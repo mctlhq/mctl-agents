@@ -9,11 +9,11 @@ AGENTS_DIR = REPO_ROOT / "agents"
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
-    # "mctl-docs",
-    # "mctl-api",
-    # "mctl-portal",
-    # "mctl-agent",
-    # "mctl-gitops",
+    "mctl-docs",
+    "mctl-api",
+    "mctl-portal",
+    "mctl-agent",
+    "mctl-gitops",
     # "upwork-mcp",
 ]
 

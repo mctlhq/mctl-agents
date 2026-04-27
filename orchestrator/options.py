@@ -35,6 +35,28 @@ SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "1.50"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 
 
+# Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
+# scans their git log). Configurable via env so the same orchestrator works
+# locally (paths cloned by user) and in cluster (paths cloned by workflow init).
+SIBLING_REPOS_PATH = os.getenv(
+    "SIBLING_REPOS_PATH",
+    "/Users/dmitriimashkov/PycharmProjects/mctlhq",
+)
+SERVICES_NEEDING_SIBLING_ACCESS = {"mctl-docs"}
+_SIBLING_REPOS = (
+    "mctl-api", "mctl-web", "mctl-portal", "mctl-agent",
+    "mctl-agents", "mctl-gitops", "mctl-openclaw",
+)
+
+
+def _sibling_add_dirs(service_name: str) -> list[str]:
+    """For services that scan sibling repos, expand the workspace to include them."""
+    if service_name not in SERVICES_NEEDING_SIBLING_ACCESS:
+        return []
+    base = Path(SIBLING_REPOS_PATH)
+    return [str(base / r) for r in _SIBLING_REPOS if (base / r).exists()]
+
+
 def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOptions:
     """Опции для агента-владельца сервиса."""
     return ClaudeAgentOptions(
@@ -49,6 +71,10 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",         # без интерактива — для cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
+        add_dirs=_sibling_add_dirs(service_dir.name),
+        # Extend (NOT replace) parent env — child needs PATH/HOME/etc. for
+        # npm-installed `claude` CLI and the Claude credentials lookup.
+        env={**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH},
     )
 
 
