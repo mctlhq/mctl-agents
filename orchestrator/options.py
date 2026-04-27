@@ -33,6 +33,11 @@ def _mctl_tool_globs() -> list[str]:
 
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
+# Tier 2 implementer budget — soft cap per single proposal implementation.
+# A proposal touching one or two files usually finishes well under this.
+# No hard kill: the SDK stops sampling once the cap is exceeded but the
+# already-applied edits remain. Caller can raise via env if a proposal needs more.
+IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -75,6 +80,40 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         # Extend (NOT replace) parent env — child needs PATH/HOME/etc. for
         # npm-installed `claude` CLI and the Claude credentials lookup.
         env={**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH},
+    )
+
+
+def build_implementer_agent_options(repo_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Опции для Tier 2 implementer-агента.
+
+    Запускается с cwd внутри клонированного sibling-репо (не agents/<svc>/).
+    setting_sources=["project"] подхватывает .claude/agents/implementer.md из
+    *самого* mctl-agents repo через PROPOSAL_DIR — нет, на самом деле SDK
+    смотрит .claude в cwd. Поэтому орчестратор копирует implementer.md в
+    cloned-repo/.claude/agents/ перед запуском (см. run_implementer.py).
+
+    add_dirs=[] — нет нужды видеть sibling-репо: агент работает только в
+    cwd (cloned target repo) и читает spec из PROPOSAL_DIR (gitops worktree
+    смонтирован в pod, путь передаётся через env).
+
+    GITHUB_TOKEN пробрасывается из родительского env — нужен gh CLI для clone +
+    pr create в Python-обёртке, но самому SDK-агенту он не нужен (агент НЕ
+    делает push, только commit).
+    """
+    return ClaudeAgentOptions(
+        cwd=str(repo_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=[
+            "Read", "Write", "Edit", "Glob", "Grep",
+            "WebSearch", "WebFetch",
+            "Bash",
+        ] + _mctl_tool_globs(),
+        mcp_servers=mctl_mcp_config(),
+        permission_mode="acceptEdits",
+        max_budget_usd=IMPLEMENTER_BUDGET_USD,
+        add_dirs=[],
+        env={**os.environ},
     )
 
 
