@@ -3,13 +3,78 @@
 Usage:
     python -m orchestrator.run_mentor
 """
-import anyio
+import re
 from datetime import date
+from pathlib import Path
+
+import anyio
 from claude_agent_sdk import query
 
 from config.settings import MENTOR_DIR, MENTOR_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.options import build_mentor_options
+
+
+# Digest filename: YYYY-WNN.md (ISO 8601 year + week).
+_DIGEST_RE = re.compile(r"^(\d{4})-W(\d{2})\.md$")
+
+
+def _subtract_iso_weeks(year: int, week: int, weeks: int) -> tuple[int, int]:
+    """Return (year, week) that is `weeks` ISO-weeks before the given (year, week).
+
+    Implemented via date arithmetic to handle year boundaries and 53-week years.
+    """
+    anchor = date.fromisocalendar(year, week, 1)
+    shifted = date.fromordinal(anchor.toordinal() - weeks * 7)
+    iso_year, iso_week, _ = shifted.isocalendar()
+    return iso_year, iso_week
+
+
+def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
+    """Move digest files older than the last `keep_weeks` ISO-weeks to archive/.
+
+    Called before the SDK writes the new digest. Files matching `YYYY-WNN.md`
+    older than (latest_week - keep_weeks) are renamed into `digest_dir/archive/`.
+    Non-matching files (README.md, archive/, etc.) are left untouched.
+    The function is idempotent: it is silent when there is nothing to rotate.
+    """
+    if not digest_dir.is_dir():
+        return
+
+    candidates: list[tuple[tuple[int, int], Path]] = []
+    for entry in digest_dir.iterdir():
+        if not entry.is_file():
+            continue
+        match = _DIGEST_RE.match(entry.name)
+        if not match:
+            continue
+        iso_year = int(match.group(1))
+        iso_week = int(match.group(2))
+        candidates.append(((iso_year, iso_week), entry))
+
+    if not candidates:
+        return
+
+    latest_year, latest_week = max(key for key, _ in candidates)
+    threshold_year, threshold_week = _subtract_iso_weeks(
+        latest_year, latest_week, keep_weeks
+    )
+    threshold = (threshold_year, threshold_week)
+
+    archive_dir = digest_dir / "archive"
+    moved = 0
+    for key, path in candidates:
+        # Strictly older than threshold — keep `keep_weeks` most recent inclusive.
+        if key < threshold:
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            path.rename(archive_dir / path.name)
+            moved += 1
+
+    if moved:
+        print(
+            f"[mentor] rotated {moved} digest(s) older than "
+            f"{threshold_year}-W{threshold_week:02d} → archive/"
+        )
 
 
 def build_prompt() -> str:
@@ -42,6 +107,11 @@ def build_prompt() -> str:
 
 
 async def run_mentor() -> None:
+    # Retention is enforced by the orchestrator (deterministic, no token spend);
+    # the agent itself is not asked to manage old files.
+    digest_dir = Path(MENTOR_DIR) / "digest"
+    _rotate_old_digests(digest_dir)
+
     options = build_mentor_options(MENTOR_DIR, MENTOR_MODEL)
     print(f"\n=== Запускаю ментора ({MENTOR_MODEL}) ===\n")
 
