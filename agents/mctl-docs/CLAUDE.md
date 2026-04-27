@@ -35,7 +35,7 @@
 - `inbox/` — append-only, новый файл `YYYY-MM-DD.md` каждый день.
 - `proposals/` — оформленные предложения. Slug = `<area>-<short-desc>`, например `mcp-identity-tools` или `openclaw-skill-quotas`.
 - За пределы своей папки не выходи. Чужие сервисы — НЕ редактируешь, только читаешь git log.
-- **Не клонируй ничего**. Если соседний репо отсутствует по пути из `SIBLING_REPOS_PATH` — задокументируй это в inbox как "no signal: <repo> path missing" и продолжай со следующим.
+- **Не клонируй ничего**. В кластере sibling-клоны отсутствуют (clone-gitops step клонирует только `mctl-gitops`); в этом случае skill `scan-sibling-commits` автоматически fall back на GitHub REST API через `WebFetch`/`curl`. Для этого нужен env `GITHUB_TOKEN` (fine-grained PAT, Contents:read на `mctlhq/*`). Если токен пустой — public API rate-limit (60/h) почти гарантированно убьёт run, и skill пометит "no signal: <repo> rate-limited" в inbox. С токеном лимит 5000/h — комфортно для 7 репо. Подробности: `agents/mctl-docs/.claude/skills/scan-sibling-commits/SKILL.md`.
 
 ## Стиль предложений (и `proposed-content.md`)
 - Всегда ссылайся на конкретный commit SHA и краткое описание commit'а.
