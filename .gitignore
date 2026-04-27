@@ -1,0 +1,12 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.claude/projects/
+.DS_Store
+
+# Runtime state — lives in mctl-gitops/agents-state/, never committed here
+agents/*/inbox/
+agents/*/proposals/
+agents/_mentor/digest/

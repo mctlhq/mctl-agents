@@ -1,0 +1,28 @@
+# Build artifacts
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Runtime state — lives in mctl-gitops/agents-state/, mounted at runtime
+agents/*/inbox/
+agents/*/proposals/
+agents/_mentor/digest/
+
+# Local-only
+.env
+.env.local
+.git/
+.gitignore
+.dockerignore
+
+# CI scaffolding — image doesn't need it
+.github/
+README.md
+
+# Editor cruft
+.idea/
+.vscode/
+.claude/projects/
