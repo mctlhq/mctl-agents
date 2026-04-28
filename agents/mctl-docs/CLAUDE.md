@@ -57,9 +57,15 @@ Once a day:
 - `proposals/` — write proposals here. Slug = `<area>-<short-desc>`,
   e.g. `mcp-identity-tools` or `openclaw-skill-quotas`.
 - Stay inside your folder. Other services — read git log only, never edit.
-- **Do not clone anything.** If a sibling repo is missing under
-  `SIBLING_REPOS_PATH`, document it in the inbox as
-  "no signal: <repo> path missing" and continue with the next one.
+- **Do not clone anything.** In the cluster the sibling clones are absent
+  (the `clone-gitops` step only clones `mctl-gitops`); in that case the
+  `scan-sibling-commits` skill automatically falls back to the GitHub
+  REST API via `WebFetch` / `curl`. That fallback needs `GITHUB_TOKEN`
+  in the env (a fine-grained PAT with Contents:read on `mctlhq/*`).
+  Without a token the public API rate-limit (60/h) will almost always
+  kill the run, and the skill will mark `no signal: <repo> rate-limited`
+  in the inbox. With a token the limit is 5000/h — comfortable for 7
+  repos. Details: `.claude/skills/scan-sibling-commits/SKILL.md`.
 
 ## Proposal style (and `proposed-content.md`)
 - Always cite a concrete commit SHA and a short summary of the commit.
