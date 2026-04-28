@@ -1,54 +1,54 @@
 # Architecture: mctl-docs
 
-## Назначение
-Публичный документационный портал `docs.mctl.ai`. Источник истины для платформенной документации mctl: getting-started, гайды, MCP, API reference, security, platform internals.
+## Purpose
+Public documentation portal `docs.mctl.ai`. Source of truth for platform documentation of mctl: getting-started, guides, MCP, API reference, security, platform internals.
 
-## Технологический стек
+## Tech stack
 - **VitePress 1.6** (Vue-based static site generator)
-- **mermaid 11** для диаграмм (включается через VitePress плагин)
-- **TypeScript** (tsconfig.json) — для конфигов и кастомного theme
-- Билд: `vitepress build docs` → `docs/.vitepress/dist/`
-- Раздача: nginx + Dockerfile (см. `mctl-docs/Dockerfile`, `mctl-docs/nginx.conf`)
-- Деплой: через mctl-gitops → ArgoCD
+- **mermaid 11** for diagrams (enabled via the VitePress plugin)
+- **TypeScript** (tsconfig.json) — for configs and the custom theme
+- Build: `vitepress build docs` → `docs/.vitepress/dist/`
+- Serving: nginx + Dockerfile (see `mctl-docs/Dockerfile`, `mctl-docs/nginx.conf`)
+- Deploy: via mctl-gitops → ArgoCD
 
-## Структура `docs/` (VitePress root)
+## `docs/` structure (VitePress root)
 
-| Папка | Назначение |
+| Folder | Purpose |
 |---|---|
-| `docs/.vitepress/` | Конфиг сайта: `config.{ts,mts}`, theme overrides, sidebar/nav |
-| `docs/getting-started/` | Onboarding, "first 5 minutes" туториал, первый сервис |
-| `docs/guides/` | How-to статьи (deploy сервиса, secrets, custom domain, etc.) |
-| `docs/platform/` | Платформенные концепции (тенанты, ArgoCD flow, Backstage) |
-| `docs/mcp/` | MCP-сервер mctl-api: список тулзов, OAuth flow, примеры |
-| `docs/api/` | REST API reference от mctl-api |
-| `docs/security/` | Auth модели, секреты, vault, threat model |
-| `docs/reference/` | Шаблоны helm charts, configmaps, конвенции |
-| `docs/public/` | Статические assets (логотипы, og-image) |
+| `docs/.vitepress/` | Site config: `config.{ts,mts}`, theme overrides, sidebar/nav |
+| `docs/getting-started/` | Onboarding, "first 5 minutes" tutorial, first service |
+| `docs/guides/` | How-to articles (deploy a service, secrets, custom domain, etc.) |
+| `docs/platform/` | Platform concepts (tenants, ArgoCD flow, Backstage) |
+| `docs/mcp/` | mctl-api MCP server: tool list, OAuth flow, examples |
+| `docs/api/` | REST API reference for mctl-api |
+| `docs/security/` | Auth models, secrets, vault, threat model |
+| `docs/reference/` | Helm chart templates, configmaps, conventions |
+| `docs/public/` | Static assets (logos, og-image) |
 
-> Подробный snapshot текущей структуры (с короткими аннотациями каждой страницы) — в `context/docs-tree.md`.
+> A detailed snapshot of the current structure (with short annotations on each page) is in `context/docs-tree.md`.
 
-## Что НЕ документируем
-- Внутренние реализационные детали отдельных репо (для них есть CLAUDE.md в каждом репо)
-- Команды разработки (live-reload, debug) — это в README соответствующего репо
-- Code review процесс (PR convention, codex review) — в `.claude/CLAUDE.md` репо
+## What we do NOT document
+- Internal implementation details of individual repos (each repo has its own CLAUDE.md)
+- Development commands (live-reload, debug) — those go in the README of the corresponding repo
+- Code review process (PR convention, codex review) — in `.claude/CLAUDE.md` of the repo
 
-## Внешние интеграции
-- **mctl-api** — главный source-of-truth для `docs/api/` и `docs/mcp/`
-- **mctl-portal (Backstage)** — для `docs/platform/backstage*.md`
-- **mctl-gitops** — для `docs/guides/gitops*.md`, `docs/reference/helm*.md`
+## External integrations
+- **mctl-api** — the main source of truth for `docs/api/` and `docs/mcp/`
+- **mctl-portal (Backstage)** — for `docs/platform/backstage*.md`
+- **mctl-gitops** — for `docs/guides/gitops*.md`, `docs/reference/helm*.md`
 
-## Conventions для doc-агента
-- **Frontmatter** — VitePress поддерживает YAML frontmatter (title, description, layout). Используй для overrides.
-- **Cross-links** — root-relative, без расширения (например `[MCP overview](/mcp/overview)`).
-- **Code blocks** — указывай язык (` ```bash`, ` ```yaml`).
-- **Mermaid** — ` ```mermaid` для диаграмм flow / sequence / state.
-- **Сленг тенантов** — везде `admins/labs/ovk` нижним регистром, как в платформе.
-- **English only для пользовательской документации** (хотя CLAUDE.md в этом репо — на русском, как и весь mctl-агентный код).
+## Conventions for the doc agent
+- **Frontmatter** — VitePress supports YAML frontmatter (title, description, layout). Use it for overrides.
+- **Cross-links** — root-relative, no extension (e.g. `[MCP overview](/mcp/overview)`).
+- **Code blocks** — specify the language (` ```bash`, ` ```yaml`).
+- **Mermaid** — ` ```mermaid` for flow / sequence / state diagrams.
+- **Tenant slang** — everywhere `admins/labs/ovk` lowercase, as on the platform.
+- **English only for user-facing documentation** (although CLAUDE.md in this repo is in Russian, like the rest of the mctl-agents code).
 
-## Известные ограничения
-- VitePress 1.6 — не используется новейший 2.x; bump при обновлении должен учитывать breaking changes.
-- Билд односекционный (один `docs/`), нет concept of versioned docs (старые версии теряются при апгрейде).
-- Mermaid bundles add ~200KB к bundle size.
+## Known limitations
+- VitePress 1.6 — the latest 2.x is not in use; a bump on update must account for breaking changes.
+- The build is single-section (one `docs/`), no concept of versioned docs (old versions are lost on upgrade).
+- Mermaid bundles add ~200KB to bundle size.
 
-## Mctl MCP (для researcher проверки prod-версий сервисов)
-Тулзы `mcp__mctl__*` могут вернуть текущие версии mctl-api / mctl-web / etc. — это критично чтобы документировать только то, что юзер реально может использовать СЕЙЧАС, а не PR в feature-ветке.
+## Mctl MCP (for the researcher to verify prod versions of services)
+The `mcp__mctl__*` tools may return current versions of mctl-api / mctl-web / etc. — this is critical for documenting only what the user can actually use NOW, not a PR in a feature branch.

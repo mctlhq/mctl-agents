@@ -1,8 +1,8 @@
-# Текущая версия mctl-api
+# Current version of mctl-api
 
-**Версия:** 4.14.0
-**Тенант:** admins
+**Version:** 4.14.0
+**Tenant:** admins
 **URL:** https://api.mctl.ai (REST + MCP)
-**Последнее обновление этого файла:** 2026-04-27
+**Last update of this file:** 2026-04-27
 
-Обновления через mctl-gitops → ArgoCD. ADR в `decisions/` при значимых изменениях стека / API.
+Updates via mctl-gitops → ArgoCD. ADR in `decisions/` on significant changes to the stack / API.

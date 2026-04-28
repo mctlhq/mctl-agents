@@ -4,34 +4,34 @@
 **Date:** 2026-03-15
 
 ## Context
-openclaw хранит чувствительный канальный state (auth tokens для WhatsApp Web, Telegram session, iMessage cookies, OAuth refresh-токены и т.п.). При рестарте pod'а без восстановления этого state каналы теряют коннект, что для `ovk` означает downtime реального клиента.
+openclaw stores sensitive channel state (auth tokens for WhatsApp Web, Telegram session, iMessage cookies, OAuth refresh tokens, etc.). On a pod restart without restoring this state, channels lose their connection, which for `ovk` means downtime for a real customer.
 
-Раньше state жил только в memory + локальном volume. Несколько раз теряли auth при rollout.
+Previously state lived only in memory + a local volume. Several times we lost auth on rollout.
 
 ## Decision
-Three layers защиты:
+Three layers of protection:
 
-1. **S3 как источник истины**. openclaw периодически синкает auth/sessions в S3 bucket (per tenant). При старте pod'а — pull из S3 перед открытием каналов.
+1. **S3 as source of truth**. openclaw periodically syncs auth/sessions to an S3 bucket (per tenant). On pod startup — pull from S3 before opening channels.
 
-2. **s3-sync canary workflow** (Argo CronWorkflow). Раз в N минут проверяет: pod реально пишет в S3 (свежий timestamp есть). Если canary fail > N циклов — alert. Перед rollout canary останавливается, после — restart с задержкой (иначе шумит ложными alerts).
+2. **s3-sync canary workflow** (Argo CronWorkflow). Every N minutes it checks: the pod actually writes to S3 (a fresh timestamp is present). If the canary fails > N cycles — alert. Before rollout the canary stops, after — restart with a delay (otherwise it spams false alerts).
 
-3. **restore-state readiness probe**. Pod не маркируется ready, пока не подтвердит что auth/sessions восстановлены из S3. ArgoCD ждёт ready-status перед маркировкой rollout успешным.
+3. **restore-state readiness probe**. The pod is not marked ready until it confirms that auth/sessions have been restored from S3. ArgoCD waits for ready status before marking the rollout successful.
 
 ## Consequences
 - **+** Cross-pod restart resilience
-- **+** Rollout безопаснее (probe ловит сломанный restore до того как трафик пойдёт)
-- **+** Canary даёт раннее предупреждение о sync-проблемах
-- **−** Зависимость от S3 (bucket down = pod не стартует) — митигация: backup region
-- **−** Canary пропускает циклы во время rollout — учитывать в alert thresholds
-- **−** Probe timeout выставлять больше чем самый медленный канал восстанавливается
+- **+** Rollout is safer (the probe catches a broken restore before traffic flows)
+- **+** Canary provides early warning of sync problems
+- **−** Dependency on S3 (bucket down = pod does not start) — mitigation: backup region
+- **−** Canary skips cycles during rollout — must be accounted for in alert thresholds
+- **−** Probe timeout must be set higher than the slowest channel takes to restore
 
-## Recurring footguns (из памяти)
-- Rollout без остановки canary → ложные alerts
-- Слишком короткий probe timeout → ArgoCD тaймаутит pod даже если он восстанавливается успешно
-- Изменение S3 bucket policy без проверки на всех тенантах
-- Очистка bucket'а "для теста" — теряется auth у живых клиентов
+## Recurring footguns (from memory)
+- Rollout without stopping the canary → false alerts
+- Too short a probe timeout → ArgoCD times the pod out even when it is restoring successfully
+- Changing S3 bucket policy without checking on all tenants
+- Cleaning a bucket "for testing" — auth is lost for live customers
 
-## Что НЕ предлагать (для analyst/researcher)
-- Замену S3 на что-то stateless (etcd, Redis) без серьёзного сравнения
-- Отключение canary "потому что шумит" — нужно чинить причину шума
-- Уменьшение probe timeout без стресс-теста на самом медленном канале
+## What NOT to propose (for analyst/researcher)
+- Replacing S3 with something stateless (etcd, Redis) without a serious comparison
+- Disabling the canary "because it's noisy" — the cause of the noise must be fixed
+- Reducing probe timeout without a stress test on the slowest channel

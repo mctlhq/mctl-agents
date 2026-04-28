@@ -1,87 +1,87 @@
 # Architecture: mctl-openclaw
 
-## Назначение
-Деплой [openclaw](https://github.com/openclaw/openclaw) (multi-channel AI gateway) на платформе mctl. Три параллельных тенант-инстанса с независимым state, общей 3-layer skills архитектурой и shared canary/probe защитой.
+## Purpose
+Deployment of [openclaw](https://github.com/openclaw/openclaw) (multi-channel AI gateway) on the mctl platform. Three parallel tenant instances with independent state, a shared 3-layer skills architecture, and shared canary/probe protection.
 
-## Технологический стек
+## Tech stack
 - **Node.js** + TypeScript (workspace packages)
-- **openclaw 2026.3.14** (см. `current-version.md`) — upstream `github.com/openclaw/openclaw`, MIT
-- **Plugin SDK**: extensions живут в `extensions/*`, импортируют `openclaw/plugin-sdk/*`
-- **Каналы**: WhatsApp (web), Telegram, Discord, Slack, Signal, iMessage, BlueBubbles, Matrix, MS Teams, IRC, LINE, Mattermost, Nextcloud Talk, Nostr, Synology Chat, Tlon, Twitch, Zalo (+Personal), WeChat, QQ, WebChat, Feishu, Google Chat
-- **Раздача**: Mintlify docs на `docs.openclaw.ai`, installers на `openclaw.ai/install*`
-- **Билд / деплой**: Docker → mctl-gitops → ArgoCD
+- **openclaw 2026.3.14** (see `current-version.md`) — upstream `github.com/openclaw/openclaw`, MIT
+- **Plugin SDK**: extensions live in `extensions/*`, import `openclaw/plugin-sdk/*`
+- **Channels**: WhatsApp (web), Telegram, Discord, Slack, Signal, iMessage, BlueBubbles, Matrix, MS Teams, IRC, LINE, Mattermost, Nextcloud Talk, Nostr, Synology Chat, Tlon, Twitch, Zalo (+Personal), WeChat, QQ, WebChat, Feishu, Google Chat
+- **Serving**: Mintlify docs at `docs.openclaw.ai`, installers at `openclaw.ai/install*`
+- **Build / deploy**: Docker → mctl-gitops → ArgoCD
 
-## Тенанты на mctl
-Три деплоя openclaw в Kubernetes:
+## Tenants on mctl
+Three openclaw deployments in Kubernetes:
 
-### `admins` (admins тенант)
-- Системный деплой для команды mctlhq
-- Полный набор каналов
-- Самый низкий blast radius (внутренний)
+### `admins` (admins tenant)
+- System deployment for the mctlhq team
+- Full set of channels
+- Lowest blast radius (internal)
 
-### `labs` (labs тенант)
-- Экспериментальный деплой (новые features, beta extensions)
-- **Близок к лимиту памяти** — любое увеличение footprint требует обоснования
-- Используется для прогона новых каналов перед промо в `ovk`
+### `labs` (labs tenant)
+- Experimental deployment (new features, beta extensions)
+- **Close to the memory limit** — any footprint increase requires justification
+- Used to run new channels through before promotion to `ovk`
 
-### `ovk` (ovk тенант)
-- Production деплой для конкретного клиента
-- Высокий SLA, рестарты болезненны
-- Изменения только после прогона в `labs`
+### `ovk` (ovk tenant)
+- Production deployment for a specific customer
+- High SLA, restarts are painful
+- Changes only after a run-through in `labs`
 
-## Shared 3-layer skills архитектура
-Skills layout повторяется в каждом тенанте:
-1. **Layer 1: Built-in skills** (compiled в openclaw core)
-2. **Layer 2: YAML skills** (hot-reload из `skills/custom/`)
-3. **Layer 3: Remote skills** (HTTP-delegated, регистрация через REST API)
+## Shared 3-layer skills architecture
+The skills layout repeats in each tenant:
+1. **Layer 1: Built-in skills** (compiled into openclaw core)
+2. **Layer 2: YAML skills** (hot-reload from `skills/custom/`)
+3. **Layer 3: Remote skills** (HTTP-delegated, registered via REST API)
 
-При обновлении skill в одном тенанте — обновляется в trio (если общий). Раздельные skills возможны через tenant-specific overlays в gitops.
+When updating a skill in one tenant, it is updated across the trio (if shared). Separate skills are possible via tenant-specific overlays in gitops.
 
-## Защита состояния (state guards)
-Из памяти команды (см. `reference_openclaw_state_persistence.md`):
+## State guards
+From team memory (see `reference_openclaw_state_persistence.md`):
 
 ### s3-sync canary
-Периодический workflow проверяет что openclaw реально пишет в S3:
-- Если canary пропускает > N циклов → alert
-- При rollout: canary остановлен на время rollout, после — restart с задержкой
+A periodic workflow checks that openclaw is actually writing to S3:
+- If the canary misses > N cycles → alert
+- On rollout: the canary is stopped for the duration of rollout, after which it is restarted with a delay
 
 ### restore-state probe
-Readiness probe в pod'е проверяет что openclaw восстановил sessions/auth из S3:
-- Если probe не проходит за timeout → ArgoCD не маркирует rollout успешным
-- Особенно важно для `ovk` (нельзя терять auth для production клиентов)
+Readiness probe in the pod checks that openclaw has restored sessions/auth from S3:
+- If the probe does not pass within timeout → ArgoCD does not mark the rollout successful
+- Especially important for `ovk` (we cannot lose auth for production customers)
 
-## Где живёт state
+## Where state lives
 - Auth tokens / sessions — S3 (cross-pod restart resilience)
-- Канальные cookies (WhatsApp web, Telegram session) — S3 + memory
-- Skill metrics — SQLite в pod (теряется при restart, не критично)
-- Conversation history — каждый канал по-своему (см. `extensions/<channel>/`)
+- Channel cookies (WhatsApp web, Telegram session) — S3 + memory
+- Skill metrics — SQLite in pod (lost on restart, not critical)
+- Conversation history — each channel its own way (see `extensions/<channel>/`)
 
-## Внешние интеграции
-- **mctl-api** через MCP (`api.mctl.ai/mcp`) — статус деплоев, метрики
+## External integrations
+- **mctl-api** via MCP (`api.mctl.ai/mcp`) — deployment status, metrics
 - **Mintlify** — docs.openclaw.ai
 - **GitHub openclaw/openclaw** — upstream, fork-tracking
 
-## Dependencies для researcher (трекинг релизов)
-Researcher следит за этими источниками через `WebFetch`:
+## Dependencies for researcher (release tracking)
+The researcher monitors these sources via `WebFetch`:
 
-- `openclaw/openclaw` releases — главный upstream
-- `openclaw/openclaw` issues — особенно `bug` + `security` лейблы
+- `openclaw/openclaw` releases — main upstream
+- `openclaw/openclaw` issues — especially `bug` + `security` labels
 - `openclaw/nix-openclaw` — Nix packaging
-- Каналы (если меняются API):
+- Channels (if APIs change):
   - `whiskeysockets/Baileys` — WhatsApp Web reverse-engineered
   - `discordjs/discord.js`
   - `slackapi/node-slack-sdk`
-- Node.js LTS releases — major bumps требуют валидации
+- Node.js LTS releases — major bumps require validation
 - TypeScript releases — strict type checks
 
-## Известные ограничения / footguns
-- **`labs` тенант** — не пушить туда изменения, повышающие RAM. Даже на 50MB.
-- **Канал-агностичные refactor'ы** — затрагивают **все** built-in + extension каналы; нужно проверить routing/allowlist/pairing/onboarding/docs (см. CLAUDE.md upstream репо)
-- **`workspace:*` в plugin dependencies** — ломает `npm install --omit=dev`. Использовать `peerDependencies`/`devDependencies` для core
-- **CODEOWNERS-restricted paths** — не редактировать без явного запроса owner'а
-- **rollout без canary** — риск тихой потери S3-sync, обнаружится только когда pod'ы потеряют auth
+## Known limitations / footguns
+- **`labs` tenant** — do not push changes that increase RAM there. Even by 50MB.
+- **Channel-agnostic refactors** — affect **all** built-in + extension channels; need to verify routing/allowlist/pairing/onboarding/docs (see CLAUDE.md of the upstream repo)
+- **`workspace:*` in plugin dependencies** — breaks `npm install --omit=dev`. Use `peerDependencies`/`devDependencies` for core
+- **CODEOWNERS-restricted paths** — do not edit without an explicit request from the owner
+- **rollout without canary** — risk of silent loss of S3-sync, found only when pods lose auth
 
-## Что НЕ делать (для analyst/researcher)
-- Не предлагать рестарты `ovk` без чёткого обоснования (см. INCIDENT_RESPONSE.md в upstream)
-- Не предлагать изменения в shared skills без cross-tenant impact analysis
-- Не проксировать апстрим issue'ы без проверки fork-relevance (часть upstream проблем нас не касается)
+## What NOT to do (for analyst/researcher)
+- Do not propose restarts of `ovk` without a clear justification (see INCIDENT_RESPONSE.md in upstream)
+- Do not propose changes to shared skills without a cross-tenant impact analysis
+- Do not proxy upstream issues without checking fork-relevance (some upstream problems do not concern us)

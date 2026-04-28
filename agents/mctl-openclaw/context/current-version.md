@@ -1,12 +1,12 @@
-# Текущая версия mctl-openclaw
+# Current version of mctl-openclaw
 
-**Upstream версия (openclaw):** 2026.3.14 (см. `mctl-openclaw/package.json`)
-**Тенанты:** `ovk`, `labs`, `admins` — версия одна на trio (или указать override per tenant ниже)
-**Последнее обновление этого файла:** 2026-04-26
+**Upstream version (openclaw):** 2026.3.14 (see `mctl-openclaw/package.json`)
+**Tenants:** `ovk`, `labs`, `admins` — one version across the trio (or specify a per-tenant override below)
+**Last update of this file:** 2026-04-26
 
 ## Per-tenant overrides
-- `admins`: 2026.3.14 (на upstream)
-- `labs`: 2026.3.14 (на upstream)
-- `ovk`: 2026.3.14 (на upstream)
+- `admins`: 2026.3.14 (on upstream)
+- `labs`: 2026.3.14 (on upstream)
+- `ovk`: 2026.3.14 (on upstream)
 
-При обновлении любого тенанта — обнови этот файл и добавь ADR в `decisions/` с обоснованием (особенно если разъезжаются версии между тенантами).
+When updating any tenant — update this file and add an ADR in `decisions/` with a justification (especially if versions diverge between tenants).

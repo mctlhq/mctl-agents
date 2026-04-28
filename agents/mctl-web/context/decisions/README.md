@@ -1,8 +1,8 @@
 # Architecture Decision Records
 
-Сюда складывай решения по сервису. Файл = одно решение.
+Place service decisions here. One file = one decision.
 
-Шаблон: `NNNN-kebab-case-title.md`
+Template: `NNNN-kebab-case-title.md`
 
 ```
 # NNNN. <Title>
@@ -20,4 +20,4 @@
 ...
 ```
 
-Researcher и analyst читают эту папку чтобы не предлагать то, что уже сознательно отвергнуто.
+Researcher and analyst read this folder so they do not propose things that have been deliberately rejected.

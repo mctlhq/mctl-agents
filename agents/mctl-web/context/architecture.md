@@ -1,62 +1,62 @@
 # Architecture: mctl-web
 
-## Назначение
-Публичный сайт `mctl.ai` (landing + docs + privacy) и Cloudflare Worker для OAuth, форм заявок на создание тенанта и Telegram-уведомлений.
+## Purpose
+Public site `mctl.ai` (landing + docs + privacy) and Cloudflare Worker for OAuth, tenant creation request forms, and Telegram notifications.
 
-## Технологический стек
+## Tech stack
 
 ### Frontend (Nuxt SSG)
-- **Nuxt 4.3.1** (SSR=true, prerender для `/`, `/privacy`, `/docs`)
+- **Nuxt 4.3.1** (SSR=true, prerender for `/`, `/privacy`, `/docs`)
 - **Vue 3.5.30** + vue-router 4.6.4
-- **vee-validate 4.15.1** + **yup 1.7.1** — валидация формы тенанта
+- **vee-validate 4.15.1** + **yup 1.7.1** — tenant form validation
 - **@vueuse/core 14.2.1** — composables
 - **sass 1.98.0** + **vite-svg-loader 5.1.1**
-- Шрифт: JetBrains Mono (Google Fonts preconnect)
-- Билд: `nuxt build` → `dist/` → раздаётся статикой
+- Font: JetBrains Mono (Google Fonts preconnect)
+- Build: `nuxt build` → `dist/` → served as static
 
 ### Cloudflare Worker (`cloudflare-worker/`)
-- Routes: `mctl.ai/api/*`, плюс редиректы с `mctl.me/*`, `*.mctl.me/*`, `mctl.ru/*`, `*.mctl.ru/*` на `mctl.ai`
-- Endpoints: `/api/github/login`, `/api/github/callback`, `/api/submit` (tenant provisioning через Backstage), `/api/contact`
-- Rate limits: 5/5min на /submit, 3/5min на /contact, 10/min на /github/login
-- Деплой: Wrangler через GitHub Actions (`deploy.yml` в этом репо) — **исключение из централизованных билдов в mctl-gitops**
+- Routes: `mctl.ai/api/*`, plus redirects from `mctl.me/*`, `*.mctl.me/*`, `mctl.ru/*`, `*.mctl.ru/*` to `mctl.ai`
+- Endpoints: `/api/github/login`, `/api/github/callback`, `/api/submit` (tenant provisioning via Backstage), `/api/contact`
+- Rate limits: 5/5min on /submit, 3/5min on /contact, 10/min on /github/login
+- Deploy: Wrangler via GitHub Actions (`deploy.yml` in this repo) — **exception from centralized builds in mctl-gitops**
 
-### Раздача
-- Cloudflare Pages / nginx статика для Nuxt-билда
-- Worker — отдельный деплой через wrangler
+### Serving
+- Cloudflare Pages / nginx static for the Nuxt build
+- Worker — separate deploy via wrangler
 
-## Маршруты (Nuxt pages)
+## Routes (Nuxt pages)
 - `/` — landing (`app/pages/index.vue`)
-- `/docs` — обзор платформы (`app/pages/docs/index.vue`)
+- `/docs` — platform overview (`app/pages/docs/index.vue`)
 - `/privacy` — privacy policy (`app/pages/privacy/index.vue`)
 
-> Память упоминала `/mcp` как connector page — на момент текущего commit'а её **нет** в `app/pages/`. Возможно перенесена в docs.mctl.ai (отдельный репо `mctl-docs`).
+> Memory mentioned `/mcp` as the connector page — at the time of the current commit it is **not** in `app/pages/`. Possibly moved to docs.mctl.ai (separate `mctl-docs` repo).
 
-## Внешние интеграции
-- **GitHub OAuth App** (`GITHUB_CLIENT_ID` / `SECRET` / `OAUTH_HMAC_KEY`) — логин пользователей через GitHub org `mctlhq`
-- **Backstage API** (`app.mctl.ai`, `BACKSTAGE_LANDING_TOKEN`) — проверка доступности team name + запуск provisioning workflow для нового тенанта
-- **Telegram Bot** (`TELEGRAM_BOT_TOKEN` / `CHAT_ID`) — уведомления на каждую новую заявку
-- **Resend** (`RESEND_API_KEY`) — welcome email после успешной регистрации
+## External integrations
+- **GitHub OAuth App** (`GITHUB_CLIENT_ID` / `SECRET` / `OAUTH_HMAC_KEY`) — user login via the GitHub org `mctlhq`
+- **Backstage API** (`app.mctl.ai`, `BACKSTAGE_LANDING_TOKEN`) — team name availability check + provisioning workflow trigger for a new tenant
+- **Telegram Bot** (`TELEGRAM_BOT_TOKEN` / `CHAT_ID`) — notifications on every new request
+- **Resend** (`RESEND_API_KEY`) — welcome email after successful registration
 
 ## Worker secrets (Cloudflare Dashboard / wrangler secret)
 - `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 - `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_OAUTH_HMAC_KEY`
-- `BACKSTAGE_LANDING_TOKEN` (HMAC-SHA256, должен совпадать с env Backstage пода)
+- `BACKSTAGE_LANDING_TOKEN` (HMAC-SHA256, must match the env of the Backstage pod)
 - `RESEND_API_KEY`
 
-## Dependencies для researcher (трекинг релизов)
-Researcher следит за этими репо через `WebFetch https://github.com/<owner>/<repo>/releases/latest`:
+## Dependencies for researcher (release tracking)
+The researcher monitors these repos via `WebFetch https://github.com/<owner>/<repo>/releases/latest`:
 
-- `nuxt/nuxt` — основной фреймворк
+- `nuxt/nuxt` — main framework
 - `vuejs/core` — Vue 3
 - `vuejs/router` — vue-router
-- `logaretm/vee-validate` — формы
-- `jquense/yup` — схемы валидации
+- `logaretm/vee-validate` — forms
+- `jquense/yup` — validation schemas
 - `vueuse/vueuse` — composables
-- `sass/dart-sass` — стили
+- `sass/dart-sass` — styles
 - `cloudflare/workers-sdk` — wrangler / Worker runtime
 - `cloudflare/workerd` — Worker runtime engine
 
-## Известные ограничения / нюансы
-- **mctlhq.CLAUDE.md** в репо устарел — там описан "static HTML/CSS/JS, no frameworks", но реально сейчас Nuxt 4. Не доверять CLAUDE.md как источнику истины — смотреть `package.json` + `nuxt.config.ts`.
-- Build pipeline (`deploy.yml`) живёт **в этом репо**, а не в mctl-gitops — единственный сервис с таким исключением.
-- `runtimeConfig.apiSecret = '123'` в `nuxt.config.ts` — placeholder, не использовать для prod-логики.
+## Known limitations / nuances
+- **mctlhq.CLAUDE.md** in the repo is outdated — it describes "static HTML/CSS/JS, no frameworks", but in reality it is now Nuxt 4. Do not trust CLAUDE.md as a source of truth — look at `package.json` + `nuxt.config.ts`.
+- The build pipeline (`deploy.yml`) lives **in this repo**, not in mctl-gitops — the only service with such an exception.
+- `runtimeConfig.apiSecret = '123'` in `nuxt.config.ts` — placeholder, do not use for prod logic.
