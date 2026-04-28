@@ -73,7 +73,7 @@ curl -sD /tmp/hdr.txt \
      -H "Authorization: Bearer $GITHUB_TOKEN" \
      -H "Accept: application/vnd.github+json" \
      "https://api.github.com/repos/mctlhq/<repo>/commits?since=<ISO8601>&per_page=100&page=1" \
-   | jq -r '.[] | select((.parents | length) <= 1) | "\(.sha[0:7])|\(.commit.author.date[0:10])|\(.commit.message | split("\n")[0])|\(.html_url)"'
+   | jq -r '.[] | select((.parents | length) == 1) | "\(.sha[0:7])|\(.commit.author.date[0:10])|\(.commit.message | split("\n")[0])|\(.html_url)"'
 # Check for the next page:
 grep -i '^link:' /tmp/hdr.txt | grep -q 'rel="next"' && echo HAS_NEXT || echo NO_NEXT
 ```
@@ -106,7 +106,7 @@ enough and `Link: rel="next"` is absent — that is the normal happy path.
 ### Touched files / diff in Mode B
 - File list: `GET /repos/mctlhq/<repo>/commits/<sha>` (the `files[].filename`
   field plus `additions`/`deletions`).
-- Diff: `Accept: application/vnd.github.v3.diff` on the same endpoint
+- Diff: `Accept: application/vnd.github.diff` on the same endpoint
   returns a raw diff. Truncate with `head -200`.
 
 ## 4. Conventional-commits filter
