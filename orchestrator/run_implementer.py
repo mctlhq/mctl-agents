@@ -150,6 +150,7 @@ def find_accepted_proposals(
     state_dir: Path,
     service_filter: Optional[str] = None,
     slug_filter: Optional[str] = None,
+    include_in_progress: bool = False,
 ) -> list[ProposalRef]:
     """Glob agents-state and return all proposals with status == accepted.
 
@@ -157,9 +158,19 @@ def find_accepted_proposals(
     A directory without .status.yaml is treated as `proposed` (default per
     shared contract) and is therefore skipped here (Tier 2 only acts on
     `accepted`).
+
+    When ``include_in_progress`` is True (CLI ``--force``), proposals stuck
+    in ``in-progress`` are ALSO returned so the operator can retry a wedged
+    run without manually editing .status.yaml. ``implement_one`` already
+    short-circuits on in-progress unless ``force`` is set, so the two flags
+    must be threaded together.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
+
+    accepted_states = {"accepted"}
+    if include_in_progress:
+        accepted_states.add("in-progress")
 
     refs: list[ProposalRef] = []
     for service_dir in sorted(state_dir.iterdir()):
@@ -184,7 +195,7 @@ def find_accepted_proposals(
                 print(f"⚠️  {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
                 continue
             status = data.get("status", "proposed")
-            if status == "accepted":
+            if status in accepted_states:
                 refs.append(
                     ProposalRef(
                         service=service,
@@ -223,6 +234,12 @@ def _clone_target(service: str, slug: str) -> Path:
 def _stage_implementer_agent(target: Path, service: str) -> None:
     """Copy the per-service implementer.md sub-agent into the cloned repo's
     .claude/agents/ so the SDK (cwd=target, setting_sources=project) sees it.
+
+    The file is runtime scaffolding — it must NEVER end up in the PR. We
+    register it in `.git/info/exclude` (a per-clone, untracked-by-design
+    ignore list) so even a broad `git add -A` from the sub-agent leaves
+    it untouched. We deliberately avoid editing the repo's `.gitignore`
+    because that would itself be an out-of-scope change.
     """
     src = AGENTS_DIR / service / ".claude" / "agents" / "implementer.md"
     if not src.exists():
@@ -230,6 +247,19 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
     dst_dir = target / ".claude" / "agents"
     dst_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst_dir / "implementer.md")
+
+    # Local-only ignore: keeps PRs scoped to the proposal's intent.
+    exclude_path = target / ".git" / "info" / "exclude"
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = ".claude/agents/implementer.md"
+    existing = ""
+    if exclude_path.exists():
+        existing = exclude_path.read_text(encoding="utf-8")
+    if entry not in existing.splitlines():
+        with exclude_path.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write(f"{entry}\n")
 
 
 def _build_prompt(ref: ProposalRef) -> str:
@@ -394,6 +424,7 @@ def main() -> None:
         state_dir,
         service_filter=args.service or None,
         slug_filter=args.slug or None,
+        include_in_progress=args.force,
     )
 
     if not refs:
