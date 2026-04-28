@@ -12,6 +12,7 @@ Modes:
 """
 import os
 import sys
+import traceback
 import anyio
 
 from config.settings import SERVICES
@@ -20,10 +21,33 @@ from orchestrator.run_service_agent import run_service_agent
 from orchestrator.run_mentor import run_mentor
 
 
+async def _safe_run_service(service: str) -> None:
+    """Run one service agent and swallow any failure.
+
+    Without this, anyio.create_task_group is fail-fast: if a single agent
+    raises (e.g. error_max_budget_usd, network blip, SDK error), the whole
+    TaskGroup tears down and every other agent is cancelled — even those
+    that already finished writing proposals. The commit-and-push step in
+    the workflow then never runs and money is spent for no output.
+
+    We deliberately log + drop. The mentor that runs afterwards reads
+    whatever proposals/ landed on disk, so partial success still produces
+    a useful digest.
+    """
+    try:
+        await run_service_agent(service)
+    except Exception as exc:  # noqa: BLE001 — intentional broad catch
+        print(
+            f"⚠️  service-agent {service} failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+
+
 async def _full() -> None:
     async with anyio.create_task_group() as tg:
         for service in SERVICES:
-            tg.start_soon(run_service_agent, service)
+            tg.start_soon(_safe_run_service, service)
     await run_mentor()
 
 
