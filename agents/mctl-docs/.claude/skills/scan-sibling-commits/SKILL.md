@@ -35,7 +35,7 @@ git -C "$BASE/<repo>" show <sha> -- path/to/relevant.go | head -200
 ### Mode B — GitHub API fallback (если local clone отсутствует)
 Если `missing` — НЕ записывай "no signal", а используй `WebFetch`:
 
-URL: `https://api.github.com/repos/mctlhq/<repo>/commits?since=<ISO8601>&per_page=50`
+URL: `https://api.github.com/repos/mctlhq/<repo>/commits?since=<ISO8601>&per_page=100`
 
 Где `<ISO8601>` — например `2026-04-21T00:00:00Z` (для `--since="7 days ago"` от текущей даты).
 
@@ -49,18 +49,35 @@ URL: `https://api.github.com/repos/mctlhq/<repo>/commits?since=<ISO8601>&per_pag
   > - `url` (the `html_url` field)
   > Skip merge commits (commits with more than one parent in the `parents` array).
   > Output as plain text, one commit per line, format: `sha|date|message|url`.
+  > Also: at the very end, on a separate line, report whether the response `Link` header
+  > contains `rel="next"` (e.g. `LINK_NEXT: yes` or `LINK_NEXT: no`). If you cannot see
+  > the response headers, instead emit `LINK_NEXT: unknown`.
 
-WebFetch вернёт текст по этому формату — парси построчно.
+WebFetch вернёт текст по этому формату — парси построчно (последняя строка — `LINK_NEXT:` маркер).
 
-**Headers**: WebFetch не позволяет задать произвольные header'ы напрямую. Если `prompt` не вытаскивает данные потому что ответ возвращается публичным API без auth и rate limit'ится — добавь в URL `?` query-string ничего не помогает; вместо этого используй `Bash curl` как fallback-of-fallback:
+**Headers**: WebFetch не позволяет задать произвольные header'ы напрямую. Если `prompt` не вытаскивает данные потому что ответ возвращается публичным API без auth и rate limit'ится — вместо этого используй `Bash curl` как fallback-of-fallback. Curl-вариант также проще для пагинации (можно прочитать `Link` header через `-D-` или `curl -i`):
 ```bash
-curl -sH "Authorization: Bearer $GITHUB_TOKEN" \
+curl -sD /tmp/hdr.txt \
+     -H "Authorization: Bearer $GITHUB_TOKEN" \
      -H "Accept: application/vnd.github+json" \
-     "https://api.github.com/repos/mctlhq/<repo>/commits?since=<ISO8601>&per_page=50" \
+     "https://api.github.com/repos/mctlhq/<repo>/commits?since=<ISO8601>&per_page=100&page=1" \
    | jq -r '.[] | select((.parents | length) <= 1) | "\(.sha[0:7])|\(.commit.author.date[0:10])|\(.commit.message | split("\n")[0])|\(.html_url)"'
+# Проверь next-page:
+grep -i '^link:' /tmp/hdr.txt | grep -q 'rel="next"' && echo HAS_NEXT || echo NO_NEXT
 ```
 
 Этот curl-вариант надёжнее — задаёт `Authorization`, поднимает rate-limit с 60/h до 5000/h и возвращает строки в нужном формате.
+
+#### Pagination
+GitHub `/commits` возвращает максимум 100 коммитов на страницу — при активных репо за 7 дней этого хватает с запасом, но **обязательно пагинируй**, иначе старые коммиты молча обрежутся.
+
+Алгоритм:
+1. Стартуй с `page=1`, `per_page=100`.
+2. После каждого запроса проверь `Link` header (curl: `-D-` / `-i`; WebFetch: спроси про `LINK_NEXT` маркер в prompt'е выше). Если `rel="next"` есть — увеличивай `page` и повторяй.
+3. Альтернатива (если `Link` не виден, например WebFetch вернул `LINK_NEXT: unknown`): инкрементируй `page` пока ответ не вернёт **пустой массив** (`[]`).
+4. **Sanity cap: максимум 5 страниц на репо** (≈500 коммитов за окно — на порядок больше, чем активный репо производит за 7 дней). Если упёрся в cap — остановись и **в выводе явно отметь** что-то вроде `note: <repo> hit 5-page cap, digest may be incomplete`, чтобы analyst понимал что данные обрезаны.
+
+При `per_page=100` и типичных <100 коммитов/неделя одного запроса достаточно, и `Link: rel="next"` отсутствует — это нормальный happy-path.
 
 ### Если нужны touched files / diff (Mode B)
 - File list: `GET /repos/mctlhq/<repo>/commits/<sha>` (поле `files[].filename` + `additions`/`deletions`).
