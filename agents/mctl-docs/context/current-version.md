@@ -1,9 +1,9 @@
-# Текущая версия mctl-docs
+# Current version of mctl-docs
 
-**Версия (package.json):** 0.1.0
-**Тенант:** admins
+**Version (package.json):** 0.1.0
+**Tenant:** admins
 **URL:** https://docs.mctl.ai
-**Создан:** 2026-03-28
-**Последнее обновление этого файла:** 2026-04-27
+**Created:** 2026-03-28
+**Last update of this file:** 2026-04-27
 
-При значимых изменениях стека (bump VitePress, смена темы, новый mermaid плагин) — добавь ADR в `decisions/`.
+On significant stack changes (VitePress bump, theme change, new mermaid plugin) — add an ADR in `decisions/`.

@@ -4,24 +4,24 @@
 **Date:** 2026-02-20
 
 ## Context
-Self-healing нужен для разных типов алёртов: одни простые и universal (OOMKill → bump memory), другие специфичные для конкретного сервиса/команды (recover redis from corrupted RDB), третьи требуют внешнего знания (ML-based root cause analysis). Single hardcoded set Go skills плохо масштабируется.
+Self-healing is needed for different alert types: some are simple and universal (OOMKill → bump memory), others are specific to a particular service/team (recover redis from corrupted RDB), and others require external knowledge (ML-based root cause analysis). A single hardcoded set of Go skills scales poorly.
 
 ## Decision
 **Three-tier skill registry:**
-1. **Builtin Go skills** — компилируются в бинарь, 9 шт universal patterns. Высокая стабильность, обновление через release.
-2. **YAML skills** — определяются в `skills/custom/`, hot-reload без restart'а. Любая команда может добавить regex pattern + remediation template.
-3. **Remote skills** — регистрируются через `POST /api/v1/skills/register`, делегируют диагноз внешнему HTTP сервису. Для сложных AI/ML или vendor-specific cases.
+1. **Builtin Go skills** — compiled into the binary, 9 universal patterns. High stability, updated through release.
+2. **YAML skills** — defined in `skills/custom/`, hot-reload without restart. Any team can add a regex pattern + remediation template.
+3. **Remote skills** — registered via `POST /api/v1/skills/register`, delegate diagnosis to an external HTTP service. For complex AI/ML or vendor-specific cases.
 
 Skill matching ranked by confidence; circuit breaker auto-disables failing skills.
 
 ## Consequences
-- **+** Builtin = высокий бар качества (review + tests + Go strict typing)
-- **+** YAML = быстрая итерация для команд (PR в gitops, не в mctl-agent)
-- **+** Remote = расширяемость без модификации mctl-agent
-- **−** Три entry-point'а — увеличивает площадь "что может пойти не так"
-- **−** Circuit breaker может скрыть реальную проблему — нужна alert на disabled skills
+- **+** Builtin = high quality bar (review + tests + Go strict typing)
+- **+** YAML = fast iteration for teams (PR in gitops, not in mctl-agent)
+- **+** Remote = extensibility without modifying mctl-agent
+- **−** Three entry points — increases the surface area of "what can go wrong"
+- **−** Circuit breaker may hide a real problem — alert on disabled skills is needed
 
-## Что НЕ предлагать
-- Слияние всех skills в Go (потеря YAML hot-reload)
-- Удаление remote tier — он будущий (mctl-agents может стать remote skill source!)
-- Переключение на JS/Python plugin engine — теряем Go performance + type safety
+## What NOT to propose
+- Merging all skills into Go (loss of YAML hot-reload)
+- Removing the remote tier — it is the future (mctl-agents may become a remote skill source!)
+- Switching to a JS/Python plugin engine — we lose Go performance + type safety

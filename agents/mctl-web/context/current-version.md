@@ -1,7 +1,7 @@
-# Текущая версия mctl-web
+# Current version of mctl-web
 
-**Версия:** 4.6.2
-**Тенант:** admins
-**Последнее обновление этого файла:** 2026-04-25
+**Version:** 4.6.2
+**Tenant:** admins
+**Last update of this file:** 2026-04-25
 
-При обновлении сервиса — обнови этот файл и добавь ADR в `decisions/`.
+When updating the service — update this file and add an ADR in `decisions/`.

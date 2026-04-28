@@ -1,57 +1,57 @@
 # Architecture: mctl-portal
 
-## Назначение
-Внутренний developer portal на Backstage (`https://app.mctl.ai`). Каталог сервисов, scaffolder для онбординга нового сервиса в тенант, k8s/observability viewers, TechDocs.
+## Purpose
+Internal developer portal on Backstage (`https://app.mctl.ai`). Service catalog, scaffolder for onboarding a new service into a tenant, k8s/observability viewers, TechDocs.
 
-## Технологический стек
+## Tech stack
 - **Backstage** (latest, `backstage-cli`-based)
 - **Node.js 22 || 24** (engines.node)
 - **TypeScript**
 - **yarn workspaces**: `packages/*` (app, backend) + `plugins/*` (custom plugins)
-- **playwright** для e2e
+- **playwright** for e2e
 - **prettier** + Backstage lint
-- Раздача: nginx + Docker → mctl-gitops → ArgoCD (тенант `admins`)
+- Serving: nginx + Docker → mctl-gitops → ArgoCD (tenant `admins`)
 
-## Backstage плагины (используем)
-- **catalog** + **catalog-import** — реестр компонентов
-- **scaffolder** — onboarding-формы (со связкой mctl-gitops через Argo Workflow)
+## Backstage plugins (in use)
+- **catalog** + **catalog-import** — component registry
+- **scaffolder** — onboarding forms (tied to mctl-gitops via Argo Workflow)
 - **kubernetes** — pods/services/CRDs viewer
-- **techdocs** — markdown-доки рядом с сервисом
-- **search** — фуллтекст
-- **observability** (custom plugin) — графики из Prometheus
-- **kubernetes-permissions** — кто что видит
-- **proxy** — для внешних API
-- **github-actions** / **github** — статус CI
+- **techdocs** — markdown docs alongside the service
+- **search** — full-text
+- **observability** (custom plugin) — graphs from Prometheus
+- **kubernetes-permissions** — who sees what
+- **proxy** — for external APIs
+- **github-actions** / **github** — CI status
 
 ## Auth
-- **Dex JWT** через ops.mctl.me/api/dex — единый SSO
-- Sessions в backend хранятся в Postgres
-- Permission framework — RBAC через group-mapping
+- **Dex JWT** via ops.mctl.me/api/dex — single SSO
+- Sessions in the backend are stored in Postgres
+- Permission framework — RBAC via group mapping
 
-## Внешние интеграции
-- **mctl-api** — для read-операций (тенанты, статусы)
-- **Vault** через ExternalSecret — secrets
-- **mctl-gitops** — scaffolder коммитит в этот репо
-- **Argo Workflows** — провижионинг тенанта/сервиса через workflow templates
+## External integrations
+- **mctl-api** — for read operations (tenants, statuses)
+- **Vault** via ExternalSecret — secrets
+- **mctl-gitops** — the scaffolder commits to this repo
+- **Argo Workflows** — tenant/service provisioning via workflow templates
 - **Prometheus / Loki / Grafana** — observability plugin
 - **GitHub** (PR/issue widgets)
 
-## Известные footguns (из памяти)
-- **k8s-reader stale token** — при rotation SA UID меняется, kubernetes/observability plugins получают 401. Fix: записать свежий token в Vault → restart pod (см. `reference_backstage_k8s_reader_stale_token.md`)
-- **Namespaced Components** — `metadata.namespace` в catalog-info.yaml ломает scaffolder workflows если не qualify ref'ы (см. `feedback_backstage_namespaced_components.md`)
+## Known footguns (from memory)
+- **k8s-reader stale token** — on rotation the SA UID changes, kubernetes/observability plugins get 401. Fix: write a fresh token to Vault → restart pod (see `reference_backstage_k8s_reader_stale_token.md`)
+- **Namespaced Components** — `metadata.namespace` in catalog-info.yaml breaks scaffolder workflows if refs are not qualified (see `feedback_backstage_namespaced_components.md`)
 
-## Dependencies для researcher
-- `backstage/backstage` — main monorepo, релизы каждые 2 недели
+## Dependencies for researcher
+- `backstage/backstage` — main monorepo, releases every 2 weeks
 - `backstage/community-plugins` — kubernetes / techdocs / scaffolder
-- Node.js LTS releases (текущий 22)
+- Node.js LTS releases (current 22)
 - TypeScript releases
 - `microsoft/playwright`
 - `prettier/prettier`
 - `yarnpkg/yarn`
-- CVE по Backstage и React/Material UI (через core плагины)
-- Specific Backstage плагины которые мы используем — мониторить отдельно
+- CVEs against Backstage and React/Material UI (via core plugins)
+- The specific Backstage plugins we use — monitor separately
 
-## Что НЕ делать (для analyst)
-- Не предлагать миграцию с Backstage на Port/Cortex/etc. — слишком дорого
-- Не предлагать апгрейд Backstage major на patch-day выпуска — ждать ~неделю на comm-plugins compat
-- Не предлагать удаление observability custom плагина — он критичен
+## What NOT to do (for analyst)
+- Do not propose migrating from Backstage to Port/Cortex/etc. — too expensive
+- Do not propose a Backstage major upgrade on patch-day of release — wait ~a week for community-plugins compat
+- Do not propose removing the observability custom plugin — it is critical

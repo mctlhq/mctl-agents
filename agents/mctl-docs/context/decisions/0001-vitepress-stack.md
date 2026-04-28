@@ -1,28 +1,28 @@
-# 0001. VitePress 1.6 для документационного портала
+# 0001. VitePress 1.6 for the documentation portal
 
 **Status:** accepted
 **Date:** 2026-03-28
 
 ## Context
-До 2026-03 у платформы mctl не было выделенного документационного портала. Документация мигрировала между разными местами (README в репо mctl-web, страница `/docs` на mctl.ai). С ростом количества сервисов (mctl-api, mctl-portal, mctl-agent, mctl-openclaw, etc.) такая раздробленность стала мешать onboarding'у новых тенантов и партнёров.
+Until 2026-03 the mctl platform did not have a dedicated documentation portal. Documentation migrated between different places (README in the mctl-web repo, the `/docs` page on mctl.ai). With the growing number of services (mctl-api, mctl-portal, mctl-agent, mctl-openclaw, etc.), this fragmentation began to hinder onboarding of new tenants and partners.
 
 ## Decision
-Создан отдельный репо `mctl-docs` на **VitePress 1.6** с раздачей через `docs.mctl.ai`. Стек:
-- VitePress 1.6 (Vue 3 под капотом, SSG output)
-- mermaid 11 для диаграмм
-- TypeScript для конфигов
-- nginx + Docker → mctl-gitops → ArgoCD деплой
+A separate `mctl-docs` repo was created on **VitePress 1.6** with serving via `docs.mctl.ai`. Stack:
+- VitePress 1.6 (Vue 3 under the hood, SSG output)
+- mermaid 11 for diagrams
+- TypeScript for configs
+- nginx + Docker → mctl-gitops → ArgoCD deploy
 
 ## Consequences
-- **+** Один URL для всей пользовательской документации
-- **+** SSG = быстрая раздача, SEO-friendly
-- **+** Markdown + Vue компоненты при необходимости
-- **+** Легко контрибьютить (PR в .md файл)
-- **−** Build step (~30 сек на полный rebuild)
-- **−** Нет встроенного versioning — старые версии доков теряются при апгрейде
-- **−** Mermaid добавляет ~200KB к bundle
+- **+** One URL for all user-facing documentation
+- **+** SSG = fast serving, SEO-friendly
+- **+** Markdown + Vue components when needed
+- **+** Easy to contribute (PR to a .md file)
+- **−** Build step (~30 sec for full rebuild)
+- **−** No built-in versioning — old doc versions are lost on upgrade
+- **−** Mermaid adds ~200KB to bundle
 
-## Что НЕ предлагать (для analyst/spec-writer mctl-docs агента)
-- Замену VitePress на Docusaurus / MkDocs / GitBook без сильного обоснования (миграция дорогая, ROI неочевиден).
-- Введение i18n до того как у платформы появится non-English аудитория.
-- Сложные кастомные Vue-компоненты вместо стандартного markdown — повышает порог contribution'а.
+## What NOT to propose (for the analyst/spec-writer of the mctl-docs agent)
+- Replacing VitePress with Docusaurus / MkDocs / GitBook without a strong rationale (migration is expensive, ROI unclear).
+- Introducing i18n before the platform has a non-English audience.
+- Complex custom Vue components instead of standard markdown — raises the contribution bar.

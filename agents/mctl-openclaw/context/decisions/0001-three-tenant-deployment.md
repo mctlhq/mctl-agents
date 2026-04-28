@@ -1,34 +1,34 @@
-# 0001. Три отдельных тенанта вместо single multi-user деплоя
+# 0001. Three separate tenants instead of a single multi-user deployment
 
 **Status:** accepted
 **Date:** 2026-02-01
 
 ## Context
-openclaw поддерживает multi-user gateway, но его state (auth tokens, channel sessions, S3-bucket scoping) сложно безопасно изолировать в одном инстансе. Команда mctl эксплуатирует openclaw для:
-- внутренних нужд (`admins`)
-- эксперементов с beta-features (`labs`)
-- production клиента с высоким SLA (`ovk`)
+openclaw supports a multi-user gateway, but its state (auth tokens, channel sessions, S3-bucket scoping) is hard to safely isolate within one instance. The mctl team operates openclaw for:
+- internal needs (`admins`)
+- experiments with beta features (`labs`)
+- a production customer with a high SLA (`ovk`)
 
-Слияние в single deployment означало бы blast radius всех изменений на production клиента.
+Merging into a single deployment would mean the blast radius of all changes lands on the production customer.
 
 ## Decision
-Развёрнуты **три независимых deployment'а** openclaw в отдельных Kubernetes namespaces (`admins`, `labs`, `ovk`). Каждый имеет:
-- свой S3 bucket для state
-- свой helm release в mctl-gitops
-- свой rollout pipeline
-- shared **3-layer skills** (built-in + YAML + remote) для уменьшения дублирования
+**Three independent deployments** of openclaw in separate Kubernetes namespaces (`admins`, `labs`, `ovk`). Each has:
+- its own S3 bucket for state
+- its own helm release in mctl-gitops
+- its own rollout pipeline
+- shared **3-layer skills** (built-in + YAML + remote) to reduce duplication
 
-Изменения катятся в порядке: `labs` → (наблюдение N дней) → `admins` → `ovk`.
+Changes roll out in order: `labs` → (observation for N days) → `admins` → `ovk`.
 
 ## Consequences
-- **+** Полная изоляция state и blast radius
-- **+** `labs` служит canary для `ovk`
-- **+** `ovk` SLA не зависит от экспериментов команды
-- **−** 3x ресурсов
-- **−** 3x операционных задач (rollouts, мониторинг, тех-долг)
-- **−** Skills в trio синхронизировать руками (если общие)
+- **+** Full isolation of state and blast radius
+- **+** `labs` serves as a canary for `ovk`
+- **+** `ovk` SLA does not depend on team experiments
+- **−** 3x the resources
+- **−** 3x the operational tasks (rollouts, monitoring, tech debt)
+- **−** Skills across the trio are synchronized by hand (when shared)
 
-## Что НЕ предлагать (для analyst/researcher)
-- Слияние тенантов в один деплой — это явно отвергнуто
-- Удаление `labs` для экономии ресурсов — он критичен как canary для `ovk`
-- Прямой rollout в `ovk` без прохождения через `labs`
+## What NOT to propose (for analyst/researcher)
+- Merging the tenants into a single deployment — explicitly rejected
+- Removing `labs` to save resources — it is critical as a canary for `ovk`
+- A direct rollout to `ovk` without going through `labs`
