@@ -1,6 +1,8 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import os
 from pathlib import Path
+from typing import Optional
+
 from claude_agent_sdk import ClaudeAgentOptions
 
 from config.settings import MCTL_MCP_URL
@@ -83,7 +85,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
     )
 
 
-def build_implementer_agent_options(repo_dir: Path, model: str) -> ClaudeAgentOptions:
+def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Optional[Path] = None) -> ClaudeAgentOptions:
     """Options for the Tier 2 implementer agent.
 
     Runs with cwd inside the cloned sibling repo (not agents/<svc>/).
@@ -100,6 +102,9 @@ def build_implementer_agent_options(repo_dir: Path, model: str) -> ClaudeAgentOp
     Python wrapper needs it for clone + pr create, but the SDK agent
     itself does not (the agent commits, never pushes).
     """
+    env = {**os.environ}
+    if proposal_dir is not None:
+        env["PROPOSAL_DIR"] = str(proposal_dir)
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
@@ -113,7 +118,7 @@ def build_implementer_agent_options(repo_dir: Path, model: str) -> ClaudeAgentOp
         permission_mode="acceptEdits",
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
-        env={**os.environ},
+        env=env,
     )
 
 

@@ -68,7 +68,7 @@ from orchestrator.options import build_implementer_agent_options
 DEFAULT_STATE_DIR = Path(
     os.getenv(
         "STATE_DIR",
-        "/Users/dmitriimashkov/PycharmProjects/mctlhq/mctl-gitops/platform-gitops/agents-state",
+        "/workdir/mctl-gitops/platform-gitops/agents-state",
     )
 )
 
@@ -296,8 +296,8 @@ Ground rules:
 """
 
 
-async def _run_implementer_agent(repo_dir: Path, prompt: str) -> None:
-    options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL)
+async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
+    options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
     async for message in query(prompt=prompt, options=options):
         print(message)
 
@@ -346,6 +346,7 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
     update_status_yaml(ref, "in-progress")
 
     target = None
+    result: Optional[ImplementResult] = None
     try:
         # 2. Clone target sibling repo.
         target = _clone_target(ref.service, ref.slug)
@@ -358,9 +359,8 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
         _stage_implementer_agent(target, ref.service)
 
         # 5. Run the SDK with PROPOSAL_DIR pointing at the gitops worktree.
-        os.environ["PROPOSAL_DIR"] = str(ref.proposal_dir.resolve())
         prompt = _build_prompt(ref)
-        anyio.run(_run_implementer_agent, target, prompt)
+        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
@@ -380,17 +380,20 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
 
         # 8. Mark implemented.
         update_status_yaml(ref, "implemented", pr=pr_url)
-        return ImplementResult(ref=ref, pr_url=pr_url)
+        result = ImplementResult(ref=ref, pr_url=pr_url)
+        return result
 
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         # Leave .status.yaml as in-progress so operator notices the wedge.
-        return ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        return result
     except Exception as e:  # pragma: no cover — defensive
-        return ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
+        result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
+        return result
     finally:
         # Keep target dir for post-mortem on failure; clean only on success.
-        if target and target.exists():
+        if target and target.exists() and result is not None and result.pr_url is not None:
             try:
                 shutil.rmtree(target)
             except OSError:
