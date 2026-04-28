@@ -36,7 +36,13 @@ async def _safe_run_service(service: str) -> None:
     """
     try:
         await run_service_agent(service)
-    except Exception as exc:  # noqa: BLE001 — intentional broad catch
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — intentional broad catch
+        # SystemExit is raised by run_service_agent when the agent
+        # directory is missing (run_service_agent.py:55). It inherits
+        # from BaseException, not Exception, so it would otherwise
+        # bypass this handler and the TaskGroup would still tear down.
+        # We deliberately keep KeyboardInterrupt / CancelledError on the
+        # BaseException side — those should propagate.
         print(
             f"⚠️  service-agent {service} failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
