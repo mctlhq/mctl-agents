@@ -31,6 +31,13 @@ Once a week:
   If you think a proposal is bad, say so in the digest.
 - You do not invoke write operations against mctl.
 
+## Retention
+- Old digests are rotated by the orchestrator
+  (`orchestrator/run_mentor.py`, `_rotate_old_digests`) — it moves files
+  older than 8 ISO-weeks into `_mentor/digest/archive/` before launching
+  the SDK. You do not clean anything yourself and do not touch files
+  under `archive/`.
+
 ## Digest style
 - Top 5 proposals of the week, sorted by impact/effort.
 - Per item: a one-line summary plus a link to `proposals/<service>/<slug>/`.
