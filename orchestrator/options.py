@@ -1,6 +1,8 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import os
 from pathlib import Path
+from typing import Optional
+
 from claude_agent_sdk import ClaudeAgentOptions
 
 from config.settings import MCTL_MCP_URL
@@ -33,6 +35,11 @@ def _mctl_tool_globs() -> list[str]:
 
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
+# Tier 2 implementer budget — soft cap per single proposal implementation.
+# A proposal touching one or two files usually finishes well under this.
+# No hard kill: the SDK stops sampling once the cap is exceeded but the
+# already-applied edits remain. Caller can raise via env if a proposal needs more.
+IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -75,6 +82,43 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         # Extend (NOT replace) parent env — child needs PATH/HOME/etc. for
         # npm-installed `claude` CLI and the Claude credentials lookup.
         env={**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH},
+    )
+
+
+def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Optional[Path] = None) -> ClaudeAgentOptions:
+    """Options for the Tier 2 implementer agent.
+
+    Runs with cwd inside the cloned sibling repo (not agents/<svc>/).
+    setting_sources=["project"] picks up .claude/agents/implementer.md from
+    cwd, so the orchestrator copies implementer.md into
+    cloned-repo/.claude/agents/ before launching the agent
+    (see run_implementer.py).
+
+    add_dirs=[] — no need to see other sibling repos: the agent only
+    works in cwd (the cloned target repo) and reads the spec from
+    PROPOSAL_DIR (gitops worktree mounted in the pod, path passed via env).
+
+    GITHUB_TOKEN is forwarded from the parent env — the gh CLI in the
+    Python wrapper needs it for clone + pr create, but the SDK agent
+    itself does not (the agent commits, never pushes).
+    """
+    env = {**os.environ}
+    if proposal_dir is not None:
+        env["PROPOSAL_DIR"] = str(proposal_dir)
+    return ClaudeAgentOptions(
+        cwd=str(repo_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=[
+            "Read", "Write", "Edit", "Glob", "Grep",
+            "WebSearch", "WebFetch",
+            "Bash",
+        ] + _mctl_tool_globs(),
+        mcp_servers=mctl_mcp_config(),
+        permission_mode="acceptEdits",
+        max_budget_usd=IMPLEMENTER_BUDGET_USD,
+        add_dirs=[],
+        env=env,
     )
 
 
