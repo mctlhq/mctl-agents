@@ -1,10 +1,11 @@
-"""Универсальный auth для Claude Agent SDK.
+"""Universal auth for the Claude Agent SDK.
 
-Сценарии:
-- Локальная разработка / прототип: CLAUDE_CODE_OAUTH_TOKEN (Claude Pro/Max).
-- Production / деплой в кластер: ANTHROPIC_API_KEY (Console-биллинг).
+Scenarios:
+- Local dev / prototype: CLAUDE_CODE_OAUTH_TOKEN (Claude Pro/Max).
+- Production / in-cluster deploy: ANTHROPIC_API_KEY (Console billing).
 
-Один и тот же код работает в обоих режимах — выбор по наличию env-переменной.
+The same code path works for both modes — the choice is driven by which
+env var is present.
 """
 import os
 from dataclasses import dataclass
@@ -15,68 +16,69 @@ load_dotenv()
 
 @dataclass
 class AuthMode:
-    name: str          # "oauth" или "api_key"
-    env_var: str       # имя env-переменной с токеном/ключом
-    description: str   # человекочитаемое описание
+    name: str          # "oauth" or "api_key"
+    env_var: str       # name of the env var holding the token/key
+    description: str   # human-readable description
 
 
 def detect_auth() -> AuthMode:
-    """Определить режим auth по env. OAuth имеет приоритет."""
+    """Detect the auth mode from env. OAuth wins when both are set."""
     oauth = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
     if oauth:
         if not oauth.startswith("sk-ant-oat01-"):
             print(
-                "⚠️  CLAUDE_CODE_OAUTH_TOKEN не похож на OAuth-токен "
-                "(должен начинаться с sk-ant-oat01-). Возможно, ты подсунул API-ключ."
+                "⚠️  CLAUDE_CODE_OAUTH_TOKEN does not look like an OAuth token "
+                "(should start with sk-ant-oat01-). Did you paste an API key by mistake?"
             )
         return AuthMode(
             name="oauth",
             env_var="CLAUDE_CODE_OAUTH_TOKEN",
-            description="OAuth-токен Claude Pro/Max (расход по подписке)",
+            description="Claude Pro/Max OAuth token (billed against the subscription)",
         )
 
     if api_key:
         if not api_key.startswith("sk-ant-api03-"):
             print(
-                "⚠️  ANTHROPIC_API_KEY не похож на API-ключ "
-                "(должен начинаться с sk-ant-api03-)."
+                "⚠️  ANTHROPIC_API_KEY does not look like an API key "
+                "(should start with sk-ant-api03-)."
             )
         return AuthMode(
             name="api_key",
             env_var="ANTHROPIC_API_KEY",
-            description="API-ключ Anthropic Console (pay-per-token)",
+            description="Anthropic Console API key (pay-per-token)",
         )
 
-    # Третий путь: ни OAuth-токена, ни API-ключа в env, но локальный
-    # `claude` CLI авторизован (~/.claude/.credentials.json или интерактивная сессия).
-    # Claude Agent SDK подцепит CLI auth через subprocess. Это удобно в dev, но в
-    # production / cron / Docker полагаться нельзя — там CLI не авторизован.
+    # Third path: no OAuth token and no API key in env, but the local
+    # `claude` CLI is authenticated (~/.claude/.credentials.json or an
+    # interactive session). The SDK picks up CLI auth via subprocess.
+    # Convenient in dev; do not rely on it in production / cron / Docker
+    # where the CLI is not logged in.
     import shutil
     if shutil.which("claude"):
         return AuthMode(
             name="cli_session",
             env_var="(claude CLI session)",
-            description="существующая авторизация локального `claude` CLI",
+            description="existing authentication of the local `claude` CLI",
         )
 
     raise RuntimeError(
-        "Auth не найден: нет ни CLAUDE_CODE_OAUTH_TOKEN, ни ANTHROPIC_API_KEY в env, "
-        "и `claude` CLI не установлен. Положи токен в .env или установи Claude Code."
+        "Auth not found: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set, "
+        "and the `claude` CLI is not installed. Put a token in .env or install Claude Code."
     )
 
 
 def ensure_auth_for_sdk() -> AuthMode:
-    """Подготовить env так, чтобы Claude Agent SDK подхватил нужный credential.
+    """Prepare env so the Claude Agent SDK picks up the right credential.
 
-    SDK сам читает обе переменные. Мы только логируем выбор и подчищаем
-    лишнее, чтобы не было конфликтов приоритетов.
+    The SDK reads both variables on its own — we only log the choice and
+    clean up empty/garbage values to avoid priority conflicts.
     """
     mode = detect_auth()
 
     if mode.name == "oauth":
-        # API-ключ имеет приоритет над OAuth у CLI — убираем, если он пустой/мусорный
+        # The CLI gives the API key precedence over OAuth — drop it if it's empty.
         if not os.getenv("ANTHROPIC_API_KEY", "").strip():
             os.environ.pop("ANTHROPIC_API_KEY", None)
 

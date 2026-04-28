@@ -1,4 +1,4 @@
-"""Сборка ClaudeAgentOptions для агентов и ментора."""
+"""Build ClaudeAgentOptions for service agents and the mentor."""
 import os
 from pathlib import Path
 from claude_agent_sdk import ClaudeAgentOptions
@@ -7,15 +7,15 @@ from config.settings import MCTL_MCP_URL
 
 
 def mctl_mcp_config() -> dict:
-    """MCP-конфиг для подключения к https://api.mctl.ai/mcp.
+    """MCP config for https://api.mctl.ai/mcp.
 
-    Возвращает пустой dict если MCTL_TOKEN не задан — агент тогда работает
-    без mcp__mctl__* тулзов (только Read/Write/WebSearch/WebFetch/Bash).
-    Удобно для smoke-тестов и dev без mctl-доступа.
+    Returns an empty dict when MCTL_TOKEN is unset — the agent then runs
+    without mcp__mctl__* tools (Read/Write/WebSearch/WebFetch/Bash only).
+    Convenient for smoke tests and local dev without mctl access.
     """
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
-        print("⚠️  MCTL_TOKEN не задан — агент запустится без mctl MCP tools.")
+        print("⚠️  MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
         return {}
     return {
         "mctl": {
@@ -27,7 +27,7 @@ def mctl_mcp_config() -> dict:
 
 
 def _mctl_tool_globs() -> list[str]:
-    """Если MCP сконфигурён — разрешаем mcp__mctl__*. Иначе — пусто."""
+    """Allow mcp__mctl__* when MCP is configured; empty otherwise."""
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
@@ -58,10 +58,10 @@ def _sibling_add_dirs(service_name: str) -> list[str]:
 
 
 def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOptions:
-    """Опции для агента-владельца сервиса."""
+    """Options for a service-owner agent."""
     return ClaudeAgentOptions(
         cwd=str(service_dir),                  # CLAUDE.md, .claude/, inbox/, proposals/
-        setting_sources=["project"],           # подхватить .claude/skills и .claude/agents
+        setting_sources=["project"],           # pick up .claude/skills and .claude/agents
         model=model,
         allowed_tools=[
             "Read", "Write", "Edit", "Glob", "Grep",
@@ -69,7 +69,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
             "Bash",
         ] + _mctl_tool_globs(),
         mcp_servers=mctl_mcp_config(),
-        permission_mode="acceptEdits",         # без интерактива — для cron
+        permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
         add_dirs=_sibling_add_dirs(service_dir.name),
         # Extend (NOT replace) parent env — child needs PATH/HOME/etc. for
@@ -79,14 +79,14 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
 
 
 def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
-    """Опции для ментора. Доступ только на чтение к репо агентов + запись в digest/."""
+    """Options for the mentor. Read-only across agent repos, writes only to digest/."""
     return ClaudeAgentOptions(
-        cwd=str(mentor_dir.parent),            # .../agents — чтобы видеть всех агентов
+        cwd=str(mentor_dir.parent),            # .../agents — so the mentor sees every agent
         setting_sources=["project"],
         model=model,
         allowed_tools=[
             "Read", "Glob", "Grep",
-            "Write", "Edit",                   # пишет только в _mentor/digest/
+            "Write", "Edit",                   # writes only into _mentor/digest/
         ] + _mctl_tool_globs(),
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
