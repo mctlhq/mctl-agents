@@ -84,21 +84,21 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
 
 
 def build_implementer_agent_options(repo_dir: Path, model: str) -> ClaudeAgentOptions:
-    """Опции для Tier 2 implementer-агента.
+    """Options for the Tier 2 implementer agent.
 
-    Запускается с cwd внутри клонированного sibling-репо (не agents/<svc>/).
-    setting_sources=["project"] подхватывает .claude/agents/implementer.md из
-    *самого* mctl-agents repo через PROPOSAL_DIR — нет, на самом деле SDK
-    смотрит .claude в cwd. Поэтому орчестратор копирует implementer.md в
-    cloned-repo/.claude/agents/ перед запуском (см. run_implementer.py).
+    Runs with cwd inside the cloned sibling repo (not agents/<svc>/).
+    setting_sources=["project"] picks up .claude/agents/implementer.md from
+    cwd, so the orchestrator copies implementer.md into
+    cloned-repo/.claude/agents/ before launching the agent
+    (see run_implementer.py).
 
-    add_dirs=[] — нет нужды видеть sibling-репо: агент работает только в
-    cwd (cloned target repo) и читает spec из PROPOSAL_DIR (gitops worktree
-    смонтирован в pod, путь передаётся через env).
+    add_dirs=[] — no need to see other sibling repos: the agent only
+    works in cwd (the cloned target repo) and reads the spec from
+    PROPOSAL_DIR (gitops worktree mounted in the pod, path passed via env).
 
-    GITHUB_TOKEN пробрасывается из родительского env — нужен gh CLI для clone +
-    pr create в Python-обёртке, но самому SDK-агенту он не нужен (агент НЕ
-    делает push, только commit).
+    GITHUB_TOKEN is forwarded from the parent env — the gh CLI in the
+    Python wrapper needs it for clone + pr create, but the SDK agent
+    itself does not (the agent commits, never pushes).
     """
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
