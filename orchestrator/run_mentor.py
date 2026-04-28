@@ -74,8 +74,12 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
     for key, path in candidates:
         # Strictly older than threshold — keep `keep_weeks` most recent inclusive.
         if key < threshold:
-            archive_dir.mkdir(parents=True, exist_ok=True)
-            path.rename(archive_dir / path.name)
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                path.rename(archive_dir / path.name)
+            except OSError as exc:
+                print(f"[mentor] could not archive {path.name}: {exc}")
+                continue
             moved += 1
 
     if moved:
@@ -135,7 +139,7 @@ Finish with a single short message linking to the created file. All output in En
 async def run_mentor() -> None:
     # Retention is enforced by the orchestrator (deterministic, no token spend);
     # the agent itself is not asked to manage old files.
-    digest_dir = Path(MENTOR_DIR) / "digest"
+    digest_dir = MENTOR_DIR / "digest"
     _rotate_old_digests(digest_dir)
 
     options = build_mentor_options(MENTOR_DIR, MENTOR_MODEL)
