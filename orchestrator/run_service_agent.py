@@ -1,4 +1,4 @@
-"""Запуск агента-владельца одного сервиса.
+"""Run the service-owner agent for one service.
 
 Usage:
     python -m orchestrator.run_service_agent mctl-web
@@ -13,49 +13,52 @@ from orchestrator.options import build_service_agent_options
 
 
 PROMPT = """\
-Автономный дневной прогон. **Не задавай вопросов человеку — он отсутствует.** Работай с тем, что есть.
+**Output language: English only. Write every artifact (inbox, proposals, summary report) in English. Do not switch languages even if context/ files contain non-English text.**
 
-Используй context/ (read-only база знаний — архитектура, ADR, текущая версия) и .claude/skills/ как руководство к действию.
+Autonomous daily run. **Do not ask the human anything — there is no human.** Work with what you have.
 
-Жёсткая последовательность (выполнить каждый шаг и создать соответствующие файлы):
+Use `context/` (read-only knowledge base — architecture, ADRs, current version) and `.claude/skills/` as your playbook.
 
-**Шаг 1 — researcher:**
-- Создай файл `inbox/{сегодняшняя ISO-дата YYYY-MM-DD}.md`
-- Источники:
-  - GitHub releases ключевых deps (список в context/architecture.md, раздел "Dependencies для researcher") — через WebFetch
-  - CVE / security advisories по тем же deps — через WebSearch
-  - Если доступны mcp__mctl__* тулзы — используй их для статуса сервиса. **Если их нет в твоём наборе тулзов — пропусти молча, не спрашивай юзера, не пытайся авторизоваться.**
-- Формат записи строго как в .claude/agents/researcher.md
+Strict sequence (execute each step and create the corresponding files):
 
-**Шаг 2 — analyst:**
-- Прочитай inbox-файл, который только что создал
-- Отфильтруй нерелевантное, выбери Top-3 с обоснованием (impact 1-5, effort 1-5)
-- Дополни тот же inbox-файл секцией `## Top-3 (для spec-writer)` (формат — в .claude/agents/analyst.md)
-- Сверься с context/decisions/ — не предлагай уже отвергнутое
+**Step 1 — researcher:**
+- Create the file `inbox/{today's ISO date YYYY-MM-DD}.md`
+- Sources:
+  - GitHub releases of key deps (list in `context/architecture.md`, section "Dependencies for researcher") — via WebFetch
+  - CVE / security advisories for the same deps — via WebSearch
+  - If `mcp__mctl__*` tools are available, use them to check service status. **If they are not in your tool set, skip silently — do not ask the user, do not attempt to authenticate.**
+- Record format strictly as in `.claude/agents/researcher.md`
 
-**Шаг 3 — spec-writer:**
-- Для каждого из Top-3 создай `proposals/<slug>/` с тремя файлами: `requirements.md`, `design.md`, `tasks.md` (формат — в .claude/agents/spec-writer.md)
-- EARS-нотация для acceptance criteria
-- Если slug уже существует — добавь `-v2`
+**Step 2 — analyst:**
+- Read the inbox file you just created
+- Filter out irrelevant findings, pick a Top-3 with rationale (impact 1-5, effort 1-5)
+- Append a `## Top-3 (for spec-writer)` section to the same inbox file (format in `.claude/agents/analyst.md`)
+- Cross-check `context/decisions/` — do not propose anything already rejected
 
-**Шаг 4 — короткий итоговый отчёт** одним сообщением: что нашёл (числом), что отбросил (числом), что оформил (список slug'ов).
+**Step 3 — spec-writer:**
+- For each Top-3 item create `proposals/<slug>/` with three files: `requirements.md`, `design.md`, `tasks.md` (format in `.claude/agents/spec-writer.md`)
+- EARS notation for acceptance criteria
+- If a slug already exists, append `-v2`
 
-**Важно:**
-- Никогда не запрашивай интерактивный ввод от человека.
-- Не редактируй context/ — оно read-only.
-- Если какой-то шаг технически невозможен (например, нет интернета для WebFetch) — задокументируй это в inbox-файле и продолжай со следующим шагом."""
+**Step 4 — short final report** in a single message: what you found (count), what you dropped (count), what you wrote up (list of slugs).
+
+**Important:**
+- Never request interactive input from a human.
+- Do not edit `context/` — it is read-only.
+- If a step is technically impossible (e.g. no network for WebFetch), document that in the inbox file and continue with the next step.
+- All written output must be in English."""
 
 
 async def run_service_agent(service: str) -> None:
     service_dir = AGENTS_DIR / service
     if not service_dir.exists():
-        raise SystemExit(f"Папка агента не найдена: {service_dir}")
+        raise SystemExit(f"Agent directory not found: {service_dir}")
 
     options = build_service_agent_options(service_dir, SERVICE_AGENT_MODEL)
-    print(f"\n=== Запускаю агента {service} ({SERVICE_AGENT_MODEL}) ===\n")
+    print(f"\n=== Running agent {service} ({SERVICE_AGENT_MODEL}) ===\n")
 
     async for message in query(prompt=PROMPT, options=options):
-        # Стримим сообщения. Можно красивее форматировать — здесь просто print.
+        # Stream messages. Could be prettier-formatted; just print for now.
         print(message)
 
 
@@ -67,7 +70,7 @@ def main() -> None:
 
     service = sys.argv[1]
     if service not in SERVICES:
-        print(f"Неизвестный сервис {service}. Доступные: {', '.join(SERVICES)}")
+        print(f"Unknown service {service}. Available: {', '.join(SERVICES)}")
         sys.exit(1)
 
     ensure_auth_for_sdk()

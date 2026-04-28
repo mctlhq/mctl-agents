@@ -1,4 +1,4 @@
-"""Параллельный прогон всех агентов сервисов + ментор.
+"""Run every service agent in parallel, then the mentor.
 
 Usage:
     python -m orchestrator.run_all                # mode=full (default)
@@ -6,9 +6,9 @@ Usage:
     RUN_MODE=single-service RUN_SERVICE=mctl-api python -m orchestrator.run_all
 
 Modes:
-    full           — все service-агенты параллельно, потом mentor (default)
-    mentor-only    — только mentor, читает существующие proposals/ из state
-    single-service — один агент (имя в RUN_SERVICE), без mentor
+    full           — all service agents in parallel, then the mentor (default)
+    mentor-only    — mentor only, reads existing proposals/ from state
+    single-service — one agent (name in RUN_SERVICE), no mentor
 """
 import os
 import sys
@@ -28,7 +28,7 @@ async def _full() -> None:
 
 
 async def _mentor_only() -> None:
-    print("=== mode=mentor-only — пропускаю service-агентов ===")
+    print("=== mode=mentor-only — skipping service agents ===")
     await run_mentor()
 
 
@@ -40,7 +40,7 @@ async def _single_service(service: str) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-    print(f"=== mode=single-service — только {service}, без mentor ===")
+    print(f"=== mode=single-service — only {service}, no mentor ===")
     await run_service_agent(service)
 
 

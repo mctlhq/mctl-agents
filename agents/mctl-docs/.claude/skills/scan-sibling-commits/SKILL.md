@@ -1,41 +1,53 @@
 ---
 name: scan-sibling-commits
-description: Использовать когда нужно собрать список user-visible изменений из соседних mctl-репо за указанный период.
+description: Use when collecting user-visible changes from neighbouring mctl repos over a given period.
 ---
 
 # Scan sibling commits
 
-Когда researcher mctl-docs ищет doc gaps:
+When the mctl-docs researcher hunts for doc gaps:
 
-1. **Базовый путь.** `BASE="${SIBLING_REPOS_PATH:-/Users/dmitriimashkov/PycharmProjects/mctlhq}"`. Список репо — в `CLAUDE.md`. Себя (mctl-docs) не сканируй.
+1. **Base path.** `BASE="${SIBLING_REPOS_PATH:-/Users/dmitriimashkov/PycharmProjects/mctlhq}"`.
+   The repo list is in `CLAUDE.md`. Do not scan yourself (`mctl-docs`).
 
-2. **За какой период.** По умолчанию `--since="7 days ago"`. Если хочешь другой диапазон — учитывай дату последнего mentor-digest'а (можешь поискать `cd mctl-gitops && ls platform-gitops/agents-state/_mentor/digest/`, взять самый свежий).
+2. **Time range.** Default `--since="7 days ago"`. If you need a
+   different range, factor in the date of the last mentor digest (look
+   at `cd mctl-gitops && ls platform-gitops/agents-state/_mentor/digest/`
+   and pick the freshest).
 
-3. **Команды:**
+3. **Commands:**
 ```bash
-# Перечисление user-visible коммитов
+# List user-visible commits
 git -C "$BASE/<repo>" log --since="7 days ago" --pretty='%h|%ad|%s' --date=short --no-merges
 
-# Если непонятно — получить touched files
+# When unclear — list touched files
 git -C "$BASE/<repo>" show --stat <sha>
 
-# Если всё ещё непонятно — посмотреть конкретный диф (короткий!)
+# When still unclear — read a specific (short!) diff
 git -C "$BASE/<repo>" show <sha> -- path/to/relevant.go | head -200
 ```
 
-4. **Conventional commits фильтр.** Оставлять только префиксы:
-- `feat:` / `feat(scope):` — новая user-facing функциональность
-- `fix:` / `fix(scope):` — исправление user-visible бага
-- `docs:` / `docs(scope):` — но только если описывает новый concept (не typo fix)
-- `BREAKING CHANGE:` упоминание — всегда брать (нужно migration note)
+4. **Conventional-commits filter.** Keep only the prefixes:
+   - `feat:` / `feat(scope):` — new user-facing capability
+   - `fix:` / `fix(scope):` — fix for a user-visible bug
+   - `docs:` / `docs(scope):` — only if it describes a new concept (not a typo fix)
+   - any mention of `BREAKING CHANGE:` — always keep (migration note needed)
 
-Отбрасывать: `chore:`, `refactor:`, `test:`, `ci:`, `style:`, `build:`, `perf:` (если perf не меняет user-observable behaviour).
+   Drop: `chore:`, `refactor:`, `test:`, `ci:`, `style:`, `build:`,
+   `perf:` (unless perf changes user-observable behaviour).
 
-5. **Cross-reference с docs.** Прочитай `context/docs-tree.md` — там snapshot структуры docs.mctl.ai с короткими описаниями. Для каждого user-visible коммита ответь "уже задокументировано / gap / stale" сравнив с этим деревом.
+5. **Cross-reference with docs.** Read `context/docs-tree.md` — it
+   snapshots the structure of `docs.mctl.ai` with short descriptions.
+   For each user-visible commit, decide
+   "already documented / gap / stale" against that tree.
 
-6. **mctl MCP проверка (опционально).** Если `mcp__mctl__*` доступен — проверь текущую prod-версию каждого репо. Если коммит выше prod-версии — пометь "in-flight" (документировать рано, может откатиться).
+6. **mctl MCP check (optional).** If `mcp__mctl__*` is available, fetch
+   the current production version of each repo. A commit ahead of
+   production gets tagged "in-flight" — too early to document, may be reverted.
 
-## Не делай
-- Не клонируй ничего. Если репо нет по пути — это инфра-проблема, пиши в inbox и пропускай.
-- Не интерпретируй приоритет — это работа analyst.
-- Не читай больше 200 строк дифа за раз — для понимания смысла обычно хватает stat + commit message + первого hunk'а.
+## Do not
+- Do not clone anything. If a repo is missing, record it in the inbox
+  and skip — the gap is infra, not docs.
+- Do not interpret priority — that is the analyst's job.
+- Do not read more than 200 lines of diff at a time. Stat + commit
+  message + first hunk is usually enough to grasp the meaning.

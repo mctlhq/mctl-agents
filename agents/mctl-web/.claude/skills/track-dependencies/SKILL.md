@@ -1,17 +1,18 @@
 ---
 name: track-dependencies
-description: Использовать когда нужно проверить обновления npm/Python зависимостей mctl-web.
+description: Use when checking for npm / Python dependency updates for mctl-web.
 ---
 
 # Track dependencies
 
-Когда нужно посмотреть, что вышло нового у зависимостей сервиса:
+When you need to see what is new in the service's dependencies:
 
-1. Список ключевых зависимостей лежит в `context/architecture.md` (раздел "Dependencies").
-2. Для каждой зависимости проверить `https://github.com/<owner>/<repo>/releases`
-   через WebFetch.
-3. Сравнить с текущей версией из `context/current-version.md`.
-4. Релевантно только то, что вышло после нашей текущей версии **и** содержит
-   security fix, performance улучшение или breaking change.
+1. The list of key dependencies lives in `context/architecture.md` (section "Dependencies").
+2. For each dependency, check `https://github.com/<owner>/<repo>/releases` via WebFetch.
+3. Compare with the current version recorded in `context/current-version.md`.
+4. Only releases that are **above** our current version **and** ship a
+   security fix, a meaningful performance improvement, or a breaking
+   change are worth recording.
 
-Не дублируй то, что уже зафиксировано в `context/decisions/` как сознательно отложенное.
+Do not duplicate anything already captured under `context/decisions/` as
+a deliberately deferred upgrade.

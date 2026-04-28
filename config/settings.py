@@ -1,11 +1,11 @@
-"""Конфигурация платформы mctl."""
+"""mctl platform configuration."""
 import os
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = REPO_ROOT / "agents"
 
-# Сервисы платформы. Добавляй сюда по мере роста.
+# Platform services. Append as the platform grows.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -19,9 +19,9 @@ SERVICES = [
 
 MENTOR_DIR = AGENTS_DIR / "_mentor"
 
-# mctl MCP — общий для всех агентов
+# mctl MCP — shared by every agent
 MCTL_MCP_URL = "https://api.mctl.ai/mcp"
 
-# Модели
+# Models
 SERVICE_AGENT_MODEL = os.getenv("SERVICE_AGENT_MODEL", "claude-sonnet-4-6")
 MENTOR_MODEL = os.getenv("MENTOR_MODEL", "claude-opus-4-7")

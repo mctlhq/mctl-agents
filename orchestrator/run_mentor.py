@@ -1,4 +1,4 @@
-"""Запуск ментора — агрегирует proposals/ всех агентов в weekly digest.
+"""Run the mentor — aggregates proposals/ from every service agent into a weekly digest.
 
 Usage:
     python -m orchestrator.run_mentor
@@ -18,32 +18,34 @@ def build_prompt() -> str:
     services_list = ", ".join(SERVICES)
 
     return f"""\
-Ты ментор платформы mctl. Сегодня собираешь еженедельный дайджест.
+**Output language: English only. Write the entire digest in English. Do not switch languages even if upstream proposals contain non-English text.**
 
-Активные сервисы: {services_list}.
+You are the mentor for the mctl platform. Today you assemble the weekly digest.
 
-1. Прочитай proposals/ во всех агентских репо ({services_list}).
-   Читай только свежие предложения, которых ещё нет в предыдущих дайджестах.
-2. Для каждого предложения оцени:
-   - impact (1-5): эффект для платформы
-   - effort (1-5): сложность реализации
-   - конфликты с другими предложениями (несовместимые изменения)
-   - соответствие текущим приоритетам платформы
-3. Сгруппируй связанные предложения (одна тема — один блок).
-4. Используй mcp__mctl__* тулзы чтобы свериться с реальным состоянием:
-   текущие версии сервисов, открытые инциденты, лимиты тенантов.
-5. Запиши результат в {digest_path}:
-   - топ-5 предложений готовых к ревью
-   - короткое summary по каждому: что, почему, impact/effort, конфликты
-   - отдельный блок "Платформенные риски" — общие наблюдения
-   - блок "Отложено" — что отбросил и почему
+Active services: {services_list}.
 
-В конце выдай короткое сообщение со ссылкой на созданный файл."""
+1. Read `proposals/` in every agent repo ({services_list}).
+   Only consider fresh proposals that did not appear in earlier digests.
+2. For each proposal, score:
+   - impact (1-5): effect on the platform
+   - effort (1-5): implementation cost
+   - conflicts with other proposals (incompatible changes)
+   - fit with current platform priorities
+3. Group related proposals (one theme — one block).
+4. Use `mcp__mctl__*` tools to cross-check against reality:
+   current service versions, open incidents, tenant resource limits.
+5. Write the result to {digest_path}:
+   - top 5 proposals ready for review
+   - a short summary per item: what, why, impact/effort, conflicts
+   - a "Platform risks" section with cross-cutting observations
+   - a "Deferred" section listing what you dropped and why
+
+Finish with a single short message linking to the created file. All output in English."""
 
 
 async def run_mentor() -> None:
     options = build_mentor_options(MENTOR_DIR, MENTOR_MODEL)
-    print(f"\n=== Запускаю ментора ({MENTOR_MODEL}) ===\n")
+    print(f"\n=== Running mentor ({MENTOR_MODEL}) ===\n")
 
     async for message in query(prompt=build_prompt(), options=options):
         print(message)
