@@ -50,6 +50,14 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
             continue
         iso_year = int(match.group(1))
         iso_week = int(match.group(2))
+        # Validate that (year, week) is a real ISO 8601 date.
+        # The regex permits W00-W99, but only W01-W52 (or W53 in long years)
+        # are valid; date.fromisocalendar raises ValueError otherwise.
+        try:
+            date.fromisocalendar(iso_year, iso_week, 1)
+        except ValueError:
+            print(f"[mentor] skipping invalid digest filename: {entry.name}")
+            continue
         candidates.append(((iso_year, iso_week), entry))
 
     if not candidates:
