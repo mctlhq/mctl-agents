@@ -15,7 +15,7 @@ import sys
 import traceback
 import anyio
 
-from config.settings import SERVICES
+from config.settings import ROTATING_SERVICES, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.run_service_agent import run_service_agent
 from orchestrator.run_mentor import run_mentor
@@ -52,7 +52,7 @@ async def _safe_run_service(service: str) -> None:
 
 async def _full() -> None:
     async with anyio.create_task_group() as tg:
-        for service in SERVICES:
+        for service in ROTATING_SERVICES:
             tg.start_soon(_safe_run_service, service)
     await run_mentor()
 
