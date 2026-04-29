@@ -388,6 +388,14 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
         # Leave .status.yaml as in-progress so operator notices the wedge.
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
+    except SystemExit as e:
+        # _stage_implementer_agent and a few other helpers raise SystemExit
+        # for unrecoverable config errors (e.g. missing implementer.md for
+        # a service that's in SERVICES but has no agents/<svc>/.claude/
+        # tree yet). Catching SystemExit alongside Exception here keeps
+        # one bad proposal from killing a multi-proposal run mid-pipeline.
+        result = ImplementResult(ref=ref, pr_url=None, error=f"SystemExit: {e}")
+        return result
     except Exception as e:  # pragma: no cover — defensive
         result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
         return result
