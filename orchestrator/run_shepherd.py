@@ -861,8 +861,8 @@ def apply_followup(
     finally:
         try:
             os.unlink(bundle_path)
-        except OSError:
-            pass
+        except FileNotFoundError:
+            pass  # already gone — that's fine
     return bundle
 
 

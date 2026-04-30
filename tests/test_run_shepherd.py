@@ -16,6 +16,7 @@ fixture so the YAML serialisation is exercised.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -522,8 +523,6 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
     so we capture its contents from inside the fake subprocess call while it
     still exists on disk.
     """
-    import json as _json
-
     findings = [make_finding()]
 
     async def fake_format(_findings):
@@ -540,7 +539,7 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
         # it after this call returns (try/finally cleanup).
         idx = list(cmd).index("--review-feedback")
         with open(cmd[idx + 1], "r", encoding="utf-8") as f:
-            captured["bundle_on_disk"] = _json.load(f)
+            captured["bundle_on_disk"] = json.load(f)
         return _Result()
 
     with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
