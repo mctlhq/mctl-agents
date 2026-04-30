@@ -40,6 +40,13 @@ MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
 # already-applied edits remain. Caller can raise via env if a proposal needs more.
 IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
+# Tier 3 shepherd budget — soft cap per shepherd tick.
+# A tick spends Claude tokens only when there are unresolved codex findings
+# to summarise; most ticks find nothing to do and exit free. Default
+# matches MENTOR_BUDGET_USD's order of magnitude but is intentionally lower
+# (1.00) because the shepherd's SDK call is a single-shot JSON formatter,
+# not an open-ended analysis.
+SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "1.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -135,4 +142,29 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
+    )
+
+
+def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Options for the Tier 3 shepherd sub-agent.
+
+    The sub-agent's only job is to translate a pre-filtered bundle of
+    P1/P2 codex findings into a JSON `{p1, p2, summaries}` object the
+    Python wrapper hands to the Tier 2 implementer via
+    `--review-feedback`. It is read-only — no Write/Edit/Bash. The cwd
+    is `agents/_shepherd/` so the SDK picks up `shepherd.md` via
+    `setting_sources=["project"]` (same pattern as the mentor and the
+    implementer agent staging).
+
+    No mctl MCP, no sibling repos — the bundle is self-contained text.
+    """
+    return ClaudeAgentOptions(
+        cwd=str(shepherd_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=["Read"],
+        mcp_servers={},
+        permission_mode="acceptEdits",
+        max_budget_usd=SHEPHERD_BUDGET_USD,
+        env={**os.environ},
     )
