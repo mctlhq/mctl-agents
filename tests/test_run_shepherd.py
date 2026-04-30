@@ -516,7 +516,14 @@ def test_apply_followup_skip_subprocess_does_not_fork(monkeypatch) -> None:
 
 def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
     """skip_subprocess=False forks `python -m orchestrator.run_implementer`
-    with --review-feedback pointed at the bundle JSON."""
+    with --review-feedback pointed at the bundle JSON.
+
+    The temp file is deleted by apply_followup after the subprocess returns,
+    so we capture its contents from inside the fake subprocess call while it
+    still exists on disk.
+    """
+    import json as _json
+
     findings = [make_finding()]
 
     async def fake_format(_findings):
@@ -529,6 +536,11 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
 
     def fake_run(cmd, check=False, text=False, **_kwargs):
         captured["cmd"] = list(cmd)
+        # Read the bundle file while it still exists — apply_followup deletes
+        # it after this call returns (try/finally cleanup).
+        idx = list(cmd).index("--review-feedback")
+        with open(cmd[idx + 1], "r", encoding="utf-8") as f:
+            captured["bundle_on_disk"] = _json.load(f)
         return _Result()
 
     with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
@@ -544,9 +556,5 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
     assert "--service" in cmd and "mctl-web" in cmd
     assert "--slug" in cmd and "test-slug" in cmd
     assert "--review-feedback" in cmd
-    feedback_path = cmd[cmd.index("--review-feedback") + 1]
-    # The bundle file was written to disk and the JSON round-trips.
-    import json as _json
-    with open(feedback_path, "r", encoding="utf-8") as f:
-        on_disk = _json.load(f)
-    assert on_disk == bundle
+    # The bundle was correctly serialised to disk and the JSON round-trips.
+    assert captured["bundle_on_disk"] == bundle

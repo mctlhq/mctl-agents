@@ -854,9 +854,15 @@ def apply_followup(
         "--review-feedback", bundle_path,
     ]
     print(f"$ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, check=False, text=True)
-    if proc.returncode != 0:
-        print(f"warn: implementer follow-up exited non-zero ({proc.returncode}); leaving status as review-fixing")
+    try:
+        proc = subprocess.run(cmd, check=False, text=True)
+        if proc.returncode != 0:
+            print(f"warn: implementer follow-up exited non-zero ({proc.returncode}); leaving status as review-fixing")
+    finally:
+        try:
+            os.unlink(bundle_path)
+        except OSError:
+            pass
     return bundle
 
 

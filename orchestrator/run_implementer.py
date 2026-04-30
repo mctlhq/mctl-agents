@@ -509,8 +509,11 @@ def review_feedback_one(
         prompt = _build_prompt(ref, review_feedback=bundle)
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
 
-        # 5. Did the agent commit anything new?
-        if not _has_new_commits(target):
+        # 5. Did the agent commit anything new? Compare against the remote
+        # feature-branch tip (not main / origin/HEAD) so the check detects
+        # a no-op run even though the branch already has the original
+        # implementer commits ahead of main.
+        if not _has_new_commits(target, base=f"origin/{branch}"):
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
@@ -545,9 +548,20 @@ def review_feedback_one(
                 pass
 
 
-def _has_new_commits(repo_dir: Path) -> bool:
-    """True iff the implementer actually committed something on the branch."""
-    proc = _run(["git", "log", "--oneline", "origin/HEAD..HEAD"], cwd=repo_dir, check=False)
+def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
+    """True iff the implementer actually committed something beyond base.
+
+    New-branch path (implement_one): base defaults to ``origin/HEAD`` (the
+    default-branch tip). The fresh branch has no commits yet, so after the
+    agent runs any commit shows up.
+
+    Review-feedback path (review_feedback_one): pass
+    ``base=f"origin/{branch}"`` so we compare against the remote feature-
+    branch tip that was fetched by ``_checkout_existing_branch``. Using the
+    default ``origin/HEAD`` there would always return True because the
+    feature branch already has the original implementer commits ahead of main.
+    """
+    proc = _run(["git", "log", "--oneline", f"{base}..HEAD"], cwd=repo_dir, check=False)
     return bool(proc.stdout.strip())
 
 
