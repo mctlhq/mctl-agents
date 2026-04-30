@@ -38,9 +38,6 @@ Usage:
     python -m orchestrator.run_shepherd --service mctl-web
     python -m orchestrator.run_shepherd --service mctl-web --slug wrangler-cve-0933
     python -m orchestrator.run_shepherd --budget 2.00
-
-TODO Task 4: tests/test_run_shepherd.py covers each branch of decide()
-and the 3-attempt outer-loop cap. Out of scope for this PR.
 """
 from __future__ import annotations
 
@@ -816,9 +813,7 @@ def _fallback_bundle(findings: list[CodexFinding]) -> dict:
 
 # ---------------------------------------------------------------------------
 # Address-review followup — subprocess into run_implementer.py with
-# --review-feedback. NB: --review-feedback is implemented in TASK 3 of
-# the tier3-pr-shepherd spec, which is OUT OF SCOPE for this PR. We
-# build the bundle today so Task 3 only has to wire the flag through.
+# --review-feedback (Task 3, landed in this branch).
 # ---------------------------------------------------------------------------
 def apply_followup(
     service: str,
@@ -829,28 +824,22 @@ def apply_followup(
     """Bundle findings + invoke the Tier 2 implementer with --review-feedback.
 
     Returns the bundle dict so callers (and tests) can inspect what the
-    SDK produced. The actual subprocess call to
-    `python -m orchestrator.run_implementer --review-feedback <path>`
-    is gated on `skip_subprocess` because Task 3 (the
-    `--review-feedback` flag in run_implementer.py) lands in a
-    follow-up PR. When that PR is merged this flag flips to default
-    False and the subprocess fires for real.
+    SDK produced. ``skip_subprocess`` is kept as a test-only escape hatch
+    (the unit tests don't want to fork a real implementer) — production
+    code paths leave it at the default ``False`` so the subprocess fires.
     """
     bundle = anyio.run(_format_bundle_via_sdk, findings)
 
     if skip_subprocess:
-        # TODO Task 3: wire --review-feedback through to
-        # run_implementer.py and drop this guard. Until then the
-        # shepherd produces the bundle but does not actually invoke the
-        # implementer — flipping the proposal back to review-fixing
-        # alone is enough to make the next tick re-evaluate after a
-        # human pushes the fix.
-        print(f"info: --review-feedback subprocess gated (Task 3 pending); bundle={bundle}")
+        # Tests / dry-run: build the bundle but do not fork. The shepherd's
+        # outer loop still flips the proposal to review-fixing; the next
+        # tick will re-evaluate codex on the head SHA the implementer
+        # would have moved.
+        print(f"info: --review-feedback subprocess skipped (test/dry-run); bundle={bundle}")
         return bundle
 
-    # When Task 3 lands, this branch is exercised. We persist the
-    # bundle to a temp file because run_implementer.py's flag will be
-    # `--review-feedback <path>` (per tasks.md task 2 DoD note).
+    # Persist the bundle to a temp file because the implementer reads it
+    # via `--review-feedback <path>` (see run_implementer.main).
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", prefix=f"shepherd-{service}-{slug}-",
         delete=False, encoding="utf-8",
@@ -992,21 +981,10 @@ def process_one(
             "review-fixing",
             review_attempts=ref.review_attempts + 1,
         )
-        try:
-            apply_followup(
-                ref.service, ref.slug, payload,
-                skip_subprocess=skip_subprocess,
-            )
-        except NotImplementedError as e:
-            # apply_followup raises NotImplementedError ONLY when Task 3
-            # has not yet wired through and the caller asked for a real
-            # subprocess. Surface as a soft error and keep the proposal
-            # in review-fixing so a human can take over.
-            return ShepherdResult(
-                ref=ref,
-                decision="address-review",
-                error=str(e),
-            )
+        apply_followup(
+            ref.service, ref.slug, payload,
+            skip_subprocess=skip_subprocess,
+        )
         # Flip back to implemented so the next tick re-evaluates.
         update_status(ref, "implemented")
         return ShepherdResult(ref=ref, decision="address-review")
@@ -1120,9 +1098,10 @@ def main() -> None:
             print(f"[dry-run] would process {ref.service}/{ref.slug}")
             results.append(ShepherdResult(ref=ref, decision="dry-run"))
             continue
-        # Skip the subprocess call in apply_followup until Task 3 lands.
-        # See module docstring + apply_followup() for context.
-        result = process_one(ref, skip_subprocess=True)
+        # Production mode: apply_followup forks the implementer with
+        # --review-feedback. Tests pass skip_subprocess=True via
+        # process_one() to avoid forking real shells.
+        result = process_one(ref)
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate
