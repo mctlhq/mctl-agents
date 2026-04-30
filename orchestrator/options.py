@@ -41,12 +41,17 @@ MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # already-applied edits remain. Caller can raise via env if a proposal needs more.
 IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 # Tier 3 shepherd budget — soft cap per shepherd tick.
-# A tick spends Claude tokens only when there are unresolved codex findings
-# to summarise; most ticks find nothing to do and exit free. Default
-# matches MENTOR_BUDGET_USD's order of magnitude but is intentionally lower
-# (1.00) because the shepherd's SDK call is a single-shot JSON formatter,
-# not an open-ended analysis.
-SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "1.00"))
+# Covers the shepherd's own spend only: the sub-agent classification call
+# that turns codex findings into the bundle, plus the small amount of
+# decision-logic accounting. The implementer subprocess that the shepherd
+# forks for follow-ups has its own IMPLEMENTER_BUDGET_USD cap and does
+# NOT count against this.
+# Default raised to $5.00 to leave headroom for many-finding PRs (a
+# typical PR has 0-3 findings, but a noisy review can produce 10+ which
+# bloats the bundle prompt). The previous $1.00 default was too tight
+# under those conditions and risked tripping max_budget_usd before the
+# JSON object was complete.
+SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "5.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs

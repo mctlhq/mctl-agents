@@ -30,7 +30,7 @@ Env:
     STATE_DIR — path to platform-gitops/agents-state/ (default same as
         run_implementer.py — the workflow PVC mounts the gitops worktree
         at /workdir/mctl-gitops/...).
-    SHEPHERD_BUDGET_USD — soft budget cap per tick (default 1.00).
+    SHEPHERD_BUDGET_USD — soft budget cap per tick (default 5.00).
     GITHUB_TOKEN — required for `gh api` and `gh pr merge` calls.
 
 Usage:
@@ -1034,7 +1034,7 @@ def main() -> None:
         "--budget", type=float, default=None,
         help=(
             "Per-tick soft budget cap in USD "
-            "(default $SHEPHERD_BUDGET_USD or 1.00). When the cap is "
+            "(default $SHEPHERD_BUDGET_USD or 5.00). When the cap is "
             "crossed the shepherd exits cleanly with a warning."
         ),
     )
