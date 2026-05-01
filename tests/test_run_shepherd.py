@@ -341,8 +341,8 @@ def test_outer_loop_review_stuck_after_three_attempts(tmp_path, monkeypatch) -> 
 
     apply_calls: list[tuple] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False):
-        apply_calls.append((service, slug, payload, skip_subprocess))
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
+        apply_calls.append((service, slug, payload, skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
@@ -441,8 +441,8 @@ def test_loop_path_p1_then_followup_then_merge(tmp_path) -> None:
     )
     apply_calls: list[tuple] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False):
-        apply_calls.append((service, slug, len(payload), skip_subprocess))
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
+        apply_calls.append((service, slug, len(payload), skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr_t1), \
@@ -787,3 +787,63 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
     assert "--review-feedback" in cmd
     # The bundle was correctly serialised to disk and the JSON round-trips.
     assert captured["bundle_on_disk"] == bundle
+
+
+def test_apply_followup_propagates_state_dir(tmp_path) -> None:
+    """apply_followup must forward a non-default state_dir to the
+    implementer subprocess as `--state-dir <path>`, and omit the flag
+    when state_dir matches the implementer's DEFAULT_STATE_DIR (no-op
+    noise on the command line) or is None.
+
+    Regression for codex P2 on PR #12: a shepherd invocation with a
+    custom --state-dir previously fired the implementer with no
+    --state-dir, so the implementer resolved proposals from its own
+    DEFAULT_STATE_DIR, failed to find the target in
+    `implemented/review-fixing`, and exited non-zero.
+    """
+    findings = [make_finding()]
+    custom_dir = tmp_path / "explicit-state"
+    custom_dir.mkdir()
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        captured["cmd"] = list(cmd)
+        return _Result()
+
+    # Custom state_dir -> --state-dir is appended.
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        run_shepherd.apply_followup(
+            "mctl-web", "test-slug", findings,
+            state_dir=custom_dir,
+        )
+    cmd = captured["cmd"]
+    assert "--state-dir" in cmd
+    idx = cmd.index("--state-dir")
+    assert cmd[idx + 1] == str(custom_dir)
+
+    # Default state_dir -> flag omitted (would be a no-op).
+    captured.clear()
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        run_shepherd.apply_followup(
+            "mctl-web", "test-slug", findings,
+            state_dir=run_implementer.DEFAULT_STATE_DIR,
+        )
+    assert "--state-dir" not in captured["cmd"]
+
+    # No state_dir argument -> flag omitted.
+    captured.clear()
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        run_shepherd.apply_followup(
+            "mctl-web", "test-slug", findings,
+        )
+    assert "--state-dir" not in captured["cmd"]

@@ -57,6 +57,7 @@ import yaml
 from claude_agent_sdk import query
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
+from orchestrator import run_implementer
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
 
@@ -826,6 +827,7 @@ def apply_followup(
     slug: str,
     findings: list[CodexFinding],
     skip_subprocess: bool = False,
+    state_dir: Optional[Path] = None,
 ) -> dict:
     """Bundle findings + invoke the Tier 2 implementer with --review-feedback.
 
@@ -833,6 +835,14 @@ def apply_followup(
     SDK produced. ``skip_subprocess`` is kept as a test-only escape hatch
     (the unit tests don't want to fork a real implementer) — production
     code paths leave it at the default ``False`` so the subprocess fires.
+
+    ``state_dir`` is forwarded to the implementer subprocess as
+    ``--state-dir <path>`` whenever it differs from the implementer's
+    own default. Without this, an upstream shepherd run with a custom
+    ``--state-dir`` would invoke the implementer with the env default
+    and the implementer could not find the proposal in
+    ``implemented/review-fixing`` — exiting non-zero and triggering an
+    avoidable ``review-stuck`` flip.
     """
     bundle = anyio.run(_format_bundle_via_sdk, findings)
 
@@ -859,6 +869,11 @@ def apply_followup(
         "--slug", slug,
         "--review-feedback", bundle_path,
     ]
+    # Forward --state-dir only when it differs from the implementer's
+    # own DEFAULT_STATE_DIR. The implementer's argparse default is the
+    # same env-driven path; appending it unconditionally would be noise.
+    if state_dir is not None and Path(state_dir) != run_implementer.DEFAULT_STATE_DIR:
+        cmd.extend(["--state-dir", str(state_dir)])
     print(f"$ {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, check=False, text=True)
@@ -1003,6 +1018,7 @@ def process_one(
         apply_followup(
             ref.service, ref.slug, payload,
             skip_subprocess=skip_subprocess,
+            state_dir=state_dir,
         )
         # Flip back to implemented so the next tick re-evaluates.
         update_status(ref, "implemented")
