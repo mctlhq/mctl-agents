@@ -24,7 +24,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from orchestrator import run_shepherd
+from orchestrator import run_implementer, run_shepherd
 from orchestrator.run_shepherd import (
     CodexFinding,
     CodexReview,
@@ -556,6 +556,49 @@ def test_process_one_pr_unfetchable_returns_wait(tmp_path) -> None:
     assert result.error
     # Status unchanged.
     assert read_status(ref)["status"] == "implemented"
+
+
+def _git(*args: str, cwd: Path) -> None:
+    """Tiny git wrapper for test fixtures (no logging, no capture)."""
+    import subprocess as _sp
+    _sp.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def test_has_new_commits_against_pre_sdk_head(tmp_path) -> None:
+    """_has_new_commits(base=old_head) must distinguish a no-op SDK run
+    from a real follow-up commit on an existing PR branch.
+
+    Build a repo where HEAD already has commits ahead of origin/HEAD AND
+    of origin/<branch> (the pre-existing implementer commit). Then:
+      - capture HEAD via _capture_head_sha,
+      - simulate "no SDK commit" -> _has_new_commits(base=old_head) is False,
+      - simulate "SDK committed" -> _has_new_commits(base=old_head) is True.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.email", "test@example.com", cwd=repo)
+    _git("config", "user.name", "Test", cwd=repo)
+    (repo / "README.md").write_text("seed\n")
+    _git("add", "README.md", cwd=repo)
+    _git("commit", "-q", "-m", "seed", cwd=repo)
+
+    # Simulate the original implementer commit already on the PR branch.
+    (repo / "feat.txt").write_text("v1\n")
+    _git("add", "feat.txt", cwd=repo)
+    _git("commit", "-q", "-m", "feat: original implementer commit", cwd=repo)
+
+    old_head = run_implementer._capture_head_sha(repo)
+    assert old_head and len(old_head) == 40
+
+    # No-op SDK run: HEAD is unchanged -> _has_new_commits must be False.
+    assert run_implementer._has_new_commits(repo, base=old_head) is False
+
+    # SDK pushed a follow-up commit -> _has_new_commits must be True.
+    (repo / "feat.txt").write_text("v2\n")
+    _git("add", "feat.txt", cwd=repo)
+    _git("commit", "-q", "-m", "fix: address codex P1", cwd=repo)
+    assert run_implementer._has_new_commits(repo, base=old_head) is True
 
 
 def test_apply_followup_skip_subprocess_does_not_fork(monkeypatch) -> None:

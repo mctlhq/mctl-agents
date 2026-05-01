@@ -505,25 +505,30 @@ def review_feedback_one(
         # 3. Stage the per-service implementer sub-agent (same as new-PR path).
         _stage_implementer_agent(target, ref.service)
 
-        # 4. Run the SDK with the bundle baked into the prompt.
+        # 4. Capture HEAD BEFORE the SDK call. This is the only ref that
+        # cleanly distinguishes a no-op follow-up from a successful one —
+        # comparing against `origin/<branch>` is unreliable when the local
+        # fetch is stale, and `origin/HEAD..HEAD` is always non-empty on
+        # an existing PR branch (it includes the original implementer
+        # commit). See codex P1 on PR #12.
+        old_head = _capture_head_sha(target)
+
+        # 5. Run the SDK with the bundle baked into the prompt.
         prompt = _build_prompt(ref, review_feedback=bundle)
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
 
-        # 5. Did the agent commit anything new? Compare against the remote
-        # feature-branch tip (not main / origin/HEAD) so the check detects
-        # a no-op run even though the branch already has the original
-        # implementer commits ahead of main.
-        if not _has_new_commits(target, base=f"origin/{branch}"):
+        # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
+        if not _has_new_commits(target, base=old_head):
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
                 error="implementer produced no follow-up commits",
             )
 
-        # 6. Push to the existing branch — no -u, no new PR.
+        # 7. Push to the existing branch — no -u, no new PR.
         _push_followup(target, branch)
 
-        # 7. Read the existing PR URL from `.status.yaml` for the result
+        # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
@@ -551,18 +556,26 @@ def review_feedback_one(
 def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
     """True iff the implementer actually committed something beyond base.
 
-    New-branch path (implement_one): base defaults to ``origin/HEAD`` (the
-    default-branch tip). The fresh branch has no commits yet, so after the
-    agent runs any commit shows up.
+    Prefer to pass the *pre-SDK HEAD SHA* as ``base`` (captured by the
+    caller right before the SDK invocation). That is the only ref that
+    can reliably distinguish a no-op SDK run from a successful follow-up:
 
-    Review-feedback path (review_feedback_one): pass
-    ``base=f"origin/{branch}"`` so we compare against the remote feature-
-    branch tip that was fetched by ``_checkout_existing_branch``. Using the
-    default ``origin/HEAD`` there would always return True because the
-    feature branch already has the original implementer commits ahead of main.
+    - New-branch path (implement_one): a freshly-created branch sits at
+      origin/HEAD, so the captured SHA equals origin/HEAD anyway.
+    - Review-feedback path (review_feedback_one): the existing branch
+      tip already has commits ahead of origin/HEAD AND ahead of
+      origin/<branch> when the local fetch is stale. Comparing against
+      either remote ref can wrongly report "new commits" when the SDK
+      did nothing. The captured pre-SDK SHA cannot.
     """
     proc = _run(["git", "log", "--oneline", f"{base}..HEAD"], cwd=repo_dir, check=False)
     return bool(proc.stdout.strip())
+
+
+def _capture_head_sha(repo_dir: Path) -> str:
+    """Return the current HEAD SHA in ``repo_dir`` (no rev parsing here)."""
+    proc = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    return proc.stdout.strip()
 
 
 def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
