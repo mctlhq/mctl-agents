@@ -14,6 +14,27 @@ Pipeline per proposal:
     7. `gh pr create` with title/body referencing the proposal.
     8. Update .status.yaml → `implemented`, write the PR URL.
 
+Review-feedback mode (`--review-feedback <path>`):
+    Used by the Tier 3 shepherd to address codex P1/P2 findings on an
+    existing PR. The bundle JSON has shape
+    `{"p1": bool, "p2": bool, "summaries": [{"file": "...",
+    "line": 123, "severity": "P1", "body": "..."}, ...]}` written by
+    `orchestrator.run_shepherd.apply_followup()`.
+
+    Behaviour differences from the new-branch path:
+    - The branch `feat/agents-<slug>` MUST already exist on origin; the
+      implementer fetches it and checks it out (no `-b`).
+    - The codex findings bundle is appended to the sub-agent prompt as
+      additional context.
+    - After the agent commits, the implementer pushes to the existing
+      branch (no `-u`) and does NOT open a new PR — the existing PR
+      auto-updates because head ref is unchanged.
+    - `.status.yaml` does NOT flip to `implemented` on success. The
+      shepherd already wrote `review-fixing` before the subprocess call;
+      this mode leaves the status as-is so the next shepherd tick can
+      re-evaluate codex against the new commit. The transition to
+      `implemented` (and eventually `merged`) belongs to the shepherd.
+
 Auth:
     Uses GITHUB_TOKEN from env (Sub-plan B introduces this in the
     mctl-agents-secrets ExternalSecret as `github-token` Vault key, surfaced
@@ -36,6 +57,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -44,7 +66,7 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import anyio
 import yaml
@@ -71,6 +93,50 @@ DEFAULT_STATE_DIR = Path(
         "/workdir/mctl-gitops/platform-gitops/agents-state",
     )
 )
+
+
+# ---------------------------------------------------------------------------
+# Sentinel exit codes for review-feedback mode. These let the Tier 3 shepherd
+# tell deterministic *content* failures apart from transient subprocess /
+# auth / network plumbing failures: only the former should consume one of
+# the MAX_REVIEW_ATTEMPTS budget slots and eventually flip the proposal to
+# `review-stuck`. Without a sentinel, the shepherd treats every non-zero
+# exit as transient and retries forever — see codex P1 on PR #12.
+#
+# The mapping is intentionally narrow: any error path that is NOT one of
+# these explicit codes falls back to plain `sys.exit(1)` which the shepherd
+# classifies as transient. New deterministic-failure paths must opt in by
+# returning an `ImplementResult.error` whose prefix matches the table in
+# `_review_feedback_exit_code()`.
+# ---------------------------------------------------------------------------
+EXIT_OK = 0
+EXIT_GENERIC_FAILURE = 1
+EXIT_NO_FOLLOWUP_COMMITS = 42
+EXIT_BRANCH_MISSING_ON_ORIGIN = 43
+
+
+def _review_feedback_exit_code(error: str) -> int:
+    """Map an ``ImplementResult.error`` string to a sentinel exit code.
+
+    Deterministic content failures get their own non-1 codes so the Tier 3
+    shepherd can distinguish them from transient plumbing errors:
+
+      - 42: agent ran but committed nothing — re-running the SDK with the
+        same findings will deterministically reproduce the same outcome.
+      - 43: PR branch was deleted on origin between ticks — re-running
+        cannot resurrect it; a human must look at the PR.
+
+    Everything else (shell failures, SystemExit from missing config,
+    unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and the
+    shepherd treats it as transient.
+    """
+    if not error:
+        return EXIT_OK
+    if error == "implementer produced no follow-up commits":
+        return EXIT_NO_FOLLOWUP_COMMITS
+    if error.startswith("branch ") and "not found on origin" in error:
+        return EXIT_BRANCH_MISSING_ON_ORIGIN
+    return EXIT_GENERIC_FAILURE
 
 
 @dataclass
@@ -151,6 +217,7 @@ def find_accepted_proposals(
     service_filter: Optional[str] = None,
     slug_filter: Optional[str] = None,
     include_in_progress: bool = False,
+    statuses: Optional[set[str]] = None,
 ) -> list[ProposalRef]:
     """Glob agents-state and return all proposals with status == accepted.
 
@@ -164,13 +231,21 @@ def find_accepted_proposals(
     run without manually editing .status.yaml. ``implement_one`` already
     short-circuits on in-progress unless ``force`` is set, so the two flags
     must be threaded together.
+
+    When ``statuses`` is set it overrides the default filter entirely. The
+    ``--review-feedback`` path uses this to look up proposals in
+    ``{implemented, review-fixing}`` status, since the follow-up does NOT
+    require the proposal to be in ``accepted`` (it is post-implementation).
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
 
-    accepted_states = {"accepted"}
-    if include_in_progress:
-        accepted_states.add("in-progress")
+    if statuses is not None:
+        accepted_states = set(statuses)
+    else:
+        accepted_states = {"accepted"}
+        if include_in_progress:
+            accepted_states.add("in-progress")
 
     refs: list[ProposalRef] = []
     for service_dir in sorted(state_dir.iterdir()):
@@ -262,14 +337,53 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
             f.write(f"{entry}\n")
 
 
-def _build_prompt(ref: ProposalRef) -> str:
+def _build_prompt(ref: ProposalRef, review_feedback: Optional[dict] = None) -> str:
     """Prompt that delegates to the `implementer` sub-agent.
 
     The sub-agent is told (in its frontmatter and body) to read the spec
     files via $PROPOSAL_DIR, edit minimal files in cwd, run a brief sanity
     check, and `git commit` — but NOT push.
+
+    When ``review_feedback`` is set the prompt is the follow-up variant:
+    the agent is told the branch is already checked out, points to the
+    existing PR, and addresses each codex finding from the bundle.
     """
     branch = f"feat/agents-{ref.slug}"
+
+    if review_feedback is not None:
+        feedback_md = _render_review_feedback(review_feedback)
+        return f"""\
+Tier 2 implementer follow-up for proposal `{ref.service}/{ref.slug}`.
+
+Context:
+- Branch `{branch}` is already checked out on the existing PR.
+- Codex review left P1/P2 findings on this PR — they are listed below.
+- Spec files live at `$PROPOSAL_DIR` (env var): requirements.md, design.md, tasks.md.
+
+Workflow:
+1. Use the `implementer` sub-agent. Read the codex findings (below) and
+   the relevant lines in the working tree.
+2. Apply the MINIMAL change that resolves each finding. Stay in scope —
+   do not refactor outside the touched files.
+3. Stage and commit on the SAME branch (`{branch}`). Conventional Commits
+   subject: `fix(agents): address P1/P2 codex findings on {ref.slug}`.
+   Body should reference the proposal:
+   `Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`.
+4. DO NOT push and DO NOT open a PR — the orchestrator will push to the
+   existing branch after you finish. The PR auto-updates because the
+   head ref does not change.
+5. If a finding is invalid or already addressed, STOP without committing
+   and explain why in your final message.
+
+{feedback_md}
+
+Ground rules:
+- One commit per run is fine; multiple small commits are also fine.
+- Stay strictly within scope — fixing the codex findings only.
+- No emoji in code or commit messages.
+- English only.
+"""
+
     return f"""\
 Tier 2 implementer run for proposal `{ref.service}/{ref.slug}`.
 
@@ -296,16 +410,216 @@ Ground rules:
 """
 
 
+def _load_review_feedback(path: Path) -> dict:
+    """Read the JSON bundle the shepherd writes via ``apply_followup``.
+
+    Schema (loose — fields beyond the documented set are ignored):
+        {
+          "p1": bool,
+          "p2": bool,
+          "summaries": [
+            {"file": "...", "line": 123, "severity": "P1", "body": "..."},
+            ...
+          ]
+        }
+
+    The shepherd's fallback path may also produce ``summaries`` as plain
+    strings; we tolerate both shapes so a fallback bundle still works
+    end-to-end.
+    """
+    if not path.exists():
+        raise SystemExit(f"--review-feedback path not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise SystemExit(f"--review-feedback bundle must be a JSON object, got {type(data).__name__}")
+    return data
+
+
+def _render_review_feedback(bundle: dict) -> str:
+    """Format the JSON bundle as a Markdown section for the sub-agent."""
+    summaries = bundle.get("summaries") or []
+    has_p1 = bool(bundle.get("p1"))
+    has_p2 = bool(bundle.get("p2"))
+
+    lines: list[str] = ["## Codex review findings (address each)"]
+    if has_p1 and has_p2:
+        lines.append("Severity mix: at least one P1 and one P2 — fix both.")
+    elif has_p1:
+        lines.append("Severity: at least one P1 — must be fixed.")
+    elif has_p2:
+        lines.append("Severity: P2 only — fix all of them.")
+    lines.append("")
+
+    if not summaries:
+        lines.append("(No summaries in bundle — re-read the PR's codex review on GitHub.)")
+        return "\n".join(lines)
+
+    for i, item in enumerate(summaries, 1):
+        if isinstance(item, dict):
+            severity = item.get("severity") or "?"
+            file_ = item.get("file") or item.get("path") or "(top-level comment)"
+            line = item.get("line")
+            body = (item.get("body") or "").strip()
+            loc = file_ + (f":{line}" if line else "")
+            lines.append(f"### Finding {i} [{severity}] — {loc}")
+            if body:
+                lines.append(body)
+            lines.append("")
+        else:
+            # Fallback shape: plain string summary.
+            lines.append(f"- {str(item).strip()}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:
+    """True iff `git ls-remote --heads origin <branch>` returns a ref line."""
+    proc = _run(["git", "ls-remote", "--heads", "origin", branch], cwd=repo_dir, check=False)
+    return bool(proc.stdout.strip())
+
+
+def _push_followup(repo_dir: Path, branch: str) -> None:
+    """Push the follow-up commit to the existing branch (no `-u`)."""
+    _run(["git", "push", "origin", branch], cwd=repo_dir)
+
+
 async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
     async for message in query(prompt=prompt, options=options):
         print(message)
 
 
-def _has_new_commits(repo_dir: Path) -> bool:
-    """True iff the implementer actually committed something on the branch."""
-    proc = _run(["git", "log", "--oneline", "origin/HEAD..HEAD"], cwd=repo_dir, check=False)
+# ---------------------------------------------------------------------------
+# Review-feedback mode — drive an existing branch.
+# ---------------------------------------------------------------------------
+def _checkout_existing_branch(repo_dir: Path, branch: str) -> None:
+    """Fetch and check out an existing remote branch.
+
+    Assumes the caller already verified the branch exists on origin via
+    ``_branch_exists_on_origin``. Uses an explicit refspec so the local
+    branch is created tracking origin/<branch>.
+    """
+    _run(["git", "fetch", "origin", f"{branch}:{branch}"], cwd=repo_dir)
+    _run(["git", "checkout", branch], cwd=repo_dir)
+
+
+def review_feedback_one(
+    ref: ProposalRef,
+    bundle: dict,
+    dry_run: bool = False,
+) -> ImplementResult:
+    """Apply codex review feedback as a follow-up commit on the existing PR.
+
+    Pre-conditions (caller's responsibility):
+    - ``feat/agents-<slug>`` exists on origin (the shepherd only invokes
+      this mode after observing an open PR).
+    - ``ref`` has a ``pr`` URL set in `.status.yaml` (used for logging
+      only — we do not re-open a PR).
+
+    On success: pushes a follow-up commit to the existing branch and
+    returns an ``ImplementResult`` whose ``pr_url`` is the existing PR
+    URL (read from `.status.yaml`). `.status.yaml` is intentionally NOT
+    rewritten — the shepherd owns the status transitions for follow-ups.
+    """
+    if dry_run:
+        print(f"[dry-run] would address review on {ref.service}/{ref.slug}")
+        return ImplementResult(ref=ref, pr_url=None, skipped_reason="dry-run")
+
+    target = None
+    result: Optional[ImplementResult] = None
+    branch = f"feat/agents-{ref.slug}"
+    try:
+        # 1. Clone the sibling repo. The shepherd's bundle path holds the
+        # findings; cloning fresh keeps the worktree clean (avoids
+        # stepping on a previous wedged run).
+        target = _clone_target(ref.service, ref.slug)
+
+        # 2. The branch must exist on origin — the shepherd only triggers
+        # follow-ups for PRs whose head ref already exists. If it does
+        # not, fail loudly so the operator can investigate (a missing
+        # branch implies the PR was closed/deleted between ticks).
+        if not _branch_exists_on_origin(target, branch):
+            return ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error=f"branch {branch} not found on origin; refusing to create it in review-feedback mode",
+            )
+        _checkout_existing_branch(target, branch)
+
+        # 3. Stage the per-service implementer sub-agent (same as new-PR path).
+        _stage_implementer_agent(target, ref.service)
+
+        # 4. Capture HEAD BEFORE the SDK call. This is the only ref that
+        # cleanly distinguishes a no-op follow-up from a successful one —
+        # comparing against `origin/<branch>` is unreliable when the local
+        # fetch is stale, and `origin/HEAD..HEAD` is always non-empty on
+        # an existing PR branch (it includes the original implementer
+        # commit). See codex P1 on PR #12.
+        old_head = _capture_head_sha(target)
+
+        # 5. Run the SDK with the bundle baked into the prompt.
+        prompt = _build_prompt(ref, review_feedback=bundle)
+        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
+
+        # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
+        if not _has_new_commits(target, base=old_head):
+            return ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error="implementer produced no follow-up commits",
+            )
+
+        # 7. Push to the existing branch — no -u, no new PR.
+        _push_followup(target, branch)
+
+        # 8. Read the existing PR URL from `.status.yaml` for the result
+        # surface; do NOT rewrite the status — that belongs to the shepherd.
+        existing = _load_status(ref.status_path)
+        pr_url = existing.get("pr")
+        result = ImplementResult(ref=ref, pr_url=pr_url)
+        return result
+
+    except subprocess.CalledProcessError as e:
+        msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        return result
+    except SystemExit as e:
+        result = ImplementResult(ref=ref, pr_url=None, error=f"SystemExit: {e}")
+        return result
+    except Exception as e:  # pragma: no cover — defensive
+        result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
+        return result
+    finally:
+        if target and target.exists() and result is not None and result.error is None:
+            try:
+                shutil.rmtree(target)
+            except OSError:
+                pass
+
+
+def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
+    """True iff the implementer actually committed something beyond base.
+
+    Prefer to pass the *pre-SDK HEAD SHA* as ``base`` (captured by the
+    caller right before the SDK invocation). That is the only ref that
+    can reliably distinguish a no-op SDK run from a successful follow-up:
+
+    - New-branch path (implement_one): a freshly-created branch sits at
+      origin/HEAD, so the captured SHA equals origin/HEAD anyway.
+    - Review-feedback path (review_feedback_one): the existing branch
+      tip already has commits ahead of origin/HEAD AND ahead of
+      origin/<branch> when the local fetch is stale. Comparing against
+      either remote ref can wrongly report "new commits" when the SDK
+      did nothing. The captured pre-SDK SHA cannot.
+    """
+    proc = _run(["git", "log", "--oneline", f"{base}..HEAD"], cwd=repo_dir, check=False)
     return bool(proc.stdout.strip())
+
+
+def _capture_head_sha(repo_dir: Path) -> str:
+    """Return the current HEAD SHA in ``repo_dir`` (no rev parsing here)."""
+    proc = _run(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    return proc.stdout.strip()
 
 
 def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
@@ -422,6 +736,18 @@ def main() -> None:
         help="Path to platform-gitops/agents-state/ (defaults to STATE_DIR env)",
     )
     ap.add_argument("--dry-run", action="store_true", help="Discover only; don't clone or run the SDK")
+    ap.add_argument(
+        "--review-feedback",
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to a JSON bundle of codex P1/P2 findings written by the "
+            "Tier 3 shepherd. When set, the implementer drives the EXISTING "
+            "feat/agents-<slug> branch — fetches it, lets the sub-agent "
+            "address findings, and pushes a follow-up commit (no new PR). "
+            "Requires --service AND --slug."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
@@ -431,6 +757,49 @@ def main() -> None:
     ensure_auth_for_sdk()
 
     state_dir = Path(args.state_dir)
+
+    # Review-feedback mode: drive the existing PR's branch with codex findings.
+    if args.review_feedback:
+        if not (args.service and args.slug):
+            print(
+                "--review-feedback requires --service AND --slug "
+                "(the shepherd always passes both).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        bundle = _load_review_feedback(Path(args.review_feedback))
+        # In review-feedback mode the proposal is post-implementation —
+        # status is `implemented` or `review-fixing`. Look it up under
+        # those statuses rather than `accepted`.
+        refs = find_accepted_proposals(
+            state_dir,
+            service_filter=args.service,
+            slug_filter=args.slug,
+            statuses={"implemented", "review-fixing"},
+        )
+        if not refs:
+            print(
+                f"No proposal {args.service}/{args.slug} in implemented/review-fixing status; "
+                f"refusing to apply review feedback.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        result = review_feedback_one(refs[0], bundle, dry_run=args.dry_run)
+        print("\n=== Review-feedback summary ===")
+        if result.error:
+            print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
+            # Map deterministic content failures to sentinel exit codes so
+            # the Tier 3 shepherd can stop retrying them forever (see
+            # `_review_feedback_exit_code` docstring). Transient plumbing
+            # errors continue to exit 1 so the shepherd's transient-failure
+            # path is unchanged.
+            sys.exit(_review_feedback_exit_code(result.error))
+        if result.skipped_reason:
+            print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
+            return
+        print(f"  ok   {result.ref.service}/{result.ref.slug} -> {result.pr_url or '(existing PR)'}")
+        return
+
     refs = find_accepted_proposals(
         state_dir,
         service_filter=args.service or None,

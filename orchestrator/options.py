@@ -40,6 +40,18 @@ MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
 # already-applied edits remain. Caller can raise via env if a proposal needs more.
 IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
+# Tier 3 shepherd budget — soft cap per shepherd tick.
+# Covers the shepherd's own spend only: the sub-agent classification call
+# that turns codex findings into the bundle, plus the small amount of
+# decision-logic accounting. The implementer subprocess that the shepherd
+# forks for follow-ups has its own IMPLEMENTER_BUDGET_USD cap and does
+# NOT count against this.
+# Default raised to $5.00 to leave headroom for many-finding PRs (a
+# typical PR has 0-3 findings, but a noisy review can produce 10+ which
+# bloats the bundle prompt). The previous $1.00 default was too tight
+# under those conditions and risked tripping max_budget_usd before the
+# JSON object was complete.
+SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "5.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -135,4 +147,31 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
+    )
+
+
+def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Options for the Tier 3 shepherd sub-agent.
+
+    The sub-agent's only job is to translate a pre-filtered bundle of
+    P1/P2 codex findings into a JSON `{p1, p2, summaries}` object the
+    Python wrapper hands to the Tier 2 implementer via
+    `--review-feedback`. It is read-only — no Write/Edit/Bash.
+
+    ``cwd`` is `agents/_shepherd/` so `setting_sources=["project"]`
+    picks up `agents/_shepherd/.claude/agents/shepherd.md` — same
+    pattern as every other service agent in this repo (sub-agent prompts
+    live under `.claude/agents/` in the working directory).
+
+    No mctl MCP, no sibling repos — the bundle is self-contained text.
+    """
+    return ClaudeAgentOptions(
+        cwd=str(shepherd_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=["Read"],
+        mcp_servers={},
+        permission_mode="acceptEdits",
+        max_budget_usd=SHEPHERD_BUDGET_USD,
+        env={**os.environ},
     )

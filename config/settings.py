@@ -37,6 +37,7 @@ SERVICES = [
 ROTATING_SERVICES = [s for s in SERVICES if s != "mctl-agents"]
 
 MENTOR_DIR = AGENTS_DIR / "_mentor"
+SHEPHERD_DIR = AGENTS_DIR / "_shepherd"
 
 # mctl MCP — shared by every agent
 MCTL_MCP_URL = "https://api.mctl.ai/mcp"
@@ -44,3 +45,5 @@ MCTL_MCP_URL = "https://api.mctl.ai/mcp"
 # Models
 SERVICE_AGENT_MODEL = os.getenv("SERVICE_AGENT_MODEL", "claude-sonnet-4-6")
 MENTOR_MODEL = os.getenv("MENTOR_MODEL", "claude-opus-4-7")
+# Tier 3 shepherd: a single-shot JSON formatter — sonnet is plenty.
+SHEPHERD_MODEL = os.getenv("SHEPHERD_MODEL", "claude-sonnet-4-6")
