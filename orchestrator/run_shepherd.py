@@ -428,12 +428,18 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
         else ""
     )
 
-    # Required-checks-only: GitHub's statusCheckRollup.state is the
-    # rollup of *all* checks (required and not). For v1 we treat
-    # SUCCESS or PENDING-with-mergeable as fine: the merge_state_status
-    # gate is the load-bearing check (UNSTABLE means non-required failing,
-    # required passing — design.md explicitly opts in).
-    checks_green = rollup_state == "SUCCESS"
+    # GitHub's statusCheckRollup.state aggregates *all* checks (required
+    # and not). When merge_state_status is UNSTABLE, GitHub has already
+    # confirmed required checks pass (only non-required ones are red);
+    # when HAS_HOOKS, required checks pass and the only blocker is the
+    # pre-receive hook. Both are mergeable per design.md L143-154, so we
+    # also treat them as "checks green" even when the raw rollup is not
+    # SUCCESS. Otherwise PRs with non-required CI failures (or in
+    # hook-enabled repos) would stall here despite a clean codex review.
+    checks_green = (
+        rollup_state == "SUCCESS"
+        or merge_state_status in {"UNSTABLE", "HAS_HOOKS"}
+    )
 
     return PRSnapshot(
         number=int(pr.get("number") or number),

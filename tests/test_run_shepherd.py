@@ -243,6 +243,71 @@ def test_decide_findings_anchored_to_head_sha() -> None:
     assert decide(pr, review) == ("merge", None)
 
 
+def test_decide_merge_with_unstable_merge_state() -> None:
+    """UNSTABLE mergeStateStatus + clean codex must merge, not wait.
+
+    Per design.md L143-154, UNSTABLE means non-required CI is red but the
+    required checks pass — GitHub still considers the PR mergeable. The
+    rollup state in that case is typically not SUCCESS, so checks_green
+    must be derived from mergeStateStatus (not the raw rollup) for these
+    PRs to leave the wait loop.
+    """
+    pr = make_pr(merge_state_status="UNSTABLE", checks_green=True)
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review) == ("merge", None)
+
+
+def test_fetch_pr_snapshot_unstable_yields_checks_green(monkeypatch) -> None:
+    """_fetch_pr_snapshot must derive checks_green from mergeStateStatus
+    when the raw rollup state is not SUCCESS but GitHub already
+    classified the PR as UNSTABLE / HAS_HOOKS (mergeable, required checks
+    pass). Otherwise PRs in hook-enabled repos or with non-required CI
+    failures stall in `wait` forever.
+    """
+    def make_view(merge_state: str, rollup: str) -> dict:
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "number": 99,
+                        "state": "OPEN",
+                        "merged": False,
+                        "headRefOid": "f" * 40,
+                        "mergeCommit": None,
+                        "statusCheckRollup": {"state": rollup},
+                        "mergeStateStatus": merge_state,
+                        "commits": {"nodes": []},
+                        "timelineItems": {"nodes": []},
+                        "isDraft": False,
+                    }
+                }
+            }
+        }
+
+    cases = {"UNSTABLE": True, "HAS_HOOKS": True, "BLOCKED": False, "CLEAN": False}
+    for merge_state, expected in cases.items():
+        with patch.object(
+            run_shepherd, "_gh_api_json",
+            return_value=make_view(merge_state, "FAILURE"),
+        ):
+            snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 99)
+        assert snap is not None
+        assert snap.merge_state_status == merge_state
+        assert snap.checks_green is expected, (
+            f"merge_state={merge_state}: checks_green expected {expected} "
+            f"got {snap.checks_green}"
+        )
+
+    # SUCCESS rollup must always yield checks_green=True regardless of merge state.
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view("BLOCKED", "SUCCESS"),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 99)
+    assert snap is not None
+    assert snap.checks_green is True
+
+
 def test_decide_keeps_top_level_finding_without_commit_id() -> None:
     """Top-level issue comment findings have commit_id=None and are kept.
 
