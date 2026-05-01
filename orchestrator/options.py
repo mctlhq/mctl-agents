@@ -156,10 +156,12 @@ def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions
     The sub-agent's only job is to translate a pre-filtered bundle of
     P1/P2 codex findings into a JSON `{p1, p2, summaries}` object the
     Python wrapper hands to the Tier 2 implementer via
-    `--review-feedback`. It is read-only — no Write/Edit/Bash. The cwd
-    is `agents/_shepherd/` so the SDK picks up `shepherd.md` via
-    `setting_sources=["project"]` (same pattern as the mentor and the
-    implementer agent staging).
+    `--review-feedback`. It is read-only — no Write/Edit/Bash.
+
+    ``cwd`` is ``agents/_shepherd/`` so ``setting_sources=["project"]``
+    picks up ``agents/_shepherd/.claude/agents/shepherd.md`` — same
+    pattern as every other service agent in this repo (sub-agent prompts
+    live under ``.claude/agents/`` in the working directory).
 
     No mctl MCP, no sibling repos — the bundle is self-contained text.
     """
