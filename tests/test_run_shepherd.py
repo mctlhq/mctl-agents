@@ -623,6 +623,45 @@ def test_apply_followup_skip_subprocess_does_not_fork(monkeypatch) -> None:
     assert calls == []
 
 
+def test_main_dry_run_skips_sdk_auth(tmp_path, monkeypatch) -> None:
+    """`--dry-run` is documented as discovery-only and must run in
+    environments without Claude credentials (read-only ops checks, CI
+    inventory). ensure_auth_for_sdk() must therefore NOT be called.
+    """
+    # Empty state dir -> _discover_refs returns []. main() exits early
+    # but only AFTER the auth gate; that gate must remain bypassed.
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--dry-run", "--state-dir", str(state_dir)],
+    )
+
+    with patch.object(run_shepherd, "ensure_auth_for_sdk") as mocked_auth, \
+         patch.object(run_shepherd, "_discover_refs", return_value=[]):
+        run_shepherd.main()
+
+    mocked_auth.assert_not_called()
+
+
+def test_main_non_dry_run_calls_sdk_auth(tmp_path, monkeypatch) -> None:
+    """Sanity counterpart: without --dry-run, ensure_auth_for_sdk IS called."""
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--state-dir", str(state_dir)],
+    )
+
+    with patch.object(run_shepherd, "ensure_auth_for_sdk") as mocked_auth, \
+         patch.object(run_shepherd, "_discover_refs", return_value=[]):
+        run_shepherd.main()
+
+    mocked_auth.assert_called_once()
+
+
 def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
     """skip_subprocess=False forks `python -m orchestrator.run_implementer`
     with --review-feedback pointed at the bundle JSON.

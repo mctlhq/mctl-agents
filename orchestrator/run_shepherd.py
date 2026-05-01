@@ -1073,7 +1073,11 @@ def main() -> None:
     if budget <= 0:
         print(f"warn: SHEPHERD_BUDGET_USD={budget} is non-positive; nothing will run")
 
-    ensure_auth_for_sdk()
+    # Skip SDK auth init in dry-run mode: --dry-run is documented as
+    # discovery-only and must work in environments without Claude
+    # credentials (read-only ops checks, CI inventory runs).
+    if not args.dry_run:
+        ensure_auth_for_sdk()
 
     state_dir = Path(args.state_dir)
     refs = _discover_refs(
