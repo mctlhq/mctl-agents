@@ -308,6 +308,77 @@ def test_fetch_pr_snapshot_unstable_yields_checks_green(monkeypatch) -> None:
     assert snap.checks_green is True
 
 
+def test_checks_green_no_rollup_clean_merge_state(monkeypatch) -> None:
+    """Empty/missing statusCheckRollup + mergeStateStatus=CLEAN must be
+    treated as green so decide() returns merge.
+
+    Regression for codex P1 on PR #12: repos with no CI configured at all
+    (e.g. mctl-gitops merges have CI=SKIPPED with an empty rollup) still
+    get classified as CLEAN by GitHub, but the previous logic only set
+    checks_green when the raw rollup state was SUCCESS or
+    mergeStateStatus was UNSTABLE/HAS_HOOKS. A genuinely mergeable PR
+    therefore stalled in `wait` forever.
+    """
+    # Unit-level: decide() merges when the snapshot reports
+    # checks_green=True from a CLEAN merge state with no rollup.
+    pr = make_pr(merge_state_status="CLEAN", checks_green=True)
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review) == ("merge", None)
+
+    # End-to-end through _fetch_pr_snapshot: an empty rollup must yield
+    # checks_green=True only when mergeStateStatus is CLEAN.
+    def make_view(merge_state: str, rollup: Optional[str]) -> dict:
+        rollup_obj: Optional[dict] = (
+            {"state": rollup} if rollup is not None else None
+        )
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "number": 101,
+                        "state": "OPEN",
+                        "merged": False,
+                        "headRefOid": "e" * 40,
+                        "mergeCommit": None,
+                        "statusCheckRollup": rollup_obj,
+                        "mergeStateStatus": merge_state,
+                        "commits": {"nodes": []},
+                        "timelineItems": {"nodes": []},
+                        "isDraft": False,
+                    }
+                }
+            }
+        }
+
+    # CLEAN + no rollup -> green.
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view("CLEAN", None),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-gitops", 101)
+    assert snap is not None
+    assert snap.checks_green is True
+
+    # CLEAN + empty-string rollup state (defensive — same effect).
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view("CLEAN", ""),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-gitops", 101)
+    assert snap is not None
+    assert snap.checks_green is True
+
+    # No rollup but a non-CLEAN merge state must NOT be treated as green;
+    # the shepherd cannot conclude anything about CI from a BLOCKED PR.
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view("BLOCKED", None),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-gitops", 101)
+    assert snap is not None
+    assert snap.checks_green is False
+
+
 def test_decide_keeps_top_level_finding_without_commit_id() -> None:
     """Top-level issue comment findings have commit_id=None and are kept.
 

@@ -437,9 +437,18 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
     # also treat them as "checks green" even when the raw rollup is not
     # SUCCESS. Otherwise PRs with non-required CI failures (or in
     # hook-enabled repos) would stall here despite a clean codex review.
+    #
+    # Third branch: the rollup is absent/empty when the repo has no CI
+    # configured at all (e.g. mctl-gitops where merges have CI=SKIPPED
+    # with an empty rollup). In that case GitHub still classifies the PR
+    # as CLEAN — there is literally nothing to wait for. Without this
+    # branch decide() would return ("wait", None) forever and the
+    # shepherd would never progress past the `if not pr.checks_green`
+    # gate.
     checks_green = (
         rollup_state == "SUCCESS"
         or merge_state_status in {"UNSTABLE", "HAS_HOOKS"}
+        or (not rollup_state and merge_state_status == "CLEAN")
     )
 
     return PRSnapshot(
