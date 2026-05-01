@@ -95,6 +95,50 @@ DEFAULT_STATE_DIR = Path(
 )
 
 
+# ---------------------------------------------------------------------------
+# Sentinel exit codes for review-feedback mode. These let the Tier 3 shepherd
+# tell deterministic *content* failures apart from transient subprocess /
+# auth / network plumbing failures: only the former should consume one of
+# the MAX_REVIEW_ATTEMPTS budget slots and eventually flip the proposal to
+# `review-stuck`. Without a sentinel, the shepherd treats every non-zero
+# exit as transient and retries forever — see codex P1 on PR #12.
+#
+# The mapping is intentionally narrow: any error path that is NOT one of
+# these explicit codes falls back to plain `sys.exit(1)` which the shepherd
+# classifies as transient. New deterministic-failure paths must opt in by
+# returning an `ImplementResult.error` whose prefix matches the table in
+# `_review_feedback_exit_code()`.
+# ---------------------------------------------------------------------------
+EXIT_OK = 0
+EXIT_GENERIC_FAILURE = 1
+EXIT_NO_FOLLOWUP_COMMITS = 42
+EXIT_BRANCH_MISSING_ON_ORIGIN = 43
+
+
+def _review_feedback_exit_code(error: str) -> int:
+    """Map an ``ImplementResult.error`` string to a sentinel exit code.
+
+    Deterministic content failures get their own non-1 codes so the Tier 3
+    shepherd can distinguish them from transient plumbing errors:
+
+      - 42: agent ran but committed nothing — re-running the SDK with the
+        same findings will deterministically reproduce the same outcome.
+      - 43: PR branch was deleted on origin between ticks — re-running
+        cannot resurrect it; a human must look at the PR.
+
+    Everything else (shell failures, SystemExit from missing config,
+    unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and the
+    shepherd treats it as transient.
+    """
+    if not error:
+        return EXIT_OK
+    if error == "implementer produced no follow-up commits":
+        return EXIT_NO_FOLLOWUP_COMMITS
+    if error.startswith("branch ") and "not found on origin" in error:
+        return EXIT_BRANCH_MISSING_ON_ORIGIN
+    return EXIT_GENERIC_FAILURE
+
+
 @dataclass
 class ProposalRef:
     """Lightweight handle to a proposal on disk."""
@@ -744,7 +788,12 @@ def main() -> None:
         print("\n=== Review-feedback summary ===")
         if result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
-            sys.exit(1)
+            # Map deterministic content failures to sentinel exit codes so
+            # the Tier 3 shepherd can stop retrying them forever (see
+            # `_review_feedback_exit_code` docstring). Transient plumbing
+            # errors continue to exit 1 so the shepherd's transient-failure
+            # path is unchanged.
+            sys.exit(_review_feedback_exit_code(result.error))
         if result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
             return
