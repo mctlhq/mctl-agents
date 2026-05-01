@@ -94,12 +94,24 @@ MERGEABLE_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 
 
 class FollowupSubprocessError(RuntimeError):
-    """Raised when ``apply_followup`` cannot push a new commit because
-    the implementer subprocess exited non-zero (auth/network/branch
-    issues etc.). The outer state machine treats this as transient and
-    must NOT consume one of the MAX_REVIEW_ATTEMPTS slots — the cap is
-    for codex-flagged real fix attempts, not subprocess plumbing
-    failures (see design.md L122-142)."""
+    """Raised when ``apply_followup`` cannot push a new commit.
+
+    ``transient`` distinguishes plumbing failures (auth/network/branch
+    protection — retry next tick, do NOT consume a review_attempts slot)
+    from deterministic content failures (the implementer ran but produced
+    no commits, or the PR branch was deleted on origin — same outcome
+    every retry, so they MUST consume a slot and eventually flip the
+    proposal to ``review-stuck`` for human triage).
+
+    Default ``transient=True`` keeps backward compatibility with callers
+    that raise without specifying — they are assumed safe-to-retry.
+    Deterministic failures are surfaced via sentinel exit codes from
+    ``run_implementer`` (see ``run_implementer._review_feedback_exit_code``).
+    """
+
+    def __init__(self, message: str, *, transient: bool = True) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 # ---------------------------------------------------------------------------
@@ -903,14 +915,29 @@ def apply_followup(
     if proc.returncode != 0:
         # Surface as a typed exception so the outer state machine can
         # tell a transient subprocess failure (auth/network/branch
-        # protection on the implementer's git push) apart from a real
-        # codex fix attempt. The MAX_REVIEW_ATTEMPTS cap exists for
-        # codex-flagged content fixes, not for plumbing errors — burning
-        # the budget on the latter would falsely drive proposals into
-        # terminal review-stuck.
+        # protection on the implementer's git push) apart from a
+        # deterministic content failure (the agent ran but produced no
+        # commits, or the PR branch was deleted on origin). The
+        # MAX_REVIEW_ATTEMPTS cap exists for the latter — re-running an
+        # auth-failed push is free, re-running an SDK call that just
+        # produced nothing is not, and the only graceful exit for the
+        # deterministic case is to flip to review-stuck once the budget
+        # is spent.
+        #
+        # The implementer encodes the kind of failure via sentinel exit
+        # codes (`run_implementer.EXIT_NO_FOLLOWUP_COMMITS` = 42,
+        # `EXIT_BRANCH_MISSING_ON_ORIGIN` = 43). Anything else (1, 137,
+        # 2, ...) is treated as transient — we cannot tell the kind from
+        # the code alone.
+        deterministic_codes = {
+            run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
+            run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+        }
+        is_transient = proc.returncode not in deterministic_codes
         raise FollowupSubprocessError(
             f"implementer follow-up exited non-zero "
-            f"({proc.returncode}) for {service}/{slug}"
+            f"({proc.returncode}) for {service}/{slug}",
+            transient=is_transient,
         )
     return bundle
 
@@ -1039,8 +1066,15 @@ def process_one(
         # flipping status. The MAX_REVIEW_ATTEMPTS cap is for codex
         # content fix attempts, not subprocess plumbing failures — a
         # transient auth/network/branch error in the implementer push
-        # must NOT burn one of the three slots. On failure we leave
-        # .status.yaml untouched so the next tick retries cleanly.
+        # must NOT burn one of the three slots. On transient failure we
+        # leave .status.yaml untouched so the next tick retries cleanly.
+        #
+        # Deterministic content failures (the implementer ran but
+        # produced no commits, or the PR branch was deleted on origin)
+        # DO consume a slot — re-running them yields the same outcome,
+        # so the cap is the only thing that prevents the proposal from
+        # spinning forever. When the cap is hit, flip to review-stuck
+        # so a human can intervene.
         try:
             apply_followup(
                 ref.service, ref.slug, payload,
@@ -1048,15 +1082,55 @@ def process_one(
                 state_dir=state_dir,
             )
         except FollowupSubprocessError as e:
+            if e.transient:
+                print(
+                    f"warn: {ref.service}/{ref.slug}: follow-up subprocess "
+                    f"failed transiently ({e}); leaving "
+                    f"review_attempts={ref.review_attempts} and "
+                    f"status={ref.status} for retry next tick"
+                )
+                return ShepherdResult(
+                    ref=ref,
+                    decision="wait",
+                    notes="follow-up subprocess failed; will retry next tick",
+                )
+            # Deterministic failure — count the attempt and surface the
+            # proposal once the cap is exhausted.
+            new_attempts = ref.review_attempts + 1
             print(
-                f"warn: {ref.service}/{ref.slug}: follow-up subprocess "
-                f"failed ({e}); leaving review_attempts={ref.review_attempts} "
-                f"and status={ref.status} for retry next tick"
+                f"error: {ref.service}/{ref.slug}: follow-up subprocess "
+                f"failed deterministically ({e}); incrementing "
+                f"review_attempts to {new_attempts}"
             )
+            if new_attempts >= MAX_REVIEW_ATTEMPTS:
+                update_status(
+                    ref,
+                    "review-stuck",
+                    review_attempts=new_attempts,
+                    notes=(
+                        f"Follow-up failed deterministically "
+                        f"{new_attempts} time(s) ({e}); human triage "
+                        f"required."
+                    ),
+                )
+                return ShepherdResult(
+                    ref=ref,
+                    decision="review-stuck",
+                    notes="follow-up subprocess failed deterministically",
+                )
+            update_status(
+                ref,
+                "review-fixing",
+                review_attempts=new_attempts,
+            )
+            update_status(ref, "implemented")
             return ShepherdResult(
                 ref=ref,
                 decision="wait",
-                notes="follow-up subprocess failed; will retry next tick",
+                notes=(
+                    "follow-up subprocess failed deterministically; "
+                    "attempt counted, will retry next tick"
+                ),
             )
 
         # Followup pushed successfully — now it is fair to count the

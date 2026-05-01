@@ -619,7 +619,7 @@ def test_process_one_merge_failure_falls_back_to_wait(tmp_path) -> None:
 
 
 def test_outer_loop_does_not_count_attempt_on_subprocess_failure(tmp_path) -> None:
-    """Subprocess plumbing failures must NOT consume review_attempts.
+    """Transient subprocess plumbing failures must NOT consume review_attempts.
 
     Regression for codex P1 on PR #12: ``process_one`` previously flipped
     status to ``review-fixing`` and incremented the counter BEFORE
@@ -629,9 +629,9 @@ def test_outer_loop_does_not_count_attempt_on_subprocess_failure(tmp_path) -> No
     proposals to terminal ``review-stuck``.
 
     With the fix, ``apply_followup`` raises ``FollowupSubprocessError``
-    on non-zero exit and the outer loop catches it: the attempt counter
-    and on-disk status are left exactly as they were so the next tick
-    retries cleanly.
+    on non-zero exit and the outer loop catches it: for ``transient=True``
+    (auth/network/etc.), the attempt counter and on-disk status are left
+    exactly as they were so the next tick retries cleanly.
     """
     ref = make_ref(tmp_path, review_attempts=1)
     pr = make_pr()
@@ -639,6 +639,7 @@ def test_outer_loop_does_not_count_attempt_on_subprocess_failure(tmp_path) -> No
     review = CodexReview(has_responded=True, findings=findings)
 
     def boom(*_a, **_kw):
+        # Default constructor → transient=True. Plain plumbing failure.
         raise run_shepherd.FollowupSubprocessError(
             "implementer follow-up exited non-zero (1)"
         )
@@ -661,6 +662,144 @@ def test_outer_loop_does_not_count_attempt_on_subprocess_failure(tmp_path) -> No
     # In-memory ref state also untouched.
     assert ref.review_attempts == 1
     assert ref.status == "implemented"
+
+
+def test_outer_loop_counts_attempt_on_deterministic_subprocess_failure(tmp_path) -> None:
+    """Deterministic subprocess failures DO consume review_attempts.
+
+    Codex P1 follow-up on PR #12: re-running an implementer that produced
+    no commits (or whose PR branch was deleted on origin) yields the same
+    failure every tick. The shepherd previously caught those exits as
+    transient and retried forever. The fix: ``FollowupSubprocessError``
+    carries a ``transient`` flag; deterministic failures (sentinel exit
+    codes 42/43 from the implementer) increment the counter and either
+    flip to ``review-fixing`` (still under the cap) or ``review-stuck``
+    (cap exhausted).
+
+    Below the cap: counter ticks up, status flips to ``review-fixing``
+    then back to ``implemented`` so the next tick re-decides.
+    """
+    ref = make_ref(tmp_path, review_attempts=1)
+    pr = make_pr()
+    findings = [make_finding()]
+    review = CodexReview(has_responded=True, findings=findings)
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (42)",
+            transient=False,
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    # Deterministic failure under the cap → wait but counter incremented.
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["review_attempts"] == 2
+    # Status returned to `implemented` after the brief `review-fixing` flip
+    # so the next tick can re-evaluate (same shape as a successful followup).
+    assert final["status"] == "implemented"
+
+
+def test_outer_loop_flips_to_review_stuck_on_deterministic_at_cap(tmp_path) -> None:
+    """Deterministic failure at the cap flips the proposal to review-stuck.
+
+    Counter starts at MAX_REVIEW_ATTEMPTS - 1 = 2. The subprocess fails
+    deterministically; the new counter value (3) hits the cap, so the
+    proposal flips terminal so a human can intervene instead of the
+    shepherd spinning indefinitely.
+    """
+    ref = make_ref(tmp_path, review_attempts=run_shepherd.MAX_REVIEW_ATTEMPTS - 1)
+    pr = make_pr()
+    findings = [make_finding()]
+    review = CodexReview(has_responded=True, findings=findings)
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (43)",
+            transient=False,
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "review-stuck"
+    final = read_status(ref)
+    assert final["status"] == "review-stuck"
+    assert final["review_attempts"] == run_shepherd.MAX_REVIEW_ATTEMPTS
+    assert "deterministic" in (final.get("notes") or "").lower()
+
+
+def test_apply_followup_raises_transient_on_generic_failure(monkeypatch) -> None:
+    """returncode=1 (or any non-sentinel non-zero) -> transient=True.
+
+    Generic failures (auth blip, network glitch, branch protection
+    rejection) cannot be distinguished from each other by exit code alone,
+    so the safer default is ``transient=True`` and the shepherd retries
+    next tick without consuming a review_attempts slot.
+    """
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = 1
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup(
+                "mctl-web", "test-slug", findings,
+            )
+    assert exc.value.transient is True
+
+
+def test_apply_followup_raises_deterministic_on_no_commits(monkeypatch) -> None:
+    """returncode=42 -> transient=False (no follow-up commits sentinel).
+
+    The implementer ran but committed nothing; re-running with the same
+    findings will reproduce the same outcome, so the shepherd MUST count
+    this as a real address-review attempt and eventually flip the proposal
+    to ``review-stuck`` once the cap is hit. Same reasoning for code 43
+    (PR branch missing on origin).
+    """
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    for code in (
+        run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
+        run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+    ):
+        class _Result:
+            returncode = code
+
+        def fake_run(cmd, check=False, text=False, **_kwargs):
+            return _Result()
+
+        with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+             patch.object(run_shepherd.subprocess, "run", fake_run):
+            with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+                run_shepherd.apply_followup(
+                    "mctl-web", "test-slug", findings,
+                )
+        assert exc.value.transient is False, (
+            f"exit code {code} must be classified as deterministic"
+        )
 
 
 def test_process_one_pr_unfetchable_returns_wait(tmp_path) -> None:
