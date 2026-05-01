@@ -618,6 +618,51 @@ def test_process_one_merge_failure_falls_back_to_wait(tmp_path) -> None:
     assert read_status(ref)["status"] == "implemented"
 
 
+def test_outer_loop_does_not_count_attempt_on_subprocess_failure(tmp_path) -> None:
+    """Subprocess plumbing failures must NOT consume review_attempts.
+
+    Regression for codex P1 on PR #12: ``process_one`` previously flipped
+    status to ``review-fixing`` and incremented the counter BEFORE
+    calling ``apply_followup`` — so a transient auth / network / branch
+    protection error in the implementer push wasted one of the three
+    cap slots without producing a new commit, and could falsely drive
+    proposals to terminal ``review-stuck``.
+
+    With the fix, ``apply_followup`` raises ``FollowupSubprocessError``
+    on non-zero exit and the outer loop catches it: the attempt counter
+    and on-disk status are left exactly as they were so the next tick
+    retries cleanly.
+    """
+    ref = make_ref(tmp_path, review_attempts=1)
+    pr = make_pr()
+    findings = [make_finding()]
+    review = CodexReview(has_responded=True, findings=findings)
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (1)"
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    # decide() said address-review, but the subprocess failed; the outer
+    # loop treats it as a transient wait and leaves state alone.
+    assert result.decision == "wait"
+    final = read_status(ref)
+    # Counter unchanged — subprocess failure must not burn the budget.
+    assert final["review_attempts"] == 1
+    # Status unchanged — next tick re-decides from the same starting point.
+    assert final["status"] == "implemented"
+    # In-memory ref state also untouched.
+    assert ref.review_attempts == 1
+    assert ref.status == "implemented"
+
+
 def test_process_one_pr_unfetchable_returns_wait(tmp_path) -> None:
     """find_pr_for_proposal -> None (network blip etc.) is a soft wait."""
     ref = make_ref(tmp_path)

@@ -93,6 +93,15 @@ MAX_REVIEW_ATTEMPTS = 3
 MERGEABLE_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 
 
+class FollowupSubprocessError(RuntimeError):
+    """Raised when ``apply_followup`` cannot push a new commit because
+    the implementer subprocess exited non-zero (auth/network/branch
+    issues etc.). The outer state machine treats this as transient and
+    must NOT consume one of the MAX_REVIEW_ATTEMPTS slots — the cap is
+    for codex-flagged real fix attempts, not subprocess plumbing
+    failures (see design.md L122-142)."""
+
+
 # ---------------------------------------------------------------------------
 # Data classes. Plain old dataclasses, same shape as run_implementer.py.
 # ---------------------------------------------------------------------------
@@ -886,13 +895,23 @@ def apply_followup(
     print(f"$ {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, check=False, text=True)
-        if proc.returncode != 0:
-            print(f"warn: implementer follow-up exited non-zero ({proc.returncode}); leaving status as review-fixing")
     finally:
         try:
             os.unlink(bundle_path)
         except FileNotFoundError:
             pass  # already gone — that's fine
+    if proc.returncode != 0:
+        # Surface as a typed exception so the outer state machine can
+        # tell a transient subprocess failure (auth/network/branch
+        # protection on the implementer's git push) apart from a real
+        # codex fix attempt. The MAX_REVIEW_ATTEMPTS cap exists for
+        # codex-flagged content fixes, not for plumbing errors — burning
+        # the budget on the latter would falsely drive proposals into
+        # terminal review-stuck.
+        raise FollowupSubprocessError(
+            f"implementer follow-up exited non-zero "
+            f"({proc.returncode}) for {service}/{slug}"
+        )
     return bundle
 
 
@@ -1016,20 +1035,39 @@ def process_one(
             )
             return ShepherdResult(ref=ref, decision="review-stuck")
 
-        # Flip to review-fixing for the duration of the followup; the
-        # next tick re-reads the PR and either sees the new commit
-        # (back to implemented) or still sees the same head (wait).
+        # Run the followup BEFORE incrementing the attempt counter or
+        # flipping status. The MAX_REVIEW_ATTEMPTS cap is for codex
+        # content fix attempts, not subprocess plumbing failures — a
+        # transient auth/network/branch error in the implementer push
+        # must NOT burn one of the three slots. On failure we leave
+        # .status.yaml untouched so the next tick retries cleanly.
+        try:
+            apply_followup(
+                ref.service, ref.slug, payload,
+                skip_subprocess=skip_subprocess,
+                state_dir=state_dir,
+            )
+        except FollowupSubprocessError as e:
+            print(
+                f"warn: {ref.service}/{ref.slug}: follow-up subprocess "
+                f"failed ({e}); leaving review_attempts={ref.review_attempts} "
+                f"and status={ref.status} for retry next tick"
+            )
+            return ShepherdResult(
+                ref=ref,
+                decision="wait",
+                notes="follow-up subprocess failed; will retry next tick",
+            )
+
+        # Followup pushed successfully — now it is fair to count the
+        # attempt. Flip to review-fixing so the in-flight signal is on
+        # disk, then back to implemented so the next tick re-evaluates
+        # codex against the new head SHA the implementer just pushed.
         update_status(
             ref,
             "review-fixing",
             review_attempts=ref.review_attempts + 1,
         )
-        apply_followup(
-            ref.service, ref.slug, payload,
-            skip_subprocess=skip_subprocess,
-            state_dir=state_dir,
-        )
-        # Flip back to implemented so the next tick re-evaluates.
         update_status(ref, "implemented")
         return ShepherdResult(ref=ref, decision="address-review")
 
