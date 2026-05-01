@@ -611,6 +611,11 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             sev = _extract_severity(body)
             if sev in ("P1", "P2") and _iso_gt(created_at, pr.head_pushed_at):
                 # Top-level issue comment — no commit_id; time-anchor only.
+                # A finding posted as an issue comment is itself proof codex
+                # responded; set the flag so decide() routes to address-review
+                # instead of spinning in wait when no separate +1 reaction or
+                # "no major issues" sibling comment exists.
+                has_responded = True
                 findings.append(CodexFinding(
                     body=body,
                     path=None,

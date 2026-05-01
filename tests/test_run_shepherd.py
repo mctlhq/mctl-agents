@@ -393,6 +393,66 @@ def test_decide_keeps_top_level_finding_without_commit_id() -> None:
     assert payload == [issue_finding]
 
 
+def test_has_responded_set_on_issue_comment_findings() -> None:
+    """Codex P1/P2 posted as a top-level issue comment must flip
+    ``has_responded`` to True.
+
+    Regression for codex P1 on PR #12: when codex emitted findings only
+    via issue comments (no formal review, no line-anchored comment, no
+    +1 reaction, no "Didn't find any major issues" sibling), the parser
+    appended them to ``findings`` but left ``has_responded`` False.
+    ``decide()`` checks ``has_responded`` before evaluating findings, so
+    the shepherd would loop in ``wait`` instead of routing to
+    ``address-review``. The fix sets the flag symmetrically with the
+    other source branches.
+    """
+    pr = make_pr()
+
+    issue_comment_body = (
+        "![P1 Badge] Pin tar to >=6.2.1\n\n"
+        "Top-level issue comment finding from codex."
+    )
+    issue_comments = [
+        {
+            "id": 9001,
+            "user": {"login": run_shepherd.CODEX_BOT},
+            "body": issue_comment_body,
+            # Strictly newer than HEAD_PUSHED_AT so _iso_gt returns True.
+            "created_at": "2026-04-29T11:30:00Z",
+        }
+    ]
+
+    def fake_gh_api_json(args: list[str]):
+        # First arg is the endpoint path; route by suffix.
+        endpoint = args[0]
+        if endpoint.endswith("/reviews"):
+            return []
+        if endpoint.endswith("/pulls/{0}/comments".format(pr.number)):
+            return []
+        if endpoint.endswith("/issues/{0}/comments".format(pr.number)):
+            return issue_comments
+        if "/issues/comments/" in endpoint and endpoint.endswith("/reactions"):
+            return []
+        return []
+
+    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake_gh_api_json):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is True
+    assert len(review.findings) == 1
+    finding = review.findings[0]
+    assert finding.severity == "P1"
+    assert finding.commit_id is None
+    assert finding.path is None
+    assert finding.line is None
+
+    # Sanity: feeding this review into decide() with a mergeable PR must
+    # route to address-review, not wait.
+    decision, payload = decide(pr, review)
+    assert decision == "address-review"
+    assert payload == [finding]
+
+
 # ---------------------------------------------------------------------------
 # T6: outer-loop 3-attempt cap
 # ---------------------------------------------------------------------------
