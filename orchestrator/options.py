@@ -158,10 +158,10 @@ def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions
     Python wrapper hands to the Tier 2 implementer via
     `--review-feedback`. It is read-only — no Write/Edit/Bash.
 
-    ``cwd`` is ``agents/_shepherd/`` so ``setting_sources=["project"]``
-    picks up ``agents/_shepherd/.claude/agents/shepherd.md`` — same
+    ``cwd`` is `agents/_shepherd/` so `setting_sources=["project"]`
+    picks up `agents/_shepherd/.claude/agents/shepherd.md` — same
     pattern as every other service agent in this repo (sub-agent prompts
-    live under ``.claude/agents/`` in the working directory).
+    live under `.claude/agents/` in the working directory).
 
     No mctl MCP, no sibling repos — the bundle is self-contained text.
     """
