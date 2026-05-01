@@ -662,6 +662,89 @@ def test_main_non_dry_run_calls_sdk_auth(tmp_path, monkeypatch) -> None:
     mocked_auth.assert_called_once()
 
 
+def test_find_pr_uses_explicit_state_dir(tmp_path) -> None:
+    """find_pr_for_proposal must read the proposal under the explicit
+    state_dir argument, not under DEFAULT_STATE_DIR.
+
+    Regression for codex P1 on PR #12: process_one() previously called
+    find_pr_for_proposal(service, slug) without forwarding --state-dir,
+    so a CLI invocation with a custom path silently re-read the env
+    default and produced "could not fetch PR snapshot" warnings on
+    valid proposals.
+    """
+    custom_dir = tmp_path / "custom-state"
+    proposal_dir = custom_dir / "mctl-web" / "proposals" / "wrangler-cve"
+    proposal_dir.mkdir(parents=True)
+    pr_url = "https://github.com/mctlhq/mctl-web/pull/77"
+    (proposal_dir / ".status.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "status": "implemented",
+                "updated_at": "2026-04-29T09:00:00Z",
+                "updated_by": "mctl-agents[bot]",
+                "pr": pr_url,
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # Point DEFAULT_STATE_DIR at an unrelated tree to prove the helper
+    # is NOT silently falling back to it.
+    bogus_default = tmp_path / "bogus-default"
+    bogus_default.mkdir()
+
+    captured: dict = {}
+    sentinel = object()
+
+    def fake_fetch(repo: str, number: int):
+        captured["repo"] = repo
+        captured["number"] = number
+        return sentinel
+
+    with patch.object(run_shepherd, "DEFAULT_STATE_DIR", bogus_default), \
+         patch.object(run_shepherd, "_fetch_pr_snapshot", side_effect=fake_fetch):
+        result = run_shepherd.find_pr_for_proposal(
+            "mctl-web", "wrangler-cve", state_dir=custom_dir,
+        )
+
+    assert result is sentinel
+    assert captured == {"repo": "mctlhq/mctl-web", "number": 77}
+
+    # Sanity: with no state_dir argument, the helper falls back to
+    # DEFAULT_STATE_DIR, which we pointed at an empty tree -> None.
+    with patch.object(run_shepherd, "DEFAULT_STATE_DIR", bogus_default), \
+         patch.object(run_shepherd, "_fetch_pr_snapshot",
+                      side_effect=AssertionError("must not fetch — no PR url")):
+        fallback = run_shepherd.find_pr_for_proposal("mctl-web", "wrangler-cve")
+    assert fallback is None
+
+
+def test_process_one_forwards_state_dir(tmp_path) -> None:
+    """process_one() must forward state_dir to find_pr_for_proposal.
+
+    Without this plumbing, a CLI run with --state-dir <X> reads the env
+    default in the lookup and reports valid proposals as wait/error.
+    """
+    ref = make_ref(tmp_path)
+    custom_dir = tmp_path / "explicit-state"
+    custom_dir.mkdir()
+
+    captured: dict = {}
+
+    def fake_find(service: str, slug: str, state_dir=None):
+        captured["service"] = service
+        captured["slug"] = slug
+        captured["state_dir"] = state_dir
+        return None  # short-circuit out of process_one with a wait
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", side_effect=fake_find):
+        result = process_one(ref, skip_subprocess=True, state_dir=custom_dir)
+
+    assert result.decision == "wait"
+    assert captured["state_dir"] == custom_dir
+
+
 def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
     """skip_subprocess=False forks `python -m orchestrator.run_implementer`
     with --review-feedback pointed at the bundle JSON.

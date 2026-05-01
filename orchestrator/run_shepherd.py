@@ -913,6 +913,7 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
 def process_one(
     ref: ProposalRef,
     skip_subprocess: bool = False,
+    state_dir: Optional[Path] = None,
 ) -> ShepherdResult:
     """Drive a single proposal one tick further.
 
@@ -922,8 +923,14 @@ def process_one(
     - Writes back .status.yaml.
     - Returns a ShepherdResult with the decision name (greppable in
       the workflow log).
+
+    ``state_dir`` is forwarded to every helper that resolves proposals
+    on disk. When ``None``, callers fall back to ``DEFAULT_STATE_DIR``
+    (the env-driven default). The CLI always threads ``args.state_dir``
+    so a non-default ``--state-dir`` is honoured end-to-end and we do
+    not silently re-read from the env path.
     """
-    pr = find_pr_for_proposal(ref.service, ref.slug)
+    pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
     if pr is None:
         return ShepherdResult(
             ref=ref,
@@ -1116,8 +1123,11 @@ def main() -> None:
             continue
         # Production mode: apply_followup forks the implementer with
         # --review-feedback. Tests pass skip_subprocess=True via
-        # process_one() to avoid forking real shells.
-        result = process_one(ref)
+        # process_one() to avoid forking real shells. ``state_dir`` is
+        # threaded through so a non-default ``--state-dir`` is honoured
+        # by every helper (find_pr_for_proposal, apply_followup, ...)
+        # rather than silently falling back to the env-driven default.
+        result = process_one(ref, state_dir=state_dir)
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate
