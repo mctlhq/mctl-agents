@@ -1162,3 +1162,141 @@ def test_apply_followup_propagates_state_dir(tmp_path) -> None:
             "mctl-web", "test-slug", findings,
         )
     assert "--state-dir" not in captured["cmd"]
+
+
+# ---------------------------------------------------------------------------
+# Dead-letter `in-progress` recovery
+#
+# Tier 2 sets `in-progress` BEFORE pushing, then flips to `implemented`
+# with `pr:` after `gh pr create`. If the second update_status_yaml is
+# interrupted, the proposal stays `in-progress` with a real PR URL. If
+# the operator then closes that PR without merging, shepherd needs to
+# claim the dead-letter and flip to `rejected` — but only when the PR
+# is CLOSED-unmerged. OPEN/MERGED PRs belong to Tier 2 mid-flight.
+# Reference incident: mctl-openclaw/upgrade-to-2026-4-27 (PR
+# mctlhq/mctl-openclaw#15, closed 2026-04-30).
+# ---------------------------------------------------------------------------
+def test_discover_refs_includes_in_progress_with_closed_pr(tmp_path) -> None:
+    """Discovery picks up in-progress proposals that have a PR URL.
+
+    Pins the `SHEPHERD_INPUT_STATUSES` scope expansion: an in-progress
+    proposal with a recorded PR is enrolled, alongside the steady-state
+    `implemented` case.
+    """
+    make_status_yaml(
+        tmp_path,
+        service="mctl-openclaw",
+        slug="upgrade-to-2026-4-27",
+        status="in-progress",
+        pr="https://github.com/mctlhq/mctl-openclaw/pull/15",
+    )
+    make_status_yaml(
+        tmp_path,
+        service="mctl-web",
+        slug="baseline",
+        status="implemented",
+    )
+
+    refs = run_shepherd._discover_refs(tmp_path)
+
+    by_slug = {r.slug: r for r in refs}
+    assert set(by_slug) == {"upgrade-to-2026-4-27", "baseline"}
+    assert by_slug["upgrade-to-2026-4-27"].status == "in-progress"
+    assert by_slug["upgrade-to-2026-4-27"].pr_url == (
+        "https://github.com/mctlhq/mctl-openclaw/pull/15"
+    )
+
+
+def test_discover_refs_skips_in_progress_with_no_pr(tmp_path) -> None:
+    """The pre-PR Tier-2-mid-creation case is filtered at discovery.
+
+    Pins the existing `if not pr_url: continue` guard against the new
+    scope expansion: an in-progress proposal without a `pr:` field
+    means Tier 2 is still constructing the PR — shepherd must not
+    enrol it (no work to do, would race the implementer).
+    """
+    make_status_yaml(
+        tmp_path,
+        service="mctl-openclaw",
+        slug="mid-creation",
+        status="in-progress",
+        pr=None,
+    )
+
+    refs = run_shepherd._discover_refs(tmp_path)
+
+    assert refs == []
+
+
+def test_process_one_in_progress_with_open_pr_skips(tmp_path) -> None:
+    """OPEN PR + status=in-progress -> wait, no on-disk change.
+
+    Tier 2 race avoidance: the implementer just pushed the PR and is
+    about to flip status to `implemented`. Shepherd must defer.
+    """
+    ref = make_ref(tmp_path, status="in-progress")
+    pr = make_pr()  # default: state="OPEN", merged=False, closed_unmerged=False
+
+    def must_not_run(*_a, **_kw):
+        raise AssertionError("guard must short-circuit before codex/copilot reads")
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", side_effect=must_not_run), \
+         patch.object(run_shepherd, "read_copilot_review", side_effect=must_not_run):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "wait"
+    assert "Tier 2" in (result.notes or "")
+    assert read_status(ref)["status"] == "in-progress"
+
+
+def test_process_one_in_progress_with_merged_pr_skips(tmp_path) -> None:
+    """MERGED PR + status=in-progress -> wait, no on-disk change.
+
+    Stale-status race avoidance: Tier 2 may still flip to `implemented`
+    on the next implementer tick, after which the normal `implemented`
+    path will detect the merge and produce a clean flip-to-merged.
+    Shepherd hijacking it from `in-progress` would skip the recorded
+    pipeline transition.
+    """
+    ref = make_ref(tmp_path, status="in-progress")
+    pr = make_pr(merged=True, merge_commit="deadbeef" * 5)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review",
+                      return_value=CodexReview(False, [])), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "wait"
+    assert "Tier 2" in (result.notes or "")
+    assert read_status(ref)["status"] == "in-progress"
+
+
+def test_process_one_in_progress_dead_letter_flips_to_rejected(tmp_path) -> None:
+    """End-to-end: in-progress + closed-unmerged PR -> rejected.
+
+    Mirrors the mctl-openclaw/upgrade-to-2026-4-27 real-world path:
+    Tier 2 left status=in-progress with a PR URL, operator closed the
+    PR without merging, shepherd flips to rejected. Verifies that
+    update_status preserves `pr:` and clears `review_attempts`.
+    """
+    ref = make_ref(tmp_path, status="in-progress", review_attempts=2)
+    pr = make_pr(closed_unmerged=True)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review",
+                      return_value=CodexReview(False, [])), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "flip-to-rejected"
+    final = read_status(ref)
+    assert final["status"] == "rejected"
+    assert "without merging" in (final.get("notes") or "")
+    assert final["pr"] == PR_URL
+    # review_attempts is cleared on terminal-status flip; either absent
+    # or explicitly null is acceptable.
+    assert not final.get("review_attempts")
