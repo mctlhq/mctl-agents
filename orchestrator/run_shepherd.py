@@ -76,10 +76,22 @@ DEFAULT_STATE_DIR = Path(
 CODEX_BOT = "chatgpt-codex-connector[bot]"
 COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 
-# Statuses that the shepherd actively ticks. Both are non-terminal: see
-# requirements.md L41-58 for why filtering to `implemented` only strands
-# proposals that the previous tick moved to `review-fixing`.
-SHEPHERD_INPUT_STATUSES = {"implemented", "review-fixing"}
+# Statuses that the shepherd's discovery pass picks up. `implemented`
+# and `review-fixing` are the steady-state inputs — see requirements.md
+# L41-58 for why both must be in scope.
+#
+# `in-progress` is included narrowly to recover dead-letters: Tier 2
+# sets `in-progress` BEFORE pushing a branch, then flips to
+# `implemented` with `pr:` after `gh pr create`. If that second
+# update_status_yaml is interrupted (pod evicted, network blip,
+# `gh pr create` retry hiccup), the PR exists on GitHub but the
+# proposal stays `in-progress` forever. The
+# operator-closes-without-merging case (mctl-openclaw#15, 2026-04-30 —
+# manually reconciled in mctl-gitops PR #97) is the canonical wedge.
+# `process_one` gates on PR shape so we never race Tier 2 mid-flight:
+# only `closed_unmerged` PRs are treated as dead-letters here, OPEN /
+# MERGED PRs return `wait` and leave the proposal for Tier 2.
+SHEPHERD_INPUT_STATUSES = {"implemented", "review-fixing", "in-progress"}
 
 # Outer-loop cap on consecutive address-review attempts before giving up
 # and flipping to `review-stuck`. Lives here (NOT in decide()) so the
@@ -1011,6 +1023,25 @@ def process_one(
             ref=ref,
             decision="wait",
             error="could not fetch PR snapshot",
+        )
+
+    # Dead-letter gate for `in-progress` proposals. Tier 2 owns the
+    # proposal whenever status is `in-progress` AND the PR is OPEN or
+    # MERGED — touching it would race the implementer's own
+    # `update_status_yaml(ref, "implemented", pr=...)` call. Only the
+    # closed-without-merge shape is a true dead-letter (Tier 2 finished
+    # `gh pr create`, status flip dropped, operator then closed the
+    # PR). decide() already returns flip-to-rejected for this case, so
+    # we fall through after the guard.
+    if ref.status == "in-progress" and not pr.closed_unmerged:
+        print(
+            f"info: {ref.service}/{ref.slug}: status=in-progress with "
+            f"pr.state={pr.state} merged={pr.merged}; deferring to Tier 2"
+        )
+        return ShepherdResult(
+            ref=ref,
+            decision="wait",
+            notes="in-progress with non-closed PR; Tier 2 owns",
         )
 
     codex = read_codex_review(pr)
