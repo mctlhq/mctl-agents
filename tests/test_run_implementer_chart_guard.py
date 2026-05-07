@@ -233,6 +233,28 @@ def test_detect_rejects_4component_pseudo_semver(tmp_path: Path):
     assert bumps == []
 
 
+def test_detect_cross_hunk_moved_and_bumped(tmp_path: Path):
+    """Codex P1 on PR mctl-agents#14: when `targetRevision` is moved
+    AND bumped in the same commit, `git diff --unified=0` emits two
+    hunks (delete at old line, add at new line). The previous version
+    cleared `pending_olds` on every `@@`, so the old value was dropped
+    before the add was seen and a real MAJOR bump silently bypassed
+    the guard. With the per-file (not per-hunk) FIFO, the bump is
+    correctly paired across hunk boundaries.
+    """
+    repo = _init_repo(tmp_path)
+    # v1: targetRevision near top, lots of padding after.
+    v1 = "header: x\n" + "targetRevision: 0.10.7\n" + ("padding: line\n" * 30)
+    # v2: targetRevision near bottom, padding moved up. Same field,
+    # different line — diff with unified=0 produces two hunks.
+    v2 = "header: x\n" + ("padding: line\n" * 30) + "targetRevision: 2.4.0\n"
+    _commit(repo, "apps/moved.yaml", v1, "init")
+    _commit(repo, "apps/moved.yaml", v2, "move + bump")
+
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    assert bumps == [("apps/moved.yaml", "0.10.7", "2.4.0")]
+
+
 def test_detect_ignores_uncommitted_working_tree_edits(tmp_path: Path):
     """Codex P2 on PR mctl-agents#14: the guard must reflect what would
     actually be pushed (HEAD), not the dirty working tree. An uncommitted

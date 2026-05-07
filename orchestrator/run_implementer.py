@@ -707,13 +707,27 @@ def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current_file = line[len("+++ b/"):]
+            # File boundary resets the queue — pairing `-` from one
+            # file with `+` from another is never correct.
             pending_olds = []
             continue
-        if line.startswith("--- ") or line.startswith("@@"):
-            # New hunk — drop any unmatched old versions from the
-            # previous hunk so we never falsely pair `-` from one hunk
-            # with `+` from another.
-            pending_olds = []
+        if line.startswith("--- "):
+            # `--- a/<file>` is the partner of `+++ b/<file>` in the
+            # diff header; just skip it. (We don't reset on `--- `
+            # alone because that would clobber `pending_olds` between
+            # the two header lines.)
+            continue
+        if line.startswith("@@"):
+            # NB: do NOT reset pending_olds on hunk boundaries.
+            # `git diff --unified=0` splits a single field-move-and-
+            # bump into two hunks (delete at old line, add at new
+            # line). Resetting here drops the old version before the
+            # add is parsed, and a real MAJOR bump bypasses the guard
+            # (Codex P1 on PR mctl-agents#14). The FIFO is per-file,
+            # not per-hunk; a stray un-paired `-` would surface as a
+            # false-positive bump on a later unrelated `+` in the
+            # same file, which is the safer failure mode for a guard
+            # (block-on-doubt).
             continue
         # Both `-` and `+` go through the anchored helper so a line
         # like `# targetRevision: 2.4.0` (comment) or
