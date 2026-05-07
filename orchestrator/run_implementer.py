@@ -661,28 +661,33 @@ def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list
 
     bumps: list[tuple[str, str, str]] = []
     current_file: Optional[str] = None
-    pending_old: Optional[str] = None
+    # FIFO queue of `-` versions waiting for their matching `+`. A
+    # single hunk like `-old1 -old2 +new1 +new2` must pair old1↔new1
+    # and old2↔new2; with a scalar pending_old we'd lose old1 on the
+    # second `-` and falsely pair old2↔new1, missing a real MAJOR
+    # bump (Codex P1 on PR mctl-agents#14).
+    pending_olds: list[str] = []
 
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current_file = line[len("+++ b/"):]
-            pending_old = None
+            pending_olds = []
         elif line.startswith("--- ") or line.startswith("@@"):
-            # New hunk — drop any unmatched old version from the previous
-            # hunk so we never falsely pair `-` from one hunk with `+`
-            # from another.
-            pending_old = None
+            # New hunk — drop any unmatched old versions from the
+            # previous hunk so we never falsely pair `-` from one hunk
+            # with `+` from another.
+            pending_olds = []
         elif line.startswith("-") and not line.startswith("---"):
             m = _TARGET_REVISION_RE.search(line)
             if m:
-                pending_old = m.group(1)
+                pending_olds.append(m.group(1))
         elif line.startswith("+") and not line.startswith("+++"):
             m = _TARGET_REVISION_RE.search(line)
-            if m and pending_old is not None and current_file is not None:
+            if m and pending_olds and current_file is not None:
+                old_ver = pending_olds.pop(0)
                 new_ver = m.group(1)
-                if _is_major_bump(pending_old, new_ver):
-                    bumps.append((current_file, pending_old, new_ver))
-                pending_old = None
+                if _is_major_bump(old_ver, new_ver):
+                    bumps.append((current_file, old_ver, new_ver))
     return bumps
 
 

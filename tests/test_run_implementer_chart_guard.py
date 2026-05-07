@@ -144,6 +144,41 @@ def test_detect_no_diff_returns_empty(tmp_path: Path):
     assert bumps == []
 
 
+def test_detect_multiple_bumps_in_single_hunk(tmp_path: Path):
+    """Codex P1 on PR mctl-agents#14: two `targetRevision` replacements
+    inside a single diff hunk must be paired in order. With a scalar
+    pending_old, the second `-` would clobber the first and the helper
+    would mismatch (or miss) the real MAJOR bump.
+
+    Layout: two top-level Applications in the same file, both bumped.
+    The first edit is a NON-major bump (0.5 → 0.6 — same major 0); the
+    second is a real MAJOR bump (1.x → 2.x). The previous scalar
+    implementation paired old2 (1.x) with new1 (0.6) and missed the
+    real bump entirely.
+    """
+    repo = _init_repo(tmp_path)
+    initial = (
+        "applications:\n"
+        "  - name: a\n"
+        "    targetRevision: 0.5.0\n"
+        "  - name: b\n"
+        "    targetRevision: 1.4.0\n"
+    )
+    bumped = (
+        "applications:\n"
+        "  - name: a\n"
+        "    targetRevision: 0.6.0\n"
+        "  - name: b\n"
+        "    targetRevision: 2.0.0\n"
+    )
+    _commit(repo, "apps/multi.yaml", initial, "init")
+    _commit(repo, "apps/multi.yaml", bumped, "bumps")
+
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    # First edit (0.5 → 0.6) is not MAJOR; second (1.4 → 2.0) is.
+    assert bumps == [("apps/multi.yaml", "1.4.0", "2.0.0")]
+
+
 def test_detect_ignores_uncommitted_working_tree_edits(tmp_path: Path):
     """Codex P2 on PR mctl-agents#14: the guard must reflect what would
     actually be pushed (HEAD), not the dirty working tree. An uncommitted
