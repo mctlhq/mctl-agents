@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -622,6 +623,169 @@ def _capture_head_sha(repo_dir: Path) -> str:
     return proc.stdout.strip()
 
 
+# ---------------------------------------------------------------------------
+# Pre-PR safety guard — chart MAJOR-version bump must acknowledge CRD migration
+# ---------------------------------------------------------------------------
+# Anchored at the start of the post-prefix YAML body — the helper
+# below strips the diff `+`/`-` prefix and leading whitespace before
+# applying this pattern. Negative lookahead `(?![.0-9])` rejects
+# 4-component values like `1.2.3.4` instead of capturing `1.2.3` and
+# silently dropping the trailing `.4`.
+_TARGET_REVISION_RE = re.compile(
+    r"""^targetRevision:\s*['"]?([0-9]+(?:\.[0-9]+){1,2})(?![.0-9])"""
+)
+
+
+def _diff_line_targets_revision(line: str) -> Optional[str]:
+    """Parse a diff `-`/`+` line that mutates a YAML
+    ``targetRevision:`` field, return the version string. Return
+    ``None`` for diff lines that look superficially similar but
+    aren't real bumps:
+
+    - YAML comments (`# targetRevision: 2.4.0`) — Codex P2 #1.
+    - Substring keys (`nottargetRevision: 2.4.0`,
+      `customTargetRevision: 2.4.0`) — Codex P2 #2.
+    - 4-component pseudo-semvers (`targetRevision: 1.2.3.4`).
+    - Unanchored substrings inside other YAML strings.
+
+    Also returns ``None`` for the diff metadata lines themselves
+    (`---`, `+++`, `@@`) by virtue of their prefix.
+    """
+    if not line or line[0] not in "+-":
+        return None
+    body = line[1:].lstrip()
+    # Skip YAML comments — `_TARGET_REVISION_RE` is anchored at
+    # `^targetRevision:` so this is belt-and-braces, but the explicit
+    # check makes the intent obvious to a reader.
+    if body.startswith("#"):
+        return None
+    m = _TARGET_REVISION_RE.match(body)
+    if m is None:
+        return None
+    return m.group(1)
+
+
+def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list[tuple[str, str, str]]:
+    """Return (file, old_version, new_version) tuples for Helm chart
+    `targetRevision` MAJOR-version bumps in the diff against ``base``.
+
+    Matches lines like:
+        - targetRevision: 0.10.7
+        + targetRevision: 2.4.0
+
+    Lines must be on adjacent diff hunks (same `targetRevision:` field
+    edit). Pre-release suffixes (`-rc1`, `-beta.2`) are tolerated by
+    extracting only the leading numeric prefix; the comparison is on
+    integer MAJOR.
+
+    Why: this is the long-tail timebomb from the 2026-05-01 ESO incident
+    (external-secrets 0.10.x → 2.x). Helm doesn't refresh CRDs on
+    `helm upgrade`, so a chart MAJOR bump can leave the cluster with
+    a controller that requires CRDs the cluster doesn't serve. The
+    proposal author must explicitly acknowledge the CRD migration
+    plan; otherwise the implementer fails fast before pushing the PR.
+    """
+    # Pin the comparison to committed HEAD, NOT the working tree.
+    # `git diff <base>` (no second arg) diffs base against the working
+    # copy, which means a stray uncommitted scratch edit could fire
+    # the guard against a PR that won't actually push that change —
+    # or, conversely, an uncommitted revert could mask a real bump
+    # that IS in HEAD. The bumps we want to gate on are exactly the
+    # ones a `git push` would deliver, which is `<base>..HEAD`.
+    proc = _run(["git", "diff", base, "HEAD", "--unified=0"], cwd=repo_dir, check=False)
+    diff = proc.stdout
+
+    bumps: list[tuple[str, str, str]] = []
+    current_file: Optional[str] = None
+    # FIFO queue of `-` versions waiting for their matching `+`. A
+    # single hunk like `-old1 -old2 +new1 +new2` must pair old1↔new1
+    # and old2↔new2; with a scalar pending_old we'd lose old1 on the
+    # second `-` and falsely pair old2↔new1, missing a real MAJOR
+    # bump (Codex P1 on PR mctl-agents#14).
+    pending_olds: list[str] = []
+
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/"):]
+            # File boundary resets the queue — pairing `-` from one
+            # file with `+` from another is never correct.
+            pending_olds = []
+            continue
+        if line.startswith("--- "):
+            # `--- a/<file>` is the partner of `+++ b/<file>` in the
+            # diff header; just skip it. (We don't reset on `--- `
+            # alone because that would clobber `pending_olds` between
+            # the two header lines.)
+            continue
+        if line.startswith("@@"):
+            # NB: do NOT reset pending_olds on hunk boundaries.
+            # `git diff --unified=0` splits a single field-move-and-
+            # bump into two hunks (delete at old line, add at new
+            # line). Resetting here drops the old version before the
+            # add is parsed, and a real MAJOR bump bypasses the guard
+            # (Codex P1 on PR mctl-agents#14). The FIFO is per-file,
+            # not per-hunk; a stray un-paired `-` would surface as a
+            # false-positive bump on a later unrelated `+` in the
+            # same file, which is the safer failure mode for a guard
+            # (block-on-doubt).
+            continue
+        # Both `-` and `+` go through the anchored helper so a line
+        # like `# targetRevision: 2.4.0` (comment) or
+        # `someTargetRevision: 2.4.0` (substring key) does NOT register.
+        if line.startswith("-") and not line.startswith("---"):
+            ver = _diff_line_targets_revision(line)
+            if ver:
+                pending_olds.append(ver)
+        elif line.startswith("+") and not line.startswith("+++"):
+            ver = _diff_line_targets_revision(line)
+            if ver and pending_olds and current_file is not None:
+                old_ver = pending_olds.pop(0)
+                if _is_major_bump(old_ver, ver):
+                    bumps.append((current_file, old_ver, ver))
+    return bumps
+
+
+def _is_major_bump(old: str, new: str) -> bool:
+    """True iff ``new`` has a strictly larger SemVer MAJOR than ``old``.
+
+    Both strings are dotted SemVer (no leading `v`). Anything that
+    doesn't parse cleanly returns False — defensive default that
+    matches the existing `feedback_no_v_prefix` convention.
+    """
+    try:
+        old_major = int(old.split(".")[0])
+        new_major = int(new.split(".")[0])
+    except (ValueError, IndexError):
+        return False
+    return new_major > old_major
+
+
+def _proposal_acks_crd_migration(proposal_dir: Path) -> bool:
+    """True if the proposal explicitly acknowledges that this change
+    crosses a chart MAJOR boundary and therefore requires a CRD
+    migration plan.
+
+    Acknowledgement signal: any file whose name starts with
+    ``crd-migration`` (case-insensitive) inside the proposal directory.
+    Content is not inspected — the *existence* is the contract: the
+    spec author saw the warning, named the file, and either described
+    the migration in it or linked to the relevant doc / drill.
+
+    Examples that count:
+        proposals/eso-cve-patch/crd-migration.md
+        proposals/eso-cve-patch/crd-migration-plan.md
+        proposals/eso-cve-patch/CRD-MIGRATION.txt
+
+    Empty files are fine — the file is a flag, not a doc.
+    """
+    if not proposal_dir.exists():
+        return False
+    for entry in proposal_dir.iterdir():
+        if entry.is_file() and entry.name.lower().startswith("crd-migration"):
+            return True
+    return False
+
+
 def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
     branch = f"feat/agents-{ref.slug}"
     _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
@@ -688,6 +852,32 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
                 pr_url=None,
                 error="implementer produced no commits",
             )
+
+        # 6b. Chart MAJOR-version guard — the long-tail timebomb from the
+        # 2026-05-01 ESO incident (external-secrets 0.10.x → 2.x). Helm
+        # doesn't refresh CRDs on upgrade, so a MAJOR bump can leave a
+        # controller pinned to CRD versions the cluster doesn't serve.
+        # Block the push unless the proposal explicitly opts in via a
+        # `crd-migration*` marker file. The proposal author owns the
+        # migration plan; the implementer just enforces that they've
+        # written one down.
+        bumps = _detect_chart_major_bumps(target)
+        if bumps and not _proposal_acks_crd_migration(ref.proposal_dir):
+            bump_summary = "; ".join(f"{f}: {old} → {new}" for f, old, new in bumps)
+            msg = (
+                "chart MAJOR-version bump detected without CRD-migration "
+                f"acknowledgement: {bump_summary}. Add a 'crd-migration*' "
+                "file (e.g. crd-migration-plan.md) to the proposal "
+                f"directory '{ref.proposal_dir}' describing how the CRDs "
+                "will be pre-staged or the migration sequenced. See "
+                "feedback_eso_chart_2x_crd_lifecycle.md."
+            )
+            update_status_yaml(
+                ref,
+                "accepted",
+                notes=f"blocked by chart-major-bump guard: {bump_summary}",
+            )
+            return ImplementResult(ref=ref, pr_url=None, error=msg)
 
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref)
