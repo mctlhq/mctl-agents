@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -622,6 +623,103 @@ def _capture_head_sha(repo_dir: Path) -> str:
     return proc.stdout.strip()
 
 
+# ---------------------------------------------------------------------------
+# Pre-PR safety guard — chart MAJOR-version bump must acknowledge CRD migration
+# ---------------------------------------------------------------------------
+_TARGET_REVISION_RE = re.compile(r'targetRevision:\s*"?([0-9]+(?:\.[0-9]+){1,2})"?')
+
+
+def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list[tuple[str, str, str]]:
+    """Return (file, old_version, new_version) tuples for Helm chart
+    `targetRevision` MAJOR-version bumps in the diff against ``base``.
+
+    Matches lines like:
+        - targetRevision: 0.10.7
+        + targetRevision: 2.4.0
+
+    Lines must be on adjacent diff hunks (same `targetRevision:` field
+    edit). Pre-release suffixes (`-rc1`, `-beta.2`) are tolerated by
+    extracting only the leading numeric prefix; the comparison is on
+    integer MAJOR.
+
+    Why: this is the long-tail timebomb from the 2026-05-01 ESO incident
+    (external-secrets 0.10.x → 2.x). Helm doesn't refresh CRDs on
+    `helm upgrade`, so a chart MAJOR bump can leave the cluster with
+    a controller that requires CRDs the cluster doesn't serve. The
+    proposal author must explicitly acknowledge the CRD migration
+    plan; otherwise the implementer fails fast before pushing the PR.
+    """
+    proc = _run(["git", "diff", base, "--unified=0"], cwd=repo_dir, check=False)
+    diff = proc.stdout
+
+    bumps: list[tuple[str, str, str]] = []
+    current_file: Optional[str] = None
+    pending_old: Optional[str] = None
+
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[len("+++ b/"):]
+            pending_old = None
+        elif line.startswith("--- ") or line.startswith("@@"):
+            # New hunk — drop any unmatched old version from the previous
+            # hunk so we never falsely pair `-` from one hunk with `+`
+            # from another.
+            pending_old = None
+        elif line.startswith("-") and not line.startswith("---"):
+            m = _TARGET_REVISION_RE.search(line)
+            if m:
+                pending_old = m.group(1)
+        elif line.startswith("+") and not line.startswith("+++"):
+            m = _TARGET_REVISION_RE.search(line)
+            if m and pending_old is not None and current_file is not None:
+                new_ver = m.group(1)
+                if _is_major_bump(pending_old, new_ver):
+                    bumps.append((current_file, pending_old, new_ver))
+                pending_old = None
+    return bumps
+
+
+def _is_major_bump(old: str, new: str) -> bool:
+    """True iff ``new`` has a strictly larger SemVer MAJOR than ``old``.
+
+    Both strings are dotted SemVer (no leading `v`). Anything that
+    doesn't parse cleanly returns False — defensive default that
+    matches the existing `feedback_no_v_prefix` convention.
+    """
+    try:
+        old_major = int(old.split(".")[0])
+        new_major = int(new.split(".")[0])
+    except (ValueError, IndexError):
+        return False
+    return new_major > old_major
+
+
+def _proposal_acks_crd_migration(proposal_dir: Path) -> bool:
+    """True if the proposal explicitly acknowledges that this change
+    crosses a chart MAJOR boundary and therefore requires a CRD
+    migration plan.
+
+    Acknowledgement signal: any file whose name starts with
+    ``crd-migration`` (case-insensitive) inside the proposal directory.
+    Content is not inspected — the *existence* is the contract: the
+    spec author saw the warning, named the file, and either described
+    the migration in it or linked to the relevant doc / drill.
+
+    Examples that count:
+        proposals/eso-cve-patch/crd-migration.md
+        proposals/eso-cve-patch/crd-migration-plan.md
+        proposals/eso-cve-patch/CRD-MIGRATION.txt
+
+    Empty files are fine — the file is a flag, not a doc.
+    """
+    if not proposal_dir.exists():
+        return False
+    for entry in proposal_dir.iterdir():
+        if entry.is_file() and entry.name.lower().startswith("crd-migration"):
+            return True
+    return False
+
+
 def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
     branch = f"feat/agents-{ref.slug}"
     _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
@@ -688,6 +786,32 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
                 pr_url=None,
                 error="implementer produced no commits",
             )
+
+        # 6b. Chart MAJOR-version guard — the long-tail timebomb from the
+        # 2026-05-01 ESO incident (external-secrets 0.10.x → 2.x). Helm
+        # doesn't refresh CRDs on upgrade, so a MAJOR bump can leave a
+        # controller pinned to CRD versions the cluster doesn't serve.
+        # Block the push unless the proposal explicitly opts in via a
+        # `crd-migration*` marker file. The proposal author owns the
+        # migration plan; the implementer just enforces that they've
+        # written one down.
+        bumps = _detect_chart_major_bumps(target)
+        if bumps and not _proposal_acks_crd_migration(ref.proposal_dir):
+            bump_summary = "; ".join(f"{f}: {old} → {new}" for f, old, new in bumps)
+            msg = (
+                "chart MAJOR-version bump detected without CRD-migration "
+                f"acknowledgement: {bump_summary}. Add a 'crd-migration*' "
+                "file (e.g. crd-migration-plan.md) to the proposal "
+                f"directory '{ref.proposal_dir}' describing how the CRDs "
+                "will be pre-staged or the migration sequenced. See "
+                "feedback_eso_chart_2x_crd_lifecycle.md."
+            )
+            update_status_yaml(
+                ref,
+                "accepted",
+                notes=f"blocked by chart-major-bump guard: {bump_summary}",
+            )
+            return ImplementResult(ref=ref, pr_url=None, error=msg)
 
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref)
