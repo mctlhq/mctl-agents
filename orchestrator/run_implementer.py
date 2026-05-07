@@ -626,7 +626,43 @@ def _capture_head_sha(repo_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 # Pre-PR safety guard — chart MAJOR-version bump must acknowledge CRD migration
 # ---------------------------------------------------------------------------
-_TARGET_REVISION_RE = re.compile(r"""targetRevision:\s*['"]?([0-9]+(?:\.[0-9]+){1,2})['"]?""")
+# Anchored at the start of the post-prefix YAML body — the helper
+# below strips the diff `+`/`-` prefix and leading whitespace before
+# applying this pattern. Negative lookahead `(?![.0-9])` rejects
+# 4-component values like `1.2.3.4` instead of capturing `1.2.3` and
+# silently dropping the trailing `.4`.
+_TARGET_REVISION_RE = re.compile(
+    r"""^targetRevision:\s*['"]?([0-9]+(?:\.[0-9]+){1,2})(?![.0-9])"""
+)
+
+
+def _diff_line_targets_revision(line: str) -> Optional[str]:
+    """Parse a diff `-`/`+` line that mutates a YAML
+    ``targetRevision:`` field, return the version string. Return
+    ``None`` for diff lines that look superficially similar but
+    aren't real bumps:
+
+    - YAML comments (`# targetRevision: 2.4.0`) — Codex P2 #1.
+    - Substring keys (`nottargetRevision: 2.4.0`,
+      `customTargetRevision: 2.4.0`) — Codex P2 #2.
+    - 4-component pseudo-semvers (`targetRevision: 1.2.3.4`).
+    - Unanchored substrings inside other YAML strings.
+
+    Also returns ``None`` for the diff metadata lines themselves
+    (`---`, `+++`, `@@`) by virtue of their prefix.
+    """
+    if not line or line[0] not in "+-":
+        return None
+    body = line[1:].lstrip()
+    # Skip YAML comments — `_TARGET_REVISION_RE` is anchored at
+    # `^targetRevision:` so this is belt-and-braces, but the explicit
+    # check makes the intent obvious to a reader.
+    if body.startswith("#"):
+        return None
+    m = _TARGET_REVISION_RE.match(body)
+    if m is None:
+        return None
+    return m.group(1)
 
 
 def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list[tuple[str, str, str]]:
@@ -672,22 +708,26 @@ def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list
         if line.startswith("+++ b/"):
             current_file = line[len("+++ b/"):]
             pending_olds = []
-        elif line.startswith("--- ") or line.startswith("@@"):
+            continue
+        if line.startswith("--- ") or line.startswith("@@"):
             # New hunk — drop any unmatched old versions from the
             # previous hunk so we never falsely pair `-` from one hunk
             # with `+` from another.
             pending_olds = []
-        elif line.startswith("-") and not line.startswith("---"):
-            m = _TARGET_REVISION_RE.search(line)
-            if m:
-                pending_olds.append(m.group(1))
+            continue
+        # Both `-` and `+` go through the anchored helper so a line
+        # like `# targetRevision: 2.4.0` (comment) or
+        # `someTargetRevision: 2.4.0` (substring key) does NOT register.
+        if line.startswith("-") and not line.startswith("---"):
+            ver = _diff_line_targets_revision(line)
+            if ver:
+                pending_olds.append(ver)
         elif line.startswith("+") and not line.startswith("+++"):
-            m = _TARGET_REVISION_RE.search(line)
-            if m and pending_olds and current_file is not None:
+            ver = _diff_line_targets_revision(line)
+            if ver and pending_olds and current_file is not None:
                 old_ver = pending_olds.pop(0)
-                new_ver = m.group(1)
-                if _is_major_bump(old_ver, new_ver):
-                    bumps.append((current_file, old_ver, new_ver))
+                if _is_major_bump(old_ver, ver):
+                    bumps.append((current_file, old_ver, ver))
     return bumps
 
 

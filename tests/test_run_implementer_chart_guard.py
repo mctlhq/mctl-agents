@@ -179,6 +179,60 @@ def test_detect_multiple_bumps_in_single_hunk(tmp_path: Path):
     assert bumps == [("apps/multi.yaml", "1.4.0", "2.0.0")]
 
 
+def test_detect_ignores_yaml_comment_lines(tmp_path: Path):
+    """Codex P2 on PR mctl-agents#14 (regex too permissive): a YAML
+    comment that mentions `targetRevision` must NOT trigger the guard.
+    Otherwise comment-only edits would block PR creation."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "apps/eso.yaml", "spec:\n  source:\n    targetRevision: 0.10.7\n", "init")
+    _commit(
+        repo,
+        "apps/eso.yaml",
+        "spec:\n"
+        "  source:\n"
+        "    # targetRevision: 0.10.7  # MAJOR bump pending — see CRD plan\n"
+        "    # Was previously: targetRevision: 2.4.0\n"
+        "    targetRevision: 0.10.7\n",
+        "comment-only edit",
+    )
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    assert bumps == []
+
+
+def test_detect_ignores_substring_key_match(tmp_path: Path):
+    """Codex P2 on PR mctl-agents#14: a key whose name HAPPENS to end
+    in `targetRevision:` (e.g. `customTargetRevision`) is not the
+    Helm field we gate on. The anchored regex must reject it."""
+    repo = _init_repo(tmp_path)
+    _commit(
+        repo,
+        "apps/custom.yaml",
+        "spec:\n  source:\n    customTargetRevision: 0.10.7\n",
+        "init",
+    )
+    _commit(
+        repo,
+        "apps/custom.yaml",
+        "spec:\n  source:\n    customTargetRevision: 2.4.0\n",
+        "fake bump on substring key",
+    )
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    assert bumps == []
+
+
+def test_detect_rejects_4component_pseudo_semver(tmp_path: Path):
+    """Codex P2 on PR mctl-agents#14: `1.2.3.4` is not a valid SemVer.
+    The previous regex would capture `1.2.3` and silently drop the
+    trailing `.4`, which could misclassify a bump. The negative
+    lookahead `(?![.0-9])` rejects this shape outright."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "apps/x.yaml", "spec:\n  source:\n    targetRevision: 0.10.7\n", "init")
+    _commit(repo, "apps/x.yaml", "spec:\n  source:\n    targetRevision: 1.2.3.4\n", "weird")
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    # The new value is unparseable → cannot be classified as a bump.
+    assert bumps == []
+
+
 def test_detect_ignores_uncommitted_working_tree_edits(tmp_path: Path):
     """Codex P2 on PR mctl-agents#14: the guard must reflect what would
     actually be pushed (HEAD), not the dirty working tree. An uncommitted
