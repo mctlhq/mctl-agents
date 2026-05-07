@@ -626,7 +626,7 @@ def _capture_head_sha(repo_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 # Pre-PR safety guard — chart MAJOR-version bump must acknowledge CRD migration
 # ---------------------------------------------------------------------------
-_TARGET_REVISION_RE = re.compile(r'targetRevision:\s*"?([0-9]+(?:\.[0-9]+){1,2})"?')
+_TARGET_REVISION_RE = re.compile(r"""targetRevision:\s*['"]?([0-9]+(?:\.[0-9]+){1,2})['"]?""")
 
 
 def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list[tuple[str, str, str]]:
@@ -649,7 +649,14 @@ def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list
     proposal author must explicitly acknowledge the CRD migration
     plan; otherwise the implementer fails fast before pushing the PR.
     """
-    proc = _run(["git", "diff", base, "--unified=0"], cwd=repo_dir, check=False)
+    # Pin the comparison to committed HEAD, NOT the working tree.
+    # `git diff <base>` (no second arg) diffs base against the working
+    # copy, which means a stray uncommitted scratch edit could fire
+    # the guard against a PR that won't actually push that change —
+    # or, conversely, an uncommitted revert could mask a real bump
+    # that IS in HEAD. The bumps we want to gate on are exactly the
+    # ones a `git push` would deliver, which is `<base>..HEAD`.
+    proc = _run(["git", "diff", base, "HEAD", "--unified=0"], cwd=repo_dir, check=False)
     diff = proc.stdout
 
     bumps: list[tuple[str, str, str]] = []

@@ -115,10 +115,22 @@ def test_detect_chart_minor_bump_not_flagged(tmp_path: Path):
     assert bumps == []
 
 
-def test_detect_chart_quoted_version(tmp_path: Path):
+def test_detect_chart_double_quoted_version(tmp_path: Path):
     repo = _init_repo(tmp_path)
     _commit(repo, "apps/eso.yaml", 'spec:\n  source:\n    targetRevision: "0.10.7"\n', "init")
     _commit(repo, "apps/eso.yaml", 'spec:\n  source:\n    targetRevision: "2.4.0"\n', "bump")
+
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    assert bumps == [("apps/eso.yaml", "0.10.7", "2.4.0")]
+
+
+def test_detect_chart_single_quoted_version(tmp_path: Path):
+    """Codex P1 on PR mctl-agents#14: single-quoted YAML values are a
+    common style in the existing platform-gitops manifests; the guard
+    must catch them too or the safety check has a hole."""
+    repo = _init_repo(tmp_path)
+    _commit(repo, "apps/eso.yaml", "spec:\n  source:\n    targetRevision: '0.10.7'\n", "init")
+    _commit(repo, "apps/eso.yaml", "spec:\n  source:\n    targetRevision: '2.4.0'\n", "bump")
 
     bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
     assert bumps == [("apps/eso.yaml", "0.10.7", "2.4.0")]
@@ -129,4 +141,24 @@ def test_detect_no_diff_returns_empty(tmp_path: Path):
     _commit(repo, "README.md", "first", "init")
     _commit(repo, "README.md", "second", "noop")
     bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    assert bumps == []
+
+
+def test_detect_ignores_uncommitted_working_tree_edits(tmp_path: Path):
+    """Codex P2 on PR mctl-agents#14: the guard must reflect what would
+    actually be pushed (HEAD), not the dirty working tree. An uncommitted
+    scratch edit of `targetRevision` should not fire the guard, because
+    `git push` would not deliver it.
+    """
+    repo = _init_repo(tmp_path)
+    _commit(repo, "apps/eso.yaml", "spec:\n  source:\n    targetRevision: 0.10.7\n", "init")
+    _commit(repo, "apps/eso.yaml", "spec:\n  source:\n    targetRevision: 0.11.0\n", "minor bump")
+    # Uncommitted MAJOR-bump edit in the working tree only.
+    (repo / "apps" / "eso.yaml").write_text(
+        "spec:\n  source:\n    targetRevision: 2.4.0\n"
+    )
+
+    bumps = _detect_chart_major_bumps(repo, base="HEAD~1")
+    # HEAD is 0.11.0 (minor bump, not flagged); the working-tree 2.4.0
+    # is uncommitted and must be ignored.
     assert bumps == []
