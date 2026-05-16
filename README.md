@@ -186,11 +186,11 @@ counter — it stays trivially testable with hand-built fixtures.
 
 **Bot signals.**
 
-- `chatgpt-codex-connector[bot]` — the **only** gating signal.
+- `claude[bot]` — the **only** gating signal.
   `has_responded` is anchored to `pr.head_sha` (review with matching
   `commit_id`, line-anchored comment with matching `commit_id`,
-  top-level "Didn't find any major issues" comment newer than
-  `head_pushed_at`, or `+1` reaction on a `@codex review` trigger
+  top-level "No P1/P2 findings" comment newer than
+  `head_pushed_at`, or `+1` reaction on a `@claude review` trigger
   newer than `head_pushed_at`). Any signal predating the head push
   is ignored.
 - `copilot-pull-request-reviewer[bot]` — observed only. Findings
