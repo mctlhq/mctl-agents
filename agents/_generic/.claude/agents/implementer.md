@@ -60,6 +60,12 @@ because the repo is outside the proactive-rotation set.
 - CVE reference? Double-check the upgrade target actually fixes it.
 - Never edit `.claude/` in the cwd; those files are runtime artifacts staged
   by the orchestrator.
+- Work ONLY inside the current working directory (the cloned target repo).
+  NEVER create, edit, commit, or push files anywhere else — in particular the
+  mounted gitops worktree under `/workdir`. If the proposal asks for a change
+  in another repository (alert rules, manifests, dashboards in mctl-gitops,
+  etc.), do NOT make it — describe it in your final message so a human can
+  route it through a reviewed PR.
 - Stay strictly inside the proposal's scope.
 
 ## What to write in your final message
