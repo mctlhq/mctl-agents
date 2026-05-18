@@ -418,6 +418,11 @@ Workflow:
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
 - Stay strictly within scope — fixing the codex findings only.
+- Work ONLY inside the current working directory (the cloned target repo).
+  NEVER create, edit, commit, or push files anywhere else — in particular
+  the mounted gitops worktree under `/workdir`. If a finding implies a
+  change in another repository, do NOT make it; describe it in your final
+  message so a human can route it.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -443,6 +448,12 @@ Workflow:
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
 - Stay strictly within the proposal's scope — no drive-by refactors.
+- Work ONLY inside the current working directory (the cloned target repo).
+  NEVER create, edit, commit, or push files anywhere else — in particular
+  the mounted gitops worktree under `/workdir`. If the proposal asks for a
+  change in another repository (e.g. alert rules or manifests in
+  mctl-gitops), do NOT make it; describe it in your final message so a
+  human can route it through a reviewed PR.
 - No emoji in code or commit messages.
 - English only.
 """
