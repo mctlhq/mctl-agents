@@ -52,6 +52,11 @@ IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 # under those conditions and risked tripping max_budget_usd before the
 # JSON object was complete.
 SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "5.00"))
+# Issue-investigator budget — covers reading a GitHub issue, exploring the
+# target repo clone, and writing the requirements/design/tasks triplet.
+# Comparable to a single spec-writer pass; $3 leaves headroom for a large
+# repo that needs a fair amount of Grep/Read to ground the design.
+ISSUE_INVESTIGATOR_BUDGET_USD = float(os.getenv("ISSUE_INVESTIGATOR_BUDGET_USD", "3.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -147,6 +152,44 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
+    )
+
+
+def build_issue_investigator_options(
+    repo_dir: Path,
+    model: str,
+    proposal_dir: Path,
+) -> ClaudeAgentOptions:
+    """Options for the issue-investigator agent.
+
+    ``cwd`` is a fresh, read-only clone of the target sibling repo so the
+    agent can ground its proposal in the real code (Glob/Grep/Read/Bash).
+    ``setting_sources=["project"]`` picks up that repo's own CLAUDE.md as
+    context — useful for conventions, harmless if absent.
+
+    The proposal triplet (requirements/design/tasks.md) is written into
+    ``proposal_dir`` — the gitops agents-state worktree, which sits OUTSIDE
+    cwd — so it must be granted via ``add_dirs``. The orchestrator creates
+    that directory before launching the agent.
+
+    GITHUB_TOKEN is forwarded for any `gh`/`git` the agent might run, though
+    the Python wrapper already does the issue read + clone + comment.
+    """
+    env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
+    return ClaudeAgentOptions(
+        cwd=str(repo_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=[
+            "Read", "Write", "Edit", "Glob", "Grep",
+            "WebSearch", "WebFetch",
+            "Bash",
+        ] + _mctl_tool_globs(),
+        mcp_servers=mctl_mcp_config(),
+        permission_mode="acceptEdits",
+        max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
+        add_dirs=[str(proposal_dir)],
+        env=env,
     )
 
 
