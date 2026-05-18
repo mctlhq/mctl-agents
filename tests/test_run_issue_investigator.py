@@ -22,7 +22,11 @@ from orchestrator.run_issue_investigator import (
     slugify,
     write_status_yaml,
 )
-from orchestrator.run_implementer import ProposalRef, update_status_yaml
+from orchestrator.run_implementer import (
+    ProposalRef,
+    _issue_closing_line,
+    update_status_yaml,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +201,70 @@ def test_investigate_rejects_unknown_service(tmp_path, monkeypatch):
     )
     with pytest.raises(SystemExit):
         investigate("https://github.com/mctlhq/not-a-service/issues/1", tmp_path)
+
+
+def test_update_status_yaml_absent_file(tmp_path):
+    """First-ever write (no prior .status.yaml) must not crash and carries
+    only the managed keys."""
+    proposal_dir = tmp_path / "proposals" / "fresh"
+    ref = ProposalRef(
+        service="mctl-api",
+        slug="fresh",
+        proposal_dir=proposal_dir,
+        status="accepted",
+    )
+    update_status_yaml(ref, "in-progress")
+    data = yaml.safe_load((proposal_dir / ".status.yaml").read_text())
+    assert data["status"] == "in-progress"
+    assert "source" not in data
+
+
+# ---------------------------------------------------------------------------
+# _issue_closing_line — drives the PR auto-close
+# ---------------------------------------------------------------------------
+def _ref_with_status(tmp_path, status_payload):
+    proposal_dir = tmp_path / "proposals" / "p"
+    proposal_dir.mkdir(parents=True)
+    if status_payload is not None:
+        (proposal_dir / ".status.yaml").write_text(yaml.safe_dump(status_payload))
+    return ProposalRef(
+        service="mctl-telegram",
+        slug="p",
+        proposal_dir=proposal_dir,
+        status=status_payload.get("status", "accepted") if status_payload else "accepted",
+    )
+
+
+def test_issue_closing_line_github_issue(tmp_path):
+    ref = _ref_with_status(tmp_path, {
+        "status": "accepted",
+        "source": {"type": "github_issue", "repo": "mctlhq/mctl-telegram", "issue": 123},
+    })
+    assert _issue_closing_line(ref) == "\n\nCloses mctlhq/mctl-telegram#123"
+
+
+def test_issue_closing_line_no_status_file(tmp_path):
+    ref = _ref_with_status(tmp_path, None)
+    assert _issue_closing_line(ref) == ""
+
+
+def test_issue_closing_line_no_source(tmp_path):
+    ref = _ref_with_status(tmp_path, {"status": "accepted"})
+    assert _issue_closing_line(ref) == ""
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {"type": "manual", "repo": "mctlhq/x", "issue": 1},   # not a github issue
+        {"type": "github_issue", "issue": 1},                  # missing repo
+        {"type": "github_issue", "repo": "mctlhq/x"},          # missing issue
+        "not-a-dict",                                          # malformed
+    ],
+)
+def test_issue_closing_line_rejects_incomplete_source(tmp_path, source):
+    ref = _ref_with_status(tmp_path, {"status": "accepted", "source": source})
+    assert _issue_closing_line(ref) == ""
 
 
 # Keep an explicit reference so an accidental removal of the public helper

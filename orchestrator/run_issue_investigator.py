@@ -407,6 +407,10 @@ def investigate(
         )
         return InvestigateResult(service, slug, proposal_dir, skipped_reason="dry-run")
 
+    # Whether the proposal dir already existed (a re-investigation of a
+    # `proposed` proposal). If it did NOT, a failure path must roll it back
+    # so a half-written orphan is never committed to gitops main.
+    proposal_preexisted = proposal_dir.exists()
     clone = None
     try:
         # 1. Read-only clone so the agent can ground the design in real code.
@@ -430,11 +434,21 @@ def investigate(
                 error=f"agent did not write: {', '.join(missing)}",
             )
 
-        # 5. Write .status.yaml (status: proposed + source block).
+        # 5. Write .status.yaml (status: proposed + source block). After this
+        # the proposal is complete and durable on disk.
         write_status_yaml(proposal_dir, issue)
 
-        # 6. Link the proposal back to the issue.
-        post_proposal_comment(issue.ref.url, service, slug)
+        # 6. Link the proposal back to the issue. A failure here (e.g. the
+        # token lacks `issues: write`) must NOT mark the investigation as
+        # failed — the proposal is already written and re-running is
+        # idempotent on `proposed`. Downgrade to a warning.
+        try:
+            post_proposal_comment(issue.ref.url, service, slug)
+        except subprocess.CalledProcessError as e:
+            print(
+                f"⚠️  proposal written, but `gh issue comment` failed "
+                f"(non-fatal): {e.stderr or e}"
+            )
 
         return InvestigateResult(service, slug, proposal_dir)
 
@@ -446,10 +460,24 @@ def investigate(
     except Exception as e:  # pragma: no cover — defensive
         return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
     finally:
-        # Keep the clone on failure for post-mortem; drop it on success.
+        # Drop the throwaway /tmp clone.
         if clone and clone.exists():
             try:
                 shutil.rmtree(clone)
+            except OSError:
+                pass
+        # Roll back a freshly-created proposal dir that never received a
+        # valid .status.yaml — without this the CWFT commit step would push
+        # an orphan, half-written proposal to gitops main. A re-investigation
+        # (dir pre-existed) is left intact so a transient failure does not
+        # destroy an already-good proposal.
+        if (
+            not proposal_preexisted
+            and proposal_dir.exists()
+            and not (proposal_dir / ".status.yaml").is_file()
+        ):
+            try:
+                shutil.rmtree(proposal_dir)
             except OSError:
                 pass
 

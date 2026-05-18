@@ -220,10 +220,14 @@ def update_status_yaml(
         payload["notes"] = notes
 
     # Carry over unmanaged keys (source, control, …) from the existing file.
+    # `key in payload` guards against drift: if a future managed key is added
+    # to `payload` above but missed from `_MANAGED_STATUS_KEYS`, the freshly
+    # computed value still wins over the stale on-disk copy.
     existing = _load_status(ref.status_path)
     for key, value in existing.items():
-        if key not in _MANAGED_STATUS_KEYS:
-            payload[key] = value
+        if key in _MANAGED_STATUS_KEYS or key in payload:
+            continue
+        payload[key] = value
 
     ref.status_path.parent.mkdir(parents=True, exist_ok=True)
     with ref.status_path.open("w", encoding="utf-8") as f:
