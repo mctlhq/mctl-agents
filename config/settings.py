@@ -17,6 +17,10 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # orchestrator modules, sub-agent prompts, etc.). The service-agent
 # rotation skips it — analysis of the agent platform is the mentor's job
 # via _mentor/ aggregations, not a per-service researcher run.
+#
+# `mctl-telegram` is included as a valid implementer/investigator target
+# but is NOT a rotation service: it has no agents/<svc>/ scaffold and is
+# driven only by GitHub-issue proposals via the issue-investigator.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -26,15 +30,20 @@ SERVICES = [
     "mctl-agent",
     "mctl-gitops",
     "mctl-agents",
+    "mctl-telegram",
     # "upwork-mcp",
 ]
+
+# Services that are valid implementer/investigator targets but are NOT
+# analyzed by the proactive researcher/analyst/spec-writer rotation.
+NON_ROTATING_SERVICES = {"mctl-agents", "mctl-telegram"}
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
 # researcher/analyst/spec-writer. Anything in SERVICES but NOT here is
 # accepted by the implementer (--service filter) but is not subject to
 # automatic proposal generation; proposals for those services are
-# authored by the mentor or by humans.
-ROTATING_SERVICES = [s for s in SERVICES if s != "mctl-agents"]
+# authored by the mentor, by humans, or by the issue-investigator.
+ROTATING_SERVICES = [s for s in SERVICES if s not in NON_ROTATING_SERVICES]
 
 MENTOR_DIR = AGENTS_DIR / "_mentor"
 SHEPHERD_DIR = AGENTS_DIR / "_shepherd"
