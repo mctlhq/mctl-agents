@@ -96,6 +96,16 @@ def test_poll_dry_run_neither_investigates_nor_relabels(tmp_path, monkeypatch):
     assert removed == []
 
 
+def test_poll_dry_run_unknown_service_does_not_count_as_failure(tmp_path, monkeypatch):
+    """A dry-run is a side-effect-free preview — an unknown-service issue is
+    reported but must not inflate the failure count."""
+    monkeypatch.setattr(
+        run_issue_poller, "search_labeled_issues",
+        lambda label: [_ref(repo="not-a-service")],
+    )
+    assert poll(state_dir=tmp_path, dry_run=True) == 0
+
+
 def test_poll_success_removes_label(tmp_path, monkeypatch):
     ref = _ref(number=7)
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
@@ -144,9 +154,10 @@ def test_poll_error_keeps_label(tmp_path, monkeypatch):
     assert removed == []
 
 
-def test_poll_label_removal_failure_is_non_fatal(tmp_path, monkeypatch):
-    """A failed `gh issue edit` must not turn a successful investigation
-    into a poll failure."""
+def test_poll_label_removal_failure_counts_as_failure(tmp_path, monkeypatch):
+    """A failed `gh issue edit` leaves the label on the issue, so the next
+    cycle re-investigates — count it as a failure so the broken permission
+    surfaces instead of silently burning SDK budget."""
     ref = _ref(number=7)
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
     monkeypatch.setattr(
@@ -158,7 +169,7 @@ def test_poll_label_removal_failure_is_non_fatal(tmp_path, monkeypatch):
         raise subprocess.CalledProcessError(1, ["gh"], stderr="label not found")
 
     monkeypatch.setattr(run_issue_poller, "remove_label", _boom)
-    assert poll(state_dir=tmp_path) == 0
+    assert poll(state_dir=tmp_path) == 1
 
 
 # Keep explicit references so an accidental removal of a public helper trips

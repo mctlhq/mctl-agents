@@ -20,6 +20,7 @@ from orchestrator.run_issue_investigator import (
     investigate,
     parse_issue_url,
     slugify,
+    try_parse_issue_url,
     write_status_yaml,
 )
 from orchestrator.run_implementer import (
@@ -64,6 +65,26 @@ def test_parse_issue_url_malformed(url):
 def test_parse_issue_url_rejects_non_mctlhq_owner():
     with pytest.raises(SystemExit):
         parse_issue_url("https://github.com/someone-else/mctl-api/issues/7")
+
+
+def test_try_parse_issue_url_ok():
+    ref = try_parse_issue_url("https://github.com/mctlhq/mctl-api/issues/7")
+    assert ref is not None
+    assert (ref.repo, ref.number) == ("mctl-api", 7)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://github.com/mctlhq/mctl-api/pull/7",        # a PR, not an issue
+        "https://github.com/someone-else/mctl-api/issues/7",  # non-mctlhq owner
+        "not-a-url",
+    ],
+)
+def test_try_parse_issue_url_returns_none_on_bad_input(url):
+    """The poller filters a mixed `gh search` list — bad input is dropped,
+    not raised (no SystemExit leaking out as control flow)."""
+    assert try_parse_issue_url(url) is None
 
 
 # ---------------------------------------------------------------------------

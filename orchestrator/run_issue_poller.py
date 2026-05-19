@@ -51,8 +51,13 @@ from orchestrator.run_issue_investigator import (
     IssueRef,
     _run,
     investigate,
-    parse_issue_url,
+    try_parse_issue_url,
 )
+
+# `gh search` returns at most this many rows per call. A poll cycle with more
+# labelled issues than this is well outside normal operation, but warn rather
+# than silently drop the overflow.
+_SEARCH_LIMIT = 100
 
 # Issues carrying this label are picked up by the poller. An operator adds it
 # to a feature-request issue to hand it to the pipeline; the poller removes it
@@ -72,10 +77,18 @@ def search_labeled_issues(label: str) -> list[IssueRef]:
         "--owner", "mctlhq",
         "--label", label,
         "--state", "open",
-        "--limit", "100",
+        "--limit", str(_SEARCH_LIMIT),
         "--json", "url",
     ])
     rows = json.loads(proc.stdout or "[]")
+    if len(rows) >= _SEARCH_LIMIT:
+        # The search is capped — any labelled issues beyond the cap are not
+        # seen this cycle. They are picked up once the backlog drains below
+        # the cap, but an operator should know the cap was hit.
+        print(
+            f"WARN: `gh search` returned the {_SEARCH_LIMIT}-row cap — there "
+            f"may be more issues labelled '{label}' than handled this cycle."
+        )
     refs: list[IssueRef] = []
     seen: set[str] = set()
     for row in rows:
@@ -83,11 +96,12 @@ def search_labeled_issues(label: str) -> list[IssueRef]:
         if not url or url in seen:
             continue
         seen.add(url)
-        try:
-            refs.append(parse_issue_url(url))
-        except SystemExit:
-            # A PR, or an issue outside the mctlhq org — not ours to act on.
+        ref = try_parse_issue_url(url)
+        if ref is None:
+            # A PR URL (/pull/…) or an issue outside the mctlhq org — not
+            # ours to act on.
             continue
+        refs.append(ref)
     return refs
 
 
@@ -118,7 +132,22 @@ def poll(
     for ref in refs:
         print(f"\n=== {ref.full_repo}#{ref.number} ===")
 
-        if ref.repo not in SERVICES:
+        known_service = ref.repo in SERVICES
+
+        # dry-run is a side-effect-free preview: it neither investigates nor
+        # relabels, and never increments the failure count (an unknown
+        # service is reported but not counted — see the non-dry-run path).
+        if dry_run:
+            if known_service:
+                print(f"[dry-run] would investigate {ref.url} and remove '{label}'")
+            else:
+                print(
+                    f"[dry-run] would skip — {ref.repo} is not a known "
+                    f"service (config/settings.py SERVICES)"
+                )
+            continue
+
+        if not known_service:
             # A label on a repo the pipeline can't build. Leave the label so
             # the operator notices, rather than silently dropping the request.
             print(
@@ -128,15 +157,11 @@ def poll(
             failures += 1
             continue
 
-        if dry_run:
-            print(f"[dry-run] would investigate {ref.url} and remove '{label}'")
-            continue
-
         try:
             result = investigate(ref.url, state_dir=state_dir)
         except SystemExit as e:
-            # Pre-flight rejection (e.g. an unknown service that slipped past
-            # the check above) — treat as a per-issue failure, keep the label.
+            # Pre-flight rejection from the investigator — treat as a
+            # per-issue failure, keep the label.
             print(f"FAIL: investigate raised: {e}")
             failures += 1
             continue
@@ -160,10 +185,17 @@ def poll(
             remove_label(ref.url, label)
             print(f"  removed '{label}' label")
         except subprocess.CalledProcessError as e:
-            # Non-fatal: the proposal is written. The label staying on means
-            # the next cycle re-investigates idempotently (a `proposed`
-            # proposal is overwritable) — wasteful but not wrong.
-            print(f"WARN: could not remove label (non-fatal): {e.stderr or e}")
+            # The proposal IS written, but the label is still on the issue —
+            # so the next cycle re-investigates it (a `proposed` proposal is
+            # overwritable) and re-spends the SDK budget. Count it as a
+            # failure so a broken label-write permission surfaces instead of
+            # silently burning budget every cycle.
+            print(
+                f"FAIL: {result.service}/{result.slug}: proposal written but "
+                f"'{label}' label removal failed ({e.stderr or e}) — fix the "
+                f"token's label-write permission or the next cycle repeats."
+            )
+            failures += 1
 
     return failures
 
