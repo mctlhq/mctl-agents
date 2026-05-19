@@ -111,23 +111,48 @@ def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subp
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
 
 
-def parse_issue_url(url: str) -> IssueRef:
-    """Parse a GitHub issue URL into an IssueRef. Raises SystemExit on a
-    malformed URL or a non-`mctlhq` owner (the pipeline only touches
-    repos under the mctlhq org)."""
+class IssueURLError(ValueError):
+    """A malformed GitHub issue URL, or one outside the mctlhq org."""
+
+
+def _parse_issue_url(url: str) -> IssueRef:
+    """Parse a GitHub issue URL into an IssueRef, raising IssueURLError on
+    bad input. The library-facing core of `parse_issue_url` — callers that
+    filter a mixed list (e.g. the poller) catch IssueURLError rather than
+    the process-exit signal `SystemExit`."""
     m = _ISSUE_URL_RE.match(url.strip())
     if not m:
-        raise SystemExit(
+        raise IssueURLError(
             f"Not a GitHub issue URL: {url!r}\n"
             f"Expected: https://github.com/<owner>/<repo>/issues/<number>"
         )
     owner, repo, number = m.group(1), m.group(2), int(m.group(3))
     if owner != "mctlhq":
-        raise SystemExit(
+        raise IssueURLError(
             f"Issue owner {owner!r} is not 'mctlhq'; the investigator only "
             f"handles repos under the mctlhq org."
         )
     return IssueRef(owner=owner, repo=repo, number=number, url=url.strip())
+
+
+def parse_issue_url(url: str) -> IssueRef:
+    """Parse a GitHub issue URL into an IssueRef. Raises SystemExit on a
+    malformed URL or a non-`mctlhq` owner — the CLI-facing wrapper, so a
+    bad `--issue-url` exits cleanly instead of dumping a traceback."""
+    try:
+        return _parse_issue_url(url)
+    except IssueURLError as e:
+        raise SystemExit(str(e))
+
+
+def try_parse_issue_url(url: str) -> Optional[IssueRef]:
+    """Parse a GitHub issue URL, returning None instead of raising on a
+    malformed URL or non-mctlhq owner. For callers filtering a mixed list
+    (e.g. the poller dropping PR URLs from `gh search` output)."""
+    try:
+        return _parse_issue_url(url)
+    except IssueURLError:
+        return None
 
 
 def slugify(text: str, max_len: int = 40) -> str:
