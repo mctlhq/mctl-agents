@@ -155,6 +155,34 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
     )
 
 
+def build_incident_responder_options(
+    agent_dir: Path,
+    model: str,
+    state_dir: Optional[Path] = None,
+) -> ClaudeAgentOptions:
+    """Options for the incident responder.
+
+    Runs with cwd=agents/_incident-responder/ so setting_sources=["project"]
+    picks up its CLAUDE.md. Needs mctl MCP for listing/resolving incidents and
+    Write/Bash for creating proposal files and computing timestamps.
+    """
+    env = {**os.environ}
+    if state_dir is not None:
+        env["INCIDENT_STATE_DIR"] = str(state_dir)
+    return ClaudeAgentOptions(
+        cwd=str(agent_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=[
+            "Read", "Write", "Bash", "Glob",
+        ] + _mctl_tool_globs(),
+        mcp_servers=mctl_mcp_config(),
+        permission_mode="acceptEdits",
+        max_budget_usd=float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00")),
+        env=env,
+    )
+
+
 def build_issue_investigator_options(
     repo_dir: Path,
     model: str,

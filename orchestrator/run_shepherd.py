@@ -20,7 +20,7 @@ follow-up gitops PR; this module is the orchestrator only):
     5. Print `<service>/<slug>: <decision>` so the workflow log is
        greppable.
 
-The Claude SDK is used for one specific decision: parsing codex
+The Claude SDK is used for one specific decision: parsing review
 findings into "merge-ready vs. needs-fix" and shaping the followup
 prompt for the implementer when needed. The sub-agent prompt lives at
 `agents/_shepherd/shepherd.md`. Everything else is deterministic
@@ -72,8 +72,8 @@ DEFAULT_STATE_DIR = Path(
     )
 )
 
-# Codex bot login (the actor on review/comment/reaction events).
-CODEX_BOT = "chatgpt-codex-connector[bot]"
+# Claude review bot login (the actor on review/comment/reaction events).
+REVIEW_BOT = "claude[bot]"
 COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 
 # Statuses that the shepherd's discovery pass picks up. `implemented`
@@ -166,10 +166,11 @@ class CodexFinding:
 class CodexReview:
     """Aggregated codex signals on a PR, anchored to head_sha.
 
-    `has_responded` matches design.md L86-99: a review by codex at
-    head_sha, a line-anchored comment at head_sha, a "no major issues"
-    issue comment newer than head_pushed_at, OR a +1 reaction on a
-    `@codex review` trigger comment newer than head_pushed_at.
+    `has_responded` matches design.md L86-99: a review by the claude
+    review bot at head_sha, a line-anchored comment at head_sha, a
+    "No P1/P2 findings" issue comment newer than head_pushed_at, OR a
+    +1 reaction on a `@claude review` trigger comment newer than
+    head_pushed_at.
     """
 
     has_responded: bool
@@ -524,11 +525,11 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
     """Build a CodexReview anchored to pr.head_sha.
 
     Implements the four signal rules in design.md L86-99:
-      1. A review by codex at commit_id == pr.head_sha (any state).
-      2. A line-anchored review comment by codex at commit_id == head_sha.
-      3. A top-level issue comment by codex matching "Didn't find any
-         major issues" with created_at > pr.head_pushed_at.
-      4. A +1 reaction by codex on the most recent `@codex review`
+      1. A review by the claude review bot at commit_id == pr.head_sha (any state).
+      2. A line-anchored review comment by the bot at commit_id == head_sha.
+      3. A top-level issue comment by the bot containing "No P1/P2 findings"
+         with created_at > pr.head_pushed_at.
+      4. A +1 reaction by the bot on the most recent `@claude review`
          trigger comment whose created_at > pr.head_pushed_at.
 
     findings_p1_p2(at=head_sha) drops any finding whose commit_id is
@@ -548,7 +549,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         print(f"warn: codex reviews fetch failed for {pr.repo}#{pr.number}: {e.stderr.strip()}")
         reviews = []
     for r in reviews:
-        if (r.get("user") or {}).get("login") != CODEX_BOT:
+        if (r.get("user") or {}).get("login") != REVIEW_BOT:
             continue
         commit_id = r.get("commit_id")
         if commit_id and commit_id == pr.head_sha:
@@ -576,7 +577,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         print(f"warn: codex pull comments fetch failed: {e.stderr.strip()}")
         review_comments = []
     for c in review_comments:
-        if (c.get("user") or {}).get("login") != CODEX_BOT:
+        if (c.get("user") or {}).get("login") != REVIEW_BOT:
             continue
         commit_id = c.get("commit_id")
         if commit_id and commit_id == pr.head_sha:
@@ -593,8 +594,8 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                 severity=sev,
             ))
 
-    # 3. Issue comments — top-level `Didn't find any major issues` newer
-    #    than head_pushed_at — and (4) +1 reactions on a `@codex review`
+    # 3. Issue comments — top-level `No P1/P2 findings` newer
+    #    than head_pushed_at — and (4) +1 reactions on a `@claude review`
     #    trigger newer than head_pushed_at. `gh api repos/.../issues/<n>/comments`.
     try:
         issue_comments = _gh_api_json([
@@ -605,25 +606,25 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         print(f"warn: codex issue comments fetch failed: {e.stderr.strip()}")
         issue_comments = []
 
-    # Walk newest-first to find the most recent `@codex review` trigger.
+    # Walk newest-first to find the most recent `@claude review` trigger.
     latest_trigger: Optional[dict] = None
     for c in sorted(issue_comments, key=lambda x: x.get("created_at") or "", reverse=True):
         body = (c.get("body") or "").strip()
-        if "@codex review" in body.lower():
+        if "@claude review" in body.lower():
             latest_trigger = c
             break
 
     for c in issue_comments:
         login = (c.get("user") or {}).get("login")
         body = c.get("body") or ""
-        if login == CODEX_BOT:
+        if login == REVIEW_BOT:
             created_at = c.get("created_at")
-            if "Didn't find any major issues" in body and _iso_gt(created_at, pr.head_pushed_at):
+            if "No P1/P2 findings" in body and _iso_gt(created_at, pr.head_pushed_at):
                 has_responded = True
             sev = _extract_severity(body)
             if sev in ("P1", "P2") and _iso_gt(created_at, pr.head_pushed_at):
                 # Top-level issue comment — no commit_id; time-anchor only.
-                # A finding posted as an issue comment is itself proof codex
+                # A finding posted as an issue comment is itself proof the bot
                 # responded; set the flag so decide() routes to address-review
                 # instead of spinning in wait when no separate +1 reaction or
                 # "no major issues" sibling comment exists.
@@ -637,7 +638,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                     severity=sev,
                 ))
 
-    # +1 reaction by codex on the latest @codex review trigger.
+    # +1 reaction by claude review bot on the latest @claude review trigger.
     if latest_trigger and _iso_gt(latest_trigger.get("created_at"), pr.head_pushed_at):
         comment_id = latest_trigger.get("id")
         try:
@@ -649,7 +650,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             print(f"warn: codex reactions fetch failed: {e.stderr.strip()}")
             reactions = []
         for r in reactions:
-            if (r.get("user") or {}).get("login") == CODEX_BOT and r.get("content") == "+1":
+            if (r.get("user") or {}).get("login") == REVIEW_BOT and r.get("content") == "+1":
                 has_responded = True
                 break
 
@@ -659,7 +660,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
 def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
     """Observed-only Copilot signal. Never gates a merge.
 
-    Per design.md L100-108: codex is the only gating signal. Copilot's
+    Per design.md L100-108: claude review is the only gating signal. Copilot's
     findings (if any) are surfaced in the per-tick operator log so a
     human can spot interesting commentary; they do not block.
     """
@@ -739,7 +740,7 @@ async def _format_bundle_via_sdk(findings: list[CodexFinding]) -> dict:
     """
     raw = _serialise_findings(findings)
     prompt = (
-        "You are about to receive a list of P1/P2 codex findings on a PR.\n"
+        "You are about to receive a list of P1/P2 review findings on a PR.\n"
         "Use the `shepherd` sub-agent (defined in this project's "
         ".claude/agents/) to produce the final JSON.\n\n"
         "Findings:\n"

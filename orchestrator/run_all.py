@@ -4,11 +4,13 @@ Usage:
     python -m orchestrator.run_all                # mode=full (default)
     RUN_MODE=mentor-only python -m orchestrator.run_all
     RUN_MODE=single-service RUN_SERVICE=mctl-api python -m orchestrator.run_all
+    RUN_MODE=incident-responder python -m orchestrator.run_all
 
 Modes:
-    full           — all service agents in parallel, then the mentor (default)
-    mentor-only    — mentor only, reads existing proposals/ from state
-    single-service — one agent (name in RUN_SERVICE), no mentor
+    full                — all service agents in parallel, then the mentor (default)
+    mentor-only         — mentor only, reads existing proposals/ from state
+    single-service      — one agent (name in RUN_SERVICE), no mentor
+    incident-responder  — diagnose TypeGeneric analyzing incidents, write accepted proposals
 """
 import os
 import sys
@@ -19,6 +21,7 @@ from config.settings import ROTATING_SERVICES, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.run_service_agent import run_service_agent
 from orchestrator.run_mentor import run_mentor
+from orchestrator.run_incident_responder import run_incident_responder
 
 
 async def _safe_run_service(service: str) -> None:
@@ -84,10 +87,13 @@ async def main() -> None:
         await _mentor_only()
     elif mode == "single-service":
         await _single_service(service)
+    elif mode == "incident-responder":
+        print("=== mode=incident-responder — diagnosing TypeGeneric analyzing incidents ===")
+        await run_incident_responder()
     else:
         print(
             f"ERROR: unknown RUN_MODE '{mode}'. "
-            f"Valid: full, mentor-only, single-service",
+            f"Valid: full, mentor-only, single-service, incident-responder",
             file=sys.stderr,
         )
         sys.exit(1)
