@@ -415,7 +415,7 @@ def test_has_responded_set_on_issue_comment_findings() -> None:
     issue_comments = [
         {
             "id": 9001,
-            "user": {"login": run_shepherd.CODEX_BOT},
+            "user": {"login": run_shepherd.REVIEW_BOT},
             "body": issue_comment_body,
             # Strictly newer than HEAD_PUSHED_AT so _iso_gt returns True.
             "created_at": "2026-04-29T11:30:00Z",
@@ -471,16 +471,21 @@ def test_outer_loop_review_stuck_after_three_attempts(tmp_path, monkeypatch) -> 
     review = CodexReview(has_responded=True, findings=findings)
 
     apply_calls: list[tuple] = []
+    trigger_calls: list[PRSnapshot] = []
 
     def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
         apply_calls.append((service, slug, payload, skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
+    def fake_trigger_review(pr):
+        trigger_calls.append(pr)
+
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
          patch.object(run_shepherd, "read_codex_review", return_value=review), \
          patch.object(run_shepherd, "read_copilot_review",
                       return_value=run_shepherd.CopilotReview(False, 0)), \
-         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup):
+         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup), \
+         patch.object(run_shepherd, "trigger_review", side_effect=fake_trigger_review):
 
         # Tick 1
         result = process_one(ref, skip_subprocess=True)
@@ -503,13 +508,17 @@ def test_outer_loop_review_stuck_after_three_attempts(tmp_path, monkeypatch) -> 
         assert read_status(ref)["review_attempts"] == 3
         ref.review_attempts = 3
 
-        # Tick 4 — should flip to review-stuck, NOT call apply_followup.
+        # Tick 4 — should flip to review-stuck, NOT call apply_followup
+        # and NOT post `@claude review` (no fix-up push happened).
         result = process_one(ref, skip_subprocess=True)
         assert result.decision == "review-stuck"
         assert read_status(ref)["status"] == "review-stuck"
 
-    # Three followup attempts, no fourth.
+    # Three followup attempts, no fourth — and one `@claude review`
+    # trigger per successful followup, no trigger on the review-stuck
+    # flip.
     assert len(apply_calls) == 3
+    assert len(trigger_calls) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -571,19 +580,27 @@ def test_loop_path_p1_then_followup_then_merge(tmp_path) -> None:
         findings=[make_finding(severity="P1", commit_id=HEAD_SHA)],
     )
     apply_calls: list[tuple] = []
+    trigger_calls: list[PRSnapshot] = []
 
     def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
         apply_calls.append((service, slug, len(payload), skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
+    def fake_trigger_review(pr):
+        trigger_calls.append(pr)
+
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr_t1), \
          patch.object(run_shepherd, "read_codex_review", return_value=review_t1), \
          patch.object(run_shepherd, "read_copilot_review",
                       return_value=run_shepherd.CopilotReview(False, 0)), \
-         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup):
+         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup), \
+         patch.object(run_shepherd, "trigger_review", side_effect=fake_trigger_review):
         result = process_one(ref, skip_subprocess=True)
     assert result.decision == "address-review"
     assert len(apply_calls) == 1
+    # Each successful followup must trigger a fresh review.
+    assert len(trigger_calls) == 1
+    assert trigger_calls[0] is pr_t1
     after_t1 = read_status(ref)
     assert after_t1["status"] == "implemented"
     assert after_t1["review_attempts"] == 1
@@ -1300,3 +1317,88 @@ def test_process_one_in_progress_dead_letter_flips_to_rejected(tmp_path) -> None
     # review_attempts is cleared on terminal-status flip; either absent
     # or explicitly null is acceptable.
     assert not final.get("review_attempts")
+
+
+# ---------------------------------------------------------------------------
+# trigger_review — fix for the fix-loop stall observed on mctl-docs#7
+# (memory: feedback_shepherd_codex_review_repost).
+# ---------------------------------------------------------------------------
+def test_trigger_review_posts_claude_review_comment(monkeypatch) -> None:
+    """trigger_review must shell out to `gh pr comment` with `@claude review`.
+
+    The review bot only re-reviews on an explicit @-mention. Without
+    this comment after a fix-up push, the shepherd loop stalls forever
+    on the new head SHA.
+    """
+    pr = make_pr()
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, check=True):
+        captured.append(cmd)
+        class _Proc:
+            stdout = ""
+            stderr = ""
+        return _Proc()
+
+    monkeypatch.setattr(run_shepherd, "_run", fake_run)
+    run_shepherd.trigger_review(pr)
+
+    assert len(captured) == 1
+    cmd = captured[0]
+    assert cmd[:3] == ["gh", "pr", "comment"]
+    assert cmd[-2:] == ["--body", "@claude review"]
+    # Must target the right PR URL.
+    assert f"https://github.com/{pr.repo}/pull/{pr.number}" in cmd
+
+
+def test_trigger_review_swallows_subprocess_failure(monkeypatch, capsys) -> None:
+    """A failed `gh pr comment` must NOT raise — best-effort by design.
+
+    If the trigger raised, a single transient GitHub blip would crash
+    the entire shepherd tick after a successful implementer push,
+    leaving .status.yaml in whatever state the partial run left.
+    """
+    import subprocess as sp
+
+    pr = make_pr()
+
+    def boom(cmd, cwd=None, check=True):
+        raise sp.CalledProcessError(returncode=1, cmd=cmd, stderr="rate limit exceeded")
+
+    monkeypatch.setattr(run_shepherd, "_run", boom)
+    # Must not raise.
+    run_shepherd.trigger_review(pr)
+
+    out = capsys.readouterr().out
+    assert "warn:" in out
+    assert "rate limit exceeded" in out
+
+
+def test_process_one_does_not_trigger_review_on_followup_failure(tmp_path) -> None:
+    """A failed apply_followup must NOT lead to a stray `@claude review`.
+
+    Posting `@claude review` only makes sense after a successful fix-up
+    push. On a transient failure the next tick retries the followup; on
+    a deterministic failure the proposal moves toward review-stuck.
+    Either way, no new head was pushed, so the review bot has nothing
+    new to look at.
+    """
+    ref = make_ref(tmp_path)
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+    trigger_calls: list = []
+
+    def boom(*args, **kwargs):
+        raise run_shepherd.FollowupSubprocessError("transient", transient=True)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom), \
+         patch.object(run_shepherd, "trigger_review",
+                      side_effect=lambda pr_: trigger_calls.append(pr_)):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "wait"
+    assert trigger_calls == []

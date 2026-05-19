@@ -963,6 +963,31 @@ def apply_followup(
 # ---------------------------------------------------------------------------
 # Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
 # ---------------------------------------------------------------------------
+def trigger_review(pr: PRSnapshot) -> None:
+    """Post ``@claude review`` so the review bot re-reviews the new head.
+
+    Without this, ``apply_followup``'s fix-up push moves head_sha forward
+    but no review is anchored to it: ``read_codex_review`` returns
+    has_responded=False and ``decide()`` spins in ``wait`` forever. The
+    review bot only triggers on explicit @-mention, PR open, or
+    draft→ready transition — a bare new commit does NOT retrigger it.
+
+    Best-effort: a failed comment post is logged, not raised. The tick
+    still completes; the next tick will retry once a human posts the
+    trigger manually.
+    """
+    pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
+    try:
+        _run(["gh", "pr", "comment", pr_ref, "--body", "@claude review"])
+        print(f"info: posted `@claude review` on {pr.repo}#{pr.number}")
+    except subprocess.CalledProcessError as e:
+        msg = (e.stderr or "").strip() or str(e)
+        print(
+            f"warn: failed to post `@claude review` on {pr.repo}#{pr.number} "
+            f"({msg}); next tick stalls until trigger is posted manually"
+        )
+
+
 def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
     """Invoke `gh pr merge --merge --delete-branch --match-head-commit <SHA>`.
 
@@ -1170,10 +1195,16 @@ def process_one(
                 ),
             )
 
-        # Followup pushed successfully — now it is fair to count the
-        # attempt. Flip to review-fixing so the in-flight signal is on
-        # disk, then back to implemented so the next tick re-evaluates
-        # codex against the new head SHA the implementer just pushed.
+        # Followup pushed successfully — re-trigger the review bot so it
+        # re-reviews the new head SHA the implementer just pushed. The
+        # bot only re-reviews on explicit @-mention; without this post
+        # the loop stalls (read_codex_review returns has_responded=False
+        # on the new head_sha, decide() returns wait, forever).
+        trigger_review(pr)
+
+        # Now it is fair to count the attempt. Flip to review-fixing so
+        # the in-flight signal is on disk, then back to implemented so
+        # the next tick re-evaluates codex against the new head SHA.
         update_status(
             ref,
             "review-fixing",
