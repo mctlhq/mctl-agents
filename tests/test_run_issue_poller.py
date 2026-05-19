@@ -172,6 +172,97 @@ def test_poll_label_removal_failure_counts_as_failure(tmp_path, monkeypatch):
     assert poll(state_dir=tmp_path) == 1
 
 
+# ---------------------------------------------------------------------------
+# poll — --max-issues cap
+# ---------------------------------------------------------------------------
+def _investigate_ok(tmp_path, calls: list):
+    """An ``investigate`` stub that records each URL and reports success."""
+    def _inv(url, state_dir):
+        calls.append(url)
+        return InvestigateResult("mctl-telegram", "issue-x", tmp_path)
+    return _inv
+
+
+def test_poll_max_issues_caps_cycle(tmp_path, monkeypatch):
+    """More labelled issues than the cap → only the first --max-issues are
+    investigated; the rest are never touched, so their label survives."""
+    refs = [_ref(number=n) for n in range(1, 9)]  # 8 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    investigated: list = []
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, investigated))
+    removed: list = []
+    monkeypatch.setattr(run_issue_poller, "remove_label",
+                        lambda url, label: removed.append(url))
+
+    assert poll(state_dir=tmp_path, max_issues=3) == 0
+    assert investigated == [r.url for r in refs[:3]]
+    assert removed == [r.url for r in refs[:3]]
+
+
+def test_poll_max_issues_zero_disables_cap(tmp_path, monkeypatch):
+    """`--max-issues 0` is the operator escape hatch — all issues run."""
+    refs = [_ref(number=n) for n in range(1, 9)]  # 8 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    investigated: list = []
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, investigated))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    assert poll(state_dir=tmp_path, max_issues=0) == 0
+    assert investigated == [r.url for r in refs]
+
+
+def test_poll_max_issues_warns_when_capped(tmp_path, monkeypatch, capsys):
+    refs = [_ref(number=n) for n in range(1, 6)]  # 5 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, []))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    poll(state_dir=tmp_path, max_issues=2)
+    out = capsys.readouterr().out
+    assert "WARN:" in out
+    assert "--max-issues=2" in out
+
+
+def test_poll_under_cap_does_not_warn(tmp_path, monkeypatch, capsys):
+    """Issue count below the cap → no cap WARN line."""
+    refs = [_ref(number=n) for n in range(1, 4)]  # 3 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, []))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    poll(state_dir=tmp_path, max_issues=5)
+    assert "capping this cycle" not in capsys.readouterr().out
+
+
+def test_poll_at_cap_does_not_warn(tmp_path, monkeypatch, capsys):
+    """Exactly cap issues → no truncation, no warning (guard is strict `>`)."""
+    refs = [_ref(number=n) for n in range(1, 4)]  # 3 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, []))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    poll(state_dir=tmp_path, max_issues=3)  # exactly at cap
+    assert "capping this cycle" not in capsys.readouterr().out
+
+
+def test_poll_cap_excludes_non_service_issues(tmp_path, monkeypatch):
+    """Non-service issues cost no SDK budget — they must not consume the
+    --max-issues cap and starve a valid service issue out of the cycle."""
+    non_service = [_ref(repo="not-a-service", number=n) for n in range(1, 6)]  # 5
+    valid = _ref(repo="mctl-telegram", number=99)
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues",
+                        lambda label: non_service + [valid])
+    investigated: list = []
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, investigated))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    # cap of 3: the 5 non-service issues must not consume it, so the lone
+    # service issue still gets investigated.
+    failures = poll(state_dir=tmp_path, max_issues=3)
+    assert investigated == [valid.url]
+    assert failures == 5  # the 5 non-service issues, label kept
+
+
 # Keep explicit references so an accidental removal of a public helper trips
 # the import at collection time.
 assert callable(remove_label)
