@@ -961,33 +961,39 @@ def apply_followup(
 
 
 # ---------------------------------------------------------------------------
-# Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
+# Re-trigger review after a successful followup push. Paired with
+# apply_followup above — the review bot only re-reviews on explicit
+# @-mention, so a bare new commit will not get it to look at the new
+# head_sha. Without this, the shepherd stalls in `wait` forever after
+# the first fix-up push.
 # ---------------------------------------------------------------------------
 def trigger_review(pr: PRSnapshot) -> None:
     """Post ``@claude review`` so the review bot re-reviews the new head.
 
-    Without this, ``apply_followup``'s fix-up push moves head_sha forward
-    but no review is anchored to it: ``read_codex_review`` returns
-    has_responded=False and ``decide()`` spins in ``wait`` forever. The
-    review bot only triggers on explicit @-mention, PR open, or
-    draft→ready transition — a bare new commit does NOT retrigger it.
-
     Best-effort: a failed comment post is logged, not raised. The tick
     still completes; the next tick will retry once a human posts the
-    trigger manually.
+    trigger manually. ``OSError`` is caught alongside
+    ``CalledProcessError`` so a missing-`gh` binary in a stripped image
+    cannot crash the tick after a real fix push — the exact failure
+    mode this function is designed to prevent.
     """
     pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
     try:
         _run(["gh", "pr", "comment", pr_ref, "--body", "@claude review"])
         print(f"info: posted `@claude review` on {pr.repo}#{pr.number}")
-    except subprocess.CalledProcessError as e:
-        msg = (e.stderr or "").strip() or str(e)
+    except (subprocess.CalledProcessError, OSError) as e:
+        # OSError (e.g. FileNotFoundError when gh isn't on PATH) has no
+        # .stderr attribute; fall back to str(e) via getattr.
+        msg = (getattr(e, "stderr", None) or "").strip() or str(e)
         print(
             f"warn: failed to post `@claude review` on {pr.repo}#{pr.number} "
             f"({msg}); next tick stalls until trigger is posted manually"
         )
 
 
+# ---------------------------------------------------------------------------
+# Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
+# ---------------------------------------------------------------------------
 def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
     """Invoke `gh pr merge --merge --delete-branch --match-head-commit <SHA>`.
 

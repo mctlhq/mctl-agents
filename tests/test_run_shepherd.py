@@ -1374,6 +1374,28 @@ def test_trigger_review_swallows_subprocess_failure(monkeypatch, capsys) -> None
     assert "rate limit exceeded" in out
 
 
+def test_trigger_review_swallows_oserror(monkeypatch, capsys) -> None:
+    """A missing `gh` binary (FileNotFoundError) must NOT raise either.
+
+    The except clause widened to (CalledProcessError, OSError) so a
+    stripped image without `gh` on PATH cannot crash the tick after a
+    real fix-up push — the exact failure mode trigger_review exists to
+    prevent. Regression for claude review P2 on PR #25.
+    """
+    pr = make_pr()
+
+    def missing_gh(cmd, cwd=None, check=True):
+        raise FileNotFoundError(2, "No such file or directory: 'gh'")
+
+    monkeypatch.setattr(run_shepherd, "_run", missing_gh)
+    # Must not raise.
+    run_shepherd.trigger_review(pr)
+
+    out = capsys.readouterr().out
+    assert "warn:" in out
+    assert "gh" in out
+
+
 def test_process_one_does_not_trigger_review_on_followup_failure(tmp_path) -> None:
     """A failed apply_followup must NOT lead to a stray `@claude review`.
 
