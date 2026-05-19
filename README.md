@@ -61,6 +61,10 @@ python -m orchestrator.run_mentor
 
 # всё целиком
 python -m orchestrator.run_all
+
+# issue-driven: превратить GitHub issue в proposal
+python -m orchestrator.run_issue_investigator \
+    --issue-url https://github.com/mctlhq/mctl-telegram/issues/123
 ```
 
 ## Architecture
@@ -74,8 +78,10 @@ is observable from `git log`.
 
 ```
 researcher / analyst / spec-writer  (Tier 1: per-service rotation)
-        |
-        v
+        |                                  run_issue_investigator.py
+        |                              (issue-driven entry, on demand)
+        |                                          |
+        v                                          v
    proposals/<slug>/{requirements,design,tasks}.md  (status: proposed)
         |  (mentor or human flips status: accepted)
         v
@@ -85,6 +91,27 @@ researcher / analyst / spec-writer  (Tier 1: per-service rotation)
    run_shepherd.py  (Tier 3)  -->  drives the PR to merge
                                    status: merged | rejected | review-stuck
 ```
+
+### Issue-driven entry — investigator
+
+The proactive Tier 1 rotation is not the only way a proposal is born.
+`orchestrator/run_issue_investigator.py` takes a **GitHub issue** (a
+human-filed feature request) and converts it into the same
+`proposals/<slug>/` triplet:
+
+1. Parses `--issue-url`, reads the issue via `gh issue view`.
+2. Derives a deterministic slug `issue-<N>-<kebab-title>` and an
+   idempotency guard: a proposal already past `proposed` is left alone.
+3. Clones the target repo read-only so the agent can ground the design
+   in real code, then runs the investigator sub-agent prompt.
+4. Writes `.status.yaml` with `status: proposed` plus a `source` block
+   linking back to the issue, and comments the proposal link on the issue.
+
+The proposal then follows the normal path: a human flips it to
+`accepted`, Tier 2 implements it, and the PR carries `Closes <repo>#<N>`
+(read from the `source` block) so the issue auto-closes on merge.
+Triggered on demand — by the `mctl_trigger_issue` MCP tool or an operator
+submitting the `mctl-agents-investigate` workflow.
 
 ### Tier 2 — implementer
 
