@@ -224,7 +224,7 @@ def test_poll_max_issues_warns_when_capped(tmp_path, monkeypatch, capsys):
 
 
 def test_poll_under_cap_does_not_warn(tmp_path, monkeypatch, capsys):
-    """Issue count at or below the cap → no cap WARN line."""
+    """Issue count below the cap → no cap WARN line."""
     refs = [_ref(number=n) for n in range(1, 4)]  # 3 issues
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
     monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, []))
@@ -232,6 +232,35 @@ def test_poll_under_cap_does_not_warn(tmp_path, monkeypatch, capsys):
 
     poll(state_dir=tmp_path, max_issues=5)
     assert "capping this cycle" not in capsys.readouterr().out
+
+
+def test_poll_at_cap_does_not_warn(tmp_path, monkeypatch, capsys):
+    """Exactly cap issues → no truncation, no warning (guard is strict `>`)."""
+    refs = [_ref(number=n) for n in range(1, 4)]  # 3 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, []))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    poll(state_dir=tmp_path, max_issues=3)  # exactly at cap
+    assert "capping this cycle" not in capsys.readouterr().out
+
+
+def test_poll_cap_excludes_non_service_issues(tmp_path, monkeypatch):
+    """Non-service issues cost no SDK budget — they must not consume the
+    --max-issues cap and starve a valid service issue out of the cycle."""
+    non_service = [_ref(repo="not-a-service", number=n) for n in range(1, 6)]  # 5
+    valid = _ref(repo="mctl-telegram", number=99)
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues",
+                        lambda label: non_service + [valid])
+    investigated: list = []
+    monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, investigated))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    # cap of 3: the 5 non-service issues must not consume it, so the lone
+    # service issue still gets investigated.
+    failures = poll(state_dir=tmp_path, max_issues=3)
+    assert investigated == [valid.url]
+    assert failures == 5  # the 5 non-service issues, label kept
 
 
 # Keep explicit references so an accidental removal of a public helper trips

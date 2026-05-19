@@ -131,9 +131,9 @@ def poll(
 ) -> int:
     """Run one poll cycle. Returns the count of issues that failed.
 
-    At most ``max_issues`` issues are investigated per cycle (``max_issues <= 0``
-    disables the cap). Any beyond the cap keep their label and are picked up by
-    a later cycle.
+    At most ``max_issues`` *known-service* issues are investigated per cycle
+    (``max_issues <= 0`` disables the cap). Any beyond the cap keep their label
+    and are picked up by a later cycle.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -143,17 +143,28 @@ def poll(
         print(f"No open issues labelled '{label}' — nothing to do.")
         return 0
 
-    if max_issues > 0 and len(refs) > max_issues:
-        # Each investigation spends SDK budget — cap the cycle. The dropped
-        # issues keep their label (they are never passed to investigate /
-        # remove_label below), so the next cycle picks them up.
-        print(
-            f"WARN: {len(refs)} issue(s) labelled '{label}' found — capping "
-            f"this cycle at --max-issues={max_issues}; the remaining "
-            f"{len(refs) - max_issues} keep their label for the next cycle."
-        )
-        refs = refs[:max_issues]
+    # The --max-issues cap bounds the number of *paid* investigations per
+    # cycle. Apply it only to known-service issues: a non-service issue costs
+    # no SDK budget (it is reported and its label kept for the operator), so
+    # capping the raw search result would let a wall of mislabelled
+    # non-service issues starve a valid one out of every cycle.
+    service_refs = [r for r in refs if r.repo in SERVICES]
+    other_refs = [r for r in refs if r.repo not in SERVICES]
 
+    if max_issues > 0 and len(service_refs) > max_issues:
+        # The dropped issues keep their label (they are never passed to
+        # investigate / remove_label below), so the next cycle picks them up.
+        print(
+            f"WARN: {len(service_refs)} investigable issue(s) labelled "
+            f"'{label}' found — capping this cycle at --max-issues={max_issues}; "
+            f"the remaining {len(service_refs) - max_issues} keep their label "
+            f"for the next cycle."
+        )
+        service_refs = service_refs[:max_issues]
+
+    # Non-service issues first so a misconfiguration surfaces at the top of
+    # the log, then the capped investigable issues.
+    refs = other_refs + service_refs
     print(f"Found {len(refs)} issue(s) labelled '{label}':")
     for ref in refs:
         print(f"  - {ref.full_repo}#{ref.number}")
@@ -261,6 +272,8 @@ def main() -> None:
         ),
     )
     args = ap.parse_args()
+    if args.max_issues < 0:
+        ap.error("--max-issues must be >= 0 (use 0 to disable the cap)")
 
     ensure_auth_for_sdk()
 
