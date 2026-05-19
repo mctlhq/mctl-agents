@@ -27,6 +27,12 @@ is kept for retry. The process exits non-zero only on a global failure
 (missing state dir, broken `gh` auth) so the CronWorkflow surfaces a genuine
 outage but stays green on the normal "one bad issue" case.
 
+A cycle investigates at most ``--max-issues`` issues (default
+``DEFAULT_MAX_ISSUES``). Each investigation spends real SDK budget, so a
+mass-label event would otherwise be an uncapped N-runs runaway; any issues
+beyond the cap keep their label and are picked up by a later cycle. Pass
+``--max-issues 0`` to disable the cap.
+
 Auth:
     GITHUB_TOKEN from env (gh CLI honors it) — needs `repo` read on the
     target repos, plus `issues: write` for the proposal comment and the
@@ -35,6 +41,7 @@ Auth:
 Usage:
     python -m orchestrator.run_issue_poller
     python -m orchestrator.run_issue_poller --label agent:investigate --dry-run
+    python -m orchestrator.run_issue_poller --max-issues 3
 """
 from __future__ import annotations
 
@@ -63,6 +70,12 @@ _SEARCH_LIMIT = 100
 # to a feature-request issue to hand it to the pipeline; the poller removes it
 # once the issue has been turned into a proposal.
 DEFAULT_LABEL = "agent:investigate"
+
+# A cycle investigates at most this many issues. Each investigation spends
+# real SDK budget, so without a cap a mass-label event would fan out into an
+# uncapped run of paid investigations. Issues beyond the cap keep their label
+# and are handled by a later cycle. `--max-issues 0` disables the cap.
+DEFAULT_MAX_ISSUES = 5
 
 
 def search_labeled_issues(label: str) -> list[IssueRef]:
@@ -114,8 +127,14 @@ def poll(
     label: str = DEFAULT_LABEL,
     state_dir: Path = DEFAULT_STATE_DIR,
     dry_run: bool = False,
+    max_issues: int = DEFAULT_MAX_ISSUES,
 ) -> int:
-    """Run one poll cycle. Returns the count of issues that failed."""
+    """Run one poll cycle. Returns the count of issues that failed.
+
+    At most ``max_issues`` issues are investigated per cycle (``max_issues <= 0``
+    disables the cap). Any beyond the cap keep their label and are picked up by
+    a later cycle.
+    """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
 
@@ -123,6 +142,17 @@ def poll(
     if not refs:
         print(f"No open issues labelled '{label}' — nothing to do.")
         return 0
+
+    if max_issues > 0 and len(refs) > max_issues:
+        # Each investigation spends SDK budget — cap the cycle. The dropped
+        # issues keep their label (they are never passed to investigate /
+        # remove_label below), so the next cycle picks them up.
+        print(
+            f"WARN: {len(refs)} issue(s) labelled '{label}' found — capping "
+            f"this cycle at --max-issues={max_issues}; the remaining "
+            f"{len(refs) - max_issues} keep their label for the next cycle."
+        )
+        refs = refs[:max_issues]
 
     print(f"Found {len(refs)} issue(s) labelled '{label}':")
     for ref in refs:
@@ -219,6 +249,17 @@ def main() -> None:
         action="store_true",
         help="List matching issues only; don't investigate or relabel",
     )
+    ap.add_argument(
+        "--max-issues",
+        type=int,
+        default=DEFAULT_MAX_ISSUES,
+        help=(
+            f"Max issues to investigate per cycle (default: {DEFAULT_MAX_ISSUES}; "
+            "0 disables the cap). Each investigation spends SDK budget, so the "
+            "cap bounds the cost of a mass-label event; capped-out issues keep "
+            "their label and are handled by a later cycle."
+        ),
+    )
     args = ap.parse_args()
 
     ensure_auth_for_sdk()
@@ -227,6 +268,7 @@ def main() -> None:
         label=args.label,
         state_dir=Path(args.state_dir),
         dry_run=args.dry_run,
+        max_issues=args.max_issues,
     )
 
     print("\n=== Poll summary ===")
