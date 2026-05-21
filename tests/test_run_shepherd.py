@@ -17,6 +17,7 @@ fixture so the YAML serialisation is exercised.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -166,7 +167,53 @@ def test_decide_merge() -> None:
     """T1: clean review + green CI -> merge."""
     pr = make_pr(merged=False, checks_green=True, merge_state_status="CLEAN")
     review = CodexReview(has_responded=True, findings=[])
-    assert decide(pr, review) == ("merge", None)
+    # Pin now well after HEAD_PUSHED_AT so the settling window does not apply;
+    # makes the test independent of wall-clock time and the fixture's date.
+    now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=timezone.utc)
+    assert decide(pr, review, now=now) == ("merge", None)
+
+
+def test_decide_wait_within_settle_window() -> None:
+    """Clean + green but head pushed inside the settling window -> wait.
+
+    Guards against the mctl-telegram#115 failure: merging out from under a
+    human/second reviewer who is still pushing fix-ups. Default window is 15m;
+    here the head was pushed 5 minutes before `now`.
+    """
+    now = datetime(2026, 4, 29, 10, 5, 0, tzinfo=timezone.utc)
+    pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review, now=now) == ("wait", None)
+
+
+def test_decide_merge_after_settle_window() -> None:
+    """Clean + green and head pushed before the settling window -> merge.
+
+    Head pushed 30 minutes before `now`, outside the default 15m window.
+    """
+    now = datetime(2026, 4, 29, 10, 30, 0, tzinfo=timezone.utc)
+    pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review, now=now) == ("merge", None)
+
+
+def test_decide_merge_future_dated_head() -> None:
+    """A future-dated head_pushed_at must not hold the PR forever -> merge.
+
+    Guards the committedDate fallback: a commit authored with a skewed/future
+    clock makes now - pushed negative; without the guard that reads as "still
+    in the window" and would wedge the PR indefinitely.
+    """
+    now = datetime(2026, 4, 29, 10, 0, 0, tzinfo=timezone.utc)
+    pr = make_pr(head_pushed_at="2026-04-29T10:30:00Z")  # 30 min in the future
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review, now=now) == ("merge", None)
+
+
+def test_settle_min_from_env_bad_value(monkeypatch) -> None:
+    """A non-integer SHEPHERD_MERGE_SETTLE_MIN falls back to 15, not a crash."""
+    monkeypatch.setenv("SHEPHERD_MERGE_SETTLE_MIN", "15m")
+    assert run_shepherd._settle_min_from_env() == 15
 
 
 def test_decide_address_review() -> None:
