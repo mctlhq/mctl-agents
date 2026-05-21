@@ -48,7 +48,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -103,6 +103,15 @@ MAX_REVIEW_ATTEMPTS = 3
 # branch protection, secret scanning) — GitHub still considers the PR
 # mergeable. UNSTABLE = non-required CI failing but required ones pass.
 MERGEABLE_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
+
+# Settling window: do not merge a PR whose head was pushed within the last
+# SHEPHERD_MERGE_SETTLE_MIN minutes, even when the review is clean and checks
+# are green. This leaves a gap for a human (or a second-opinion reviewer such
+# as codex) to push review fix-ups before the shepherd merges out from under
+# active work — the failure mode that stranded fixes on mctl-telegram#115,
+# which merged within minutes of a clean-but-shallow review. 0 disables the
+# window. Anchored on head_pushed_at so the window resets on every new push.
+SHEPHERD_MERGE_SETTLE_MIN = int(os.environ.get("SHEPHERD_MERGE_SETTLE_MIN", "15"))
 
 
 class FollowupSubprocessError(RuntimeError):
@@ -508,6 +517,26 @@ def _iso_gt(a: Optional[str], b: Optional[str]) -> bool:
     return a > b
 
 
+def _within_settle_window(
+    head_pushed_at: Optional[str], now: datetime, settle_min: int
+) -> bool:
+    """True iff head_pushed_at is less than settle_min minutes before now.
+
+    Unknown/unparseable timestamps and a non-positive settle_min return False
+    (no constraint), so the merge gate keeps its prior behavior when the window
+    is disabled or the push time cannot be determined.
+    """
+    if not head_pushed_at or settle_min <= 0:
+        return False
+    try:
+        pushed = datetime.fromisoformat(head_pushed_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if pushed.tzinfo is None:
+        pushed = pushed.replace(tzinfo=timezone.utc)
+    return now - pushed < timedelta(minutes=settle_min)
+
+
 def _extract_severity(body: str) -> Optional[str]:
     """Find a `![P<n> Badge]` marker in a codex finding body. None if absent.
 
@@ -698,14 +727,18 @@ def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
 def decide(
     pr: PRSnapshot,
     codex_review: CodexReview,
+    now: Optional[datetime] = None,
 ) -> tuple[str, Any]:
     """Return one of the five decisions per design.md L62-75.
 
-    Pure: only depends on its arguments. The 3-attempt cap on
-    address-review loops lives in the OUTER state machine (process_one),
-    NOT here, so this function stays trivially testable with hand-built
-    fixtures.
+    Pure: only depends on its arguments. `now` is injected so the settling
+    window stays deterministic in tests; it defaults to the current UTC time.
+    The 3-attempt cap on address-review loops lives in the OUTER state machine
+    (process_one), NOT here, so this function stays trivially testable with
+    hand-built fixtures.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
     if pr.merged:
         return ("flip-to-merged", pr.merge_commit)
     if pr.closed_unmerged:
@@ -722,6 +755,11 @@ def decide(
         # BLOCKED, BEHIND, DIRTY, UNKNOWN, DRAFT — retry next tick.
         return ("wait", None)
     if not pr.checks_green:
+        return ("wait", None)
+    if _within_settle_window(pr.head_pushed_at, now, SHEPHERD_MERGE_SETTLE_MIN):
+        # Clean + green, but the head was pushed within the settling window —
+        # hold one tick so a human or second-opinion reviewer can land fix-ups
+        # before we merge. See SHEPHERD_MERGE_SETTLE_MIN.
         return ("wait", None)
     return ("merge", None)
 

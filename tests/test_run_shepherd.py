@@ -17,6 +17,7 @@ fixture so the YAML serialisation is exercised.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
@@ -167,6 +168,30 @@ def test_decide_merge() -> None:
     pr = make_pr(merged=False, checks_green=True, merge_state_status="CLEAN")
     review = CodexReview(has_responded=True, findings=[])
     assert decide(pr, review) == ("merge", None)
+
+
+def test_decide_wait_within_settle_window() -> None:
+    """Clean + green but head pushed inside the settling window -> wait.
+
+    Guards against the mctl-telegram#115 failure: merging out from under a
+    human/second reviewer who is still pushing fix-ups. Default window is 15m;
+    here the head was pushed 5 minutes before `now`.
+    """
+    now = datetime(2026, 4, 29, 10, 5, 0, tzinfo=timezone.utc)
+    pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review, now=now) == ("wait", None)
+
+
+def test_decide_merge_after_settle_window() -> None:
+    """Clean + green and head pushed before the settling window -> merge.
+
+    Head pushed 30 minutes before `now`, outside the default 15m window.
+    """
+    now = datetime(2026, 4, 29, 10, 30, 0, tzinfo=timezone.utc)
+    pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review, now=now) == ("merge", None)
 
 
 def test_decide_address_review() -> None:
