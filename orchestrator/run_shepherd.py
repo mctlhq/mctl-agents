@@ -111,7 +111,19 @@ MERGEABLE_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
 # active work — the failure mode that stranded fixes on mctl-telegram#115,
 # which merged within minutes of a clean-but-shallow review. 0 disables the
 # window. Anchored on head_pushed_at so the window resets on every new push.
-SHEPHERD_MERGE_SETTLE_MIN = int(os.environ.get("SHEPHERD_MERGE_SETTLE_MIN", "15"))
+def _settle_min_from_env() -> int:
+    raw = os.environ.get("SHEPHERD_MERGE_SETTLE_MIN", "15")
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"warn: SHEPHERD_MERGE_SETTLE_MIN={raw!r} is not an integer; "
+            "defaulting to 15 minutes"
+        )
+        return 15
+
+
+SHEPHERD_MERGE_SETTLE_MIN = _settle_min_from_env()
 
 
 class FollowupSubprocessError(RuntimeError):
@@ -534,6 +546,11 @@ def _within_settle_window(
         return False
     if pushed.tzinfo is None:
         pushed = pushed.replace(tzinfo=timezone.utc)
+    if pushed > now:
+        # A future-dated head (e.g. committedDate fallback on a commit authored
+        # with a skewed clock) would make now - pushed negative, which is < the
+        # window and would hold the PR forever. Treat it as outside the window.
+        return False
     return now - pushed < timedelta(minutes=settle_min)
 
 

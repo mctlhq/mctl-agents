@@ -167,7 +167,10 @@ def test_decide_merge() -> None:
     """T1: clean review + green CI -> merge."""
     pr = make_pr(merged=False, checks_green=True, merge_state_status="CLEAN")
     review = CodexReview(has_responded=True, findings=[])
-    assert decide(pr, review) == ("merge", None)
+    # Pin now well after HEAD_PUSHED_AT so the settling window does not apply;
+    # makes the test independent of wall-clock time and the fixture's date.
+    now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=timezone.utc)
+    assert decide(pr, review, now=now) == ("merge", None)
 
 
 def test_decide_wait_within_settle_window() -> None:
@@ -192,6 +195,25 @@ def test_decide_merge_after_settle_window() -> None:
     pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
     review = CodexReview(has_responded=True, findings=[])
     assert decide(pr, review, now=now) == ("merge", None)
+
+
+def test_decide_merge_future_dated_head() -> None:
+    """A future-dated head_pushed_at must not hold the PR forever -> merge.
+
+    Guards the committedDate fallback: a commit authored with a skewed/future
+    clock makes now - pushed negative; without the guard that reads as "still
+    in the window" and would wedge the PR indefinitely.
+    """
+    now = datetime(2026, 4, 29, 10, 0, 0, tzinfo=timezone.utc)
+    pr = make_pr(head_pushed_at="2026-04-29T10:30:00Z")  # 30 min in the future
+    review = CodexReview(has_responded=True, findings=[])
+    assert decide(pr, review, now=now) == ("merge", None)
+
+
+def test_settle_min_from_env_bad_value(monkeypatch) -> None:
+    """A non-integer SHEPHERD_MERGE_SETTLE_MIN falls back to 15, not a crash."""
+    monkeypatch.setenv("SHEPHERD_MERGE_SETTLE_MIN", "15m")
+    assert run_shepherd._settle_min_from_env() == 15
 
 
 def test_decide_address_review() -> None:
