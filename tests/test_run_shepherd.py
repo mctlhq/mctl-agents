@@ -310,6 +310,16 @@ def test_reconcile_one_open_pr_is_noop(tmp_path) -> None:
     assert read_status(ref)["status"] == "implemented"
 
 
+def test_reconcile_one_pr_none_is_wait(tmp_path) -> None:
+    """Unfetchable PR (None) → wait with an error; status left untouched."""
+    ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=None):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "wait"
+    assert result.error is not None
+    assert read_status(ref)["status"] == "implemented"
+
+
 def test_decide_address_review() -> None:
     """T2: codex P1 finding on the head SHA -> address-review."""
     pr = make_pr()

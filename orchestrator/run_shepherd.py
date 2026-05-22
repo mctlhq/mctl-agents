@@ -1348,7 +1348,10 @@ def reconcile_one(
     ref: ProposalRef,
     state_dir: Optional[Path] = None,
 ) -> ShepherdResult:
-    """Read-only status reconciliation for a SHEPHERD_SKIP_SERVICES repo.
+    """Terminal-status reconciliation for a SHEPHERD_SKIP_SERVICES repo.
+
+    Does NOT read reviews, apply fixes, merge, or call the SDK — its only
+    side effect is the merged/rejected `.status.yaml` flip below.
 
     These repos are owned by another PR lifecycle (pr-steward), which is
     responsible for writing `.status.yaml: merged` after it merges. That
@@ -1451,6 +1454,15 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
+
+    # Reconcile only covers skip-listed repos, so a --service that is valid but
+    # NOT skip-listed would silently match nothing. Warn rather than look broken.
+    if args.reconcile and args.service and args.service not in SHEPHERD_SKIP_SERVICES:
+        print(
+            f"warn: --reconcile --service {args.service}: not in "
+            "SHEPHERD_SKIP_SERVICES, so nothing will match (reconcile only "
+            "covers repos owned by another PR lifecycle)."
+        )
 
     # Resolve effective budget.
     budget = args.budget if args.budget is not None else SHEPHERD_BUDGET_USD
