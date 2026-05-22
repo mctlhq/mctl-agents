@@ -21,6 +21,13 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # `mctl-telegram` is included as a valid implementer/investigator target
 # but is NOT a rotation service: it has no agents/<svc>/ scaffold and is
 # driven only by GitHub-issue proposals via the issue-investigator.
+#
+# `mctl-design` is the autonomous-pipeline pilot (design system + Storybook
+# at ui.mctl.ai). It is an issue-driven implementer target only — no
+# proactive rotation, and its review/fix/merge is owned by pr-steward, not
+# the shepherd (see SHEPHERD_SKIP_SERVICES in run_shepherd.py). The generic
+# implementer sub-agent (agents/_generic/.claude/agents/implementer.md)
+# covers it; no per-service scaffold.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -31,12 +38,13 @@ SERVICES = [
     "mctl-gitops",
     "mctl-agents",
     "mctl-telegram",
+    "mctl-design",
     # "upwork-mcp",
 ]
 
 # Services that are valid implementer/investigator targets but are NOT
 # analyzed by the proactive researcher/analyst/spec-writer rotation.
-NON_ROTATING_SERVICES = {"mctl-agents", "mctl-telegram"}
+NON_ROTATING_SERVICES = {"mctl-agents", "mctl-telegram", "mctl-design"}
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
 # researcher/analyst/spec-writer. Anything in SERVICES but NOT here is

@@ -126,6 +126,20 @@ def _settle_min_from_env() -> int:
 SHEPHERD_MERGE_SETTLE_MIN = _settle_min_from_env()
 
 
+# Per-service opt-out. A repo whose name is listed here is owned by a
+# different PR lifecycle (e.g. mctl-claude-remote's pr-steward) and the
+# shepherd must NOT discover, fix, or merge its proposals — otherwise two
+# actors push fixes to the same feat/agents-* branch and race on merge.
+# Comma- or whitespace-separated; unset = empty set = today's behavior
+# (zero blast radius for every other repo).
+def _skip_services_from_env() -> frozenset[str]:
+    raw = os.environ.get("SHEPHERD_SKIP_SERVICES", "")
+    return frozenset(s for s in raw.replace(",", " ").split() if s)
+
+
+SHEPHERD_SKIP_SERVICES = _skip_services_from_env()
+
+
 class FollowupSubprocessError(RuntimeError):
     """Raised when ``apply_followup`` cannot push a new commit.
 
@@ -312,6 +326,8 @@ def _discover_refs(
     Both `implemented` and `review-fixing` are included per
     requirements.md L41-58. Proposals without a `pr:` URL are skipped —
     the shepherd has nothing to do until the implementer opens a PR.
+    Services in SHEPHERD_SKIP_SERVICES are skipped entirely — they are
+    owned by another PR lifecycle (e.g. pr-steward).
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -321,6 +337,9 @@ def _discover_refs(
         if not service_dir.is_dir() or service_dir.name.startswith("_"):
             continue
         service = service_dir.name
+        if service in SHEPHERD_SKIP_SERVICES:
+            # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone.
+            continue
         if service_filter and service != service_filter:
             continue
 
