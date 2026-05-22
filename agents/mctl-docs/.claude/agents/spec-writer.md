@@ -82,7 +82,7 @@ page; reference-style vs. how-to-style); why each was dropped.
         links work, mermaid blocks render.
 - [ ] 4. Cross-link: check whether 1-2 related pages should mention the
         new page (where appropriate). — DoD: cross-references in place.
-- [ ] 5. Open a PR against `mctlhq/mctl-docs`, run codex review, merge.
+- [ ] 5. Open a PR against `mctlhq/mctl-docs`, request a `@claude review`, merge.
         — DoD: deployed to docs.mctl.ai.
 
 ## Tests

@@ -30,7 +30,7 @@ Public documentation portal `docs.mctl.ai`. Source of truth for platform documen
 ## What we do NOT document
 - Internal implementation details of individual repos (each repo has its own CLAUDE.md)
 - Development commands (live-reload, debug) — those go in the README of the corresponding repo
-- Code review process (PR convention, codex review) — in `.claude/CLAUDE.md` of the repo
+- Code review process (PR convention, code review) — in `.claude/CLAUDE.md` of the repo
 
 ## External integrations
 - **mctl-api** — the main source of truth for `docs/api/` and `docs/mcp/`

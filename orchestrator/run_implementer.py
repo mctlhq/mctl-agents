@@ -395,7 +395,7 @@ Tier 2 implementer follow-up for proposal `{ref.service}/{ref.slug}`.
 
 Context:
 - Branch `{branch}` is already checked out on the existing PR.
-- Codex review left P1/P2 findings on this PR — they are listed below.
+- Code review left P1/P2 findings on this PR — they are listed below.
 - Spec files live at `$PROPOSAL_DIR` (env var): requirements.md, design.md, tasks.md.
 
 Workflow:
@@ -491,7 +491,7 @@ def _render_review_feedback(bundle: dict) -> str:
     has_p1 = bool(bundle.get("p1"))
     has_p2 = bool(bundle.get("p2"))
 
-    lines: list[str] = ["## Codex review findings (address each)"]
+    lines: list[str] = ["## Code review findings (address each)"]
     if has_p1 and has_p2:
         lines.append("Severity mix: at least one P1 and one P2 — fix both.")
     elif has_p1:
@@ -501,7 +501,7 @@ def _render_review_feedback(bundle: dict) -> str:
     lines.append("")
 
     if not summaries:
-        lines.append("(No summaries in bundle — re-read the PR's codex review on GitHub.)")
+        lines.append("(No summaries in bundle — re-read the PR's code review on GitHub.)")
         return "\n".join(lines)
 
     for i, item in enumerate(summaries, 1):
@@ -557,7 +557,7 @@ def review_feedback_one(
     bundle: dict,
     dry_run: bool = False,
 ) -> ImplementResult:
-    """Apply codex review feedback as a follow-up commit on the existing PR.
+    """Apply code review feedback as a follow-up commit on the existing PR.
 
     Pre-conditions (caller's responsibility):
     - ``feat/agents-<slug>`` exists on origin (the shepherd only invokes
