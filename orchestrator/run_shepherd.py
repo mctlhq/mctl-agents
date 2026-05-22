@@ -134,7 +134,16 @@ SHEPHERD_MERGE_SETTLE_MIN = _settle_min_from_env()
 # (zero blast radius for every other repo).
 def _skip_services_from_env() -> frozenset[str]:
     raw = os.environ.get("SHEPHERD_SKIP_SERVICES", "")
-    return frozenset(s for s in raw.replace(",", " ").split() if s)
+    names = frozenset(s for s in raw.replace(",", " ").split() if s)
+    unknown = names - set(SERVICES)
+    if unknown:
+        # A typo (e.g. `mctl-desig`) would silently skip nothing — warn so the
+        # operator notices, mirroring the --service validation in main().
+        print(
+            "warn: SHEPHERD_SKIP_SERVICES contains names not in SERVICES "
+            f"(typo?): {sorted(unknown)}"
+        )
+    return names
 
 
 SHEPHERD_SKIP_SERVICES = _skip_services_from_env()
@@ -338,7 +347,14 @@ def _discover_refs(
             continue
         service = service_dir.name
         if service in SHEPHERD_SKIP_SERVICES:
-            # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone.
+            # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
+            # but log it (only for real targets with a proposals/ dir) so an
+            # operator isn't confused about why its proposals never appear.
+            if (service_dir / "proposals").is_dir():
+                print(
+                    f"shepherd: skipping {service} "
+                    "(SHEPHERD_SKIP_SERVICES; owned by another PR lifecycle)"
+                )
             continue
         if service_filter and service != service_filter:
             continue

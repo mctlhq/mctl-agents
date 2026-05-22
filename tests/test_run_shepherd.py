@@ -227,14 +227,22 @@ def test_skip_services_from_env_unset(monkeypatch) -> None:
 
 def test_skip_services_from_env_parses_comma_and_space(monkeypatch) -> None:
     """Comma- or whitespace-separated names both parse, blanks dropped."""
-    monkeypatch.setenv("SHEPHERD_SKIP_SERVICES", "mctl-design, mctl-foo  mctl-bar")
+    monkeypatch.setenv("SHEPHERD_SKIP_SERVICES", "mctl-design, mctl-web  mctl-api")
     assert run_shepherd._skip_services_from_env() == frozenset(
-        {"mctl-design", "mctl-foo", "mctl-bar"}
+        {"mctl-design", "mctl-web", "mctl-api"}
     )
 
 
-def test_discover_skips_listed_service(tmp_path, monkeypatch) -> None:
-    """A skip-listed service is invisible to discovery; others stay visible."""
+def test_skip_services_from_env_warns_on_unknown(monkeypatch, capsys) -> None:
+    """A name not in SERVICES (typo) is kept but warned about, not silent."""
+    monkeypatch.setenv("SHEPHERD_SKIP_SERVICES", "mctl-desig")
+    names = run_shepherd._skip_services_from_env()
+    assert names == frozenset({"mctl-desig"})
+    assert "not in SERVICES" in capsys.readouterr().out
+
+
+def test_discover_skips_listed_service(tmp_path, monkeypatch, capsys) -> None:
+    """A skip-listed service is invisible to discovery and logged; others stay."""
     make_status_yaml(tmp_path, service="mctl-design", slug="icon-swap")
     make_status_yaml(tmp_path, service="mctl-web", slug="dep-bump")
     monkeypatch.setattr(
@@ -244,6 +252,7 @@ def test_discover_skips_listed_service(tmp_path, monkeypatch) -> None:
     services = {r.service for r in refs}
     assert "mctl-design" not in services
     assert "mctl-web" in services
+    assert "skipping mctl-design" in capsys.readouterr().out
 
 
 def test_discover_no_skip_includes_all(tmp_path, monkeypatch) -> None:
