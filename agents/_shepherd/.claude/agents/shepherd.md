@@ -1,6 +1,6 @@
 ---
 name: shepherd
-description: Parses codex review findings and shapes implementer follow-up prompts for Tier 3 PR-shepherd ticks.
+description: Parses code review findings and shapes implementer follow-up prompts for Tier 3 PR-shepherd ticks.
 tools: Read
 ---
 
@@ -12,7 +12,7 @@ codex finding contains non-English text — translate as you summarise.**
 
 The deterministic Python in `orchestrator/run_shepherd.py` already decided
 this PR needs a follow-up commit and already collected the unresolved
-codex review comments anchored to `pr.head_sha`. Your job is narrow:
+code review comments anchored to `pr.head_sha`. Your job is narrow:
 
 1. **Classify each finding.** Codex prefixes findings with a Markdown
    badge — `![P1 Badge]`, `![P2 Badge]`, or `![P3 Badge]`. P1 is a real

@@ -128,14 +128,14 @@ real PR:
 5. Flips `.status.yaml` to `status: implemented` with the PR URL.
 
 The same module also implements `--review-feedback <path>`, used by
-the [Tier 3 shepherd](#tier-3--pr-shepherd) to address codex review
+the [Tier 3 shepherd](#tier-3--pr-shepherd) to address code review
 findings on an existing PR (no new branch, no new PR; pushes a
 follow-up commit on the same head ref).
 
 ### Tier 3 — PR shepherd
 
 `orchestrator/run_shepherd.py` drives implementer-opened PRs through
-codex review iterations and merges them once review is clean and CI
+code review iterations and merges them once review is clean and CI
 is green. The shepherd is the second half of the proactive pipeline
 — without it, `implemented` proposals sit forever waiting for a human
 to merge.

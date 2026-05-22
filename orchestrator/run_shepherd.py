@@ -191,7 +191,7 @@ class ProposalRef:
 
 @dataclass
 class CodexFinding:
-    """A single P1 or P2 finding parsed out of a codex review comment.
+    """A single P1 or P2 finding parsed out of a code review comment.
 
     `commit_id` is the SHA the comment is anchored to (line-anchored
     review comments carry a `commit_id` field; top-level issue comments
@@ -535,7 +535,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
     # pre-receive hook. Both are mergeable per design.md L143-154, so we
     # also treat them as "checks green" even when the raw rollup is not
     # SUCCESS. Otherwise PRs with non-required CI failures (or in
-    # hook-enabled repos) would stall here despite a clean codex review.
+    # hook-enabled repos) would stall here despite a clean code review.
     #
     # Third branch: the rollup is absent/empty when the repo has no CI
     # configured at all (e.g. mctl-gitops where merges have CI=SKIPPED
@@ -636,7 +636,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             "--paginate",
         ]) or []
     except subprocess.CalledProcessError as e:
-        print(f"warn: codex reviews fetch failed for {pr.repo}#{pr.number}: {e.stderr.strip()}")
+        print(f"warn: code reviews fetch failed for {pr.repo}#{pr.number}: {e.stderr.strip()}")
         reviews = []
     for r in reviews:
         if (r.get("user") or {}).get("login") != REVIEW_BOT:
