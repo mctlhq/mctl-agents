@@ -263,6 +263,53 @@ def test_discover_no_skip_includes_all(tmp_path, monkeypatch) -> None:
     assert {r.service for r in refs} == {"mctl-design"}
 
 
+# ---------------------------------------------------------------------------
+# Reconcile mode: read-only status repair for skip-listed repos
+# ---------------------------------------------------------------------------
+def test_discover_reconcile_inverts_skip(tmp_path, monkeypatch) -> None:
+    """reconcile=True returns ONLY skip-listed services, the inverse of normal."""
+    make_status_yaml(tmp_path, service="mctl-design", slug="icon-swap")
+    make_status_yaml(tmp_path, service="mctl-web", slug="dep-bump")
+    monkeypatch.setattr(
+        run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-design"})
+    )
+    refs = run_shepherd._discover_refs(tmp_path, reconcile=True)
+    assert {r.service for r in refs} == {"mctl-design"}
+
+
+def test_reconcile_one_flips_merged(tmp_path) -> None:
+    """A merged PR flips the proposal to merged with the merge commit."""
+    ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
+    pr = make_pr(merged=True, merge_commit="abc123" + "0" * 34)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "flip-to-merged"
+    final = read_status(ref)
+    assert final["status"] == "merged"
+    assert final["merge_commit"] == "abc123" + "0" * 34
+
+
+def test_reconcile_one_flips_rejected(tmp_path) -> None:
+    """A closed-unmerged PR flips the proposal to rejected."""
+    ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
+    pr = make_pr(closed_unmerged=True)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "flip-to-rejected"
+    assert read_status(ref)["status"] == "rejected"
+
+
+def test_reconcile_one_open_pr_is_noop(tmp_path) -> None:
+    """An open PR is left to pr-steward — reconcile does nothing."""
+    ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
+    pr = make_pr(merged=False, closed_unmerged=False)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "wait"
+    # Status untouched (still implemented from make_ref).
+    assert read_status(ref)["status"] == "implemented"
+
+
 def test_decide_address_review() -> None:
     """T2: codex P1 finding on the head SHA -> address-review."""
     pr = make_pr()

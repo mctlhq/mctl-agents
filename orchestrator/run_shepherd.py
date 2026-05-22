@@ -329,14 +329,18 @@ def _discover_refs(
     state_dir: Path,
     service_filter: Optional[str] = None,
     slug_filter: Optional[str] = None,
+    reconcile: bool = False,
 ) -> list[ProposalRef]:
     """Glob agents-state for proposals in SHEPHERD_INPUT_STATUSES.
 
     Both `implemented` and `review-fixing` are included per
     requirements.md L41-58. Proposals without a `pr:` URL are skipped —
     the shepherd has nothing to do until the implementer opens a PR.
-    Services in SHEPHERD_SKIP_SERVICES are skipped entirely — they are
-    owned by another PR lifecycle (e.g. pr-steward).
+
+    Normal mode skips services in SHEPHERD_SKIP_SERVICES entirely (they are
+    owned by another PR lifecycle, e.g. pr-steward). `reconcile=True` inverts
+    the gate: it returns ONLY the skip-listed services, for the read-only
+    status-repair pass (`reconcile_one`).
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -346,7 +350,12 @@ def _discover_refs(
         if not service_dir.is_dir() or service_dir.name.startswith("_"):
             continue
         service = service_dir.name
-        if service in SHEPHERD_SKIP_SERVICES:
+        is_skipped = service in SHEPHERD_SKIP_SERVICES
+        if reconcile:
+            # Reconcile pass handles ONLY the repos the normal shepherd skips.
+            if not is_skipped:
+                continue
+        elif is_skipped:
             # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
             # but log it (only for real targets with a proposals/ dir) so an
             # operator isn't confused about why its proposals never appear.
@@ -1335,9 +1344,67 @@ def process_one(
     )
 
 
+def reconcile_one(
+    ref: ProposalRef,
+    state_dir: Optional[Path] = None,
+) -> ShepherdResult:
+    """Read-only status reconciliation for a SHEPHERD_SKIP_SERVICES repo.
+
+    These repos are owned by another PR lifecycle (pr-steward), which is
+    responsible for writing `.status.yaml: merged` after it merges. That
+    write-back is best-effort and non-blocking, so it can be dropped (push
+    conflict, crash). This pass repairs the drift: it reads the linked PR and,
+    if it is actually merged/closed, flips the proposal to the matching
+    terminal status. It NEVER reads reviews, applies fixes, or merges — those
+    belong to pr-steward. It is the eventual-consistency safety net, not a
+    second driver, so it only ever performs the two terminal flips that
+    process_one's flip-to-merged / flip-to-rejected branches do.
+    """
+    pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+    if pr is None:
+        return ShepherdResult(
+            ref=ref, decision="wait", error="could not fetch PR snapshot"
+        )
+    if pr.merged:
+        update_status(
+            ref,
+            "merged",
+            merged_at=_now_iso(),
+            merge_commit=pr.merge_commit,
+            review_attempts=None,
+        )
+        return ShepherdResult(ref=ref, decision="flip-to-merged")
+    if pr.closed_unmerged:
+        update_status(
+            ref,
+            "rejected",
+            notes=pr.close_comment_or_default or "PR was closed without merging.",
+            review_attempts=None,
+        )
+        return ShepherdResult(ref=ref, decision="flip-to-rejected")
+    # PR still open — pr-steward owns the active loop; nothing to reconcile.
+    return ShepherdResult(ref=ref, decision="wait")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _print_summary(results: list[ShepherdResult]) -> None:
+    """Greppable per-tick summary; exit non-zero if any proposal errored."""
+    print("\n=== Shepherd summary ===")
+    fail = 0
+    for r in results:
+        line = f"{r.ref.service}/{r.ref.slug}: {r.decision}"
+        if r.error:
+            line += f"  ERROR: {r.error}"
+            fail += 1
+        if r.notes:
+            line += f"  ({r.notes})"
+        print(line)
+    if fail:
+        sys.exit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Tier 3 PR shepherd — drive implementer-opened PRs to merge",
@@ -1367,6 +1434,15 @@ def main() -> None:
         "--dry-run", action="store_true",
         help="Discover only; do not call the SDK or merge anything",
     )
+    ap.add_argument(
+        "--reconcile", action="store_true",
+        help=(
+            "Read-only status-repair pass for SHEPHERD_SKIP_SERVICES repos "
+            "(owned by pr-steward): flip implemented/review-fixing/in-progress "
+            "to merged/rejected based on the live PR state. Never reads "
+            "reviews, applies fixes, or merges. No SDK calls."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
@@ -1381,10 +1457,10 @@ def main() -> None:
     if budget <= 0:
         print(f"warn: SHEPHERD_BUDGET_USD={budget} is non-positive; nothing will run")
 
-    # Skip SDK auth init in dry-run mode: --dry-run is documented as
-    # discovery-only and must work in environments without Claude
-    # credentials (read-only ops checks, CI inventory runs).
-    if not args.dry_run:
+    # Skip SDK auth init in dry-run AND reconcile modes: both are read-only
+    # (reconcile only reads PR state + writes terminal status) and must work
+    # in environments without Claude credentials.
+    if not args.dry_run and not args.reconcile:
         ensure_auth_for_sdk()
 
     state_dir = Path(args.state_dir)
@@ -1392,10 +1468,29 @@ def main() -> None:
         state_dir,
         service_filter=args.service or None,
         slug_filter=args.slug or None,
+        reconcile=args.reconcile,
     )
 
     if not refs:
-        print("info: no implemented/review-fixing proposals with a PR found.")
+        if args.reconcile:
+            print("info: no proposals to reconcile in SHEPHERD_SKIP_SERVICES repos.")
+        else:
+            print("info: no implemented/review-fixing proposals with a PR found.")
+        return
+
+    # Reconcile mode: read-only terminal-status repair, no budget, no SDK.
+    if args.reconcile:
+        print(f"Reconcile pass: {len(refs)} proposal(s) in skip-listed repos:")
+        for r in refs:
+            print(f"  - {r.service}/{r.slug} [{r.status}]")
+        results = []
+        for ref in refs:
+            if args.dry_run:
+                print(f"[dry-run] would reconcile {ref.service}/{ref.slug}")
+                results.append(ShepherdResult(ref=ref, decision="dry-run"))
+                continue
+            results.append(reconcile_one(ref, state_dir=state_dir))
+        _print_summary(results)
         return
 
     print(f"Found {len(refs)} proposal(s) to evaluate (budget cap ${budget:.2f}):")
@@ -1433,19 +1528,7 @@ def main() -> None:
         if result.decision == "address-review":
             spent_estimate += per_call_estimate
 
-    # Greppable summary — required by tasks.md task 2 DoD.
-    print("\n=== Shepherd summary ===")
-    fail = 0
-    for r in results:
-        line = f"{r.ref.service}/{r.ref.slug}: {r.decision}"
-        if r.error:
-            line += f"  ERROR: {r.error}"
-            fail += 1
-        if r.notes:
-            line += f"  ({r.notes})"
-        print(line)
-    if fail:
-        sys.exit(1)
+    _print_summary(results)
 
 
 if __name__ == "__main__":
