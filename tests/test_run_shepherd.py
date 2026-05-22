@@ -216,6 +216,53 @@ def test_settle_min_from_env_bad_value(monkeypatch) -> None:
     assert run_shepherd._settle_min_from_env() == 15
 
 
+# ---------------------------------------------------------------------------
+# SHEPHERD_SKIP_SERVICES: per-service opt-out (pr-steward-owned repos)
+# ---------------------------------------------------------------------------
+def test_skip_services_from_env_unset(monkeypatch) -> None:
+    """Unset env -> empty set -> shepherd discovers everything (default)."""
+    monkeypatch.delenv("SHEPHERD_SKIP_SERVICES", raising=False)
+    assert run_shepherd._skip_services_from_env() == frozenset()
+
+
+def test_skip_services_from_env_parses_comma_and_space(monkeypatch) -> None:
+    """Comma- or whitespace-separated names both parse, blanks dropped."""
+    monkeypatch.setenv("SHEPHERD_SKIP_SERVICES", "mctl-design, mctl-web  mctl-api")
+    assert run_shepherd._skip_services_from_env() == frozenset(
+        {"mctl-design", "mctl-web", "mctl-api"}
+    )
+
+
+def test_skip_services_from_env_warns_on_unknown(monkeypatch, capsys) -> None:
+    """A name not in SERVICES (typo) is kept but warned about, not silent."""
+    monkeypatch.setenv("SHEPHERD_SKIP_SERVICES", "mctl-desig")
+    names = run_shepherd._skip_services_from_env()
+    assert names == frozenset({"mctl-desig"})
+    assert "not in SERVICES" in capsys.readouterr().out
+
+
+def test_discover_skips_listed_service(tmp_path, monkeypatch, capsys) -> None:
+    """A skip-listed service is invisible to discovery and logged; others stay."""
+    make_status_yaml(tmp_path, service="mctl-design", slug="icon-swap")
+    make_status_yaml(tmp_path, service="mctl-web", slug="dep-bump")
+    monkeypatch.setattr(
+        run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-design"})
+    )
+    refs = run_shepherd._discover_refs(tmp_path)
+    services = {r.service for r in refs}
+    assert "mctl-design" not in services
+    assert "mctl-web" in services
+    assert "skipping mctl-design" in capsys.readouterr().out
+
+
+def test_discover_no_skip_includes_all(tmp_path, monkeypatch) -> None:
+    """With an empty skip-set, mctl-design is discovered like any other repo."""
+    make_status_yaml(tmp_path, service="mctl-design", slug="icon-swap")
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    refs = run_shepherd._discover_refs(tmp_path)
+    assert {r.service for r in refs} == {"mctl-design"}
+
+
 def test_decide_address_review() -> None:
     """T2: codex P1 finding on the head SHA -> address-review."""
     pr = make_pr()

@@ -126,6 +126,29 @@ def _settle_min_from_env() -> int:
 SHEPHERD_MERGE_SETTLE_MIN = _settle_min_from_env()
 
 
+# Per-service opt-out. A repo whose name is listed here is owned by a
+# different PR lifecycle (e.g. mctl-claude-remote's pr-steward) and the
+# shepherd must NOT discover, fix, or merge its proposals — otherwise two
+# actors push fixes to the same feat/agents-* branch and race on merge.
+# Comma- or whitespace-separated; unset = empty set = today's behavior
+# (zero blast radius for every other repo).
+def _skip_services_from_env() -> frozenset[str]:
+    raw = os.environ.get("SHEPHERD_SKIP_SERVICES", "")
+    names = frozenset(s for s in raw.replace(",", " ").split() if s)
+    unknown = names - set(SERVICES)
+    if unknown:
+        # A typo (e.g. `mctl-desig`) would silently skip nothing — warn so the
+        # operator notices, mirroring the --service validation in main().
+        print(
+            "warn: SHEPHERD_SKIP_SERVICES contains names not in SERVICES "
+            f"(typo?): {sorted(unknown)}"
+        )
+    return names
+
+
+SHEPHERD_SKIP_SERVICES = _skip_services_from_env()
+
+
 class FollowupSubprocessError(RuntimeError):
     """Raised when ``apply_followup`` cannot push a new commit.
 
@@ -312,6 +335,8 @@ def _discover_refs(
     Both `implemented` and `review-fixing` are included per
     requirements.md L41-58. Proposals without a `pr:` URL are skipped —
     the shepherd has nothing to do until the implementer opens a PR.
+    Services in SHEPHERD_SKIP_SERVICES are skipped entirely — they are
+    owned by another PR lifecycle (e.g. pr-steward).
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -321,6 +346,16 @@ def _discover_refs(
         if not service_dir.is_dir() or service_dir.name.startswith("_"):
             continue
         service = service_dir.name
+        if service in SHEPHERD_SKIP_SERVICES:
+            # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
+            # but log it (only for real targets with a proposals/ dir) so an
+            # operator isn't confused about why its proposals never appear.
+            if (service_dir / "proposals").is_dir():
+                print(
+                    f"shepherd: skipping {service} "
+                    "(SHEPHERD_SKIP_SERVICES; owned by another PR lifecycle)"
+                )
+            continue
         if service_filter and service != service_filter:
             continue
 
