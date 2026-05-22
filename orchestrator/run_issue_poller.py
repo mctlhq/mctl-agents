@@ -1,17 +1,17 @@
-"""Issue-poller — central scan that turns `agent:investigate`-labelled issues
+"""Issue-poller — central scan that turns `agents:intake`-labelled issues
 into mctl-agents proposals.
 
 This is the Phase 2 trigger for the issue-driven entry point. Where
 ``run_issue_investigator`` handles ONE issue (manually, via the
 ``mctl_trigger_issue`` MCP tool), the poller scans every open issue under the
-`mctlhq` org carrying the `agent:investigate` label and runs the investigator
+`mctlhq` org carrying the `agents:intake` label and runs the investigator
 for each. It lets an operator start an investigation by *labelling* an issue
 instead of calling an MCP tool — a single in-cluster CronWorkflow
 (`mctl-agents-issue-poll`) does the scan.
 
 Pipeline for one poll cycle:
     1. `gh search issues` — list open `mctlhq` issues labelled the configured
-       label (default `agent:investigate`).
+       label (default `agents:intake`).
     2. For each issue, in turn:
        a. Skip (label left in place) if the repo is not a known service —
           a misconfiguration the operator should see.
@@ -40,7 +40,7 @@ Auth:
 
 Usage:
     python -m orchestrator.run_issue_poller
-    python -m orchestrator.run_issue_poller --label agent:investigate --dry-run
+    python -m orchestrator.run_issue_poller --label agents:intake --dry-run
     python -m orchestrator.run_issue_poller --max-issues 3
 """
 from __future__ import annotations
@@ -69,7 +69,7 @@ _SEARCH_LIMIT = 100
 # Issues carrying this label are picked up by the poller. An operator adds it
 # to a feature-request issue to hand it to the pipeline; the poller removes it
 # once the issue has been turned into a proposal.
-DEFAULT_LABEL = "agent:investigate"
+DEFAULT_LABEL = "agents:intake"
 
 # A cycle investigates at most this many issues. Each investigation spends
 # real SDK budget, so without a cap a mass-label event would fan out into an
@@ -243,7 +243,7 @@ def poll(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Issue-poller — investigate every `agent:investigate`-labelled issue"
+        description="Issue-poller — investigate every `agents:intake`-labelled issue"
     )
     ap.add_argument(
         "--label",

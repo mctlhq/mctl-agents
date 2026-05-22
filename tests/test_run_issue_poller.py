@@ -42,7 +42,7 @@ def test_search_labeled_issues_parses_and_filters(monkeypatch):
         {"url": "https://github.com/mctlhq/mctl-api/issues/4"},
     ])
     monkeypatch.setattr(run_issue_poller, "_run", lambda cmd: _completed(payload))
-    refs = search_labeled_issues("agent:investigate")
+    refs = search_labeled_issues("agents:intake")
     assert [(r.repo, r.number) for r in refs] == [
         ("mctl-telegram", 12),
         ("mctl-api", 4),
@@ -51,7 +51,7 @@ def test_search_labeled_issues_parses_and_filters(monkeypatch):
 
 def test_search_labeled_issues_empty(monkeypatch):
     monkeypatch.setattr(run_issue_poller, "_run", lambda cmd: _completed("[]"))
-    assert search_labeled_issues("agent:investigate") == []
+    assert search_labeled_issues("agents:intake") == []
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +117,7 @@ def test_poll_success_removes_label(tmp_path, monkeypatch):
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append((url, label)))
     assert poll(state_dir=tmp_path) == 0
-    assert removed == [(ref.url, "agent:investigate")]
+    assert removed == [(ref.url, "agents:intake")]
 
 
 def test_poll_skipped_in_flight_still_removes_label(tmp_path, monkeypatch):
