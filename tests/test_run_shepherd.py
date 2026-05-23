@@ -1575,3 +1575,55 @@ def test_process_one_does_not_trigger_review_on_followup_failure(tmp_path) -> No
 
     assert result.decision == "wait"
     assert trigger_calls == []
+
+
+# ---------------------------------------------------------------------------
+# _extract_severity — format compatibility tests
+# ---------------------------------------------------------------------------
+def test_extract_severity_codex_badge_format() -> None:
+    """Legacy Codex badge format is still recognized."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("![P1 Badge](url) Pin tar to >=6.2.1") == "P1"
+    assert _extract_severity("Some text\n![P2 Badge](url)\nmore") == "P2"
+    assert _extract_severity("![P3 Badge]") == "P3"
+
+
+def test_extract_severity_claude_bold_prefix() -> None:
+    """Claude review inline comments use **P2 — title** (bold prefix)."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("**P2 — PeerCache never activated**\n\ndesc") == "P2"
+    assert _extract_severity("**P1 — Security hole**") == "P1"
+    assert _extract_severity("**P3 — Minor nit**") == "P3"
+    # Bold prefix embedded mid-body (top-level review body format)
+    body = "Has P1/P2 findings, changes requested: 1 P2.\n\n**P2 — Title (file:74)**\ndesc"
+    assert _extract_severity(body) == "P2"
+
+
+def test_extract_severity_claude_bold_prefix_hyphen() -> None:
+    """Hyphen variant **P2 -** is also recognized."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("**P2 - Some finding**") == "P2"
+
+
+def test_extract_severity_bare_prefix_at_body_start() -> None:
+    """Bare P2 — at the very start of the body (no bold asterisks)."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("P2 — finding at top") == "P2"
+    assert _extract_severity("P1 — critical") == "P1"
+
+
+def test_extract_severity_bare_prefix_mid_body() -> None:
+    """Bare P2 — at the start of a line in the middle of the body."""
+    from orchestrator.run_shepherd import _extract_severity
+    body = "Summary line.\n\nP2 — finding on second paragraph"
+    assert _extract_severity(body) == "P2"
+
+
+def test_extract_severity_no_match() -> None:
+    """Bodies with no severity marker return None."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("No P1/P2 findings (2 P3). Good to merge.") is None
+    assert _extract_severity("") is None
+    assert _extract_severity("Some random review text") is None
+    # P3 in prose does not count as a severity marker
+    assert _extract_severity("There are P3 nits to consider") is None

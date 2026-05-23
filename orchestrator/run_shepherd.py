@@ -602,16 +602,22 @@ def _extract_severity(body: str) -> Optional[str]:
     """Find the severity marker in a review comment body.
 
     Supports two formats:
-    - Codex badge format:  `![P2 Badge](...)` (legacy)
-    - Claude inline format: `**P2 —` or `P2 —` at the start of a line or body
+    - Codex badge format:   ``![P2 Badge](...)`` anywhere in body (legacy)
+    - Claude review format: ``**P2 —`` anywhere in body (bold prefix), or
+                            ``P2 —`` / ``P2 -`` at the start of any line
     """
     for sev in ("P1", "P2", "P3"):
         if f"![{sev} Badge]" in body:
             return sev
-        # Claude review format: bold prefix e.g. "**P2 —" or bare "P2 —"
+        # Claude bold prefix — appears anywhere in the body (inline comment
+        # bodies start with it; top-level review bodies embed it mid-text).
         if f"**{sev} —" in body or f"**{sev} -" in body:
             return sev
-        if body.startswith(f"{sev} —") or body.startswith(f"{sev} -"):
+        # Bare prefix — matches at the start of the body or any line.
+        bare_em = f"{sev} —"
+        bare_hyp = f"{sev} -"
+        if (body.startswith(bare_em) or f"\n{bare_em}" in body
+                or body.startswith(bare_hyp) or f"\n{bare_hyp}" in body):
             return sev
     return None
 
