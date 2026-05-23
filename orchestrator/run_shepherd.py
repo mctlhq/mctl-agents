@@ -599,14 +599,25 @@ def _within_settle_window(
 
 
 def _extract_severity(body: str) -> Optional[str]:
-    """Find a `![P<n> Badge]` marker in a codex finding body. None if absent.
+    """Find the severity marker in a review comment body.
 
-    Per tasks.md T2: codex prefixes findings with a Markdown badge image
-    whose alt text is exactly `P1 Badge`, `P2 Badge`, etc. Match with a
-    plain substring lookup; a regex isn't necessary.
+    Supports two formats:
+    - Codex badge format:   ``![P2 Badge](...)`` anywhere in body (legacy)
+    - Claude review format: ``**P2 —`` anywhere in body (bold prefix), or
+                            ``P2 —`` / ``P2 -`` at the start of any line
     """
     for sev in ("P1", "P2", "P3"):
         if f"![{sev} Badge]" in body:
+            return sev
+        # Claude bold prefix — appears anywhere in the body (inline comment
+        # bodies start with it; top-level review bodies embed it mid-text).
+        if f"**{sev} —" in body or f"**{sev} -" in body:
+            return sev
+        # Bare prefix — matches at the start of the body or any line.
+        bare_em = f"{sev} —"
+        bare_hyp = f"{sev} -"
+        if (body.startswith(bare_em) or f"\n{bare_em}" in body
+                or body.startswith(bare_hyp) or f"\n{bare_hyp}" in body):
             return sev
     return None
 
