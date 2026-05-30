@@ -33,6 +33,17 @@ jobs:
           fetch-depth: 1
           ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
 
+      - name: Check fallback token availability
+        id: token-check
+        run: |
+          if [ -n "$TOKEN2" ]; then
+            echo "has_fallback=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_fallback=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          TOKEN2: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
+
       - name: Claude review
         id: review
         continue-on-error: true
@@ -76,8 +87,52 @@ jobs:
             not restate the diff.
           claude_args: '--model claude-sonnet-4-6 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
 
+      - name: Claude review (fallback token)
+        id: review2
+        if: steps.review.outcome == 'failure' && steps.token-check.outputs.has_fallback == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
+
+            You are the automated code reviewer for this pull request. Review
+            the PR diff thoroughly.
+
+            Focus on:
+            - Correctness and logic errors; edge cases the change misses.
+            - Security: injection, authentication/authorization, secret
+              handling, unsafe input.
+            - Error handling: ignored errors, missing context.
+            - Test coverage: behaviour changed without a corresponding test.
+
+            Follow the conventions in this repository's CLAUDE.md (Python style,
+            conventional commits, English only, no emoji).
+
+            If the diff is trivial — only config/values YAML (hostname, env
+            var, image tag, resource limits, replica count), a dependency bump
+            with no logic change, docs/comments, or a one-line typo — post a
+            single short top-level approval comment and nothing else.
+
+            Otherwise, post each finding as an inline comment using the
+            mcp__github_inline_comment__create_inline_comment tool, prefixed
+            with a severity tag:
+            - P1 — must fix before merge (bug, security hole, data loss).
+            - P2 — should fix before merge (likely bug, missing test, unsafe
+              pattern).
+            - P3 — nice to have (style, minor nit); does not block merge.
+
+            Finish with a top-level summary comment: the count of P1/P2/P3
+            findings and an explicit verdict — "No P1/P2 findings, good to
+            merge" or "Has P1/P2 findings, changes requested". Be concise; do
+            not restate the diff.
+          claude_args: '--model claude-sonnet-4-6 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
+
       - name: Classify reviewer outcome
-        if: steps.review.outcome != 'success'
+        if: steps.review.outcome != 'success' && steps.review2.outcome != 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
