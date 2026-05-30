@@ -47,6 +47,13 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
+      - name: Validate semver tag
+        run: |
+          if ! [[ "${{ github.ref_name }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '${{ github.ref_name }}' is not strict semver (X.Y.Z) — skipping gitops bump"
+            exit 1
+          fi
+
       - name: Dispatch gitops image bump
         env:
           GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
