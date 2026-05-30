@@ -41,3 +41,27 @@ jobs:
           tags: ${{ steps.tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  bump-gitops:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate semver tag
+        run: |
+          if ! [[ "${{ github.ref_name }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '${{ github.ref_name }}' is not strict semver (X.Y.Z) — skipping gitops bump"
+            exit 1
+          fi
+
+      - name: Dispatch gitops image bump
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh workflow run gitops-bump.yaml \
+            --repo mctlhq/mctl-gitops \
+            --ref main \
+            -f image_name=ghcr.io/mctlhq/mctl-agents \
+            -f image_tag="$TAG" \
+            -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml"
