@@ -3,23 +3,37 @@ name: Claude PR review
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  # Manual rerun path: comment "@claude review" on a PR to re-run the reviewer
+  # (handy after a transient quota-limit failure once the window has reset).
+  issue_comment:
+    types: [created]
 
 permissions: {}
 
 jobs:
   review:
-    if: github.event.pull_request.draft == false
+    # Run on non-draft PR events, or on an "@claude review" comment on a PR.
+    if: >
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '@claude review'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       issues: write
       id-token: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 1
+          # For comment-triggered runs, check out the PR head (the diff itself
+          # is fetched via `gh pr diff`, so this is just working-dir context).
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
 
       - name: Classify PR complexity and pick model
         id: classify
@@ -65,6 +79,9 @@ jobs:
 
       - name: Claude review
         id: review
+        # Don't hard-fail the job here — the "Classify reviewer outcome" step
+        # below decides whether a failure is a transient quota limit (neutral)
+        # or a real error (block).
         continue-on-error: true
         uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
         with:
@@ -72,7 +89,7 @@ jobs:
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
 
             You are the automated code reviewer for this pull request. Review
             the PR diff thoroughly.
@@ -107,6 +124,8 @@ jobs:
           claude_args: '--model ${{ steps.classify.outputs.model }} --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
 
       - name: Claude review (fallback token)
+        id: review2
+        continue-on-error: true
         if: steps.review.outcome == 'failure' && steps.token-check.outputs.has_fallback == 'true'
         uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
         with:
@@ -114,7 +133,7 @@ jobs:
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ github.event.pull_request.number }}
+            PR NUMBER: ${{ env.PR_NUMBER }}
 
             You are the automated code reviewer for this pull request. Review
             the PR diff thoroughly.
@@ -147,3 +166,18 @@ jobs:
             merge" or "Has P1/P2 findings, changes requested". Be concise; do
             not restate the diff.
           claude_args: '--model ${{ steps.classify.outputs.model }} --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
+
+      - name: Classify reviewer outcome
+        if: steps.review.outcome != 'success' && steps.review2.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OUT="$RUNNER_TEMP/claude-execution-output.json"
+          if [ -f "$OUT" ] && grep -qiE "hit your limit|usage limit|rate.?limit|overloaded|insufficient.*quota|credit balance" "$OUT"; then
+            echo "::warning::Claude reviewer hit a transient usage limit — treating as non-blocking."
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
+              "⏳ The Claude reviewer hit the shared usage limit and could not finish. This is **transient** and is *not* a code issue. Re-run with \`@claude review\` once the window resets." || true
+            exit 0
+          fi
+          echo "::error::Claude reviewer failed for a non-quota reason — see the 'Claude review' step logs."
+          exit 1
