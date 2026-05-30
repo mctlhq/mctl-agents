@@ -3,35 +3,65 @@ name: Claude PR review
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
-  # Manual rerun path: comment "@claude review" on a PR to re-run the reviewer
-  # (handy after a transient quota-limit failure once the window has reset).
-  issue_comment:
-    types: [created]
 
 permissions: {}
 
 jobs:
   review:
-    # Run on non-draft PR events, or on an "@claude review" comment on a PR.
-    if: >
-      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       contains(github.event.comment.body, '@claude review'))
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
       issues: write
       id-token: write
-    env:
-      PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 1
-          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
+
+      - name: Classify PR complexity and pick model
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR=${{ github.event.pull_request.number || github.event.issue.number }}
+          files=$(gh pr view "$PR" --repo ${{ github.repository }} \
+            --json files --jq '[.files[].path] | join("\n")')
+          lines=$(gh pr diff "$PR" --repo ${{ github.repository }} 2>/dev/null \
+            | grep -c '^[+-][^+-]' || echo 0)
+          score=1
+          while IFS= read -r f; do
+            if echo "$f" | grep -qE '^internal/(auth|crypto|db|mcp|telegram)/'; then
+              score=3; break
+            elif echo "$f" | grep -qE '\.go$' && ! echo "$f" | grep -qE '_test\.go$'; then
+              [ $score -lt 2 ] && score=2
+            fi
+          done <<< "$files"
+          if [ "$lines" -gt 400 ] && [ $score -lt 3 ]; then
+            score=$((score + 1))
+          fi
+          case $score in
+            3) model="claude-opus-4-7" ;;
+            2) model="claude-sonnet-4-6" ;;
+            *) model="claude-haiku-4-5-20251001" ;;
+          esac
+          echo "model=$model" >> $GITHUB_OUTPUT
+          echo "score=$score" >> $GITHUB_OUTPUT
+          echo "lines=$lines" >> $GITHUB_OUTPUT
+          echo "PR #$PR: model=$model score=$score lines=$lines"
+
+      - name: Check fallback token availability
+        id: token-check
+        run: |
+          if [ -n "$TOKEN2" ]; then
+            echo "has_fallback=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_fallback=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          TOKEN2: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
 
       - name: Claude review
         id: review
@@ -42,7 +72,7 @@ jobs:
           track_progress: true
           prompt: |
             REPO: ${{ github.repository }}
-            PR NUMBER: ${{ env.PR_NUMBER }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
             You are the automated code reviewer for this pull request. Review
             the PR diff thoroughly.
@@ -74,19 +104,46 @@ jobs:
             findings and an explicit verdict — "No P1/P2 findings, good to
             merge" or "Has P1/P2 findings, changes requested". Be concise; do
             not restate the diff.
-          claude_args: '--model claude-sonnet-4-6 --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
+          claude_args: '--model ${{ steps.classify.outputs.model }} --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
 
-      - name: Classify reviewer outcome
-        if: steps.review.outcome != 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          OUT="$RUNNER_TEMP/claude-execution-output.json"
-          if [ -f "$OUT" ] && grep -qiE "hit your limit|usage limit|rate.?limit|overloaded|insufficient.*quota|credit balance" "$OUT"; then
-            echo "::warning::Claude reviewer hit a transient usage limit — treating as non-blocking."
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
-              "⏳ The Claude reviewer hit the shared usage limit and could not finish. This is **transient** and is *not* a code issue. Re-run with \`@claude review\` once the window resets." || true
-            exit 0
-          fi
-          echo "::error::Claude reviewer failed for a non-quota reason — see the 'Claude review' step logs."
-          exit 1
+      - name: Claude review (fallback token)
+        if: steps.review.outcome == 'failure' && steps.token-check.outputs.has_fallback == 'true'
+        uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
+          track_progress: true
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
+
+            You are the automated code reviewer for this pull request. Review
+            the PR diff thoroughly.
+
+            Focus on:
+            - Correctness and logic errors; edge cases the change misses.
+            - Security: injection, authentication/authorization, secret
+              handling, unsafe input.
+            - Error handling: ignored errors, missing context.
+            - Test coverage: behaviour changed without a corresponding test.
+
+            Follow the conventions in this repository's CLAUDE.md (Python style,
+            conventional commits, English only, no emoji).
+
+            If the diff is trivial — only config/values YAML (hostname, env
+            var, image tag, resource limits, replica count), a dependency bump
+            with no logic change, docs/comments, or a one-line typo — post a
+            single short top-level approval comment and nothing else.
+
+            Otherwise, post each finding as an inline comment using the
+            mcp__github_inline_comment__create_inline_comment tool, prefixed
+            with a severity tag:
+            - P1 — must fix before merge (bug, security hole, data loss).
+            - P2 — should fix before merge (likely bug, missing test, unsafe
+              pattern).
+            - P3 — nice to have (style, minor nit); does not block merge.
+
+            Finish with a top-level summary comment: the count of P1/P2/P3
+            findings and an explicit verdict — "No P1/P2 findings, good to
+            merge" or "Has P1/P2 findings, changes requested". Be concise; do
+            not restate the diff.
+          claude_args: '--model ${{ steps.classify.outputs.model }} --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
