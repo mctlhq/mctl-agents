@@ -873,8 +873,13 @@ def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
         f"this PR was opened automatically and the spec may have gaps."
         f"{_issue_closing_line(ref)}"
     )
+    # Pin the base repo with --repo: on a fork (e.g. mctl-openclaw, forked from
+    # openclaw/openclaw) `gh pr create` otherwise defaults the base to the parent
+    # repo and the non-interactive call fails, so the branch is pushed but no PR
+    # is opened. --repo forces the PR into our repo against our own `main`.
     proc = _run(
-        ["gh", "pr", "create", "--title", title, "--body", body, "--head", branch, "--base", "main"],
+        ["gh", "pr", "create", "--repo", f"mctlhq/{ref.service}",
+         "--title", title, "--body", body, "--head", branch, "--base", "main"],
         cwd=repo_dir,
     )
     pr_url = proc.stdout.strip().splitlines()[-1]
