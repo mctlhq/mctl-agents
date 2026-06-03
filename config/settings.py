@@ -39,12 +39,13 @@ SERVICES = [
     "mctl-agents",
     "mctl-telegram",
     "mctl-design",
+    "mctl-pairdesk",
     # "upwork-mcp",
 ]
 
 # Services that are valid implementer/investigator targets but are NOT
 # analyzed by the proactive researcher/analyst/spec-writer rotation.
-NON_ROTATING_SERVICES = {"mctl-agents", "mctl-telegram", "mctl-design"}
+NON_ROTATING_SERVICES = {"mctl-agents", "mctl-telegram", "mctl-design", "mctl-pairdesk"}
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
 # researcher/analyst/spec-writer. Anything in SERVICES but NOT here is
