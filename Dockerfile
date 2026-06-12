@@ -36,5 +36,14 @@ COPY agents/ ./agents/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Drop root: the LLM-driven agents can run Bash, so they should not run as
+# UID 0. NOTE: the runtime STATE_DIR / /workdir volume must be writable by
+# uid 10001 — set securityContext.runAsUser/fsGroup=10001 in the Argo
+# workflow podSpec that mounts the gitops clone.
+RUN useradd --create-home --uid 10001 --shell /bin/bash app \
+    && chown -R app:app /app
+ENV HOME=/home/app
+USER app
+
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "-m", "orchestrator.run_all"]
