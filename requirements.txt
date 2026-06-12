@@ -1,4 +1,6 @@
-claude-agent-sdk>=0.1.68
-anyio>=4.0
-python-dotenv>=1.0
-PyYAML>=6.0
+# Upper bounds prevent a silent major-version break of the harness the whole
+# system depends on. Bump deliberately when validating a new SDK release.
+claude-agent-sdk>=0.1.68,<0.2
+anyio>=4.0,<5
+python-dotenv>=1.0,<2
+PyYAML>=6.0,<7
