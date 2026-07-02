@@ -1,5 +1,9 @@
 FROM python:3.12-slim
 
+# Pinned harness CLI — the Claude Agent SDK spawns this exact `claude` binary.
+# Bump deliberately, in an explicit commit (see issue #44).
+ARG CLAUDE_CODE_VERSION=2.1.198
+
 WORKDIR /app
 
 # Claude Agent SDK spawns the `claude` CLI subprocess — install it.
@@ -22,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g @anthropic-ai/claude-code@latest
+    && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
