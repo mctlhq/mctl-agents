@@ -14,9 +14,10 @@ jobs:
   review:
     # Run on non-draft same-repo PR events (fork PRs can't read the OAuth
     # secret — the job would only fail noisily), or on an "@claude review"
-    # comment posted by a maintainer. The author gate matters on a public
-    # repo: without it any passerby could burn review quota or prompt-inject
-    # the reviewer via a PR comment.
+    # comment. The comment path is gated twice: author_association here as a
+    # cheap pre-filter, then an API write-permission + same-repo check in the
+    # first step below. This matters on a public repo: ungated, any passerby
+    # could burn review quota or prompt-inject the reviewer via a PR comment.
     if: >
       (github.event_name == 'pull_request' &&
        github.event.pull_request.draft == false &&
@@ -34,6 +35,27 @@ jobs:
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number }}
     steps:
+      # author_association alone is too coarse (MEMBER = any org member,
+      # COLLABORATOR includes read-only). Require actual write access, and
+      # refuse comment-triggered runs on fork PRs — the job would check out
+      # refs/pull/N/head, making fork-controlled files the workspace while
+      # the OAuth secret is available.
+      - name: Gate comment-triggered runs (write permission + same-repo)
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PERM=$(gh api "repos/${{ github.repository }}/collaborators/${{ github.event.comment.user.login }}/permission" --jq .permission)
+          case "$PERM" in
+            admin|maintain|write) ;;
+            *) echo "::error::@claude review requires write access (commenter has: $PERM)"; exit 1 ;;
+          esac
+          CROSS=$(gh pr view "${{ github.event.issue.number }}" --repo "${{ github.repository }}" --json isCrossRepository --jq .isCrossRepository)
+          if [ "$CROSS" != "false" ]; then
+            echo "::error::comment-triggered review is not supported on fork PRs"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -49,8 +71,7 @@ jobs:
         run: |
           PR=${{ github.event.pull_request.number || github.event.issue.number }}
           files=$(gh pr view "$PR" --repo ${{ github.repository }} \
-            --json files --jq '[.files[].path] | join("
-")')
+            --json files --jq '[.files[].path] | join("\n")')
           lines=$(gh pr diff "$PR" --repo ${{ github.repository }} 2>/dev/null \
             | grep -c '^[+-][^+-]' || echo 0)
           score=1
