@@ -61,7 +61,6 @@ SHEPHERD_DIR = AGENTS_DIR / "_shepherd"
 MCTL_MCP_URL = "https://api.mctl.ai/mcp"
 
 # Models
-SERVICE_AGENT_MODEL = os.getenv("SERVICE_AGENT_MODEL", "claude-sonnet-4-6")
-MENTOR_MODEL = os.getenv("MENTOR_MODEL", "claude-opus-4-7")
-# Tier 3 shepherd: a single-shot JSON formatter — sonnet is plenty.
-SHEPHERD_MODEL = os.getenv("SHEPHERD_MODEL", "claude-sonnet-4-6")
+SERVICE_AGENT_MODEL = os.getenv("SERVICE_AGENT_MODEL", "claude-sonnet-5")
+MENTOR_MODEL = os.getenv("MENTOR_MODEL", "claude-sonnet-5")
+SHEPHERD_MODEL = os.getenv("SHEPHERD_MODEL", "claude-sonnet-5")
