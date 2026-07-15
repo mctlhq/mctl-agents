@@ -57,6 +57,13 @@ SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "5.00"))
 # Comparable to a single spec-writer pass; $3 leaves headroom for a large
 # repo that needs a fair amount of Grep/Read to ground the design.
 ISSUE_INVESTIGATOR_BUDGET_USD = float(os.getenv("ISSUE_INVESTIGATOR_BUDGET_USD", "3.00"))
+# Incident-responder budget — covers listing/getting incidents, fetching logs,
+# writing proposal triplets (requirements/design/tasks/.status.yaml), and
+# resolving incidents.  Each incident requires ~7 MCP + Write calls; with up
+# to 5 incidents per run and claude-sonnet the $2 default was too tight and
+# caused consistent budget-exhaustion failures after ~3 minutes.  Raised to
+# $5 to match the service-agent and shepherd caps.
+INCIDENT_RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -178,7 +185,7 @@ def build_incident_responder_options(
         ] + _mctl_tool_globs(),
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
-        max_budget_usd=float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00")),
+        max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
     )
 
