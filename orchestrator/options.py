@@ -178,7 +178,7 @@ def build_incident_responder_options(
         ] + _mctl_tool_globs(),
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
-        max_budget_usd=float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00")),
+        max_budget_usd=float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00")),
         env=env,
     )
 
