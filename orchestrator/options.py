@@ -35,6 +35,12 @@ def _mctl_tool_globs() -> list[str]:
 
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
+# Incident-responder budget — raised from $2.00 to $5.00 to prevent budget
+# exhaustion when multiple workflow_failed incidents are queued in the same
+# cron window (each incident costs ~4 Write calls + 2-3 MCP calls; 5 queued
+# incidents easily exceeded the old $2 cap and caused the Argo step to exit
+# non-zero, which fired a new workflow_failed incident, compounding the backlog).
+INCIDENT_RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00"))
 # Tier 2 implementer budget — soft cap per single proposal implementation.
 # A proposal touching one or two files usually finishes well under this.
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
@@ -178,7 +184,7 @@ def build_incident_responder_options(
         ] + _mctl_tool_globs(),
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
-        max_budget_usd=float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00")),
+        max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
     )
 
