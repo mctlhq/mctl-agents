@@ -23,7 +23,7 @@ from pathlib import Path
 
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.options import build_incident_responder_options
+from orchestrator.options import INCIDENT_RESPONDER_BUDGET_USD, build_incident_responder_options
 
 
 DEFAULT_STATE_DIR = Path(
@@ -34,7 +34,6 @@ DEFAULT_STATE_DIR = Path(
 )
 MIN_AGE_MINUTES = int(os.getenv("MIN_AGE_MINUTES", "30"))
 RESPONDER_MODEL = os.getenv("INCIDENT_RESPONDER_MODEL", SERVICE_AGENT_MODEL)
-RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00"))
 
 
 def _build_prompt(state_dir: Path, min_age_minutes: int) -> str:
