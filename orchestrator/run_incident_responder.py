@@ -34,7 +34,7 @@ DEFAULT_STATE_DIR = Path(
 )
 MIN_AGE_MINUTES = int(os.getenv("MIN_AGE_MINUTES", "30"))
 RESPONDER_MODEL = os.getenv("INCIDENT_RESPONDER_MODEL", SERVICE_AGENT_MODEL)
-RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00"))
+RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00"))
 
 
 def _build_prompt(state_dir: Path, min_age_minutes: int) -> str:
@@ -107,6 +107,7 @@ async def run_incident_responder(state_dir: Path = DEFAULT_STATE_DIR) -> None:
         agent_dir=agent_dir,
         model=RESPONDER_MODEL,
         state_dir=state_dir,
+        budget_usd=RESPONDER_BUDGET_USD,
     )
 
     print(f"\n=== Running incident responder ({RESPONDER_MODEL}, state_dir={state_dir}) ===\n")

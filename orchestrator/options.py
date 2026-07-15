@@ -159,6 +159,7 @@ def build_incident_responder_options(
     agent_dir: Path,
     model: str,
     state_dir: Optional[Path] = None,
+    budget_usd: float = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00")),
 ) -> ClaudeAgentOptions:
     """Options for the incident responder.
 
@@ -178,7 +179,7 @@ def build_incident_responder_options(
         ] + _mctl_tool_globs(),
         mcp_servers=mctl_mcp_config(),
         permission_mode="acceptEdits",
-        max_budget_usd=float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "2.00")),
+        max_budget_usd=budget_usd,
         env=env,
     )
 
