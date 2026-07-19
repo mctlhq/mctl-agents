@@ -5,7 +5,7 @@ the responder runs a Claude sub-agent that:
   1. Lists analyzing incidents via mctl MCP tools.
   2. Skips incidents younger than MIN_AGE_MINUTES (they may still self-resolve).
   3. For each qualifying incident, fetches logs and writes a diagnosis proposal to
-     agents-state/{target_service}/proposals/incident-{id[:8]}/ with status: accepted.
+     agents-state/{target_service}/proposals/incident-{sha1(id)[:8]}/ with status: accepted.
   4. Resolves the mctl incident with "diagnosis delegated to implementer".
 
 The implementer's find_accepted_proposals() picks up the proposal on its next run
@@ -73,11 +73,25 @@ e. Determine target_service:
    - Go code change → `mctl-agent`
    - Orchestrator change → `mctl-agents`
    - Default: `mctl-gitops`
-f. Build slug: `incident-` + first 8 characters of the incident ID.
-g. Write the proposal files (see CLAUDE.md for format) to:
+f. Build slug: `incident-` + first 8 hex characters of the SHA-1 hash of the
+   full incident ID (NOT a prefix slice of the ID itself — IDs from some
+   sources, e.g. `argo-<workflow-name>-<ts>-<ts>`, share a long common
+   prefix across unrelated incidents, so slicing the ID collapses them onto
+   the same slug). Compute it with Bash, e.g.:
+   `python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:8])" '{{incident_id}}'`
+g. Guard against collisions before writing: if
+   `{state_dir}/{{target_service}}/proposals/{{slug}}/` already exists, read its
+   `requirements.md` and compare its `## Incident` -> `- ID:` line to the
+   incident ID you are processing now.
+   - Same ID (re-run for the same incident) -> proceed, overwrite as usual.
+   - Different ID (an unrelated incident already occupies this slug) -> do
+     NOT overwrite it. Print a warning and retry with `-2`, `-3`, ... appended
+     to the slug until you find a directory that is unused or whose
+     requirements.md ID matches the current incident.
+h. Write the proposal files (see CLAUDE.md for format) to:
    `{state_dir}/{{target_service}}/proposals/{{slug}}/`
    Write in this order: requirements.md → design.md → tasks.md → .status.yaml
-h. Call `mctl_resolve_incident` with the incident ID and reason:
+i. Call `mctl_resolve_incident` with the incident ID and reason:
    `"diagnosis delegated to implementer — proposal: {{target_service}}/proposals/{{slug}}"`
 
 **Step 4 — report**
