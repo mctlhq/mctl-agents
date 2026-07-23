@@ -102,8 +102,14 @@ class PollResult:
     # check needs this: `failures == rate_limited_failures` alone is true
     # whenever there happen to be zero non-rate-limited FAILURES, even if
     # most attempts actually succeeded (Codex P2 on mctl-agents#63) —
-    # comparing against `attempted` instead correctly requires zero
-    # successes/skips too.
+    # comparing against `attempted` instead requires zero successes/skips
+    # among issues that reached investigate(). Note this does NOT guarantee
+    # zero failures anywhere in the cycle: an unknown-service skip or a
+    # pre-flight SystemExit both increment `failures` without ever
+    # incrementing `attempted` (Codex P3 on mctl-agents#63), so main() can
+    # still exit RATE_LIMIT_EXIT_CODE while one of those coexists — which is
+    # correct, since the only real SDK call that cycle genuinely was
+    # rate-limited.
     attempted: int
 
 
@@ -339,18 +345,22 @@ def main() -> None:
         print("  all matching issues handled.")
 
     if result.attempted and result.attempted == result.rate_limited_failures:
-        # EVERY issue actually attempted this cycle (not `failures` — that
-        # only counts non-success outcomes, so comparing against it would be
-        # true whenever there happen to be zero non-rate-limited FAILURES,
-        # even if most attempts actually succeeded; Codex P2 on
+        # EVERY issue that reached investigate() this cycle (not `failures`
+        # — that only counts non-success outcomes, so comparing against it
+        # would be true whenever there happen to be zero non-rate-limited
+        # FAILURES, even if most attempts actually succeeded; Codex P2 on
         # mctl-agents#63) failed specifically because the account's OAuth
-        # token was rate-limited/out of quota. That is a genuine "this
-        # account cannot do any work right now" signal, not the routine "one
-        # bad issue" case this cron is otherwise designed to absorb. Exit
-        # non-zero so cwft-mctl-agents-issue-poll's run-poller step reports
-        # Failed and the poll-fallback step retries the whole cycle on
-        # claude-code-oauth-token-2, instead of masking a fully-exhausted
-        # account as a clean run.
+        # token was rate-limited/out of quota. See PollResult.attempted for
+        # why this can still be true alongside an unrelated failure
+        # elsewhere in the cycle (e.g. an unknown-service skip) — that's
+        # correct, not an overclaim (Codex P3 on mctl-agents#63): the only
+        # real SDK call this cycle genuinely was rate-limited. That is a
+        # genuine "this account cannot do any work right now" signal, not
+        # the routine "one bad issue" case this cron is otherwise designed
+        # to absorb. Exit non-zero so cwft-mctl-agents-issue-poll's
+        # run-poller step reports Failed and the poll-fallback step retries
+        # the whole cycle on claude-code-oauth-token-2, instead of masking a
+        # fully-exhausted account as a clean run.
         print(
             f"  ALL {result.attempted} attempted issue(s) failed due to "
             f"rate-limit/quota exhaustion — exiting {RATE_LIMIT_EXIT_CODE} "

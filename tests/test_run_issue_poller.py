@@ -246,6 +246,29 @@ def test_poll_unknown_service_never_counts_as_rate_limited(tmp_path, monkeypatch
     assert result.attempted == 0
 
 
+def test_poll_unknown_service_skip_coexists_with_full_rate_limit_exhaustion(tmp_path, monkeypatch):
+    """Codex P3 on mctl-agents#63: an unrelated unknown-service skip can
+    coexist with EVERY real (known-service) attempt being rate-limited in
+    the same cycle. `attempted` only counts the known-service issue, so
+    attempted == rate_limited_failures == 1 here — main() correctly still
+    treats this as full exhaustion of the real SDK attempt, even though
+    `failures` (2) includes the unrelated skip too."""
+    refs = [_ref(repo="not-a-service", number=1), _ref(number=2)]
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    monkeypatch.setattr(
+        run_issue_poller, "investigate",
+        lambda url, state_dir: InvestigateResult(
+            "mctl-telegram", "issue-2-x", tmp_path,
+            error="api_error_status=429", rate_limited=True,
+        ),
+    )
+    result = poll(state_dir=tmp_path)
+    assert result.failures == 2
+    assert result.rate_limited_failures == 1
+    assert result.attempted == 1
+    assert result.attempted == result.rate_limited_failures
+
+
 def test_poll_label_removal_failure_counts_as_failure(tmp_path, monkeypatch):
     """A failed `gh issue edit` leaves the label on the issue, so the next
     cycle re-investigates — count it as a failure so the broken permission
