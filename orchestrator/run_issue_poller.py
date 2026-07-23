@@ -49,6 +49,7 @@ import argparse
 import json
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from config.settings import SERVICES
@@ -76,6 +77,24 @@ DEFAULT_LABEL = "agents:intake"
 # uncapped run of paid investigations. Issues beyond the cap keep their label
 # and are handled by a later cycle. `--max-issues 0` disables the cap.
 DEFAULT_MAX_ISSUES = 5
+
+# Distinct sys.exit() code used only when EVERY issue attempted this cycle
+# failed specifically because the account's OAuth token was rate-limited/
+# out of quota (never for an unrelated per-issue failure or a mix). The
+# CronWorkflow's shell wrapper treats any non-zero exit as "not a confirmed
+# success" and retries on the fallback token — see the note in main().
+RATE_LIMIT_EXIT_CODE = 3
+
+
+@dataclass
+class PollResult:
+    failures: int
+    # Subset of `failures` that were specifically RateLimitExhaustedError —
+    # see InvestigateResult.rate_limited. Issues skipped for an unrelated
+    # reason (unknown service, pre-flight SystemExit, label-removal failure)
+    # never set this, so a mix of rate-limited + unrelated failures always
+    # has rate_limited_failures < failures.
+    rate_limited_failures: int
 
 
 def search_labeled_issues(label: str) -> list[IssueRef]:
@@ -128,8 +147,9 @@ def poll(
     state_dir: Path = DEFAULT_STATE_DIR,
     dry_run: bool = False,
     max_issues: int = DEFAULT_MAX_ISSUES,
-) -> int:
-    """Run one poll cycle. Returns the count of issues that failed.
+) -> PollResult:
+    """Run one poll cycle. Returns the count of issues that failed, plus how
+    many of those were specifically rate-limit/quota exhaustion.
 
     At most ``max_issues`` *known-service* issues are investigated per cycle
     (``max_issues <= 0`` disables the cap). Any beyond the cap keep their label
@@ -141,7 +161,7 @@ def poll(
     refs = search_labeled_issues(label)
     if not refs:
         print(f"No open issues labelled '{label}' — nothing to do.")
-        return 0
+        return PollResult(failures=0, rate_limited_failures=0)
 
     # The --max-issues cap bounds the number of *paid* investigations per
     # cycle. Apply it only to known-service issues: a non-service issue costs
@@ -170,6 +190,7 @@ def poll(
         print(f"  - {ref.full_repo}#{ref.number}")
 
     failures = 0
+    rate_limited_failures = 0
     for ref in refs:
         print(f"\n=== {ref.full_repo}#{ref.number} ===")
 
@@ -191,6 +212,8 @@ def poll(
         if not known_service:
             # A label on a repo the pipeline can't build. Leave the label so
             # the operator notices, rather than silently dropping the request.
+            # Not a rate-limit signal — never counted toward
+            # rate_limited_failures.
             print(
                 f"WARN: {ref.repo} is not a known service "
                 f"(config/settings.py SERVICES) — skipping, label kept."
@@ -202,7 +225,7 @@ def poll(
             result = investigate(ref.url, state_dir=state_dir)
         except SystemExit as e:
             # Pre-flight rejection from the investigator — treat as a
-            # per-issue failure, keep the label.
+            # per-issue failure, keep the label. Not a rate-limit signal.
             print(f"FAIL: investigate raised: {e}")
             failures += 1
             continue
@@ -213,6 +236,8 @@ def poll(
                 f"— label kept for retry"
             )
             failures += 1
+            if result.rate_limited:
+                rate_limited_failures += 1
             continue
 
         # Success, or skipped because an implementation is already in flight.
@@ -230,7 +255,8 @@ def poll(
             # so the next cycle re-investigates it (a `proposed` proposal is
             # overwritable) and re-spends the SDK budget. Count it as a
             # failure so a broken label-write permission surfaces instead of
-            # silently burning budget every cycle.
+            # silently burning budget every cycle. Not a rate-limit signal —
+            # the investigation itself already succeeded.
             print(
                 f"FAIL: {result.service}/{result.slug}: proposal written but "
                 f"'{label}' label removal failed ({e.stderr or e}) — fix the "
@@ -238,7 +264,7 @@ def poll(
             )
             failures += 1
 
-    return failures
+    return PollResult(failures=failures, rate_limited_failures=rate_limited_failures)
 
 
 def main() -> None:
@@ -277,7 +303,7 @@ def main() -> None:
 
     ensure_auth_for_sdk()
 
-    failures = poll(
+    result = poll(
         label=args.label,
         state_dir=Path(args.state_dir),
         dry_run=args.dry_run,
@@ -285,13 +311,32 @@ def main() -> None:
     )
 
     print("\n=== Poll summary ===")
-    if failures:
+    if result.failures:
         # Per-issue failures are expected and retryable (the label is kept).
         # Surface the count but exit 0 so the CronWorkflow does not flap on a
         # single malformed issue. A global failure raised SystemExit earlier.
-        print(f"  {failures} issue(s) failed — labels kept, will retry next cycle.")
+        print(f"  {result.failures} issue(s) failed — labels kept, will retry next cycle.")
     else:
         print("  all matching issues handled.")
+
+    if result.failures and result.failures == result.rate_limited_failures:
+        # EVERY attempted issue failed specifically because the account's
+        # OAuth token was rate-limited/out of quota — not a mix with an
+        # unrelated per-issue failure, and not just "some issues failed".
+        # That is a genuine "this account cannot do any work right now"
+        # signal, not the routine "one bad issue" case this cron is
+        # otherwise designed to absorb. Exit non-zero so
+        # cwft-mctl-agents-issue-poll's run-poller step reports Failed and
+        # the poll-fallback step retries the whole cycle on
+        # claude-code-oauth-token-2, instead of masking a fully-exhausted
+        # account as a clean run.
+        print(
+            f"  ALL {result.failures} failure(s) were rate-limit/quota "
+            f"exhaustion — exiting {RATE_LIMIT_EXIT_CODE} to trigger the "
+            f"fallback OAuth token."
+        )
+        sys.exit(RATE_LIMIT_EXIT_CODE)
+
     sys.exit(0)
 
 

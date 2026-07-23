@@ -54,7 +54,7 @@ from typing import Optional
 
 import anyio
 import yaml
-from claude_agent_sdk import query
+from claude_agent_sdk import ResultMessage, query
 
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
@@ -372,10 +372,38 @@ human reviewer should look at carefully (especially open questions).
 """
 
 
+class RateLimitExhaustedError(RuntimeError):
+    """The SDK's final ResultMessage reported an API-level rate/usage-limit
+    rejection (``is_error`` True, ``api_error_status`` 429) rather than an
+    agent/tooling failure. Distinct from the generic ``Exception`` branch in
+    ``investigate()`` so callers — specifically
+    ``run_issue_poller.poll()`` — can tell "this account is out of quota"
+    apart from "the agent broke on this issue", and only fail the whole poll
+    cycle (to trigger the OAuth fallback token) when EVERY attempted issue
+    hit this specific case, not on an unrelated per-issue error.
+    """
+
+
 async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
     async for message in query(prompt=prompt, options=options):
         print(message)
+        # The CLI's final message for a run that never got a completion —
+        # e.g. the account's five_hour/seven_day usage limit was already
+        # exhausted before the first turn — is a ResultMessage with
+        # is_error=True and api_error_status=429 (emitted since CLI
+        # v2.1.110), NOT a raised exception. Surface it as one here so the
+        # normal except-clause plumbing in investigate() below can tell it
+        # apart from an agent/tooling failure.
+        if (
+            isinstance(message, ResultMessage)
+            and message.is_error
+            and message.api_error_status == 429
+        ):
+            raise RateLimitExhaustedError(
+                f"SDK reported api_error_status=429 (rate/usage limit "
+                f"exhausted): {message.result!r}"
+            )
 
 
 @dataclass
@@ -385,6 +413,11 @@ class InvestigateResult:
     proposal_dir: Path
     skipped_reason: Optional[str] = None
     error: Optional[str] = None
+    # True only when `error` is set AND the failure was specifically a
+    # RateLimitExhaustedError (api_error_status=429), not any other agent/
+    # tooling failure. run_issue_poller.poll() uses this to distinguish
+    # "this account is out of quota" from "the agent broke on this issue".
+    rate_limited: bool = False
 
 
 def investigate(
@@ -482,6 +515,14 @@ def investigate(
         return InvestigateResult(service, slug, proposal_dir, error=msg)
     except SystemExit as e:
         return InvestigateResult(service, slug, proposal_dir, error=f"SystemExit: {e}")
+    except RateLimitExhaustedError as e:
+        # Must be caught before the generic Exception branch below — same
+        # exception hierarchy, but this one carries a distinguishable
+        # `rate_limited=True` so run_issue_poller.poll() can tell "this
+        # account is out of quota" apart from any other agent failure.
+        return InvestigateResult(
+            service, slug, proposal_dir, error=str(e), rate_limited=True
+        )
     except Exception as e:  # pragma: no cover — defensive
         return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
     finally:

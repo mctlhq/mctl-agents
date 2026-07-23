@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 
 import pytest
 
 from orchestrator import run_issue_poller
 from orchestrator.run_issue_investigator import InvestigateResult, IssueRef
-from orchestrator.run_issue_poller import poll, remove_label, search_labeled_issues
+from orchestrator.run_issue_poller import (
+    RATE_LIMIT_EXIT_CODE,
+    PollResult,
+    poll,
+    remove_label,
+    search_labeled_issues,
+)
 
 
 def _completed(stdout: str) -> subprocess.CompletedProcess:
@@ -64,7 +71,7 @@ def test_poll_missing_state_dir_raises(tmp_path):
 
 def test_poll_no_issues(tmp_path, monkeypatch):
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [])
-    assert poll(state_dir=tmp_path) == 0
+    assert poll(state_dir=tmp_path).failures == 0
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +86,7 @@ def test_poll_unknown_service_keeps_label(tmp_path, monkeypatch):
     removed: list[str] = []
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append(url))
-    assert poll(state_dir=tmp_path) == 1
+    assert poll(state_dir=tmp_path).failures == 1
     assert removed == []
 
 
@@ -91,7 +98,7 @@ def test_poll_dry_run_neither_investigates_nor_relabels(tmp_path, monkeypatch):
                         lambda *a, **k: investigated.append(a))
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append(url))
-    assert poll(state_dir=tmp_path, dry_run=True) == 0
+    assert poll(state_dir=tmp_path, dry_run=True).failures == 0
     assert investigated == []
     assert removed == []
 
@@ -103,7 +110,7 @@ def test_poll_dry_run_unknown_service_does_not_count_as_failure(tmp_path, monkey
         run_issue_poller, "search_labeled_issues",
         lambda label: [_ref(repo="not-a-service")],
     )
-    assert poll(state_dir=tmp_path, dry_run=True) == 0
+    assert poll(state_dir=tmp_path, dry_run=True).failures == 0
 
 
 def test_poll_success_removes_label(tmp_path, monkeypatch):
@@ -116,7 +123,7 @@ def test_poll_success_removes_label(tmp_path, monkeypatch):
     removed: list = []
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append((url, label)))
-    assert poll(state_dir=tmp_path) == 0
+    assert poll(state_dir=tmp_path).failures == 0
     assert removed == [(ref.url, "agents:intake")]
 
 
@@ -134,7 +141,7 @@ def test_poll_skipped_in_flight_still_removes_label(tmp_path, monkeypatch):
     removed: list = []
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append(url))
-    assert poll(state_dir=tmp_path) == 0
+    assert poll(state_dir=tmp_path).failures == 0
     assert removed == [ref.url]
 
 
@@ -150,8 +157,63 @@ def test_poll_error_keeps_label(tmp_path, monkeypatch):
     removed: list = []
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append(url))
-    assert poll(state_dir=tmp_path) == 1
+    assert poll(state_dir=tmp_path).failures == 1
     assert removed == []
+
+
+def test_poll_rate_limited_error_counts_toward_rate_limited_failures(tmp_path, monkeypatch):
+    """A rate_limited=True InvestigateResult must increment BOTH failures
+    and rate_limited_failures — this is what main() uses to tell "the
+    account is out of quota" apart from a routine per-issue failure."""
+    ref = _ref(number=7)
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
+    monkeypatch.setattr(
+        run_issue_poller, "investigate",
+        lambda url, state_dir: InvestigateResult(
+            "mctl-telegram", "issue-7-x", tmp_path,
+            error="SDK reported api_error_status=429 (rate/usage limit exhausted): ...",
+            rate_limited=True,
+        ),
+    )
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+    result = poll(state_dir=tmp_path)
+    assert result.failures == 1
+    assert result.rate_limited_failures == 1
+
+
+def test_poll_mixed_failures_do_not_all_count_as_rate_limited(tmp_path, monkeypatch):
+    """One rate-limited issue plus one unrelated failure → failures=2 but
+    rate_limited_failures=1, so main()'s all-rate-limited check is False."""
+    refs = [_ref(number=1), _ref(number=2)]
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    results = iter([
+        InvestigateResult(
+            "mctl-telegram", "issue-1-x", tmp_path,
+            error="api_error_status=429", rate_limited=True,
+        ),
+        InvestigateResult(
+            "mctl-telegram", "issue-2-x", tmp_path,
+            error="agent did not write tasks.md",
+        ),
+    ])
+    monkeypatch.setattr(run_issue_poller, "investigate",
+                        lambda url, state_dir: next(results))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+    result = poll(state_dir=tmp_path)
+    assert result.failures == 2
+    assert result.rate_limited_failures == 1
+
+
+def test_poll_unknown_service_never_counts_as_rate_limited(tmp_path, monkeypatch):
+    """An unknown-service skip never calls investigate() at all — it must
+    not be mistaken for a rate-limit signal."""
+    monkeypatch.setattr(
+        run_issue_poller, "search_labeled_issues",
+        lambda label: [_ref(repo="not-a-service")],
+    )
+    result = poll(state_dir=tmp_path)
+    assert result.failures == 1
+    assert result.rate_limited_failures == 0
 
 
 def test_poll_label_removal_failure_counts_as_failure(tmp_path, monkeypatch):
@@ -169,7 +231,7 @@ def test_poll_label_removal_failure_counts_as_failure(tmp_path, monkeypatch):
         raise subprocess.CalledProcessError(1, ["gh"], stderr="label not found")
 
     monkeypatch.setattr(run_issue_poller, "remove_label", _boom)
-    assert poll(state_dir=tmp_path) == 1
+    assert poll(state_dir=tmp_path).failures == 1
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +256,7 @@ def test_poll_max_issues_caps_cycle(tmp_path, monkeypatch):
     monkeypatch.setattr(run_issue_poller, "remove_label",
                         lambda url, label: removed.append(url))
 
-    assert poll(state_dir=tmp_path, max_issues=3) == 0
+    assert poll(state_dir=tmp_path, max_issues=3).failures == 0
     assert investigated == [r.url for r in refs[:3]]
     assert removed == [r.url for r in refs[:3]]
 
@@ -207,7 +269,7 @@ def test_poll_max_issues_zero_disables_cap(tmp_path, monkeypatch):
     monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, investigated))
     monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
 
-    assert poll(state_dir=tmp_path, max_issues=0) == 0
+    assert poll(state_dir=tmp_path, max_issues=0).failures == 0
     assert investigated == [r.url for r in refs]
 
 
@@ -258,9 +320,50 @@ def test_poll_cap_excludes_non_service_issues(tmp_path, monkeypatch):
 
     # cap of 3: the 5 non-service issues must not consume it, so the lone
     # service issue still gets investigated.
-    failures = poll(state_dir=tmp_path, max_issues=3)
+    result = poll(state_dir=tmp_path, max_issues=3)
     assert investigated == [valid.url]
-    assert failures == 5  # the 5 non-service issues, label kept
+    assert result.failures == 5  # the 5 non-service issues, label kept
+
+
+# ---------------------------------------------------------------------------
+# main — rate-limit fallback exit code
+# ---------------------------------------------------------------------------
+def _run_main(monkeypatch, result: PollResult) -> int:
+    """Run main() with poll() stubbed to return `result`; return the exit code."""
+    monkeypatch.setattr(sys, "argv", ["run_issue_poller"])
+    monkeypatch.setattr(run_issue_poller, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(run_issue_poller, "poll", lambda **kwargs: result)
+    with pytest.raises(SystemExit) as exc_info:
+        run_issue_poller.main()
+    return exc_info.value.code
+
+
+def test_main_exits_zero_when_no_failures(monkeypatch):
+    code = _run_main(monkeypatch, PollResult(failures=0, rate_limited_failures=0))
+    assert code == 0
+
+
+def test_main_exits_zero_on_partial_unrelated_failures(monkeypatch):
+    """Some issues failed, none of them rate-limited — routine soft-failure,
+    exit 0 so the cron does not flap on one bad issue."""
+    code = _run_main(monkeypatch, PollResult(failures=2, rate_limited_failures=0))
+    assert code == 0
+
+
+def test_main_exits_zero_on_mixed_failures(monkeypatch):
+    """Some failures rate-limited, some not — NOT every attempted issue hit
+    quota exhaustion, so this must still be the routine soft-failure path."""
+    code = _run_main(monkeypatch, PollResult(failures=3, rate_limited_failures=2))
+    assert code == 0
+
+
+def test_main_exits_nonzero_when_all_failures_rate_limited(monkeypatch):
+    """Every attempted issue failed specifically due to rate-limit exhaustion
+    → distinct non-zero exit so the CronWorkflow's poll-fallback step
+    engages instead of masking an exhausted account as a clean run."""
+    code = _run_main(monkeypatch, PollResult(failures=4, rate_limited_failures=4))
+    assert code == RATE_LIMIT_EXIT_CODE
+    assert code != 0
 
 
 # Keep explicit references so an accidental removal of a public helper trips
