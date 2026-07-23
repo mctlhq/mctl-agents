@@ -1,6 +1,7 @@
 """mctl platform configuration."""
-import os
 from pathlib import Path
+
+from config.model_policy import resolve_model
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AGENTS_DIR = REPO_ROOT / "agents"
@@ -60,7 +61,21 @@ SHEPHERD_DIR = AGENTS_DIR / "_shepherd"
 # mctl MCP — shared by every agent
 MCTL_MCP_URL = "https://api.mctl.ai/mcp"
 
-# Models
-SERVICE_AGENT_MODEL = os.getenv("SERVICE_AGENT_MODEL", "claude-sonnet-5")
-MENTOR_MODEL = os.getenv("MENTOR_MODEL", "claude-sonnet-5")
-SHEPHERD_MODEL = os.getenv("SHEPHERD_MODEL", "claude-sonnet-5")
+# Models. Task-specific env vars remain supported as highest-priority
+# overrides so existing workflow configuration remains backwards compatible.
+SERVICE_AGENT_SELECTION = resolve_model(
+    "service_agent",
+    legacy_model_env="SERVICE_AGENT_MODEL",
+)
+MENTOR_SELECTION = resolve_model(
+    "mentor_digest",
+    legacy_model_env="MENTOR_MODEL",
+)
+SHEPHERD_SELECTION = resolve_model(
+    "review_findings_normalize",
+    legacy_model_env="SHEPHERD_MODEL",
+)
+
+SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
+MENTOR_MODEL = MENTOR_SELECTION.model
+SHEPHERD_MODEL = SHEPHERD_SELECTION.model
