@@ -95,6 +95,16 @@ class PollResult:
     # never set this, so a mix of rate-limited + unrelated failures always
     # has rate_limited_failures < failures.
     rate_limited_failures: int
+    # Count of issues that actually reached `investigate()` this cycle —
+    # i.e. every outcome EXCEPT an unknown-service skip (never attempted)
+    # and a dry-run preview. Unlike `failures`, this also counts successes
+    # and in-flight skips. main()'s "every attempted issue was rate-limited"
+    # check needs this: `failures == rate_limited_failures` alone is true
+    # whenever there happen to be zero non-rate-limited FAILURES, even if
+    # most attempts actually succeeded (Codex P2 on mctl-agents#63) —
+    # comparing against `attempted` instead correctly requires zero
+    # successes/skips too.
+    attempted: int
 
 
 def search_labeled_issues(label: str) -> list[IssueRef]:
@@ -161,7 +171,7 @@ def poll(
     refs = search_labeled_issues(label)
     if not refs:
         print(f"No open issues labelled '{label}' — nothing to do.")
-        return PollResult(failures=0, rate_limited_failures=0)
+        return PollResult(failures=0, rate_limited_failures=0, attempted=0)
 
     # The --max-issues cap bounds the number of *paid* investigations per
     # cycle. Apply it only to known-service issues: a non-service issue costs
@@ -191,6 +201,7 @@ def poll(
 
     failures = 0
     rate_limited_failures = 0
+    attempted = 0
     for ref in refs:
         print(f"\n=== {ref.full_repo}#{ref.number} ===")
 
@@ -221,6 +232,10 @@ def poll(
             failures += 1
             continue
 
+        # Counted regardless of outcome (success, skip, or any failure) —
+        # see the note on PollResult.attempted for why this, not `failures`,
+        # is what main() compares rate_limited_failures against.
+        attempted += 1
         try:
             result = investigate(ref.url, state_dir=state_dir)
         except SystemExit as e:
@@ -264,7 +279,11 @@ def poll(
             )
             failures += 1
 
-    return PollResult(failures=failures, rate_limited_failures=rate_limited_failures)
+    return PollResult(
+        failures=failures,
+        rate_limited_failures=rate_limited_failures,
+        attempted=attempted,
+    )
 
 
 def main() -> None:
@@ -319,21 +338,23 @@ def main() -> None:
     else:
         print("  all matching issues handled.")
 
-    if result.failures and result.failures == result.rate_limited_failures:
-        # EVERY attempted issue failed specifically because the account's
-        # OAuth token was rate-limited/out of quota — not a mix with an
-        # unrelated per-issue failure, and not just "some issues failed".
-        # That is a genuine "this account cannot do any work right now"
-        # signal, not the routine "one bad issue" case this cron is
-        # otherwise designed to absorb. Exit non-zero so
-        # cwft-mctl-agents-issue-poll's run-poller step reports Failed and
-        # the poll-fallback step retries the whole cycle on
+    if result.attempted and result.attempted == result.rate_limited_failures:
+        # EVERY issue actually attempted this cycle (not `failures` — that
+        # only counts non-success outcomes, so comparing against it would be
+        # true whenever there happen to be zero non-rate-limited FAILURES,
+        # even if most attempts actually succeeded; Codex P2 on
+        # mctl-agents#63) failed specifically because the account's OAuth
+        # token was rate-limited/out of quota. That is a genuine "this
+        # account cannot do any work right now" signal, not the routine "one
+        # bad issue" case this cron is otherwise designed to absorb. Exit
+        # non-zero so cwft-mctl-agents-issue-poll's run-poller step reports
+        # Failed and the poll-fallback step retries the whole cycle on
         # claude-code-oauth-token-2, instead of masking a fully-exhausted
         # account as a clean run.
         print(
-            f"  ALL {result.failures} failure(s) were rate-limit/quota "
-            f"exhaustion — exiting {RATE_LIMIT_EXIT_CODE} to trigger the "
-            f"fallback OAuth token."
+            f"  ALL {result.attempted} attempted issue(s) failed due to "
+            f"rate-limit/quota exhaustion — exiting {RATE_LIMIT_EXIT_CODE} "
+            f"to trigger the fallback OAuth token."
         )
         sys.exit(RATE_LIMIT_EXIT_CODE)
 

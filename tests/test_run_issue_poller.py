@@ -179,6 +179,7 @@ def test_poll_rate_limited_error_counts_toward_rate_limited_failures(tmp_path, m
     result = poll(state_dir=tmp_path)
     assert result.failures == 1
     assert result.rate_limited_failures == 1
+    assert result.attempted == 1
 
 
 def test_poll_mixed_failures_do_not_all_count_as_rate_limited(tmp_path, monkeypatch):
@@ -202,11 +203,39 @@ def test_poll_mixed_failures_do_not_all_count_as_rate_limited(tmp_path, monkeypa
     result = poll(state_dir=tmp_path)
     assert result.failures == 2
     assert result.rate_limited_failures == 1
+    assert result.attempted == 2
+
+
+def test_poll_success_alongside_rate_limited_failure_leaves_attempted_higher(tmp_path, monkeypatch):
+    """One issue succeeds, another is rate-limited → `attempted` (2) is
+    strictly greater than `rate_limited_failures` (1), which is exactly the
+    signal main() needs to NOT treat this as full-account exhaustion
+    (Codex P2 on mctl-agents#63 — comparing against `failures` alone would
+    have missed this, since failures == rate_limited_failures == 1 here
+    too)."""
+    refs = [_ref(number=1), _ref(number=2)]
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    results = iter([
+        InvestigateResult("mctl-telegram", "issue-1-x", tmp_path),  # success
+        InvestigateResult(
+            "mctl-telegram", "issue-2-x", tmp_path,
+            error="api_error_status=429", rate_limited=True,
+        ),
+    ])
+    monkeypatch.setattr(run_issue_poller, "investigate",
+                        lambda url, state_dir: next(results))
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+    result = poll(state_dir=tmp_path)
+    assert result.failures == 1
+    assert result.rate_limited_failures == 1
+    assert result.attempted == 2
+    assert result.attempted != result.rate_limited_failures
 
 
 def test_poll_unknown_service_never_counts_as_rate_limited(tmp_path, monkeypatch):
     """An unknown-service skip never calls investigate() at all — it must
-    not be mistaken for a rate-limit signal."""
+    not be mistaken for a rate-limit signal, and must not inflate
+    `attempted` either."""
     monkeypatch.setattr(
         run_issue_poller, "search_labeled_issues",
         lambda label: [_ref(repo="not-a-service")],
@@ -214,6 +243,7 @@ def test_poll_unknown_service_never_counts_as_rate_limited(tmp_path, monkeypatch
     result = poll(state_dir=tmp_path)
     assert result.failures == 1
     assert result.rate_limited_failures == 0
+    assert result.attempted == 0
 
 
 def test_poll_label_removal_failure_counts_as_failure(tmp_path, monkeypatch):
@@ -338,30 +368,52 @@ def _run_main(monkeypatch, result: PollResult) -> int:
     return exc_info.value.code
 
 
-def test_main_exits_zero_when_no_failures(monkeypatch):
-    code = _run_main(monkeypatch, PollResult(failures=0, rate_limited_failures=0))
+def test_main_exits_zero_when_nothing_labelled(monkeypatch):
+    code = _run_main(monkeypatch, PollResult(failures=0, rate_limited_failures=0, attempted=0))
+    assert code == 0
+
+
+def test_main_exits_zero_when_all_attempts_succeed(monkeypatch):
+    code = _run_main(monkeypatch, PollResult(failures=0, rate_limited_failures=0, attempted=3))
     assert code == 0
 
 
 def test_main_exits_zero_on_partial_unrelated_failures(monkeypatch):
     """Some issues failed, none of them rate-limited — routine soft-failure,
     exit 0 so the cron does not flap on one bad issue."""
-    code = _run_main(monkeypatch, PollResult(failures=2, rate_limited_failures=0))
+    code = _run_main(monkeypatch, PollResult(failures=2, rate_limited_failures=0, attempted=2))
     assert code == 0
 
 
 def test_main_exits_zero_on_mixed_failures(monkeypatch):
     """Some failures rate-limited, some not — NOT every attempted issue hit
     quota exhaustion, so this must still be the routine soft-failure path."""
-    code = _run_main(monkeypatch, PollResult(failures=3, rate_limited_failures=2))
+    code = _run_main(monkeypatch, PollResult(failures=3, rate_limited_failures=2, attempted=3))
     assert code == 0
 
 
-def test_main_exits_nonzero_when_all_failures_rate_limited(monkeypatch):
-    """Every attempted issue failed specifically due to rate-limit exhaustion
-    → distinct non-zero exit so the CronWorkflow's poll-fallback step
-    engages instead of masking an exhausted account as a clean run."""
-    code = _run_main(monkeypatch, PollResult(failures=4, rate_limited_failures=4))
+def test_main_exits_zero_when_rate_limited_failure_mixed_with_success(monkeypatch):
+    """Regression for Codex P2 on mctl-agents#63: `failures ==
+    rate_limited_failures` alone is true whenever there are zero
+    non-rate-limited FAILURES, even if most attempts actually succeeded —
+    4 successes + 1 rate-limited failure must NOT trigger the fallback,
+    since the account clearly isn't fully exhausted."""
+    code = _run_main(
+        monkeypatch,
+        PollResult(failures=1, rate_limited_failures=1, attempted=5),
+    )
+    assert code == 0
+
+
+def test_main_exits_nonzero_when_all_attempts_rate_limited(monkeypatch):
+    """Every issue actually attempted this cycle failed specifically due to
+    rate-limit exhaustion (zero successes, zero unrelated failures) →
+    distinct non-zero exit so the CronWorkflow's poll-fallback step engages
+    instead of masking an exhausted account as a clean run."""
+    code = _run_main(
+        monkeypatch,
+        PollResult(failures=4, rate_limited_failures=4, attempted=4),
+    )
     assert code == RATE_LIMIT_EXIT_CODE
     assert code != 0
 
