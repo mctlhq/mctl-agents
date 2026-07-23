@@ -9,12 +9,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import anyio
 import pytest
 import yaml
+from claude_agent_sdk import ResultMessage
 
+from orchestrator import run_issue_investigator
 from orchestrator.run_issue_investigator import (
     IssueData,
     IssueRef,
+    RateLimitExhaustedError,
     build_slug,
     gh_issue_view,
     investigate,
@@ -286,6 +290,91 @@ def test_issue_closing_line_no_source(tmp_path):
 def test_issue_closing_line_rejects_incomplete_source(tmp_path, source):
     ref = _ref_with_status(tmp_path, {"status": "accepted", "source": source})
     assert _issue_closing_line(ref) == ""
+
+
+# ---------------------------------------------------------------------------
+# _run_agent — rate-limit exhaustion detection
+# ---------------------------------------------------------------------------
+def _result_message(*, is_error: bool, api_error_status: int | None, subtype: str = "success") -> ResultMessage:
+    return ResultMessage(
+        subtype=subtype,
+        duration_ms=1,
+        duration_api_ms=0,
+        is_error=is_error,
+        num_turns=1,
+        session_id="test-session",
+        api_error_status=api_error_status,
+    )
+
+
+def _fake_query(messages):
+    async def _query(*, prompt, options):
+        for m in messages:
+            yield m
+    return _query
+
+
+def test_run_agent_raises_on_429_result(tmp_path, monkeypatch):
+    """A final ResultMessage with is_error + api_error_status=429 must raise
+    RateLimitExhaustedError, not just be printed and swallowed."""
+    monkeypatch.setattr(
+        run_issue_investigator, "query",
+        _fake_query([_result_message(is_error=True, api_error_status=429)]),
+    )
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_run_agent_does_not_raise_on_clean_success(tmp_path, monkeypatch):
+    """A normal, non-error ResultMessage must NOT be mistaken for a
+    rate-limit exhaustion."""
+    monkeypatch.setattr(
+        run_issue_investigator, "query",
+        _fake_query([_result_message(is_error=False, api_error_status=None)]),
+    )
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
+
+
+def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
+    """An error result with a DIFFERENT api_error_status (e.g. 500) is a
+    real failure, but not the specific rate-limit signal — it must fall
+    through to investigate()'s generic Exception branch, not
+    RateLimitExhaustedError, so it is never counted toward
+    poll()'s rate_limited_failures."""
+    monkeypatch.setattr(
+        run_issue_investigator, "query",
+        _fake_query([_result_message(is_error=True, api_error_status=500)]),
+    )
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
+
+
+def test_investigate_sets_rate_limited_on_429(tmp_path, monkeypatch):
+    """End-to-end through investigate(): a RateLimitExhaustedError from the
+    agent run must surface as InvestigateResult(error=..., rate_limited=True),
+    which is exactly what run_issue_poller.poll() keys off of."""
+    issue = IssueData(
+        ref=IssueRef(owner="mctlhq", repo="mctl-telegram", number=7,
+                     url="https://github.com/mctlhq/mctl-telegram/issues/7"),
+        title="Some feature",
+        body="Body text",
+        state="OPEN",
+    )
+    clone_dir = tmp_path / "clone"
+    clone_dir.mkdir()
+    monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: issue)
+    monkeypatch.setattr(run_issue_investigator, "_clone_repo", lambda repo, slug: clone_dir)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: (_ for _ in ()).throw(
+            RateLimitExhaustedError("SDK reported api_error_status=429: boom")
+        ),
+    )
+    monkeypatch.setattr(run_issue_investigator.anyio, "run",
+                        lambda fn, *a: fn(*a))
+
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.rate_limited is True
+    assert "429" in result.error
 
 
 # Keep an explicit reference so an accidental removal of the public helper
