@@ -56,6 +56,7 @@ def make_pr(
     head_sha: str = HEAD_SHA,
     head_pushed_at: Optional[str] = HEAD_PUSHED_AT,
     state: Optional[str] = None,
+    review_decision: str = "",
 ) -> PRSnapshot:
     """Build a PRSnapshot with sensible mergeable defaults."""
     if state is None:
@@ -80,6 +81,7 @@ def make_pr(
         merge_state_status=merge_state_status,
         checks_green=checks_green,
         is_draft=is_draft,
+        review_decision=review_decision,
     )
 
 
@@ -266,15 +268,15 @@ def test_discover_no_skip_includes_all(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # Reconcile mode: read-only status repair for skip-listed repos
 # ---------------------------------------------------------------------------
-def test_discover_reconcile_inverts_skip(tmp_path, monkeypatch) -> None:
-    """reconcile=True returns ONLY skip-listed services, the inverse of normal."""
+def test_discover_reconcile_covers_all_services(tmp_path, monkeypatch) -> None:
+    """GitHub projection covers shepherd- and steward-owned services."""
     make_status_yaml(tmp_path, service="mctl-design", slug="icon-swap")
     make_status_yaml(tmp_path, service="mctl-web", slug="dep-bump")
     monkeypatch.setattr(
         run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-design"})
     )
     refs = run_shepherd._discover_refs(tmp_path, reconcile=True)
-    assert {r.service for r in refs} == {"mctl-design"}
+    assert {r.service for r in refs} == {"mctl-design", "mctl-web"}
 
 
 def test_reconcile_one_flips_merged(tmp_path) -> None:
@@ -299,25 +301,218 @@ def test_reconcile_one_flips_rejected(tmp_path) -> None:
     assert read_status(ref)["status"] == "rejected"
 
 
-def test_reconcile_one_open_pr_is_noop(tmp_path) -> None:
-    """An open PR is left to pr-steward — reconcile does nothing."""
+def test_reconcile_one_open_pr_repairs_projection(tmp_path) -> None:
+    """An open PR is projected even when steward owns the active loop."""
     ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
     pr = make_pr(merged=False, closed_unmerged=False)
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
         result = run_shepherd.reconcile_one(ref)
-    assert result.decision == "wait"
-    # Status untouched (still implemented from make_ref).
-    assert read_status(ref)["status"] == "implemented"
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert final["github"]["state"] == "open"
 
 
-def test_reconcile_one_pr_none_is_wait(tmp_path) -> None:
-    """Unfetchable PR (None) → wait with an error; status left untouched."""
+def test_reconcile_open_pr_overrides_stale_accepted(tmp_path) -> None:
+    """An existing PR prevents an accepted proposal from re-entering Tier 2."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        status="accepted",
+    )
+    pr = make_pr(merged=False, closed_unmerged=False)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+
+
+def test_reconcile_dry_run_reports_without_writing(tmp_path) -> None:
+    """Dry-run executes GitHub decisions but leaves YAML byte-for-byte intact."""
+    ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
+    before = ref.status_path.read_text(encoding="utf-8")
+    pr = make_pr(merged=False, closed_unmerged=False)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref, dry_run=True)
+    assert result.decision == "repair-open-pr"
+    assert ref.status_path.read_text(encoding="utf-8") == before
+
+
+def test_reconcile_dry_run_reports_orphan_branch_without_writing(tmp_path) -> None:
+    """A useful orphan branch is reported but no PR or YAML write occurs."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        status="in-progress",
+        pr_url=None,
+    )
+    before = ref.status_path.read_text(encoding="utf-8")
+    with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
+         patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
+         patch.object(
+             run_shepherd.run_implementer,
+             "_preflight_existing_result",
+             return_value=run_shepherd.run_implementer.ExistingResult(
+                 action="branch-ready",
+                 reason="useful branch exists without PR",
+             ),
+         ) as preflight:
+        result = run_shepherd.reconcile_one(ref, dry_run=True)
+    assert result.decision == "would-open-pr"
+    assert preflight.call_args.kwargs["allow_pr_create"] is False
+    assert ref.status_path.read_text(encoding="utf-8") == before
+
+
+def test_discovery_dry_run_does_not_restore_pr_on_disk(tmp_path) -> None:
+    """Normal shepherd dry-run may discover a PR but must not mutate YAML."""
+    proposal = make_status_yaml(
+        tmp_path,
+        service="mctl-web",
+        slug="lost-link",
+        status="in-progress",
+        pr=None,
+    )
+    status_path = proposal / ".status.yaml"
+    before = status_path.read_text(encoding="utf-8")
+    with patch.object(
+        run_shepherd,
+        "_find_pr_url_by_branch",
+        return_value="https://github.com/mctlhq/mctl-web/pull/99",
+    ):
+        refs = run_shepherd._discover_refs(tmp_path, dry_run=True)
+    assert len(refs) == 1
+    assert refs[0].pr_url.endswith("/pull/99")
+    assert status_path.read_text(encoding="utf-8") == before
+
+
+def test_reconcile_one_recorded_pr_fetch_failure_waits(tmp_path) -> None:
+    """A transient fetch failure must not overwrite durable state."""
     ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=None):
         result = run_shepherd.reconcile_one(ref)
     assert result.decision == "wait"
     assert result.error is not None
     assert read_status(ref)["status"] == "implemented"
+
+
+def test_reconcile_one_missing_result_is_needs_triage(tmp_path) -> None:
+    """Expired durable work with no PR or result branch is quarantined."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        pr_url=None,
+    )
+    with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
+         patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
+         patch.object(
+             run_shepherd.run_implementer,
+             "_preflight_existing_result",
+             return_value=run_shepherd.run_implementer.ExistingResult(action="none"),
+         ):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "needs-triage"
+    final = read_status(ref)
+    assert final["status"] == "needs-triage"
+    assert final["failure"]["code"] == "missing-pr"
+
+
+def test_reconcile_preserves_existing_triage_failure_without_pr(tmp_path) -> None:
+    """No-commit diagnostics must survive later reconciliation."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        status="needs-triage",
+        pr_url=None,
+    )
+    status = read_status(ref)
+    status["failure"] = {
+        "code": "no-commits",
+        "stage": "agent",
+        "message": "implementer produced no commits",
+    }
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
+    with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
+         patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
+         patch.object(
+             run_shepherd.run_implementer,
+             "_preflight_existing_result",
+             return_value=run_shepherd.run_implementer.ExistingResult(action="none"),
+         ):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "no-commits"
+
+
+def test_reconcile_never_adopts_recorded_branch_collision(tmp_path) -> None:
+    """A non-canonical colliding PR cannot enter the shepherd merge loop."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        status="needs-triage",
+        pr_url="https://github.com/mctlhq/mctl-design/pull/99",
+    )
+    status = read_status(ref)
+    status["failure"] = {
+        "code": "branch-collision",
+        "stage": "preflight",
+        "message": "canonical marker missing",
+    }
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
+    with patch.object(
+        run_shepherd,
+        "find_pr_for_proposal",
+        side_effect=AssertionError("colliding URL must not be trusted"),
+    ):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["status"] == "needs-triage"
+
+
+def test_reconcile_review_stuck_requires_material_change(tmp_path) -> None:
+    """Unchanged findings stay terminal; a clean approval reopens the state."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-agents",
+        slug="stuck",
+        status="review-stuck",
+    )
+    status = read_status(ref)
+    status["github"] = {
+        "state": "open",
+        "head_sha": HEAD_SHA,
+        "observed_at": "2026-04-29T12:00:00Z",
+    }
+    status["failure"] = {"code": "review-attempts-exhausted"}
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
+    unchanged = make_pr(review_decision="CHANGES_REQUESTED")
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=unchanged):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "wait"
+    assert read_status(ref)["status"] == "review-stuck"
+    assert read_status(ref)["failure"]["code"] == "review-attempts-exhausted"
+
+    approved = make_pr(review_decision="APPROVED")
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=approved):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert "review_attempts" not in final
 
 
 def test_decide_address_review() -> None:
@@ -1396,37 +1591,57 @@ def test_discover_refs_skips_in_progress_with_no_pr(tmp_path) -> None:
     assert refs == []
 
 
-def test_process_one_in_progress_with_open_pr_skips(tmp_path) -> None:
-    """OPEN PR + status=in-progress -> wait, no on-disk change.
-
-    Tier 2 race avoidance: the implementer just pushed the PR and is
-    about to flip status to `implemented`. Shepherd must defer.
-    """
+def test_process_one_in_progress_with_open_pr_repairs(tmp_path) -> None:
+    """OPEN PR proves Tier 2 finished, so the dropped YAML write is healed."""
     ref = make_ref(tmp_path, status="in-progress")
+    status = read_status(ref)
+    status["attempt"] = {
+        "id": "attempt-1",
+        "started_at": "2026-04-29T09:00:00Z",
+        "expires_at": "2026-04-29T11:10:00Z",
+    }
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
     pr = make_pr()  # default: state="OPEN", merged=False, closed_unmerged=False
 
-    def must_not_run(*_a, **_kw):
-        raise AssertionError("guard must short-circuit before codex/copilot reads")
-
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
-         patch.object(run_shepherd, "read_codex_review", side_effect=must_not_run), \
-         patch.object(run_shepherd, "read_copilot_review", side_effect=must_not_run):
+         patch.object(run_shepherd, "read_codex_review",
+                      return_value=CodexReview(False, [])), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)):
         result = process_one(ref, skip_subprocess=True)
 
     assert result.decision == "wait"
-    assert "Tier 2" in (result.notes or "")
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert final["attempt"]["finished_at"]
+
+
+def test_process_one_in_progress_with_fresh_lease_waits(tmp_path) -> None:
+    """Shepherd does not race a still-active implementer after PR creation."""
+    ref = make_ref(tmp_path, status="in-progress")
+    status = read_status(ref)
+    status["attempt"] = {
+        "id": "attempt-live",
+        "started_at": "2999-01-01T00:00:00Z",
+        "expires_at": "2999-01-01T02:10:00Z",
+    }
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
+    pr = make_pr()
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "wait"
+    assert "lease" in (result.notes or "")
     assert read_status(ref)["status"] == "in-progress"
 
 
-def test_process_one_in_progress_with_merged_pr_skips(tmp_path) -> None:
-    """MERGED PR + status=in-progress -> wait, no on-disk change.
-
-    Stale-status race avoidance: Tier 2 may still flip to `implemented`
-    on the next implementer tick, after which the normal `implemented`
-    path will detect the merge and produce a clean flip-to-merged.
-    Shepherd hijacking it from `in-progress` would skip the recorded
-    pipeline transition.
-    """
+def test_process_one_in_progress_with_merged_pr_repairs(tmp_path) -> None:
+    """MERGED PR is authoritative even when YAML still says in-progress."""
     ref = make_ref(tmp_path, status="in-progress")
     pr = make_pr(merged=True, merge_commit="deadbeef" * 5)
 
@@ -1437,9 +1652,8 @@ def test_process_one_in_progress_with_merged_pr_skips(tmp_path) -> None:
                       return_value=run_shepherd.CopilotReview(False, 0)):
         result = process_one(ref, skip_subprocess=True)
 
-    assert result.decision == "wait"
-    assert "Tier 2" in (result.notes or "")
-    assert read_status(ref)["status"] == "in-progress"
+    assert result.decision == "flip-to-merged"
+    assert read_status(ref)["status"] == "merged"
 
 
 def test_process_one_in_progress_dead_letter_flips_to_rejected(tmp_path) -> None:
