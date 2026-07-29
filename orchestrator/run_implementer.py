@@ -1361,6 +1361,20 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped)
 
 
+def _max_proposals_error(max_proposals: int, dry_run: bool) -> Optional[str]:
+    """Return a policy error for an unsafe executable batch size.
+
+    Implementations are deliberately serial and limited to one proposal per
+    run so a queue cannot multiply subscription usage. Unlimited discovery is
+    still useful and safe in dry-run mode (incident-7eb12290).
+    """
+    if max_proposals < 0:
+        return "--max-proposals must be zero or positive"
+    if not dry_run and max_proposals != 1:
+        return "--max-proposals must be 1 for executable runs (0 is dry-run only)"
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Tier 2 implementer — open PRs from accepted proposals")
     ap.add_argument("--service", default="", help=f"Filter by service (one of: {', '.join(SERVICES)})")
@@ -1369,7 +1383,10 @@ def main() -> None:
         "--max-proposals",
         type=int,
         default=int(os.getenv("IMPLEMENTER_MAX_PROPOSALS", "1")),
-        help="Maximum accepted proposals per run (default: 1; 0 means unlimited)",
+        help=(
+            "Maximum accepted proposals per run (execution is fixed at 1; "
+            "0 is allowed only with --dry-run)"
+        ),
     )
     ap.add_argument(
         "--state-dir",
@@ -1393,9 +1410,6 @@ def main() -> None:
 
     if args.service and args.service not in SERVICES:
         print(f"Unknown service '{args.service}'. Available: {', '.join(SERVICES)}", file=sys.stderr)
-        sys.exit(2)
-    if args.max_proposals < 0:
-        print("--max-proposals must be zero or positive", file=sys.stderr)
         sys.exit(2)
 
     state_dir = Path(args.state_dir)
@@ -1442,6 +1456,10 @@ def main() -> None:
             return
         print(f"  ok   {result.ref.service}/{result.ref.slug} -> {result.pr_url or '(existing PR)'}")
         return
+
+    if policy_error := _max_proposals_error(args.max_proposals, args.dry_run):
+        print(policy_error, file=sys.stderr)
+        sys.exit(2)
 
     refs = find_accepted_proposals(
         state_dir,
