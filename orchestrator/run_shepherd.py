@@ -1680,6 +1680,8 @@ def reconcile_one(
         repair_fields["failure"] = None
         repair_fields["notes"] = None
         repair_fields["attempt"] = _finished_attempt(ref)
+        if ref.status == "review-stuck":
+            repair_fields["review_attempts"] = None
     changed = _update_status_if_changed(
         ref,
         target_status,

@@ -325,7 +325,8 @@ def test_reconcile_open_pr_overrides_stale_accepted(tmp_path) -> None:
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
         result = run_shepherd.reconcile_one(ref)
     assert result.decision == "repair-open-pr"
-    assert read_status(ref)["status"] == "implemented"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
 
 
 def test_reconcile_dry_run_reports_without_writing(tmp_path) -> None:
@@ -509,7 +510,9 @@ def test_reconcile_review_stuck_requires_material_change(tmp_path) -> None:
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=approved):
         result = run_shepherd.reconcile_one(ref)
     assert result.decision == "repair-open-pr"
-    assert read_status(ref)["status"] == "implemented"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert "review_attempts" not in final
 
 
 def test_decide_address_review() -> None:
