@@ -1370,7 +1370,10 @@ def main() -> None:
     print("\n=== Summary ===")
     fail = 0
     for r in results:
-        if r.pr_url:
+        if r.error:
+            fail += 1
+            print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
+        elif r.pr_url:
             print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
         elif r.skipped_reason:
             print(f"  · {r.ref.service}/{r.ref.slug} skipped: {r.skipped_reason}")

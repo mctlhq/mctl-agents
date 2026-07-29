@@ -93,6 +93,39 @@ def test_implement_one_never_calls_model_when_pr_exists(
     assert "notes" not in status
 
 
+def test_main_reports_error_even_when_result_has_colliding_pr_url(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ref = make_ref(tmp_path)
+    result = run_implementer.ImplementResult(
+        ref=ref,
+        pr_url="https://github.com/mctlhq/mctl-agents/pull/71",
+        error="branch-collision",
+    )
+    monkeypatch.setattr(
+        run_implementer,
+        "find_accepted_proposals",
+        lambda *_args, **_kwargs: [ref],
+    )
+    monkeypatch.setattr(
+        run_implementer,
+        "_implement_refs",
+        lambda *_args, **_kwargs: [result],
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_implementer.py", "--state-dir", str(tmp_path)],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        run_implementer.main()
+
+    assert exc_info.value.code == 1
+    output = capsys.readouterr().out
+    assert "failed: branch-collision" in output
+    assert "→ https://github.com/mctlhq/mctl-agents/pull/71" not in output
+
+
 def test_github_failure_is_fail_closed(monkeypatch, tmp_path: Path) -> None:
     ref = make_ref(tmp_path)
 
