@@ -168,6 +168,13 @@ class ImplementResult:
 
 
 @dataclass(frozen=True)
+class BatchOutcome:
+    succeeded: int
+    failed: int
+    skipped: int
+
+
+@dataclass(frozen=True)
 class ExistingResult:
     """Outcome of the GitHub preflight for one deterministic result branch."""
 
@@ -1279,6 +1286,21 @@ def _implement_refs(
     return results
 
 
+def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
+    """Classify every result; partial success must never mask a failure."""
+    succeeded = failed = skipped = 0
+    for result in results:
+        if result.error:
+            failed += 1
+        elif result.pr_url:
+            succeeded += 1
+        elif result.skipped_reason:
+            skipped += 1
+        else:
+            failed += 1
+    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Tier 2 implementer — open PRs from accepted proposals")
     ap.add_argument("--service", default="", help=f"Filter by service (one of: {', '.join(SERVICES)})")
@@ -1381,19 +1403,23 @@ def main() -> None:
     )
 
     print("\n=== Summary ===")
-    fail = 0
     for r in results:
         if r.error:
-            fail += 1
             print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
         elif r.pr_url:
             print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
         elif r.skipped_reason:
             print(f"  · {r.ref.service}/{r.ref.slug} skipped: {r.skipped_reason}")
         else:
-            fail += 1
             print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
-    if fail:
+    outcome = _batch_outcome(results)
+    print(
+        "Totals: "
+        f"{outcome.succeeded} succeeded, "
+        f"{outcome.failed} failed, "
+        f"{outcome.skipped} skipped"
+    )
+    if outcome.failed:
         sys.exit(1)
 
 
