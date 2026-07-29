@@ -420,6 +420,34 @@ def test_reconcile_one_missing_result_is_needs_triage(tmp_path) -> None:
     assert final["failure"]["code"] == "missing-pr"
 
 
+@pytest.mark.parametrize("terminal_status", ["merged", "rejected"])
+def test_reconcile_preserves_terminal_status_without_pr(
+    tmp_path,
+    terminal_status,
+) -> None:
+    """A missing PR cannot erase an existing terminal decision."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="finished-work",
+        status=terminal_status,
+        pr_url=None,
+    )
+    before = ref.status_path.read_text(encoding="utf-8")
+    with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
+         patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
+         patch.object(
+             run_shepherd.run_implementer,
+             "_preflight_existing_result",
+         ) as preflight:
+        result = run_shepherd.reconcile_one(ref)
+
+    assert result.decision == "wait"
+    assert f"terminal {terminal_status}" in (result.notes or "")
+    assert ref.status_path.read_text(encoding="utf-8") == before
+    preflight.assert_not_called()
+
+
 def test_reconcile_preserves_existing_triage_failure_without_pr(tmp_path) -> None:
     """No-commit diagnostics must survive later reconciliation."""
     ref = make_ref(
