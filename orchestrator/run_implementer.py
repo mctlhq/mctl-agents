@@ -82,7 +82,11 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.options import build_implementer_agent_options
+from orchestrator.options import (
+    IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
+    IMPLEMENTER_TIMEOUT_SECONDS,
+    build_implementer_agent_options,
+)
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 
@@ -118,6 +122,7 @@ EXIT_OK = 0
 EXIT_GENERIC_FAILURE = 1
 EXIT_NO_FOLLOWUP_COMMITS = 42
 EXIT_BRANCH_MISSING_ON_ORIGIN = 43
+EXIT_OPERATION_TIMEOUT = 44
 
 
 def _review_feedback_exit_code(error: str) -> int:
@@ -130,10 +135,13 @@ def _review_feedback_exit_code(error: str) -> int:
         same findings will deterministically reproduce the same outcome.
       - 43: PR branch was deleted on origin between ticks — re-running
         cannot resurrect it; a human must look at the PR.
+      - 44: a model stream or shell command exceeded its explicit wall-clock
+        bound. Re-running forever cannot make forward progress, so this
+        consumes the shepherd's bounded review-attempt budget.
 
-    Everything else (shell failures, SystemExit from missing config,
-    unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and the
-    shepherd treats it as transient.
+    Everything else (non-timeout shell failures, SystemExit from missing
+    config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
+    the shepherd treats it as transient.
     """
     if not error:
         return EXIT_OK
@@ -141,6 +149,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_NO_FOLLOWUP_COMMITS
     if error.startswith("branch ") and "not found on origin" in error:
         return EXIT_BRANCH_MISSING_ON_ORIGIN
+    if error.startswith("operation timed out:"):
+        return EXIT_OPERATION_TIMEOUT
     return EXIT_GENERIC_FAILURE
 
 
@@ -186,6 +196,10 @@ class ExistingResult:
 
 class GitHubPreflightError(RuntimeError):
     """GitHub could not be queried safely, so the model must not run."""
+
+
+class ImplementerOperationTimeout(RuntimeError):
+    """A bounded model or shell operation exceeded its wall-clock limit."""
 
 
 # ---------------------------------------------------------------------------
@@ -288,10 +302,30 @@ def find_accepted_proposals(
 # ---------------------------------------------------------------------------
 # Implementation
 # ---------------------------------------------------------------------------
-def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
-    """Thin wrapper over subprocess.run with consistent logging."""
+def _run(
+    cmd: list[str],
+    cwd: Optional[Path] = None,
+    check: bool = True,
+    timeout: Optional[float] = None,
+) -> subprocess.CompletedProcess:
+    """Run a bounded subprocess with consistent logging."""
+    effective_timeout = (
+        IMPLEMENTER_COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
+    )
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=cwd,
+            check=check,
+            text=True,
+            capture_output=True,
+            timeout=effective_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ImplementerOperationTimeout(
+            f"command exceeded {effective_timeout:g}s: {' '.join(cmd)}"
+        ) from exc
 
 
 def _github_json(cmd: list[str]) -> Any:
@@ -523,8 +557,16 @@ def _push_followup(repo_dir: Path, branch: str) -> None:
 
 async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
-    async for message in query(prompt=prompt, options=options):
-        print(message)
+    # A budget bounds spend but not a stalled network/model stream. Keep one
+    # proposal inside the workflow's larger deadline (incident e3649b04).
+    try:
+        with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
+            async for message in query(prompt=prompt, options=options):
+                print(message)
+    except TimeoutError as exc:
+        raise ImplementerOperationTimeout(
+            f"model stream exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +659,13 @@ def review_feedback_one(
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerOperationTimeout as e:
+        result = ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"operation timed out: {e}",
+        )
+        return result
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
@@ -1216,6 +1265,17 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerOperationTimeout as e:
+        msg = f"operation timed out: {e}"
+        _mark_needs_triage(
+            ref,
+            code="operation-timeout",
+            stage="runtime",
+            message=msg,
+            attempt=attempt,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        return result
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         _mark_needs_triage(

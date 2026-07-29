@@ -1092,12 +1092,14 @@ def apply_followup(
         #
         # The implementer encodes the kind of failure via sentinel exit
         # codes (`run_implementer.EXIT_NO_FOLLOWUP_COMMITS` = 42,
-        # `EXIT_BRANCH_MISSING_ON_ORIGIN` = 43). Anything else (1, 137,
-        # 2, ...) is treated as transient — we cannot tell the kind from
-        # the code alone.
+        # `EXIT_BRANCH_MISSING_ON_ORIGIN` = 43,
+        # `EXIT_OPERATION_TIMEOUT` = 44). Anything else (1, 137, 2, ...)
+        # is treated as transient — we cannot tell the kind from the code
+        # alone.
         deterministic_codes = {
             run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
             run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+            run_implementer.EXIT_OPERATION_TIMEOUT,
         }
         is_transient = proc.returncode not in deterministic_codes
         raise FollowupSubprocessError(
