@@ -40,6 +40,11 @@ MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
 # already-applied edits remain. Caller can raise via env if a proposal needs more.
 IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
+# Per-proposal wall-clock bound. The SDK budget limits spend, not elapsed time;
+# without this a stalled stream can consume the whole Argo workflow deadline.
+IMPLEMENTER_TIMEOUT_SECONDS = float(
+    os.getenv("IMPLEMENTER_TIMEOUT_SECONDS", "900")
+)
 # Tier 3 shepherd budget — soft cap per shepherd tick.
 # Covers the shepherd's own spend only: the sub-agent classification call
 # that turns codex findings into the bundle, plus the small amount of

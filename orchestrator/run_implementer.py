@@ -82,7 +82,10 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.options import build_implementer_agent_options
+from orchestrator.options import (
+    IMPLEMENTER_TIMEOUT_SECONDS,
+    build_implementer_agent_options,
+)
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 
@@ -516,8 +519,11 @@ def _push_followup(repo_dir: Path, branch: str) -> None:
 
 async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
-    async for message in query(prompt=prompt, options=options):
-        print(message)
+    # A budget bounds spend but not a stalled network/model stream. Keep one
+    # proposal inside the workflow's larger deadline (incident e3649b04).
+    with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
+        async for message in query(prompt=prompt, options=options):
+            print(message)
 
 
 # ---------------------------------------------------------------------------
