@@ -1308,10 +1308,10 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     for result in results:
         if result.error:
             failed += 1
-        elif result.pr_url:
-            succeeded += 1
         elif result.skipped_reason:
             skipped += 1
+        elif result.pr_url:
+            succeeded += 1
         else:
             failed += 1
     return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped)

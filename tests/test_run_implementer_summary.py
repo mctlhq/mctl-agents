@@ -40,3 +40,15 @@ def test_result_without_outcome_is_failure() -> None:
         pr_url=None,
     )
     assert run_implementer._batch_outcome([result]).failed == 1
+
+
+def test_explicit_skip_takes_precedence_over_pr_url() -> None:
+    result = run_implementer.ImplementResult(
+        ref=_ref("closed-pr"),
+        pr_url="https://github.com/mctlhq/mctl-agents/pull/2",
+        skipped_reason="existing PR is closed without merge",
+    )
+
+    assert run_implementer._batch_outcome(
+        [result]
+    ) == run_implementer.BatchOutcome(succeeded=0, failed=0, skipped=1)
