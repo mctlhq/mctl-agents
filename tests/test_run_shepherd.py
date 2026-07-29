@@ -311,6 +311,17 @@ def test_reconcile_one_open_pr_repairs_projection(tmp_path) -> None:
     assert final["github"]["state"] == "open"
 
 
+def test_reconcile_dry_run_reports_without_writing(tmp_path) -> None:
+    """Dry-run executes GitHub decisions but leaves YAML byte-for-byte intact."""
+    ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
+    before = ref.status_path.read_text(encoding="utf-8")
+    pr = make_pr(merged=False, closed_unmerged=False)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref, dry_run=True)
+    assert result.decision == "repair-open-pr"
+    assert ref.status_path.read_text(encoding="utf-8") == before
+
+
 def test_reconcile_one_recorded_pr_fetch_failure_waits(tmp_path) -> None:
     """A transient fetch failure must not overwrite durable state."""
     ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")

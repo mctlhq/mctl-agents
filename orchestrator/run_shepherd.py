@@ -1383,20 +1383,25 @@ def process_one(
 def _update_status_if_changed(
     ref: ProposalRef,
     new_status: str,
+    *,
+    dry_run: bool = False,
     **fields: Any,
 ) -> bool:
     """Avoid noisy GitOps commits when the durable projection is unchanged."""
     existing = _load_status(ref.status_path)
     if existing.get("status", "proposed") != new_status:
-        update_status(ref, new_status, **fields)
+        if not dry_run:
+            update_status(ref, new_status, **fields)
         return True
     for key, value in fields.items():
         if value is None:
             if key in existing:
-                update_status(ref, new_status, **fields)
+                if not dry_run:
+                    update_status(ref, new_status, **fields)
                 return True
         elif existing.get(key) != value:
-            update_status(ref, new_status, **fields)
+            if not dry_run:
+                update_status(ref, new_status, **fields)
             return True
     return False
 
@@ -1437,6 +1442,7 @@ def _github_projection_for_ref(
 def reconcile_one(
     ref: ProposalRef,
     state_dir: Optional[Path] = None,
+    dry_run: bool = False,
 ) -> ShepherdResult:
     """Project authoritative GitHub PR state back into ``.status.yaml``.
 
@@ -1455,7 +1461,10 @@ def reconcile_one(
                 error="could not fetch recorded GitHub PR",
             )
         try:
-            recovered = run_implementer._preflight_existing_result(ref)
+            recovered = run_implementer._preflight_existing_result(
+                ref,
+                allow_pr_create=not dry_run,
+            )
         except run_implementer.GitHubPreflightError as exc:
             return ShepherdResult(
                 ref=ref,
@@ -1463,9 +1472,10 @@ def reconcile_one(
                 error=f"GitHub preflight failed closed: {exc}",
             )
         if recovered.action == "open" and recovered.pr_url:
-            update_status(
+            _update_status_if_changed(
                 ref,
                 "implemented",
+                dry_run=dry_run,
                 pr=recovered.pr_url,
                 failure=None,
             )
@@ -1478,10 +1488,17 @@ def reconcile_one(
                     error="opened/adopted PR but could not fetch its snapshot",
                 )
             discovered_url = recovered.pr_url
+        elif recovered.action == "branch-ready":
+            return ShepherdResult(
+                ref=ref,
+                decision="would-open-pr" if dry_run else "needs-triage",
+                notes=recovered.reason,
+            )
         elif recovered.action == "needs-triage":
             _update_status_if_changed(
                 ref,
                 "needs-triage",
+                dry_run=dry_run,
                 failure={
                     "code": recovered.reason or "existing-result-invalid",
                     "stage": "reconcile",
@@ -1518,6 +1535,7 @@ def reconcile_one(
         _update_status_if_changed(
             ref,
             "needs-triage",
+            dry_run=dry_run,
             failure={
                 "code": "missing-pr",
                 "stage": "reconcile",
@@ -1540,6 +1558,7 @@ def reconcile_one(
         _update_status_if_changed(
             ref,
             "merged",
+            dry_run=dry_run,
             pr=pr_url,
             github=github,
             merged_at=existing_status.get("merged_at") or _now_iso(),
@@ -1552,6 +1571,7 @@ def reconcile_one(
         _update_status_if_changed(
             ref,
             "rejected",
+            dry_run=dry_run,
             pr=pr_url,
             github=github,
             notes=pr.close_comment_or_default or "PR was closed without merging.",
@@ -1569,6 +1589,7 @@ def reconcile_one(
         _update_status_if_changed(
             ref,
             "needs-triage",
+            dry_run=dry_run,
             pr=pr_url,
             github=github,
             failure={
@@ -1586,6 +1607,7 @@ def reconcile_one(
     changed = _update_status_if_changed(
         ref,
         target_status,
+        dry_run=dry_run,
         pr=pr_url,
         github=github,
         failure=None,
@@ -1687,18 +1709,21 @@ def main() -> None:
             print("info: no implemented/review-fixing proposals with a PR found.")
         return
 
-    # Reconcile mode: read-only terminal-status repair, no budget, no SDK.
+    # Reconcile mode: GitHub projection, no budget or SDK. Dry-run executes the
+    # full decision pass but suppresses YAML writes and PR creation.
     if args.reconcile:
         print(f"Reconcile pass: {len(refs)} proposal(s):")
         for r in refs:
             print(f"  - {r.service}/{r.slug} [{r.status}]")
         results = []
         for ref in refs:
-            if args.dry_run:
-                print(f"[dry-run] would reconcile {ref.service}/{ref.slug}")
-                results.append(ShepherdResult(ref=ref, decision="dry-run"))
-                continue
-            results.append(reconcile_one(ref, state_dir=state_dir))
+            results.append(
+                reconcile_one(
+                    ref,
+                    state_dir=state_dir,
+                    dry_run=args.dry_run,
+                )
+            )
         _print_summary(results)
         return
 

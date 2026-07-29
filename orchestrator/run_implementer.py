@@ -872,7 +872,11 @@ def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
     return pr_url
 
 
-def _preflight_existing_result(ref: ProposalRef) -> ExistingResult:
+def _preflight_existing_result(
+    ref: ProposalRef,
+    *,
+    allow_pr_create: bool = True,
+) -> ExistingResult:
     """Reconstruct durable proposal state from GitHub before using the model."""
     repo = f"mctlhq/{ref.service}"
     branch = f"feat/agents-{ref.slug}"
@@ -937,6 +941,12 @@ def _preflight_existing_result(ref: ProposalRef) -> ExistingResult:
             action="needs-triage",
             head_sha=head_sha,
             reason="branch-has-no-commits",
+        )
+    if not allow_pr_create:
+        return ExistingResult(
+            action="branch-ready",
+            head_sha=head_sha,
+            reason="useful branch exists without PR",
         )
 
     # The previous attempt pushed useful commits and died before `gh pr create`.
