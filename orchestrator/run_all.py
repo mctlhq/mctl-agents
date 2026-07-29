@@ -53,6 +53,32 @@ async def _safe_run_service(service: str) -> None:
         traceback.print_exc(file=sys.stderr)
 
 
+async def _safe_run_incident_responder() -> None:
+    """Run the incident responder and swallow any failure.
+
+    Unlike the per-service agents in `_full`, this mode has no task group to
+    protect it — a raised exception (e.g. error_max_budget_usd, a flaky
+    mctl MCP call, an SDK error) propagates straight out of main() and the
+    process exits non-zero. Argo then marks the incident-responder job
+    Failed, which raises a workflow_failed incident about the incident
+    responder itself with no useful logs (see incident
+    argo-mctl-agents-incidents-1785053700-1785053856 / proposal b892d8c7).
+
+    The responder is best-effort diagnostics: any proposals it already
+    wrote to state_dir before failing are still useful, and a transient
+    failure here should not surface as a platform incident. We log + drop,
+    matching _safe_run_service's rationale.
+    """
+    try:
+        await run_incident_responder()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — intentional broad catch
+        print(
+            f"⚠️  incident-responder failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+
+
 async def _full() -> None:
     async with anyio.create_task_group() as tg:
         for service in ROTATING_SERVICES:
@@ -89,7 +115,7 @@ async def main() -> None:
         await _single_service(service)
     elif mode == "incident-responder":
         print("=== mode=incident-responder — diagnosing TypeGeneric analyzing incidents ===")
-        await run_incident_responder()
+        await _safe_run_incident_responder()
     else:
         print(
             f"ERROR: unknown RUN_MODE '{mode}'. "
