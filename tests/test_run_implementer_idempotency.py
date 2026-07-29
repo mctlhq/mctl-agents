@@ -145,6 +145,91 @@ def test_remote_branch_with_no_commits_needs_triage(
     assert existing.reason == "branch-has-no-commits"
 
 
+def test_failed_orphan_pr_creation_is_preflight_error(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ref = make_ref(tmp_path)
+    github_results = iter([[], {"ahead_by": 1}, []])
+    monkeypatch.setattr(
+        run_implementer,
+        "_github_json",
+        lambda _cmd: next(github_results),
+    )
+    monkeypatch.setattr(
+        run_implementer,
+        "_run",
+        lambda *_a, **_kw: subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout=json.dumps({"sha": "abc"}), stderr=""
+        ),
+    )
+    monkeypatch.setattr(
+        run_implementer,
+        "_open_pr_for_branch",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            subprocess.CalledProcessError(
+                1,
+                ["gh", "pr", "create"],
+                stderr="permission denied",
+            )
+        ),
+    )
+    with pytest.raises(
+        run_implementer.GitHubPreflightError,
+        match="failed to open PR",
+    ):
+        run_implementer._preflight_existing_result(ref)
+
+
+def test_failed_preflight_does_not_starve_later_proposal(
+    monkeypatch, tmp_path: Path
+) -> None:
+    first = make_ref(tmp_path)
+    second_dir = tmp_path / "mctl-agents" / "proposals" / "second"
+    second_dir.mkdir(parents=True)
+    (second_dir / ".status.yaml").write_text("status: accepted\n", encoding="utf-8")
+    second = run_implementer.ProposalRef(
+        service="mctl-agents",
+        slug="second",
+        proposal_dir=second_dir,
+        status="accepted",
+    )
+    calls: list[str] = []
+
+    def fake_implement(ref, dry_run=False):
+        calls.append(ref.slug)
+        if ref is first:
+            return run_implementer.ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error="GitHub preflight failed closed",
+                counts_toward_limit=False,
+            )
+        return run_implementer.ImplementResult(
+            ref=ref,
+            pr_url="https://github.com/mctlhq/mctl-agents/pull/99",
+        )
+
+    monkeypatch.setattr(run_implementer, "implement_one", fake_implement)
+    results = run_implementer._implement_refs(
+        [first, second],
+        max_proposals=1,
+        dry_run=False,
+    )
+    assert calls == ["incident-example", "second"]
+    assert len(results) == 2
+
+
+def test_terminal_closed_projection_has_no_blocking_reason() -> None:
+    projection = run_implementer._github_projection(
+        run_implementer.ExistingResult(
+            action="closed",
+            reason="closed-unmerged",
+        )
+    )
+    assert projection["state"] == "closed"
+    assert "blocking_reason" not in projection
+
+
 def test_mark_failure_quarantines_and_preserves_pr(tmp_path: Path) -> None:
     ref = make_ref(tmp_path)
     run_implementer._mark_needs_triage(

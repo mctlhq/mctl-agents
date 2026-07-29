@@ -163,6 +163,7 @@ class ImplementResult:
     pr_url: Optional[str]
     error: Optional[str] = None
     skipped_reason: Optional[str] = None
+    counts_toward_limit: bool = True
 
 
 @dataclass(frozen=True)
@@ -953,7 +954,7 @@ def _preflight_existing_result(
     # Opening the PR is deterministic and avoids spending model quota again.
     try:
         pr_url = _open_pr_for_branch(ref, branch)
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as exc:
         # A concurrent actor may have opened it between list and create.
         retry = _github_json([
             "gh", "pr", "list", "--repo", repo, "--state", "open",
@@ -966,7 +967,10 @@ def _preflight_existing_result(
             and _canonical_proposal_marker(ref) in (pr.get("body") or "")
         ]
         if not matching:
-            raise
+            detail = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise GitHubPreflightError(
+                f"failed to open PR for existing result branch: {detail}"
+            ) from exc
         pr_url = matching[0]["url"]
         head_sha = matching[0].get("headRefOid") or head_sha
     return ExistingResult(action="open", pr_url=pr_url, head_sha=head_sha)
@@ -985,7 +989,7 @@ def _github_projection(existing: ExistingResult) -> dict[str, Any]:
     }
     if existing.head_sha:
         projection["head_sha"] = existing.head_sha
-    if existing.reason:
+    if existing.action == "needs-triage" and existing.reason:
         projection["blocking_reason"] = existing.reason
     return projection
 
@@ -1042,6 +1046,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=None,
             error=f"GitHub preflight failed closed: {exc}",
+            counts_toward_limit=False,
         )
 
     if existing.action == "open":
@@ -1241,6 +1246,26 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _implement_refs(
+    refs: list[ProposalRef],
+    *,
+    max_proposals: int,
+    dry_run: bool,
+) -> list[ImplementResult]:
+    """Run a bounded batch without letting failed preflights starve the queue."""
+    results: list[ImplementResult] = []
+    handled = 0
+    for ref in refs:
+        print(f"\n=== Implementing {ref.service}/{ref.slug} ===")
+        result = implement_one(ref, dry_run=dry_run)
+        results.append(result)
+        if result.counts_toward_limit:
+            handled += 1
+        if max_proposals and handled >= max_proposals:
+            break
+    return results
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Tier 2 implementer — open PRs from accepted proposals")
     ap.add_argument("--service", default="", help=f"Filter by service (one of: {', '.join(SERVICES)})")
@@ -1328,9 +1353,6 @@ def main() -> None:
         service_filter=args.service or None,
         slug_filter=args.slug or None,
     )
-    if args.max_proposals:
-        refs = refs[:args.max_proposals]
-
     if not refs:
         print("ℹ️  No accepted proposals found.")
         return
@@ -1339,10 +1361,11 @@ def main() -> None:
     for r in refs:
         print(f"  - {r.service}/{r.slug}")
 
-    results: list[ImplementResult] = []
-    for ref in refs:
-        print(f"\n=== Implementing {ref.service}/{ref.slug} ===")
-        results.append(implement_one(ref, dry_run=args.dry_run))
+    results = _implement_refs(
+        refs,
+        max_proposals=args.max_proposals,
+        dry_run=args.dry_run,
+    )
 
     print("\n=== Summary ===")
     fail = 0

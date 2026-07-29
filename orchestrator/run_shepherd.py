@@ -270,6 +270,7 @@ class PRSnapshot:
     merge_state_status: str         # mergeStateStatus from GraphQL
     checks_green: bool              # required checks all SUCCESS
     is_draft: bool
+    review_decision: str = ""       # APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
 
 
 @dataclass
@@ -321,6 +322,7 @@ def _discover_refs(
     service_filter: Optional[str] = None,
     slug_filter: Optional[str] = None,
     reconcile: bool = False,
+    dry_run: bool = False,
 ) -> list[ProposalRef]:
     """Glob agents-state for proposals in SHEPHERD_INPUT_STATUSES.
 
@@ -379,11 +381,12 @@ def _discover_refs(
             if not pr_url and not reconcile:
                 pr_url = _find_pr_url_by_branch(service, slug)
                 if pr_url:
-                    update_status_file(
-                        proposal_dir / ".status.yaml",
-                        "implemented" if status == "in-progress" else status,
-                        pr=pr_url,
-                    )
+                    if not dry_run:
+                        update_status_file(
+                            proposal_dir / ".status.yaml",
+                            "implemented" if status == "in-progress" else status,
+                            pr=pr_url,
+                        )
                     if status == "in-progress":
                         status = "implemented"
             if not pr_url and not reconcile:
@@ -516,7 +519,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            f"query=query($owner:String!,$repo:String!,$number:Int!){{repository(owner:$owner,name:$repo){{pullRequest(number:$number){{number state merged mergedAt mergeStateStatus isDraft headRefOid baseRefName mergeCommit{{oid}} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){{nodes{{__typename ... on PullRequestCommit{{commit{{oid committedDate}}}} ... on HeadRefForcePushedEvent{{createdAt afterCommit{{oid}}}}}}}} commits(last:1){{nodes{{commit{{oid committedDate pushedDate}}}}}} statusCheckRollup{{state}}}}}}}}",
+            f"query=query($owner:String!,$repo:String!,$number:Int!){{repository(owner:$owner,name:$repo){{pullRequest(number:$number){{number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid baseRefName mergeCommit{{oid}} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){{nodes{{__typename ... on PullRequestCommit{{commit{{oid committedDate}}}} ... on HeadRefForcePushedEvent{{createdAt afterCommit{{oid}}}}}}}} commits(last:1){{nodes{{commit{{oid committedDate pushedDate}}}}}} statusCheckRollup{{state}}}}}}}}",
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -597,6 +600,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
         merge_state_status=merge_state_status,
         checks_green=checks_green,
         is_draft=bool(pr.get("isDraft")),
+        review_decision=(pr.get("reviewDecision") or "").upper(),
     )
 
 
@@ -1203,6 +1207,17 @@ def process_one(
 
     # A durable PR proves Tier 2 finished its expensive work. Heal a dropped
     # status write and continue on the same tick instead of waiting forever.
+    if (
+        ref.status == "in-progress"
+        and not pr.closed_unmerged
+        and not pr.merged
+        and _attempt_is_fresh(ref)
+    ):
+        return ShepherdResult(
+            ref=ref,
+            decision="wait",
+            notes="active implementation lease has not expired",
+        )
     if ref.status == "in-progress" and not pr.closed_unmerged and not pr.merged:
         attempt = _load_status(ref.status_path).get("attempt")
         if isinstance(attempt, dict):
@@ -1464,6 +1479,19 @@ def reconcile_one(
     This never reviews, fixes, or merges. It is safe for both shepherd-owned
     and steward-owned repositories.
     """
+    status_data = _load_status(ref.status_path)
+    existing_failure = status_data.get("failure")
+    failure_code = (
+        existing_failure.get("code")
+        if isinstance(existing_failure, dict)
+        else None
+    )
+    if ref.status == "needs-triage" and failure_code == "branch-collision":
+        return ShepherdResult(
+            ref=ref,
+            decision="needs-triage",
+            notes="branch collision requires explicit operator resolution",
+        )
     discovered_url = ref.pr_url or _find_pr_url_by_branch(ref.service, ref.slug)
     pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
     if pr is None:
@@ -1508,7 +1536,7 @@ def reconcile_one(
         elif recovered.action == "branch-ready":
             return ShepherdResult(
                 ref=ref,
-                decision="would-open-pr" if dry_run else "needs-triage",
+                decision="would-open-pr",
                 notes=recovered.reason,
             )
         elif recovered.action == "needs-triage":
@@ -1543,6 +1571,12 @@ def reconcile_one(
     if pr is None:
         if ref.status == "accepted":
             return ShepherdResult(ref=ref, decision="wait")
+        if ref.status == "needs-triage" and existing_failure:
+            return ShepherdResult(
+                ref=ref,
+                decision="needs-triage",
+                notes=f"preserving existing failure: {failure_code or 'unknown'}",
+            )
         if ref.status == "in-progress" and _attempt_is_fresh(ref):
             return ShepherdResult(
                 ref=ref,
@@ -1623,17 +1657,27 @@ def reconcile_one(
         "accepted",
         "in-progress",
         "error",
-        "review-stuck",
         "needs-triage",
         "rejected",
     }:
         target_status = "implemented"
+    if ref.status == "review-stuck":
+        prior_github = status_data.get("github") or {}
+        prior_head = (
+            prior_github.get("head_sha")
+            if isinstance(prior_github, dict)
+            else None
+        )
+        if pr.review_decision == "APPROVED" or (
+            prior_head and prior_head != pr.head_sha
+        ):
+            target_status = "implemented"
     repair_fields: dict[str, Any] = {
         "pr": pr_url,
         "github": github,
-        "failure": None,
     }
     if target_status == "implemented" and ref.status != "implemented":
+        repair_fields["failure"] = None
         repair_fields["notes"] = None
         repair_fields["attempt"] = _finished_attempt(ref)
     changed = _update_status_if_changed(
@@ -1730,6 +1774,7 @@ def main() -> None:
         service_filter=args.service or None,
         slug_filter=args.slug or None,
         reconcile=args.reconcile,
+        dry_run=args.dry_run,
     )
 
     if not refs:
