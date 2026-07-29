@@ -1640,11 +1640,11 @@ def reconcile_one(
         # GitHub can transiently return UNKNOWN while recomputing
         # mergeability. Never let that weak observation erase a previously
         # confirmed conflict. Reopen the proposal only after a new head SHA
-        # is explicitly reported CLEAN.
+        # is explicitly reported in one of GitHub's mergeable states.
         if (
             pr.merge_state_status != "DIRTY"
             and (
-                pr.merge_state_status != "CLEAN"
+                pr.merge_state_status not in MERGEABLE_STATES
                 or not prior_head
                 or prior_head == pr.head_sha
             )
@@ -1654,7 +1654,7 @@ def reconcile_one(
                 decision="needs-triage",
                 notes=(
                     "preserving confirmed merge conflict until a changed "
-                    "head SHA is explicitly clean"
+                    "head SHA is explicitly mergeable"
                 ),
             )
     if pr.merge_state_status == "DIRTY":

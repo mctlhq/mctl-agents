@@ -514,8 +514,8 @@ def test_reconcile_preserves_confirmed_conflict_when_github_is_unknown(
     assert final["github"]["blocking_reason"] == "conflict"
 
 
-def test_reconcile_clears_conflict_only_for_changed_clean_head(tmp_path) -> None:
-    """A rebased, explicitly clean head may re-enter the active lifecycle."""
+def test_reconcile_clears_conflict_for_changed_mergeable_head(tmp_path) -> None:
+    """A rebased head in any mergeable state may re-enter the lifecycle."""
     ref = make_ref(
         tmp_path,
         service="mctl-agents",
@@ -534,7 +534,7 @@ def test_reconcile_clears_conflict_only_for_changed_clean_head(tmp_path) -> None
         yaml.safe_dump(status, sort_keys=False),
         encoding="utf-8",
     )
-    clean = make_pr(merge_state_status="CLEAN", head_sha=HEAD_SHA)
+    clean = make_pr(merge_state_status="UNSTABLE", head_sha=HEAD_SHA)
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=clean):
         result = run_shepherd.reconcile_one(ref)
