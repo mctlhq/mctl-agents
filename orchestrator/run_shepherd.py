@@ -1619,7 +1619,14 @@ def reconcile_one(
         return ShepherdResult(ref=ref, decision="needs-triage", notes="merge conflict")
 
     target_status = ref.status
-    if ref.status in {"in-progress", "error", "review-stuck", "needs-triage", "rejected"}:
+    if ref.status in {
+        "accepted",
+        "in-progress",
+        "error",
+        "review-stuck",
+        "needs-triage",
+        "rejected",
+    }:
         target_status = "implemented"
     repair_fields: dict[str, Any] = {
         "pr": pr_url,

@@ -311,6 +311,21 @@ def test_reconcile_one_open_pr_repairs_projection(tmp_path) -> None:
     assert final["github"]["state"] == "open"
 
 
+def test_reconcile_open_pr_overrides_stale_accepted(tmp_path) -> None:
+    """An existing PR prevents an accepted proposal from re-entering Tier 2."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        status="accepted",
+    )
+    pr = make_pr(merged=False, closed_unmerged=False)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "repair-open-pr"
+    assert read_status(ref)["status"] == "implemented"
+
+
 def test_reconcile_dry_run_reports_without_writing(tmp_path) -> None:
     """Dry-run executes GitHub decisions but leaves YAML byte-for-byte intact."""
     ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
