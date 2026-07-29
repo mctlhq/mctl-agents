@@ -1503,6 +1503,16 @@ def reconcile_one(
                 decision="wait",
                 error="could not fetch recorded GitHub PR",
             )
+        # A terminal human/GitHub decision is durable.  We still perform the
+        # canonical branch/PR lookup above so a real PR can correct stale
+        # projection, but the absence of a PR is not evidence that a rejected
+        # or already-merged proposal should be reopened for triage.
+        if ref.status in {"merged", "rejected"}:
+            return ShepherdResult(
+                ref=ref,
+                decision="wait",
+                notes=f"preserving terminal {ref.status} status without a PR",
+            )
         try:
             recovered = run_implementer._preflight_existing_result(
                 ref,
