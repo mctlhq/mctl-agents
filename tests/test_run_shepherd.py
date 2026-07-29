@@ -480,6 +480,72 @@ def test_reconcile_never_adopts_recorded_branch_collision(tmp_path) -> None:
     assert read_status(ref)["status"] == "needs-triage"
 
 
+def test_reconcile_preserves_confirmed_conflict_when_github_is_unknown(
+    tmp_path,
+) -> None:
+    """A transient UNKNOWN must not un-quarantine a confirmed conflict."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-agents",
+        slug="conflict",
+        status="needs-triage",
+    )
+    status = read_status(ref)
+    status["github"] = {
+        "state": "open",
+        "head_sha": HEAD_SHA,
+        "blocking_reason": "conflict",
+        "observed_at": "2026-04-29T12:00:00Z",
+    }
+    status["failure"] = {"code": "merge-conflict", "stage": "reconcile"}
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
+    unknown = make_pr(merge_state_status="UNKNOWN", head_sha=HEAD_SHA)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=unknown):
+        result = run_shepherd.reconcile_one(ref)
+
+    assert result.decision == "needs-triage"
+    final = read_status(ref)
+    assert final["status"] == "needs-triage"
+    assert final["failure"]["code"] == "merge-conflict"
+    assert final["github"]["blocking_reason"] == "conflict"
+
+
+def test_reconcile_clears_conflict_only_for_changed_clean_head(tmp_path) -> None:
+    """A rebased, explicitly clean head may re-enter the active lifecycle."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-agents",
+        slug="conflict",
+        status="needs-triage",
+    )
+    status = read_status(ref)
+    status["github"] = {
+        "state": "open",
+        "head_sha": OLD_SHA,
+        "blocking_reason": "conflict",
+        "observed_at": "2026-04-29T12:00:00Z",
+    }
+    status["failure"] = {"code": "merge-conflict", "stage": "reconcile"}
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
+    clean = make_pr(merge_state_status="CLEAN", head_sha=HEAD_SHA)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=clean):
+        result = run_shepherd.reconcile_one(ref)
+
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert "failure" not in final
+    assert "blocking_reason" not in final["github"]
+
+
 def test_reconcile_review_stuck_requires_material_change(tmp_path) -> None:
     """Unchanged findings stay terminal; a clean approval reopens the state."""
     ref = make_ref(

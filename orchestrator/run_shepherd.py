@@ -1630,6 +1630,33 @@ def reconcile_one(
             failure=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
+    if ref.status == "needs-triage" and failure_code == "merge-conflict":
+        prior_github = status_data.get("github") or {}
+        prior_head = (
+            prior_github.get("head_sha")
+            if isinstance(prior_github, dict)
+            else None
+        )
+        # GitHub can transiently return UNKNOWN while recomputing
+        # mergeability. Never let that weak observation erase a previously
+        # confirmed conflict. Reopen the proposal only after a new head SHA
+        # is explicitly reported CLEAN.
+        if (
+            pr.merge_state_status != "DIRTY"
+            and (
+                pr.merge_state_status != "CLEAN"
+                or not prior_head
+                or prior_head == pr.head_sha
+            )
+        ):
+            return ShepherdResult(
+                ref=ref,
+                decision="needs-triage",
+                notes=(
+                    "preserving confirmed merge conflict until a changed "
+                    "head SHA is explicitly clean"
+                ),
+            )
     if pr.merge_state_status == "DIRTY":
         github = _github_projection_for_ref(
             ref,
