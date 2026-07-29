@@ -859,6 +859,18 @@ def _canonical_proposal_marker(ref: ProposalRef) -> str:
     return f"agents-state/{ref.service}/proposals/{ref.slug}/"
 
 
+def _result_branch_is_missing(detail: str) -> bool:
+    """Return true only for GitHub responses that prove the ref is absent."""
+    return (
+        "HTTP 404" in detail
+        or "Not Found" in detail
+        or (
+            "HTTP 422" in detail
+            and "No commit found for SHA:" in detail
+        )
+    )
+
+
 def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
     title, body = _pr_title_and_body(ref)
     # Pin the base repo with --repo: on a fork (e.g. mctl-openclaw, forked from
@@ -925,7 +937,7 @@ def _preflight_existing_result(
     )
     if branch_proc.returncode != 0:
         detail = (branch_proc.stderr or branch_proc.stdout or "").strip()
-        if "HTTP 404" in detail or "Not Found" in detail:
+        if _result_branch_is_missing(detail):
             return ExistingResult(action="none")
         raise GitHubPreflightError(detail or "failed to query result branch")
     try:

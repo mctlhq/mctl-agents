@@ -178,6 +178,53 @@ def test_remote_branch_with_no_commits_needs_triage(
     assert existing.reason == "branch-has-no-commits"
 
 
+def test_missing_remote_branch_422_is_not_a_preflight_failure(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ref = make_ref(tmp_path)
+    monkeypatch.setattr(run_implementer, "_github_json", lambda _cmd: [])
+    monkeypatch.setattr(
+        run_implementer,
+        "_run",
+        lambda *_a, **_kw: subprocess.CompletedProcess(
+            args=["gh", "api"],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "gh: No commit found for SHA: feat/agents-incident-example "
+                "(HTTP 422)"
+            ),
+        ),
+    )
+
+    existing = run_implementer._preflight_existing_result(ref)
+
+    assert existing.action == "none"
+
+
+def test_unrelated_remote_branch_422_fails_closed(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ref = make_ref(tmp_path)
+    monkeypatch.setattr(run_implementer, "_github_json", lambda _cmd: [])
+    monkeypatch.setattr(
+        run_implementer,
+        "_run",
+        lambda *_a, **_kw: subprocess.CompletedProcess(
+            args=["gh", "api"],
+            returncode=1,
+            stdout="",
+            stderr="gh: Validation Failed (HTTP 422)",
+        ),
+    )
+
+    with pytest.raises(
+        run_implementer.GitHubPreflightError,
+        match="Validation Failed",
+    ):
+        run_implementer._preflight_existing_result(ref)
+
+
 def test_failed_orphan_pr_creation_is_preflight_error(
     monkeypatch, tmp_path: Path
 ) -> None:
