@@ -1276,9 +1276,17 @@ def _implement_refs(
     results: list[ImplementResult] = []
     handled = 0
     for ref in refs:
-        print(f"\n=== Implementing {ref.service}/{ref.slug} ===")
+        label = f"{ref.service}/{ref.slug}"
+        print(f"\n=== [{label}] Implementing ===")
         result = implement_one(ref, dry_run=dry_run)
         results.append(result)
+        if result.error:
+            outcome = "failed"
+        elif result.pr_url:
+            outcome = "ready"
+        else:
+            outcome = "skipped"
+        print(f"=== [{label}] Finished: {outcome} ===")
         if result.counts_toward_limit:
             handled += 1
         if max_proposals and handled >= max_proposals:
