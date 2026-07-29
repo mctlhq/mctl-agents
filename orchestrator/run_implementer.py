@@ -1351,9 +1351,6 @@ def main() -> None:
     if args.service and args.service not in SERVICES:
         print(f"Unknown service '{args.service}'. Available: {', '.join(SERVICES)}", file=sys.stderr)
         sys.exit(2)
-    if policy_error := _max_proposals_error(args.max_proposals, args.dry_run):
-        print(policy_error, file=sys.stderr)
-        sys.exit(2)
 
     state_dir = Path(args.state_dir)
 
@@ -1399,6 +1396,10 @@ def main() -> None:
             return
         print(f"  ok   {result.ref.service}/{result.ref.slug} -> {result.pr_url or '(existing PR)'}")
         return
+
+    if policy_error := _max_proposals_error(args.max_proposals, args.dry_run):
+        print(policy_error, file=sys.stderr)
+        sys.exit(2)
 
     refs = find_accepted_proposals(
         state_dir,
