@@ -2,17 +2,18 @@
 
 Pipeline per proposal:
     1. Find proposals/<slug>/.status.yaml with status: accepted
-    2. Mark .status.yaml as `in-progress` (pre-commit so a crashed orchestrator
-       won't be re-attempted on next run unless --force is passed).
-    3. `gh repo clone mctlhq/<service>` to /tmp/impl-<service>-<slug>-<ts>/
-    4. Create branch `feat/agents-<slug>` in the cloned repo.
-    5. Run the implementer Claude sub-agent with cwd=cloned-repo and
+    2. Query GitHub for the canonical PR and deterministic branch. Adopt an
+       existing result, or fail closed when GitHub cannot be queried.
+    3. Mark .status.yaml as `in-progress` with an expiring attempt lease.
+    4. `gh repo clone mctlhq/<service>` to /tmp/impl-<service>-<slug>-<ts>/
+    5. Create branch `feat/agents-<slug>` in the cloned repo.
+    6. Run the implementer Claude sub-agent with cwd=cloned-repo and
        PROPOSAL_DIR pointing at the gitops proposal directory. The agent
        reads requirements.md / design.md / tasks.md, edits files, and
        commits — but does NOT push (orchestrator handles push + PR open).
-    6. `git push -u origin <branch>` from the cloned repo.
-    7. `gh pr create` with title/body referencing the proposal.
-    8. Update .status.yaml → `implemented`, write the PR URL.
+    7. `git push -u origin <branch>` from the cloned repo.
+    8. `gh pr create` with title/body referencing the proposal.
+    9. Update .status.yaml → `implemented`, write the PR URL.
 
 Review-feedback mode (`--review-feedback <path>`):
     Used by the Tier 3 shepherd to address codex P1/P2 findings on an
