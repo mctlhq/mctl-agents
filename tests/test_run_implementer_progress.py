@@ -14,7 +14,7 @@ def _ref(slug: str) -> run_implementer.ProposalRef:
 
 
 def test_progress_markers_identify_each_proposal(monkeypatch, capsys) -> None:
-    refs = [_ref("first"), _ref("second")]
+    refs = [_ref("first"), _ref("second"), _ref("closed")]
 
     def fake_implement(ref, dry_run=False):
         if ref.slug == "first":
@@ -23,10 +23,17 @@ def test_progress_markers_identify_each_proposal(monkeypatch, capsys) -> None:
                 pr_url="https://github.com/mctlhq/mctl-agents/pull/1",
                 counts_toward_limit=False,
             )
+        if ref.slug == "second":
+            return run_implementer.ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error="preflight unavailable",
+                counts_toward_limit=False,
+            )
         return run_implementer.ImplementResult(
             ref=ref,
-            pr_url=None,
-            error="preflight unavailable",
+            pr_url="https://github.com/mctlhq/mctl-agents/pull/2",
+            skipped_reason="existing PR is closed without merge",
             counts_toward_limit=False,
         )
 
@@ -38,3 +45,5 @@ def test_progress_markers_identify_each_proposal(monkeypatch, capsys) -> None:
     assert "[mctl-agents/first] Finished: ready" in output
     assert "[mctl-agents/second] Implementing" in output
     assert "[mctl-agents/second] Finished: failed" in output
+    assert "[mctl-agents/closed] Implementing" in output
+    assert "[mctl-agents/closed] Finished: skipped" in output

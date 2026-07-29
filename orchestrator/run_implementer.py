@@ -1282,10 +1282,12 @@ def _implement_refs(
         results.append(result)
         if result.error:
             outcome = "failed"
+        elif result.skipped_reason:
+            outcome = "skipped"
         elif result.pr_url:
             outcome = "ready"
         else:
-            outcome = "skipped"
+            outcome = "failed"
         print(f"=== [{label}] Finished: {outcome} ===")
         if result.counts_toward_limit:
             handled += 1
@@ -1414,10 +1416,10 @@ def main() -> None:
     for r in results:
         if r.error:
             print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
-        elif r.pr_url:
-            print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
         elif r.skipped_reason:
             print(f"  · {r.ref.service}/{r.ref.slug} skipped: {r.skipped_reason}")
+        elif r.pr_url:
+            print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
         else:
             print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
     outcome = _batch_outcome(results)
