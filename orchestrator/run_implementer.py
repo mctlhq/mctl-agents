@@ -44,15 +44,16 @@ Auth:
     fast in that case (set --dry-run to verify spec parsing without auth).
 
 Idempotency:
-    A proposal whose .status.yaml is already `in-progress` is skipped on the
-    next run unless --force is passed. The owner can manually flip the file
-    back to `accepted` to retry.
+    GitHub is checked before any model call.  An existing PR or remote result
+    branch is adopted instead of re-running the implementer. Failed attempts
+    move to `needs-triage`; an operator must explicitly move that proposal
+    back to `accepted` before it can run again.
 
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
     python -m orchestrator.run_implementer --service mctl-web --slug wrangler-cve-0933
-    python -m orchestrator.run_implementer --slug wrangler-cve-0933 --force
+    python -m orchestrator.run_implementer --slug wrangler-cve-0933
 """
 from __future__ import annotations
 
@@ -64,13 +65,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 import anyio
-import yaml
 from claude_agent_sdk import query
 
 from config.settings import (
@@ -80,6 +82,7 @@ from config.settings import (
 )
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.options import build_implementer_agent_options
+from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 
 # ---------------------------------------------------------------------------
@@ -162,76 +165,50 @@ class ImplementResult:
     skipped_reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ExistingResult:
+    """Outcome of the GitHub preflight for one deterministic result branch."""
+
+    action: str
+    pr_url: Optional[str] = None
+    head_sha: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class GitHubPreflightError(RuntimeError):
+    """GitHub could not be queried safely, so the model must not run."""
+
+
 # ---------------------------------------------------------------------------
 # .status.yaml IO
 # ---------------------------------------------------------------------------
 def _load_status(path: Path) -> dict:
     """Parse .status.yaml. Missing file → {}; default status is `proposed`."""
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a mapping, got {type(data).__name__}")
-    return data
+    return load_status(path)
 
 
 def _now_iso() -> str:
     """RFC 3339 UTC timestamp without microseconds."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-# Keys that `update_status_yaml` owns and rewrites on every call. Anything
-# else found in an existing .status.yaml (e.g. the `source` / `control`
-# blocks written by the issue-investigator) is unmanaged and preserved
-# verbatim through every status transition.
-_MANAGED_STATUS_KEYS = {"status", "updated_at", "updated_by", "pr", "notes"}
+    return now_iso()
 
 
 def update_status_yaml(
     ref: ProposalRef,
     new_status: str,
-    pr: Optional[str] = None,
-    notes: Optional[str] = None,
     actor: str = "mctl-agents[bot]",
+    **fields: Any,
 ) -> None:
     """Write .status.yaml back to the gitops worktree.
 
-    Read-merge-write: the managed keys (status / updated_at / updated_by /
-    pr / notes) are rewritten, but any unmanaged keys already on disk are
-    carried over untouched. This matters for issue-driven proposals, whose
-    `source` block links the proposal back to a GitHub issue — a plain
-    full-file overwrite would drop it on the very first `accepted →
-    in-progress` transition and the implementer could no longer add
-    `Closes #N` to the PR.
+    Every existing field is preserved unless the caller explicitly overrides
+    it. Passing ``None`` removes a field. This prevents an `in-progress`
+    transition or a failed retry from erasing an already-known PR URL.
 
     The file is keep-it-simple YAML — no comments preserved (we don't need
     ruamel for this). A trailing newline is added so `git diff` shows the
     last-line change cleanly.
     """
-    payload = {
-        "status": new_status,
-        "updated_at": _now_iso(),
-        "updated_by": actor,
-    }
-    if pr is not None:
-        payload["pr"] = pr
-    if notes is not None:
-        payload["notes"] = notes
-
-    # Carry over unmanaged keys (source, control, …) from the existing file.
-    # `key in payload` guards against drift: if a future managed key is added
-    # to `payload` above but missed from `_MANAGED_STATUS_KEYS`, the freshly
-    # computed value still wins over the stale on-disk copy.
-    existing = _load_status(ref.status_path)
-    for key, value in existing.items():
-        if key in _MANAGED_STATUS_KEYS or key in payload:
-            continue
-        payload[key] = value
-
-    ref.status_path.parent.mkdir(parents=True, exist_ok=True)
-    with ref.status_path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+    update_status_file(ref.status_path, new_status, actor=actor, **fields)
     ref.status = new_status
 
 
@@ -242,7 +219,6 @@ def find_accepted_proposals(
     state_dir: Path,
     service_filter: Optional[str] = None,
     slug_filter: Optional[str] = None,
-    include_in_progress: bool = False,
     statuses: Optional[set[str]] = None,
 ) -> list[ProposalRef]:
     """Glob agents-state and return all proposals with status == accepted.
@@ -251,12 +227,6 @@ def find_accepted_proposals(
     A directory without .status.yaml is treated as `proposed` (default per
     shared contract) and is therefore skipped here (Tier 2 only acts on
     `accepted`).
-
-    When ``include_in_progress`` is True (CLI ``--force``), proposals stuck
-    in ``in-progress`` are ALSO returned so the operator can retry a wedged
-    run without manually editing .status.yaml. ``implement_one`` already
-    short-circuits on in-progress unless ``force`` is set, so the two flags
-    must be threaded together.
 
     When ``statuses`` is set it overrides the default filter entirely. The
     ``--review-feedback`` path uses this to look up proposals in
@@ -270,8 +240,6 @@ def find_accepted_proposals(
         accepted_states = set(statuses)
     else:
         accepted_states = {"accepted"}
-        if include_in_progress:
-            accepted_states.add("in-progress")
 
     refs: list[ProposalRef] = []
     for service_dir in sorted(state_dir.iterdir()):
@@ -315,6 +283,18 @@ def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subp
     """Thin wrapper over subprocess.run with consistent logging."""
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+
+
+def _github_json(cmd: list[str]) -> Any:
+    """Run a GitHub CLI command and parse JSON, failing closed on any error."""
+    proc = _run(cmd, check=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown GitHub CLI error").strip()
+        raise GitHubPreflightError(detail)
+    try:
+        return json.loads(proc.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise GitHubPreflightError(f"invalid JSON from {' '.join(cmd[:3])}") from exc
 
 
 def _clone_target(service: str, slug: str) -> Path:
@@ -860,10 +840,7 @@ def _issue_closing_line(ref: ProposalRef) -> str:
     return f"\n\nCloses {repo}#{issue}"
 
 
-def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
-    branch = f"feat/agents-{ref.slug}"
-    _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
-
+def _pr_title_and_body(ref: ProposalRef) -> tuple[str, str]:
     title = f"feat(agents): {ref.slug}"
     body = (
         f"Implements accepted proposal `{ref.service}/{ref.slug}`.\n\n"
@@ -873,6 +850,15 @@ def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
         f"this PR was opened automatically and the spec may have gaps."
         f"{_issue_closing_line(ref)}"
     )
+    return title, body
+
+
+def _canonical_proposal_marker(ref: ProposalRef) -> str:
+    return f"agents-state/{ref.service}/proposals/{ref.slug}/"
+
+
+def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
+    title, body = _pr_title_and_body(ref)
     # Pin the base repo with --repo: on a fork (e.g. mctl-openclaw, forked from
     # openclaw/openclaw) `gh pr create` otherwise defaults the base to the parent
     # repo and the non-interactive call fails, so the branch is pushed but no PR
@@ -880,28 +866,243 @@ def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
     proc = _run(
         ["gh", "pr", "create", "--repo", f"mctlhq/{ref.service}",
          "--title", title, "--body", body, "--head", branch, "--base", "main"],
-        cwd=repo_dir,
     )
     pr_url = proc.stdout.strip().splitlines()[-1]
     print(f"✓ PR opened: {pr_url}")
     return pr_url
 
 
-def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) -> ImplementResult:
+def _preflight_existing_result(ref: ProposalRef) -> ExistingResult:
+    """Reconstruct durable proposal state from GitHub before using the model."""
+    repo = f"mctlhq/{ref.service}"
+    branch = f"feat/agents-{ref.slug}"
+    prs = _github_json([
+        "gh", "pr", "list", "--repo", repo, "--state", "all",
+        "--head", branch, "--limit", "100",
+        "--json", "number,url,state,mergedAt,headRefName,headRefOid,body",
+    ])
+    if not isinstance(prs, list):
+        raise GitHubPreflightError("gh pr list returned a non-list response")
+
+    exact = [pr for pr in prs if pr.get("headRefName") == branch]
+    exact.sort(
+        key=lambda pr: (
+            pr.get("state") == "OPEN",
+            bool(pr.get("mergedAt")) or pr.get("state") == "MERGED",
+            int(pr.get("number") or 0),
+        ),
+        reverse=True,
+    )
+    if exact:
+        pr = exact[0]
+        if _canonical_proposal_marker(ref) not in (pr.get("body") or ""):
+            return ExistingResult(
+                action="needs-triage",
+                pr_url=pr.get("url"),
+                head_sha=pr.get("headRefOid"),
+                reason="branch-collision",
+            )
+        common = {
+            "pr_url": pr.get("url"),
+            "head_sha": pr.get("headRefOid"),
+        }
+        if pr.get("state") == "OPEN":
+            return ExistingResult(action="open", **common)
+        if pr.get("mergedAt") or pr.get("state") == "MERGED":
+            return ExistingResult(action="merged", **common)
+        return ExistingResult(action="closed", reason="closed-unmerged", **common)
+
+    encoded_branch = quote(branch, safe="")
+    branch_proc = _run(
+        ["gh", "api", f"repos/{repo}/commits/{encoded_branch}"],
+        check=False,
+    )
+    if branch_proc.returncode != 0:
+        detail = (branch_proc.stderr or branch_proc.stdout or "").strip()
+        if "HTTP 404" in detail or "Not Found" in detail:
+            return ExistingResult(action="none")
+        raise GitHubPreflightError(detail or "failed to query result branch")
+    try:
+        branch_data = json.loads(branch_proc.stdout)
+        head_sha = branch_data["sha"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise GitHubPreflightError("invalid result-branch response") from exc
+
+    comparison = _github_json([
+        "gh", "api", f"repos/{repo}/compare/main...{head_sha}",
+    ])
+    ahead_by = int((comparison or {}).get("ahead_by") or 0)
+    if ahead_by <= 0:
+        return ExistingResult(
+            action="needs-triage",
+            head_sha=head_sha,
+            reason="branch-has-no-commits",
+        )
+
+    # The previous attempt pushed useful commits and died before `gh pr create`.
+    # Opening the PR is deterministic and avoids spending model quota again.
+    try:
+        pr_url = _open_pr_for_branch(ref, branch)
+    except subprocess.CalledProcessError:
+        # A concurrent actor may have opened it between list and create.
+        retry = _github_json([
+            "gh", "pr", "list", "--repo", repo, "--state", "open",
+            "--head", branch, "--limit", "10",
+            "--json", "url,headRefName,headRefOid,body",
+        ])
+        matching = [
+            pr for pr in retry
+            if pr.get("headRefName") == branch
+            and _canonical_proposal_marker(ref) in (pr.get("body") or "")
+        ]
+        if not matching:
+            raise
+        pr_url = matching[0]["url"]
+        head_sha = matching[0].get("headRefOid") or head_sha
+    return ExistingResult(action="open", pr_url=pr_url, head_sha=head_sha)
+
+
+def _github_projection(existing: ExistingResult) -> dict[str, Any]:
+    state = {
+        "open": "open",
+        "merged": "merged",
+        "closed": "closed",
+        "needs-triage": "unknown",
+    }.get(existing.action, "unknown")
+    projection: dict[str, Any] = {
+        "state": state,
+        "observed_at": _now_iso(),
+    }
+    if existing.head_sha:
+        projection["head_sha"] = existing.head_sha
+    if existing.reason:
+        projection["blocking_reason"] = existing.reason
+    return projection
+
+
+def _mark_needs_triage(
+    ref: ProposalRef,
+    *,
+    code: str,
+    stage: str,
+    message: str,
+    pr_url: Optional[str] = None,
+    attempt: Optional[dict[str, Any]] = None,
+) -> None:
+    fields: dict[str, Any] = {
+        "failure": {
+            "code": code,
+            "stage": stage,
+            "message": message[:2000],
+        },
+        "notes": f"{stage}: {message[:500]}",
+    }
+    if pr_url:
+        fields["pr"] = pr_url
+    if attempt:
+        finished = dict(attempt)
+        finished["finished_at"] = _now_iso()
+        fields["attempt"] = finished
+    update_status_yaml(ref, "needs-triage", **fields)
+
+
+def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
+    branch = f"feat/agents-{ref.slug}"
+    _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
+    return _open_pr_for_branch(ref, branch)
+
+
+def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     """Implement a single accepted proposal. Returns ImplementResult."""
-    if ref.status == "in-progress" and not force:
+    if ref.status != "accepted":
         return ImplementResult(
             ref=ref,
             pr_url=None,
-            skipped_reason="already in-progress (a previous attempt may have died); pass --force to retry",
+            skipped_reason=f"status is {ref.status}; only accepted proposals are runnable",
         )
 
     if dry_run:
-        print(f"[dry-run] would implement {ref.service}/{ref.slug}")
+        print(f"[dry-run] would preflight then implement {ref.service}/{ref.slug}")
         return ImplementResult(ref=ref, pr_url=None, skipped_reason="dry-run")
 
-    # 1. Mark in-progress BEFORE doing real work — lets a parallel runner skip.
-    update_status_yaml(ref, "in-progress")
+    try:
+        existing = _preflight_existing_result(ref)
+    except GitHubPreflightError as exc:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"GitHub preflight failed closed: {exc}",
+        )
+
+    if existing.action == "open":
+        update_status_yaml(
+            ref,
+            "implemented",
+            pr=existing.pr_url,
+            github=_github_projection(existing),
+            failure=None,
+        )
+        return ImplementResult(ref=ref, pr_url=existing.pr_url)
+    if existing.action == "merged":
+        update_status_yaml(
+            ref,
+            "merged",
+            pr=existing.pr_url,
+            github=_github_projection(existing),
+            merged_at=_now_iso(),
+            failure=None,
+        )
+        return ImplementResult(ref=ref, pr_url=existing.pr_url)
+    if existing.action == "closed":
+        update_status_yaml(
+            ref,
+            "rejected",
+            pr=existing.pr_url,
+            github=_github_projection(existing),
+            notes="GitHub PR was closed without merging.",
+            failure=None,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=existing.pr_url,
+            skipped_reason="existing PR is closed without merge",
+        )
+    if existing.action == "needs-triage":
+        _mark_needs_triage(
+            ref,
+            code=existing.reason or "existing-result-invalid",
+            stage="preflight",
+            message="Existing deterministic result cannot be adopted safely.",
+            pr_url=existing.pr_url,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=existing.pr_url,
+            error=existing.reason or "existing result needs triage",
+        )
+
+    try:
+        ensure_auth_for_sdk()
+    except (Exception, SystemExit) as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        _mark_needs_triage(
+            ref,
+            code="sdk-auth-failed",
+            stage="auth",
+            message=message,
+        )
+        return ImplementResult(ref=ref, pr_url=None, error=message)
+
+    started = datetime.now(timezone.utc)
+    attempt = {
+        "id": os.getenv("WORKFLOW_UID") or str(uuid.uuid4()),
+        "started_at": started.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "expires_at": (
+            started + timedelta(minutes=130)
+        ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    # Mark in-progress only after GitHub proves there is no prior result.
+    update_status_yaml(ref, "in-progress", attempt=attempt, failure=None)
 
     target = None
     result: Optional[ImplementResult] = None
@@ -922,10 +1123,12 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
-            update_status_yaml(
+            _mark_needs_triage(
                 ref,
-                "accepted",
-                notes="implementer produced no commits; reverted to accepted",
+                code="no-commits",
+                stage="agent",
+                message="implementer produced no commits",
+                attempt=attempt,
             )
             return ImplementResult(
                 ref=ref,
@@ -952,10 +1155,12 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
                 "will be pre-staged or the migration sequenced. See "
                 "feedback_eso_chart_2x_crd_lifecycle.md."
             )
-            update_status_yaml(
+            _mark_needs_triage(
                 ref,
-                "accepted",
-                notes=f"blocked by chart-major-bump guard: {bump_summary}",
+                code="chart-major-migration-required",
+                stage="policy",
+                message=msg,
+                attempt=attempt,
             )
             return ImplementResult(ref=ref, pr_url=None, error=msg)
 
@@ -963,13 +1168,27 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
         pr_url = _push_and_open_pr(target, ref)
 
         # 8. Mark implemented.
-        update_status_yaml(ref, "implemented", pr=pr_url)
+        completed_attempt = dict(attempt)
+        completed_attempt["finished_at"] = _now_iso()
+        update_status_yaml(
+            ref,
+            "implemented",
+            pr=pr_url,
+            attempt=completed_attempt,
+            failure=None,
+        )
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
-        # Leave .status.yaml as in-progress so operator notices the wedge.
+        _mark_needs_triage(
+            ref,
+            code="shell-failed",
+            stage="shell",
+            message=msg,
+            attempt=attempt,
+        )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
     except SystemExit as e:
@@ -978,10 +1197,26 @@ def implement_one(ref: ProposalRef, force: bool = False, dry_run: bool = False) 
         # a service that's in SERVICES but has no agents/<svc>/.claude/
         # tree yet). Catching SystemExit alongside Exception here keeps
         # one bad proposal from killing a multi-proposal run mid-pipeline.
-        result = ImplementResult(ref=ref, pr_url=None, error=f"SystemExit: {e}")
+        msg = f"SystemExit: {e}"
+        _mark_needs_triage(
+            ref,
+            code="configuration-error",
+            stage="agent",
+            message=msg,
+            attempt=attempt,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
     except Exception as e:  # pragma: no cover — defensive
-        result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
+        msg = f"{type(e).__name__}: {e}"
+        _mark_needs_triage(
+            ref,
+            code="unexpected-error",
+            stage="agent",
+            message=msg,
+            attempt=attempt,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
     finally:
         # Keep target dir for post-mortem on failure; clean only on success.
@@ -999,7 +1234,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Tier 2 implementer — open PRs from accepted proposals")
     ap.add_argument("--service", default="", help=f"Filter by service (one of: {', '.join(SERVICES)})")
     ap.add_argument("--slug", default="", help="Filter by proposal slug")
-    ap.add_argument("--force", action="store_true", help="Re-run a proposal stuck in `in-progress`")
+    ap.add_argument(
+        "--max-proposals",
+        type=int,
+        default=int(os.getenv("IMPLEMENTER_MAX_PROPOSALS", "1")),
+        help="Maximum accepted proposals per run (default: 1; 0 means unlimited)",
+    )
     ap.add_argument(
         "--state-dir",
         default=str(DEFAULT_STATE_DIR),
@@ -1023,13 +1263,15 @@ def main() -> None:
     if args.service and args.service not in SERVICES:
         print(f"Unknown service '{args.service}'. Available: {', '.join(SERVICES)}", file=sys.stderr)
         sys.exit(2)
-
-    ensure_auth_for_sdk()
+    if args.max_proposals < 0:
+        print("--max-proposals must be zero or positive", file=sys.stderr)
+        sys.exit(2)
 
     state_dir = Path(args.state_dir)
 
     # Review-feedback mode: drive the existing PR's branch with codex findings.
     if args.review_feedback:
+        ensure_auth_for_sdk()
         if not (args.service and args.slug):
             print(
                 "--review-feedback requires --service AND --slug "
@@ -1074,8 +1316,9 @@ def main() -> None:
         state_dir,
         service_filter=args.service or None,
         slug_filter=args.slug or None,
-        include_in_progress=args.force,
     )
+    if args.max_proposals:
+        refs = refs[:args.max_proposals]
 
     if not refs:
         print("ℹ️  No accepted proposals found.")
@@ -1088,7 +1331,7 @@ def main() -> None:
     results: list[ImplementResult] = []
     for ref in refs:
         print(f"\n=== Implementing {ref.service}/{ref.slug} ===")
-        results.append(implement_one(ref, force=args.force, dry_run=args.dry_run))
+        results.append(implement_one(ref, dry_run=args.dry_run))
 
     print("\n=== Summary ===")
     fail = 0

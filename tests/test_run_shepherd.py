@@ -266,15 +266,15 @@ def test_discover_no_skip_includes_all(tmp_path, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 # Reconcile mode: read-only status repair for skip-listed repos
 # ---------------------------------------------------------------------------
-def test_discover_reconcile_inverts_skip(tmp_path, monkeypatch) -> None:
-    """reconcile=True returns ONLY skip-listed services, the inverse of normal."""
+def test_discover_reconcile_covers_all_services(tmp_path, monkeypatch) -> None:
+    """GitHub projection covers shepherd- and steward-owned services."""
     make_status_yaml(tmp_path, service="mctl-design", slug="icon-swap")
     make_status_yaml(tmp_path, service="mctl-web", slug="dep-bump")
     monkeypatch.setattr(
         run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-design"})
     )
     refs = run_shepherd._discover_refs(tmp_path, reconcile=True)
-    assert {r.service for r in refs} == {"mctl-design"}
+    assert {r.service for r in refs} == {"mctl-design", "mctl-web"}
 
 
 def test_reconcile_one_flips_merged(tmp_path) -> None:
@@ -299,25 +299,48 @@ def test_reconcile_one_flips_rejected(tmp_path) -> None:
     assert read_status(ref)["status"] == "rejected"
 
 
-def test_reconcile_one_open_pr_is_noop(tmp_path) -> None:
-    """An open PR is left to pr-steward — reconcile does nothing."""
+def test_reconcile_one_open_pr_repairs_projection(tmp_path) -> None:
+    """An open PR is projected even when steward owns the active loop."""
     ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
     pr = make_pr(merged=False, closed_unmerged=False)
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr):
         result = run_shepherd.reconcile_one(ref)
-    assert result.decision == "wait"
-    # Status untouched (still implemented from make_ref).
-    assert read_status(ref)["status"] == "implemented"
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert final["github"]["state"] == "open"
 
 
-def test_reconcile_one_pr_none_is_wait(tmp_path) -> None:
-    """Unfetchable PR (None) → wait with an error; status left untouched."""
+def test_reconcile_one_recorded_pr_fetch_failure_waits(tmp_path) -> None:
+    """A transient fetch failure must not overwrite durable state."""
     ref = make_ref(tmp_path, service="mctl-design", slug="icon-swap")
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=None):
         result = run_shepherd.reconcile_one(ref)
     assert result.decision == "wait"
     assert result.error is not None
     assert read_status(ref)["status"] == "implemented"
+
+
+def test_reconcile_one_missing_result_is_needs_triage(tmp_path) -> None:
+    """Expired durable work with no PR or result branch is quarantined."""
+    ref = make_ref(
+        tmp_path,
+        service="mctl-design",
+        slug="icon-swap",
+        pr_url=None,
+    )
+    with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
+         patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
+         patch.object(
+             run_shepherd.run_implementer,
+             "_preflight_existing_result",
+             return_value=run_shepherd.run_implementer.ExistingResult(action="none"),
+         ):
+        result = run_shepherd.reconcile_one(ref)
+    assert result.decision == "needs-triage"
+    final = read_status(ref)
+    assert final["status"] == "needs-triage"
+    assert final["failure"]["code"] == "missing-pr"
 
 
 def test_decide_address_review() -> None:
@@ -1396,37 +1419,24 @@ def test_discover_refs_skips_in_progress_with_no_pr(tmp_path) -> None:
     assert refs == []
 
 
-def test_process_one_in_progress_with_open_pr_skips(tmp_path) -> None:
-    """OPEN PR + status=in-progress -> wait, no on-disk change.
-
-    Tier 2 race avoidance: the implementer just pushed the PR and is
-    about to flip status to `implemented`. Shepherd must defer.
-    """
+def test_process_one_in_progress_with_open_pr_repairs(tmp_path) -> None:
+    """OPEN PR proves Tier 2 finished, so the dropped YAML write is healed."""
     ref = make_ref(tmp_path, status="in-progress")
     pr = make_pr()  # default: state="OPEN", merged=False, closed_unmerged=False
 
-    def must_not_run(*_a, **_kw):
-        raise AssertionError("guard must short-circuit before codex/copilot reads")
-
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
-         patch.object(run_shepherd, "read_codex_review", side_effect=must_not_run), \
-         patch.object(run_shepherd, "read_copilot_review", side_effect=must_not_run):
+         patch.object(run_shepherd, "read_codex_review",
+                      return_value=CodexReview(False, [])), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)):
         result = process_one(ref, skip_subprocess=True)
 
     assert result.decision == "wait"
-    assert "Tier 2" in (result.notes or "")
-    assert read_status(ref)["status"] == "in-progress"
+    assert read_status(ref)["status"] == "implemented"
 
 
-def test_process_one_in_progress_with_merged_pr_skips(tmp_path) -> None:
-    """MERGED PR + status=in-progress -> wait, no on-disk change.
-
-    Stale-status race avoidance: Tier 2 may still flip to `implemented`
-    on the next implementer tick, after which the normal `implemented`
-    path will detect the merge and produce a clean flip-to-merged.
-    Shepherd hijacking it from `in-progress` would skip the recorded
-    pipeline transition.
-    """
+def test_process_one_in_progress_with_merged_pr_repairs(tmp_path) -> None:
+    """MERGED PR is authoritative even when YAML still says in-progress."""
     ref = make_ref(tmp_path, status="in-progress")
     pr = make_pr(merged=True, merge_commit="deadbeef" * 5)
 
@@ -1437,9 +1447,8 @@ def test_process_one_in_progress_with_merged_pr_skips(tmp_path) -> None:
                       return_value=run_shepherd.CopilotReview(False, 0)):
         result = process_one(ref, skip_subprocess=True)
 
-    assert result.decision == "wait"
-    assert "Tier 2" in (result.notes or "")
-    assert read_status(ref)["status"] == "in-progress"
+    assert result.decision == "flip-to-merged"
+    assert read_status(ref)["status"] == "merged"
 
 
 def test_process_one_in_progress_dead_letter_flips_to_rejected(tmp_path) -> None:

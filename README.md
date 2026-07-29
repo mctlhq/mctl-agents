@@ -118,14 +118,24 @@ submitting the `mctl-agents-investigate` workflow.
 `orchestrator/run_implementer.py` turns an `accepted` proposal into a
 real PR:
 
-1. Clones the target sibling repo (`mctlhq/<svc>`) to a tmp worktree.
-2. Creates branch `feat/agents-<slug>`.
+1. Queries GitHub for the deterministic `feat/agents-<slug>` branch and
+   canonical PR. An existing open/merged/closed result is projected into
+   `.status.yaml`; the model is not called.
+2. If no prior result exists, clones the target sibling repo
+   (`mctlhq/<svc>`) to a tmp worktree and creates the result branch.
 3. Runs the per-service implementer sub-agent
    (`agents/<svc>/.claude/agents/implementer.md`) with `PROPOSAL_DIR`
    pointing at the gitops worktree. The agent reads the spec and
    commits the minimum viable change; it never pushes.
 4. The Python wrapper pushes the branch and opens a PR via `gh pr create`.
-5. Flips `.status.yaml` to `status: implemented` with the PR URL.
+5. Flips `.status.yaml` to `status: implemented` with the PR URL. Any
+   incomplete/no-commit attempt moves to `needs-triage` and is never
+   automatically retried.
+
+The scheduled workflow processes at most one accepted proposal per run.
+There is no unfiltered `--force` mode or automatic second-account retry.
+An operator retries by reviewing the failure and moving that one proposal
+from `needs-triage` back to `accepted`.
 
 The same module also implements `--review-feedback <path>`, used by
 the [Tier 3 shepherd](#tier-3--pr-shepherd) to address code review
@@ -156,6 +166,9 @@ python -m orchestrator.run_shepherd --budget 2.00
 
 # Discover-only — no SDK calls, no merges.
 python -m orchestrator.run_shepherd --dry-run
+
+# GitHub-first projection repair for every service; no SDK or merge.
+python -m orchestrator.run_shepherd --reconcile
 ```
 
 The local one-shot needs the same env as the implementer: a
@@ -164,8 +177,11 @@ api` and `gh pr merge`) and either `CLAUDE_CODE_OAUTH_TOKEN`
 (Pro/Max) or `ANTHROPIC_API_KEY` for the SDK call that summarises
 codex findings. See `.env.example` for the full list.
 
-**State machine.** Per tick, for every proposal whose status is in
-`{implemented, review-fixing}` and that has a `pr:` URL:
+**State machine.** Normal mode drives proposals in
+`{implemented, review-fixing, in-progress}`. Missing PR URLs are recovered
+from GitHub before the decision loop. Reconcile mode additionally repairs
+`accepted`, `error`, `review-stuck`, `needs-triage`, and terminal drift without
+reviewing, fixing, or merging a PR.
 
 ```python
 def decide(pr, codex_review):

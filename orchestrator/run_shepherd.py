@@ -53,12 +53,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 import anyio
-import yaml
 from claude_agent_sdk import query
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator import run_implementer
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.proposal_state import load_status, now_iso, update_status_file
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
 
 
@@ -92,6 +92,16 @@ COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 # only `closed_unmerged` PRs are treated as dead-letters here, OPEN /
 # MERGED PRs return `wait` and leave the proposal for Tier 2.
 SHEPHERD_INPUT_STATUSES = {"implemented", "review-fixing", "in-progress"}
+RECONCILE_INPUT_STATUSES = {
+    "accepted",
+    "in-progress",
+    "implemented",
+    "review-fixing",
+    "review-stuck",
+    "error",
+    "needs-triage",
+    "rejected",
+}
 
 # Outer-loop cap on consecutive address-review attempts before giving up
 # and flipping to `review-stuck`. Lives here (NOT in decide()) so the
@@ -277,18 +287,12 @@ class ShepherdResult:
 # ---------------------------------------------------------------------------
 def _load_status(path: Path) -> dict:
     """Parse .status.yaml. Missing file → {}; default status is `proposed`."""
-    if not path.exists():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError(f"{path}: expected a mapping, got {type(data).__name__}")
-    return data
+    return load_status(path)
 
 
 def _now_iso() -> str:
     """RFC 3339 UTC timestamp without microseconds."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return now_iso()
 
 
 def update_status(
@@ -303,20 +307,7 @@ def update_status(
     are preserved unless explicitly overridden in `fields`. `status`,
     `updated_at`, and `updated_by` are always rewritten.
     """
-    existing = _load_status(ref.status_path)
-    payload = dict(existing)
-    payload["status"] = new_status
-    payload["updated_at"] = _now_iso()
-    payload["updated_by"] = actor
-    for k, v in fields.items():
-        if v is None:
-            payload.pop(k, None)
-        else:
-            payload[k] = v
-
-    ref.status_path.parent.mkdir(parents=True, exist_ok=True)
-    with ref.status_path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+    update_status_file(ref.status_path, new_status, actor=actor, **fields)
     ref.status = new_status
     if "review_attempts" in fields and fields["review_attempts"] is not None:
         ref.review_attempts = int(fields["review_attempts"])
@@ -338,9 +329,9 @@ def _discover_refs(
     the shepherd has nothing to do until the implementer opens a PR.
 
     Normal mode skips services in SHEPHERD_SKIP_SERVICES entirely (they are
-    owned by another PR lifecycle, e.g. pr-steward). `reconcile=True` inverts
-    the gate: it returns ONLY the skip-listed services, for the read-only
-    status-repair pass (`reconcile_one`).
+    owned by another PR lifecycle, e.g. pr-steward). Reconcile mode covers all
+    services because GitHub-to-YAML projection is independent of which actor
+    owns the active review/fix/merge loop.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -351,11 +342,7 @@ def _discover_refs(
             continue
         service = service_dir.name
         is_skipped = service in SHEPHERD_SKIP_SERVICES
-        if reconcile:
-            # Reconcile pass handles ONLY the repos the normal shepherd skips.
-            if not is_skipped:
-                continue
-        elif is_skipped:
+        if not reconcile and is_skipped:
             # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
             # but log it (only for real targets with a proposals/ dir) so an
             # operator isn't confused about why its proposals never appear.
@@ -383,11 +370,23 @@ def _discover_refs(
                 print(f"warn: {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
                 continue
             status = data.get("status", "proposed")
-            if status not in SHEPHERD_INPUT_STATUSES:
+            accepted_statuses = (
+                RECONCILE_INPUT_STATUSES if reconcile else SHEPHERD_INPUT_STATUSES
+            )
+            if status not in accepted_statuses:
                 continue
             pr_url = data.get("pr")
-            if not pr_url:
-                # No PR yet — nothing for the shepherd to do.
+            if not pr_url and not reconcile:
+                pr_url = _find_pr_url_by_branch(service, slug)
+                if pr_url:
+                    update_status_file(
+                        proposal_dir / ".status.yaml",
+                        "implemented" if status == "in-progress" else status,
+                        pr=pr_url,
+                    )
+                    if status == "in-progress":
+                        status = "implemented"
+            if not pr_url and not reconcile:
                 continue
             refs.append(
                 ProposalRef(
@@ -418,6 +417,42 @@ def _gh_api_json(args: list[str]) -> Any:
     if not out:
         return None
     return json.loads(out)
+
+
+def _find_pr_url_by_branch(service: str, slug: str) -> Optional[str]:
+    """Find the canonical implementer PR even when YAML lost its URL."""
+    branch = f"feat/agents-{slug}"
+    proc = _run([
+        "gh", "pr", "list",
+        "--repo", f"mctlhq/{service}",
+        "--state", "all",
+        "--head", branch,
+        "--limit", "100",
+        "--json", "number,url,state,mergedAt,headRefName,body",
+    ], check=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        print(f"warn: GitHub PR discovery failed for {service}/{slug}: {detail}")
+        return None
+    try:
+        prs = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        print(f"warn: invalid GitHub PR discovery JSON for {service}/{slug}")
+        return None
+    marker = f"agents-state/{service}/proposals/{slug}/"
+    exact = [
+        pr for pr in prs
+        if pr.get("headRefName") == branch and marker in (pr.get("body") or "")
+    ]
+    exact.sort(
+        key=lambda pr: (
+            pr.get("state") == "OPEN",
+            bool(pr.get("mergedAt")) or pr.get("state") == "MERGED",
+            int(pr.get("number") or 0),
+        ),
+        reverse=True,
+    )
+    return exact[0].get("url") if exact else None
 
 
 def _parse_pr_url(pr_url: str) -> tuple[str, str, int]:
@@ -451,15 +486,14 @@ def find_pr_for_proposal(
 ) -> Optional[PRSnapshot]:
     """Read the linked PR for a proposal.
 
-    Returns None if `.status.yaml` has no `pr:` URL or the PR cannot be
-    fetched. Crucially this does NOT filter to state=open — closed and
-    merged PRs are returned too, so the next tick can flip the proposal
-    to its terminal state (see requirements.md L41-58).
+    If `.status.yaml` has no `pr:` URL, discover it from the deterministic
+    implementer branch. Crucially this does NOT filter to state=open — closed
+    and merged PRs are returned too.
     """
     sd = state_dir or DEFAULT_STATE_DIR
     status_path = sd / service / "proposals" / slug / ".status.yaml"
     data = _load_status(status_path)
-    pr_url = data.get("pr")
+    pr_url = data.get("pr") or _find_pr_url_by_branch(service, slug)
     if not pr_url:
         return None
     owner, repo, number = _parse_pr_url(pr_url)
@@ -1167,23 +1201,14 @@ def process_one(
             error="could not fetch PR snapshot",
         )
 
-    # Dead-letter gate for `in-progress` proposals. Tier 2 owns the
-    # proposal whenever status is `in-progress` AND the PR is OPEN or
-    # MERGED — touching it would race the implementer's own
-    # `update_status_yaml(ref, "implemented", pr=...)` call. Only the
-    # closed-without-merge shape is a true dead-letter (Tier 2 finished
-    # `gh pr create`, status flip dropped, operator then closed the
-    # PR). decide() already returns flip-to-rejected for this case, so
-    # we fall through after the guard.
-    if ref.status == "in-progress" and not pr.closed_unmerged:
-        print(
-            f"info: {ref.service}/{ref.slug}: status=in-progress with "
-            f"pr.state={pr.state} merged={pr.merged}; deferring to Tier 2"
-        )
-        return ShepherdResult(
-            ref=ref,
-            decision="wait",
-            notes="in-progress with non-closed PR; Tier 2 owns",
+    # A durable PR proves Tier 2 finished its expensive work. Heal a dropped
+    # status write and continue on the same tick instead of waiting forever.
+    if ref.status == "in-progress" and not pr.closed_unmerged and not pr.merged:
+        update_status(
+            ref,
+            "implemented",
+            pr=f"https://github.com/{pr.repo}/pull/{pr.number}",
+            failure=None,
         )
 
     codex = read_codex_review(pr)
@@ -1355,49 +1380,220 @@ def process_one(
     )
 
 
+def _update_status_if_changed(
+    ref: ProposalRef,
+    new_status: str,
+    **fields: Any,
+) -> bool:
+    """Avoid noisy GitOps commits when the durable projection is unchanged."""
+    existing = _load_status(ref.status_path)
+    if existing.get("status", "proposed") != new_status:
+        update_status(ref, new_status, **fields)
+        return True
+    for key, value in fields.items():
+        if value is None:
+            if key in existing:
+                update_status(ref, new_status, **fields)
+                return True
+        elif existing.get(key) != value:
+            update_status(ref, new_status, **fields)
+            return True
+    return False
+
+
+def _attempt_is_fresh(ref: ProposalRef) -> bool:
+    attempt = _load_status(ref.status_path).get("attempt") or {}
+    expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    if not expires_at:
+        return False
+    try:
+        expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    return expires > datetime.now(timezone.utc)
+
+
+def _github_projection_for_ref(
+    ref: ProposalRef,
+    *,
+    state: str,
+    head_sha: str,
+    blocking_reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Keep observed_at stable until a material GitHub field changes."""
+    existing = _load_status(ref.status_path).get("github") or {}
+    core: dict[str, Any] = {"state": state, "head_sha": head_sha}
+    if blocking_reason:
+        core["blocking_reason"] = blocking_reason
+    if isinstance(existing, dict):
+        existing_core = {
+            key: value for key, value in existing.items() if key != "observed_at"
+        }
+        if existing_core == core and existing.get("observed_at"):
+            return existing
+    return {**core, "observed_at": _now_iso()}
+
+
 def reconcile_one(
     ref: ProposalRef,
     state_dir: Optional[Path] = None,
 ) -> ShepherdResult:
-    """Terminal-status reconciliation for a SHEPHERD_SKIP_SERVICES repo.
+    """Project authoritative GitHub PR state back into ``.status.yaml``.
 
-    Does NOT read reviews, apply fixes, merge, or call the SDK — its only
-    side effect is the merged/rejected `.status.yaml` flip below.
-
-    These repos are owned by another PR lifecycle (pr-steward), which is
-    responsible for writing `.status.yaml: merged` after it merges. That
-    write-back is best-effort and non-blocking, so it can be dropped (push
-    conflict, crash). This pass repairs the drift: it reads the linked PR and,
-    if it is actually merged/closed, flips the proposal to the matching
-    terminal status. It NEVER reads reviews, applies fixes, or merges — those
-    belong to pr-steward. It is the eventual-consistency safety net, not a
-    second driver, so it only ever performs the two terminal flips that
-    process_one's flip-to-merged / flip-to-rejected branches do.
+    This never reviews, fixes, or merges. It is safe for both shepherd-owned
+    and steward-owned repositories.
     """
+    discovered_url = ref.pr_url or _find_pr_url_by_branch(ref.service, ref.slug)
     pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
     if pr is None:
-        return ShepherdResult(
-            ref=ref, decision="wait", error="could not fetch PR snapshot"
+        # A recorded/discovered URL that cannot be fetched is a transient
+        # GitHub read failure, not proof that the PR disappeared.
+        if discovered_url:
+            return ShepherdResult(
+                ref=ref,
+                decision="wait",
+                error="could not fetch recorded GitHub PR",
+            )
+        try:
+            recovered = run_implementer._preflight_existing_result(ref)
+        except run_implementer.GitHubPreflightError as exc:
+            return ShepherdResult(
+                ref=ref,
+                decision="wait",
+                error=f"GitHub preflight failed closed: {exc}",
+            )
+        if recovered.action == "open" and recovered.pr_url:
+            update_status(
+                ref,
+                "implemented",
+                pr=recovered.pr_url,
+                failure=None,
+            )
+            owner, repo, number = _parse_pr_url(recovered.pr_url)
+            pr = _fetch_pr_snapshot(f"{owner}/{repo}", number)
+            if pr is None:
+                return ShepherdResult(
+                    ref=ref,
+                    decision="wait",
+                    error="opened/adopted PR but could not fetch its snapshot",
+                )
+            discovered_url = recovered.pr_url
+        elif recovered.action == "needs-triage":
+            _update_status_if_changed(
+                ref,
+                "needs-triage",
+                failure={
+                    "code": recovered.reason or "existing-result-invalid",
+                    "stage": "reconcile",
+                    "message": "Existing deterministic result cannot be adopted safely.",
+                },
+                notes=f"reconcile: {recovered.reason or 'existing result invalid'}",
+            )
+            return ShepherdResult(
+                ref,
+                decision="needs-triage",
+                notes=recovered.reason,
+            )
+        elif recovered.action in {"merged", "closed"} and recovered.pr_url:
+            owner, repo, number = _parse_pr_url(recovered.pr_url)
+            pr = _fetch_pr_snapshot(f"{owner}/{repo}", number)
+            discovered_url = recovered.pr_url
+            if pr is None:
+                return ShepherdResult(
+                    ref=ref,
+                    decision="wait",
+                    error="found terminal PR but could not fetch its snapshot",
+                )
+        else:
+            pr = None
+    if pr is None:
+        if ref.status == "accepted":
+            return ShepherdResult(ref=ref, decision="wait")
+        if ref.status == "in-progress" and _attempt_is_fresh(ref):
+            return ShepherdResult(
+                ref=ref,
+                decision="wait",
+                notes="active implementation lease has not expired",
+            )
+        _update_status_if_changed(
+            ref,
+            "needs-triage",
+            failure={
+                "code": "missing-pr",
+                "stage": "reconcile",
+                "message": "No canonical PR exists for the deterministic result branch.",
+            },
+            notes="reconcile: no canonical GitHub PR found",
         )
+        return ShepherdResult(
+            ref=ref, decision="needs-triage", notes="missing canonical PR"
+        )
+    pr_url = discovered_url or f"https://github.com/{pr.repo}/pull/{pr.number}"
+    github_state = "merged" if pr.merged else ("closed" if pr.closed_unmerged else "open")
+    github = _github_projection_for_ref(
+        ref,
+        state=github_state,
+        head_sha=pr.head_sha,
+    )
     if pr.merged:
-        update_status(
+        existing_status = _load_status(ref.status_path)
+        _update_status_if_changed(
             ref,
             "merged",
-            merged_at=_now_iso(),
+            pr=pr_url,
+            github=github,
+            merged_at=existing_status.get("merged_at") or _now_iso(),
             merge_commit=pr.merge_commit,
             review_attempts=None,
+            failure=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
     if pr.closed_unmerged:
-        update_status(
+        _update_status_if_changed(
             ref,
             "rejected",
+            pr=pr_url,
+            github=github,
             notes=pr.close_comment_or_default or "PR was closed without merging.",
             review_attempts=None,
+            failure=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
-    # PR still open — pr-steward owns the active loop; nothing to reconcile.
-    return ShepherdResult(ref=ref, decision="wait")
+    if pr.merge_state_status == "DIRTY":
+        github = _github_projection_for_ref(
+            ref,
+            state="open",
+            head_sha=pr.head_sha,
+            blocking_reason="conflict",
+        )
+        _update_status_if_changed(
+            ref,
+            "needs-triage",
+            pr=pr_url,
+            github=github,
+            failure={
+                "code": "merge-conflict",
+                "stage": "reconcile",
+                "message": "GitHub reports a merge conflict with the base branch.",
+            },
+            notes="reconcile: open PR has a merge conflict",
+        )
+        return ShepherdResult(ref=ref, decision="needs-triage", notes="merge conflict")
+
+    target_status = ref.status
+    if ref.status in {"in-progress", "error", "review-stuck", "needs-triage", "rejected"}:
+        target_status = "implemented"
+    changed = _update_status_if_changed(
+        ref,
+        target_status,
+        pr=pr_url,
+        github=github,
+        failure=None,
+    )
+    return ShepherdResult(
+        ref=ref,
+        decision="repair-open-pr" if changed else "wait",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1451,10 +1647,9 @@ def main() -> None:
     ap.add_argument(
         "--reconcile", action="store_true",
         help=(
-            "Read-only status-repair pass for SHEPHERD_SKIP_SERVICES repos "
-            "(owned by pr-steward): flip implemented/review-fixing/in-progress "
-            "to merged/rejected based on the live PR state. Never reads "
-            "reviews, applies fixes, or merges. No SDK calls."
+            "GitHub-first status projection for every service: discover lost "
+            "PR links and repair open/merged/closed/expired states. Never "
+            "reads reviews, applies fixes, merges, or calls the SDK."
         ),
     )
     args = ap.parse_args()
@@ -1465,15 +1660,6 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-
-    # Reconcile only covers skip-listed repos, so a --service that is valid but
-    # NOT skip-listed would silently match nothing. Warn rather than look broken.
-    if args.reconcile and args.service and args.service not in SHEPHERD_SKIP_SERVICES:
-        print(
-            f"warn: --reconcile --service {args.service}: not in "
-            "SHEPHERD_SKIP_SERVICES, so nothing will match (reconcile only "
-            "covers repos owned by another PR lifecycle)."
-        )
 
     # Resolve effective budget.
     budget = args.budget if args.budget is not None else SHEPHERD_BUDGET_USD
@@ -1496,14 +1682,14 @@ def main() -> None:
 
     if not refs:
         if args.reconcile:
-            print("info: no proposals to reconcile in SHEPHERD_SKIP_SERVICES repos.")
+            print("info: no non-terminal proposals to reconcile.")
         else:
             print("info: no implemented/review-fixing proposals with a PR found.")
         return
 
     # Reconcile mode: read-only terminal-status repair, no budget, no SDK.
     if args.reconcile:
-        print(f"Reconcile pass: {len(refs)} proposal(s) in skip-listed repos:")
+        print(f"Reconcile pass: {len(refs)} proposal(s):")
         for r in refs:
             print(f"  - {r.service}/{r.slug} [{r.status}]")
         results = []
