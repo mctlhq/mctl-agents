@@ -1336,8 +1336,24 @@ def _implement_refs(
     results: list[ImplementResult] = []
     handled = 0
     for ref in refs:
-        print(f"\n=== Implementing {ref.service}/{ref.slug} ===")
-        result = implement_one(ref, dry_run=dry_run)
+        label = f"{ref.service}/{ref.slug}"
+        print(f"\n=== [{label}] Implementing ===")
+        outcome = "aborted"
+        try:
+            result = implement_one(ref, dry_run=dry_run)
+            if result.error:
+                outcome = "failed"
+            elif result.skipped_reason:
+                outcome = "skipped"
+            elif result.pr_url:
+                outcome = "ready"
+            else:
+                outcome = "failed"
+        finally:
+            # Workflow-global failures (for example SDK auth) deliberately
+            # propagate out of ``implement_one``. Still close the attributable
+            # progress span so operators can see which proposal aborted.
+            print(f"=== [{label}] Finished: {outcome} ===")
         results.append(result)
         if result.counts_toward_limit:
             handled += 1
@@ -1352,10 +1368,10 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     for result in results:
         if result.error:
             failed += 1
-        elif result.pr_url:
-            succeeded += 1
         elif result.skipped_reason:
             skipped += 1
+        elif result.pr_url:
+            succeeded += 1
         else:
             failed += 1
     return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped)
@@ -1484,10 +1500,10 @@ def main() -> None:
     for r in results:
         if r.error:
             print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
-        elif r.pr_url:
-            print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
         elif r.skipped_reason:
             print(f"  · {r.ref.service}/{r.ref.slug} skipped: {r.skipped_reason}")
+        elif r.pr_url:
+            print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
         else:
             print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
     outcome = _batch_outcome(results)
