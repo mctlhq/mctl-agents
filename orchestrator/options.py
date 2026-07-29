@@ -45,6 +45,12 @@ IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 IMPLEMENTER_TIMEOUT_SECONDS = float(
     os.getenv("IMPLEMENTER_TIMEOUT_SECONDS", "900")
 )
+# Bound every synchronous git/gh command as well.  The model-stream timeout
+# above cannot interrupt a clone, fetch, or push that has stalled before or
+# after the SDK call.
+IMPLEMENTER_COMMAND_TIMEOUT_SECONDS = float(
+    os.getenv("IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", "300")
+)
 # Tier 3 shepherd budget — soft cap per shepherd tick.
 # Covers the shepherd's own spend only: the sub-agent classification call
 # that turns codex findings into the bundle, plus the small amount of

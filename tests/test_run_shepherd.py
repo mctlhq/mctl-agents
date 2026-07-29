@@ -1291,7 +1291,7 @@ def test_apply_followup_raises_deterministic_on_no_commits(monkeypatch) -> None:
     findings will reproduce the same outcome, so the shepherd MUST count
     this as a real address-review attempt and eventually flip the proposal
     to ``review-stuck`` once the cap is hit. Same reasoning for code 43
-    (PR branch missing on origin).
+    (PR branch missing on origin) and code 44 (bounded operation timed out).
     """
     findings = [make_finding()]
 
@@ -1301,6 +1301,7 @@ def test_apply_followup_raises_deterministic_on_no_commits(monkeypatch) -> None:
     for code in (
         run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
         run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+        run_implementer.EXIT_OPERATION_TIMEOUT,
     ):
         class _Result:
             returncode = code
