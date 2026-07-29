@@ -1204,11 +1204,17 @@ def process_one(
     # A durable PR proves Tier 2 finished its expensive work. Heal a dropped
     # status write and continue on the same tick instead of waiting forever.
     if ref.status == "in-progress" and not pr.closed_unmerged and not pr.merged:
+        attempt = _load_status(ref.status_path).get("attempt")
+        if isinstance(attempt, dict):
+            attempt = dict(attempt)
+            attempt.setdefault("finished_at", _now_iso())
         update_status(
             ref,
             "implemented",
             pr=f"https://github.com/{pr.repo}/pull/{pr.number}",
             failure=None,
+            notes=None,
+            attempt=attempt,
         )
 
     codex = read_codex_review(pr)
@@ -1418,6 +1424,15 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
     return expires > datetime.now(timezone.utc)
 
 
+def _finished_attempt(ref: ProposalRef) -> Optional[dict[str, Any]]:
+    attempt = _load_status(ref.status_path).get("attempt")
+    if not isinstance(attempt, dict):
+        return None
+    finished = dict(attempt)
+    finished.setdefault("finished_at", _now_iso())
+    return finished
+
+
 def _github_projection_for_ref(
     ref: ProposalRef,
     *,
@@ -1478,6 +1493,8 @@ def reconcile_one(
                 dry_run=dry_run,
                 pr=recovered.pr_url,
                 failure=None,
+                notes=None,
+                attempt=_finished_attempt(ref),
             )
             owner, repo, number = _parse_pr_url(recovered.pr_url)
             pr = _fetch_pr_snapshot(f"{owner}/{repo}", number)
@@ -1604,13 +1621,19 @@ def reconcile_one(
     target_status = ref.status
     if ref.status in {"in-progress", "error", "review-stuck", "needs-triage", "rejected"}:
         target_status = "implemented"
+    repair_fields: dict[str, Any] = {
+        "pr": pr_url,
+        "github": github,
+        "failure": None,
+    }
+    if target_status == "implemented" and ref.status != "implemented":
+        repair_fields["notes"] = None
+        repair_fields["attempt"] = _finished_attempt(ref)
     changed = _update_status_if_changed(
         ref,
         target_status,
         dry_run=dry_run,
-        pr=pr_url,
-        github=github,
-        failure=None,
+        **repair_fields,
     )
     return ShepherdResult(
         ref=ref,

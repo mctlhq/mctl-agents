@@ -5,6 +5,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 from orchestrator import run_implementer
@@ -89,6 +90,7 @@ def test_implement_one_never_calls_model_when_pr_exists(
     status = read_status(ref)
     assert status["status"] == "implemented"
     assert status["pr"].endswith("/pull/71")
+    assert "notes" not in status
 
 
 def test_github_failure_is_fail_closed(monkeypatch, tmp_path: Path) -> None:
@@ -100,6 +102,25 @@ def test_github_failure_is_fail_closed(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(run_implementer, "_preflight_existing_result", fail)
     result = run_implementer.implement_one(ref)
     assert "failed closed" in (result.error or "")
+    assert read_status(ref)["status"] == "accepted"
+
+
+def test_sdk_auth_failure_aborts_without_quarantining(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ref = make_ref(tmp_path)
+    monkeypatch.setattr(
+        run_implementer,
+        "_preflight_existing_result",
+        lambda _ref: run_implementer.ExistingResult(action="none"),
+    )
+    monkeypatch.setattr(
+        run_implementer,
+        "ensure_auth_for_sdk",
+        lambda: (_ for _ in ()).throw(SystemExit("expired token")),
+    )
+    with pytest.raises(SystemExit, match="SDK authentication failed"):
+        run_implementer.implement_one(ref)
     assert read_status(ref)["status"] == "accepted"
 
 

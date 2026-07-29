@@ -1051,6 +1051,8 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             pr=existing.pr_url,
             github=_github_projection(existing),
             failure=None,
+            notes=None,
+            attempt=None,
         )
         return ImplementResult(ref=ref, pr_url=existing.pr_url)
     if existing.action == "merged":
@@ -1061,6 +1063,8 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             github=_github_projection(existing),
             merged_at=_now_iso(),
             failure=None,
+            notes=None,
+            attempt=None,
         )
         return ImplementResult(ref=ref, pr_url=existing.pr_url)
     if existing.action == "closed":
@@ -1094,14 +1098,10 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     try:
         ensure_auth_for_sdk()
     except (Exception, SystemExit) as exc:
-        message = f"{type(exc).__name__}: {exc}"
-        _mark_needs_triage(
-            ref,
-            code="sdk-auth-failed",
-            stage="auth",
-            message=message,
-        )
-        return ImplementResult(ref=ref, pr_url=None, error=message)
+        # Auth is workflow-global, not proposal-specific. Leave the proposal
+        # accepted and abort the run so later ticks keep selecting this same
+        # item instead of draining the entire queue into needs-triage.
+        raise SystemExit(f"SDK authentication failed: {exc}") from exc
 
     started = datetime.now(timezone.utc)
     attempt = {
@@ -1186,6 +1186,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             pr=pr_url,
             attempt=completed_attempt,
             failure=None,
+            notes=None,
         )
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result

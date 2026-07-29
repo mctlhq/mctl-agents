@@ -1433,6 +1433,16 @@ def test_discover_refs_skips_in_progress_with_no_pr(tmp_path) -> None:
 def test_process_one_in_progress_with_open_pr_repairs(tmp_path) -> None:
     """OPEN PR proves Tier 2 finished, so the dropped YAML write is healed."""
     ref = make_ref(tmp_path, status="in-progress")
+    status = read_status(ref)
+    status["attempt"] = {
+        "id": "attempt-1",
+        "started_at": "2026-04-29T09:00:00Z",
+        "expires_at": "2026-04-29T11:10:00Z",
+    }
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False),
+        encoding="utf-8",
+    )
     pr = make_pr()  # default: state="OPEN", merged=False, closed_unmerged=False
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
@@ -1443,7 +1453,9 @@ def test_process_one_in_progress_with_open_pr_repairs(tmp_path) -> None:
         result = process_one(ref, skip_subprocess=True)
 
     assert result.decision == "wait"
-    assert read_status(ref)["status"] == "implemented"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert final["attempt"]["finished_at"]
 
 
 def test_process_one_in_progress_with_merged_pr_repairs(tmp_path) -> None:
