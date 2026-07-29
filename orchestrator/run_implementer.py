@@ -1278,17 +1278,23 @@ def _implement_refs(
     for ref in refs:
         label = f"{ref.service}/{ref.slug}"
         print(f"\n=== [{label}] Implementing ===")
-        result = implement_one(ref, dry_run=dry_run)
+        outcome = "aborted"
+        try:
+            result = implement_one(ref, dry_run=dry_run)
+            if result.error:
+                outcome = "failed"
+            elif result.skipped_reason:
+                outcome = "skipped"
+            elif result.pr_url:
+                outcome = "ready"
+            else:
+                outcome = "failed"
+        finally:
+            # Workflow-global failures (for example SDK auth) deliberately
+            # propagate out of ``implement_one``. Still close the attributable
+            # progress span so operators can see which proposal aborted.
+            print(f"=== [{label}] Finished: {outcome} ===")
         results.append(result)
-        if result.error:
-            outcome = "failed"
-        elif result.skipped_reason:
-            outcome = "skipped"
-        elif result.pr_url:
-            outcome = "ready"
-        else:
-            outcome = "failed"
-        print(f"=== [{label}] Finished: {outcome} ===")
         if result.counts_toward_limit:
             handled += 1
         if max_proposals and handled >= max_proposals:

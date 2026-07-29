@@ -1,6 +1,8 @@
 """Attributable progress-log tests for implementer runs."""
 from pathlib import Path
 
+import pytest
+
 from orchestrator import run_implementer
 
 
@@ -47,3 +49,26 @@ def test_progress_markers_identify_each_proposal(monkeypatch, capsys) -> None:
     assert "[mctl-agents/second] Finished: failed" in output
     assert "[mctl-agents/closed] Implementing" in output
     assert "[mctl-agents/closed] Finished: skipped" in output
+
+
+def test_progress_marker_closes_when_implementation_aborts(
+    monkeypatch,
+    capsys,
+) -> None:
+    ref = _ref("auth-failure")
+
+    def abort_implementation(_ref, dry_run=False):
+        raise SystemExit("SDK authentication failed")
+
+    monkeypatch.setattr(
+        run_implementer,
+        "implement_one",
+        abort_implementation,
+    )
+
+    with pytest.raises(SystemExit, match="SDK authentication failed"):
+        run_implementer._implement_refs([ref], max_proposals=1, dry_run=False)
+
+    output = capsys.readouterr().out
+    assert "[mctl-agents/auth-failure] Implementing" in output
+    assert "[mctl-agents/auth-failure] Finished: aborted" in output
