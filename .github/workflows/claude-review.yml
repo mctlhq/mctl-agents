@@ -83,6 +83,14 @@ jobs:
         continue-on-error: true
         uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
         with:
+          # release-please opens its release PR through GITHUB_TOKEN, so the
+          # workflow actor is a Bot and the action refuses to run ("Workflow
+          # initiated by non-human actor"), making the review-required check
+          # structurally unpassable for every release PR. Matching normalizes
+          # both sides (lowercase, trailing "[bot]" stripped), so the bare name
+          # covers the `github-actions[bot]` actor. Deliberately NOT "*": that
+          # would let any bot-triggered workflow invoke the reviewer.
+          allowed_bots: "github-actions"
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: true
           prompt: |
@@ -158,6 +166,9 @@ jobs:
         if: steps.review-check.outputs.failed == 'true' && steps.token-check.outputs.has_fallback == 'true'
         uses: anthropics/claude-code-action@51ea8ea73a139f2a74ff649e3092c25a904aed7e # v1
         with:
+          # Must match the step above: the bot-actor check runs before the token
+          # is ever used, so without this the fallback fails identically.
+          allowed_bots: "github-actions"
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
           track_progress: true
           prompt: |
