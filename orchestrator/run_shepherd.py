@@ -58,6 +58,7 @@ from claude_agent_sdk import query
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator import run_implementer
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.github_token import refresh_github_token
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
 
@@ -409,6 +410,7 @@ def _discover_refs(
 # ---------------------------------------------------------------------------
 def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
     """Thin wrapper over subprocess.run with consistent logging."""
+    refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
 
@@ -1160,6 +1162,11 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
         "--match-head-commit", pr.head_sha,
         pr_ref,
     ]
+    # Bypasses _run() (this is the one gh call this module makes outside
+    # that wrapper), so it needs its own refresh: merge_pr() typically fires
+    # after a review/fix cycle long enough to have crossed the token's
+    # ~60min TTL — the exact case refresh_github_token() exists to cover.
+    refresh_github_token()
     print(f"$ {' '.join(cmd)}")
     proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
     if proc.returncode != 0:
