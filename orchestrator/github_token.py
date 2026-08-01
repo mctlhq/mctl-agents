@@ -35,7 +35,13 @@ def refresh_github_token() -> None:
         return
     try:
         token = Path(path).read_text().strip()
-    except OSError as e:
+    except (OSError, ValueError) as e:
+        # ValueError covers UnicodeDecodeError: a Secret volume update isn't
+        # atomic from the reader's side, so a read landing mid-rotation can
+        # observe a truncated write with invalid UTF-8 tail bytes. That must
+        # degrade the same as a missing file, not crash — an uncaught
+        # exception here would propagate out of _run() and abort every
+        # subsequent gh/git call for the rest of the process.
         print(f"refresh_github_token: could not read {path}: {e}; keeping previous token")
         return
     if token:

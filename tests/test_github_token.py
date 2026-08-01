@@ -34,3 +34,15 @@ def test_keeps_previous_token_when_file_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("GITHUB_TOKEN", "still-here")
     refresh_github_token()
     assert __import__("os").environ["GITHUB_TOKEN"] == "still-here"
+
+
+def test_keeps_previous_token_on_mid_rotation_truncated_read(tmp_path, monkeypatch):
+    """A Secret volume update isn't atomic from the reader's side — a read
+    landing mid-write can see truncated bytes with an invalid UTF-8 tail.
+    Must degrade like a missing file, not raise UnicodeDecodeError."""
+    token_file = tmp_path / "github-token"
+    token_file.write_bytes(b"ghs_partialtoken\xff\xfe")
+    monkeypatch.setenv("GITHUB_TOKEN_FILE", str(token_file))
+    monkeypatch.setenv("GITHUB_TOKEN", "still-here")
+    refresh_github_token()
+    assert __import__("os").environ["GITHUB_TOKEN"] == "still-here"
