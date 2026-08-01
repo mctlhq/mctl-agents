@@ -1162,6 +1162,11 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
         "--match-head-commit", pr.head_sha,
         pr_ref,
     ]
+    # Bypasses _run() (this is the one gh call this module makes outside
+    # that wrapper), so it needs its own refresh: merge_pr() typically fires
+    # after a review/fix cycle long enough to have crossed the token's
+    # ~60min TTL — the exact case refresh_github_token() exists to cover.
+    refresh_github_token()
     print(f"$ {' '.join(cmd)}")
     proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
     if proc.returncode != 0:
