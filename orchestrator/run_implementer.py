@@ -82,6 +82,7 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.github_token import refresh_github_token
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
     IMPLEMENTER_TIMEOUT_SECONDS,
@@ -312,6 +313,7 @@ def _run(
     effective_timeout = (
         IMPLEMENTER_COMMAND_TIMEOUT_SECONDS if timeout is None else timeout
     )
+    refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
     try:
         return subprocess.run(

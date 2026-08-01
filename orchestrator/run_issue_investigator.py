@@ -58,6 +58,7 @@ from claude_agent_sdk import ResultMessage, query
 
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.github_token import refresh_github_token
 from orchestrator.options import build_issue_investigator_options
 
 
@@ -107,6 +108,7 @@ def _now_iso() -> str:
 
 def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
     """Thin wrapper over subprocess.run with consistent logging."""
+    refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
     return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
 
