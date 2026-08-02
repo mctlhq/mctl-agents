@@ -53,17 +53,20 @@ cp .env.example .env
 # отредактируй .env: положи либо CLAUDE_CODE_OAUTH_TOKEN, либо ANTHROPIC_API_KEY,
 # плюс MCTL_TOKEN для доступа к https://api.mctl.ai/mcp
 
+# `uv sync` creates .venv but doesn't put it on PATH — `uv run` (or
+# `source .venv/bin/activate`) is what actually uses the locked interpreter.
+
 # один агент
-python -m orchestrator.run_service_agent mctl-web
+uv run python -m orchestrator.run_service_agent mctl-web
 
 # ментор
-python -m orchestrator.run_mentor
+uv run python -m orchestrator.run_mentor
 
 # всё целиком
-python -m orchestrator.run_all
+uv run python -m orchestrator.run_all
 
 # issue-driven: превратить GitHub issue в proposal
-python -m orchestrator.run_issue_investigator \
+uv run python -m orchestrator.run_issue_investigator \
     --issue-url https://github.com/mctlhq/mctl-telegram/issues/123
 ```
 

@@ -5,6 +5,9 @@ Thank you for your interest in contributing to mctl-agents! This guide will help
 ## Prerequisites
 
 - **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — the
+  version pinned in CI and the Dockerfile is `0.11.11`; any recent uv works
+  for local development.
 - **Docker** (for container builds)
 
 ## Local Development

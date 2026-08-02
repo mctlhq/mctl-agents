@@ -37,11 +37,13 @@ COPY --from=ghcr.io/astral-sh/uv@sha256:798712e57f879c5393777cbda2bb309b29fcdeb0
 # ^ ghcr.io/astral-sh/uv:0.11.11
 
 COPY pyproject.toml uv.lock ./
-# --frozen: fail loudly if the lockfile is stale rather than silently
-#   re-resolving, which would defeat the point of committing it.
+# --locked, not --frozen: --frozen only fails if uv.lock is missing entirely
+#   and otherwise installs whatever it already pins, even if pyproject.toml
+#   has since moved — it would build a stale tree in silence. --locked
+#   rejects that mismatch, which is the actual point of committing the lock.
 # --no-dev: `dev` is a default group in uv, so without this the production
 #   image ships pytest (and later ruff and mypy).
-RUN uv sync --frozen --no-dev --no-cache
+RUN uv sync --locked --no-dev --no-cache
 
 # Put the locked environment on PATH rather than invoking `uv run`, which
 # re-checks the environment on each call and can pull the dev group back in.

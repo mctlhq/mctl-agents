@@ -60,12 +60,16 @@ jobs:
 
       - name: Install dependencies
         # No --no-dev here, unlike the Dockerfile: CI wants the dev group,
-        # which is where pytest lives. --frozen fails if the lockfile is stale
-        # rather than silently re-resolving.
-        run: uv sync --frozen
+        # which is where pytest lives. --locked (not --frozen) is what
+        # actually rejects a stale lockfile: --frozen only fails if uv.lock is
+        # missing entirely, and otherwise installs whatever it already pins
+        # even if pyproject.toml has since moved — verified empirically by
+        # bumping a version bound without re-locking and confirming --frozen
+        # exits 0 on the stale lock while --locked exits 1.
+        run: uv sync --locked
 
       - name: Run tests
-        run: uv run --frozen pytest -q
+        run: uv run --locked pytest -q
 
   docker-build:
     name: docker build (smoke)
