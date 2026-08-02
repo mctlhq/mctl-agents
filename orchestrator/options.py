@@ -136,8 +136,11 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
         add_dirs=_sibling_add_dirs(service_dir.name),
-        # Extend (NOT replace) parent env — child needs PATH/HOME/etc. for
-        # npm-installed `claude` CLI and the Claude credentials lookup.
+        # Extend (NOT replace) parent env — child needs HOME for the Claude
+        # credentials lookup, and PATH for `git`/`gh`/`node`/`npm`, which the
+        # Bash tool shells out to. The Claude Code CLI itself doesn't need
+        # PATH: claude-agent-sdk bundles its own binary and prefers it over
+        # anything on PATH (see Dockerfile).
         env={**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH},
     )
 
