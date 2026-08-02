@@ -1,10 +1,13 @@
 """Wall-clock timeout tests for the Tier 2 implementer."""
 from __future__ import annotations
 
+import types
+
 import anyio
 import pytest
 
 from orchestrator import run_implementer
+from tests.conftest import fake_mcp_client_factory
 
 
 class _FakeClient:
@@ -51,7 +54,7 @@ def test_implementer_agent_times_out(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(
         run_implementer.ImplementerOperationTimeout,
-        match=r"model stream exceeded 0\.05s",
+        match=r"operation exceeded 0\.05s",
     ):
         anyio.run(
             run_implementer._run_implementer_agent,
@@ -71,6 +74,50 @@ def test_implementer_agent_completes_before_timeout(tmp_path, monkeypatch) -> No
         "prompt",
         tmp_path,
     )
+
+
+# ---------------------------------------------------------------------------
+# mctl MCP connectivity guard, wiring level
+#
+# Regression coverage for a Claude-review finding on PR #84: the tests above
+# all run with MCTL_TOKEN unset (mcp_servers={}), so ensure_mctl_connected()
+# is never actually invoked here — only in isolation via test_mcp_guard.py.
+# These stub build_implementer_agent_options() to force mcp_servers
+# non-empty, matching tests/test_run_incident_responder.py's pattern.
+# ---------------------------------------------------------------------------
+def _stub_build_options(monkeypatch, *, mcp_servers):
+    monkeypatch.setattr(
+        run_implementer, "build_implementer_agent_options",
+        lambda *args, **kwargs: types.SimpleNamespace(mcp_servers=mcp_servers),
+    )
+
+
+def test_implementer_agent_connected_mcp_dispatches_without_warning(tmp_path, monkeypatch, capsys):
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        run_implementer, "ClaudeSDKClient",
+        fake_mcp_client_factory(
+            statuses=[{"mcpServers": [{"name": "mctl", "status": "connected"}]}],
+            messages=["done"],
+        ),
+    )
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+    assert "⚠️" not in capsys.readouterr().err
+
+
+def test_implementer_agent_failed_mcp_warns_but_still_dispatches(tmp_path, monkeypatch, capsys):
+    """fatal=False: a broken mctl connection must not stop the implementer
+    from applying an already-written proposal via Read/Write/Edit/Bash."""
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        run_implementer, "ClaudeSDKClient",
+        fake_mcp_client_factory(
+            statuses=[{"mcpServers": [{"name": "mctl", "status": "failed", "error": "boom"}]}],
+            messages=["done"],
+        ),
+    )
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)  # must not raise
+    assert "boom" in capsys.readouterr().err
 
 
 def test_shell_command_times_out(monkeypatch) -> None:

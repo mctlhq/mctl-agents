@@ -578,7 +578,8 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                     print(message)
     except TimeoutError as exc:
         raise ImplementerOperationTimeout(
-            f"model stream exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s"
+            f"operation exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s "
+            f"(model stream, client construction, or mctl connectivity check)"
         ) from exc
 
 
