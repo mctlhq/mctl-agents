@@ -21,9 +21,14 @@ import os
 import anyio
 from pathlib import Path
 
+from claude_agent_sdk import ClaudeSDKClient
+
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.options import INCIDENT_RESPONDER_BUDGET_USD, build_incident_responder_options
+from orchestrator.options import (
+    INCIDENT_RESPONDER_BUDGET_USD,
+    build_incident_responder_options,
+)
 
 
 DEFAULT_STATE_DIR = Path(
@@ -34,6 +39,70 @@ DEFAULT_STATE_DIR = Path(
 )
 MIN_AGE_MINUTES = int(os.getenv("MIN_AGE_MINUTES", "30"))
 RESPONDER_MODEL = os.getenv("INCIDENT_RESPONDER_MODEL", SERVICE_AGENT_MODEL)
+
+# alwaysLoad's own blocking guarantee is tied to first-turn dispatch, not to
+# ClaudeSDKClient construction — a single status read immediately after
+# __aenter__ can observe a legitimately still-connecting ("pending") server
+# and misreport it as failed. Poll instead, bounded so a genuinely dead
+# server still fails loud within a reasonable window.
+MCP_CONNECT_POLL_TIMEOUT_S = 5.0
+MCP_CONNECT_POLL_INTERVAL_S = 0.5
+_MCP_TERMINAL_FAILURE_STATUSES = frozenset({"failed", "needs-auth", "disabled"})
+
+
+class McpNotConnectedError(RuntimeError):
+    """mctl MCP was configured (MCTL_TOKEN present) but never reached
+    'connected' status before the prompt was dispatched — the session would
+    otherwise silently run with zero mcp__mctl__* tools and no diagnosis
+    would ever happen, indistinguishable at the Argo level from a real
+    "nothing to do" run. Distinct from the generic Exception branch in
+    run_all.py's _safe_run_incident_responder() so this specific condition
+    is not swallowed the way transient SDK/budget errors are.
+    """
+
+
+async def _wait_for_mctl_connected(client: ClaudeSDKClient) -> None:
+    """Poll get_mcp_status() until the mctl server is connected or reaches a
+    terminal non-connected state. Raises McpNotConnectedError on a terminal
+    failure, on timeout, or if the status check itself fails (e.g. the SDK
+    control request errors out) — a failure to even verify connectivity
+    means zero real work happened, same as an explicit non-connected
+    status, and must not be swallowed as a generic/transient error either.
+    """
+    deadline = anyio.current_time() + MCP_CONNECT_POLL_TIMEOUT_S
+    while True:
+        # Response *parsing* (dict indexing below), not just the await
+        # itself, must stay inside this try: a malformed/unexpected
+        # response (missing mcpServers/name/status keys) would otherwise
+        # raise a raw KeyError that falls through run_all's generic swallow
+        # and recreates the exact false-green bug this function exists to
+        # prevent (caught by Codex on the first version of this fix).
+        try:
+            status = await client.get_mcp_status()
+            mctl_status = next(
+                (s for s in status["mcpServers"] if s["name"] == "mctl"), None
+            )
+            current = mctl_status["status"] if mctl_status else "missing"
+        except Exception as exc:
+            raise McpNotConnectedError(
+                f"failed to verify mctl MCP connection status: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if current == "connected":
+            return
+        if current in _MCP_TERMINAL_FAILURE_STATUSES:
+            raise McpNotConnectedError(
+                f"mctl MCP server status={current} "
+                f"error={mctl_status.get('error') if mctl_status else None!r} "
+                f"— check api.mctl.ai/mcp health and MCTL_TOKEN validity"
+            )
+        if anyio.current_time() >= deadline:
+            raise McpNotConnectedError(
+                f"mctl MCP server still status={current} after "
+                f"{MCP_CONNECT_POLL_TIMEOUT_S}s — check api.mctl.ai/mcp health "
+                f"and MCTL_TOKEN validity"
+            )
+        await anyio.sleep(MCP_CONNECT_POLL_INTERVAL_S)
 
 
 def _build_prompt(state_dir: Path, min_age_minutes: int) -> str:
@@ -113,18 +182,27 @@ async def run_incident_responder(state_dir: Path = DEFAULT_STATE_DIR) -> None:
     if not agent_dir.exists():
         raise SystemExit(f"Incident responder agent dir not found: {agent_dir}")
 
-    from claude_agent_sdk import query
-
     prompt = _build_prompt(state_dir, MIN_AGE_MINUTES)
     options = build_incident_responder_options(
         agent_dir=agent_dir,
         model=RESPONDER_MODEL,
         state_dir=state_dir,
     )
+    # Read off the options the builder already computed rather than calling
+    # mctl_mcp_config() again — it prints a warning when MCTL_TOKEN is unset,
+    # and this would otherwise be the 3rd call per run.
+    mcp_configured = bool(options.mcp_servers)
 
     print(f"\n=== Running incident responder ({RESPONDER_MODEL}, state_dir={state_dir}) ===\n")
-    async for message in query(prompt=prompt, options=options):
-        print(message)
+    async with ClaudeSDKClient(options=options) as client:
+        if mcp_configured:
+            # query() (used everywhere else) has no MCP-status API — this is
+            # why incident-responder specifically needs streaming mode. See
+            # McpNotConnectedError's docstring for why this check exists.
+            await _wait_for_mctl_connected(client)
+        await client.query(prompt)
+        async for message in client.receive_response():
+            print(message)
 
 
 if __name__ == "__main__":
