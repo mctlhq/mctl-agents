@@ -5,6 +5,9 @@ Thank you for your interest in contributing to mctl-agents! This guide will help
 ## Prerequisites
 
 - **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — the
+  version pinned in CI and the Dockerfile is `0.11.11`; any recent uv works
+  for local development.
 - **Docker** (for container builds)
 
 ## Local Development
@@ -12,8 +15,16 @@ Thank you for your interest in contributing to mctl-agents! This guide will help
 Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
+
+This installs exactly what `uv.lock` pins, including the `dev` group (pytest).
+The image builds with `--no-dev` so those tools stay out of production.
+
+Adding or changing a dependency means editing `pyproject.toml` and running
+`uv lock`; commit the updated lockfile alongside it. Do not install into the
+environment ad hoc — an unpinned harness lets an image rebuild silently change
+agent behaviour, which is the whole reason the lockfile is committed.
 
 The orchestrator entry points live in `orchestrator/` (see `README.md` for the
 agent/mentor run flow). Runs require either a Claude OAuth token or an API key —
@@ -22,7 +33,7 @@ see `orchestrator/auth.py`.
 ## Testing
 
 ```bash
-pytest tests/
+uv run pytest tests/
 ```
 
 Please ensure tests pass before submitting a pull request.

@@ -1,0 +1,41 @@
+[project]
+name = "mctl-agents"
+# Placeholder, and deliberately not the real version. release-please runs with
+# release-type "simple", which maintains .release-please-manifest.json and the
+# changelog but does not rewrite version strings in source files. A realistic
+# value here would silently rot one release after it was written; the manifest
+# is the single source of truth.
+version = "0.0.0"
+description = "Agent orchestrator for the mctl platform"
+requires-python = ">=3.12,<3.13"
+
+# Exact pins — the SDK loop IS the harness of this system; an unpinned harness
+# means every image rebuild may silently change agent behavior. Bump
+# deliberately, in an explicit commit (see issue #44).
+#
+# These four are the direct dependencies. Everything they pull in is pinned by
+# uv.lock, which is what actually makes a rebuild reproducible: pinning only
+# this list left ~40 transitive packages (pydantic, mcp, httpx, jsonschema,
+# cryptography, starlette, ...) free to move between builds.
+#
+# Note that the harness includes a Claude Code CLI binary bundled inside the
+# claude-agent-sdk wheel, so the pin below also fixes the CLI version.
+dependencies = [
+    "claude-agent-sdk==0.2.110",
+    "anyio==4.14.1",
+    "python-dotenv==1.2.2",
+    "PyYAML==6.0.3",
+]
+
+[tool.uv]
+# Not an installable package: there is no importable top-level distribution to
+# build, and the image runs `python -m orchestrator.run_all` against the source
+# tree it copies in. Without this, uv tries to build a wheel and fails.
+package = false
+
+[dependency-groups]
+# `dev` is a default group: `uv sync` installs it unless told otherwise, which
+# is why the image runs `uv sync --frozen --no-dev`.
+dev = [
+    "pytest~=9.0",
+]

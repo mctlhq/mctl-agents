@@ -28,8 +28,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# uv, pinned by digest like everything else here: an unpinned installer is the
+# same class of drift the lockfile exists to prevent, and a registry tag can be
+# moved after the fact in a way uv.lock hashes cannot. The digest resolves to a
+# multi-arch index (linux/amd64 + linux/arm64), so this does not tie the build
+# to one architecture. Keep the tag comment in step when bumping.
+COPY --from=ghcr.io/astral-sh/uv@sha256:798712e57f879c5393777cbda2bb309b29fcdeb0532129d4b1c3125c5385975a /uv /usr/local/bin/uv
+# ^ ghcr.io/astral-sh/uv:0.11.11
+
+COPY pyproject.toml uv.lock ./
+# --locked, not --frozen: --frozen only fails if uv.lock is missing entirely
+#   and otherwise installs whatever it already pins, even if pyproject.toml
+#   has since moved — it would build a stale tree in silence. --locked
+#   rejects that mismatch, which is the actual point of committing the lock.
+# --no-dev: `dev` is a default group in uv, so without this the production
+#   image ships pytest (and later ruff and mypy).
+RUN uv sync --locked --no-dev --no-cache
+
+# Put the locked environment on PATH rather than invoking `uv run`, which
+# re-checks the environment on each call and can pull the dev group back in.
+# This also means `python` is the locked interpreter for anything the agents
+# run through their Bash tool.
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Code + per-service CLAUDE.md, .claude/, context/ are baked in.
 # inbox/ proposals/ digest/ live in mctl-gitops/agents-state/ and are linked

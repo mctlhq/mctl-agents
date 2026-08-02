@@ -1,7 +1,0 @@
-# Exact pins — the SDK loop IS the harness of this system; an unpinned
-# harness means every image rebuild may silently change agent behavior.
-# Bump deliberately, in an explicit commit (see issue #44).
-claude-agent-sdk==0.2.110
-anyio==4.14.1
-python-dotenv==1.2.2
-PyYAML==6.0.3
