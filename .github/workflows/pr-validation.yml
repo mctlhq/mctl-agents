@@ -6,6 +6,15 @@ name: PR validation
 # Note that adding the workflow is only half of it: until the `tests` job is
 # a required status check on `main`, a PR can still be merged without it.
 # That is a repository setting, not a file — see the PR description.
+#
+# Before making it required, mind release-please: it opens its release PR with
+# the default GITHUB_TOKEN, and GitHub suppresses workflow triggers for events
+# raised by that token (anti-recursion). Release PRs therefore never run this
+# workflow and can never satisfy a required `tests` check. Today they are
+# merged manually with `gh pr merge --admin`, which bypasses required checks,
+# so releases keep working — but the release commit goes unvalidated. The real
+# fix is to hand release-please-action a GitHub App token so its PRs trigger
+# workflows normally; that belongs in a change to release-please.yml, not here.
 
 on:
   pull_request:
@@ -16,9 +25,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: pr-validation-${{ github.ref }}
-  # Superseded PR pushes are worth cancelling; runs on main are not — each
-  # one is the record for a distinct merged commit.
+  # Pull requests share a group per ref, so a superseded push cancels the run
+  # it replaced. Pushes to main get one group per commit instead.
+  #
+  # The per-commit group matters: GitHub keeps at most one running and one
+  # pending run per group, and a newly queued run evicts the pending one even
+  # when cancel-in-progress is false. With a shared group, three merges
+  # landing in quick succession would silently drop the middle commit's
+  # validation — the opposite of what a per-commit record is for.
+  group: pr-validation-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
