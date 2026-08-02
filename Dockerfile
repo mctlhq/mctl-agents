@@ -1,13 +1,21 @@
 FROM python:3.12-slim
 
-# Pinned harness CLI — the Claude Agent SDK spawns this exact `claude` binary.
-# Bump deliberately, in an explicit commit (see issue #44).
-ARG CLAUDE_CODE_VERSION=2.1.198
-
 WORKDIR /app
 
-# Claude Agent SDK spawns the `claude` CLI subprocess — install it.
-# Using a slim runtime; npm is required for the install.
+# The harness CLI version is pinned by claude-agent-sdk in uv.lock, not here.
+# The SDK bundles its own Claude Code CLI binary (claude_agent_sdk/_bundled/)
+# and prefers it over anything on PATH — see _find_cli() in
+# claude_agent_sdk/_internal/transport/subprocess_cli.py. A separate global
+# `npm install -g @anthropic-ai/claude-code` used to live here; it installed a
+# second CLI that the SDK never actually ran, so the ARG that pinned its
+# version controlled nothing. Bump the harness by bumping claude-agent-sdk in
+# pyproject.toml, deliberately, in an explicit commit (see issue #44).
+#
+# nodejs/npm stay: they are not CLI-install plumbing, they are tools the
+# implementer agent needs directly. 6 of the 11 services in SERVICES
+# (config/settings.py) are Node repositories, and
+# agents/mctl-web/.claude/agents/implementer.md tells the agent to run
+# `npm install --no-save && npm run lint` as its sanity check.
 # `gh` CLI is required by the Tier 2 implementer (orchestrator/run_implementer.py)
 # for `gh repo clone mctlhq/<svc>` + `gh pr create`. Installed from the
 # official cli.github.com Debian repo.
@@ -25,8 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
          > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/* \
-    && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+    && rm -rf /var/lib/apt/lists/*
 
 # uv, pinned by digest like everything else here: an unpinned installer is the
 # same class of drift the lockfile exists to prevent, and a registry tag can be
