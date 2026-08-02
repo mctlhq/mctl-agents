@@ -1,7 +1,6 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import os
 from pathlib import Path
-from typing import Optional
 
 from claude_agent_sdk import ClaudeAgentOptions
 
@@ -127,11 +126,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         cwd=str(service_dir),                  # CLAUDE.md, .claude/, inbox/, proposals/
         setting_sources=["project"],           # pick up .claude/skills and .claude/agents
         model=model,
-        allowed_tools=[
-            "Read", "Write", "Edit", "Glob", "Grep",
-            "WebSearch", "WebFetch",
-            "Bash",
-        ] + _mctl_tool_globs(),
+        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
@@ -145,7 +140,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
     )
 
 
-def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Optional[Path] = None) -> ClaudeAgentOptions:
+def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Path | None = None) -> ClaudeAgentOptions:
     """Options for the Tier 2 implementer agent.
 
     Runs with cwd inside the cloned sibling repo (not agents/<svc>/).
@@ -169,11 +164,7 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Op
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=[
-            "Read", "Write", "Edit", "Glob", "Grep",
-            "WebSearch", "WebFetch",
-            "Bash",
-        ] + _mctl_tool_globs(),
+        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
@@ -188,10 +179,8 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         cwd=str(mentor_dir.parent),            # .../agents — so the mentor sees every agent
         setting_sources=["project"],
         model=model,
-        allowed_tools=[
-            "Read", "Glob", "Grep",
-            "Write", "Edit",                   # writes only into _mentor/digest/
-        ] + _mctl_tool_globs(),
+        # Write/Edit: writes only into _mentor/digest/
+        allowed_tools=["Read", "Glob", "Grep", "Write", "Edit", *_mctl_tool_globs()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
@@ -201,7 +190,7 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
 def build_incident_responder_options(
     agent_dir: Path,
     model: str,
-    state_dir: Optional[Path] = None,
+    state_dir: Path | None = None,
 ) -> ClaudeAgentOptions:
     """Options for the incident responder.
 
@@ -216,9 +205,7 @@ def build_incident_responder_options(
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=[
-            "Read", "Write", "Bash", "Glob",
-        ] + _mctl_tool_globs(),
+        allowed_tools=["Read", "Write", "Bash", "Glob", *_mctl_tool_globs()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
@@ -251,11 +238,7 @@ def build_issue_investigator_options(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=[
-            "Read", "Write", "Edit", "Glob", "Grep",
-            "WebSearch", "WebFetch",
-            "Bash",
-        ] + _mctl_tool_globs(),
+        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,

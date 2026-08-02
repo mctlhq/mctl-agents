@@ -8,7 +8,6 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 from __future__ import annotations
 
 import types
-from pathlib import Path
 
 import anyio
 import pytest
@@ -16,7 +15,11 @@ import yaml
 from claude_agent_sdk import ResultMessage
 
 from orchestrator import run_issue_investigator
-from tests.conftest import fake_mcp_client_factory
+from orchestrator.run_implementer import (
+    ProposalRef,
+    _issue_closing_line,
+    update_status_yaml,
+)
 from orchestrator.run_issue_investigator import (
     IssueData,
     IssueRef,
@@ -29,11 +32,7 @@ from orchestrator.run_issue_investigator import (
     try_parse_issue_url,
     write_status_yaml,
 )
-from orchestrator.run_implementer import (
-    ProposalRef,
-    _issue_closing_line,
-    update_status_yaml,
-)
+from tests.conftest import fake_mcp_client_factory
 
 
 # ---------------------------------------------------------------------------

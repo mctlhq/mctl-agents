@@ -15,7 +15,6 @@ from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_mentor_options
 
-
 # Digest filename: YYYY-WNN.md (ISO 8601 year + week).
 _DIGEST_RE = re.compile(r"^(\d{4})-W(\d{2})\.md$")
 

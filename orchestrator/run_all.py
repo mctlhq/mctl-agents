@@ -15,14 +15,15 @@ Modes:
 import os
 import sys
 import traceback
+
 import anyio
 
 from config.settings import ROTATING_SERVICES, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.run_service_agent import run_service_agent
-from orchestrator.run_mentor import run_mentor
 from orchestrator.mcp_guard import McpNotConnectedError
 from orchestrator.run_incident_responder import run_incident_responder
+from orchestrator.run_mentor import run_mentor
+from orchestrator.run_service_agent import run_service_agent
 
 # Distinct from run_issue_poller.py's RATE_LIMIT_EXIT_CODE=3 — different
 # workflow template, no collision risk; Argo's assert-attempt only checks

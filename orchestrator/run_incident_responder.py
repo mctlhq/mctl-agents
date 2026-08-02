@@ -18,19 +18,17 @@ Usage:
 from __future__ import annotations
 
 import os
-import anyio
 from pathlib import Path
 
+import anyio
 from claude_agent_sdk import ClaudeSDKClient
 
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.mcp_guard import McpNotConnectedError, ensure_mctl_connected
+from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
-    INCIDENT_RESPONDER_BUDGET_USD,
     build_incident_responder_options,
 )
-
 
 DEFAULT_STATE_DIR = Path(
     os.getenv(

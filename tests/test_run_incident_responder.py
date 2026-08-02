@@ -29,8 +29,7 @@ import types
 import anyio
 import pytest
 
-from orchestrator import mcp_guard
-from orchestrator import run_all
+from orchestrator import mcp_guard, run_all
 from orchestrator import run_incident_responder as rir
 from orchestrator.mcp_guard import McpNotConnectedError
 

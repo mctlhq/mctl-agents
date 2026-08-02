@@ -68,9 +68,9 @@ import sys
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import quote
 
 import anyio
@@ -90,7 +90,6 @@ from orchestrator.options import (
     build_implementer_agent_options,
 )
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
-
 
 # ---------------------------------------------------------------------------
 # State directory resolution.
@@ -173,9 +172,9 @@ class ProposalRef:
 @dataclass
 class ImplementResult:
     ref: ProposalRef
-    pr_url: Optional[str]
-    error: Optional[str] = None
-    skipped_reason: Optional[str] = None
+    pr_url: str | None
+    error: str | None = None
+    skipped_reason: str | None = None
     counts_toward_limit: bool = True
 
 
@@ -191,9 +190,9 @@ class ExistingResult:
     """Outcome of the GitHub preflight for one deterministic result branch."""
 
     action: str
-    pr_url: Optional[str] = None
-    head_sha: Optional[str] = None
-    reason: Optional[str] = None
+    pr_url: str | None = None
+    head_sha: str | None = None
+    reason: str | None = None
 
 
 class GitHubPreflightError(RuntimeError):
@@ -242,9 +241,9 @@ def update_status_yaml(
 # ---------------------------------------------------------------------------
 def find_accepted_proposals(
     state_dir: Path,
-    service_filter: Optional[str] = None,
-    slug_filter: Optional[str] = None,
-    statuses: Optional[set[str]] = None,
+    service_filter: str | None = None,
+    slug_filter: str | None = None,
+    statuses: set[str] | None = None,
 ) -> list[ProposalRef]:
     """Glob agents-state and return all proposals with status == accepted.
 
@@ -285,7 +284,7 @@ def find_accepted_proposals(
                 continue
             try:
                 data = _load_status(proposal_dir / ".status.yaml")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — skip one bad status file, keep scanning the rest
                 print(f"⚠️  {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
                 continue
             status = data.get("status", "proposed")
@@ -306,9 +305,9 @@ def find_accepted_proposals(
 # ---------------------------------------------------------------------------
 def _run(
     cmd: list[str],
-    cwd: Optional[Path] = None,
+    cwd: Path | None = None,
     check: bool = True,
-    timeout: Optional[float] = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a bounded subprocess with consistent logging."""
     effective_timeout = (
@@ -345,7 +344,7 @@ def _github_json(cmd: list[str]) -> Any:
 
 def _clone_target(service: str, slug: str) -> Path:
     """gh repo clone the target sibling repo to a fresh tmp dir."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     target = Path(tempfile.gettempdir()) / f"impl-{service}-{slug}-{ts}"
     if target.exists():
         shutil.rmtree(target)
@@ -376,7 +375,7 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
         # sub-agent so Tier 2 still works for those repos.
         generic = AGENTS_DIR / "_generic" / ".claude" / "agents" / "implementer.md"
         if generic.exists():
-            print(f"ℹ️  No per-service implementer for '{service}'; using generic fallback.")
+            print(f"ℹ️  No per-service implementer for '{service}'; using generic fallback.")  # noqa: RUF001
             src = generic
         else:
             raise SystemExit(
@@ -401,7 +400,7 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
             f.write(f"{entry}\n")
 
 
-def _build_prompt(ref: ProposalRef, review_feedback: Optional[dict] = None) -> str:
+def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
     """Prompt that delegates to the `implementer` sub-agent.
 
     The sub-agent is told (in its frontmatter and body) to read the spec
@@ -620,7 +619,7 @@ def review_feedback_one(
         return ImplementResult(ref=ref, pr_url=None, skipped_reason="dry-run")
 
     target = None
-    result: Optional[ImplementResult] = None
+    result: ImplementResult | None = None
     branch = f"feat/agents-{ref.slug}"
     try:
         # 1. Clone the sibling repo. The shepherd's bundle path holds the
@@ -687,7 +686,7 @@ def review_feedback_one(
     except SystemExit as e:
         result = ImplementResult(ref=ref, pr_url=None, error=f"SystemExit: {e}")
         return result
-    except Exception as e:  # pragma: no cover — defensive
+    except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
         return result
     finally:
@@ -736,7 +735,7 @@ _TARGET_REVISION_RE = re.compile(
 )
 
 
-def _diff_line_targets_revision(line: str) -> Optional[str]:
+def _diff_line_targets_revision(line: str) -> str | None:
     """Parse a diff `-`/`+` line that mutates a YAML
     ``targetRevision:`` field, return the version string. Return
     ``None`` for diff lines that look superficially similar but
@@ -796,7 +795,7 @@ def _detect_chart_major_bumps(repo_dir: Path, base: str = "origin/HEAD") -> list
     diff = proc.stdout
 
     bumps: list[tuple[str, str, str]] = []
-    current_file: Optional[str] = None
+    current_file: str | None = None
     # FIFO queue of `-` versions waiting for their matching `+`. A
     # single hunk like `-old1 -old2 +new1 +new2` must pair old1↔new1
     # and old2↔new2; with a scalar pending_old we'd lose old1 on the
@@ -1083,8 +1082,8 @@ def _mark_needs_triage(
     code: str,
     stage: str,
     message: str,
-    pr_url: Optional[str] = None,
-    attempt: Optional[dict[str, Any]] = None,
+    pr_url: str | None = None,
+    attempt: dict[str, Any] | None = None,
 ) -> None:
     fields: dict[str, Any] = {
         "failure": {
@@ -1191,7 +1190,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # item instead of draining the entire queue into needs-triage.
         raise SystemExit(f"SDK authentication failed: {exc}") from exc
 
-    started = datetime.now(timezone.utc)
+    started = datetime.now(UTC)
     attempt = {
         "id": os.getenv("WORKFLOW_UID") or str(uuid.uuid4()),
         "started_at": started.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
@@ -1203,7 +1202,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     update_status_yaml(ref, "in-progress", attempt=attempt, failure=None)
 
     target = None
-    result: Optional[ImplementResult] = None
+    result: ImplementResult | None = None
     try:
         # 2. Clone target sibling repo.
         target = _clone_target(ref.service, ref.slug)
@@ -1317,7 +1316,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
-    except Exception as e:  # pragma: no cover — defensive
+    except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         msg = f"{type(e).__name__}: {e}"
         _mark_needs_triage(
             ref,
@@ -1391,7 +1390,7 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped)
 
 
-def _max_proposals_error(max_proposals: int, dry_run: bool) -> Optional[str]:
+def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
     """Return a policy error for an unsafe executable batch size.
 
     Implementations are deliberately serial and limited to one proposal per
@@ -1497,7 +1496,7 @@ def main() -> None:
         slug_filter=args.slug or None,
     )
     if not refs:
-        print("ℹ️  No accepted proposals found.")
+        print("ℹ️  No accepted proposals found.")  # noqa: RUF001 — emoji, not a homoglyph
         return
 
     print(f"Found {len(refs)} accepted proposal(s):")

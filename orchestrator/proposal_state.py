@@ -6,7 +6,7 @@ writer must therefore preserve fields it does not explicitly change.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,7 @@ UNSET = _Unset()
 def now_iso() -> str:
     """Return an RFC 3339 UTC timestamp without microseconds."""
     return (
-        datetime.now(timezone.utc)
+        datetime.now(UTC)
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z")
