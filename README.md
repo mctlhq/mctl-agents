@@ -1,71 +1,72 @@
 # mctl-agents
 
-Multi-agent система для платформы mctl. Каждый сервис имеет своего агента-владельца, который:
-- читает источники (changelog'и, GitHub releases, CVE, метрики из mctl MCP)
-- складывает находки в `inbox/`
-- оформляет топ-предложения в `proposals/<slug>/{requirements,design,tasks}.md`
+Multi-agent system for the mctl platform. Each service has its own owner
+agent, which:
+- reads sources (changelogs, GitHub releases, CVEs, metrics from the mctl MCP)
+- drops findings into `inbox/`
+- writes up top proposals in `proposals/<slug>/{requirements,design,tasks}.md`
 
-Mentor-агент агрегирует proposals и выдаёт еженедельный дайджест.
+A mentor agent aggregates proposals and produces a weekly digest.
 
-## Структура
+## Structure
 
 ```
 agents/
-├── mctl-web/                  # один агент = один сервис
-│   ├── CLAUDE.md              # роль и границы агента
+├── mctl-web/                  # one agent = one service
+│   ├── CLAUDE.md              # agent role and boundaries
 │   ├── .claude/
-│   │   ├── skills/            # переиспользуемые навыки
+│   │   ├── skills/            # reusable skills
 │   │   └── agents/            # sub-agents (researcher, analyst, spec-writer)
-│   ├── context/               # архитектура, ADR, текущая версия
-│   ├── inbox/                 # сырые находки researcher'а
-│   └── proposals/             # оформленные spec-driven предложения
-├── _mentor/                   # ментор платформы
+│   ├── context/               # architecture, ADRs, current version
+│   ├── inbox/                 # raw researcher findings
+│   └── proposals/             # finalized spec-driven proposals
+├── _mentor/                   # platform mentor
 │   ├── CLAUDE.md
-│   └── digest/                # еженедельные дайджесты
+│   └── digest/                # weekly digests
 config/
 └── settings.py                # SERVICES, mctl MCP URL
 orchestrator/
-├── auth.py                    # OAuth ИЛИ API-ключ
-├── run_service_agent.py       # запуск агента сервиса
-├── run_mentor.py              # запуск ментора
-└── run_all.py                 # параллельный прогон всех + ментор
+├── auth.py                    # OAuth OR API key
+├── run_service_agent.py       # run a service agent
+├── run_mentor.py              # run the mentor
+└── run_all.py                 # run everything in parallel + mentor
 ```
 
-## Auth: два режима
+## Auth: two modes
 
-Код одинаково работает и с OAuth-токеном (твоя Claude Pro/Max подписка),
-и с API-ключом (Console-биллинг). Выбор автоматический:
+The code works the same way with either an OAuth token (your Claude Pro/Max
+subscription) or an API key (Console billing). The choice is automatic:
 
-- если задан `CLAUDE_CODE_OAUTH_TOKEN` — используется он (личное использование, прототип)
-- иначе используется `ANTHROPIC_API_KEY` (production)
+- if `CLAUDE_CODE_OAUTH_TOKEN` is set, it's used (personal use, prototyping)
+- otherwise `ANTHROPIC_API_KEY` is used (production)
 
-Получить OAuth-токен:
+Get an OAuth token:
 ```bash
 npm install -g @anthropic-ai/claude-code
-claude setup-token   # откроет браузер, выдаст sk-ant-oat01-...
+claude setup-token   # opens a browser, gives you sk-ant-oat01-...
 ```
 
-## Запуск
+## Running it
 
 ```bash
 uv sync            # installs from uv.lock, including the dev group (pytest)
 cp .env.example .env
-# отредактируй .env: положи либо CLAUDE_CODE_OAUTH_TOKEN, либо ANTHROPIC_API_KEY,
-# плюс MCTL_TOKEN для доступа к https://api.mctl.ai/mcp
+# edit .env: set either CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY,
+# plus MCTL_TOKEN for access to https://api.mctl.ai/mcp
 
 # `uv sync` creates .venv but doesn't put it on PATH — `uv run` (or
 # `source .venv/bin/activate`) is what actually uses the locked interpreter.
 
-# один агент
+# one agent
 uv run python -m orchestrator.run_service_agent mctl-web
 
-# ментор
+# mentor
 uv run python -m orchestrator.run_mentor
 
-# всё целиком
+# everything, all at once
 uv run python -m orchestrator.run_all
 
-# issue-driven: превратить GitHub issue в proposal
+# issue-driven: turn a GitHub issue into a proposal
 uv run python -m orchestrator.run_issue_investigator \
     --issue-url https://github.com/mctlhq/mctl-telegram/issues/123
 ```
