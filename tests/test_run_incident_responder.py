@@ -151,6 +151,21 @@ def test_raises_when_status_check_itself_errors(monkeypatch):
         anyio.run(rir.run_incident_responder)
 
 
+def test_raises_when_status_response_is_malformed(monkeypatch):
+    """Codex P1 on the first version of this fix: response *parsing* (dict
+    indexing), not just the get_mcp_status() await itself, has to be inside
+    the try/except — a status payload missing 'mcpServers' would otherwise
+    raise a raw KeyError that isn't McpNotConnectedError, falls through
+    run_all's generic swallow, and recreates the false-green bug."""
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        rir, "ClaudeSDKClient",
+        _fake_client_factory(statuses=[{"unexpected_shape": True}]),
+    )
+    with pytest.raises(McpNotConnectedError, match="KeyError"):
+        anyio.run(rir.run_incident_responder)
+
+
 def test_recovers_after_transient_pending_status(monkeypatch):
     """Regression for the race Codex and claude[bot] both flagged: a status
     read immediately after connect can legitimately observe 'pending' on a

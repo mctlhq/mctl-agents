@@ -71,19 +71,23 @@ async def _wait_for_mctl_connected(client: ClaudeSDKClient) -> None:
     """
     deadline = anyio.current_time() + MCP_CONNECT_POLL_TIMEOUT_S
     while True:
+        # Response *parsing* (dict indexing below), not just the await
+        # itself, must stay inside this try: a malformed/unexpected
+        # response (missing mcpServers/name/status keys) would otherwise
+        # raise a raw KeyError that falls through run_all's generic swallow
+        # and recreates the exact false-green bug this function exists to
+        # prevent (caught by Codex on the first version of this fix).
         try:
             status = await client.get_mcp_status()
-        except McpNotConnectedError:
-            raise
+            mctl_status = next(
+                (s for s in status["mcpServers"] if s["name"] == "mctl"), None
+            )
+            current = mctl_status["status"] if mctl_status else "missing"
         except Exception as exc:
             raise McpNotConnectedError(
                 f"failed to verify mctl MCP connection status: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        mctl_status = next(
-            (s for s in status["mcpServers"] if s["name"] == "mctl"), None
-        )
-        current = mctl_status["status"] if mctl_status else "missing"
         if current == "connected":
             return
         if current in _MCP_TERMINAL_FAILURE_STATUSES:
