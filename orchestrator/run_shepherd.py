@@ -411,7 +411,7 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproc
     """Thin wrapper over subprocess.run with consistent logging."""
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)  # noqa: S603 — cmd is list[str]
 
 
 def _gh_api_json(args: list[str]) -> Any:
@@ -1068,7 +1068,7 @@ def apply_followup(
         cmd.extend(["--state-dir", str(state_dir)])
     print(f"$ {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd, check=False, text=True)
+        proc = subprocess.run(cmd, check=False, text=True)  # noqa: S603 — cmd is list[str], built above
     finally:
         try:
             os.unlink(bundle_path)
@@ -1162,7 +1162,7 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     # ~60min TTL — the exact case refresh_github_token() exists to cover.
     refresh_github_token()
     print(f"$ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, check=False, text=True, capture_output=True)
+    proc = subprocess.run(cmd, check=False, text=True, capture_output=True)  # noqa: S603 — cmd is list[str]
     if proc.returncode != 0:
         # HEAD-SHA mismatch is the expected non-zero exit. Anything else
         # (auth, branch protection rejection) is also surfaced as wait —

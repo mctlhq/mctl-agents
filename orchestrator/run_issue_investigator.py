@@ -109,7 +109,7 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproc
     """Thin wrapper over subprocess.run with consistent logging."""
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)
+    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)  # noqa: S603 — cmd is list[str]
 
 
 class IssueURLError(ValueError):

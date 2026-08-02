@@ -316,7 +316,7 @@ def _run(
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
     try:
-        return subprocess.run(
+        return subprocess.run(  # noqa: S603 — cmd is always this wrapper's own list[str] param, never shell=True
             cmd,
             cwd=cwd,
             check=check,
