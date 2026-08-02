@@ -65,3 +65,23 @@ def test_ensure_mctl_connected_fatal_false_timeout_warns(monkeypatch, capsys):
     anyio.run(partial(ensure_mctl_connected, client, fatal=False))  # must not raise
     captured = capsys.readouterr()
     assert "still status=pending" in captured.err
+
+
+class _WedgedClient:
+    """get_mcp_status() that never returns — simulates the SDK control
+    request itself hanging, not just an application-level 'pending' status.
+    Regression for the Codex finding on PR #84: the old manual
+    anyio.current_time() deadline check only fired after this await
+    returned, so a call like this blocked wait_for_mctl_connected() forever.
+    """
+
+    async def get_mcp_status(self):
+        await anyio.sleep_forever()
+
+
+def test_wedged_status_call_still_times_out(monkeypatch):
+    """A get_mcp_status() call that never returns must still be bounded by
+    MCP_CONNECT_POLL_TIMEOUT_S via cancellation, not hang indefinitely."""
+    _shrink_poll_window(monkeypatch)
+    with pytest.raises(McpNotConnectedError):
+        anyio.run(partial(ensure_mctl_connected, _WedgedClient(), fatal=True))

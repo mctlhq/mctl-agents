@@ -53,39 +53,51 @@ async def wait_for_mctl_connected(client: ClaudeSDKClient) -> None:
     control request errors out) — a failure to even verify connectivity
     means the caller cannot trust the tool set either, same as an explicit
     non-connected status.
+
+    The whole loop runs inside one anyio.fail_after scope rather than a
+    manual anyio.current_time() deadline check (Codex finding on PR #84): a
+    plain clock check only fires *after* an await returns, so a wedged SDK
+    control request — get_mcp_status() itself never returning — blocked
+    forever and the "bounded" guarantee never actually applied.
+    anyio.fail_after instead cancels the enclosing scope (including an
+    in-flight await) once the deadline passes, converting to TimeoutError.
     """
-    deadline = anyio.current_time() + MCP_CONNECT_POLL_TIMEOUT_S
-    while True:
-        # Response *parsing* (dict indexing below), not just the await
-        # itself, must stay inside this try: a malformed/unexpected response
-        # (missing mcpServers/name/status keys) would otherwise raise a raw
-        # KeyError instead of McpNotConnectedError.
-        try:
-            status = await client.get_mcp_status()
-            mctl_status = next(
-                (s for s in status["mcpServers"] if s["name"] == "mctl"), None
-            )
-            current = mctl_status["status"] if mctl_status else "missing"
-        except Exception as exc:
-            raise McpNotConnectedError(
-                f"failed to verify mctl MCP connection status: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-        if current == "connected":
-            return
-        if current in _MCP_TERMINAL_FAILURE_STATUSES:
-            raise McpNotConnectedError(
-                f"mctl MCP server status={current} "
-                f"error={mctl_status.get('error') if mctl_status else None!r} "
-                f"— check api.mctl.ai/mcp health and MCTL_TOKEN validity"
-            )
-        if anyio.current_time() >= deadline:
-            raise McpNotConnectedError(
-                f"mctl MCP server still status={current} after "
-                f"{MCP_CONNECT_POLL_TIMEOUT_S}s — check api.mctl.ai/mcp health "
-                f"and MCTL_TOKEN validity"
-            )
-        await anyio.sleep(MCP_CONNECT_POLL_INTERVAL_S)
+    current = "pending"
+    try:
+        with anyio.fail_after(MCP_CONNECT_POLL_TIMEOUT_S):
+            while True:
+                # Response *parsing* (dict indexing below), not just the
+                # await itself, must stay inside this try: a malformed/
+                # unexpected response (missing mcpServers/name/status keys)
+                # would otherwise raise a raw KeyError instead of
+                # McpNotConnectedError.
+                try:
+                    status = await client.get_mcp_status()
+                    mctl_status = next(
+                        (s for s in status["mcpServers"] if s["name"] == "mctl"), None
+                    )
+                    current = mctl_status["status"] if mctl_status else "missing"
+                except Exception as exc:
+                    raise McpNotConnectedError(
+                        f"failed to verify mctl MCP connection status: "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
+                if current == "connected":
+                    return
+                if current in _MCP_TERMINAL_FAILURE_STATUSES:
+                    raise McpNotConnectedError(
+                        f"mctl MCP server status={current} "
+                        f"error={mctl_status.get('error') if mctl_status else None!r} "
+                        f"— check api.mctl.ai/mcp health and MCTL_TOKEN validity"
+                    )
+                await anyio.sleep(MCP_CONNECT_POLL_INTERVAL_S)
+    except TimeoutError as exc:
+        raise McpNotConnectedError(
+            f"mctl MCP server still status={current} after "
+            f"{MCP_CONNECT_POLL_TIMEOUT_S}s (a wedged get_mcp_status() call "
+            f"would also surface here now) — check api.mctl.ai/mcp health "
+            f"and MCTL_TOKEN validity"
+        ) from exc
 
 
 async def ensure_mctl_connected(client: ClaudeSDKClient, *, fatal: bool) -> None:
