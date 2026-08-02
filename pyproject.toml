@@ -77,23 +77,26 @@ select = [
 "orchestrator/run_incident_responder.py" = ["E501"]
 
 # S (bandit): measured before deciding, not assumed. A bare `--select S`
-# reported 432 findings; 418 of them (96.8%) were entirely inside tests/ and
+# reported 432 findings; 424 of them (98.1%) are entirely inside tests/ and
 # confirmed false positives on inspection — S101 (411, plain pytest
 # `assert`, the standard pattern), S105 (5, fake tokens like "seed-token" in
 # monkeypatch fixtures for orchestrator/github_token.py's refresh logic),
-# S108 (2, `Path("/tmp") / slug` building a test fixture's proposal_dir).
+# S108 (2, `Path("/tmp") / slug` building a test fixture's proposal_dir),
+# S603+S607 (6, tests/test_run_implementer_chart_guard.py's
+# subprocess.run(["git", ...], cwd=tmp_path, check=True) calls that spin up
+# a real, throwaway git repo as a test fixture — genuinely executed, not
+# mocked, but every command is a fixed literal with no untrusted input).
 # Ignoring the same three categories mctl-trading-data's ruff.toml already
-# ignores in tests/, for the same "fine in tests" reasoning, plus S108 and
-# S607 (6, mocked command lists used as test input data, never executed).
+# ignores in tests/, for the same "fine in tests" reasoning, plus S108.
 "tests/*" = ["S101", "S105", "S108", "S603", "S607"]
 
-# The remaining production-code S603 findings (5, across these 3 files) are
-# all the same `_run()`-style wrapper: subprocess.run(cmd, ...) where cmd is
-# the wrapper's own list[str] parameter, never shell=True, never a raw
-# shell string. Read every call site before ignoring, not just counted them.
-"orchestrator/run_implementer.py" = ["S603"]
-"orchestrator/run_issue_investigator.py" = ["S603"]
-"orchestrator/run_shepherd.py" = ["S603"]
+# The remaining 8 S603 findings split as: 3 inside tests/ (the git-fixture
+# calls above, covered by the ignore two lines up) and 5 in production code,
+# which are NOT ignored here at all — each of the 5 call sites
+# (run_implementer.py, run_issue_investigator.py, run_shepherd.py x3)
+# carries its own `# noqa: S603` at the call site instead of a per-file
+# ignore, so a subprocess call added to any of these files in the future is
+# still checked rather than silently exempted by file scope.
 
 [tool.mypy]
 python_version = "3.12"
