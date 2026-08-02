@@ -21,9 +21,15 @@ import os
 import anyio
 from pathlib import Path
 
+from claude_agent_sdk import ClaudeSDKClient
+
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.options import INCIDENT_RESPONDER_BUDGET_USD, build_incident_responder_options
+from orchestrator.options import (
+    INCIDENT_RESPONDER_BUDGET_USD,
+    build_incident_responder_options,
+    mctl_mcp_config,
+)
 
 
 DEFAULT_STATE_DIR = Path(
@@ -34,6 +40,17 @@ DEFAULT_STATE_DIR = Path(
 )
 MIN_AGE_MINUTES = int(os.getenv("MIN_AGE_MINUTES", "30"))
 RESPONDER_MODEL = os.getenv("INCIDENT_RESPONDER_MODEL", SERVICE_AGENT_MODEL)
+
+
+class McpNotConnectedError(RuntimeError):
+    """mctl MCP was configured (MCTL_TOKEN present) but never reached
+    'connected' status before the prompt was dispatched — the session would
+    otherwise silently run with zero mcp__mctl__* tools and no diagnosis
+    would ever happen, indistinguishable at the Argo level from a real
+    "nothing to do" run. Distinct from the generic Exception branch in
+    run_all.py's _safe_run_incident_responder() so this specific condition
+    is not swallowed the way transient SDK/budget errors are.
+    """
 
 
 def _build_prompt(state_dir: Path, min_age_minutes: int) -> str:
@@ -113,18 +130,34 @@ async def run_incident_responder(state_dir: Path = DEFAULT_STATE_DIR) -> None:
     if not agent_dir.exists():
         raise SystemExit(f"Incident responder agent dir not found: {agent_dir}")
 
-    from claude_agent_sdk import query
-
     prompt = _build_prompt(state_dir, MIN_AGE_MINUTES)
     options = build_incident_responder_options(
         agent_dir=agent_dir,
         model=RESPONDER_MODEL,
         state_dir=state_dir,
     )
+    mcp_configured = bool(mctl_mcp_config())
 
     print(f"\n=== Running incident responder ({RESPONDER_MODEL}, state_dir={state_dir}) ===\n")
-    async for message in query(prompt=prompt, options=options):
-        print(message)
+    async with ClaudeSDKClient(options=options) as client:
+        if mcp_configured:
+            # query() (used everywhere else) has no MCP-status API — this is
+            # why incident-responder specifically needs streaming mode. See
+            # McpNotConnectedError's docstring for why this check exists.
+            status = await client.get_mcp_status()
+            mctl_status = next(
+                (s for s in status["mcpServers"] if s["name"] == "mctl"), None
+            )
+            if mctl_status is None or mctl_status["status"] != "connected":
+                raise McpNotConnectedError(
+                    f"mctl MCP server status="
+                    f"{mctl_status['status'] if mctl_status else 'missing'} "
+                    f"error={mctl_status.get('error') if mctl_status else None!r} "
+                    f"— check api.mctl.ai/mcp health and MCTL_TOKEN validity"
+                )
+        await client.query(prompt)
+        async for message in client.receive_response():
+            print(message)
 
 
 if __name__ == "__main__":

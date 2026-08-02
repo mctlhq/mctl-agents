@@ -21,7 +21,12 @@ from config.settings import ROTATING_SERVICES, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.run_service_agent import run_service_agent
 from orchestrator.run_mentor import run_mentor
-from orchestrator.run_incident_responder import run_incident_responder
+from orchestrator.run_incident_responder import McpNotConnectedError, run_incident_responder
+
+# Distinct from run_issue_poller.py's RATE_LIMIT_EXIT_CODE=3 — different
+# workflow template, no collision risk; Argo's assert-attempt only checks
+# whether the step status is Succeeded, not the specific exit code.
+MCP_NOT_CONNECTED_EXIT_CODE = 4
 
 
 async def _safe_run_service(service: str) -> None:
@@ -54,7 +59,7 @@ async def _safe_run_service(service: str) -> None:
 
 
 async def _safe_run_incident_responder() -> None:
-    """Run the incident responder and swallow any failure.
+    """Run the incident responder and swallow any *transient* failure.
 
     Unlike the per-service agents in `_full`, this mode has no task group to
     protect it — a raised exception (e.g. error_max_budget_usd, a flaky
@@ -67,10 +72,20 @@ async def _safe_run_incident_responder() -> None:
     The responder is best-effort diagnostics: any proposals it already
     wrote to state_dir before failing are still useful, and a transient
     failure here should not surface as a platform incident. We log + drop,
-    matching _safe_run_service's rationale.
+    matching _safe_run_service's rationale — EXCEPT for
+    McpNotConnectedError, which means zero real work happened and must not
+    be reported as a false green (see that exception's docstring).
     """
     try:
         await run_incident_responder()
+    except McpNotConnectedError as exc:
+        # Not a transient/best-effort failure — the pipeline did zero real
+        # work, so unlike everything else here this must NOT be swallowed.
+        # Exit non-zero so Argo's assert-attempt gate (which only checks
+        # step status) correctly reports failure instead of a false green,
+        # and run-fallback gets a chance to retry on the account-2 token.
+        print(f"❌ incident-responder: {exc}", file=sys.stderr)
+        sys.exit(MCP_NOT_CONNECTED_EXIT_CODE)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — intentional broad catch
         print(
             f"⚠️  incident-responder failed: {type(exc).__name__}: {exc}",

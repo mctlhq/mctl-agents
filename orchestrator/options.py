@@ -24,6 +24,13 @@ def mctl_mcp_config() -> dict:
             "type": "http",
             "url": MCTL_MCP_URL,
             "headers": {"Authorization": f"Bearer {token}"},
+            # Without this, Claude Code connects to the server in the
+            # background and can dispatch the first (often only) turn before
+            # the handshake completes, silently running with zero
+            # mcp__mctl__* tools. alwaysLoad blocks first-turn dispatch
+            # until the server connects. See mctl-telegram#316 for the
+            # equivalent stdio-transport bug this mirrors.
+            "alwaysLoad": True,
         }
     }
 
