@@ -28,8 +28,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# uv, pinned by version like everything else here: an unpinned installer is
+# the same class of drift the lockfile exists to prevent.
+COPY --from=ghcr.io/astral-sh/uv:0.11.11 /uv /usr/local/bin/uv
+
+COPY pyproject.toml uv.lock ./
+# --frozen: fail loudly if the lockfile is stale rather than silently
+#   re-resolving, which would defeat the point of committing it.
+# --no-dev: `dev` is a default group in uv, so without this the production
+#   image ships pytest (and later ruff and mypy).
+RUN uv sync --frozen --no-dev --no-cache
+
+# Put the locked environment on PATH rather than invoking `uv run`, which
+# re-checks the environment on each call and can pull the dev group back in.
+# This also means `python` is the locked interpreter for anything the agents
+# run through their Bash tool.
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Code + per-service CLAUDE.md, .claude/, context/ are baked in.
 # inbox/ proposals/ digest/ live in mctl-gitops/agents-state/ and are linked

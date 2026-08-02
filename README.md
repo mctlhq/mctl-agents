@@ -48,7 +48,7 @@ claude setup-token   # откроет браузер, выдаст sk-ant-oat01-
 ## Запуск
 
 ```bash
-pip install -r requirements.txt
+uv sync            # installs from uv.lock, including the dev group (pytest)
 cp .env.example .env
 # отредактируй .env: положи либо CLAUDE_CODE_OAUTH_TOKEN, либо ANTHROPIC_API_KEY,
 # плюс MCTL_TOKEN для доступа к https://api.mctl.ai/mcp

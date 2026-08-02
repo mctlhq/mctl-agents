@@ -41,8 +41,11 @@ This is meta-territory; be careful.
 - One commit is fine; two or three small commits are fine; a dozen is not.
 - If the proposal is unclear or self-contradicting, STOP without
   committing and explain what's missing in your final message.
-- New Python dependency? Add to `pyproject.toml`. Run
-  `pip install -e .` to verify; do NOT hand-edit `requirements*.txt`.
+- New Python dependency? Add it to `dependencies` in `pyproject.toml`
+  (or to the `dev` group if it is tooling), then run `uv lock` and
+  commit `uv.lock` in the same change. Verify with `uv sync`. Never
+  hand-edit `uv.lock`, and note the project is not installable
+  (`package = false`), so `pip install -e .` does not apply.
 - Never edit `.claude/` in the cwd. The implementer.md you are
   reading right now is staged by the orchestrator at runtime and
   excluded via `.git/info/exclude`; if you want to change THIS file,
