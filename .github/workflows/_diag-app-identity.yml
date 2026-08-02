@@ -1,0 +1,36 @@
+name: diag app-token identity
+
+# Temporary, read-only diagnostic. Manual trigger only. Determines which
+# GitHub App backs the org-wide APP_ID/APP_PRIVATE_KEY secrets referenced by
+# release-please.yml, and whether it has enough scope on this repo to be
+# usable as release-please-action's `token:` input — without touching
+# release-please.yml itself, which has broken releases org-wide twice before
+# (see project memory) and cannot be safely dry-run (its own workflow only
+# fires on `push: branches: [main]`).
+#
+# Only prints installation-id and app-slug, both explicitly documented by
+# actions/create-github-app-token as non-sensitive. Never touches the
+# `token` output. To be deleted once the answer is known, either way.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  identify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate app token scoped to this repo
+        id: app
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: mctlhq
+          repositories: mctl-agents
+
+      - name: Report identity (non-sensitive outputs only)
+        run: |
+          echo "installation-id: ${{ steps.app.outputs.installation-id }}"
+          echo "app-slug: ${{ steps.app.outputs.app-slug }}"
