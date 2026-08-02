@@ -34,9 +34,12 @@ see `orchestrator/auth.py`.
 
 ```bash
 uv run pytest tests/
+uv run ruff check orchestrator config tests
+uv run mypy
 ```
 
-Please ensure tests pass before submitting a pull request.
+Please ensure tests, ruff, and mypy all pass before submitting a pull request
+— `.github/workflows/pr-validation.yml` runs all three on every PR.
 
 ## Pull Request Process
 
@@ -47,7 +50,14 @@ Please ensure tests pass before submitting a pull request.
 ## Code Style
 
 - English for all code, comments, and documentation
-- No emoji in code or commit messages
+- No emoji in code or commit messages, with one narrow, existing exception:
+  single-character status prefixes on CLI/log output — `⚠️` warning,
+  `✓`/`✗` success/failure, `ℹ️` info, `🔑` auth mode, `❌` hard error. This
+  orchestrator runs unattended in cron/Argo Workflows; these prefixes make a
+  log greppable and scannable for outcomes without reading full sentences.
+  Stick to this small, already-established vocabulary — it's not a license
+  for new decorative emoji anywhere else in code, comments, or commit
+  messages.
 
 ## Reporting Issues
 
