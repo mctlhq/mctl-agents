@@ -248,3 +248,5 @@ of `decide()`, the head-SHA anchor on stale findings, the
 3-attempt outer-loop cap, and end-to-end happy + loop paths driving
 `process_one()` against a real `tmp_path` worktree fixture with the
 GitHub API + implementer subprocess mocked at the module boundary.
+
+<!-- scratch: verifying required status checks block merge; reverted -->
