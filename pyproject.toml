@@ -21,7 +21,7 @@ requires-python = ">=3.12,<3.13"
 # Note that the harness includes a Claude Code CLI binary bundled inside the
 # claude-agent-sdk wheel, so the pin below also fixes the CLI version.
 dependencies = [
-    "claude-agent-sdk==0.2.110",
+    "claude-agent-sdk==0.2.128",
     "anyio==4.14.1",
     "python-dotenv==1.2.2",
     "PyYAML==6.0.3",
