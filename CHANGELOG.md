@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.21.0](https://github.com/mctlhq/mctl-agents/compare/1.20.2...1.21.0) (2026-08-02)
+
+
+### Features
+
+* **agents:** e3649b04 ([b5b01c1](https://github.com/mctlhq/mctl-agents/commit/b5b01c1abddd1916e21b29547f9e9c1e313a51d8))
+* **auth:** refresh GITHUB_TOKEN from a mounted file before each gh/git call ([ba6abd4](https://github.com/mctlhq/mctl-agents/commit/ba6abd443addecdcde29659e597d460940a87bab))
+* **auth:** refresh GITHUB_TOKEN from a mounted file before each gh/git call ([7ce7369](https://github.com/mctlhq/mctl-agents/commit/7ce73698ceefb57bdd0389e32f5b43154538dcf7))
+
+
+### Bug Fixes
+
+* address Codex/claude[bot] review findings on PR [#83](https://github.com/mctlhq/mctl-agents/issues/83) ([979b084](https://github.com/mctlhq/mctl-agents/commit/979b084a6fba238ef664ac1d5f7b99b68cc76121))
+* align skipped outcome totals ([9410081](https://github.com/mctlhq/mctl-agents/commit/941008189a3296916bb28b19d5ad897d7db03409))
+* bound implementer model runtime ([2d20b45](https://github.com/mctlhq/mctl-agents/commit/2d20b4575b47dd14ca809a1618c6ec9831d5a196))
+* bound implementer runtime operations ([658c6c7](https://github.com/mctlhq/mctl-agents/commit/658c6c79805bf3684167c0f84639897ae42f3041))
+* catch UnicodeDecodeError when refreshing GITHUB_TOKEN from file ([3a26b71](https://github.com/mctlhq/mctl-agents/commit/3a26b71ea361f45f9de52e4ade74fc34200e33f5))
+* close aborted progress spans ([bd0b07c](https://github.com/mctlhq/mctl-agents/commit/bd0b07cf3eb3e54a3f2d902312cef4c881fe03e4))
+* enforce one-proposal implementer runs ([6116384](https://github.com/mctlhq/mctl-agents/commit/611638454b25b48b9b9754022616e8d188224fd7))
+* enforce quota-safe implementer batching ([32ff931](https://github.com/mctlhq/mctl-agents/commit/32ff9316396095b332b864f87e15a432affa5528))
+* **incident-responder:** stop silent false-green when mctl MCP never connects ([8768c22](https://github.com/mctlhq/mctl-agents/commit/8768c2266753914ebfdc2f6d0feef169e3758a90))
+* **incident-responder:** stop silent false-green when mctl MCP never connects ([394fec7](https://github.com/mctlhq/mctl-agents/commit/394fec78e26ccbb2310a6d3d9da08c338484d78b))
+* label implementer progress logs ([178d2af](https://github.com/mctlhq/mctl-agents/commit/178d2afd2f55d6001d196c1853150078393cb9a8))
+* label implementer progress logs ([4bab8e5](https://github.com/mctlhq/mctl-agents/commit/4bab8e5387fbeb23b16a362445c08d94ba2ae6dc))
+* move status response parsing inside the McpNotConnectedError guard ([10699b1](https://github.com/mctlhq/mctl-agents/commit/10699b1cd8438aa0a5cdcff5775bdfb0f3655de1))
+* prefer explicit skipped outcomes ([d13c46a](https://github.com/mctlhq/mctl-agents/commit/d13c46a615c63e80ef4b0c1d876dfcebd71d41cf))
+* refresh GITHUB_TOKEN before merge_pr()'s direct gh pr merge call ([570c5ee](https://github.com/mctlhq/mctl-agents/commit/570c5ee715772fd4c06c203aeca40829bcdd60a1))
+* report truthful implementer outcomes ([c38c4b9](https://github.com/mctlhq/mctl-agents/commit/c38c4b996d37785e8d737995c6ac12b220c448a8))
+* report truthful implementer outcomes ([ace18b3](https://github.com/mctlhq/mctl-agents/commit/ace18b362a89766564b5d0ddda2faaed58ee30a5))
+* scope batch policy to implementation ([e246f92](https://github.com/mctlhq/mctl-agents/commit/e246f922444e18a4242284a2413996fa157ca4f1))
+
 ## [1.20.2](https://github.com/mctlhq/mctl-agents/compare/1.20.1...1.20.2) (2026-07-29)
 
 
