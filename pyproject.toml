@@ -39,6 +39,8 @@ package = false
 dev = [
     "pytest~=9.0",
     "ruff~=0.14",
+    "mypy~=1.14",
+    "types-pyyaml~=6.0",  # stub package — PyYAML ships no inline types
 ]
 
 [tool.ruff]
@@ -75,3 +77,21 @@ select = [
 # it becomes literal prompt content, so a per-line noqa isn't an option here.
 "orchestrator/run_service_agent.py" = ["E501"]
 "orchestrator/run_incident_responder.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+# Matches what CI/local `mypy` (no args) checks — the same two dirs ruff and
+# pytest cover. `tests/` is deliberately out for now: fixtures and mocks lean
+# hard on duck typing (see tests/conftest.py's FakeMcpClient), so bringing it
+# under the same bar is a separate, bigger pass, not part of onboarding mypy
+# for the first time.
+files = ["orchestrator", "config"]
+
+# Soft mode: this is the first mypy pass over a previously-unchecked 5,800+
+# line codebase. Deliberately NOT enabling disallow_untyped_defs/strict here —
+# that's a real ratcheting decision (would demand annotating every def) for a
+# separate change, not something to fold into "add the tool for the first
+# time." These two are pure hygiene: they catch a genuinely stale
+# `# type: ignore` or cast rather than restricting what's allowed today.
+warn_unused_ignores = true
+warn_redundant_casts = true

@@ -1518,7 +1518,11 @@ def reconcile_one(
             )
         try:
             recovered = run_implementer._preflight_existing_result(
-                ref,
+                ref,  # type: ignore[arg-type]  # cross-module duck typing: this
+                # module's ProposalRef is a superset of run_implementer's (see the
+                # class docstring above — "same shape as run_implementer.py"), and
+                # _preflight_existing_result only reads .service/.slug, which both
+                # classes share. Nominally different classes, safe at runtime.
                 allow_pr_create=not dry_run,
             )
         except run_implementer.GitHubPreflightError as exc:
@@ -1832,16 +1836,16 @@ def main() -> None:
         print(f"Reconcile pass: {len(refs)} proposal(s):")
         for r in refs:
             print(f"  - {r.service}/{r.slug} [{r.status}]")
-        results = []
+        reconcile_results: list[ShepherdResult] = []
         for ref in refs:
-            results.append(
+            reconcile_results.append(
                 reconcile_one(
                     ref,
                     state_dir=state_dir,
                     dry_run=args.dry_run,
                 )
             )
-        _print_summary(results)
+        _print_summary(reconcile_results)
         return
 
     print(f"Found {len(refs)} proposal(s) to evaluate (budget cap ${budget:.2f}):")

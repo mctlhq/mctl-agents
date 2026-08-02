@@ -1,6 +1,7 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import os
 from pathlib import Path
+from typing import Any
 
 from claude_agent_sdk import ClaudeAgentOptions
 
@@ -39,7 +40,7 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     if not token:
         print("⚠️  MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
         return {}
-    server_config = {
+    server_config: dict[str, Any] = {
         "type": "http",
         "url": MCTL_MCP_URL,
         "headers": {"Authorization": f"Bearer {token}"},
@@ -112,12 +113,16 @@ _SIBLING_REPOS = (
 )
 
 
-def _sibling_add_dirs(service_name: str) -> list[str]:
+def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     """For services that scan sibling repos, expand the workspace to include them."""
     if service_name not in SERVICES_NEEDING_SIBLING_ACCESS:
         return []
     base = Path(SIBLING_REPOS_PATH)
-    return [str(base / r) for r in _SIBLING_REPOS if (base / r).exists()]
+    # Typed str | Path (not just str) because ClaudeAgentOptions.add_dirs is
+    # list[str | Path] and list is invariant — a plain list[str] here isn't
+    # assignable to that parameter even though every element actually is a str.
+    dirs: list[str | Path] = [str(base / r) for r in _SIBLING_REPOS if (base / r).exists()]
+    return dirs
 
 
 def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOptions:

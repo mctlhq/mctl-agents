@@ -1510,15 +1510,15 @@ def main() -> None:
     )
 
     print("\n=== Summary ===")
-    for r in results:
-        if r.error:
-            print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
-        elif r.skipped_reason:
-            print(f"  · {r.ref.service}/{r.ref.slug} skipped: {r.skipped_reason}")
-        elif r.pr_url:
-            print(f"  ✓ {r.ref.service}/{r.ref.slug} → {r.pr_url}")
+    for result in results:
+        if result.error:
+            print(f"  ✗ {result.ref.service}/{result.ref.slug} failed: {result.error}")
+        elif result.skipped_reason:
+            print(f"  · {result.ref.service}/{result.ref.slug} skipped: {result.skipped_reason}")
+        elif result.pr_url:
+            print(f"  ✓ {result.ref.service}/{result.ref.slug} → {result.pr_url}")
         else:
-            print(f"  ✗ {r.ref.service}/{r.ref.slug} failed: {r.error}")
+            print(f"  ✗ {result.ref.service}/{result.ref.slug} failed: {result.error}")
     outcome = _batch_outcome(results)
     print(
         "Totals: "
