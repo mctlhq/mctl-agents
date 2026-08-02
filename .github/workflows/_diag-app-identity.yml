@@ -11,6 +11,12 @@ name: diag app-token identity
 # Only prints installation-id and app-slug, both explicitly documented by
 # actions/create-github-app-token as non-sensitive. Never touches the
 # `token` output. To be deleted once the answer is known, either way.
+#
+# Requests the exact permissions release-please-action's `token:` input
+# would need (contents/pull-requests/issues: write) via permission-* inputs
+# rather than the App's default grant. This makes the probe fail fast if the
+# App is installed but under-scoped, instead of a false "success" that only
+# proves installation, not usability (Codex review finding on PR #99).
 
 on:
   workflow_dispatch:
@@ -20,6 +26,7 @@ permissions: {}
 jobs:
   identify:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Generate app token scoped to this repo
         id: app
@@ -29,8 +36,14 @@ jobs:
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           owner: mctlhq
           repositories: mctl-agents
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - name: Report identity (non-sensitive outputs only)
+        env:
+          INSTALLATION_ID: ${{ steps.app.outputs.installation-id }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
         run: |
-          echo "installation-id: ${{ steps.app.outputs.installation-id }}"
-          echo "app-slug: ${{ steps.app.outputs.app-slug }}"
+          echo "installation-id: ${INSTALLATION_ID}"
+          echo "app-slug: ${APP_SLUG}"
