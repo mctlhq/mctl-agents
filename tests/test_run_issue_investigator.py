@@ -307,19 +307,41 @@ def _result_message(*, is_error: bool, api_error_status: int | None, subtype: st
     )
 
 
-def _fake_query(messages):
-    async def _query(*, prompt, options):
-        for m in messages:
+class _FakeClient:
+    """Stands in for ClaudeSDKClient — no MCTL_TOKEN in the test env means
+    build_issue_investigator_options() returns mcp_servers={}, so
+    ensure_mctl_connected() is never called; only query()/receive_response()
+    need faking here."""
+
+    def __init__(self, *, options, messages):
+        self._messages = messages
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def query(self, prompt):
+        pass
+
+    async def receive_response(self):
+        for m in self._messages:
             yield m
-    return _query
+
+
+def _fake_client_factory(messages):
+    def _factory(*, options):
+        return _FakeClient(options=options, messages=messages)
+    return _factory
 
 
 def test_run_agent_raises_on_429_result(tmp_path, monkeypatch):
     """A final ResultMessage with is_error + api_error_status=429 must raise
     RateLimitExhaustedError, not just be printed and swallowed."""
     monkeypatch.setattr(
-        run_issue_investigator, "query",
-        _fake_query([_result_message(is_error=True, api_error_status=429)]),
+        run_issue_investigator, "ClaudeSDKClient",
+        _fake_client_factory([_result_message(is_error=True, api_error_status=429)]),
     )
     with pytest.raises(RateLimitExhaustedError):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -329,8 +351,8 @@ def test_run_agent_does_not_raise_on_clean_success(tmp_path, monkeypatch):
     """A normal, non-error ResultMessage must NOT be mistaken for a
     rate-limit exhaustion."""
     monkeypatch.setattr(
-        run_issue_investigator, "query",
-        _fake_query([_result_message(is_error=False, api_error_status=None)]),
+        run_issue_investigator, "ClaudeSDKClient",
+        _fake_client_factory([_result_message(is_error=False, api_error_status=None)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 
@@ -342,8 +364,8 @@ def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
     RateLimitExhaustedError, so it is never counted toward
     poll()'s rate_limited_failures."""
     monkeypatch.setattr(
-        run_issue_investigator, "query",
-        _fake_query([_result_message(is_error=True, api_error_status=500)]),
+        run_issue_investigator, "ClaudeSDKClient",
+        _fake_client_factory([_result_message(is_error=True, api_error_status=500)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 

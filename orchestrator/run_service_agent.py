@@ -5,10 +5,11 @@ Usage:
 """
 import sys
 import anyio
-from claude_agent_sdk import query
+from claude_agent_sdk import ClaudeSDKClient
 
 from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_service_agent_options
 
 
@@ -55,11 +56,22 @@ async def run_service_agent(service: str) -> None:
         raise SystemExit(f"Agent directory not found: {service_dir}")
 
     options = build_service_agent_options(service_dir, SERVICE_AGENT_MODEL)
+    mcp_configured = bool(options.mcp_servers)
     print(f"\n=== Running agent {service} ({SERVICE_AGENT_MODEL}) ===\n")
 
-    async for message in query(prompt=PROMPT, options=options):
-        # Stream messages. Could be prettier-formatted; just print for now.
-        print(message)
+    async with ClaudeSDKClient(options=options) as client:
+        if mcp_configured:
+            # fatal=False: mctl tools are a bonus here (service status
+            # checks), not the whole job — the agent still does useful
+            # WebSearch/WebFetch/proposal work without them. Warn loudly
+            # instead so a real MCTL_TOKEN outage is visible in logs rather
+            # than indistinguishable from "nothing to report" (see
+            # orchestrator/mcp_guard.py).
+            await ensure_mctl_connected(client, fatal=False)
+        await client.query(PROMPT)
+        async for message in client.receive_response():
+            # Stream messages. Could be prettier-formatted; just print for now.
+            print(message)
 
 
 def main() -> None:

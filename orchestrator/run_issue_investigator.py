@@ -54,11 +54,12 @@ from typing import Optional
 
 import anyio
 import yaml
-from claude_agent_sdk import ResultMessage, query
+from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
+from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_issue_investigator_options
 
 
@@ -388,24 +389,32 @@ class RateLimitExhaustedError(RuntimeError):
 
 async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
-    async for message in query(prompt=prompt, options=options):
-        print(message)
-        # The CLI's final message for a run that never got a completion —
-        # e.g. the account's five_hour/seven_day usage limit was already
-        # exhausted before the first turn — is a ResultMessage with
-        # is_error=True and api_error_status=429 (emitted since CLI
-        # v2.1.110), NOT a raised exception. Surface it as one here so the
-        # normal except-clause plumbing in investigate() below can tell it
-        # apart from an agent/tooling failure.
-        if (
-            isinstance(message, ResultMessage)
-            and message.is_error
-            and message.api_error_status == 429
-        ):
-            raise RateLimitExhaustedError(
-                f"SDK reported api_error_status=429 (rate/usage limit "
-                f"exhausted): {message.result!r}"
-            )
+    mcp_configured = bool(options.mcp_servers)
+    async with ClaudeSDKClient(options=options) as client:
+        if mcp_configured:
+            # fatal=False — see orchestrator/mcp_guard.py. The investigator
+            # grounds its proposal in the target repo's own code via
+            # Read/Glob/Grep; mctl tools are supplementary, not required.
+            await ensure_mctl_connected(client, fatal=False)
+        await client.query(prompt)
+        async for message in client.receive_response():
+            print(message)
+            # The CLI's final message for a run that never got a completion —
+            # e.g. the account's five_hour/seven_day usage limit was already
+            # exhausted before the first turn — is a ResultMessage with
+            # is_error=True and api_error_status=429 (emitted since CLI
+            # v2.1.110), NOT a raised exception. Surface it as one here so the
+            # normal except-clause plumbing in investigate() below can tell it
+            # apart from an agent/tooling failure.
+            if (
+                isinstance(message, ResultMessage)
+                and message.is_error
+                and message.api_error_status == 429
+            ):
+                raise RateLimitExhaustedError(
+                    f"SDK reported api_error_status=429 (rate/usage limit "
+                    f"exhausted): {message.result!r}"
+                )
 
 
 @dataclass

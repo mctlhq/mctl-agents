@@ -20,13 +20,21 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     connection timeout) instead of connecting in the background — without
     it, the CLI can dispatch the first turn before the handshake completes,
     silently running with zero mcp__mctl__* tools (see mctl-telegram#316
-    for the equivalent stdio-transport bug this mirrors). Deliberately
-    opt-in rather than the default here: only the incident-responder's
-    prompt treats "no mcp__mctl__* tools" as a silent, valid success, so
-    only it needs this guarantee — the other modes already tolerate a
-    missing/slow mctl connection, and forcing every one of them to block
-    on api.mctl.ai health would give a single mctl outage more blast
-    radius than necessary.
+    for the equivalent stdio-transport bug this mirrors).
+
+    Every builder below now passes always_load=True — the 2026-08-02
+    incident-responder outage turned out to be caused by a genuinely dead
+    MCTL_TOKEN, not just the race, and checking mctl_list_recent_agent_runs
+    afterwards showed the other modes could not prove they weren't also
+    silently degrading the same way (service-agent's prompt has its own
+    explicit "no mcp__mctl__* tools, skip silently" instruction). Blocking
+    dispatch until the connection settles (or the CLI's own timeout) is
+    cheap and deterministic either way; see orchestrator/mcp_guard.py for
+    the positive-verification layer built on top for callers that also want
+    to know whether the connection actually succeeded, and whether that's
+    fatal for their mode. shepherd is the one mode with no mctl MCP at all
+    (mcp_servers={} below) — it never calls mcp__mctl__* tools, so there is
+    nothing to always-load.
     """
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
@@ -124,7 +132,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
             "WebSearch", "WebFetch",
             "Bash",
         ] + _mctl_tool_globs(),
-        mcp_servers=mctl_mcp_config(),
+        mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
         add_dirs=_sibling_add_dirs(service_dir.name),
@@ -163,7 +171,7 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Op
             "WebSearch", "WebFetch",
             "Bash",
         ] + _mctl_tool_globs(),
-        mcp_servers=mctl_mcp_config(),
+        mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
@@ -181,7 +189,7 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
             "Read", "Glob", "Grep",
             "Write", "Edit",                   # writes only into _mentor/digest/
         ] + _mctl_tool_globs(),
-        mcp_servers=mctl_mcp_config(),
+        mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
     )
@@ -208,10 +216,6 @@ def build_incident_responder_options(
         allowed_tools=[
             "Read", "Write", "Bash", "Glob",
         ] + _mctl_tool_globs(),
-        # always_load=True: this mode's own prompt treats "no mcp__mctl__*
-        # tools" as a silent, valid success (see run_incident_responder.py's
-        # McpNotConnectedError), so it's the one mode that needs the
-        # blocking connection guarantee. See mctl_mcp_config()'s docstring.
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
@@ -249,7 +253,7 @@ def build_issue_investigator_options(
             "WebSearch", "WebFetch",
             "Bash",
         ] + _mctl_tool_globs(),
-        mcp_servers=mctl_mcp_config(),
+        mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
         add_dirs=[str(proposal_dir)],

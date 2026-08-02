@@ -8,10 +8,11 @@ from datetime import date
 from pathlib import Path
 
 import anyio
-from claude_agent_sdk import query
+from claude_agent_sdk import ClaudeSDKClient
 
 from config.settings import MENTOR_DIR, MENTOR_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_mentor_options
 
 
@@ -143,10 +144,18 @@ async def run_mentor() -> None:
     _rotate_old_digests(digest_dir)
 
     options = build_mentor_options(MENTOR_DIR, MENTOR_MODEL)
+    mcp_configured = bool(options.mcp_servers)
     print(f"\n=== Running mentor ({MENTOR_MODEL}) ===\n")
 
-    async for message in query(prompt=build_prompt(), options=options):
-        print(message)
+    async with ClaudeSDKClient(options=options) as client:
+        if mcp_configured:
+            # fatal=False — see orchestrator/mcp_guard.py. The mentor reads
+            # already-written proposals/ and summarizes; it doesn't need
+            # mctl tools to produce a useful digest.
+            await ensure_mctl_connected(client, fatal=False)
+        await client.query(build_prompt())
+        async for message in client.receive_response():
+            print(message)
 
 
 def main() -> None:

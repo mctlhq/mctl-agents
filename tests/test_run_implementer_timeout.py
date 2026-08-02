@@ -7,17 +7,46 @@ import pytest
 from orchestrator import run_implementer
 
 
-async def _slow_query(*, prompt, options):
+class _FakeClient:
+    """Stands in for ClaudeSDKClient — no MCTL_TOKEN in the test env means
+    build_implementer_agent_options() returns mcp_servers={}, so
+    ensure_mctl_connected() is never called; only query()/receive_response()
+    need faking here."""
+
+    def __init__(self, *, options, message_gen):
+        self._message_gen = message_gen
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def query(self, prompt):
+        pass
+
+    async def receive_response(self):
+        async for message in self._message_gen():
+            yield message
+
+
+def _fake_client_factory(message_gen):
+    def _factory(*, options):
+        return _FakeClient(options=options, message_gen=message_gen)
+    return _factory
+
+
+async def _slow_messages():
     await anyio.sleep(10)
     yield "unreachable"
 
 
-async def _fast_query(*, prompt, options):
+async def _fast_messages():
     yield "done"
 
 
 def test_implementer_agent_times_out(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(run_implementer, "query", _slow_query)
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_slow_messages))
     monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
 
     with pytest.raises(
@@ -33,7 +62,7 @@ def test_implementer_agent_times_out(tmp_path, monkeypatch) -> None:
 
 
 def test_implementer_agent_completes_before_timeout(tmp_path, monkeypatch) -> None:
-    monkeypatch.setattr(run_implementer, "query", _fast_query)
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
     monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
 
     anyio.run(
