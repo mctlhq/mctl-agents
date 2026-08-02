@@ -28,9 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
-# uv, pinned by version like everything else here: an unpinned installer is
-# the same class of drift the lockfile exists to prevent.
-COPY --from=ghcr.io/astral-sh/uv:0.11.11 /uv /usr/local/bin/uv
+# uv, pinned by digest like everything else here: an unpinned installer is the
+# same class of drift the lockfile exists to prevent, and a registry tag can be
+# moved after the fact in a way uv.lock hashes cannot. The digest resolves to a
+# multi-arch index (linux/amd64 + linux/arm64), so this does not tie the build
+# to one architecture. Keep the tag comment in step when bumping.
+COPY --from=ghcr.io/astral-sh/uv@sha256:798712e57f879c5393777cbda2bb309b29fcdeb0532129d4b1c3125c5385975a /uv /usr/local/bin/uv
+# ^ ghcr.io/astral-sh/uv:0.11.11
 
 COPY pyproject.toml uv.lock ./
 # --frozen: fail loudly if the lockfile is stale rather than silently
