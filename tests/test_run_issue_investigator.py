@@ -7,6 +7,7 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 """
 from __future__ import annotations
 
+import types
 from pathlib import Path
 
 import anyio
@@ -15,6 +16,7 @@ import yaml
 from claude_agent_sdk import ResultMessage
 
 from orchestrator import run_issue_investigator
+from tests.conftest import fake_mcp_client_factory
 from orchestrator.run_issue_investigator import (
     IssueData,
     IssueRef,
@@ -307,19 +309,41 @@ def _result_message(*, is_error: bool, api_error_status: int | None, subtype: st
     )
 
 
-def _fake_query(messages):
-    async def _query(*, prompt, options):
-        for m in messages:
+class _FakeClient:
+    """Stands in for ClaudeSDKClient — no MCTL_TOKEN in the test env means
+    build_issue_investigator_options() returns mcp_servers={}, so
+    ensure_mctl_connected() is never called; only query()/receive_response()
+    need faking here."""
+
+    def __init__(self, *, options, messages):
+        self._messages = messages
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def query(self, prompt):
+        pass
+
+    async def receive_response(self):
+        for m in self._messages:
             yield m
-    return _query
+
+
+def _fake_client_factory(messages):
+    def _factory(*, options):
+        return _FakeClient(options=options, messages=messages)
+    return _factory
 
 
 def test_run_agent_raises_on_429_result(tmp_path, monkeypatch):
     """A final ResultMessage with is_error + api_error_status=429 must raise
     RateLimitExhaustedError, not just be printed and swallowed."""
     monkeypatch.setattr(
-        run_issue_investigator, "query",
-        _fake_query([_result_message(is_error=True, api_error_status=429)]),
+        run_issue_investigator, "ClaudeSDKClient",
+        _fake_client_factory([_result_message(is_error=True, api_error_status=429)]),
     )
     with pytest.raises(RateLimitExhaustedError):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -329,8 +353,8 @@ def test_run_agent_does_not_raise_on_clean_success(tmp_path, monkeypatch):
     """A normal, non-error ResultMessage must NOT be mistaken for a
     rate-limit exhaustion."""
     monkeypatch.setattr(
-        run_issue_investigator, "query",
-        _fake_query([_result_message(is_error=False, api_error_status=None)]),
+        run_issue_investigator, "ClaudeSDKClient",
+        _fake_client_factory([_result_message(is_error=False, api_error_status=None)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 
@@ -342,10 +366,52 @@ def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
     RateLimitExhaustedError, so it is never counted toward
     poll()'s rate_limited_failures."""
     monkeypatch.setattr(
-        run_issue_investigator, "query",
-        _fake_query([_result_message(is_error=True, api_error_status=500)]),
+        run_issue_investigator, "ClaudeSDKClient",
+        _fake_client_factory([_result_message(is_error=True, api_error_status=500)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _run_agent — mctl MCP connectivity guard, wiring level
+#
+# Regression coverage for a Claude-review finding on PR #84: the tests above
+# all run with MCTL_TOKEN unset (mcp_servers={}), so ensure_mctl_connected()
+# is never actually invoked here — only in isolation via test_mcp_guard.py.
+# These stub build_issue_investigator_options() to force mcp_servers
+# non-empty, matching tests/test_run_incident_responder.py's pattern.
+# ---------------------------------------------------------------------------
+def _stub_build_options(monkeypatch, *, mcp_servers):
+    monkeypatch.setattr(
+        run_issue_investigator, "build_issue_investigator_options",
+        lambda *args, **kwargs: types.SimpleNamespace(mcp_servers=mcp_servers),
+    )
+
+
+def test_run_agent_connected_mcp_dispatches_without_warning(tmp_path, monkeypatch, capsys):
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        run_issue_investigator, "ClaudeSDKClient",
+        fake_mcp_client_factory(
+            statuses=[{"mcpServers": [{"name": "mctl", "status": "connected"}]}]
+        ),
+    )
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+    assert "⚠️" not in capsys.readouterr().err
+
+
+def test_run_agent_failed_mcp_warns_but_still_dispatches(tmp_path, monkeypatch, capsys):
+    """fatal=False: a broken mctl connection must not stop the investigator
+    from grounding its proposal in the repo via Read/Glob/Grep."""
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        run_issue_investigator, "ClaudeSDKClient",
+        fake_mcp_client_factory(
+            statuses=[{"mcpServers": [{"name": "mctl", "status": "failed", "error": "boom"}]}]
+        ),
+    )
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
+    assert "boom" in capsys.readouterr().err
 
 
 def test_investigate_sets_rate_limited_on_429(tmp_path, monkeypatch):

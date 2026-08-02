@@ -74,7 +74,7 @@ from typing import Any, Optional
 from urllib.parse import quote
 
 import anyio
-from claude_agent_sdk import query
+from claude_agent_sdk import ClaudeSDKClient
 
 from config.settings import (
     AGENTS_DIR,
@@ -83,6 +83,7 @@ from config.settings import (
 )
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
+from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
     IMPLEMENTER_TIMEOUT_SECONDS,
@@ -559,15 +560,26 @@ def _push_followup(repo_dir: Path, branch: str) -> None:
 
 async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
+    mcp_configured = bool(options.mcp_servers)
     # A budget bounds spend but not a stalled network/model stream. Keep one
     # proposal inside the workflow's larger deadline (incident e3649b04).
+    # The fail_after wraps the mctl connectivity check too — a wedged
+    # handshake must not silently eat into the caller's own timeout budget.
     try:
         with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
-            async for message in query(prompt=prompt, options=options):
-                print(message)
+            async with ClaudeSDKClient(options=options) as client:
+                if mcp_configured:
+                    # fatal=False — see orchestrator/mcp_guard.py. The
+                    # implementer applies an already-written proposal via
+                    # Read/Write/Edit/Bash; mctl tools are supplementary.
+                    await ensure_mctl_connected(client, fatal=False)
+                await client.query(prompt)
+                async for message in client.receive_response():
+                    print(message)
     except TimeoutError as exc:
         raise ImplementerOperationTimeout(
-            f"model stream exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s"
+            f"operation exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s "
+            f"(model stream, client construction, or mctl connectivity check)"
         ) from exc
 
 

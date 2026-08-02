@@ -29,9 +29,10 @@ import types
 import anyio
 import pytest
 
+from orchestrator import mcp_guard
 from orchestrator import run_all
 from orchestrator import run_incident_responder as rir
-from orchestrator.run_incident_responder import McpNotConnectedError
+from orchestrator.mcp_guard import McpNotConnectedError
 
 
 class _FakeClient:
@@ -89,9 +90,10 @@ def _stub_build_options(monkeypatch, *, mcp_servers):
 
 def _shrink_poll_window(monkeypatch):
     """Tests that exercise the timeout path would otherwise take
-    MCP_CONNECT_POLL_TIMEOUT_S (5s) each — shrink it so the suite stays fast."""
-    monkeypatch.setattr(rir, "MCP_CONNECT_POLL_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(rir, "MCP_CONNECT_POLL_INTERVAL_S", 0.01)
+    MCP_CONNECT_POLL_TIMEOUT_S (5s) each — shrink it so the suite stays fast.
+    Lives in orchestrator.mcp_guard now (shared across all 5 modes), not rir."""
+    monkeypatch.setattr(mcp_guard, "MCP_CONNECT_POLL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(mcp_guard, "MCP_CONNECT_POLL_INTERVAL_S", 0.01)
 
 
 # ---------------------------------------------------------------------------
