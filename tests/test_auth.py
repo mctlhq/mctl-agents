@@ -73,6 +73,18 @@ def test_malformed_oauth_token_still_selected_but_warns(monkeypatch, capsys):
     assert "does not look like an OAuth token" in capsys.readouterr().out
 
 
+def test_malformed_api_key_still_selected_but_warns(monkeypatch, capsys):
+    """Parallel case for the api_key branch — same non-fatal warning
+    behavior as the OAuth token check above."""
+    _clear_creds(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "not-an-api-key")
+
+    mode = auth.detect_auth()
+
+    assert mode.name == "api_key"
+    assert "does not look like an API key" in capsys.readouterr().out
+
+
 def test_cli_session_fallback_when_claude_on_path(monkeypatch):
     """Local-dev path: no credential env vars, but a `claude` binary is
     somewhere on PATH (developer's own install, or — historically — the
