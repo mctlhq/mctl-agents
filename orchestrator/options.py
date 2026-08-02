@@ -38,7 +38,7 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     """
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
-        print("⚠️  MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
+        print("warn: MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
         return {}
     server_config: dict[str, Any] = {
         "type": "http",

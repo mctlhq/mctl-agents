@@ -122,8 +122,8 @@ def test_main_reports_error_even_when_result_has_colliding_pr_url(
 
     assert exc_info.value.code == 1
     output = capsys.readouterr().out
-    assert "failed: branch-collision" in output
-    assert "→ https://github.com/mctlhq/mctl-agents/pull/71" not in output
+    assert "fail mctl-agents/incident-example: branch-collision" in output
+    assert "-> https://github.com/mctlhq/mctl-agents/pull/71" not in output
 
 
 def test_github_failure_is_fail_closed(monkeypatch, tmp_path: Path) -> None:

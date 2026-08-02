@@ -33,7 +33,7 @@ def test_connected_mcp_dispatches_query_without_warning(monkeypatch, capsys):
         ),
     )
     anyio.run(rm.run_mentor)
-    assert "⚠️" not in capsys.readouterr().err
+    assert "warn:" not in capsys.readouterr().err
 
 
 def test_failed_mcp_warns_but_still_dispatches_query(monkeypatch, capsys):

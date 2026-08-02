@@ -54,7 +54,7 @@ async def _safe_run_service(service: str) -> None:
         # We deliberately keep KeyboardInterrupt / CancelledError on the
         # BaseException side — those should propagate.
         print(
-            f"⚠️  service-agent {service} failed: {type(exc).__name__}: {exc}",
+            f"warn: service-agent {service} failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         traceback.print_exc(file=sys.stderr)
@@ -86,12 +86,12 @@ async def _safe_run_incident_responder() -> None:
         # Exit non-zero so Argo's assert-attempt gate (which only checks
         # step status) correctly reports failure instead of a false green,
         # and run-fallback gets a chance to retry on the account-2 token.
-        print(f"❌ incident-responder: {exc}", file=sys.stderr)
+        print(f"error: incident-responder: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         sys.exit(MCP_NOT_CONNECTED_EXIT_CODE)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — intentional broad catch
         print(
-            f"⚠️  incident-responder failed: {type(exc).__name__}: {exc}",
+            f"warn: incident-responder failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         traceback.print_exc(file=sys.stderr)

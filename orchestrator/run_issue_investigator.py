@@ -462,11 +462,11 @@ def investigate(
             f"proposal {service}/{slug} already at status "
             f"'{existing_status}' — refusing to overwrite in-flight work"
         )
-        print(f"⚠️  {reason}")
+        print(f"warn: {reason}")
         return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
 
     if issue.state == "CLOSED":
-        print(f"⚠️  Issue {issue.ref.full_repo}#{issue.ref.number} is CLOSED — investigating anyway.")
+        print(f"warn: issue {issue.ref.full_repo}#{issue.ref.number} is CLOSED — investigating anyway.")
 
     if dry_run:
         print(
@@ -515,7 +515,7 @@ def investigate(
             post_proposal_comment(issue.ref.url, service, slug)
         except subprocess.CalledProcessError as e:
             print(
-                f"⚠️  proposal written, but `gh issue comment` failed "
+                f"warn: proposal written, but `gh issue comment` failed "
                 f"(non-fatal): {e.stderr or e}"
             )
 
@@ -590,12 +590,12 @@ def main() -> None:
 
     print("\n=== Investigate summary ===")
     if result.error:
-        print(f"  ✗ {result.service}/{result.slug} failed: {result.error}")
+        print(f"  fail {result.service}/{result.slug}: {result.error}")
         sys.exit(1)
     if result.skipped_reason:
-        print(f"  · {result.service}/{result.slug} skipped: {result.skipped_reason}")
+        print(f"  skip {result.service}/{result.slug}: {result.skipped_reason}")
         return
-    print(f"  ✓ {result.service}/{result.slug} → {result.proposal_dir}")
+    print(f"  ok   {result.service}/{result.slug} -> {result.proposal_dir}")
     print(f"    {_gitops_tree_url(result.service, result.slug)}")
 
 
