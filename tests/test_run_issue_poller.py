@@ -366,7 +366,7 @@ def test_poll_cap_excludes_non_service_issues(tmp_path, monkeypatch):
     non_service = [_ref(repo="not-a-service", number=n) for n in range(1, 6)]  # 5
     valid = _ref(repo="mctl-telegram", number=99)
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues",
-                        lambda label: non_service + [valid])
+                        lambda label: [*non_service, valid])
     investigated: list = []
     monkeypatch.setattr(run_issue_poller, "investigate", _investigate_ok(tmp_path, investigated))
     monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)

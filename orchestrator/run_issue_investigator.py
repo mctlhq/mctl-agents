@@ -48,9 +48,8 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
 import anyio
 import yaml
@@ -61,7 +60,6 @@ from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_issue_investigator_options
-
 
 DEFAULT_STATE_DIR = Path(
     os.getenv(
@@ -104,10 +102,10 @@ class IssueData:
 
 def _now_iso() -> str:
     """RFC 3339 UTC timestamp without microseconds."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     """Thin wrapper over subprocess.run with consistent logging."""
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
@@ -145,10 +143,12 @@ def parse_issue_url(url: str) -> IssueRef:
     try:
         return _parse_issue_url(url)
     except IssueURLError as e:
-        raise SystemExit(str(e))
+        # from None: this wrapper's whole point (see docstring) is a clean
+        # exit with just the message, not a chained traceback.
+        raise SystemExit(str(e)) from None
 
 
-def try_parse_issue_url(url: str) -> Optional[IssueRef]:
+def try_parse_issue_url(url: str) -> IssueRef | None:
     """Parse a GitHub issue URL, returning None instead of raising on a
     malformed URL or non-mctlhq owner. For callers filtering a mixed list
     (e.g. the poller dropping PR URLs from `gh search` output)."""
@@ -205,7 +205,7 @@ def _load_status(path: Path) -> dict:
 
 def _clone_repo(full_repo: str, slug: str) -> Path:
     """Read-only `gh repo clone` of the target repo to a fresh tmp dir."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
     target = Path(tempfile.gettempdir()) / f"investigate-{slug}-{ts}"
     if target.exists():
         shutil.rmtree(target)
@@ -422,8 +422,8 @@ class InvestigateResult:
     service: str
     slug: str
     proposal_dir: Path
-    skipped_reason: Optional[str] = None
-    error: Optional[str] = None
+    skipped_reason: str | None = None
+    error: str | None = None
     # True only when `error` is set AND the failure was specifically a
     # RateLimitExhaustedError (api_error_status=429), not any other agent/
     # tooling failure. run_issue_poller.poll() uses this to distinguish
@@ -534,7 +534,7 @@ def investigate(
         return InvestigateResult(
             service, slug, proposal_dir, error=str(e), rate_limited=True
         )
-    except Exception as e:  # pragma: no cover — defensive
+    except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
     finally:
         # Drop the throwaway /tmp clone.

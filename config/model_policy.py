@@ -7,12 +7,12 @@ the highest-priority overrides for backwards compatibility.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 import yaml
-
 
 DEFAULT_POLICY_PATH = Path(__file__).with_name("model-policy.yaml")
 
@@ -29,7 +29,7 @@ class ModelSelection:
     profile: str
     model: str
     source: str
-    escalation_profile: Optional[str]
+    escalation_profile: str | None
 
     def log(self) -> None:
         escalation = self.escalation_profile or "none"
@@ -59,7 +59,7 @@ class ModelPolicy:
         self._validate()
 
     @classmethod
-    def load(cls, path: Optional[Path] = None) -> "ModelPolicy":
+    def load(cls, path: Path | None = None) -> ModelPolicy:
         configured_path = os.getenv("MODEL_POLICY_PATH", "").strip()
         policy_path = path or (
             Path(configured_path) if configured_path else DEFAULT_POLICY_PATH
@@ -108,7 +108,7 @@ class ModelPolicy:
         self,
         task: str,
         *,
-        legacy_model_env: Optional[str] = None,
+        legacy_model_env: str | None = None,
         escalate: bool = False,
         log: bool = True,
     ) -> ModelSelection:
@@ -164,7 +164,7 @@ class ModelPolicy:
 def resolve_model(
     task: str,
     *,
-    legacy_model_env: Optional[str] = None,
+    legacy_model_env: str | None = None,
     escalate: bool = False,
     log: bool = True,
 ) -> ModelSelection:

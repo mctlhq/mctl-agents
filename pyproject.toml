@@ -38,4 +38,40 @@ package = false
 # is why the image runs `uv sync --frozen --no-dev`.
 dev = [
     "pytest~=9.0",
+    "ruff~=0.14",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+# Deliberately excludes S (bandit): the codebase shells out to git/gh via
+# subprocess.run() extensively (orchestrator/run_shepherd.py's _run() helper
+# alone is used across the file), always with a list[str] command and never
+# shell=True, so S603/S607 would be mostly noise against a real injection
+# risk. Reconsider separately if that changes.
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "BLE",    # flake8-blind-except — several call sites deliberately catch
+              # bare Exception as a last-resort fallback (surface a result
+              # instead of crashing the whole run) and justify it with a
+              # `# noqa: BLE001`; this rule has to be enabled for RUF100 to
+              # recognize those as used rather than flagging them as stale
+    "UP",     # pyupgrade
+    "ASYNC",  # flake8-async — the whole orchestrator runs on AnyIO
+    "RUF",    # ruff-specific rules, including RUF100 (unused noqa)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# These two files are almost entirely a natural-language prompt string fed
+# to the Claude Agent SDK (PROMPT = """...""" / f"""..."""). Reflowing the
+# lines to fit 120 chars would change the exact text the model sees, and a
+# `#` on an interior line of a triple-quoted string isn't a Python comment —
+# it becomes literal prompt content, so a per-line noqa isn't an option here.
+"orchestrator/run_service_agent.py" = ["E501"]
+"orchestrator/run_incident_responder.py" = ["E501"]

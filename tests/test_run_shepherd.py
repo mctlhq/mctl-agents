@@ -17,9 +17,8 @@ fixture so the YAML serialisation is exercised.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 from unittest.mock import patch
 
 import pytest
@@ -29,12 +28,11 @@ from orchestrator import run_implementer, run_shepherd
 from orchestrator.run_shepherd import (
     CodexFinding,
     CodexReview,
-    PRSnapshot,
     ProposalRef,
+    PRSnapshot,
     decide,
     process_one,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
@@ -50,12 +48,12 @@ def make_pr(
     merged: bool = False,
     closed_unmerged: bool = False,
     is_draft: bool = False,
-    merge_commit: Optional[str] = None,
+    merge_commit: str | None = None,
     merge_state_status: str = "CLEAN",
     checks_green: bool = True,
     head_sha: str = HEAD_SHA,
-    head_pushed_at: Optional[str] = HEAD_PUSHED_AT,
-    state: Optional[str] = None,
+    head_pushed_at: str | None = HEAD_PUSHED_AT,
+    state: str | None = None,
     review_decision: str = "",
 ) -> PRSnapshot:
     """Build a PRSnapshot with sensible mergeable defaults."""
@@ -88,11 +86,11 @@ def make_pr(
 def make_finding(
     *,
     severity: str = "P1",
-    commit_id: Optional[str] = HEAD_SHA,
+    commit_id: str | None = HEAD_SHA,
     body: str = "![P1 Badge] Pin tar to >=6.2.1",
-    path: Optional[str] = "package.json",
-    line: Optional[int] = 42,
-    created_at: Optional[str] = "2026-04-29T11:00:00Z",
+    path: str | None = "package.json",
+    line: int | None = 42,
+    created_at: str | None = "2026-04-29T11:00:00Z",
 ) -> CodexFinding:
     return CodexFinding(
         body=body,
@@ -111,7 +109,7 @@ def make_status_yaml(
     slug: str = "test-slug",
     status: str = "implemented",
     review_attempts: int = 0,
-    pr: Optional[str] = PR_URL,
+    pr: str | None = PR_URL,
 ) -> Path:
     """Create a `.status.yaml` on disk and return its proposal_dir."""
     proposal_dir = tmp_path / service / "proposals" / slug
@@ -137,7 +135,7 @@ def make_ref(
     slug: str = "test-slug",
     status: str = "implemented",
     review_attempts: int = 0,
-    pr_url: Optional[str] = PR_URL,
+    pr_url: str | None = PR_URL,
 ) -> ProposalRef:
     proposal_dir = make_status_yaml(
         tmp_path,
@@ -171,7 +169,7 @@ def test_decide_merge() -> None:
     review = CodexReview(has_responded=True, findings=[])
     # Pin now well after HEAD_PUSHED_AT so the settling window does not apply;
     # makes the test independent of wall-clock time and the fixture's date.
-    now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=UTC)
     assert decide(pr, review, now=now) == ("merge", None)
 
 
@@ -182,7 +180,7 @@ def test_decide_wait_within_settle_window() -> None:
     human/second reviewer who is still pushing fix-ups. Default window is 15m;
     here the head was pushed 5 minutes before `now`.
     """
-    now = datetime(2026, 4, 29, 10, 5, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 10, 5, 0, tzinfo=UTC)
     pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
     review = CodexReview(has_responded=True, findings=[])
     assert decide(pr, review, now=now) == ("wait", None)
@@ -193,7 +191,7 @@ def test_decide_merge_after_settle_window() -> None:
 
     Head pushed 30 minutes before `now`, outside the default 15m window.
     """
-    now = datetime(2026, 4, 29, 10, 30, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 10, 30, 0, tzinfo=UTC)
     pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
     review = CodexReview(has_responded=True, findings=[])
     assert decide(pr, review, now=now) == ("merge", None)
@@ -206,7 +204,7 @@ def test_decide_merge_future_dated_head() -> None:
     clock makes now - pushed negative; without the guard that reads as "still
     in the window" and would wedge the PR indefinitely.
     """
-    now = datetime(2026, 4, 29, 10, 0, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 4, 29, 10, 0, 0, tzinfo=UTC)
     pr = make_pr(head_pushed_at="2026-04-29T10:30:00Z")  # 30 min in the future
     review = CodexReview(has_responded=True, findings=[])
     assert decide(pr, review, now=now) == ("merge", None)
@@ -767,8 +765,8 @@ def test_checks_green_no_rollup_clean_merge_state(monkeypatch) -> None:
 
     # End-to-end through _fetch_pr_snapshot: an empty rollup must yield
     # checks_green=True only when mergeStateStatus is CLEAN.
-    def make_view(merge_state: str, rollup: Optional[str]) -> dict:
-        rollup_obj: Optional[dict] = (
+    def make_view(merge_state: str, rollup: str | None) -> dict:
+        rollup_obj: dict | None = (
             {"state": rollup} if rollup is not None else None
         )
         return {
@@ -867,9 +865,9 @@ def test_has_responded_set_on_issue_comment_findings() -> None:
         endpoint = args[0]
         if endpoint.endswith("/reviews"):
             return []
-        if endpoint.endswith("/pulls/{0}/comments".format(pr.number)):
+        if endpoint.endswith(f"/pulls/{pr.number}/comments"):
             return []
-        if endpoint.endswith("/issues/{0}/comments".format(pr.number)):
+        if endpoint.endswith(f"/issues/{pr.number}/comments"):
             return issue_comments
         if "/issues/comments/" in endpoint and endpoint.endswith("/reactions"):
             return []
@@ -1541,7 +1539,7 @@ def test_apply_followup_invokes_implementer_subprocess(monkeypatch) -> None:
         # Read the bundle file while it still exists — apply_followup deletes
         # it after this call returns (try/finally cleanup).
         idx = list(cmd).index("--review-feedback")
-        with open(cmd[idx + 1], "r", encoding="utf-8") as f:
+        with open(cmd[idx + 1], encoding="utf-8") as f:
             captured["bundle_on_disk"] = json.load(f)
         return _Result()
 

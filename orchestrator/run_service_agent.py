@@ -4,6 +4,7 @@ Usage:
     python -m orchestrator.run_service_agent mctl-web
 """
 import sys
+
 import anyio
 from claude_agent_sdk import ClaudeSDKClient
 
@@ -11,7 +12,6 @@ from config.settings import AGENTS_DIR, SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_service_agent_options
-
 
 PROMPT = """\
 **Output language: English only. Write every artifact (inbox, proposals, summary report) in English. Do not switch languages even if context/ files contain non-English text.**
@@ -76,7 +76,7 @@ async def run_service_agent(service: str) -> None:
 
 def main() -> None:
     if len(sys.argv) != 2:
-        print(f"Usage: python -m orchestrator.run_service_agent <service>")
+        print("Usage: python -m orchestrator.run_service_agent <service>")
         print(f"Available: {', '.join(SERVICES)}")
         sys.exit(1)
 

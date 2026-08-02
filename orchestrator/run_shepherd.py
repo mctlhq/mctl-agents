@@ -48,9 +48,9 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import anyio
 from claude_agent_sdk import query
@@ -59,9 +59,8 @@ from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator import run_implementer
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
-from orchestrator.proposal_state import load_status, now_iso, update_status_file
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
-
+from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 # ---------------------------------------------------------------------------
 # State directory resolution — mirrors run_implementer.py.
@@ -193,7 +192,7 @@ class ProposalRef:
     proposal_dir: Path
     status: str
     review_attempts: int = 0
-    pr_url: Optional[str] = None
+    pr_url: str | None = None
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -210,10 +209,10 @@ class CodexFinding:
     """
 
     body: str
-    path: Optional[str]
-    line: Optional[int]
-    commit_id: Optional[str]
-    created_at: Optional[str]
+    path: str | None
+    line: int | None
+    commit_id: str | None
+    created_at: str | None
     severity: str  # "P1" or "P2"
 
 
@@ -264,10 +263,10 @@ class PRSnapshot:
     state: str            # "OPEN", "CLOSED", "MERGED"
     merged: bool
     closed_unmerged: bool
-    merge_commit: Optional[str]
+    merge_commit: str | None
     close_comment_or_default: str
     head_sha: str
-    head_pushed_at: Optional[str]   # ISO 8601, used to anchor codex signals
+    head_pushed_at: str | None   # ISO 8601, used to anchor codex signals
     merge_state_status: str         # mergeStateStatus from GraphQL
     checks_green: bool              # required checks all SUCCESS
     is_draft: bool
@@ -278,8 +277,8 @@ class PRSnapshot:
 class ShepherdResult:
     ref: ProposalRef
     decision: str
-    error: Optional[str] = None
-    notes: Optional[str] = None
+    error: str | None = None
+    notes: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -320,8 +319,8 @@ def update_status(
 # ---------------------------------------------------------------------------
 def _discover_refs(
     state_dir: Path,
-    service_filter: Optional[str] = None,
-    slug_filter: Optional[str] = None,
+    service_filter: str | None = None,
+    slug_filter: str | None = None,
     reconcile: bool = False,
     dry_run: bool = False,
 ) -> list[ProposalRef]:
@@ -369,7 +368,7 @@ def _discover_refs(
                 continue
             try:
                 data = _load_status(proposal_dir / ".status.yaml")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — skip one bad status file, keep scanning the rest
                 print(f"warn: {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
                 continue
             status = data.get("status", "proposed")
@@ -408,7 +407,7 @@ def _discover_refs(
 # ---------------------------------------------------------------------------
 # gh CLI helpers
 # ---------------------------------------------------------------------------
-def _run(cmd: list[str], cwd: Optional[Path] = None, check: bool = True) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     """Thin wrapper over subprocess.run with consistent logging."""
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
@@ -424,7 +423,7 @@ def _gh_api_json(args: list[str]) -> Any:
     return json.loads(out)
 
 
-def _find_pr_url_by_branch(service: str, slug: str) -> Optional[str]:
+def _find_pr_url_by_branch(service: str, slug: str) -> str | None:
     """Find the canonical implementer PR even when YAML lost its URL."""
     branch = f"feat/agents-{slug}"
     proc = _run([
@@ -487,8 +486,8 @@ def _parse_pr_url(pr_url: str) -> tuple[str, str, int]:
 def find_pr_for_proposal(
     service: str,
     slug: str,
-    state_dir: Optional[Path] = None,
-) -> Optional[PRSnapshot]:
+    state_dir: Path | None = None,
+) -> PRSnapshot | None:
     """Read the linked PR for a proposal.
 
     If `.status.yaml` has no `pr:` URL, discover it from the deterministic
@@ -505,7 +504,7 @@ def find_pr_for_proposal(
     return _fetch_pr_snapshot(f"{owner}/{repo}", number)
 
 
-def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
+def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     """gh pr view + a small GraphQL probe to assemble a PRSnapshot.
 
     `gh pr view` already exposes most of what we need (state, merged,
@@ -513,15 +512,10 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
     timestamp is not on `gh pr view --json` so we read it from the PR
     timeline via `gh api`.
     """
-    fields = (
-        "number,headRefName,headRefOid,mergeStateStatus,state,merged,"
-        "mergedAt,mergeCommit,closedAt,statusCheckRollup,isDraft,"
-        "url,baseRepository"
-    )
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            f"query=query($owner:String!,$repo:String!,$number:Int!){{repository(owner:$owner,name:$repo){{pullRequest(number:$number){{number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid baseRefName mergeCommit{{oid}} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){{nodes{{__typename ... on PullRequestCommit{{commit{{oid committedDate}}}} ... on HeadRefForcePushedEvent{{createdAt afterCommit{{oid}}}}}}}} commits(last:1){{nodes{{commit{{oid committedDate pushedDate}}}}}} statusCheckRollup{{state}}}}}}}}",
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -550,7 +544,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
     # createdAt. None if nothing matches — read_codex_review then
     # treats every issue-comment signal as predating the push (i.e. it
     # cannot rely on stale "no major issues" comments).
-    head_pushed_at: Optional[str] = None
+    head_pushed_at: str | None = None
     commits_nodes = (pr.get("commits") or {}).get("nodes") or []
     if commits_nodes:
         c = (commits_nodes[0] or {}).get("commit") or {}
@@ -606,7 +600,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> Optional[PRSnapshot]:
     )
 
 
-def _iso_gt(a: Optional[str], b: Optional[str]) -> bool:
+def _iso_gt(a: str | None, b: str | None) -> bool:
     """True iff a > b in ISO 8601 lexicographic order. Both must be set."""
     if not a or not b:
         return False
@@ -614,7 +608,7 @@ def _iso_gt(a: Optional[str], b: Optional[str]) -> bool:
 
 
 def _within_settle_window(
-    head_pushed_at: Optional[str], now: datetime, settle_min: int
+    head_pushed_at: str | None, now: datetime, settle_min: int
 ) -> bool:
     """True iff head_pushed_at is less than settle_min minutes before now.
 
@@ -629,7 +623,7 @@ def _within_settle_window(
     except ValueError:
         return False
     if pushed.tzinfo is None:
-        pushed = pushed.replace(tzinfo=timezone.utc)
+        pushed = pushed.replace(tzinfo=UTC)
     if pushed > now:
         # A future-dated head (e.g. committedDate fallback on a commit authored
         # with a skewed clock) would make now - pushed negative, which is < the
@@ -638,7 +632,7 @@ def _within_settle_window(
     return now - pushed < timedelta(minutes=settle_min)
 
 
-def _extract_severity(body: str) -> Optional[str]:
+def _extract_severity(body: str) -> str | None:
     """Find the severity marker in a review comment body.
 
     Supports two formats:
@@ -748,7 +742,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         issue_comments = []
 
     # Walk newest-first to find the most recent `@claude review` trigger.
-    latest_trigger: Optional[dict] = None
+    latest_trigger: dict | None = None
     for c in sorted(issue_comments, key=lambda x: x.get("created_at") or "", reverse=True):
         body = (c.get("body") or "").strip()
         if "@claude review" in body.lower():
@@ -839,7 +833,7 @@ def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
 def decide(
     pr: PRSnapshot,
     codex_review: CodexReview,
-    now: Optional[datetime] = None,
+    now: datetime | None = None,
 ) -> tuple[str, Any]:
     """Return one of the five decisions per design.md L62-75.
 
@@ -850,7 +844,7 @@ def decide(
     hand-built fixtures.
     """
     if now is None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
     if pr.merged:
         return ("flip-to-merged", pr.merge_commit)
     if pr.closed_unmerged:
@@ -1025,7 +1019,7 @@ def apply_followup(
     slug: str,
     findings: list[CodexFinding],
     skip_subprocess: bool = False,
-    state_dir: Optional[Path] = None,
+    state_dir: Path | None = None,
 ) -> dict:
     """Bundle findings + invoke the Tier 2 implementer with --review-feedback.
 
@@ -1146,7 +1140,7 @@ def trigger_review(pr: PRSnapshot) -> None:
 # ---------------------------------------------------------------------------
 # Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
 # ---------------------------------------------------------------------------
-def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
+def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     """Invoke `gh pr merge --merge --delete-branch --match-head-commit <SHA>`.
 
     Returns (success, merge_commit_oid). On HEAD-SHA mismatch the gh
@@ -1189,7 +1183,7 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, Optional[str]]:
 def process_one(
     ref: ProposalRef,
     skip_subprocess: bool = False,
-    state_dir: Optional[Path] = None,
+    state_dir: Path | None = None,
 ) -> ShepherdResult:
     """Drive a single proposal one tick further.
 
@@ -1445,10 +1439,10 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
         expires = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return False
-    return expires > datetime.now(timezone.utc)
+    return expires > datetime.now(UTC)
 
 
-def _finished_attempt(ref: ProposalRef) -> Optional[dict[str, Any]]:
+def _finished_attempt(ref: ProposalRef) -> dict[str, Any] | None:
     attempt = _load_status(ref.status_path).get("attempt")
     if not isinstance(attempt, dict):
         return None
@@ -1462,7 +1456,7 @@ def _github_projection_for_ref(
     *,
     state: str,
     head_sha: str,
-    blocking_reason: Optional[str] = None,
+    blocking_reason: str | None = None,
 ) -> dict[str, Any]:
     """Keep observed_at stable until a material GitHub field changes."""
     existing = _load_status(ref.status_path).get("github") or {}
@@ -1480,7 +1474,7 @@ def _github_projection_for_ref(
 
 def reconcile_one(
     ref: ProposalRef,
-    state_dir: Optional[Path] = None,
+    state_dir: Path | None = None,
     dry_run: bool = False,
 ) -> ShepherdResult:
     """Project authoritative GitHub PR state back into ``.status.yaml``.
