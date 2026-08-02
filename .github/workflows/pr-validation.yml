@@ -25,6 +25,10 @@ jobs:
   tests:
     name: tests
     runs-on: ubuntu-latest
+    # The suite finishes in seconds, so anything approaching this is hung.
+    # Without a cap, a wedged run would sit on a runner until GitHub's 6-hour
+    # default and hold the concurrency group the whole time.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -57,6 +61,9 @@ jobs:
     # Gating it on the tests keeps fast feedback fast and skips a costly
     # build when the suite is already red.
     needs: tests
+    # Higher than the test job: this one pulls apt packages, a global npm
+    # install and a large SDK wheel. Still far below GitHub's 6-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
