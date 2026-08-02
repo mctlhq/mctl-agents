@@ -1,0 +1,70 @@
+name: PR validation
+
+# The test suite has existed for a long time but ran on no PR, so a change
+# could break all of it and still merge green. This workflow is the gate.
+#
+# Note that adding the workflow is only half of it: until the `tests` job is
+# a required status check on `main`, a PR can still be merged without it.
+# That is a repository setting, not a file — see the PR description.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-validation-${{ github.ref }}
+  # Superseded PR pushes are worth cancelling; runs on main are not — each
+  # one is the record for a distinct merged commit.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          # Keep in sync with the Dockerfile base image (python:3.12-slim).
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        # pytest is deliberately not in requirements.txt, which pins only the
+        # runtime harness. Installing it inline keeps this PR to "run the
+        # tests that already exist" and changes no dependency file; a
+        # follow-up moves both into a pyproject dev dependency group with a
+        # lockfile, at which point this step becomes `uv sync --frozen`.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install 'pytest~=9.0'
+
+      - name: Run tests
+        run: pytest -q
+
+  docker-build:
+    name: docker build (smoke)
+    runs-on: ubuntu-latest
+    # Runs after the tests rather than beside them: the image installs Node,
+    # the gh CLI and a large SDK wheel, so it is far slower than the suite.
+    # Gating it on the tests keeps fast feedback fast and skips a costly
+    # build when the suite is already red.
+    needs: tests
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build (smoke, no push)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          push: false
+          tags: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
