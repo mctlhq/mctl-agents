@@ -285,7 +285,7 @@ def find_accepted_proposals(
             try:
                 data = _load_status(proposal_dir / ".status.yaml")
             except Exception as e:  # noqa: BLE001 — skip one bad status file, keep scanning the rest
-                print(f"⚠️  {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
+                print(f"warn: {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
                 continue
             status = data.get("status", "proposed")
             if status in accepted_states:
@@ -375,7 +375,7 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
         # sub-agent so Tier 2 still works for those repos.
         generic = AGENTS_DIR / "_generic" / ".claude" / "agents" / "implementer.md"
         if generic.exists():
-            print(f"ℹ️  No per-service implementer for '{service}'; using generic fallback.")  # noqa: RUF001
+            print(f"info: no per-service implementer for '{service}'; using generic fallback.")
             src = generic
         else:
             raise SystemExit(
@@ -951,7 +951,7 @@ def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
          "--title", title, "--body", body, "--head", branch, "--base", "main"],
     )
     pr_url = proc.stdout.strip().splitlines()[-1]
-    print(f"✓ PR opened: {pr_url}")
+    print(f"ok: PR opened: {pr_url}")
     return pr_url
 
 
@@ -1496,7 +1496,7 @@ def main() -> None:
         slug_filter=args.slug or None,
     )
     if not refs:
-        print("ℹ️  No accepted proposals found.")  # noqa: RUF001 — emoji, not a homoglyph
+        print("info: no accepted proposals found.")
         return
 
     print(f"Found {len(refs)} accepted proposal(s):")
@@ -1512,13 +1512,13 @@ def main() -> None:
     print("\n=== Summary ===")
     for result in results:
         if result.error:
-            print(f"  ✗ {result.ref.service}/{result.ref.slug} failed: {result.error}")
+            print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
         elif result.skipped_reason:
-            print(f"  · {result.ref.service}/{result.ref.slug} skipped: {result.skipped_reason}")
+            print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
         elif result.pr_url:
-            print(f"  ✓ {result.ref.service}/{result.ref.slug} → {result.pr_url}")
+            print(f"  ok   {result.ref.service}/{result.ref.slug} -> {result.pr_url}")
         else:
-            print(f"  ✗ {result.ref.service}/{result.ref.slug} failed: {result.error}")
+            print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
     outcome = _batch_outcome(results)
     print(
         "Totals: "

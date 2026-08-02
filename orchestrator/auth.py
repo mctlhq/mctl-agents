@@ -30,7 +30,7 @@ def detect_auth() -> AuthMode:
     if oauth:
         if not oauth.startswith("sk-ant-oat01-"):
             print(
-                "⚠️  CLAUDE_CODE_OAUTH_TOKEN does not look like an OAuth token "
+                "warn: CLAUDE_CODE_OAUTH_TOKEN does not look like an OAuth token "
                 "(should start with sk-ant-oat01-). Did you paste an API key by mistake?"
             )
         return AuthMode(
@@ -42,7 +42,7 @@ def detect_auth() -> AuthMode:
     if api_key:
         if not api_key.startswith("sk-ant-api03-"):
             print(
-                "⚠️  ANTHROPIC_API_KEY does not look like an API key "
+                "warn: ANTHROPIC_API_KEY does not look like an API key "
                 "(should start with sk-ant-api03-)."
             )
         return AuthMode(
@@ -83,7 +83,7 @@ def ensure_auth_for_sdk() -> AuthMode:
         if not os.getenv("ANTHROPIC_API_KEY", "").strip():
             os.environ.pop("ANTHROPIC_API_KEY", None)
 
-    print(f"🔑 Auth mode: {mode.name} — {mode.description}")
+    print(f"info: auth mode: {mode.name} — {mode.description}")
     return mode
 
 

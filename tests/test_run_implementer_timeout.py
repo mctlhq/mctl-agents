@@ -102,7 +102,7 @@ def test_implementer_agent_connected_mcp_dispatches_without_warning(tmp_path, mo
         ),
     )
     anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
-    assert "⚠️" not in capsys.readouterr().err
+    assert "warn:" not in capsys.readouterr().err
 
 
 def test_implementer_agent_failed_mcp_warns_but_still_dispatches(tmp_path, monkeypatch, capsys):

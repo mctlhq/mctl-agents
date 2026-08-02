@@ -115,4 +115,4 @@ async def ensure_mctl_connected(client: ClaudeSDKClient, *, fatal: bool) -> None
     except McpNotConnectedError as exc:
         if fatal:
             raise
-        print(f"⚠️  {exc}", file=sys.stderr)
+        print(f"warn: {exc}", file=sys.stderr)
