@@ -85,6 +85,7 @@ async def _safe_run_incident_responder() -> None:
         # step status) correctly reports failure instead of a false green,
         # and run-fallback gets a chance to retry on the account-2 token.
         print(f"❌ incident-responder: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         sys.exit(MCP_NOT_CONNECTED_EXIT_CODE)
     except (Exception, SystemExit) as exc:  # noqa: BLE001 — intentional broad catch
         print(

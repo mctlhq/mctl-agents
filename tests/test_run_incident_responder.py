@@ -7,8 +7,12 @@ Succeeded. The fix has two parts, tested separately:
 
   1. `run_incident_responder()` switched from the one-shot `query()` to
      `ClaudeSDKClient` so it can call `get_mcp_status()` before dispatching
-     the prompt, and raises `McpNotConnectedError` if mctl MCP was
-     configured but never reached "connected".
+     the prompt, polling via `_wait_for_mctl_connected()` (not a single
+     immediate read — alwaysLoad's blocking guarantee is tied to first-turn
+     dispatch, not client construction, so a lone read can race a
+     legitimately still-connecting server) and raising
+     `McpNotConnectedError` if mctl MCP was configured but never settles on
+     "connected".
   2. `run_all._safe_run_incident_responder()` must NOT swallow that
      specific exception the way it swallows transient SDK/budget errors —
      it has to `sys.exit(MCP_NOT_CONNECTED_EXIT_CODE)` so Argo's
@@ -20,6 +24,8 @@ here.
 """
 from __future__ import annotations
 
+import types
+
 import anyio
 import pytest
 
@@ -29,10 +35,16 @@ from orchestrator.run_incident_responder import McpNotConnectedError
 
 
 class _FakeClient:
-    def __init__(self, *, mcp_status, messages, options=None):
-        self._mcp_status = mcp_status
+    def __init__(self, *, statuses, messages, status_error=None, options=None):
+        # `statuses` is a list of {"mcpServers": [...]} dicts consumed in
+        # order, one per get_mcp_status() call; the last entry repeats once
+        # exhausted (so a "never connects" test can just supply one status
+        # and let the poll loop hit it every tick until timeout).
+        self._statuses = list(statuses)
         self._messages = messages
+        self._status_error = status_error
         self.queried_prompt = None
+        self.status_calls = 0
 
     async def __aenter__(self):
         return self
@@ -41,7 +53,12 @@ class _FakeClient:
         return False
 
     async def get_mcp_status(self):
-        return self._mcp_status
+        self.status_calls += 1
+        if self._status_error is not None:
+            raise self._status_error
+        if len(self._statuses) > 1:
+            return self._statuses.pop(0)
+        return self._statuses[0]
 
     async def query(self, prompt):
         self.queried_prompt = prompt
@@ -51,45 +68,112 @@ class _FakeClient:
             yield message
 
 
-def _fake_client_factory(*, mcp_status, messages=()):
+def _fake_client_factory(*, statuses, messages=(), status_error=None):
     def _factory(*, options):
-        return _FakeClient(mcp_status=mcp_status, messages=messages, options=options)
+        return _FakeClient(
+            statuses=statuses, messages=messages, status_error=status_error,
+            options=options,
+        )
     return _factory
+
+
+def _stub_build_options(monkeypatch, *, mcp_servers):
+    """Bypass the real build_incident_responder_options() (which reads the
+    real MCTL_TOKEN env var) with a stand-in exposing just the .mcp_servers
+    attribute run_incident_responder() actually reads."""
+    monkeypatch.setattr(
+        rir, "build_incident_responder_options",
+        lambda **kwargs: types.SimpleNamespace(mcp_servers=mcp_servers),
+    )
+
+
+def _shrink_poll_window(monkeypatch):
+    """Tests that exercise the timeout path would otherwise take
+    MCP_CONNECT_POLL_TIMEOUT_S (5s) each — shrink it so the suite stays fast."""
+    monkeypatch.setattr(rir, "MCP_CONNECT_POLL_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(rir, "MCP_CONNECT_POLL_INTERVAL_S", 0.01)
 
 
 # ---------------------------------------------------------------------------
 # run_incident_responder — MCP status guard
 # ---------------------------------------------------------------------------
-def test_raises_when_mctl_status_not_connected(monkeypatch):
-    monkeypatch.setattr(rir, "mctl_mcp_config", lambda: {"mctl": {}})
+def test_raises_when_mctl_never_connects(monkeypatch):
+    _shrink_poll_window(monkeypatch)
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
     monkeypatch.setattr(
         rir, "ClaudeSDKClient",
         _fake_client_factory(
-            mcp_status={"mcpServers": [{"name": "mctl", "status": "pending"}]}
+            statuses=[{"mcpServers": [{"name": "mctl", "status": "pending"}]}]
         ),
     )
     with pytest.raises(McpNotConnectedError):
         anyio.run(rir.run_incident_responder)
 
 
+def test_raises_immediately_on_terminal_failure_status(monkeypatch):
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        rir, "ClaudeSDKClient",
+        _fake_client_factory(
+            statuses=[{"mcpServers": [
+                {"name": "mctl", "status": "failed", "error": "handshake refused"}
+            ]}]
+        ),
+    )
+    with pytest.raises(McpNotConnectedError, match="handshake refused"):
+        anyio.run(rir.run_incident_responder)
+
+
 def test_raises_when_mctl_missing_from_status_list(monkeypatch):
     """The server never showing up in mcpServers at all is the same failure
     as an explicit non-connected status — must not be treated as fine."""
-    monkeypatch.setattr(rir, "mctl_mcp_config", lambda: {"mctl": {}})
+    _shrink_poll_window(monkeypatch)
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
     monkeypatch.setattr(
         rir, "ClaudeSDKClient",
-        _fake_client_factory(mcp_status={"mcpServers": []}),
+        _fake_client_factory(statuses=[{"mcpServers": []}]),
     )
     with pytest.raises(McpNotConnectedError):
         anyio.run(rir.run_incident_responder)
 
 
+def test_raises_when_status_check_itself_errors(monkeypatch):
+    """get_mcp_status() failing outright (SDK control-request timeout,
+    malformed response, ...) means zero real work happened too — it must
+    surface as McpNotConnectedError, not fall through to run_all's generic
+    swallow-everything branch and recreate the false-green bug."""
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        rir, "ClaudeSDKClient",
+        _fake_client_factory(statuses=[], status_error=RuntimeError("control request timed out")),
+    )
+    with pytest.raises(McpNotConnectedError, match="control request timed out"):
+        anyio.run(rir.run_incident_responder)
+
+
+def test_recovers_after_transient_pending_status(monkeypatch):
+    """Regression for the race Codex and claude[bot] both flagged: a status
+    read immediately after connect can legitimately observe 'pending' on a
+    server that connects moments later. The poll loop must NOT treat that
+    as a permanent failure — only a terminal status or a full timeout."""
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
+    monkeypatch.setattr(
+        rir, "ClaudeSDKClient",
+        _fake_client_factory(statuses=[
+            {"mcpServers": [{"name": "mctl", "status": "pending"}]},
+            {"mcpServers": [{"name": "mctl", "status": "pending"}]},
+            {"mcpServers": [{"name": "mctl", "status": "connected"}]},
+        ]),
+    )
+    anyio.run(rir.run_incident_responder)  # must not raise
+
+
 def test_does_not_raise_when_mctl_connected(monkeypatch):
-    monkeypatch.setattr(rir, "mctl_mcp_config", lambda: {"mctl": {}})
+    _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
     monkeypatch.setattr(
         rir, "ClaudeSDKClient",
         _fake_client_factory(
-            mcp_status={"mcpServers": [{"name": "mctl", "status": "connected"}]}
+            statuses=[{"mcpServers": [{"name": "mctl", "status": "connected"}]}]
         ),
     )
     anyio.run(rir.run_incident_responder)  # must not raise
@@ -99,12 +183,12 @@ def test_skips_check_when_mcp_not_configured(monkeypatch):
     """MCTL_TOKEN unset is the documented degrade-gracefully / local-dev
     path (mctl_mcp_config's own docstring) — it must not be conflated with
     a real connectivity failure."""
-    monkeypatch.setattr(rir, "mctl_mcp_config", lambda: {})
+    _stub_build_options(monkeypatch, mcp_servers={})
     monkeypatch.setattr(
         rir, "ClaudeSDKClient",
         # Would fail the check if it were evaluated — proves the guard is
         # actually skipped, not just coincidentally passing.
-        _fake_client_factory(mcp_status={"mcpServers": []}),
+        _fake_client_factory(statuses=[{"mcpServers": []}]),
     )
     anyio.run(rir.run_incident_responder)  # must not raise
 

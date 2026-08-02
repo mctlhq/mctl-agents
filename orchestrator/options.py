@@ -8,31 +8,38 @@ from claude_agent_sdk import ClaudeAgentOptions
 from config.settings import MCTL_MCP_URL
 
 
-def mctl_mcp_config() -> dict:
+def mctl_mcp_config(*, always_load: bool = False) -> dict:
     """MCP config for https://api.mctl.ai/mcp.
 
     Returns an empty dict when MCTL_TOKEN is unset — the agent then runs
     without mcp__mctl__* tools (Read/Write/WebSearch/WebFetch/Bash only).
     Convenient for smoke tests and local dev without mctl access.
+
+    always_load: sets the CLI's `alwaysLoad` flag, which blocks first-turn
+    dispatch until this server connects (bounded by the CLI's own MCP
+    connection timeout) instead of connecting in the background — without
+    it, the CLI can dispatch the first turn before the handshake completes,
+    silently running with zero mcp__mctl__* tools (see mctl-telegram#316
+    for the equivalent stdio-transport bug this mirrors). Deliberately
+    opt-in rather than the default here: only the incident-responder's
+    prompt treats "no mcp__mctl__* tools" as a silent, valid success, so
+    only it needs this guarantee — the other modes already tolerate a
+    missing/slow mctl connection, and forcing every one of them to block
+    on api.mctl.ai health would give a single mctl outage more blast
+    radius than necessary.
     """
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
         print("⚠️  MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
         return {}
-    return {
-        "mctl": {
-            "type": "http",
-            "url": MCTL_MCP_URL,
-            "headers": {"Authorization": f"Bearer {token}"},
-            # Without this, Claude Code connects to the server in the
-            # background and can dispatch the first (often only) turn before
-            # the handshake completes, silently running with zero
-            # mcp__mctl__* tools. alwaysLoad blocks first-turn dispatch
-            # until the server connects. See mctl-telegram#316 for the
-            # equivalent stdio-transport bug this mirrors.
-            "alwaysLoad": True,
-        }
+    server_config = {
+        "type": "http",
+        "url": MCTL_MCP_URL,
+        "headers": {"Authorization": f"Bearer {token}"},
     }
+    if always_load:
+        server_config["alwaysLoad"] = True
+    return {"mctl": server_config}
 
 
 def _mctl_tool_globs() -> list[str]:
@@ -201,7 +208,11 @@ def build_incident_responder_options(
         allowed_tools=[
             "Read", "Write", "Bash", "Glob",
         ] + _mctl_tool_globs(),
-        mcp_servers=mctl_mcp_config(),
+        # always_load=True: this mode's own prompt treats "no mcp__mctl__*
+        # tools" as a silent, valid success (see run_incident_responder.py's
+        # McpNotConnectedError), so it's the one mode that needs the
+        # blocking connection guarantee. See mctl_mcp_config()'s docstring.
+        mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
