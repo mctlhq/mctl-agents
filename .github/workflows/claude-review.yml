@@ -88,9 +88,11 @@ jobs:
           # initiated by non-human actor"), making the review-required check
           # structurally unpassable for every release PR. Matching normalizes
           # both sides (lowercase, trailing "[bot]" stripped), so the bare name
-          # covers the `github-actions[bot]` actor. Deliberately NOT "*": that
+          # covers the `github-actions[bot]` actor. `mctl-app` covers release
+          # PRs opened via the App token (release-please.yml's `token:` input)
+          # instead of the default GITHUB_TOKEN. Deliberately NOT "*": that
           # would let any bot-triggered workflow invoke the reviewer.
-          allowed_bots: "github-actions"
+          allowed_bots: "github-actions,mctl-app"
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           track_progress: true
           prompt: |
@@ -168,7 +170,7 @@ jobs:
         with:
           # Must match the step above: the bot-actor check runs before the token
           # is ever used, so without this the fallback fails identically.
-          allowed_bots: "github-actions"
+          allowed_bots: "github-actions,mctl-app"
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
           track_progress: true
           prompt: |
