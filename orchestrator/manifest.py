@@ -25,6 +25,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFESTS_DIR = REPO_ROOT / "agents" / "_manifests"
 
 SUPPORTED_API_VERSION = "agents.mctl.ai/v1alpha1"
+# The only runtime.type v1 knows how to execute. See docs/agent-inventory.yaml's
+# L4 roadmap note (plan phase L4) for why a second runtime is a bigger step
+# than adding a string here.
+SUPPORTED_RUNTIME_TYPE = "claude-agent-sdk"
 
 
 class ManifestError(ValueError):
@@ -53,7 +57,11 @@ def _resolve_ref(ref: str) -> tuple[Any, str]:
     module_name, _, symbol = ref.partition(":")
     if not module_name or not symbol:
         raise ManifestError(f"expected 'module:symbol', got {ref!r}")
-    return importlib.import_module(module_name), symbol
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise ManifestError(f"cannot import {module_name!r}: {exc}") from exc
+    return module, symbol
 
 
 @dataclass(frozen=True)
@@ -64,6 +72,7 @@ class AgentManifest:
 
     name: str
     owner: str
+    runtime_type: str
     entrypoint: str
     options_builder: str
     prompt_sources: tuple[PromptSource, ...]
@@ -75,24 +84,30 @@ class AgentManifest:
     cluster_workflow_template: str
     path: Path
 
-    def resolve_entrypoint(self) -> Callable[..., Any]:
-        module, symbol = _resolve_ref(self.entrypoint)
+    def _resolve_callable(self, ref: str, field: str) -> Callable[..., Any]:
+        module, symbol = _resolve_ref(ref)
         if not hasattr(module, symbol):
-            raise ManifestError(f"{self.name}: entrypoint {self.entrypoint!r} does not resolve")
-        return getattr(module, symbol)
+            raise ManifestError(f"{self.name}: {field} {ref!r} does not resolve")
+        value = getattr(module, symbol)
+        if not callable(value):
+            raise ManifestError(f"{self.name}: {field} {ref!r} resolves to {value!r}, which is not callable")
+        return value
+
+    def resolve_entrypoint(self) -> Callable[..., Any]:
+        return self._resolve_callable(self.entrypoint, "entrypoint")
 
     def resolve_options_builder(self) -> Callable[..., Any]:
-        module, symbol = _resolve_ref(self.options_builder)
-        if not hasattr(module, symbol):
-            raise ManifestError(f"{self.name}: optionsBuilder {self.options_builder!r} does not resolve")
-        return getattr(module, symbol)
+        return self._resolve_callable(self.options_builder, "optionsBuilder")
 
 
 def load(path: Path) -> AgentManifest:
     """Parse one agent.yaml. Raises ManifestError on anything structurally
     wrong; does not check the claims against the real code — that is
     orchestrator/validate_manifest.py's job."""
-    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ManifestError(f"{path}: invalid YAML: {exc}") from exc
     if not isinstance(document, dict):
         raise ManifestError(f"{path}: root must be a mapping")
 
@@ -126,13 +141,30 @@ def load(path: Path) -> AgentManifest:
             f"(agents/_manifests/{path.parent.name}/agent.yaml)"
         )
 
+    prompt_sources = tuple(PromptSource.from_dict(s) for s in prompt.get("sources", []))
+    if not prompt_sources:
+        # An empty list is not "no prompt sources declared yet" — it silently
+        # defeats the entire manifest contract, since a future version hash
+        # over zero inputs would be constant regardless of what the agent
+        # actually does. Every real agent has at least one (see
+        # docs/agent-inventory.yaml).
+        raise ManifestError(f"{path}: spec.prompt.sources must not be empty")
+
+    runtime_type = runtime.get("type", "")
+    if runtime_type != SUPPORTED_RUNTIME_TYPE:
+        raise ManifestError(
+            f"{path}: spec.runtime.type {runtime_type!r} is not {SUPPORTED_RUNTIME_TYPE!r} "
+            "(the only runtime v1 supports)"
+        )
+
     timeout_raw = execution.get("timeoutSeconds")
     return AgentManifest(
         name=name,
         owner=metadata.get("owner", ""),
+        runtime_type=runtime_type,
         entrypoint=runtime.get("entrypoint", ""),
         options_builder=runtime.get("optionsBuilder", ""),
-        prompt_sources=tuple(PromptSource.from_dict(s) for s in prompt.get("sources", [])),
+        prompt_sources=prompt_sources,
         model_policy_task=model_policy.get("task", ""),
         tool_allow=tuple(tool_policy.get("allow", [])),
         budget_usd=float(execution.get("budgetUsd", 0)),

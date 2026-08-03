@@ -15,9 +15,13 @@ the next one fails loudly instead of merging quietly.
 from __future__ import annotations
 
 import glob as globmod
+import importlib
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
+from typing import Any
 
 import yaml
 
@@ -56,6 +60,34 @@ _DUMMY_MCTL_TOKEN = "validate-manifest-dummy-token"  # noqa: S105 - not a real c
 # no-ops when the path is absent), so a nonexistent path is fine here — this
 # call exists only to inspect the ClaudeAgentOptions it returns.
 _DUMMY_PATH = Path("/nonexistent/agent-manifest-validation")
+
+# Every one of these is read once, at options.py's module import time, into a
+# module-level constant (e.g. `IMPLEMENTER_BUDGET_USD = float(os.getenv(...))`).
+# If any is exported in the shell running this validator, the "actual" value
+# below reflects that override instead of the coded default the manifest
+# claims to mirror — cleared for the duration of the comparison so the same
+# checkout validates the same way in a clean CI shell and a configured
+# developer shell.
+_ENV_VARS_AFFECTING_OPTIONS_DEFAULTS = (
+    "SERVICE_AGENT_BUDGET_USD",
+    "MENTOR_BUDGET_USD",
+    "IMPLEMENTER_BUDGET_USD",
+    "IMPLEMENTER_TIMEOUT_SECONDS",
+    "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS",
+    "SHEPHERD_BUDGET_USD",
+    "ISSUE_INVESTIGATOR_BUDGET_USD",
+    "INCIDENT_RESPONDER_BUDGET_USD",
+)
+
+# Agents whose execution.timeoutSeconds claims to mirror a real options.py
+# wall-clock constant, checked the same way toolPolicy/budgetUsd are: by
+# reading the real value, not trusting the YAML. Only implementer has one
+# today (IMPLEMENTER_TIMEOUT_SECONDS) — the other five don't bound wall-clock
+# time in options.py, so they must not declare timeoutSeconds at all (see the
+# "declared but unchecked" branch below).
+_TIMEOUT_CONSTANT_BY_AGENT = {
+    "implementer": "IMPLEMENTER_TIMEOUT_SECONDS",
+}
 
 
 def _builder_call_args(builder_name: str) -> tuple[tuple[object, ...], dict[str, object]]:
@@ -128,14 +160,39 @@ def _check_cluster_workflow_template(manifest: AgentManifest) -> list[str]:
     return []
 
 
+def _resolve_builder_module_with_clean_env(manifest: AgentManifest) -> tuple[Callable[..., Any], ModuleType]:
+    """Resolve the manifest's optionsBuilder with
+    _ENV_VARS_AFFECTING_OPTIONS_DEFAULTS cleared, reloading the module if it
+    was already imported (by this process's earlier manifests, or by another
+    test module) so its constants reflect the clean environment rather than
+    whatever was cached from the first import. Raises ManifestError if the
+    builder itself doesn't resolve."""
+    previous_env = {name: os.environ.pop(name, None) for name in _ENV_VARS_AFFECTING_OPTIONS_DEFAULTS}
+    try:
+        builder = manifest.resolve_options_builder()
+        module = sys.modules[builder.__module__]
+        importlib.reload(module)
+        # reload() re-executes the module body in place, so the pre-reload
+        # `builder` reference above may be stale — re-fetch by name.
+        builder = getattr(module, builder.__name__)
+        return builder, module
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _check_tool_policy_and_budget_match_options_py(manifest: AgentManifest) -> list[str]:
     """The manifest's toolPolicy/execution must match what options.py
     actually builds. This is the "derived from options.py, not a second
-    copy" contract: rather than trusting the YAML's allow list and budget
-    number, call the real builder and compare. An options.py edit that isn't
-    mirrored here fails this check instead of silently drifting."""
+    copy" contract: rather than trusting the YAML's allow list, budget
+    number, and timeout, call the real builder (and read the real module
+    constants) and compare. An options.py edit that isn't mirrored here
+    fails this check instead of silently drifting."""
     try:
-        builder = manifest.resolve_options_builder()
+        builder, module = _resolve_builder_module_with_clean_env(manifest)
     except ManifestError as exc:
         return [str(exc)]
 
@@ -167,6 +224,24 @@ def _check_tool_policy_and_budget_match_options_py(manifest: AgentManifest) -> l
             f"execution.budgetUsd {manifest.budget_usd} does not match "
             f"options.py's actual max_budget_usd {options.max_budget_usd}"
         )
+
+    timeout_constant = _TIMEOUT_CONSTANT_BY_AGENT.get(manifest.name)
+    if timeout_constant is None:
+        if manifest.timeout_seconds is not None:
+            errors.append(
+                f"execution.timeoutSeconds is declared ({manifest.timeout_seconds}) but "
+                f"{manifest.name!r} has no entry in _TIMEOUT_CONSTANT_BY_AGENT to check it "
+                "against — either the claim is unchecked, or the mapping is missing"
+            )
+    else:
+        actual_timeout = getattr(module, timeout_constant, None)
+        if actual_timeout is None:
+            errors.append(f"expected {module.__name__}.{timeout_constant} to exist for the timeout comparison")
+        elif manifest.timeout_seconds != actual_timeout:
+            errors.append(
+                f"execution.timeoutSeconds {manifest.timeout_seconds} does not match "
+                f"{module.__name__}.{timeout_constant} {actual_timeout}"
+            )
     return errors
 
 
@@ -218,6 +293,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no manifests found under {MANIFESTS_DIR}", file=sys.stderr)
         return 1
 
+    if not GITOPS_CWFT_DIR.is_dir():
+        # Otherwise every "OK" line below is indistinguishable from one where
+        # clusterWorkflowTemplate was actually cross-checked against
+        # mctl-gitops, which in CI it never is (that checkout isn't present).
+        print(f"NOTE mctl-gitops not found at {GITOPS_CWFT_DIR} — clusterWorkflowTemplate checks are skipped below")
+
     manifests: dict[str, AgentManifest] = {}
     exit_code = 0
     for manifest_path in paths:
@@ -237,7 +318,17 @@ def main(argv: list[str] | None = None) -> int:
             continue
         manifests[manifest.name] = manifest
 
-        errors = validate(manifest)
+        # validate() resolves entrypoints and calls the real options.py
+        # builder for every manifest — a bad reference in ANY one of them
+        # must not abort the batch and leave the rest unchecked, which is
+        # the entire point of running this over every manifest at once.
+        try:
+            errors = validate(manifest)
+        except Exception as exc:  # noqa: BLE001 - report as this manifest's failure, not a crash
+            print(f"FAIL {manifest_path} ({manifest.name}): unexpected error: {exc}")
+            exit_code = 1
+            continue
+
         if errors:
             exit_code = 1
             print(f"FAIL {manifest_path} ({manifest.name}):")
