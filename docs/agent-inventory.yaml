@@ -62,7 +62,14 @@ agents:
     optionsBuilder: orchestrator.options:build_implementer_agent_options
     promptSources:
       - inline: orchestrator/run_implementer.py:_build_prompt
-      - glob: agents/*/.claude/agents/implementer.md
+      # `[!_]` excludes the underscore-prefixed directories, which are other
+      # agents' homes (_shepherd, _mentor, _incident-responder) plus _generic.
+      # Matches the eight real service dirs — SERVICES, not ROTATING_SERVICES,
+      # because the implementer accepts issue-driven targets that the proactive
+      # rotation skips. _generic is listed separately below rather than being
+      # swept up here, so each line means exactly one thing and the fallback is
+      # not hashed twice.
+      - glob: agents/[!_]*/.claude/agents/implementer.md
       - file: agents/_generic/.claude/agents/implementer.md   # fallback
     modelPolicyTask: service_agent
     budgetEnv: IMPLEMENTER_BUDGET_USD          # default 3.00
@@ -128,16 +135,26 @@ agents:
     entrypoint: orchestrator.run_service_agent:run_service_agent
     optionsBuilder: orchestrator.options:build_service_agent_options
     promptSources:
-      - glob: agents/*/CLAUDE.md
+      # `[!_]` is load-bearing, not tidiness: a plain `agents/*/CLAUDE.md`
+      # also matches agents/_incident-responder/CLAUDE.md and
+      # agents/_mentor/CLAUDE.md, which are those agents' prompt sources, not
+      # this one's. run_service_agent.py only ever reads
+      # AGENTS_DIR / <service> / CLAUDE.md for services in ROTATING_SERVICES.
+      # Left unscoped, editing the mentor's prompt would bump service-agent's
+      # version hash — exactly the false bump this inventory exists to prevent.
+      # The character class keeps the pattern derived-from-disk rather than a
+      # hand-maintained copy of ROTATING_SERVICES that would silently rot;
+      # verified to match that list exactly.
+      - glob: agents/[!_]*/CLAUDE.md
       # Listed one per line on purpose: promptSources globs are consumed by
       # Python's glob module, which does NOT expand brace syntax. A
       # `{researcher,analyst,spec-writer}.md` pattern silently matches nothing.
-      # `agents/*/.claude/agents/*.md` would be shorter but would also swallow
-      # implementer.md, which belongs to the implementer agent, not this one.
-      - glob: agents/*/.claude/agents/researcher.md
-      - glob: agents/*/.claude/agents/analyst.md
-      - glob: agents/*/.claude/agents/spec-writer.md
-      - glob: agents/*/.claude/skills/**
+      # `agents/[!_]*/.claude/agents/*.md` would be shorter but would also
+      # swallow implementer.md, which belongs to the implementer agent.
+      - glob: agents/[!_]*/.claude/agents/researcher.md
+      - glob: agents/[!_]*/.claude/agents/analyst.md
+      - glob: agents/[!_]*/.claude/agents/spec-writer.md
+      - glob: agents/[!_]*/.claude/skills/**
     modelPolicyTask: service_agent
     budgetEnv: SERVICE_AGENT_BUDGET_USD        # default 5.00
     sandbox:
