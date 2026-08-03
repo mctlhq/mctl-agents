@@ -1,0 +1,344 @@
+# Agent inventory — phase 0 of the dev-workflow control plane.
+#
+# Purpose: draw the line between things that are AGENTS (get an AgentManifest,
+# an immutable version and a per-environment release in the registry) and
+# things that merely orchestrate or support them. Everything here describes
+# what exists TODAY; it is a classification, not a proposal.
+#
+# The distinguishing test for "agent": it calls the Claude Agent SDK, so its
+# behaviour depends on a prompt and a model and can therefore regress between
+# versions. A module that only globs files, queries GitHub and branches on the
+# result is deterministic — it is orchestration, and belongs in a workflow.
+#
+# Consumed by orchestrator/validate_manifest.py (phase 1) to assert that every
+# agent listed here has a manifest and vice versa.
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# Agents — one AgentManifest each.
+# ---------------------------------------------------------------------------
+#
+# `promptSources` is the full set of inputs that determine behaviour. It is
+# deliberately a LIST, not a single path: no agent in this system has its
+# prompt in one file. Every agent composes
+#   (a) an inline Python template, and
+#   (b) zero or more on-disk files picked up from cwd by the SDK
+#       (CLAUDE.md, .claude/agents/*.md sub-agents, .claude/skills/).
+# The version hash in the registry must cover all of them, otherwise editing a
+# sub-agent markdown file silently changes behaviour without a version bump.
+#
+# `promptSources` entries may be globs. Where a glob spans services (the
+# implementer and service-agent cases), a change to ANY matched file bumps the
+# single agent's version — these are per-service specialisations of one agent,
+# not separate agents.
+#
+# promptSources vs runtimeContextInputs
+# -------------------------------------
+# Two agents (issue-investigator, implementer) run with cwd inside a clone of
+# the TARGET repo and setting_sources=["project"], and their prompts explicitly
+# tell them to follow that repo's CLAUDE.md. So the target repo's instructions
+# genuinely are part of the effective prompt — but they live in another
+# repository, change independently of this one, and differ per target. They
+# cannot be hashed when a version is published.
+#
+# Pretending otherwise would make the version claim false, so the two are kept
+# apart:
+#
+#   promptSources        inputs owned by THIS repo and fixed at publish time.
+#                        These are what the version hash covers: inline
+#                        templates, files the SDK auto-loads from cwd
+#                        (CLAUDE.md, .claude/agents/*.md, .claude/skills/),
+#                        and in-repo knowledge bases the prompt directs the
+#                        agent to read (context/).
+#
+#   runtimeContextInputs inputs that are real prompt surface but resolve per
+#                        run, outside this repo. NOT part of the version hash.
+#                        They are pinned per-execution instead, by the target
+#                        repo git SHA recorded on the execution record.
+#
+# Practical consequence, and the reason this distinction is written down: an
+# agent version is reproducible only against a fixed target SHA. A shadow or
+# canary comparison that runs two agent versions against different target SHAs
+# is confounded and its diff means nothing.
+
+agents:
+  - name: issue-investigator
+    driver: orchestrator/run_issue_investigator.py
+    entrypoint: orchestrator.run_issue_investigator:investigate
+    optionsBuilder: orchestrator.options:build_issue_investigator_options
+    promptSources:
+      - inline: orchestrator/run_issue_investigator.py:_build_prompt
+    runtimeContextInputs:
+      # cwd is a clone of the target repo with setting_sources=["project"],
+      # and _build_prompt tells the agent in so many words: "Read the repo's
+      # CLAUDE.md (cwd root, if present) for conventions". Editing a target
+      # repo's CLAUDE.md therefore changes this agent's behaviour without
+      # changing its version — pinned per run by the target git SHA instead.
+      - targetRepo: CLAUDE.md
+      - targetRepo: source tree (Glob/Grep/Read to ground the design)
+    modelPolicyTask: service_agent
+    budgetEnv: ISSUE_INVESTIGATOR_BUDGET_USD   # default 3.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-investigate
+    writes: gitops agents-state proposals + a GitHub issue comment
+    riskLevel: low          # read-only against the target repo
+    triggeredBy:
+      - mctl_trigger_issue (MCP, admin-only)
+      - orchestrator/run_issue_poller.py (agents:intake label)
+    notes: >-
+      cwd is a throwaway shallow clone of the target repo, so the SDK picks up
+      no mctl-agents-owned prompt files at all: the inline template is this
+      repo's entire contribution to the prompt, which is what makes it the
+      cheapest agent to version and therefore the phase-4 pilot. It is NOT the
+      entire prompt surface — the target repo's own CLAUDE.md is auto-loaded by
+      setting_sources=["project"] and the prompt explicitly asks for it, so
+      reproducibility here is per (agent version, target SHA), not per agent
+      version alone. See runtimeContextInputs above.
+
+  - name: implementer
+    driver: orchestrator/run_implementer.py
+    entrypoint: orchestrator.run_implementer:implement_one
+    optionsBuilder: orchestrator.options:build_implementer_agent_options
+    promptSources:
+      - inline: orchestrator/run_implementer.py:_build_prompt
+      # `[!_]` excludes the underscore-prefixed directories, which are other
+      # agents' homes (_shepherd, _mentor, _incident-responder) plus _generic.
+      # Matches the eight real service dirs — SERVICES, not ROTATING_SERVICES,
+      # because the implementer accepts issue-driven targets that the proactive
+      # rotation skips. _generic is listed separately below rather than being
+      # swept up here, so each line means exactly one thing and the fallback is
+      # not hashed twice.
+      - glob: agents/[!_]*/.claude/agents/implementer.md
+      - file: agents/_generic/.claude/agents/implementer.md   # fallback
+    runtimeContextInputs:
+      # Same exposure as the investigator, and it matters more here: this is
+      # the agent that authors code. Options enable project settings in the
+      # cloned target repo, and _build_prompt says "Follow that repo's
+      # CLAUDE.md conventions". A target repo can therefore change how this
+      # high-risk agent behaves without any version moving in the registry.
+      - targetRepo: CLAUDE.md
+      # The spec triplet is an input too, but a controlled one: it is written
+      # by the investigator into gitops agents-state and passed via
+      # PROPOSAL_DIR, so it is pinned by the gitops commit, not by this file.
+      - proposalDir: requirements.md / design.md / tasks.md (via PROPOSAL_DIR)
+    modelPolicyTask: service_agent
+    budgetEnv: IMPLEMENTER_BUDGET_USD          # default 3.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-implement
+    writes: commits + branch + PR on mctlhq/<service>
+    riskLevel: high         # the only agent that authors code
+    triggeredBy:
+      - cronworkflow-mctl-agents-implement (currently suspend: true)
+      - mctl_trigger_implementer (MCP, admin-only)
+      - forked by run_shepherd.py with --review-feedback
+    notes: >-
+      Per-service sub-agent prompts are copied into the cloned repo's
+      .claude/agents/ before launch (_copy_implementer_subagent), falling back
+      to _generic. One agent with per-service specialisations — NOT eight
+      agents: they share a driver, an options builder and a budget.
+
+  - name: shepherd
+    driver: orchestrator/run_shepherd.py
+    entrypoint: orchestrator.run_shepherd:process_one
+    optionsBuilder: orchestrator.options:build_shepherd_options
+    promptSources:
+      - inline: orchestrator/run_shepherd.py:_format_bundle_via_sdk
+      - file: agents/_shepherd/.claude/agents/shepherd.md
+    modelPolicyTask: review_findings_normalize
+    budgetEnv: SHEPHERD_BUDGET_USD             # default 5.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-shepherd
+    writes: PR merges, follow-up commits (via the implementer), status projections
+    riskLevel: high         # it merges to main
+    triggeredBy:
+      - cronworkflow-mctl-agents-shepherd
+      - mctl_trigger_shepherd (MCP, admin-only)
+    notes: >-
+      Mostly deterministic: decide() is a pure function and the SDK is used
+      only to normalise review findings into a JSON bundle. When this moves to
+      Temporal, decide() and the GitHub polling belong in the worker; only the
+      normalisation call needs a sandboxed run. Runs with mcp_servers={} — it
+      is the one agent with no mctl MCP access at all.
+
+  - name: incident-responder
+    driver: orchestrator/run_incident_responder.py
+    entrypoint: orchestrator.run_incident_responder:run_incident_responder
+    optionsBuilder: orchestrator.options:build_incident_responder_options
+    promptSources:
+      - inline: orchestrator/run_incident_responder.py:_build_prompt
+      - file: agents/_incident-responder/CLAUDE.md
+    modelPolicyTask: service_agent             # INCIDENT_RESPONDER_MODEL override
+    budgetEnv: INCIDENT_RESPONDER_BUDGET_USD   # default 5.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run
+    writes: gitops proposals (status=accepted) + resolves mctl incidents
+    riskLevel: medium       # writes accepted proposals, bypassing human triage
+    triggeredBy:
+      - cronworkflow-mctl-agents-incidents
+      - mctl_trigger_incident_responder (MCP, admin-only)
+
+  - name: service-agent
+    driver: orchestrator/run_service_agent.py
+    entrypoint: orchestrator.run_service_agent:run_service_agent
+    optionsBuilder: orchestrator.options:build_service_agent_options
+    promptSources:
+      # The whole daily sequence — researcher -> analyst -> spec-writer, the
+      # output rules, the "no human to ask" framing — is a module-level
+      # constant handed to client.query(), not an on-disk file. Editing it
+      # changes every rotation run, so it belongs in the hash.
+      - inline: orchestrator/run_service_agent.py:PROMPT
+      # That PROMPT directs the agent to "use context/ (read-only knowledge
+      # base — architecture, ADRs, current version) ... as your playbook", and
+      # entrypoint.sh symlinks only inbox/ and proposals/ out to STATE_DIR —
+      # context/ stays baked into the image. So unlike the target-repo
+      # CLAUDE.md above, this one IS owned by this repo and IS hashable, and
+      # rewriting a service's architecture notes really does change behaviour.
+      - glob: agents/[!_]*/context/**
+      # `[!_]` is load-bearing, not tidiness: a plain `agents/*/CLAUDE.md`
+      # also matches agents/_incident-responder/CLAUDE.md and
+      # agents/_mentor/CLAUDE.md, which are those agents' prompt sources, not
+      # this one's. run_service_agent.py only ever reads
+      # AGENTS_DIR / <service> / CLAUDE.md for services in ROTATING_SERVICES.
+      # Left unscoped, editing the mentor's prompt would bump service-agent's
+      # version hash — exactly the false bump this inventory exists to prevent.
+      # The character class keeps the pattern derived-from-disk rather than a
+      # hand-maintained copy of ROTATING_SERVICES that would silently rot;
+      # verified to match that list exactly.
+      - glob: agents/[!_]*/CLAUDE.md
+      # Listed one per line on purpose: promptSources globs are consumed by
+      # Python's glob module, which does NOT expand brace syntax. A
+      # `{researcher,analyst,spec-writer}.md` pattern silently matches nothing.
+      # `agents/[!_]*/.claude/agents/*.md` would be shorter but would also
+      # swallow implementer.md, which belongs to the implementer agent.
+      - glob: agents/[!_]*/.claude/agents/researcher.md
+      - glob: agents/[!_]*/.claude/agents/analyst.md
+      - glob: agents/[!_]*/.claude/agents/spec-writer.md
+      - glob: agents/[!_]*/.claude/skills/**
+    modelPolicyTask: service_agent
+    budgetEnv: SERVICE_AGENT_BUDGET_USD        # default 5.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run
+    writes: gitops inbox/ findings + proposals (status=proposed)
+    riskLevel: low
+    triggeredBy:
+      - cwft-mctl-agents-daily
+      - mctl_trigger_single_service / mctl_trigger_agents_run (MCP)
+    notes: >-
+      Runs the researcher/analyst/spec-writer rotation over ROTATING_SERVICES
+      (config/settings.py). Prompt surface is entirely on-disk and per-service.
+      Only mctl-docs additionally gets sibling-repo read access via add_dirs.
+
+  - name: mentor
+    driver: orchestrator/run_mentor.py
+    entrypoint: orchestrator.run_mentor:run_mentor
+    optionsBuilder: orchestrator.options:build_mentor_options
+    promptSources:
+      - inline: orchestrator/run_mentor.py:build_prompt
+      - file: agents/_mentor/CLAUDE.md
+    modelPolicyTask: mentor_digest
+    budgetEnv: MENTOR_BUDGET_USD               # default 2.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-daily
+    writes: agents/_mentor/digest/<week>.md
+    riskLevel: low
+    triggeredBy:
+      - cwft-mctl-agents-daily (after the service-agent rotation)
+
+# ---------------------------------------------------------------------------
+# Orchestration — NOT agents. No manifest, no version, no release.
+# ---------------------------------------------------------------------------
+# These make zero Claude SDK calls. They are deterministic control flow that
+# happens to be packaged as Python modules or Argo templates today, and they
+# are exactly what the Temporal control plane replaces.
+
+orchestration:
+  - name: issue-poller
+    path: orchestrator/run_issue_poller.py
+    what: >-
+      Scans open mctlhq issues carrying the agents:intake label and calls
+      investigate() in-process for each, capped by --max-issues.
+    becomes: Temporal Schedule starting one DevLoopWorkflow per labelled issue.
+
+  - name: shepherd-reconcile
+    path: orchestrator/run_shepherd.py --reconcile
+    what: >-
+      GitHub-first repair of .status.yaml drift. Exists only because there is
+      no durable state — it re-derives the lifecycle from GitHub every run.
+    becomes: >-
+      Temporal Schedule that adopts orphan .status.yaml entries into workflows.
+      Kept as a migration path and safety net, not deleted.
+
+  - name: run_all
+    path: orchestrator/run_all.py
+    what: >-
+      Fan-out over ROTATING_SERVICES for the rotation, plus the mentor. NOT
+      SERVICES: _full() iterates ROTATING_SERVICES, which excludes the
+      issue-only targets in NON_ROTATING_SERVICES (mctl-agents, mctl-telegram,
+      mctl-design, mctl-pairdesk). Those have no service-agent scaffold, so a
+      replacement workflow that fans out over SERVICES instead would schedule
+      runs that fail immediately.
+    becomes: Workflow fan-out (child workflows), or stays as-is for local runs.
+
+  - name: cluster-workflow-templates
+    path: mctl-gitops/platform-gitops/argo-workflows/cluster-templates/
+    what: >-
+      cwft-mctl-agents-{investigate,implement,shepherd,run,daily,reconcile,
+      issue-poll}. Clone, run one driver, commit back to gitops main under the
+      mctl-gitops-main-writes mutex, notify Telegram on exit.
+    becomes: >-
+      Stays. These remain the sandboxed execution backend invoked from Temporal
+      activities; phase 3 makes their agent image a workflow parameter so the
+      registry can pin it.
+
+  - name: cronworkflows
+    path: mctl-gitops/platform-gitops/argo-workflows/cluster-templates/cronworkflow-*.yaml
+    what: >-
+      Five schedules (issue-poll, implement [suspended], shepherd, incidents,
+      reconcile), each concurrencyPolicy Forbid on a shared gitops mutex.
+    becomes: Temporal Schedules, or deleted where the step folds into a workflow.
+
+# ---------------------------------------------------------------------------
+# Supporting registries — already exist, do NOT duplicate.
+# ---------------------------------------------------------------------------
+
+skills:
+  sourceOfTruth: mctl-gitops/platform-gitops/platform-skills/catalog/
+  what: >-
+    One directory per skill (SKILL.md + metadata.yaml). Validated in CI by
+    scripts/validate-platform-skills.py, served over MCP by
+    mctl_list_platform_skills / mctl_read_platform_skill with visibility
+    enforced server-side.
+  note: >-
+    This is already a versioned, validated catalog with a publish workflow. The
+    agent registry references skills; it must not re-implement them.
+
+tools:
+  sourceOfTruth: https://api.mctl.ai/mcp
+  what: mcp__mctl__* tools, scoped server-side by caller identity.
+  note: >-
+    Tool ALLOWANCE is declared per agent (options.py allowed_tools, surfaced in
+    the manifest's toolPolicy); tool AUTHORIZATION stays server-side. The
+    manifest is documentation and a lint target, never the enforcement point.
+
+# ---------------------------------------------------------------------------
+# Out of scope for the registry (for now) — see plan phase L3.
+# ---------------------------------------------------------------------------
+
+external:
+  - name: mctl-agent
+    repo: mctlhq/mctl-agent
+    what: >-
+      Separate Go service. AlertManager -> SQLite tickets -> 9 builtin Go
+      skills + Claude API -> fix PRs against mctl-gitops. Its own store and its
+      own loop; shares no code with this repo.
+    note: >-
+      Not an agent in this registry today. Integrates later by starting a
+      Temporal workflow instead of a local ticket, at which point its builtin
+      skills become a runtime type rather than a separate system.
