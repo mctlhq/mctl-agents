@@ -1,0 +1,37 @@
+# AgentManifest for mentor. See issue-investigator/agent.yaml for the
+# contract this file follows and orchestrator/validate_manifest.py for how
+# it's checked.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: mentor
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_mentor:run_mentor
+    optionsBuilder: orchestrator.options:build_mentor_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_mentor.py:build_prompt
+      - file: agents/_mentor/CLAUDE.md
+  modelPolicy:
+    task: mentor_digest
+  # Read-only across every agent's directory (cwd = agents/, so it can see
+  # every service); Write/Edit are scoped by convention to
+  # agents/_mentor/digest/ only — options.py does not enforce a
+  # sub-directory restriction, so this is the same repo-wide grant every
+  # other writing agent gets, not a narrower one.
+  toolPolicy:
+    allow:
+      - Read
+      - Glob
+      - Grep
+      - Write
+      - Edit
+      - "mcp__mctl__*"
+  execution:
+    budgetUsd: 2.00          # MENTOR_BUDGET_USD default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-daily

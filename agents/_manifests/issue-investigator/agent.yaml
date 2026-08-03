@@ -1,0 +1,59 @@
+# AgentManifest for issue-investigator.
+#
+# This file does not invent behaviour: every field below is a claim about
+# what orchestrator/options.py:build_issue_investigator_options() already
+# does, checked against the real function by
+# orchestrator/validate_manifest.py rather than taken on faith. See
+# docs/agent-inventory.yaml for the classification this manifest formalises,
+# and orchestrator/manifest.py's module docstring for why toolPolicy/execution
+# are a lint target, not a second implementation.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: issue-investigator
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_issue_investigator:investigate
+    optionsBuilder: orchestrator.options:build_issue_investigator_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_issue_investigator.py:_build_prompt
+  # Real prompt surface also includes the target repo's own CLAUDE.md
+  # (setting_sources=["project"] + an explicit instruction to read it) and
+  # its source tree. Both live outside this repo, change independently of
+  # it, and cannot be hashed at publish time — see
+  # docs/agent-inventory.yaml's runtimeContextInputs note for
+  # issue-investigator. Recorded here for humans; not machine-checked,
+  # because there is nothing in this repo to check it against.
+  runtimeContext:
+    - targetRepo: CLAUDE.md
+    - targetRepo: source tree (Glob/Grep/Read to ground the design)
+  modelPolicy:
+    task: service_agent
+    # INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
+    # in run_issue_investigator.py — highest-priority override before the
+    # service_agent task's own model-policy.yaml resolution.
+    legacyEnvOverride: ISSUE_INVESTIGATOR_MODEL
+  # allow must equal build_issue_investigator_options()'s actual
+  # allowed_tools exactly — validate_manifest.py calls the builder and
+  # diffs the two sets. Write/Edit are here because the agent writes the
+  # requirements/design/tasks triplet into proposal_dir (granted via
+  # add_dirs), not because it edits the target repo it's read-only against.
+  toolPolicy:
+    allow:
+      - Read
+      - Write
+      - Edit
+      - Glob
+      - Grep
+      - WebSearch
+      - WebFetch
+      - Bash
+      - "mcp__mctl__*"
+  execution:
+    budgetUsd: 3.00          # ISSUE_INVESTIGATOR_BUDGET_USD default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-investigate

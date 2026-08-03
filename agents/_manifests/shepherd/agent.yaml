@@ -1,0 +1,32 @@
+# AgentManifest for shepherd. See issue-investigator/agent.yaml for the
+# contract this file follows and orchestrator/validate_manifest.py for how
+# it's checked.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: shepherd
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_shepherd:process_one
+    optionsBuilder: orchestrator.options:build_shepherd_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_shepherd.py:_format_bundle_via_sdk
+      - file: agents/_shepherd/.claude/agents/shepherd.md
+  modelPolicy:
+    task: review_findings_normalize
+  # The one agent with no mctl MCP access at all (mcp_servers={} in
+  # build_shepherd_options) — read-only, translating a pre-filtered bundle
+  # of review findings into JSON. decide() and the GitHub polling around it
+  # are deterministic and stay in orchestrator/run_shepherd.py; only this
+  # normalisation call is a Claude SDK run.
+  toolPolicy:
+    allow:
+      - Read
+  execution:
+    budgetUsd: 5.00          # SHEPHERD_BUDGET_USD default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-shepherd

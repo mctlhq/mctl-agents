@@ -1,0 +1,56 @@
+# AgentManifest for service-agent. See issue-investigator/agent.yaml for
+# the contract this file follows and orchestrator/validate_manifest.py for
+# how it's checked.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: service-agent
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_service_agent:run_service_agent
+    optionsBuilder: orchestrator.options:build_service_agent_options
+  prompt:
+    sources:
+      # The researcher -> analyst -> spec-writer daily sequence is a
+      # module-level constant handed to client.query(), not an on-disk
+      # file — editing it changes every rotation run.
+      - inline: orchestrator/run_service_agent.py:PROMPT
+      - glob: agents/[!_]*/context/**
+      # `[!_]` is load-bearing: a plain `agents/*/CLAUDE.md` also matches
+      # agents/_incident-responder/CLAUDE.md and agents/_mentor/CLAUDE.md,
+      # which are those agents' prompt sources, not this one's.
+      - glob: agents/[!_]*/CLAUDE.md
+      # Listed one per line: promptSources globs are consumed by Python's
+      # glob module, which does NOT expand brace syntax.
+      - glob: agents/[!_]*/.claude/agents/researcher.md
+      - glob: agents/[!_]*/.claude/agents/analyst.md
+      - glob: agents/[!_]*/.claude/agents/spec-writer.md
+      - glob: agents/[!_]*/.claude/skills/**
+  # For mctl-docs runs only, build_service_agent_options() grants read
+  # access to sibling mctl-* repo checkouts via add_dirs (scan-sibling-
+  # commits skill). Those checkouts live outside this repo and move
+  # independently, so — like the target-repo CLAUDE.md for
+  # issue-investigator/implementer — they cannot be hashed at publish
+  # time and are recorded here for humans, not machine-checked.
+  runtimeContext:
+    - siblingRepos: "mctl-api, mctl-web, mctl-portal, mctl-agent, mctl-agents, mctl-gitops, mctl-openclaw (mctl-docs only, via SIBLING_REPOS_PATH)"
+  modelPolicy:
+    task: service_agent
+  toolPolicy:
+    allow:
+      - Read
+      - Write
+      - Edit
+      - Glob
+      - Grep
+      - WebSearch
+      - WebFetch
+      - Bash
+      - "mcp__mctl__*"
+  execution:
+    budgetUsd: 5.00          # SERVICE_AGENT_BUDGET_USD default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run

@@ -1,0 +1,52 @@
+# AgentManifest for implementer. See issue-investigator/agent.yaml for the
+# contract this file follows and orchestrator/validate_manifest.py for how
+# it's checked.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: implementer
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_implementer:implement_one
+    optionsBuilder: orchestrator.options:build_implementer_agent_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_implementer.py:_build_prompt
+      # `[!_]` excludes the underscore-prefixed agent homes (_shepherd,
+      # _mentor, _incident-responder, _generic). Matches all real service
+      # dirs — SERVICES, not ROTATING_SERVICES: the implementer accepts
+      # issue-driven targets the proactive rotation skips.
+      - glob: agents/[!_]*/.claude/agents/implementer.md
+      - file: agents/_generic/.claude/agents/implementer.md   # fallback
+  # Same target-repo exposure as issue-investigator, and it matters more
+  # here: this is the only agent that authors code. See
+  # docs/agent-inventory.yaml's runtimeContextInputs note.
+  runtimeContext:
+    - targetRepo: CLAUDE.md
+    # Written by issue-investigator into gitops agents-state and passed via
+    # PROPOSAL_DIR — pinned by the gitops commit, not by this manifest.
+    - proposalDir: requirements.md / design.md / tasks.md (via PROPOSAL_DIR)
+  modelPolicy:
+    task: service_agent
+    # run_implementer.py imports SERVICE_AGENT_MODEL directly — no
+    # implementer-specific override env exists today, unlike
+    # issue-investigator/incident-responder.
+  toolPolicy:
+    allow:
+      - Read
+      - Write
+      - Edit
+      - Glob
+      - Grep
+      - WebSearch
+      - WebFetch
+      - Bash
+      - "mcp__mctl__*"
+  execution:
+    budgetUsd: 3.00           # IMPLEMENTER_BUDGET_USD default
+    timeoutSeconds: 900       # IMPLEMENTER_TIMEOUT_SECONDS default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-implement
