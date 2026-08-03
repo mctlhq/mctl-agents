@@ -32,6 +32,35 @@ version: 1
 # implementer and service-agent cases), a change to ANY matched file bumps the
 # single agent's version — these are per-service specialisations of one agent,
 # not separate agents.
+#
+# promptSources vs runtimeContextInputs
+# -------------------------------------
+# Two agents (issue-investigator, implementer) run with cwd inside a clone of
+# the TARGET repo and setting_sources=["project"], and their prompts explicitly
+# tell them to follow that repo's CLAUDE.md. So the target repo's instructions
+# genuinely are part of the effective prompt — but they live in another
+# repository, change independently of this one, and differ per target. They
+# cannot be hashed when a version is published.
+#
+# Pretending otherwise would make the version claim false, so the two are kept
+# apart:
+#
+#   promptSources        inputs owned by THIS repo and fixed at publish time.
+#                        These are what the version hash covers: inline
+#                        templates, files the SDK auto-loads from cwd
+#                        (CLAUDE.md, .claude/agents/*.md, .claude/skills/),
+#                        and in-repo knowledge bases the prompt directs the
+#                        agent to read (context/).
+#
+#   runtimeContextInputs inputs that are real prompt surface but resolve per
+#                        run, outside this repo. NOT part of the version hash.
+#                        They are pinned per-execution instead, by the target
+#                        repo git SHA recorded on the execution record.
+#
+# Practical consequence, and the reason this distinction is written down: an
+# agent version is reproducible only against a fixed target SHA. A shadow or
+# canary comparison that runs two agent versions against different target SHAs
+# is confounded and its diff means nothing.
 
 agents:
   - name: issue-investigator
@@ -40,6 +69,14 @@ agents:
     optionsBuilder: orchestrator.options:build_issue_investigator_options
     promptSources:
       - inline: orchestrator/run_issue_investigator.py:_build_prompt
+    runtimeContextInputs:
+      # cwd is a clone of the target repo with setting_sources=["project"],
+      # and _build_prompt tells the agent in so many words: "Read the repo's
+      # CLAUDE.md (cwd root, if present) for conventions". Editing a target
+      # repo's CLAUDE.md therefore changes this agent's behaviour without
+      # changing its version — pinned per run by the target git SHA instead.
+      - targetRepo: CLAUDE.md
+      - targetRepo: source tree (Glob/Grep/Read to ground the design)
     modelPolicyTask: service_agent
     budgetEnv: ISSUE_INVESTIGATOR_BUDGET_USD   # default 3.00
     sandbox:
@@ -52,9 +89,13 @@ agents:
       - orchestrator/run_issue_poller.py (agents:intake label)
     notes: >-
       cwd is a throwaway shallow clone of the target repo, so the SDK picks up
-      no mctl-agents-owned prompt files at all — the inline template is the
-      entire prompt surface. Simplest agent to version first, which is why it
-      is the phase-4 pilot.
+      no mctl-agents-owned prompt files at all: the inline template is this
+      repo's entire contribution to the prompt, which is what makes it the
+      cheapest agent to version and therefore the phase-4 pilot. It is NOT the
+      entire prompt surface — the target repo's own CLAUDE.md is auto-loaded by
+      setting_sources=["project"] and the prompt explicitly asks for it, so
+      reproducibility here is per (agent version, target SHA), not per agent
+      version alone. See runtimeContextInputs above.
 
   - name: implementer
     driver: orchestrator/run_implementer.py
@@ -71,6 +112,17 @@ agents:
       # not hashed twice.
       - glob: agents/[!_]*/.claude/agents/implementer.md
       - file: agents/_generic/.claude/agents/implementer.md   # fallback
+    runtimeContextInputs:
+      # Same exposure as the investigator, and it matters more here: this is
+      # the agent that authors code. Options enable project settings in the
+      # cloned target repo, and _build_prompt says "Follow that repo's
+      # CLAUDE.md conventions". A target repo can therefore change how this
+      # high-risk agent behaves without any version moving in the registry.
+      - targetRepo: CLAUDE.md
+      # The spec triplet is an input too, but a controlled one: it is written
+      # by the investigator into gitops agents-state and passed via
+      # PROPOSAL_DIR, so it is pinned by the gitops commit, not by this file.
+      - proposalDir: requirements.md / design.md / tasks.md (via PROPOSAL_DIR)
     modelPolicyTask: service_agent
     budgetEnv: IMPLEMENTER_BUDGET_USD          # default 3.00
     sandbox:
@@ -93,7 +145,7 @@ agents:
     entrypoint: orchestrator.run_shepherd:process_one
     optionsBuilder: orchestrator.options:build_shepherd_options
     promptSources:
-      - inline: orchestrator/run_shepherd.py (findings-bundle prompt)
+      - inline: orchestrator/run_shepherd.py:_format_bundle_via_sdk
       - file: agents/_shepherd/.claude/agents/shepherd.md
     modelPolicyTask: review_findings_normalize
     budgetEnv: SHEPHERD_BUDGET_USD             # default 5.00
@@ -135,6 +187,18 @@ agents:
     entrypoint: orchestrator.run_service_agent:run_service_agent
     optionsBuilder: orchestrator.options:build_service_agent_options
     promptSources:
+      # The whole daily sequence — researcher -> analyst -> spec-writer, the
+      # output rules, the "no human to ask" framing — is a module-level
+      # constant handed to client.query(), not an on-disk file. Editing it
+      # changes every rotation run, so it belongs in the hash.
+      - inline: orchestrator/run_service_agent.py:PROMPT
+      # That PROMPT directs the agent to "use context/ (read-only knowledge
+      # base — architecture, ADRs, current version) ... as your playbook", and
+      # entrypoint.sh symlinks only inbox/ and proposals/ out to STATE_DIR —
+      # context/ stays baked into the image. So unlike the target-repo
+      # CLAUDE.md above, this one IS owned by this repo and IS hashable, and
+      # rewriting a service's architecture notes really does change behaviour.
+      - glob: agents/[!_]*/context/**
       # `[!_]` is load-bearing, not tidiness: a plain `agents/*/CLAUDE.md`
       # also matches agents/_incident-responder/CLAUDE.md and
       # agents/_mentor/CLAUDE.md, which are those agents' prompt sources, not
@@ -213,7 +277,13 @@ orchestration:
 
   - name: run_all
     path: orchestrator/run_all.py
-    what: Fan-out over SERVICES for the rotation plus the mentor.
+    what: >-
+      Fan-out over ROTATING_SERVICES for the rotation, plus the mentor. NOT
+      SERVICES: _full() iterates ROTATING_SERVICES, which excludes the
+      issue-only targets in NON_ROTATING_SERVICES (mctl-agents, mctl-telegram,
+      mctl-design, mctl-pairdesk). Those have no service-agent scaffold, so a
+      replacement workflow that fans out over SERVICES instead would schedule
+      runs that fail immediately.
     becomes: Workflow fan-out (child workflows), or stays as-is for local runs.
 
   - name: cluster-workflow-templates
