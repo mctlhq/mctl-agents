@@ -17,6 +17,7 @@ from __future__ import annotations
 import glob as globmod
 import importlib
 import os
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -121,9 +122,16 @@ def _check_prompt_sources(manifest: AgentManifest) -> list[str]:
             if not target.exists():
                 errors.append(f"prompt source file does not exist: {source.value}")
         elif source.kind == "glob":
-            matches = globmod.glob(source.value, root_dir=REPO_ROOT, recursive=True)
+            # Filter to regular files: a recursive glob ending in `/**` also
+            # matches the directory itself, so an emptied-out directory (every
+            # file under it deleted) would otherwise still count as "matched"
+            # even though it now contributes nothing to the version hash.
+            matches = [
+                m for m in globmod.glob(source.value, root_dir=REPO_ROOT, recursive=True)
+                if (REPO_ROOT / m).is_file()
+            ]
             if not matches:
-                errors.append(f"prompt source glob matches nothing: {source.value}")
+                errors.append(f"prompt source glob matches no files: {source.value}")
         elif source.kind == "inline":
             module_name, _, symbol = source.value.partition(":")
             try:
@@ -142,6 +150,34 @@ def _check_model_policy_task(manifest: AgentManifest) -> list[str]:
     tasks = yaml.safe_load(MODEL_POLICY.read_text(encoding="utf-8"))["tasks"]
     if manifest.model_policy_task not in tasks:
         return [f"modelPolicy.task {manifest.model_policy_task!r} is not in config/model-policy.yaml"]
+    return []
+
+
+def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
+    """spec.modelPolicy.legacyEnvOverride documents an env var the agent's own
+    driver module reads directly (bypassing config/model_policy.py) as the
+    highest-priority model override — e.g. run_issue_investigator.py's
+    `INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", ...)`. Verify
+    the driver's source actually reads that exact name via os.getenv, so a
+    typo'd or stale override name doesn't silently pass. Agents that declare
+    no override skip this check entirely."""
+    if manifest.model_policy_legacy_env_override is None:
+        return []
+    try:
+        entrypoint = manifest.resolve_entrypoint()
+    except ManifestError as exc:
+        return [str(exc)]
+    module = sys.modules[entrypoint.__module__]
+    source_file = getattr(module, "__file__", None)
+    if source_file is None:
+        return [f"cannot find source file for {manifest.entrypoint} to verify modelPolicy.legacyEnvOverride"]
+    var = manifest.model_policy_legacy_env_override
+    source = Path(source_file).read_text(encoding="utf-8")
+    if not re.search(rf'os\.getenv\(\s*["\']{re.escape(var)}["\']', source):
+        return [
+            f"modelPolicy.legacyEnvOverride {var!r} not found as an os.getenv(...) call in "
+            f"{source_file} — update or remove the claim"
+        ]
     return []
 
 
@@ -261,11 +297,20 @@ def check_manifests_match_inventory(manifests: dict[str, AgentManifest]) -> list
     """docs/agent-inventory.yaml's own header states its purpose: "Consumed by
     orchestrator/validate_manifest.py (phase 1) to assert that every agent
     listed here has a manifest and vice versa." This is that assertion —
-    a set mismatch means either a manifest was added for something that
-    isn't an agent, or an agent was classified in the inventory but never
-    got a manifest."""
+    a name-set mismatch means either a manifest was added for something that
+    isn't an agent, or an agent was classified in the inventory but never got
+    a manifest.
+
+    Beyond the name set, this also compares each shared agent's actual
+    binding — entrypoint, optionsBuilder, promptSources, modelPolicyTask,
+    sandbox — field by field. Comparing names alone would let a manifest
+    rebind e.g. service-agent's runtime.entrypoint to another agent's real
+    callable (a copy-paste mistake) and still pass, even though a registry
+    consuming that manifest would then dispatch the wrong agent for that
+    name."""
     inventory = yaml.safe_load(INVENTORY.read_text(encoding="utf-8"))
-    inventory_names = {agent["name"] for agent in inventory["agents"]}
+    inventory_by_name = {agent["name"]: agent for agent in inventory["agents"]}
+    inventory_names = set(inventory_by_name)
     manifest_names = set(manifests)
 
     errors: list[str] = []
@@ -275,6 +320,46 @@ def check_manifests_match_inventory(manifests: dict[str, AgentManifest]) -> list
     extra_manifests = manifest_names - inventory_names
     if extra_manifests:
         errors.append(f"manifests for agents not in docs/agent-inventory.yaml: {sorted(extra_manifests)}")
+
+    for name in sorted(inventory_names & manifest_names):
+        entry = inventory_by_name[name]
+        manifest = manifests[name]
+        if entry.get("entrypoint") != manifest.entrypoint:
+            errors.append(
+                f"{name}: inventory entrypoint {entry.get('entrypoint')!r} does not match "
+                f"manifest runtime.entrypoint {manifest.entrypoint!r}"
+            )
+        if entry.get("optionsBuilder") != manifest.options_builder:
+            errors.append(
+                f"{name}: inventory optionsBuilder {entry.get('optionsBuilder')!r} does not match "
+                f"manifest runtime.optionsBuilder {manifest.options_builder!r}"
+            )
+        if entry.get("modelPolicyTask") != manifest.model_policy_task:
+            errors.append(
+                f"{name}: inventory modelPolicyTask {entry.get('modelPolicyTask')!r} does not match "
+                f"manifest modelPolicy.task {manifest.model_policy_task!r}"
+            )
+        inventory_sandbox = entry.get("sandbox") or {}
+        if inventory_sandbox.get("backend") != manifest.sandbox_backend:
+            errors.append(
+                f"{name}: inventory sandbox.backend {inventory_sandbox.get('backend')!r} does not match "
+                f"manifest execution.sandbox.backend {manifest.sandbox_backend!r}"
+            )
+        if inventory_sandbox.get("clusterWorkflowTemplate") != manifest.cluster_workflow_template:
+            errors.append(
+                f"{name}: inventory sandbox.clusterWorkflowTemplate "
+                f"{inventory_sandbox.get('clusterWorkflowTemplate')!r} does not match manifest "
+                f"execution.sandbox.clusterWorkflowTemplate {manifest.cluster_workflow_template!r}"
+            )
+        inventory_prompt_sources = {
+            (kind, value) for source in (entry.get("promptSources") or []) for kind, value in source.items()
+        }
+        manifest_prompt_sources = {(s.kind, s.value) for s in manifest.prompt_sources}
+        if inventory_prompt_sources != manifest_prompt_sources:
+            errors.append(
+                f"{name}: inventory promptSources {sorted(inventory_prompt_sources)} does not match "
+                f"manifest prompt.sources {sorted(manifest_prompt_sources)}"
+            )
     return errors
 
 
@@ -294,6 +379,10 @@ def validate(manifest: AgentManifest) -> list[str]:
     # resolve above — otherwise this reports the same failure twice.
     if not any("optionsBuilder" in error for error in errors):
         errors += _check_tool_policy_and_budget_match_options_py(manifest)
+    # Same guard for the entrypoint side: _check_legacy_env_override resolves
+    # the entrypoint itself.
+    if not any("entrypoint" in error for error in errors):
+        errors += _check_legacy_env_override(manifest)
     return errors
 
 

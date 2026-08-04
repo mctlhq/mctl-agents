@@ -77,6 +77,7 @@ class AgentManifest:
     options_builder: str
     prompt_sources: tuple[PromptSource, ...]
     model_policy_task: str
+    model_policy_legacy_env_override: str | None
     tool_allow: tuple[str, ...]
     budget_usd: float
     timeout_seconds: float | None
@@ -119,6 +120,22 @@ def load(path: Path) -> AgentManifest:
     if document.get("kind") != "Agent":
         raise ManifestError(f"{path}: kind must be 'Agent'")
 
+    try:
+        return _parse_fields(document, path)
+    except ManifestError:
+        raise
+    except (AttributeError, TypeError, ValueError) as exc:
+        # A structurally-valid-YAML-but-wrong-shape document (e.g. `spec: [1]`
+        # instead of a mapping, or `execution.budgetUsd: not-a-number`) would
+        # otherwise raise a raw AttributeError/TypeError/ValueError here.
+        # main()'s per-manifest loop only guards against ManifestError, so an
+        # unwrapped exception from one bad manifest would abort the whole
+        # batch instead of being reported and skipped like any other invalid
+        # manifest.
+        raise ManifestError(f"{path}: malformed manifest field: {exc}") from exc
+
+
+def _parse_fields(document: dict[str, Any], path: Path) -> AgentManifest:
     metadata = document.get("metadata") or {}
     spec = document.get("spec") or {}
     runtime = spec.get("runtime") or {}
@@ -166,6 +183,7 @@ def load(path: Path) -> AgentManifest:
         options_builder=runtime.get("optionsBuilder", ""),
         prompt_sources=prompt_sources,
         model_policy_task=model_policy.get("task", ""),
+        model_policy_legacy_env_override=model_policy.get("legacyEnvOverride"),
         tool_allow=tuple(tool_policy.get("allow", [])),
         budget_usd=float(execution.get("budgetUsd", 0)),
         timeout_seconds=float(timeout_raw) if timeout_raw is not None else None,
