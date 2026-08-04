@@ -90,6 +90,19 @@ _TIMEOUT_CONSTANT_BY_AGENT = {
     "implementer": "IMPLEMENTER_TIMEOUT_SECONDS",
 }
 
+# Agents whose driver module reads an env var as a highest-priority model
+# override, bypassing config/model_policy.py — e.g. run_issue_investigator.py's
+# `INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)`.
+# Same "checked against the real value, not trusted YAML" contract as
+# _TIMEOUT_CONSTANT_BY_AGENT above, in both directions: an agent listed here
+# must declare modelPolicy.legacyEnvOverride matching this exact name (a
+# manifest that omits it would understate what actually controls the agent's
+# model), and an agent NOT listed here must not declare one at all.
+_LEGACY_MODEL_ENV_VAR_BY_AGENT = {
+    "issue-investigator": "ISSUE_INVESTIGATOR_MODEL",
+    "incident-responder": "INCIDENT_RESPONDER_MODEL",
+}
+
 
 def _builder_call_args(builder_name: str) -> tuple[tuple[object, ...], dict[str, object]]:
     """Positional/keyword args for each build_*_options() signature."""
@@ -119,7 +132,10 @@ def _check_prompt_sources(manifest: AgentManifest) -> list[str]:
     for source in manifest.prompt_sources:
         if source.kind == "file":
             target = REPO_ROOT / source.value.split("#")[0].strip()
-            if not target.exists():
+            # is_file(), not exists(): the same drift-protection gap the glob
+            # branch closes below — a `file:` source accidentally repointed at
+            # a directory would otherwise pass despite hashing nothing.
+            if not target.is_file():
                 errors.append(f"prompt source file does not exist: {source.value}")
         elif source.kind == "glob":
             # Filter to regular files: a recursive glob ending in `/**` also
@@ -157,12 +173,30 @@ def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
     """spec.modelPolicy.legacyEnvOverride documents an env var the agent's own
     driver module reads directly (bypassing config/model_policy.py) as the
     highest-priority model override — e.g. run_issue_investigator.py's
-    `INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", ...)`. Verify
-    the driver's source actually reads that exact name via os.getenv, so a
-    typo'd or stale override name doesn't silently pass. Agents that declare
-    no override skip this check entirely."""
-    if manifest.model_policy_legacy_env_override is None:
+    `INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", ...)`. Checked
+    in both directions against _LEGACY_MODEL_ENV_VAR_BY_AGENT, the same
+    "real value, not trusted YAML" contract _TIMEOUT_CONSTANT_BY_AGENT uses:
+    a listed agent must declare the exact matching name (an omitted or
+    typo'd override would understate what actually controls the agent's
+    model), and an unlisted agent must not declare one at all (there'd be
+    nothing real to check it against)."""
+    expected_var = _LEGACY_MODEL_ENV_VAR_BY_AGENT.get(manifest.name)
+    declared_var = manifest.model_policy_legacy_env_override
+
+    if expected_var is None:
+        if declared_var is not None:
+            return [
+                f"modelPolicy.legacyEnvOverride {declared_var!r} is declared but {manifest.name!r} has no "
+                "entry in _LEGACY_MODEL_ENV_VAR_BY_AGENT to check it against — either the claim is "
+                "unchecked, or the mapping is missing"
+            ]
         return []
+    if declared_var != expected_var:
+        return [
+            f"modelPolicy.legacyEnvOverride is {declared_var!r} but {manifest.name!r}'s driver reads "
+            f"{expected_var!r} as its highest-priority model override — declare it exactly"
+        ]
+
     try:
         entrypoint = manifest.resolve_entrypoint()
     except ManifestError as exc:
@@ -171,11 +205,10 @@ def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
     source_file = getattr(module, "__file__", None)
     if source_file is None:
         return [f"cannot find source file for {manifest.entrypoint} to verify modelPolicy.legacyEnvOverride"]
-    var = manifest.model_policy_legacy_env_override
     source = Path(source_file).read_text(encoding="utf-8")
-    if not re.search(rf'os\.getenv\(\s*["\']{re.escape(var)}["\']', source):
+    if not re.search(rf'os\.getenv\(\s*["\']{re.escape(expected_var)}["\']', source):
         return [
-            f"modelPolicy.legacyEnvOverride {var!r} not found as an os.getenv(...) call in "
+            f"modelPolicy.legacyEnvOverride {expected_var!r} not found as an os.getenv(...) call in "
             f"{source_file} — update or remove the claim"
         ]
     return []
@@ -309,11 +342,21 @@ def check_manifests_match_inventory(manifests: dict[str, AgentManifest]) -> list
     consuming that manifest would then dispatch the wrong agent for that
     name."""
     inventory = yaml.safe_load(INVENTORY.read_text(encoding="utf-8"))
+    inventory_agent_names = [agent["name"] for agent in inventory["agents"]]
+
+    errors: list[str] = []
+    duplicate_names = sorted({name for name in inventory_agent_names if inventory_agent_names.count(name) > 1})
+    if duplicate_names:
+        # A dict keyed by name would otherwise silently keep only the last of
+        # each duplicate, reporting success for an inventory that no longer
+        # has the one-to-one relationship with manifests this function exists
+        # to assert.
+        errors.append(f"duplicate agent names in docs/agent-inventory.yaml: {duplicate_names}")
+
     inventory_by_name = {agent["name"]: agent for agent in inventory["agents"]}
     inventory_names = set(inventory_by_name)
     manifest_names = set(manifests)
 
-    errors: list[str] = []
     missing_manifests = inventory_names - manifest_names
     if missing_manifests:
         errors.append(f"agents in docs/agent-inventory.yaml with no manifest: {sorted(missing_manifests)}")

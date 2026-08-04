@@ -148,6 +148,12 @@ def _parse_fields(document: dict[str, Any], path: Path) -> AgentManifest:
     name = metadata.get("name")
     if not name:
         raise ManifestError(f"{path}: metadata.name is required")
+    owner = metadata.get("owner")
+    if not owner:
+        # A silently-defaulted "" owner would let phase-1's contract lose its
+        # ownership metadata with nothing noticing — no check anywhere else
+        # (validate_manifest.py, the inventory comparison) looks at owner.
+        raise ManifestError(f"{path}: metadata.owner is required")
     # The directory is the primary key everywhere else this system refers to
     # an agent (docs/agent-inventory.yaml, gitops CWFT names); metadata.name
     # drifting from it would let two manifests silently claim the same name
@@ -177,7 +183,7 @@ def _parse_fields(document: dict[str, Any], path: Path) -> AgentManifest:
     timeout_raw = execution.get("timeoutSeconds")
     return AgentManifest(
         name=name,
-        owner=metadata.get("owner", ""),
+        owner=owner,
         runtime_type=runtime_type,
         entrypoint=runtime.get("entrypoint", ""),
         options_builder=runtime.get("optionsBuilder", ""),
