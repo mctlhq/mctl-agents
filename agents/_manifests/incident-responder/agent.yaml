@@ -1,0 +1,34 @@
+# AgentManifest for incident-responder. See issue-investigator/agent.yaml
+# for the contract this file follows and orchestrator/validate_manifest.py
+# for how it's checked.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: incident-responder
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_incident_responder:run_incident_responder
+    optionsBuilder: orchestrator.options:build_incident_responder_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_incident_responder.py:_build_prompt
+      - file: agents/_incident-responder/CLAUDE.md
+  modelPolicy:
+    task: service_agent
+    # RESPONDER_MODEL = os.getenv("INCIDENT_RESPONDER_MODEL", SERVICE_AGENT_MODEL)
+    # in run_incident_responder.py.
+    legacyEnvOverride: INCIDENT_RESPONDER_MODEL
+  toolPolicy:
+    allow:
+      - Read
+      - Write
+      - Bash
+      - Glob
+      - "mcp__mctl__*"
+  execution:
+    budgetUsd: 5.00          # INCIDENT_RESPONDER_BUDGET_USD default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run
