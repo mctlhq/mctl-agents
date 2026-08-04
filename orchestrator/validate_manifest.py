@@ -196,53 +196,65 @@ def _check_tool_policy_and_budget_match_options_py(manifest: AgentManifest) -> l
     except ManifestError as exc:
         return [str(exc)]
 
-    builder_name = manifest.options_builder.rpartition(":")[2]
-    args, kwargs = _builder_call_args(builder_name)
-
-    previous_token = os.environ.get("MCTL_TOKEN")
-    os.environ["MCTL_TOKEN"] = _DUMMY_MCTL_TOKEN
     try:
-        options = builder(*args, **kwargs)
-    except Exception as exc:  # noqa: BLE001 - report as a validation failure, not a crash
-        return [f"{manifest.options_builder} raised while building options: {exc}"]
-    finally:
-        if previous_token is None:
-            os.environ.pop("MCTL_TOKEN", None)
+        builder_name = manifest.options_builder.rpartition(":")[2]
+        args, kwargs = _builder_call_args(builder_name)
+
+        previous_token = os.environ.get("MCTL_TOKEN")
+        os.environ["MCTL_TOKEN"] = _DUMMY_MCTL_TOKEN
+        try:
+            options = builder(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - report as a validation failure, not a crash
+            return [f"{manifest.options_builder} raised while building options: {exc}"]
+        finally:
+            if previous_token is None:
+                os.environ.pop("MCTL_TOKEN", None)
+            else:
+                os.environ["MCTL_TOKEN"] = previous_token
+
+        errors: list[str] = []
+        actual_tools = set(options.allowed_tools or [])
+        declared_tools = set(manifest.tool_allow)
+        if actual_tools != declared_tools:
+            errors.append(
+                f"toolPolicy.allow {sorted(declared_tools)} does not match "
+                f"options.py's actual allowed_tools {sorted(actual_tools)}"
+            )
+        if manifest.budget_usd != options.max_budget_usd:
+            errors.append(
+                f"execution.budgetUsd {manifest.budget_usd} does not match "
+                f"options.py's actual max_budget_usd {options.max_budget_usd}"
+            )
+
+        timeout_constant = _TIMEOUT_CONSTANT_BY_AGENT.get(manifest.name)
+        if timeout_constant is None:
+            if manifest.timeout_seconds is not None:
+                errors.append(
+                    f"execution.timeoutSeconds is declared ({manifest.timeout_seconds}) but "
+                    f"{manifest.name!r} has no entry in _TIMEOUT_CONSTANT_BY_AGENT to check it "
+                    "against — either the claim is unchecked, or the mapping is missing"
+                )
         else:
-            os.environ["MCTL_TOKEN"] = previous_token
-
-    errors: list[str] = []
-    actual_tools = set(options.allowed_tools or [])
-    declared_tools = set(manifest.tool_allow)
-    if actual_tools != declared_tools:
-        errors.append(
-            f"toolPolicy.allow {sorted(declared_tools)} does not match "
-            f"options.py's actual allowed_tools {sorted(actual_tools)}"
-        )
-    if manifest.budget_usd != options.max_budget_usd:
-        errors.append(
-            f"execution.budgetUsd {manifest.budget_usd} does not match "
-            f"options.py's actual max_budget_usd {options.max_budget_usd}"
-        )
-
-    timeout_constant = _TIMEOUT_CONSTANT_BY_AGENT.get(manifest.name)
-    if timeout_constant is None:
-        if manifest.timeout_seconds is not None:
-            errors.append(
-                f"execution.timeoutSeconds is declared ({manifest.timeout_seconds}) but "
-                f"{manifest.name!r} has no entry in _TIMEOUT_CONSTANT_BY_AGENT to check it "
-                "against — either the claim is unchecked, or the mapping is missing"
-            )
-    else:
-        actual_timeout = getattr(module, timeout_constant, None)
-        if actual_timeout is None:
-            errors.append(f"expected {module.__name__}.{timeout_constant} to exist for the timeout comparison")
-        elif manifest.timeout_seconds != actual_timeout:
-            errors.append(
-                f"execution.timeoutSeconds {manifest.timeout_seconds} does not match "
-                f"{module.__name__}.{timeout_constant} {actual_timeout}"
-            )
-    return errors
+            actual_timeout = getattr(module, timeout_constant, None)
+            if actual_timeout is None:
+                errors.append(f"expected {module.__name__}.{timeout_constant} to exist for the timeout comparison")
+            elif manifest.timeout_seconds != actual_timeout:
+                errors.append(
+                    f"execution.timeoutSeconds {manifest.timeout_seconds} does not match "
+                    f"{module.__name__}.{timeout_constant} {actual_timeout}"
+                )
+        return errors
+    finally:
+        # _resolve_builder_module_with_clean_env reloaded `module` with the
+        # budget/timeout env vars cleared, and only restored os.environ — the
+        # module itself was left pinned to those clean-env defaults in
+        # sys.modules. reload() mutates the module's __dict__ in place, so
+        # without this second reload every later consumer of
+        # orchestrator.options in this process (e.g. a subsequent test in the
+        # same `uv run pytest -q` session) would silently see the coded
+        # defaults instead of a real env var override, even after it's back
+        # in os.environ.
+        importlib.reload(module)
 
 
 def check_manifests_match_inventory(manifests: dict[str, AgentManifest]) -> list[str]:

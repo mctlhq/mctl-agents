@@ -26,7 +26,7 @@ MANIFESTS_DIR = REPO_ROOT / "agents" / "_manifests"
 
 SUPPORTED_API_VERSION = "agents.mctl.ai/v1alpha1"
 # The only runtime.type v1 knows how to execute. See docs/agent-inventory.yaml's
-# L4 roadmap note (plan phase L4) for why a second runtime is a bigger step
+# L3 roadmap note (plan phase L3) for why a second runtime is a bigger step
 # than adding a string here.
 SUPPORTED_RUNTIME_TYPE = "claude-agent-sdk"
 
