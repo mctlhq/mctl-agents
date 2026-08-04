@@ -1,0 +1,212 @@
+"""Tests for orchestrator/temporal/activities/*.
+
+Runs each @activity.defn function through temporalio.testing.ActivityEnvironment
+(so activity.heartbeat()/activity.logger calls have a real, if fake, activity
+context) with httpx wired to a MockTransport instead of a real network call —
+mctl-api's actual request/response shapes are asserted against directly
+(field names, status codes), not just "was called".
+"""
+from __future__ import annotations
+
+import json
+
+import httpx
+import pytest
+from temporalio.testing import ActivityEnvironment
+
+from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
+from orchestrator.temporal.activities.registry import resolve_agent_release
+from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture(autouse=True)
+def mctl_token(monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+
+
+@pytest.fixture
+def env():
+    return ActivityEnvironment()
+
+
+def _mock_async_client(monkeypatch, handler):
+    """Force every httpx.AsyncClient(...) constructed by the activity code to
+    route through a MockTransport, while preserving the base_url/timeout
+    kwargs the activity passes (asserted on indirectly via request.url)."""
+    real_client_cls = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+
+class TestResolveAgentRelease:
+    async def test_resolves_version_and_image(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == "Bearer test-token"
+            if request.url.path == "/api/v1/agents/issue-investigator/resolve":
+                assert request.url.params["environment"] == "production"
+                return httpx.Response(200, json={"agent": "issue-investigator", "version": "1.2.0"})
+            if request.url.path == "/api/v1/agents/issue-investigator/versions":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {"version": "1.1.0", "image_repository": "ghcr.io/mctlhq/mctl-agents"},
+                            {
+                                "version": "1.2.0",
+                                "image_repository": "ghcr.io/mctlhq/mctl-agents",
+                                "image_digest": "sha256:abc123",
+                            },
+                        ]
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(resolve_agent_release, "issue-investigator", "production")
+        assert result is not None
+        assert result.version == "1.2.0"
+        assert result.image_ref == "ghcr.io/mctlhq/mctl-agents@sha256:abc123"
+
+    async def test_falls_back_to_tag_without_digest(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/resolve"):
+                return httpx.Response(200, json={"version": "1.2.0"})
+            return httpx.Response(
+                200, json={"items": [{"version": "1.2.0", "image_repository": "ghcr.io/mctlhq/mctl-agents"}]}
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(resolve_agent_release, "implementer", "production")
+        assert result.image_ref == "ghcr.io/mctlhq/mctl-agents:1.2.0"
+
+    async def test_returns_none_when_never_released(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"error": "no release"})
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(resolve_agent_release, "mentor", "production")
+        assert result is None
+
+    async def test_raises_without_mctl_token(self, env, monkeypatch):
+        monkeypatch.delenv("MCTL_TOKEN", raising=False)
+        with pytest.raises(Exception, match="MCTL_TOKEN"):
+            await env.run(resolve_agent_release, "issue-investigator", "production")
+
+
+class TestSubmitAndWait:
+    async def test_submits_and_polls_to_success(self, env, monkeypatch):
+        calls = {"status": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST" and request.url.path == "/api/v1/operations/mctl-agents-investigate/execute":
+                body = json.loads(request.content)
+                assert body == {"issue_url": "https://github.com/mctlhq/mctl-telegram/issues/1"}
+                return httpx.Response(
+                    202,
+                    json={
+                        "operation": "mctl-agents-investigate",
+                        "workflow": {"workflowName": "mctl-agents-investigate-ab12cd34"},
+                    },
+                )
+            if request.url.path == "/api/v1/workflows/mctl-agents-investigate-ab12cd34":
+                calls["status"] += 1
+                # First poll: not yet terminal. Second poll: Succeeded.
+                phase = "Running" if calls["status"] == 1 else "Succeeded"
+                return httpx.Response(
+                    200,
+                    json={
+                        "workflow": "mctl-agents-investigate-ab12cd34",
+                        "live": {"status": {"phase": phase, "startedAt": "2026-08-05T00:00:00Z"}},
+                    },
+                )
+            raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+        # Skip the real sleep between polls so the test is instant.
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(
+            submit_and_wait,
+            SubmitAndWaitInput(
+                operation="mctl-agents-investigate",
+                params={"issue_url": "https://github.com/mctlhq/mctl-telegram/issues/1"},
+            ),
+        )
+        assert result.workflow_name == "mctl-agents-investigate-ab12cd34"
+        assert result.phase == "Succeeded"
+        assert result.succeeded is True
+        assert calls["status"] == 2
+
+    async def test_failed_phase_is_not_succeeded(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "wf-1"}})
+            return httpx.Response(200, json={"live": {"status": {"phase": "Failed"}}})
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.phase == "Failed"
+        assert result.succeeded is False
+
+    async def test_raises_on_submit_http_error(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, json={"error": "agent registry is admin-only"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+
+
+class TestRecordExecution:
+    async def test_posts_execution_record(self, env, monkeypatch):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/v1/agents/executions"
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(201, json={"ok": True})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(
+            record_execution,
+            ExecutionRecord(
+                temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-1",
+                agent="issue-investigator",
+                environment="production",
+                version="1.2.0",
+                image_ref="ghcr.io/mctlhq/mctl-agents@sha256:abc123",
+                argo_workflow_name="mctl-agents-investigate-ab12cd34",
+                phase="Succeeded",
+            ),
+        )
+        assert seen["body"]["agent"] == "issue-investigator"
+        assert seen["body"]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-telegram-1"
+        assert seen["body"]["phase"] == "Succeeded"
+
+    async def test_raises_on_error_response(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": "invalid"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(
+                record_execution,
+                ExecutionRecord(
+                    temporal_workflow_id="x",
+                    agent="issue-investigator",
+                    environment="production",
+                    version="",
+                    image_ref="",
+                    argo_workflow_name="wf",
+                    phase="Succeeded",
+                ),
+            )

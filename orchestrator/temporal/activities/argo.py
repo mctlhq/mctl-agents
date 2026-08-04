@@ -1,0 +1,98 @@
+"""Activity: submit an mctl-api operation (which maps 1:1 to an Argo
+ClusterWorkflowTemplate, e.g. "mctl-agents-investigate") and poll it to a
+terminal status.
+
+Retry ownership (plan phase 4's explicit rule): the CWFTs already retry
+*within* a run — on a failed attempt they re-run on a second OAuth account
+(claude-code-oauth-token-2), which exists precisely because the first
+account hits the five-hour 429. A Temporal RetryPolicy stacked on top of
+that would multiply real SDK runs (3 attempts x 2 accounts = 6), burning
+quota hardest exactly when it's already exhausted. DevLoopWorkflow MUST
+register this activity with maximum_attempts=1; re-running a whole step is
+an explicit operator decision, never automatic retry.
+
+Do not re-read Argo for a result: mctl-agents-investigate carries
+ttlStrategy.secondsAfterCompletion=86400, so a workflow that resumes after
+that finds the Argo Workflow gone. This activity returns the terminal
+result at completion time; callers must persist whatever they need (see
+activities/state.py's record_execution) rather than re-querying Argo later.
+"""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+
+import httpx
+from temporalio import activity
+
+from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
+
+REQUEST_TIMEOUT_SECONDS = 30.0
+POLL_INTERVAL_SECONDS = 15.0
+# Argo Workflow status.phase terminal values. "" / "Pending" / "Running" all
+# mean "keep polling" — anything not in this set is treated as non-terminal
+# rather than guessed at, since a not-yet-populated status block also reads
+# as an empty phase right after submission.
+TERMINAL_PHASES = frozenset({"Succeeded", "Failed", "Error"})
+
+
+@dataclass(frozen=True)
+class SubmitAndWaitInput:
+    # mctl-api operation name — matches the target ClusterWorkflowTemplate
+    # name 1:1 for every mctl-agents-* operation (see
+    # internal/operations/registry.go and AgentManifest.cluster_workflow_template).
+    operation: str
+    params: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class WorkflowResult:
+    workflow_name: str
+    phase: str  # Succeeded | Failed | Error
+    started_at: str | None = None
+    finished_at: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.phase == "Succeeded"
+
+
+@activity.defn
+async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+    headers = auth_headers()
+    async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        submit_resp = await client.post(
+            f"/api/v1/operations/{input.operation}/execute",
+            json=input.params,
+            headers=headers,
+        )
+        submit_resp.raise_for_status()
+        workflow_name = submit_resp.json()["workflow"]["workflowName"]
+        activity.logger.info("submitted %s -> %s", input.operation, workflow_name)
+
+        while True:
+            # Heartbeat before every poll, not just on change: a stuck
+            # mctl-api / cluster makes this loop spin on the `continue`
+            # below without ever reaching a terminal phase, and the
+            # heartbeat is what lets Temporal notice a genuinely wedged
+            # activity (worker crash, network partition) instead of the
+            # activity looking alive forever because polling itself is
+            # still succeeding.
+            activity.heartbeat(workflow_name)
+
+            status_resp = await client.get(f"/api/v1/workflows/{workflow_name}", headers=headers)
+            status_resp.raise_for_status()
+            body = status_resp.json()
+            live = body.get("live") or {}
+            status_block = live.get("status") or {}
+            phase = status_block.get("phase", "")
+
+            if phase in TERMINAL_PHASES:
+                return WorkflowResult(
+                    workflow_name=workflow_name,
+                    phase=phase,
+                    started_at=status_block.get("startedAt"),
+                    finished_at=status_block.get("finishedAt"),
+                )
+
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
