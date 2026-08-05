@@ -81,16 +81,15 @@ jobs:
             echo "::error::git log failed for range ${BASE_SHA}..${HEAD_SHA} — cannot check commit messages."
             exit 1
           fi
-          MATCHED=0
-          while IFS= read -r subject; do
-            if printf '%s' "$subject" | grep -qE "$PATTERN"; then
-              echo "✓ releasable commit: $subject"
-              MATCHED=1
-            fi
-          done <<EOF
-$SUBJECTS
-EOF
-          if [ "$MATCHED" -eq 0 ]; then
+          # Here-string, not a heredoc: a heredoc's terminator has to sit at
+          # column 0, which would break out of this YAML block scalar's
+          # indentation and make the whole workflow file invalid. Not a pipe
+          # into grep either — under `pipefail`, grep -q exiting early can
+          # SIGPIPE the writer and turn a *successful match* into a non-zero
+          # pipeline status, i.e. the exact opposite verdict.
+          if grep -qE "$PATTERN" <<< "$SUBJECTS"; then
+            grep -E "$PATTERN" <<< "$SUBJECTS" | sed 's/^/✓ releasable commit: /'
+          else
             echo "::error::No commit in this PR uses a release-please-releasable type (feat/fix/perf/revert)." \
                  "release-please will merge this PR's changes into main but silently cut NO release for it —" \
                  "no version bump, no CHANGELOG entry, no image build. Prefix at least one commit" \
