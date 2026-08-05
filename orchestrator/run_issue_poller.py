@@ -27,9 +27,12 @@ Pipeline for one poll cycle:
        d. On error, leave the label so the next cycle retries.
 
 Per-issue failures never fail the whole poll: they are logged and the label
-is kept for retry. The process exits non-zero only on a global failure
-(missing Temporal connection, broken `gh` auth) so the CronWorkflow surfaces
-a genuine outage but stays green on the normal "one bad issue" case.
+is kept for retry. The process exits non-zero only on a global failure —
+broken `gh` auth (crashes before the per-issue loop even starts), or a
+cycle with dispatchable issues where connecting to the Temporal frontend
+itself fails (checked once up front, not per issue) — so the CronWorkflow
+surfaces a genuine outage but stays green on the normal "one bad issue"
+case.
 
 A cycle dispatches at most ``--max-issues`` issues (default
 ``DEFAULT_MAX_ISSUES``) — starting a workflow is cheap, but this keeps a
@@ -61,7 +64,7 @@ from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from config.settings import SERVICES
 from orchestrator.run_issue_investigator import IssueRef, _run, try_parse_issue_url
-from orchestrator.temporal.start import start_dev_loop_workflow, workflow_id_for
+from orchestrator.temporal.start import connect, start_dev_loop_workflow, workflow_id_for
 
 # `gh search` returns at most this many rows per call. A poll cycle with more
 # labelled issues than this is well outside normal operation, but warn rather
@@ -174,6 +177,20 @@ async def poll(
     for ref in refs:
         print(f"  - {ref.full_repo}#{ref.number}")
 
+    # Connect once per cycle, not once per issue — reused across every
+    # start_dev_loop_workflow call below. Checked up front, before the
+    # per-issue loop, so a Temporal-frontend outage is a genuine GLOBAL
+    # failure (raises SystemExit, non-zero exit) rather than N identical
+    # per-issue soft failures that would leave the CronWorkflow green.
+    # Skipped entirely for dry-run (side-effect-free preview) and when there
+    # is nothing dispatchable this cycle (no point requiring connectivity).
+    client = None
+    if not dry_run and service_refs:
+        try:
+            client = await connect()
+        except Exception as e:
+            raise SystemExit(f"Could not connect to Temporal — {e}") from e
+
     started = 0
     failures = 0
     for ref in refs:
@@ -205,7 +222,7 @@ async def poll(
             continue
 
         try:
-            handle = await start_dev_loop_workflow(ref.url)
+            handle = await start_dev_loop_workflow(ref.url, client=client)
         except WorkflowAlreadyStartedError:
             # A prior DevLoopWorkflow for this issue already ran to
             # completion (REJECT_DUPLICATE rejects id-reuse against a

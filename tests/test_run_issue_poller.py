@@ -38,26 +38,40 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-async def _start_ok(url: str):
+async def _connect_ok(*args, **kwargs):
+    """A connect() stub — the returned client is never touched by our
+    start_dev_loop_workflow stubs below, so its identity doesn't matter."""
+    return SimpleNamespace()
+
+
+@pytest.fixture(autouse=True)
+def _stub_connect(monkeypatch):
+    """poll() connects once per cycle before dispatching any issue — stub it
+    everywhere by default so tests don't need a live Temporal frontend.
+    Tests exercising the connect-failure path override this explicitly."""
+    monkeypatch.setattr(run_issue_poller, "connect", _connect_ok)
+
+
+async def _start_ok(url: str, client=None):
     """A start_dev_loop_workflow stub returning a fake, successful handle."""
     n = url.rstrip("/").rsplit("/", 1)[-1]
     return SimpleNamespace(id=f"dev-loop-mctlhq-x-{n}", result_run_id="run-1")
 
 
 def _start_ok_recording(calls: list):
-    async def _inner(url: str):
+    async def _inner(url: str, client=None):
         calls.append(url)
         return await _start_ok(url)
     return _inner
 
 
-async def _start_already_started(url: str):
+async def _start_already_started(url: str, client=None):
     raise WorkflowAlreadyStartedError(
         workflow_id="dev-loop-mctlhq-x-1", run_id="run-1", workflow_type="DevLoopWorkflow"
     )
 
 
-async def _start_boom(url: str):
+async def _start_boom(url: str, client=None):
     raise RuntimeError("temporal frontend unreachable")
 
 
@@ -93,6 +107,76 @@ def test_poll_no_issues(monkeypatch):
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [])
     assert _run(poll()).started == 0
     assert _run(poll()).failures == 0
+
+
+def test_poll_connect_failure_is_a_global_failure(monkeypatch):
+    """A cycle with a dispatchable issue where the Temporal frontend itself
+    is unreachable must raise SystemExit (non-zero exit, surfaces the
+    outage) rather than being absorbed as a per-issue soft failure — a real
+    outage would otherwise report "N issue(s) failed, will retry" and still
+    exit 0, leaving the CronWorkflow green (Claude P2 on PR #106)."""
+    ref = _ref(number=7)
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
+
+    async def _boom_connect():
+        raise RuntimeError("temporal frontend unreachable")
+
+    monkeypatch.setattr(run_issue_poller, "connect", _boom_connect)
+    with pytest.raises(SystemExit):
+        _run(poll())
+
+
+def test_poll_dry_run_never_connects(monkeypatch):
+    """A dry-run preview must not require live Temporal connectivity."""
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [_ref()])
+    called: list = []
+
+    async def _tracking_connect():
+        called.append(True)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(run_issue_poller, "connect", _tracking_connect)
+    _run(poll(dry_run=True))
+    assert called == []
+
+
+def test_poll_unknown_service_only_never_connects(monkeypatch):
+    """Nothing dispatchable this cycle → connecting to Temporal at all would
+    be pointless; must not be attempted."""
+    monkeypatch.setattr(
+        run_issue_poller, "search_labeled_issues",
+        lambda label: [_ref(repo="not-a-service")],
+    )
+    called: list = []
+
+    async def _tracking_connect():
+        called.append(True)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(run_issue_poller, "connect", _tracking_connect)
+    _run(poll())
+    assert called == []
+
+
+def test_poll_connects_once_per_cycle_not_per_issue(monkeypatch):
+    """P3 on PR #106: a cycle with several issues must reuse a single
+    connected client rather than reconnecting to the Temporal frontend once
+    per issue."""
+    refs = [_ref(number=n) for n in range(1, 4)]  # 3 issues
+    monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: list(refs))
+    monkeypatch.setattr(run_issue_poller, "start_dev_loop_workflow", _start_ok)
+    monkeypatch.setattr(run_issue_poller, "remove_label", lambda url, label: None)
+
+    connect_calls: list = []
+
+    async def _counting_connect():
+        connect_calls.append(True)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(run_issue_poller, "connect", _counting_connect)
+    result = _run(poll())
+    assert result.started == 3
+    assert len(connect_calls) == 1
 
 
 # ---------------------------------------------------------------------------

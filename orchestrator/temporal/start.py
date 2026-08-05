@@ -31,8 +31,13 @@ async def connect() -> Client:
     return await Client.connect(address, namespace=namespace)
 
 
-async def start_dev_loop_workflow(issue_url: str) -> WorkflowHandle:
+async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) -> WorkflowHandle:
     """Start (or attach to) the DevLoopWorkflow for ``issue_url``.
+
+    Connects fresh when ``client`` is None — the single-shot cli.py case.
+    Callers dispatching many issues per cycle (the poller) should connect
+    once and pass that ``Client`` in, instead of reconnecting to the
+    Temporal frontend once per issue.
 
     id_reuse_policy=REJECT_DUPLICATE + id_conflict_policy=USE_EXISTING makes
     a repeated start against an issue with a currently-RUNNING workflow a
@@ -42,7 +47,8 @@ async def start_dev_loop_workflow(issue_url: str) -> WorkflowHandle:
     (i.e. the poller) must catch that and treat it as "already handled",
     not a bug.
     """
-    client = await connect()
+    if client is None:
+        client = await connect()
     return await client.start_workflow(
         DevLoopWorkflow.run,
         IssueRef(issue_url=issue_url),
