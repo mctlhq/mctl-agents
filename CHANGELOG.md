@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.23.0](https://github.com/mctlhq/mctl-agents/compare/1.22.0...1.23.0) (2026-08-05)
+
+
+### Features
+
+* **temporal:** issue-poller dispatches DevLoopWorkflow instead of investigating in-process ([61b5d2f](https://github.com/mctlhq/mctl-agents/commit/61b5d2f2a7a9da66439c36f0fe484ea2ef83d235))
+
+
+### Bug Fixes
+
+* catch a broken git-log range instead of masking it as no-releasable-commits ([321b5a0](https://github.com/mctlhq/mctl-agents/commit/321b5a0e03a7bf410ffd4949d7ed683c4ca491ee))
+* **ci:** catch commits release-please would silently skip ([c74a94b](https://github.com/mctlhq/mctl-agents/commit/c74a94b9f01a8faf3b605f1b269a9a78d8fe7c63))
+* **ci:** catch commits release-please would silently skip ([4e5e64f](https://github.com/mctlhq/mctl-agents/commit/4e5e64ff2b447c71e7182ace176b7f5e847643d0))
+* repair the workflow file broken by the previous commit ([c17d749](https://github.com/mctlhq/mctl-agents/commit/c17d749f819274359b67630b524bc648dad6dfcb))
+
 ## [1.22.0](https://github.com/mctlhq/mctl-agents/compare/1.21.0...1.22.0) (2026-08-05)
 
 
