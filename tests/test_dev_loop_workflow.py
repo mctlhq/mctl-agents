@@ -100,6 +100,100 @@ class TestDevLoopWorkflow:
         assert result.implement.phase == "Succeeded"
         assert calls == ["mctl-agents-investigate", "mctl-agents-implement"]
 
+    async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
+        """The implement CWFT must only be allowed to touch proposals under
+        this issue's own repo (the `service` param) — otherwise approve()
+        could implement an unrelated already-accepted proposal in a
+        different repo (see the module docstring's known-simplification
+        note)."""
+        seen_params: dict[str, dict[str, str]] = {}
+        investigate_ran = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return None
+
+        @activity.defn(name="submit_and_wait")
+        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            seen_params[input.operation] = input.params
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        activities = [fake_resolve_agent_release, capturing_submit_and_wait, fake_record_execution]
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/42"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert seen_params["mctl-agents-implement"]["service"] == "mctl-telegram"
+
+    async def test_unpinned_release_is_not_recorded_as_used(self, env):
+        """resolve_agent_release can return a release with no image_ref (a
+        version exists but couldn't be turned into a pullable image) — the
+        CWFT then runs its own baked-in default, NOT that version. The
+        execution record must reflect that (empty version/image_ref), or the
+        audit trail would falsely claim a specific registry version produced
+        the result."""
+        recorded: list[ExecutionRecord] = []
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            # version resolved, but no image_ref -- e.g. the /versions
+            # response had no matching entry to build one from.
+            return ResolvedRelease(agent=agent, environment=environment, version="9.9.9", image_ref="")
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def capturing_record_execution(record: ExecutionRecord) -> None:
+            recorded.append(record)
+
+        activities = [fake_resolve_agent_release, fake_submit_and_wait, capturing_record_execution]
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        # Both steps resolve an unpinned release in this fake (investigate,
+        # then implement after approve) -- neither should ever be recorded
+        # as if a specific version had actually run.
+        assert len(recorded) == 2
+        for record in recorded:
+            assert record.version == ""
+            assert record.image_ref == ""
+            assert record.target_repo == "mctl-telegram"
+
     async def test_failed_investigate_never_implements(self, env):
         activities, calls, _investigate_ran = _fake_activities(released=True, investigate_phase="Failed")
         async with Worker(

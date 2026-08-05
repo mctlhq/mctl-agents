@@ -32,6 +32,14 @@ class ExecutionRecord:
     environment: str
     version: str  # "" when no registry release existed yet (CWFT default image used)
     image_ref: str  # "" when no registry release existed yet
+    # The sibling repo (e.g. "mctl-telegram") this run's target-repo inputs
+    # came from — see docs/agent-inventory.yaml's runtimeContextInputs note:
+    # an agent version is only reproducible against a fixed target SHA, and
+    # this is the first half of that (which repo). The exact SHA isn't
+    # captured here yet: no CWFT exposes it as a workflow output today, and
+    # adding one is a cross-repo gitops change deferred to a follow-up rather
+    # than folded into this slice.
+    target_repo: str
     argo_workflow_name: str
     phase: str  # Succeeded | Failed | Error
 
@@ -48,6 +56,7 @@ async def record_execution(record: ExecutionRecord) -> None:
                 "environment": record.environment,
                 "version": record.version,
                 "image_ref": record.image_ref,
+                "target_repo": record.target_repo,
                 "argo_workflow_name": record.argo_workflow_name,
                 "phase": record.phase,
             },

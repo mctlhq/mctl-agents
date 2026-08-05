@@ -11,24 +11,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import re
 import sys
 
 from temporalio.client import Client
 
+from orchestrator.temporal.issue_ref import parse_issue_url
 from orchestrator.temporal.worker import TASK_QUEUE
 from orchestrator.temporal.workflows.dev_loop import DevLoopResult, DevLoopWorkflow, IssueRef
-
-_ISSUE_URL_RE = re.compile(r"^https://github\.com/mctlhq/[A-Za-z0-9_.-]+/issues/[0-9]+$")
 
 
 def _workflow_id_for(issue_url: str) -> str:
     # dev-loop-{owner}-{repo}-{issue}, per the plan — Temporal's own
     # workflow-ID dedup then replaces the hand-rolled "already past proposed"
     # guard the cron pipeline needs today.
-    _, _, rest = issue_url.partition("github.com/")
-    owner, repo, _, issue_number = rest.split("/")[:4]
-    return f"dev-loop-{owner}-{repo}-{issue_number}"
+    parts = parse_issue_url(issue_url)
+    return f"dev-loop-{parts.owner}-{parts.repo}-{parts.number}"
 
 
 async def _connect() -> Client:
@@ -38,9 +35,11 @@ async def _connect() -> Client:
 
 
 async def start(issue_url: str) -> None:
-    if not _ISSUE_URL_RE.match(issue_url):
-        print(f"error: {issue_url!r} does not look like a mctlhq GitHub issue URL", file=sys.stderr)
-        raise SystemExit(2)
+    try:
+        parse_issue_url(issue_url)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
     client = await _connect()
     workflow_id = _workflow_id_for(issue_url)
     handle = await client.start_workflow(

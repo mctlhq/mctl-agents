@@ -5,11 +5,19 @@ terminal status.
 Retry ownership (plan phase 4's explicit rule): the CWFTs already retry
 *within* a run — on a failed attempt they re-run on a second OAuth account
 (claude-code-oauth-token-2), which exists precisely because the first
-account hits the five-hour 429. A Temporal RetryPolicy stacked on top of
-that would multiply real SDK runs (3 attempts x 2 accounts = 6), burning
-quota hardest exactly when it's already exhausted. DevLoopWorkflow MUST
-register this activity with maximum_attempts=1; re-running a whole step is
-an explicit operator decision, never automatic retry.
+account hits the five-hour 429. A Temporal RetryPolicy that re-submitted
+would multiply real SDK runs (3 attempts x 2 accounts = 6), burning quota
+hardest exactly when it's already exhausted. To get resumability without
+that multiplication, this activity distinguishes "retry before submission
+happened" (must re-submit) from "retry after submission happened" (must
+NOT re-submit, only resume polling): the first successful submission is
+recorded via `activity.heartbeat(workflow_name)` before the poll loop
+starts, and a new attempt reads it back via
+`activity.info().heartbeat_details` — if present, submission is skipped
+entirely and polling resumes against the same Argo workflow name.
+DevLoopWorkflow's retry policy for this activity may therefore allow a
+small number of attempts (see SDK_STEP_RETRY_POLICY in workflows/dev_loop.py)
+without ever causing a second real SDK run for the same step.
 
 Do not re-read Argo for a result: mctl-agents-investigate carries
 ttlStrategy.secondsAfterCompletion=86400, so a workflow that resumes after
@@ -69,14 +77,32 @@ class WorkflowResult:
 async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
     headers = auth_headers()
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS) as client:
-        submit_resp = await client.post(
-            f"/api/v1/operations/{input.operation}/execute",
-            json=input.params,
-            headers=headers,
-        )
-        submit_resp.raise_for_status()
-        workflow_name = submit_resp.json()["workflow"]["workflowName"]
-        activity.logger.info("submitted %s -> %s", input.operation, workflow_name)
+        # Resume, don't resubmit: a prior attempt of THIS activity execution
+        # already heartbeated a workflow_name once submission succeeded (see
+        # below). If this attempt has that detail, the Argo run already
+        # exists — go straight to polling instead of POSTing a second one.
+        heartbeat_details = activity.info().heartbeat_details
+        workflow_name = heartbeat_details[0] if heartbeat_details else None
+
+        if workflow_name:
+            activity.logger.info(
+                "resuming poll for %s -> %s (retry after crash/heartbeat gap, no re-submit)",
+                input.operation,
+                workflow_name,
+            )
+        else:
+            submit_resp = await client.post(
+                f"/api/v1/operations/{input.operation}/execute",
+                json=input.params,
+                headers=headers,
+            )
+            submit_resp.raise_for_status()
+            workflow_name = submit_resp.json()["workflow"]["workflowName"]
+            activity.logger.info("submitted %s -> %s", input.operation, workflow_name)
+            # Record the submission immediately, before the first poll, so
+            # even a crash on the very next line leaves a retry able to find
+            # workflow_name via heartbeat_details above instead of resubmitting.
+            activity.heartbeat(workflow_name)
 
         consecutive_errors = 0
         while True:

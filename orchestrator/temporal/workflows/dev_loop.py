@@ -9,18 +9,24 @@ approval signal -> implement -> PR"). The review/fix loop (shepherd) and
 deploy/monitor stages are phase 5/6 work, layered on top of this workflow
 once the slice is proven, not reimplemented here.
 
-Known simplification: approval is signal-only in this version (no
-.status.yaml-flip polling fallback) — an operator (or mctl_trigger_implementer
-today) approves by calling the `approve` signal on this workflow's ID. A
-human editing .status.yaml directly in gitops (the pre-Temporal affordance)
-still works for the legacy cron-driven pipeline, but does not signal a
-Temporal-tracked run; wiring that up is left to phase 5's cutover.
+Known simplification: approval is signal-only in this version, and does NOT
+itself flip the proposal's `.status.yaml` from `proposed` to `accepted` — an
+operator still does that by editing gitops directly (the pre-Temporal
+affordance), same as the legacy cron-driven pipeline. `approve()` only
+unblocks this workflow's wait_condition; the implement step below still
+requires the proposal to already be `accepted` by the time it runs, or the
+CWFT skips it with `skipped_reason` (a safe no-op, not an error). Automating
+that flip requires a new gitops-committing step, which per this plan's
+"gitops commit step" constraint must run inside Argo (the only place holding
+the `mctl-gitops-main-writes` mutex) — i.e. a new CWFT parameter, a
+cross-repo change deferred to phase 5's cutover rather than done here.
 
-Also a known simplification: the implement step runs with no
-service/slug filter, matching today's cwft-mctl-agents-implement default
-(picks up whatever is accepted, max_proposals=1) — sufficient for a
-single-issue run since nothing else should be queued ahead of it in a smoke
-test, not yet a scoped "implement exactly this issue's proposal" call.
+To keep that gap from ever implementing the WRONG proposal in the meantime,
+the implement step is scoped to this issue's own repo via the CWFT's existing
+`service` parameter (see `_target_repo` below) — so an approve() on this
+workflow can at worst no-op (nothing accepted yet in this repo) or implement
+a different already-accepted proposal in the SAME repo, never a different
+repo's issue.
 """
 from __future__ import annotations
 
@@ -35,13 +41,19 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
+    from orchestrator.temporal.issue_ref import parse_issue_url
 
 ENVIRONMENT = "production"
 
 # The Argo CWFTs already retry within a run (second-OAuth-account fallback on
-# a 429/five_hour limit) — see activities/argo.py's module docstring. Never
-# stack a Temporal retry on top of an SDK-backed run.
-SDK_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=1)
+# a 429/five_hour limit) — see activities/argo.py's module docstring. A
+# Temporal retry that re-submitted on top of that would multiply real SDK
+# runs, so this bound only exists to let a retried attempt RESUME polling
+# (via activity.info().heartbeat_details, see submit_and_wait) after a worker
+# crash or missed heartbeat — submit_and_wait detects "already submitted" and
+# never re-POSTs. 3, not unlimited: still fail loudly on a genuinely wedged
+# activity rather than retry forever.
+SDK_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 SDK_STEP_TIMEOUT = timedelta(hours=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 
@@ -86,7 +98,21 @@ async def _run_cwft(operation: str, params: dict[str, str]) -> WorkflowResult:
     )
 
 
-async def _record(agent: str, release: ResolvedRelease | None, result: WorkflowResult) -> None:
+def _target_repo(issue: IssueRef) -> str:
+    return parse_issue_url(issue.issue_url).repo
+
+
+async def _record(
+    agent: str, release: ResolvedRelease | None, result: WorkflowResult, target_repo: str
+) -> None:
+    # A release with no image_ref means resolve_agent_release found nothing
+    # to pin, so the CWFT ran its own baked-in default image instead (see
+    # activities/registry.py) — record that as "no pinned version", not as
+    # release.version, or the audit trail would claim a specific registry
+    # version produced this result when it was never actually passed to the
+    # run.
+    pinned = release if release and release.image_ref else None
+
     # Best-effort: this is an audit-trail write, not the real work (the CWFT
     # this records already ran to completion by the time this is called).
     # Letting a persistent failure here fail the whole workflow would make
@@ -100,8 +126,9 @@ async def _record(agent: str, release: ResolvedRelease | None, result: WorkflowR
                 temporal_workflow_id=workflow.info().workflow_id,
                 agent=agent,
                 environment=ENVIRONMENT,
-                version=release.version if release else "",
-                image_ref=release.image_ref if release else "",
+                version=pinned.version if pinned else "",
+                image_ref=pinned.image_ref if pinned else "",
+                target_repo=target_repo,
                 argo_workflow_name=result.workflow_name,
                 phase=result.phase,
             ),
@@ -128,6 +155,8 @@ class DevLoopWorkflow:
 
     @workflow.run
     async def run(self, issue: IssueRef) -> DevLoopResult:
+        target_repo = _target_repo(issue)
+
         # Pin the investigator version ONCE, at the start of this step. A
         # later promote/rollback in the registry must not retroactively
         # change what an in-flight (or replayed) workflow already ran.
@@ -138,7 +167,7 @@ class DevLoopWorkflow:
             investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
 
         investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
-        await _record("issue-investigator", investigator_release, investigate_result)
+        await _record("issue-investigator", investigator_release, investigate_result, target_repo)
 
         if not investigate_result.succeeded:
             return DevLoopResult(investigate=investigate_result, implement=None)
@@ -150,12 +179,16 @@ class DevLoopWorkflow:
         await workflow.wait_condition(lambda: self._approved)
 
         implementer_release = await _resolve("implementer")
-        implement_params: dict[str, str] = {}
+        # Scoped to this issue's own repo (see the module docstring): the
+        # implement CWFT only considers proposals under agents-state/<service>/,
+        # so an approve() here can at worst implement a different
+        # already-accepted proposal in the SAME repo, never a different one.
+        implement_params: dict[str, str] = {"service": target_repo}
         if implementer_release and implementer_release.image_ref:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
         implement_result = await _run_cwft("mctl-agents-implement", implement_params)
-        await _record("implementer", implementer_release, implement_result)
+        await _record("implementer", implementer_release, implement_result, target_repo)
 
         return DevLoopResult(investigate=investigate_result, implement=implement_result)

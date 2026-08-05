@@ -165,6 +165,42 @@ class TestSubmitAndWait:
         with pytest.raises(httpx.HTTPStatusError):
             await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
 
+    async def test_heartbeats_workflow_name_right_after_submit(self, env, monkeypatch):
+        """The first heartbeat must carry workflow_name — a retried attempt
+        depends on reading this back via heartbeat_details to know not to
+        resubmit (see the next two tests)."""
+        heartbeats = []
+        env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "wf-1"}})
+            return httpx.Response(200, json={"live": {"status": {"phase": "Succeeded"}}})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+        assert heartbeats[0] == ("wf-1",)
+
+    async def test_resumes_from_heartbeat_details_without_resubmitting(self, env, monkeypatch):
+        """Simulates a retried attempt after a worker crash: heartbeat_details
+        already has the workflow_name from a prior attempt's submission. The
+        activity must go straight to polling, never POSTing a second run —
+        that's the whole point of allowing SDK_STEP_RETRY_POLICY > 1."""
+        import dataclasses
+
+        env.info = dataclasses.replace(env.info, heartbeat_details=["mctl-agents-investigate-ab12cd34"])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit when heartbeat_details already has a workflow_name")
+            assert request.url.path == "/api/v1/workflows/mctl-agents-investigate-ab12cd34"
+            return httpx.Response(200, json={"live": {"status": {"phase": "Succeeded"}}})
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+        assert result.workflow_name == "mctl-agents-investigate-ab12cd34"
+        assert result.succeeded is True
+
     async def test_rides_out_transient_poll_errors(self, env, monkeypatch):
         """A handful of consecutive poll failures (mctl-api 5xx blip) must
         not kill the activity — only a persistent run of them should."""
@@ -222,6 +258,7 @@ class TestRecordExecution:
                 environment="production",
                 version="1.2.0",
                 image_ref="ghcr.io/mctlhq/mctl-agents@sha256:abc123",
+                target_repo="mctl-telegram",
                 argo_workflow_name="mctl-agents-investigate-ab12cd34",
                 phase="Succeeded",
             ),
@@ -229,6 +266,7 @@ class TestRecordExecution:
         assert seen["body"]["agent"] == "issue-investigator"
         assert seen["body"]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-telegram-1"
         assert seen["body"]["phase"] == "Succeeded"
+        assert seen["body"]["target_repo"] == "mctl-telegram"
 
     async def test_raises_on_error_response(self, env, monkeypatch):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -244,6 +282,7 @@ class TestRecordExecution:
                     environment="production",
                     version="",
                     image_ref="",
+                    target_repo="",
                     argo_workflow_name="wf",
                     phase="Succeeded",
                 ),
