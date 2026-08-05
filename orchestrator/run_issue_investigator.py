@@ -379,11 +379,12 @@ class RateLimitExhaustedError(RuntimeError):
     """The SDK's final ResultMessage reported an API-level rate/usage-limit
     rejection (``is_error`` True, ``api_error_status`` 429) rather than an
     agent/tooling failure. Distinct from the generic ``Exception`` branch in
-    ``investigate()`` so callers — specifically
-    ``run_issue_poller.poll()`` — can tell "this account is out of quota"
-    apart from "the agent broke on this issue", and only fail the whole poll
-    cycle (to trigger the OAuth fallback token) when EVERY attempted issue
-    hit this specific case, not on an unrelated per-issue error.
+    ``investigate()`` so the resulting ``InvestigateResult.error`` message is
+    unambiguous ("rate/usage limit exhausted" vs. an opaque agent/tooling
+    failure) to whatever's driving this call — the CWFT-level OAuth-fallback
+    retry for a direct/legacy trigger, or (since the phase-5 poller cutover)
+    the account-2 fallback inside the Argo-submitted investigate step that
+    DevLoopWorkflow's submit_and_wait activity kicks off.
     """
 
 
@@ -426,8 +427,11 @@ class InvestigateResult:
     error: str | None = None
     # True only when `error` is set AND the failure was specifically a
     # RateLimitExhaustedError (api_error_status=429), not any other agent/
-    # tooling failure. run_issue_poller.poll() uses this to distinguish
-    # "this account is out of quota" from "the agent broke on this issue".
+    # tooling failure — lets a caller distinguish "this account is out of
+    # quota" from "the agent broke on this issue". Since the phase-5 poller
+    # cutover, run_issue_poller.poll() no longer calls investigate()
+    # in-process and so no longer reads this field; kept for whatever still
+    # calls investigate() synchronously (the legacy/direct trigger path).
     rate_limited: bool = False
 
 
@@ -529,7 +533,7 @@ def investigate(
     except RateLimitExhaustedError as e:
         # Must be caught before the generic Exception branch below — same
         # exception hierarchy, but this one carries a distinguishable
-        # `rate_limited=True` so run_issue_poller.poll() can tell "this
+        # `rate_limited=True` for whatever's driving this call to tell "this
         # account is out of quota" apart from any other agent failure.
         return InvestigateResult(
             service, slug, proposal_dir, error=str(e), rate_limited=True
