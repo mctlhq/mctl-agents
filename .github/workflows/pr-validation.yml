@@ -49,6 +49,11 @@ jobs:
     # that silent gap loud instead: it fails the PR (not main; this workflow's
     # own push:main trigger will still validate the merge, but by then it's
     # too late to fix commit messages) if not one commit qualifies.
+    #
+    # Same caveat as `tests` below (see the file-level comment at the top):
+    # this only fails the PR *check* — it doesn't gate a merge until it's a
+    # required status check, and release-please's own admin-merge path
+    # bypasses required checks entirely either way.
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     timeout-minutes: 5
@@ -67,13 +72,24 @@ jobs:
           # releasable (bumps minor/patch, gets a CHANGELOG entry): feat/fix,
           # plus perf and revert which it also bumps by default.
           PATTERN='^(feat|fix|perf|revert)(\([^)]+\))?!?:'
+          # Capture git log's own exit status explicitly rather than via a
+          # process substitution feeding the loop below — under `set -e` a
+          # failure inside `< <(...)` is not propagated to the script, so an
+          # invalid/unreachable SHA range would silently look identical to
+          # "no releasable commits found" and report the wrong error.
+          if ! SUBJECTS=$(git log --format=%s "${BASE_SHA}..${HEAD_SHA}"); then
+            echo "::error::git log failed for range ${BASE_SHA}..${HEAD_SHA} — cannot check commit messages."
+            exit 1
+          fi
           MATCHED=0
           while IFS= read -r subject; do
             if printf '%s' "$subject" | grep -qE "$PATTERN"; then
               echo "✓ releasable commit: $subject"
               MATCHED=1
             fi
-          done < <(git log --format=%s "${BASE_SHA}..${HEAD_SHA}")
+          done <<EOF
+$SUBJECTS
+EOF
           if [ "$MATCHED" -eq 0 ]; then
             echo "::error::No commit in this PR uses a release-please-releasable type (feat/fix/perf/revert)." \
                  "release-please will merge this PR's changes into main but silently cut NO release for it —" \
