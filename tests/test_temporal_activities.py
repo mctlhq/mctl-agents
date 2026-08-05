@@ -165,6 +165,44 @@ class TestSubmitAndWait:
         with pytest.raises(httpx.HTTPStatusError):
             await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
 
+    async def test_rides_out_transient_poll_errors(self, env, monkeypatch):
+        """A handful of consecutive poll failures (mctl-api 5xx blip) must
+        not kill the activity — only a persistent run of them should."""
+        calls = {"status": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "wf-1"}})
+            calls["status"] += 1
+            if calls["status"] <= 3:
+                return httpx.Response(502, json={"error": "bad gateway"})
+            return httpx.Response(200, json={"live": {"status": {"phase": "Succeeded"}}})
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+        assert result.phase == "Succeeded"
+        assert calls["status"] == 4  # 3 failures + 1 success
+
+    async def test_gives_up_after_too_many_consecutive_poll_errors(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "wf-1"}})
+            return httpx.Response(502, json={"error": "bad gateway"})
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+
 
 class TestRecordExecution:
     async def test_posts_execution_record(self, env, monkeypatch):

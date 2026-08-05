@@ -53,6 +53,12 @@ async def resolve_agent_release(agent: str, environment: str) -> ResolvedRelease
         resolve_resp.raise_for_status()
         version = resolve_resp.json()["version"]
 
+        # GET /api/v1/agents/{name}/versions is unpaginated as of this
+        # writing (ListVersions in mctl-api's agentregistry store returns
+        # every row for the agent in one response) — if that ever changes,
+        # a version published past the first page would silently fail to be
+        # found here and image_ref would fall back to "" (the CWFT's own
+        # default), not an error.
         versions_resp = await client.get(f"/api/v1/agents/{agent}/versions", headers=headers)
         versions_resp.raise_for_status()
         image_ref = ""

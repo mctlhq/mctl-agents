@@ -29,6 +29,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
@@ -45,6 +46,14 @@ SDK_STEP_TIMEOUT = timedelta(hours=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 
 FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
+# Bounded, not the Temporal default of unlimited attempts: resolve/record are
+# plain HTTP round trips to mctl-api, so a handful of retries covers a real
+# transient blip. Unlimited retries on _record in particular would otherwise
+# wedge wait_condition forever if mctl-api's executions endpoint were ever
+# down — the real SDK work (submit_and_wait) already succeeded by the time
+# _record runs, so its own failure must never block workflow progress (see
+# _record's try/except below).
+FAST_ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
 
 @dataclass(frozen=True)
@@ -63,6 +72,7 @@ async def _resolve(agent: str) -> ResolvedRelease | None:
         resolve_agent_release,
         args=[agent, ENVIRONMENT],
         start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+        retry_policy=FAST_ACTIVITY_RETRY_POLICY,
     )
 
 
@@ -77,19 +87,34 @@ async def _run_cwft(operation: str, params: dict[str, str]) -> WorkflowResult:
 
 
 async def _record(agent: str, release: ResolvedRelease | None, result: WorkflowResult) -> None:
-    await workflow.execute_activity(
-        record_execution,
-        ExecutionRecord(
-            temporal_workflow_id=workflow.info().workflow_id,
-            agent=agent,
-            environment=ENVIRONMENT,
-            version=release.version if release else "",
-            image_ref=release.image_ref if release else "",
-            argo_workflow_name=result.workflow_name,
-            phase=result.phase,
-        ),
-        start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-    )
+    # Best-effort: this is an audit-trail write, not the real work (the CWFT
+    # this records already ran to completion by the time this is called).
+    # Letting a persistent failure here fail the whole workflow would make
+    # an mctl-api outage on this one endpoint block wait_condition/approval
+    # indefinitely for work that already succeeded — worse than a missing
+    # execution record.
+    try:
+        await workflow.execute_activity(
+            record_execution,
+            ExecutionRecord(
+                temporal_workflow_id=workflow.info().workflow_id,
+                agent=agent,
+                environment=ENVIRONMENT,
+                version=release.version if release else "",
+                image_ref=release.image_ref if release else "",
+                argo_workflow_name=result.workflow_name,
+                phase=result.phase,
+            ),
+            start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+            retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+        )
+    except ActivityError:
+        workflow.logger.warning(
+            "record_execution failed after retries for agent=%s argo_workflow=%s — "
+            "continuing without a durable execution record for this step",
+            agent,
+            result.workflow_name,
+        )
 
 
 @workflow.defn

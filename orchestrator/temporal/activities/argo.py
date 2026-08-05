@@ -34,6 +34,14 @@ POLL_INTERVAL_SECONDS = 15.0
 # rather than guessed at, since a not-yet-populated status block also reads
 # as an empty phase right after submission.
 TERMINAL_PHASES = frozenset({"Succeeded", "Failed", "Error"})
+# How many consecutive poll failures (mctl-api 5xx, network blip) to ride
+# out before giving up. Because this activity runs with maximum_attempts=1
+# (see the module docstring), letting any single poll failure propagate
+# would kill the whole activity hours into an already-submitted Argo run —
+# losing track of it entirely, since the workflow_name isn't persisted
+# anywhere else. At POLL_INTERVAL_SECONDS=15s, this rides out ~5 minutes of
+# a down mctl-api before finally raising.
+MAX_CONSECUTIVE_POLL_ERRORS = 20
 
 
 @dataclass(frozen=True)
@@ -70,6 +78,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
         workflow_name = submit_resp.json()["workflow"]["workflowName"]
         activity.logger.info("submitted %s -> %s", input.operation, workflow_name)
 
+        consecutive_errors = 0
         while True:
             # Heartbeat before every poll, not just on change: a stuck
             # mctl-api / cluster makes this loop spin on the `continue`
@@ -80,8 +89,30 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             # still succeeding.
             activity.heartbeat(workflow_name)
 
-            status_resp = await client.get(f"/api/v1/workflows/{workflow_name}", headers=headers)
-            status_resp.raise_for_status()
+            try:
+                status_resp = await client.get(f"/api/v1/workflows/{workflow_name}", headers=headers)
+                status_resp.raise_for_status()
+            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+                consecutive_errors += 1
+                if consecutive_errors > MAX_CONSECUTIVE_POLL_ERRORS:
+                    activity.logger.error(
+                        "giving up polling %s after %d consecutive failures: %s",
+                        workflow_name,
+                        consecutive_errors,
+                        exc,
+                    )
+                    raise
+                activity.logger.warning(
+                    "poll failed for %s (%d/%d consecutive): %s",
+                    workflow_name,
+                    consecutive_errors,
+                    MAX_CONSECUTIVE_POLL_ERRORS,
+                    exc,
+                )
+                await asyncio.sleep(POLL_INTERVAL_SECONDS)
+                continue
+
+            consecutive_errors = 0
             body = status_resp.json()
             live = body.get("live") or {}
             status_block = live.get("status") or {}

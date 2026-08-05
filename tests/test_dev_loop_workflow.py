@@ -164,3 +164,42 @@ class TestDevLoopWorkflow:
 
         assert "agent_image" not in seen_params["mctl-agents-investigate"]
         assert "agent_version" not in seen_params["mctl-agents-investigate"]
+
+    async def test_persistent_record_execution_failure_does_not_fail_workflow(self, env):
+        """record_execution is an audit-trail write, not the real work — a
+        persistent failure there (e.g. mctl-api's executions endpoint down)
+        must not fail the whole workflow or wedge wait_condition, since the
+        underlying CWFT run it's trying to record already succeeded."""
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return None
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def always_failing_record_execution(record: ExecutionRecord) -> None:
+            raise ValueError("mctl-api executions endpoint unreachable")
+
+        activities = [fake_resolve_agent_release, fake_submit_and_wait, always_failing_record_execution]
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/4"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.investigate.phase == "Succeeded"
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
