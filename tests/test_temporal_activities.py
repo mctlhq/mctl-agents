@@ -181,6 +181,37 @@ class TestSubmitAndWait:
         await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
         assert heartbeats[0] == ("wf-1",)
 
+    async def test_unparseable_submit_response_heartbeats_sentinel_and_raises(self, env, monkeypatch):
+        """mctl-api returning 2xx (Argo run genuinely created) with a body
+        that doesn't parse into a workflow name must not silently swallow
+        the fact that a run exists — and a retry after this must never
+        resubmit, since that would duplicate the real SDK run."""
+        heartbeats = []
+        env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.method == "POST"
+            return httpx.Response(202, json={"unexpected": "shape"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(RuntimeError, match="could not parse the workflow"):
+            await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+        assert heartbeats == [("<submitted, workflow name unparseable>",)]
+
+    async def test_retry_after_unparseable_response_refuses_to_resubmit(self, env, monkeypatch):
+        import dataclasses
+
+        env.info = dataclasses.replace(
+            env.info, heartbeat_details=["<submitted, workflow name unparseable>"]
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("must never make an HTTP call once the unparseable-response sentinel is seen")
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(RuntimeError, match="refusing to resubmit"):
+            await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
+
     async def test_resumes_from_heartbeat_details_without_resubmitting(self, env, monkeypatch):
         """Simulates a retried attempt after a worker crash: heartbeat_details
         already has the workflow_name from a prior attempt's submission. The

@@ -51,8 +51,13 @@ ENVIRONMENT = "production"
 # runs, so this bound only exists to let a retried attempt RESUME polling
 # (via activity.info().heartbeat_details, see submit_and_wait) after a worker
 # crash or missed heartbeat — submit_and_wait detects "already submitted" and
-# never re-POSTs. 3, not unlimited: still fail loudly on a genuinely wedged
-# activity rather than retry forever.
+# refuses to re-POST once it has a workflow_name (including the "submitted
+# but name unparseable" sentinel, which fails loudly instead of guessing).
+# The only gap this doesn't close: a crash strictly between the Argo POST
+# succeeding and the first activity.heartbeat() call actually landing at the
+# Temporal server — vanishingly small (no I/O in between), but real. 3, not
+# unlimited: still fail loudly on a genuinely wedged activity rather than
+# retry forever.
 SDK_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 SDK_STEP_TIMEOUT = timedelta(hours=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
@@ -183,6 +188,19 @@ class DevLoopWorkflow:
         # implement CWFT only considers proposals under agents-state/<service>/,
         # so an approve() here can at worst implement a different
         # already-accepted proposal in the SAME repo, never a different one.
+        #
+        # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
+        # declaring this `service` parameter and threading it to
+        # `run_implementer.py --service <value>` — verified directly
+        # (not assumed) as of this comment: see
+        # cwft-mctl-agents-implement.yaml's `arguments.parameters` (name:
+        # service) and its `implement-proposals` step, which does
+        # `[ -n "$WORKFLOW_SERVICE" ] && set -- "$@" --service "$WORKFLOW_SERVICE"`
+        # before invoking run_implementer.py. mctl-agents' CI can't check
+        # this out to assert it directly (mctl-gitops is a sibling repo), so
+        # if that CWFT is ever changed to drop/rename the parameter, this
+        # scoping silently reverts to today's unscoped behavior with no
+        # error on this side.
         implement_params: dict[str, str] = {"service": target_repo}
         if implementer_release and implementer_release.image_ref:
             implement_params["agent_image"] = implementer_release.image_ref

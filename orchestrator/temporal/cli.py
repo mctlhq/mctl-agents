@@ -14,6 +14,7 @@ import os
 import sys
 
 from temporalio.client import Client
+from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from orchestrator.temporal.issue_ref import parse_issue_url
 from orchestrator.temporal.worker import TASK_QUEUE
@@ -42,11 +43,18 @@ async def start(issue_url: str) -> None:
         raise SystemExit(2) from exc
     client = await _connect()
     workflow_id = _workflow_id_for(issue_url)
+    # Mirrors mctl-api's internal/temporalclient.Client.StartDevLoopWorkflow:
+    # REJECT_DUPLICATE + USE_EXISTING make a repeated start against the same
+    # issue a true no-op (returns the existing run) instead of the SDK
+    # defaults (ALLOW_DUPLICATE starts a fresh run once the prior one
+    # closed; UNSPECIFIED errors while one is still running).
     handle = await client.start_workflow(
         DevLoopWorkflow.run,
         IssueRef(issue_url=issue_url),
         id=workflow_id,
         task_queue=TASK_QUEUE,
+        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )
     print(f"started {handle.id} (run_id={handle.result_run_id})")
 

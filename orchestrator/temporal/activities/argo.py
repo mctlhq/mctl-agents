@@ -17,7 +17,13 @@ starts, and a new attempt reads it back via
 entirely and polling resumes against the same Argo workflow name.
 DevLoopWorkflow's retry policy for this activity may therefore allow a
 small number of attempts (see SDK_STEP_RETRY_POLICY in workflows/dev_loop.py)
-without ever causing a second real SDK run for the same step.
+without a retry resubmitting once a workflow_name has actually been
+heartbeated — including a response mctl-api returned 2xx for but whose body
+couldn't be parsed for a name (see _SUBMITTED_UNKNOWN_NAME below), which
+fails loudly on retry rather than guessing. The one gap this doesn't close:
+a crash strictly between the Argo POST succeeding and that first heartbeat
+call landing at the Temporal server — no I/O happens in between, so it's
+vanishingly unlikely, but not impossible.
 
 Do not re-read Argo for a result: mctl-agents-investigate carries
 ttlStrategy.secondsAfterCompletion=86400, so a workflow that resumes after
@@ -73,6 +79,17 @@ class WorkflowResult:
         return self.phase == "Succeeded"
 
 
+# Heartbeat sentinel for "the POST succeeded (raise_for_status didn't raise,
+# so Argo already created the run server-side) but the response body couldn't
+# be parsed for a workflow name" — an edge case narrower than a submit
+# failure: the SDK run already exists, we just don't know its name. A retry
+# that sees this must NOT resubmit (that would duplicate the real SDK run,
+# the one failure mode this whole resume design exists to prevent) — it
+# fails loudly instead, for manual recovery, which is a strictly better
+# outcome than a silent duplicate.
+_SUBMITTED_UNKNOWN_NAME = "<submitted, workflow name unparseable>"
+
+
 @activity.defn
 async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
     headers = auth_headers()
@@ -83,6 +100,13 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
         # exists — go straight to polling instead of POSTing a second one.
         heartbeat_details = activity.info().heartbeat_details
         workflow_name = heartbeat_details[0] if heartbeat_details else None
+
+        if workflow_name == _SUBMITTED_UNKNOWN_NAME:
+            raise RuntimeError(
+                f"a prior attempt submitted {input.operation} but its Argo workflow name could not be "
+                "determined from mctl-api's response — refusing to resubmit (would duplicate the real SDK "
+                "run); check Argo/mctl-api for a recent run of this operation and record it manually"
+            )
 
         if workflow_name:
             activity.logger.info(
@@ -97,7 +121,14 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
                 headers=headers,
             )
             submit_resp.raise_for_status()
-            workflow_name = submit_resp.json()["workflow"]["workflowName"]
+            try:
+                workflow_name = submit_resp.json()["workflow"]["workflowName"]
+            except (ValueError, KeyError, TypeError) as exc:
+                activity.heartbeat(_SUBMITTED_UNKNOWN_NAME)
+                raise RuntimeError(
+                    f"submitted {input.operation} (mctl-api accepted it) but could not parse the workflow "
+                    f"name from its response: {exc!r}"
+                ) from exc
             activity.logger.info("submitted %s -> %s", input.operation, workflow_name)
             # Record the submission immediately, before the first poll, so
             # even a crash on the very next line leaves a retry able to find
