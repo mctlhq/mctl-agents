@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.22.0](https://github.com/mctlhq/mctl-agents/compare/1.21.0...1.22.0) (2026-08-05)
+
+
+### Features
+
+* **agents:** add AgentManifest contract + validator (phase 1) ([f436b6c](https://github.com/mctlhq/mctl-agents/commit/f436b6c5fcc554024df7c47982f99fab08515c35))
+* **agents:** add AgentManifest contract + validator (phase 1) ([cef7e7b](https://github.com/mctlhq/mctl-agents/commit/cef7e7b27e75832b3302436e9a3a811a812cf323))
+* **temporal:** DevLoopWorkflow — issue -&gt; investigate -&gt; approve -&gt; implement ([7b4479b](https://github.com/mctlhq/mctl-agents/commit/7b4479b2248e5bc0c0ff5cc83c601a692c7c1b5b))
+* **temporal:** DevLoopWorkflow — issue -&gt; investigate -&gt; approve -&gt; implement ([24b586a](https://github.com/mctlhq/mctl-agents/commit/24b586a8fe1379845fb0e7bd5e6bc8b49561521f))
+
+
+### Bug Fixes
+
+* **agents:** address Codex round-4 P2s posted after Claude's approval ([537f8f5](https://github.com/mctlhq/mctl-agents/commit/537f8f539a6431e97d62e68310ef00dc191dfd25))
+* **agents:** address remaining Codex P2s from round-2 review ([875b9cd](https://github.com/mctlhq/mctl-agents/commit/875b9cd89e80a7560ff49fae8ddb84db57b76cb1))
+* **agents:** address review findings on the manifest validator ([9bc814c](https://github.com/mctlhq/mctl-agents/commit/9bc814cda02cefddc3086d069989ecd9ec5e8f96))
+* **agents:** restore orchestrator.options after clean-env comparison ([4fb2cff](https://github.com/mctlhq/mctl-agents/commit/4fb2cff00ab2ae303f9913030f66aaadebbd84d0))
+* bound retry policies and poll resilience per review (PR [#105](https://github.com/mctlhq/mctl-agents/issues/105)) ([82cf0ae](https://github.com/mctlhq/mctl-agents/commit/82cf0ae267f356e631c7913dc5493e0e4a30a3db))
+* close remaining duplicate-submit gap, verify gitops scoping dependency (PR [#105](https://github.com/mctlhq/mctl-agents/issues/105) review round 3) ([9575ae3](https://github.com/mctlhq/mctl-agents/commit/9575ae3e0029c61b5bce55cbcee00571a8e8981e))
+* **diag:** request explicit permissions, avoid run: interpolation ([1a0d01d](https://github.com/mctlhq/mctl-agents/commit/1a0d01d89c60531083190802650af6564034a2e9))
+* resumable Argo polling, scope implement to issue's repo, fix audit trail (PR [#105](https://github.com/mctlhq/mctl-agents/issues/105) review) ([ecda152](https://github.com/mctlhq/mctl-agents/commit/ecda1529914cc4e39386dc13ddbef7e7e8fe2ef1))
+
 ## [1.21.0](https://github.com/mctlhq/mctl-agents/compare/1.20.2...1.21.0) (2026-08-02)
 
 
