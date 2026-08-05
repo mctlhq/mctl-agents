@@ -25,9 +25,10 @@ from orchestrator.run_incident_responder import run_incident_responder
 from orchestrator.run_mentor import run_mentor
 from orchestrator.run_service_agent import run_service_agent
 
-# Distinct from run_issue_poller.py's RATE_LIMIT_EXIT_CODE=3 — different
-# workflow template, no collision risk; Argo's assert-attempt only checks
-# whether the step status is Succeeded, not the specific exit code.
+# Distinct exit code so this specific failure mode is distinguishable in
+# logs; Argo's assert-attempt only checks whether the step status is
+# Succeeded, not the specific exit code, so no collision risk with other
+# non-zero exits from this workflow template.
 MCP_NOT_CONNECTED_EXIT_CODE = 4
 
 

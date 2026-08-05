@@ -1,13 +1,14 @@
 """Issue-poller — central scan that turns `agents:intake`-labelled issues
-into mctl-agents proposals.
+into Temporal DevLoopWorkflow runs.
 
-This is the Phase 2 trigger for the issue-driven entry point. Where
-``run_issue_investigator`` handles ONE issue (manually, via the
-``mctl_trigger_issue`` MCP tool), the poller scans every open issue under the
-`mctlhq` org carrying the `agents:intake` label and runs the investigator
-for each. It lets an operator start an investigation by *labelling* an issue
-instead of calling an MCP tool — a single in-cluster CronWorkflow
-(`mctl-agents-issue-poll`) does the scan.
+This is the phase-5 cutover of the phase-2 issue-driven trigger: where
+``run_issue_investigator`` used to handle ONE issue synchronously and this
+poller used to call it in-process for every labelled issue, the poller's job
+now shrinks to discovery + dispatch. The actual investigate/approve/
+implement pipeline — including the account-2 OAuth rate-limit fallback —
+lives inside ``DevLoopWorkflow`` and the Argo CWFTs it submits (see
+``orchestrator/temporal/workflows/dev_loop.py``); this module never spends
+SDK budget itself, only a cheap Temporal `start_workflow` RPC per issue.
 
 Pipeline for one poll cycle:
     1. `gh search issues` — list open `mctlhq` issues labelled the configured
@@ -15,28 +16,35 @@ Pipeline for one poll cycle:
     2. For each issue, in turn:
        a. Skip (label left in place) if the repo is not a known service —
           a misconfiguration the operator should see.
-       b. Run ``investigate`` in-process. It is idempotent: a proposal
-          already past `proposed` is left untouched.
-       c. On success — or on a skip because an implementation is already
-          in flight — remove the label so the next cycle does not
-          re-investigate and re-spend the SDK budget.
+       b. Start (or attach to) that issue's DevLoopWorkflow. Temporal's own
+          workflow-ID dedup (`dev-loop-{owner}-{repo}-{issue}`,
+          REJECT_DUPLICATE + USE_EXISTING) makes a repeated start against an
+          already-RUNNING workflow a true no-op; a prior CLOSED run for the
+          same issue is treated as "already handled" (see
+          ``WorkflowAlreadyStartedError`` handling below), not a failure.
+       c. Remove the label so the next cycle does not re-scan an issue
+          already handed off to the pipeline.
        d. On error, leave the label so the next cycle retries.
 
 Per-issue failures never fail the whole poll: they are logged and the label
-is kept for retry. The process exits non-zero only on a global failure
-(missing state dir, broken `gh` auth) so the CronWorkflow surfaces a genuine
-outage but stays green on the normal "one bad issue" case.
+is kept for retry. The process exits non-zero only on a global failure —
+broken `gh` auth (crashes before the per-issue loop even starts), or a
+cycle with dispatchable issues where connecting to the Temporal frontend
+itself fails (checked once up front, not per issue) — so the CronWorkflow
+surfaces a genuine outage but stays green on the normal "one bad issue"
+case.
 
-A cycle investigates at most ``--max-issues`` issues (default
-``DEFAULT_MAX_ISSUES``). Each investigation spends real SDK budget, so a
-mass-label event would otherwise be an uncapped N-runs runaway; any issues
-beyond the cap keep their label and are picked up by a later cycle. Pass
-``--max-issues 0`` to disable the cap.
+A cycle dispatches at most ``--max-issues`` issues (default
+``DEFAULT_MAX_ISSUES``) — starting a workflow is cheap, but this keeps a
+mass-label event from fanning out into an uncapped run of Argo submissions in
+one tick. Any issues beyond the cap keep their label and are picked up by a
+later cycle. Pass ``--max-issues 0`` to disable the cap.
 
 Auth:
     GITHUB_TOKEN from env (gh CLI honors it) — needs `repo` read on the
-    target repos, plus `issues: write` for the proposal comment and the
-    label removal.
+    target repos, plus `issues: write` for the label removal.
+    TEMPORAL_ADDRESS / TEMPORAL_NAMESPACE from env — see
+    orchestrator/temporal/start.py.
 
 Usage:
     python -m orchestrator.run_issue_poller
@@ -46,21 +54,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+
+from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from config.settings import SERVICES
-from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.run_issue_investigator import (
-    DEFAULT_STATE_DIR,
-    IssueRef,
-    _run,
-    investigate,
-    try_parse_issue_url,
-)
+from orchestrator.run_issue_investigator import IssueRef, _run, try_parse_issue_url
+from orchestrator.temporal.start import connect, start_dev_loop_workflow, workflow_id_for
 
 # `gh search` returns at most this many rows per call. A poll cycle with more
 # labelled issues than this is well outside normal operation, but warn rather
@@ -69,48 +73,19 @@ _SEARCH_LIMIT = 100
 
 # Issues carrying this label are picked up by the poller. An operator adds it
 # to a feature-request issue to hand it to the pipeline; the poller removes it
-# once the issue has been turned into a proposal.
+# once the issue has been handed off to a DevLoopWorkflow.
 DEFAULT_LABEL = "agents:intake"
 
-# A cycle investigates at most this many issues. Each investigation spends
-# real SDK budget, so without a cap a mass-label event would fan out into an
-# uncapped run of paid investigations. Issues beyond the cap keep their label
-# and are handled by a later cycle. `--max-issues 0` disables the cap.
+# A cycle dispatches at most this many issues per tick. Issues beyond the cap
+# keep their label and are handled by a later cycle. `--max-issues 0`
+# disables the cap.
 DEFAULT_MAX_ISSUES = 5
-
-# Distinct sys.exit() code used only when EVERY issue attempted this cycle
-# failed specifically because the account's OAuth token was rate-limited/
-# out of quota (never for an unrelated per-issue failure or a mix). The
-# CronWorkflow's shell wrapper treats any non-zero exit as "not a confirmed
-# success" and retries on the fallback token — see the note in main().
-RATE_LIMIT_EXIT_CODE = 3
 
 
 @dataclass
 class PollResult:
+    started: int
     failures: int
-    # Subset of `failures` that were specifically RateLimitExhaustedError —
-    # see InvestigateResult.rate_limited. Issues skipped for an unrelated
-    # reason (unknown service, pre-flight SystemExit, label-removal failure)
-    # never set this, so a mix of rate-limited + unrelated failures always
-    # has rate_limited_failures < failures.
-    rate_limited_failures: int
-    # Count of issues that actually reached `investigate()` this cycle —
-    # i.e. every outcome EXCEPT an unknown-service skip (never attempted)
-    # and a dry-run preview. Unlike `failures`, this also counts successes
-    # and in-flight skips. main()'s "every attempted issue was rate-limited"
-    # check needs this: `failures == rate_limited_failures` alone is true
-    # whenever there happen to be zero non-rate-limited FAILURES, even if
-    # most attempts actually succeeded (Codex P2 on mctl-agents#63) —
-    # comparing against `attempted` instead requires zero successes/skips
-    # among issues that reached investigate(). Note this does NOT guarantee
-    # zero failures anywhere in the cycle: an unknown-service skip or a
-    # pre-flight SystemExit both increment `failures` without ever
-    # incrementing `attempted` (Codex P3 on mctl-agents#63), so main() can
-    # still exit RATE_LIMIT_EXIT_CODE while one of those coexists — which is
-    # correct, since the only real SDK call that cycle genuinely was
-    # rate-limited.
-    attempted: int
 
 
 def search_labeled_issues(label: str) -> list[IssueRef]:
@@ -158,40 +133,37 @@ def remove_label(issue_url: str, label: str) -> None:
     _run(["gh", "issue", "edit", issue_url, "--remove-label", label])
 
 
-def poll(
+async def poll(
     label: str = DEFAULT_LABEL,
-    state_dir: Path = DEFAULT_STATE_DIR,
     dry_run: bool = False,
     max_issues: int = DEFAULT_MAX_ISSUES,
 ) -> PollResult:
-    """Run one poll cycle. Returns the count of issues that failed, plus how
-    many of those were specifically rate-limit/quota exhaustion.
+    """Run one poll cycle. Returns how many issues were started vs failed.
 
-    At most ``max_issues`` *known-service* issues are investigated per cycle
+    At most ``max_issues`` *known-service* issues are dispatched per cycle
     (``max_issues <= 0`` disables the cap). Any beyond the cap keep their label
     and are picked up by a later cycle.
     """
-    if not state_dir.is_dir():
-        raise SystemExit(f"State dir not found: {state_dir}")
-
     refs = search_labeled_issues(label)
     if not refs:
         print(f"No open issues labelled '{label}' — nothing to do.")
-        return PollResult(failures=0, rate_limited_failures=0, attempted=0)
+        return PollResult(started=0, failures=0)
 
-    # The --max-issues cap bounds the number of *paid* investigations per
-    # cycle. Apply it only to known-service issues: a non-service issue costs
-    # no SDK budget (it is reported and its label kept for the operator), so
-    # capping the raw search result would let a wall of mislabelled
-    # non-service issues starve a valid one out of every cycle.
+    # The --max-issues cap bounds the number of Argo submissions a single
+    # tick can fan out into. Apply it only to known-service issues: a
+    # non-service issue never reaches start_dev_loop_workflow (it is
+    # reported and its label kept for the operator), so capping the raw
+    # search result would let a wall of mislabelled non-service issues starve
+    # a valid one out of every cycle.
     service_refs = [r for r in refs if r.repo in SERVICES]
     other_refs = [r for r in refs if r.repo not in SERVICES]
 
     if max_issues > 0 and len(service_refs) > max_issues:
         # The dropped issues keep their label (they are never passed to
-        # investigate / remove_label below), so the next cycle picks them up.
+        # start_dev_loop_workflow / remove_label below), so the next cycle
+        # picks them up.
         print(
-            f"WARN: {len(service_refs)} investigable issue(s) labelled "
+            f"WARN: {len(service_refs)} dispatchable issue(s) labelled "
             f"'{label}' found — capping this cycle at --max-issues={max_issues}; "
             f"the remaining {len(service_refs) - max_issues} keep their label "
             f"for the next cycle."
@@ -199,26 +171,39 @@ def poll(
         service_refs = service_refs[:max_issues]
 
     # Non-service issues first so a misconfiguration surfaces at the top of
-    # the log, then the capped investigable issues.
+    # the log, then the capped dispatchable issues.
     refs = other_refs + service_refs
     print(f"Found {len(refs)} issue(s) labelled '{label}':")
     for ref in refs:
         print(f"  - {ref.full_repo}#{ref.number}")
 
+    # Connect once per cycle, not once per issue — reused across every
+    # start_dev_loop_workflow call below. Checked up front, before the
+    # per-issue loop, so a Temporal-frontend outage is a genuine GLOBAL
+    # failure (raises SystemExit, non-zero exit) rather than N identical
+    # per-issue soft failures that would leave the CronWorkflow green.
+    # Skipped entirely for dry-run (side-effect-free preview) and when there
+    # is nothing dispatchable this cycle (no point requiring connectivity).
+    client = None
+    if not dry_run and service_refs:
+        try:
+            client = await connect()
+        except Exception as e:
+            raise SystemExit(f"Could not connect to Temporal — {e}") from e
+
+    started = 0
     failures = 0
-    rate_limited_failures = 0
-    attempted = 0
     for ref in refs:
         print(f"\n=== {ref.full_repo}#{ref.number} ===")
 
         known_service = ref.repo in SERVICES
 
-        # dry-run is a side-effect-free preview: it neither investigates nor
-        # relabels, and never increments the failure count (an unknown
-        # service is reported but not counted — see the non-dry-run path).
+        # dry-run is a side-effect-free preview: it neither starts a
+        # workflow nor relabels.
         if dry_run:
             if known_service:
-                print(f"[dry-run] would investigate {ref.url} and remove '{label}'")
+                wf_id = workflow_id_for(ref.url)
+                print(f"[dry-run] would start/attach {wf_id} and remove '{label}'")
             else:
                 print(
                     f"[dry-run] would skip — {ref.repo} is not a known "
@@ -229,8 +214,6 @@ def poll(
         if not known_service:
             # A label on a repo the pipeline can't build. Leave the label so
             # the operator notices, rather than silently dropping the request.
-            # Not a rate-limit signal — never counted toward
-            # rate_limited_failures.
             print(
                 f"WARN: {ref.repo} is not a known service "
                 f"(config/settings.py SERVICES) — skipping, label kept."
@@ -238,63 +221,46 @@ def poll(
             failures += 1
             continue
 
-        # Counted regardless of outcome (success, skip, or any failure) —
-        # see the note on PollResult.attempted for why this, not `failures`,
-        # is what main() compares rate_limited_failures against.
-        attempted += 1
         try:
-            result = investigate(ref.url, state_dir=state_dir)
-        except SystemExit as e:
-            # Pre-flight rejection from the investigator — treat as a
-            # per-issue failure, keep the label. Not a rate-limit signal.
-            print(f"FAIL: investigate raised: {e}")
+            handle = await start_dev_loop_workflow(ref.url, client=client)
+        except WorkflowAlreadyStartedError:
+            # A prior DevLoopWorkflow for this issue already ran to
+            # completion (REJECT_DUPLICATE rejects id-reuse against a
+            # CLOSED run) — this issue has already been handled by the
+            # pipeline once; a re-added label is not a new request. Not a
+            # failure: drop the label like any other handled issue.
+            print(f"OK (already handled): {workflow_id_for(ref.url)} already ran to completion")
+        except Exception as e:  # noqa: BLE001 — surfaced as a per-issue failure, label kept for retry
+            print(f"FAIL: could not start workflow for {ref.url}: {e} — label kept for retry")
             failures += 1
             continue
-
-        if result.error:
-            print(
-                f"FAIL: {result.service}/{result.slug}: {result.error} "
-                f"— label kept for retry"
-            )
-            failures += 1
-            if result.rate_limited:
-                rate_limited_failures += 1
-            continue
-
-        # Success, or skipped because an implementation is already in flight.
-        # Either way the issue has been handled — drop the label so the next
-        # cycle does not re-run the (paid) investigator on it.
-        if result.skipped_reason:
-            print(f"OK (skipped): {result.service}/{result.slug} — {result.skipped_reason}")
         else:
-            print(f"OK: {result.service}/{result.slug} — proposal written")
+            print(f"OK: started/attached {handle.id} (run_id={handle.result_run_id})")
+            started += 1
+
         try:
             remove_label(ref.url, label)
             print(f"  removed '{label}' label")
         except subprocess.CalledProcessError as e:
-            # The proposal IS written, but the label is still on the issue —
-            # so the next cycle re-investigates it (a `proposed` proposal is
-            # overwritable) and re-spends the SDK budget. Count it as a
-            # failure so a broken label-write permission surfaces instead of
-            # silently burning budget every cycle. Not a rate-limit signal —
-            # the investigation itself already succeeded.
+            # The workflow IS started, but the label is still on the issue —
+            # so the next cycle re-dispatches it (harmless no-op via
+            # id_conflict_policy=USE_EXISTING while it's running, but noisy,
+            # and once it completes REJECT_DUPLICATE turns every subsequent
+            # cycle into a logged failure). Count it as a failure so a broken
+            # label-write permission surfaces instead of silently repeating.
             print(
-                f"FAIL: {result.service}/{result.slug}: proposal written but "
-                f"'{label}' label removal failed ({e.stderr or e}) — fix the "
-                f"token's label-write permission or the next cycle repeats."
+                f"FAIL: workflow started but '{label}' label removal failed "
+                f"({e.stderr or e}) — fix the token's label-write permission "
+                f"or the next cycle repeats."
             )
             failures += 1
 
-    return PollResult(
-        failures=failures,
-        rate_limited_failures=rate_limited_failures,
-        attempted=attempted,
-    )
+    return PollResult(started=started, failures=failures)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Issue-poller — investigate every `agents:intake`-labelled issue"
+        description="Issue-poller — start a DevLoopWorkflow for every `agents:intake`-labelled issue"
     )
     ap.add_argument(
         "--label",
@@ -302,71 +268,41 @@ def main() -> None:
         help=f"Issue label to scan for (default: {DEFAULT_LABEL})",
     )
     ap.add_argument(
-        "--state-dir",
-        default=str(DEFAULT_STATE_DIR),
-        help="Path to platform-gitops/agents-state/ (defaults to STATE_DIR env)",
-    )
-    ap.add_argument(
         "--dry-run",
         action="store_true",
-        help="List matching issues only; don't investigate or relabel",
+        help="List matching issues only; don't start workflows or relabel",
     )
     ap.add_argument(
         "--max-issues",
         type=int,
         default=DEFAULT_MAX_ISSUES,
         help=(
-            f"Max issues to investigate per cycle (default: {DEFAULT_MAX_ISSUES}; "
-            "0 disables the cap). Each investigation spends SDK budget, so the "
-            "cap bounds the cost of a mass-label event; capped-out issues keep "
-            "their label and are handled by a later cycle."
+            f"Max issues to dispatch per cycle (default: {DEFAULT_MAX_ISSUES}; "
+            "0 disables the cap). Bounds how many Argo submissions a single "
+            "tick can fan out into; capped-out issues keep their label and "
+            "are handled by a later cycle."
         ),
     )
     args = ap.parse_args()
     if args.max_issues < 0:
         ap.error("--max-issues must be >= 0 (use 0 to disable the cap)")
 
-    ensure_auth_for_sdk()
-
-    result = poll(
+    result = asyncio.run(poll(
         label=args.label,
-        state_dir=Path(args.state_dir),
         dry_run=args.dry_run,
         max_issues=args.max_issues,
-    )
+    ))
 
     print("\n=== Poll summary ===")
+    print(f"  {result.started} issue(s) started.")
     if result.failures:
         # Per-issue failures are expected and retryable (the label is kept).
         # Surface the count but exit 0 so the CronWorkflow does not flap on a
-        # single malformed issue. A global failure raised SystemExit earlier.
+        # single malformed issue or a broken label-write permission on one
+        # issue.
         print(f"  {result.failures} issue(s) failed — labels kept, will retry next cycle.")
     else:
         print("  all matching issues handled.")
-
-    if result.attempted and result.attempted == result.rate_limited_failures:
-        # EVERY issue that reached investigate() this cycle (not `failures`
-        # — that only counts non-success outcomes, so comparing against it
-        # would be true whenever there happen to be zero non-rate-limited
-        # FAILURES, even if most attempts actually succeeded; Codex P2 on
-        # mctl-agents#63) failed specifically because the account's OAuth
-        # token was rate-limited/out of quota. See PollResult.attempted for
-        # why this can still be true alongside an unrelated failure
-        # elsewhere in the cycle (e.g. an unknown-service skip) — that's
-        # correct, not an overclaim (Codex P3 on mctl-agents#63): the only
-        # real SDK call this cycle genuinely was rate-limited. That is a
-        # genuine "this account cannot do any work right now" signal, not
-        # the routine "one bad issue" case this cron is otherwise designed
-        # to absorb. Exit non-zero so cwft-mctl-agents-issue-poll's
-        # run-poller step reports Failed and the poll-fallback step retries
-        # the whole cycle on claude-code-oauth-token-2, instead of masking a
-        # fully-exhausted account as a clean run.
-        print(
-            f"  ALL {result.attempted} attempted issue(s) failed due to "
-            f"rate-limit/quota exhaustion — exiting {RATE_LIMIT_EXIT_CODE} "
-            f"to trigger the fallback OAuth token."
-        )
-        sys.exit(RATE_LIMIT_EXIT_CODE)
 
     sys.exit(0)
 
