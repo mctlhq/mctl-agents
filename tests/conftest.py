@@ -8,11 +8,23 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 # Put the repo root on sys.path so `import orchestrator.run_shepherd`
 # resolves without an editable install.
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    # Pins anyio's pytest plugin (auto-registered since anyio is already a
+    # pinned dependency — no separate pytest-asyncio needed) to asyncio only.
+    # temporalio's own async machinery (ActivityEnvironment,
+    # WorkflowEnvironment) is asyncio-native; anyio's other backend (trio)
+    # would not interoperate with it.
+    return "asyncio"
 
 
 class FakeMcpClient:

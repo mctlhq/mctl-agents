@@ -13,18 +13,25 @@ requires-python = ">=3.12,<3.13"
 # means every image rebuild may silently change agent behavior. Bump
 # deliberately, in an explicit commit (see issue #44).
 #
-# These four are the direct dependencies. Everything they pull in is pinned by
+# These are the direct dependencies. Everything they pull in is pinned by
 # uv.lock, which is what actually makes a rebuild reproducible: pinning only
-# this list left ~40 transitive packages (pydantic, mcp, httpx, jsonschema,
+# this list left ~40 transitive packages (pydantic, mcp, jsonschema,
 # cryptography, starlette, ...) free to move between builds.
 #
 # Note that the harness includes a Claude Code CLI binary bundled inside the
 # claude-agent-sdk wheel, so the pin below also fixes the CLI version.
+#
+# temporalio: orchestrator/temporal/ — the dev-workflow control plane worker
+# (plan phase 4). httpx: promoted from a transitive dep (already pulled in by
+# claude-agent-sdk/mcp) to a direct, deliberately-pinned one because
+# orchestrator/temporal/activities/* now import it directly to call mctl-api.
 dependencies = [
     "claude-agent-sdk==0.2.128",
     "anyio==4.14.1",
     "python-dotenv==1.2.2",
     "PyYAML==6.0.3",
+    "temporalio==1.19.0",
+    "httpx==0.28.1",
 ]
 
 [tool.uv]
