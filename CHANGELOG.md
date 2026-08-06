@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.24.0](https://github.com/mctlhq/mctl-agents/compare/1.23.0...1.24.0) (2026-08-06)
+
+
+### Features
+
+* register mctl-academy as an issue-driven service ([4f334c7](https://github.com/mctlhq/mctl-agents/commit/4f334c74f6b63859ef9183c2351ddba28fa814d7))
+* register mctl-academy as an issue-driven service ([0dcbeba](https://github.com/mctlhq/mctl-agents/commit/0dcbeba4f76bf67147631108879874b4c74d32dc))
+
+
+### Bug Fixes
+
+* **review:** apply the already-tagged/digested guard before the digest branch too ([00a5103](https://github.com/mctlhq/mctl-agents/commit/00a510382aa2b0baaa51d5c4817f30b6e4501ed5))
+* **temporal:** don't double-tag an image_repository that already has one ([9466565](https://github.com/mctlhq/mctl-agents/commit/9466565bdc10a401f37beccdfba46fc7540adbd9))
+* **temporal:** don't double-tag an image_repository that already has one ([c7efaef](https://github.com/mctlhq/mctl-agents/commit/c7efaef7cf262c8c2a0c609b3ffeac18ea616cc9))
+
 ## [1.23.0](https://github.com/mctlhq/mctl-agents/compare/1.22.0...1.23.0) (2026-08-05)
 
 
