@@ -109,7 +109,7 @@ class TestDevLoopWorkflow:
         Reproduce that exact call shape by signalling with an explicit None
         argument, which the Python SDK's own client would never do on its
         own (see the zero-arg signal in the test above)."""
-        activities, calls, investigate_ran = _fake_activities(released=True)
+        activities, _calls, investigate_ran = _fake_activities(released=True)
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
