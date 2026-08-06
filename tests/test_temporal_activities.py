@@ -393,3 +393,56 @@ class TestRecordExecution:
                     phase="Succeeded",
                 ),
             )
+
+
+class TestDiscoverAndProject:
+    async def test_discover_and_project_empty_dir(self, env, tmp_path):
+        from orchestrator.temporal.activities.discovery import discover_and_project
+        result = await env.run(discover_and_project, str(tmp_path))
+        assert result.total_inspected == 0
+        assert result.projections == []
+
+
+class TestDetectOrphans:
+    async def test_detect_orphans_empty_dir(self, env, tmp_path):
+        from orchestrator.temporal.activities.orphans import detect_orphans
+        result = await env.run(detect_orphans, str(tmp_path), [])
+        assert result.total_actionable == 0
+        assert result.orphans == []
+
+    async def test_detect_orphans_filters_active_workflow(self, env, tmp_path, monkeypatch):
+        from orchestrator.temporal.activities.orphans import detect_orphans
+        from orchestrator.run_shepherd import ProposalRef, PRSnapshot
+
+        fake_ref = ProposalRef(
+            service="mctl-web",
+            slug="test-slug",
+            proposal_dir=tmp_path / "mctl-web" / "proposals" / "test-slug",
+            status="accepted",
+            pr_url="https://github.com/mctlhq/mctl-web/pull/10",
+        )
+        fake_pr = PRSnapshot(
+            number=10,
+            repo="mctlhq/mctl-web",
+            state="OPEN",
+            merged=False,
+            closed_unmerged=False,
+            merge_commit=None,
+            close_comment_or_default="",
+            head_sha="abc12345",
+            head_pushed_at="2026-08-06T00:00:00Z",
+            merge_state_status="CLEAN",
+            checks_green=True,
+            is_draft=False,
+        )
+
+        monkeypatch.setattr("orchestrator.temporal.activities.orphans._discover_refs", lambda *a, **kw: [fake_ref])
+        monkeypatch.setattr("orchestrator.temporal.activities.orphans.find_pr_for_proposal", lambda *a, **kw: fake_pr)
+
+        result_active = await env.run(detect_orphans, str(tmp_path), ["dev-loop-mctlhq-mctl-web-test-slug"])
+        assert len(result_active.orphans) == 0
+
+        result_orphan = await env.run(detect_orphans, str(tmp_path), [])
+        assert len(result_orphan.orphans) == 1
+        assert result_orphan.orphans[0].slug == "test-slug"
+

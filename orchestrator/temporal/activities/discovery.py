@@ -7,9 +7,9 @@ Argo CWFT mctl-gitops-main-writes mutex.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from temporalio import activity
 
@@ -18,7 +18,6 @@ from orchestrator.run_shepherd import (
     RECONCILE_INPUT_STATUSES,
     ProposalRef,
     _discover_refs,
-    _load_status,
     find_pr_for_proposal,
 )
 
@@ -39,11 +38,8 @@ class ReconcileDiscoveryResult:
     projections: list[ProposalProjection]
 
 
-@activity.defn
-async def discover_and_project(state_dir_path: str = "") -> ReconcileDiscoveryResult:
-    state_dir = Path(state_dir_path) if state_dir_path else DEFAULT_STATE_DIR
+def _sync_discover_and_project(state_dir: Path) -> ReconcileDiscoveryResult:
     if not state_dir.is_dir():
-        activity.logger.warning("state_dir %s not found", state_dir)
         return ReconcileDiscoveryResult(total_inspected=0, projections=[])
 
     refs = _discover_refs(state_dir, reconcile=True)
@@ -85,3 +81,13 @@ async def discover_and_project(state_dir_path: str = "") -> ReconcileDiscoveryRe
         total_inspected=len(refs),
         projections=projections,
     )
+
+
+@activity.defn
+async def discover_and_project(state_dir_path: str = "") -> ReconcileDiscoveryResult:
+    state_dir = Path(state_dir_path) if state_dir_path else DEFAULT_STATE_DIR
+    if not state_dir.is_dir():
+        activity.logger.warning("state_dir %s not found", state_dir)
+        return ReconcileDiscoveryResult(total_inspected=0, projections=[])
+
+    return await asyncio.to_thread(_sync_discover_and_project, state_dir)
