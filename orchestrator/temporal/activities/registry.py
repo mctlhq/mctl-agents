@@ -23,19 +23,22 @@ def _image_ref(repo: str, version: str, digest: str) -> str:
     image_repository is supposed to be bare (mctl-api validates this on
     publish as of 2026-08-06), but a row published before that validation
     existed can still carry an embedded tag or digest. Blindly appending
-    ":{version}" to one of those doubles the tag into an invalid reference
-    the pod can never pull — incident 2026-08-06, caught by the mctl-academy
-    smoke test (mctl-agents-investigate-2b91b916 stuck on InvalidImageName
-    with "...:1.22.0:1.22.0"). Trust an already-tagged/digested repo as-is
-    instead.
+    ":{version}" or "@{digest}" to one of those doubles it into an invalid
+    reference the pod can never pull — incident 2026-08-06, caught by the
+    mctl-academy smoke test (mctl-agents-investigate-2b91b916 stuck on
+    InvalidImageName with "...:1.22.0:1.22.0"). The already-tagged/digested
+    check must run before either append, not just the tag one — a legacy
+    repo carrying its own "@sha256:..." plus a separately populated
+    image_digest field would otherwise still double into "...@sha256:x@sha256:y".
+    Trust an already-tagged/digested repo as-is instead.
     """
-    if digest:
-        return f"{repo}@{digest}"
     if not repo:
         return ""
     last_segment = repo.rsplit("/", 1)[-1]
     if "@" in repo or ":" in last_segment:
         return repo
+    if digest:
+        return f"{repo}@{digest}"
     return f"{repo}:{version}"
 
 
