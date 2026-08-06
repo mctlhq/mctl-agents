@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.25.0](https://github.com/mctlhq/mctl-agents/compare/1.24.0...1.25.0) (2026-08-06)
+
+
+### Features
+
+* **temporal:** add IncidentLoopWorkflow and 30-minute schedule ([a399fb5](https://github.com/mctlhq/mctl-agents/commit/a399fb55aa17231345b0fdf20cb040288d2b9525))
+* **temporal:** add IncidentLoopWorkflow and 30-minute schedule ([dd81a18](https://github.com/mctlhq/mctl-agents/commit/dd81a18b54d536e74da0673d4738e110fc3e4056))
+* **temporal:** add IssuePollWorkflow and 30-minute schedule ([9d7a084](https://github.com/mctlhq/mctl-agents/commit/9d7a084bb5088f2f7e2b54f8875ef7567975a850))
+* **temporal:** add IssuePollWorkflow and 30-minute schedule ([45baf36](https://github.com/mctlhq/mctl-agents/commit/45baf365e08fa4bfc009d29c6cebcb9a14ecc776))
+* **temporal:** add ReconcileWorkflow and schedule ([e6ed8dc](https://github.com/mctlhq/mctl-agents/commit/e6ed8dc900c6da73fc4c726a2fa8b1bd50289cb5))
+* **temporal:** add ReconcileWorkflow and schedule ([25e411d](https://github.com/mctlhq/mctl-agents/commit/25e411da884575690fde93c40e9685093953230a))
+* **temporal:** refine discovery and orphan activities with async thread execution ([cb953e4](https://github.com/mctlhq/mctl-agents/commit/cb953e4363164f2df0b18e7f5770e4940ab69a1c))
+* **temporal:** refine discovery and orphan activities with async thread execution and active workflow filtering ([2283fb2](https://github.com/mctlhq/mctl-agents/commit/2283fb24363c0877deb4da8b53a5420f67406265))
+
+
+### Bug Fixes
+
+* **temporal:** use ScheduleIntervalSpec for Temporal Python SDK schedule interval ([7a28f93](https://github.com/mctlhq/mctl-agents/commit/7a28f93eb4e8ed1ee748ba645f0199b4cac28f14))
+
 ## [1.24.0](https://github.com/mctlhq/mctl-agents/compare/1.23.0...1.24.0) (2026-08-06)
 
 
