@@ -155,7 +155,7 @@ class DevLoopWorkflow:
         self._approved = False
 
     @workflow.signal
-    def approve(self) -> None:
+    def approve(self, *args: object) -> None:
         self._approved = True
 
     @workflow.run
