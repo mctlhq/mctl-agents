@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.26.0](https://github.com/mctlhq/mctl-agents/compare/1.25.0...1.26.0) (2026-08-06)
+
+
+### Features
+
+* **auth:** add CLAUDE_CODE_OAUTH_TOKEN_SECONDARY and ANTHROPIC_API_KEY_SECONDARY fallback ([79ee36e](https://github.com/mctlhq/mctl-agents/commit/79ee36edaada4d892609e320069423854430dcf3))
+* **auth:** add CLAUDE_CODE_OAUTH_TOKEN_SECONDARY and ANTHROPIC_API_KEY_SECONDARY fallback support ([04e6c31](https://github.com/mctlhq/mctl-agents/commit/04e6c31a91b17216a269663d3d88fedf2bc3d8e2))
+
+
+### Bug Fixes
+
+* **config:** switch service_agent model mapping to cheap (claude-haiku-4-5) ([bdcb164](https://github.com/mctlhq/mctl-agents/commit/bdcb16454676b6ed80696d30b8114c7c205b8b96))
+* **config:** switch service_agent model mapping to cheap (claude-haiku-4-5) ([296124b](https://github.com/mctlhq/mctl-agents/commit/296124bb878720cf9fe00b2575a0c30c9aa4891a))
+
 ## [1.25.0](https://github.com/mctlhq/mctl-agents/compare/1.24.0...1.25.0) (2026-08-06)
 
 
