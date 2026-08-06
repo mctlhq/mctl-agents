@@ -85,6 +85,81 @@ class TestResolveAgentRelease:
         result = await env.run(resolve_agent_release, "implementer", "production")
         assert result.image_ref == "ghcr.io/mctlhq/mctl-agents:1.2.0"
 
+    async def test_does_not_double_a_repo_that_already_carries_a_tag(self, env, monkeypatch):
+        """Regression for incident 2026-08-06: a row published before
+        mctl-api validated image_repository could still have the tag baked
+        in (e.g. "ghcr.io/mctlhq/mctl-agents:1.22.0"). Blindly appending
+        ":{version}" doubled it into an invalid image reference
+        ("...:1.22.0:1.22.0") that the CWFT pod could never pull. resolve
+        must trust an already-tagged repo instead of appending again."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/resolve"):
+                return httpx.Response(200, json={"version": "1.22.0"})
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "version": "1.22.0",
+                            "image_repository": "ghcr.io/mctlhq/mctl-agents:1.22.0",
+                        }
+                    ]
+                },
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(resolve_agent_release, "issue-investigator", "production")
+        assert result.image_ref == "ghcr.io/mctlhq/mctl-agents:1.22.0"
+
+    async def test_does_not_double_a_repo_that_already_carries_a_digest(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/resolve"):
+                return httpx.Response(200, json={"version": "1.22.0"})
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "version": "1.22.0",
+                            "image_repository": "ghcr.io/mctlhq/mctl-agents@sha256:abc123",
+                        }
+                    ]
+                },
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(resolve_agent_release, "issue-investigator", "production")
+        assert result.image_ref == "ghcr.io/mctlhq/mctl-agents@sha256:abc123"
+
+    async def test_does_not_double_a_repo_carrying_its_own_digest_plus_a_separate_image_digest_field(
+        self, env, monkeypatch
+    ):
+        """The digest branch needs the same already-tagged/digested guard as
+        the tag branch: a legacy repo with its own baked-in "@sha256:..."
+        that *also* has a populated image_digest field must not produce
+        "...@sha256:x@sha256:y". Caught in review of the tag-only fix."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/resolve"):
+                return httpx.Response(200, json={"version": "1.22.0"})
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "version": "1.22.0",
+                            "image_repository": "ghcr.io/mctlhq/mctl-agents@sha256:abc123",
+                            "image_digest": "sha256:xyz789",
+                        }
+                    ]
+                },
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(resolve_agent_release, "issue-investigator", "production")
+        assert result.image_ref == "ghcr.io/mctlhq/mctl-agents@sha256:abc123"
+
     async def test_returns_none_when_never_released(self, env, monkeypatch):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, json={"error": "no release"})
