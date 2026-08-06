@@ -155,7 +155,17 @@ class DevLoopWorkflow:
         self._approved = False
 
     @workflow.signal
-    def approve(self) -> None:
+    def approve(self, _payload: object | None = None) -> None:
+        # Accepts and ignores an optional payload: mctl-api's Go client sends
+        # this signal via SignalWorkflow(..., arg=nil), which the Go SDK's
+        # data converter encodes as one JSON-null payload rather than zero
+        # payloads. A zero-arg handler crashes the workflow task on every
+        # such call ("approve() takes 1 positional argument but 2 were
+        # given") and — since a workflow task failure blocks all further
+        # progress rather than failing the workflow — wedges the run
+        # permanently. The existing Python-side tests never caught this:
+        # `handle.signal(DevLoopWorkflow.approve)` from the Python SDK's own
+        # client sends zero payloads, matching a zero-arg handler exactly.
         self._approved = True
 
     @workflow.run

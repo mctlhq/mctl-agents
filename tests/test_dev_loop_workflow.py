@@ -100,6 +100,38 @@ class TestDevLoopWorkflow:
         assert result.implement.phase == "Succeeded"
         assert calls == ["mctl-agents-investigate", "mctl-agents-implement"]
 
+    async def test_approve_signal_tolerates_a_null_payload(self, env):
+        """mctl-api's Go client signals via SignalWorkflow(..., arg=nil),
+        which the Go SDK's data converter encodes as one JSON-null payload —
+        not zero payloads. A zero-arg handler crashes the workflow task on
+        every such call (observed live 2026-08-06 on
+        dev-loop-mctlhq-mctl-academy-14, permanently wedging the run).
+        Reproduce that exact call shape by signalling with an explicit None
+        argument, which the Python SDK's own client would never do on its
+        own (see the zero-arg signal in the test above)."""
+        activities, calls, investigate_ran = _fake_activities(released=True)
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(DevLoopWorkflow.approve, None)
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
     async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
         """The implement CWFT must only be allowed to touch proposals under
         this issue's own repo (the `service` param) — otherwise approve()
