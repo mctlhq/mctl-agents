@@ -446,3 +446,15 @@ class TestDetectOrphans:
         assert len(result_orphan.orphans) == 1
         assert result_orphan.orphans[0].slug == "test-slug"
 
+
+class TestIncidentLoopWorkflow:
+    async def test_respond_incidents_activity(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import respond_incidents_activity
+
+        monkeypatch.setattr("orchestrator.temporal.activities.incidents.run_incident_responder_main", lambda: None)
+
+        result = await env.run(respond_incidents_activity)
+        assert result.success is True
+        assert "successfully" in result.notes
+
+
