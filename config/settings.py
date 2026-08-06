@@ -29,6 +29,18 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # the shepherd (see SHEPHERD_SKIP_SERVICES in run_shepherd.py). The generic
 # implementer sub-agent (agents/_generic/.claude/agents/implementer.md)
 # covers it; no per-service scaffold.
+#
+# `mctl-academy` is a learning product whose content is generated from
+# external documentation. Its intake is a weekly source-drift job in its own
+# repo that opens an `agents:intake` issue when an upstream doc's hash
+# changes — so registration here is what lets run_issue_poller.py dispatch
+# that issue at all (it skips issues whose repo is not in SERVICES). It is
+# NOT a rotation service: the rotation prompt researches dependency releases
+# and CVEs, which cannot detect external-source drift, and it would need an
+# agents/mctl-academy/ scaffold that deliberately does not exist. Its PRs are
+# also excluded from the shepherd (SHEPHERD_SKIP_SERVICES in the gitops
+# CronWorkflow) and are not steward-owned — content merges are gated on a
+# human CODEOWNER by design.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -41,12 +53,19 @@ SERVICES = [
     "mctl-telegram",
     "mctl-design",
     "mctl-pairdesk",
+    "mctl-academy",
     # "upwork-mcp",
 ]
 
 # Services that are valid implementer/investigator targets but are NOT
 # analyzed by the proactive researcher/analyst/spec-writer rotation.
-NON_ROTATING_SERVICES = {"mctl-agents", "mctl-telegram", "mctl-design", "mctl-pairdesk"}
+NON_ROTATING_SERVICES = {
+    "mctl-agents",
+    "mctl-telegram",
+    "mctl-design",
+    "mctl-pairdesk",
+    "mctl-academy",
+}
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
 # researcher/analyst/spec-writer. Anything in SERVICES but NOT here is
