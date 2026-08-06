@@ -14,7 +14,13 @@ import logging
 import os
 from datetime import timedelta
 
-from temporalio.client import Client, Schedule, ScheduleActionStartWorkflow, ScheduleInterval, ScheduleSpec
+from temporalio.client import (
+    Client,
+    Schedule,
+    ScheduleActionStartWorkflow,
+    ScheduleIntervalSpec,
+    ScheduleSpec,
+)
 from temporalio.exceptions import ScheduleAlreadyRunningError
 from temporalio.worker import Worker
 
@@ -43,7 +49,7 @@ async def setup_reconcile_schedule(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleInterval(every=timedelta(minutes=15))],
+            intervals=[ScheduleIntervalSpec(every=timedelta(minutes=15))],
         ),
     )
 
