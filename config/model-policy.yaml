@@ -16,6 +16,6 @@ profiles:
     model_env: CLAUDE_STRONG_MODEL
 
 tasks:
-  service_agent: balanced
+  service_agent: cheap
   mentor_digest: cheap
   review_findings_normalize: cheap
