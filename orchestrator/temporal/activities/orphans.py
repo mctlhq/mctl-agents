@@ -5,6 +5,7 @@ DevLoopWorkflow running in Temporal.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,9 +36,7 @@ class OrphanDetectionResult:
     orphans: list[OrphanSignal]
 
 
-@activity.defn
-async def detect_orphans(state_dir_path: str = "") -> OrphanDetectionResult:
-    state_dir = Path(state_dir_path) if state_dir_path else DEFAULT_STATE_DIR
+def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None = None) -> OrphanDetectionResult:
     if not state_dir.is_dir():
         return OrphanDetectionResult(total_actionable=0, orphans=[])
 
@@ -45,13 +44,18 @@ async def detect_orphans(state_dir_path: str = "") -> OrphanDetectionResult:
     actionable_refs = [r for r in refs if r.status in ACTIONABLE_STATUSES]
 
     orphans: list[OrphanSignal] = []
+    active_ids = active_workflow_ids or set()
 
     for ref in actionable_refs:
         pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
 
-        # Signal log line per ADR 005 specification
+        # Expected workflow ID for this proposal
+        expected_workflow_id = f"dev-loop-mctlhq-{ref.service}-{ref.slug}"
+        if expected_workflow_id in active_ids:
+            continue
+
         reason = "No active DevLoopWorkflow found for open PR proposal"
         signal = OrphanSignal(
             service=ref.service,
@@ -61,6 +65,23 @@ async def detect_orphans(state_dir_path: str = "") -> OrphanDetectionResult:
             reason=reason,
         )
         orphans.append(signal)
+
+    return OrphanDetectionResult(
+        total_actionable=len(actionable_refs),
+        orphans=orphans,
+    )
+
+
+@activity.defn
+async def detect_orphans(state_dir_path: str = "", active_workflow_ids: list[str] | None = None) -> OrphanDetectionResult:
+    state_dir = Path(state_dir_path) if state_dir_path else DEFAULT_STATE_DIR
+    if not state_dir.is_dir():
+        return OrphanDetectionResult(total_actionable=0, orphans=[])
+
+    active_set = set(active_workflow_ids) if active_workflow_ids else set()
+    result = await asyncio.to_thread(_sync_detect_orphans, state_dir, active_set)
+
+    for signal in result.orphans:
         activity.logger.info(
             "ORPHAN service=%s slug=%s status=%s pr_url=%s reason=%s",
             signal.service,
@@ -70,7 +91,4 @@ async def detect_orphans(state_dir_path: str = "") -> OrphanDetectionResult:
             signal.reason,
         )
 
-    return OrphanDetectionResult(
-        total_actionable=len(actionable_refs),
-        orphans=orphans,
-    )
+    return result
