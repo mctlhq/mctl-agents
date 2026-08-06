@@ -17,6 +17,28 @@ from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 REQUEST_TIMEOUT_SECONDS = 30.0
 
 
+def _image_ref(repo: str, version: str, digest: str) -> str:
+    """Build the image reference the CWFT pulls.
+
+    image_repository is supposed to be bare (mctl-api validates this on
+    publish as of 2026-08-06), but a row published before that validation
+    existed can still carry an embedded tag or digest. Blindly appending
+    ":{version}" to one of those doubles the tag into an invalid reference
+    the pod can never pull — incident 2026-08-06, caught by the mctl-academy
+    smoke test (mctl-agents-investigate-2b91b916 stuck on InvalidImageName
+    with "...:1.22.0:1.22.0"). Trust an already-tagged/digested repo as-is
+    instead.
+    """
+    if digest:
+        return f"{repo}@{digest}"
+    if not repo:
+        return ""
+    last_segment = repo.rsplit("/", 1)[-1]
+    if "@" in repo or ":" in last_segment:
+        return repo
+    return f"{repo}:{version}"
+
+
 @dataclass(frozen=True)
 class ResolvedRelease:
     """None-image_ref means the release exists but no version metadata could
@@ -69,7 +91,7 @@ async def resolve_agent_release(agent: str, environment: str) -> ResolvedRelease
                 # Prefer the immutable digest once the registry supplies one
                 # (plan phase 3's "publish by digest, not a mutable tag"
                 # note) — fall back to the version as a tag otherwise.
-                image_ref = f"{repo}@{digest}" if digest else (f"{repo}:{version}" if repo else "")
+                image_ref = _image_ref(repo, version, digest)
                 break
 
         return ResolvedRelease(agent=agent, environment=environment, version=version, image_ref=image_ref)
