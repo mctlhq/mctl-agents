@@ -23,33 +23,51 @@ class AuthMode:
 
 
 def detect_auth() -> AuthMode:
-    """Detect the auth mode from env. OAuth wins when both are set."""
-    oauth = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    """Detect the auth mode from env. OAuth wins when both are set, falling back to secondary credentials if primary is absent or exhausted."""
+    oauth = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip() or os.getenv("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", "").strip()
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("ANTHROPIC_API_KEY_SECONDARY", "").strip()
 
     if oauth:
+        active_var = "CLAUDE_CODE_OAUTH_TOKEN" if os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip() else "CLAUDE_CODE_OAUTH_TOKEN_SECONDARY"
         if not oauth.startswith("sk-ant-oat01-"):
             print(
-                "warn: CLAUDE_CODE_OAUTH_TOKEN does not look like an OAuth token "
+                f"warn: {active_var} does not look like an OAuth token "
                 "(should start with sk-ant-oat01-). Did you paste an API key by mistake?"
             )
         return AuthMode(
             name="oauth",
-            env_var="CLAUDE_CODE_OAUTH_TOKEN",
-            description="Claude Pro/Max OAuth token (billed against the subscription)",
+            env_var=active_var,
+            description=f"Claude Pro/Max OAuth token ({active_var})",
         )
 
     if api_key:
+        active_var = "ANTHROPIC_API_KEY" if os.getenv("ANTHROPIC_API_KEY", "").strip() else "ANTHROPIC_API_KEY_SECONDARY"
         if not api_key.startswith("sk-ant-api03-"):
             print(
-                "warn: ANTHROPIC_API_KEY does not look like an API key "
+                f"warn: {active_var} does not look like an API key "
                 "(should start with sk-ant-api03-)."
             )
         return AuthMode(
             name="api_key",
-            env_var="ANTHROPIC_API_KEY",
-            description="Anthropic Console API key (pay-per-token)",
+            env_var=active_var,
+            description=f"Anthropic Console API key ({active_var})",
         )
+
+
+def rotate_to_secondary_auth() -> bool:
+    """Switch primary credentials to secondary if available upon 429 RateLimit."""
+    rotated = False
+    if os.getenv("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", "").strip():
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN_SECONDARY"].strip()
+        print("info: rotated CLAUDE_CODE_OAUTH_TOKEN to CLAUDE_CODE_OAUTH_TOKEN_SECONDARY")
+        rotated = True
+
+    if os.getenv("ANTHROPIC_API_KEY_SECONDARY", "").strip():
+        os.environ["ANTHROPIC_API_KEY"] = os.environ["ANTHROPIC_API_KEY_SECONDARY"].strip()
+        print("info: rotated ANTHROPIC_API_KEY to ANTHROPIC_API_KEY_SECONDARY")
+        rotated = True
+
+    return rotated
 
     # Third path: no OAuth token and no API key in env, but the local
     # `claude` CLI is authenticated (~/.claude/.credentials.json or an
