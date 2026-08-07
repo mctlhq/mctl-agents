@@ -67,6 +67,19 @@ def detect_auth() -> AuthMode:
             description=f"Anthropic Console API key ({active_var})",
         )
 
+    import shutil
+    if shutil.which("claude"):
+        return AuthMode(
+            name="cli_session",
+            env_var="(claude CLI session)",
+            description="existing authentication of the local `claude` CLI",
+        )
+
+    raise RuntimeError(
+        "Auth not found: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set, "
+        "and the `claude` CLI is not installed. Put a token in .env or install Claude Code."
+    )
+
 
 def rotate_to_secondary_auth() -> bool:
     """Switch primary credentials to secondary if available upon 429 RateLimit."""
@@ -82,24 +95,6 @@ def rotate_to_secondary_auth() -> bool:
         rotated = True
 
     return rotated
-
-    # Third path: no OAuth token and no API key in env, but the local
-    # `claude` CLI is authenticated (~/.claude/.credentials.json or an
-    # interactive session). The SDK picks up CLI auth via subprocess.
-    # Convenient in dev; do not rely on it in production / cron / Docker
-    # where the CLI is not logged in.
-    import shutil
-    if shutil.which("claude"):
-        return AuthMode(
-            name="cli_session",
-            env_var="(claude CLI session)",
-            description="existing authentication of the local `claude` CLI",
-        )
-
-    raise RuntimeError(
-        "Auth not found: neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set, "
-        "and the `claude` CLI is not installed. Put a token in .env or install Claude Code."
-    )
 
 
 def ensure_auth_for_sdk() -> AuthMode:

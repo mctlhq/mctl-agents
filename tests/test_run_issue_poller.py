@@ -384,7 +384,7 @@ def _run_main(monkeypatch, result: PollResult) -> int:
     monkeypatch.setattr(run_issue_poller, "poll", _fake_poll)
     with pytest.raises(SystemExit) as exc_info:
         run_issue_poller.main()
-    return exc_info.value.code
+    return int(exc_info.value.code) if isinstance(exc_info.value.code, int) else 1
 
 
 def test_main_exits_zero_when_nothing_labelled(monkeypatch):

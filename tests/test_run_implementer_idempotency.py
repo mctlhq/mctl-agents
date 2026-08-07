@@ -62,6 +62,7 @@ def test_preflight_adopts_open_pr(monkeypatch, tmp_path: Path) -> None:
     )
     existing = run_implementer._preflight_existing_result(ref)
     assert existing.action == "open"
+    assert existing.pr_url is not None
     assert existing.pr_url.endswith("/pull/71")
 
 
@@ -86,6 +87,7 @@ def test_implement_one_never_calls_model_when_pr_exists(
         ),
     )
     result = run_implementer.implement_one(ref)
+    assert result.pr_url is not None
     assert result.pr_url.endswith("/pull/71")
     status = read_status(ref)
     assert status["status"] == "implemented"

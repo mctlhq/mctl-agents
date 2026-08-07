@@ -382,6 +382,7 @@ def test_discovery_dry_run_does_not_restore_pr_on_disk(tmp_path) -> None:
     ):
         refs = run_shepherd._discover_refs(tmp_path, dry_run=True)
     assert len(refs) == 1
+    assert refs[0].pr_url is not None
     assert refs[0].pr_url.endswith("/pull/99")
     assert status_path.read_text(encoding="utf-8") == before
 
