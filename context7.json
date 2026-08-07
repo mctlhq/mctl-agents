@@ -1,0 +1,7 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "mctl-agents Framework",
+  "description": "Multi-agent self-healing system, Temporal workflows, agent prompts, and autonomous GitHub issue resolution",
+  "folders": ["agents", "orchestrator"],
+  "excludeFolders": [".venv", "__pycache__", ".pytest_cache"]
+}
