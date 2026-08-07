@@ -31,12 +31,11 @@ from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
+from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 from orchestrator.temporal.workflows.issue_poll import IssuePollWorkflow, IssuePollWorkflowInput
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
-
-TASK_QUEUE = "mctl-dev-loop"
 
 RECONCILE_SCHEDULE_ID = "reconcile-mctl-agents-schedule"
 RECONCILE_WORKFLOW_ID = "reconcile-mctl-agents"

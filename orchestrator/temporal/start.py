@@ -12,8 +12,8 @@ import os
 from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
+from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.issue_ref import parse_issue_url
-from orchestrator.temporal.worker import TASK_QUEUE
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 
 
