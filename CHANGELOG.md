@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.27.0](https://github.com/mctlhq/mctl-agents/compare/1.26.0...1.27.0) (2026-08-07)
+
+
+### Features
+
+* **ci:** add context7.json and auto-reindex workflow on main push ([4ca5bf3](https://github.com/mctlhq/mctl-agents/commit/4ca5bf34196ca77c59627b3def92c980dbc9fcb7))
+* **ci:** add context7.json and auto-reindex workflow on main push ([d9eddc8](https://github.com/mctlhq/mctl-agents/commit/d9eddc827e1003505913ef93f664d741dcbf6e20))
+
+
+### Bug Fixes
+
+* break circular import between worker and start/issue_poller via constants.py ([5d7f779](https://github.com/mctlhq/mctl-agents/commit/5d7f779c90159e6cfcde5733ee73228cc8bbcbc0))
+* break circular import via constants.py ([302f499](https://github.com/mctlhq/mctl-agents/commit/302f49970db643b0bd27a14a55075964e84684bf))
+* **ci:** fix auth fallback logic, activity mocks and mypy lints ([3c022e3](https://github.com/mctlhq/mctl-agents/commit/3c022e325ba59f41178d3368a1e05af780c60dd7))
+* **ci:** fix auth unreachable code, activity mock, and mypy types in tests ([b602d51](https://github.com/mctlhq/mctl-agents/commit/b602d5181dff60a2e3963022a7cf14b45ff37049))
+* **implementer:** correct stale workflows-permission note ([4fa73aa](https://github.com/mctlhq/mctl-agents/commit/4fa73aa15d1c7af65a0fb4adfbfd0a98d72183a5))
+* **implementer:** forbid background deferral, fix stale workflows-permission note ([38ceffb](https://github.com/mctlhq/mctl-agents/commit/38ceffb67c3d7734f9101a9ff86d652bfa706487))
+* **implementer:** forbid deferring work to a background task ([07bd3d8](https://github.com/mctlhq/mctl-agents/commit/07bd3d8f7f28f105aabf7b5b17b24eaa8e87b017))
+* import poll in issue_poll activity ([5d9c1bd](https://github.com/mctlhq/mctl-agents/commit/5d9c1bdb540aa72a65832b4b38996dff169026d3))
+* import poll instead of poll_once in issue_poll activity ([8b9afc6](https://github.com/mctlhq/mctl-agents/commit/8b9afc615cb05f4d8534ec5bf18b8721035e17df))
+* import run_incident_responder in incidents activity ([e6be563](https://github.com/mctlhq/mctl-agents/commit/e6be563de17f8a95574cbd9aa69fbe04e54dd418))
+* import run_incident_responder in incidents activity ([da49cbe](https://github.com/mctlhq/mctl-agents/commit/da49cbee1ee1c7bd72cf9b35f645c89037a4c151))
+* import ScheduleAlreadyRunningError from temporalio.client ([e80c876](https://github.com/mctlhq/mctl-agents/commit/e80c87605145ffcd15c59b32df7ace472d91fcc9))
+* import ScheduleAlreadyRunningError from temporalio.client ([e0e4d75](https://github.com/mctlhq/mctl-agents/commit/e0e4d75c9228a483ee1db88b434d9b889c195e3f))
+* instruct implementer not to modify .github/workflows/ ([d8ab343](https://github.com/mctlhq/mctl-agents/commit/d8ab343720237a21c4c206cd3dd554fc57976b3d))
+* instruct implementer not to modify .github/workflows/ ([36b211a](https://github.com/mctlhq/mctl-agents/commit/36b211a49be8a428254e42d568948bc508dfd621))
+* ruff lint cleanups ([448c34e](https://github.com/mctlhq/mctl-agents/commit/448c34effb697d18920fb22f732eb66842e5f5cb))
+* ruff lint cleanups ([c2c63bf](https://github.com/mctlhq/mctl-agents/commit/c2c63bf11b28cbf66c15daca9325e20990c934df))
+
 ## [1.26.0](https://github.com/mctlhq/mctl-agents/compare/1.25.0...1.26.0) (2026-08-06)
 
 
