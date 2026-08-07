@@ -411,8 +411,8 @@ class TestDetectOrphans:
         assert result.orphans == []
 
     async def test_detect_orphans_filters_active_workflow(self, env, tmp_path, monkeypatch):
-        from orchestrator.temporal.activities.orphans import detect_orphans
         from orchestrator.run_shepherd import ProposalRef, PRSnapshot
+        from orchestrator.temporal.activities.orphans import detect_orphans
 
         fake_ref = ProposalRef(
             service="mctl-web",

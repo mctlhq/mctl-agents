@@ -23,12 +23,22 @@ class AuthMode:
 
 
 def detect_auth() -> AuthMode:
-    """Detect the auth mode from env. OAuth wins when both are set, falling back to secondary credentials if primary is absent or exhausted."""
-    oauth = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip() or os.getenv("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", "").strip()
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip() or os.getenv("ANTHROPIC_API_KEY_SECONDARY", "").strip()
+    """Detect the auth mode from env. OAuth wins when both are set."""
+    oauth = (
+        os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        or os.getenv("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", "").strip()
+    )
+    api_key = (
+        os.getenv("ANTHROPIC_API_KEY", "").strip()
+        or os.getenv("ANTHROPIC_API_KEY_SECONDARY", "").strip()
+    )
 
     if oauth:
-        active_var = "CLAUDE_CODE_OAUTH_TOKEN" if os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip() else "CLAUDE_CODE_OAUTH_TOKEN_SECONDARY"
+        active_var = (
+            "CLAUDE_CODE_OAUTH_TOKEN"
+            if os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            else "CLAUDE_CODE_OAUTH_TOKEN_SECONDARY"
+        )
         if not oauth.startswith("sk-ant-oat01-"):
             print(
                 f"warn: {active_var} does not look like an OAuth token "
@@ -41,7 +51,11 @@ def detect_auth() -> AuthMode:
         )
 
     if api_key:
-        active_var = "ANTHROPIC_API_KEY" if os.getenv("ANTHROPIC_API_KEY", "").strip() else "ANTHROPIC_API_KEY_SECONDARY"
+        active_var = (
+            "ANTHROPIC_API_KEY"
+            if os.getenv("ANTHROPIC_API_KEY", "").strip()
+            else "ANTHROPIC_API_KEY_SECONDARY"
+        )
         if not api_key.startswith("sk-ant-api03-"):
             print(
                 f"warn: {active_var} does not look like an API key "

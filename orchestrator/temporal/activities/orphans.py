@@ -13,7 +13,6 @@ from temporalio import activity
 
 from orchestrator.run_shepherd import (
     DEFAULT_STATE_DIR,
-    ProposalRef,
     _discover_refs,
     find_pr_for_proposal,
 )
@@ -73,7 +72,10 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
 
 
 @activity.defn
-async def detect_orphans(state_dir_path: str = "", active_workflow_ids: list[str] | None = None) -> OrphanDetectionResult:
+async def detect_orphans(
+    state_dir_path: str = "",
+    active_workflow_ids: list[str] | None = None,
+) -> OrphanDetectionResult:
     state_dir = Path(state_dir_path) if state_dir_path else DEFAULT_STATE_DIR
     if not state_dir.is_dir():
         return OrphanDetectionResult(total_actionable=0, orphans=[])
