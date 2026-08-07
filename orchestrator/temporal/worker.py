@@ -18,10 +18,10 @@ from temporalio.client import (
     Client,
     Schedule,
     ScheduleActionStartWorkflow,
+    ScheduleAlreadyRunningError,
     ScheduleIntervalSpec,
     ScheduleSpec,
 )
-from temporalio.exceptions import ScheduleAlreadyRunningError
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import submit_and_wait
