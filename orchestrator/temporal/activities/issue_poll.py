@@ -2,12 +2,11 @@
 """
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 
 from temporalio import activity
 
-from orchestrator.run_issue_poller import poll_once
+from orchestrator.run_issue_poller import poll
 
 
 @dataclass(frozen=True)
@@ -18,8 +17,7 @@ class IssuePollActivityResult:
 
 @activity.defn
 async def poll_issues_activity(label: str = "agents:intake", max_issues: int = 5) -> IssuePollActivityResult:
-    result = await asyncio.to_thread(
-        poll_once,
+    result = await poll(
         label=label,
         max_issues=max_issues,
         dry_run=False,
