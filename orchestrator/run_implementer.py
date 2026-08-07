@@ -448,6 +448,13 @@ Ground rules:
   the mounted gitops worktree under `/workdir`. If a finding implies a
   change in another repository, do NOT make it; describe it in your final
   message so a human can route it.
+- Never defer work to "the background." This run is a single, one-shot
+  turn — there is no later turn for you to resume into, no polling loop,
+  and nothing will notify you when a backgrounded command finishes. Run
+  every command synchronously and wait for its result before ending your
+  turn. A slow build or test is fine — wait for it inline. Do NOT end your
+  turn saying you will "keep working" or "report back once it's done":
+  ending the turn ends the run, and anything not committed by then is lost.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -479,6 +486,13 @@ Ground rules:
   change in another repository (e.g. alert rules or manifests in
   mctl-gitops), do NOT make it; describe it in your final message so a
   human can route it through a reviewed PR.
+- Never defer work to "the background." This run is a single, one-shot
+  turn — there is no later turn for you to resume into, no polling loop,
+  and nothing will notify you when a backgrounded command finishes. Run
+  every command synchronously and wait for its result before ending your
+  turn. A slow build or test is fine — wait for it inline. Do NOT end your
+  turn saying you will "keep working" or "report back once it's done":
+  ending the turn ends the run, and anything not committed by then is lost.
 - No emoji in code or commit messages.
 - English only.
 """
