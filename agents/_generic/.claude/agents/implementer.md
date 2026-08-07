@@ -81,6 +81,7 @@ because the repo is outside the proactive-rotation set.
   etc.), do NOT make it — describe it in your final message so a human can
   route it through a reviewed PR.
 - Stay strictly inside the proposal's scope.
+- NEVER edit files in `.github/workflows/` unless the proposal explicitly asks for a workflow change (the GitHub App token lacks `workflows: write` scope by design and pushing changes to `.github/workflows/` will be rejected by GitHub).
 
 ## What to write in your final message
 
