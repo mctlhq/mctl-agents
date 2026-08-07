@@ -69,7 +69,7 @@ async def setup_schedules(client: Client) -> None:
         logger.info("Created Temporal schedule %s for ReconcileWorkflow", RECONCILE_SCHEDULE_ID)
     except ScheduleAlreadyRunningError:
         logger.info("Temporal schedule %s already exists", RECONCILE_SCHEDULE_ID)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Could not register Temporal schedule %s: %s", RECONCILE_SCHEDULE_ID, exc)
 
     issue_poll_schedule = Schedule(
@@ -89,7 +89,7 @@ async def setup_schedules(client: Client) -> None:
         logger.info("Created Temporal schedule %s for IssuePollWorkflow", ISSUE_POLL_SCHEDULE_ID)
     except ScheduleAlreadyRunningError:
         logger.info("Temporal schedule %s already exists", ISSUE_POLL_SCHEDULE_ID)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Could not register Temporal schedule %s: %s", ISSUE_POLL_SCHEDULE_ID, exc)
 
     incidents_schedule = Schedule(
@@ -108,7 +108,7 @@ async def setup_schedules(client: Client) -> None:
         logger.info("Created Temporal schedule %s for IncidentLoopWorkflow", INCIDENTS_SCHEDULE_ID)
     except ScheduleAlreadyRunningError:
         logger.info("Temporal schedule %s already exists", INCIDENTS_SCHEDULE_ID)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("Could not register Temporal schedule %s: %s", INCIDENTS_SCHEDULE_ID, exc)
 
 

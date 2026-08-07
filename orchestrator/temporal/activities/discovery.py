@@ -16,7 +16,6 @@ from temporalio import activity
 from orchestrator.run_shepherd import (
     DEFAULT_STATE_DIR,
     RECONCILE_INPUT_STATUSES,
-    ProposalRef,
     _discover_refs,
     find_pr_for_proposal,
 )
