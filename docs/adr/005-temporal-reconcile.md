@@ -1,6 +1,6 @@
 # ADR 005 — Reconcile loop on Temporal (replaces Argo `mctl-agents-reconcile`)
 
-> **Status:** proposed
+> **Status:** accepted
 > **Date:** 2026-08-06
 > **Supersedes:** Argo `cronworkflow-mctl-agents-reconcile.yaml` (now `suspend: true`)
 
