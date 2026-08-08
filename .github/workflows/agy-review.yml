@@ -19,8 +19,7 @@ permissions: {}
 
 jobs:
   agy-review:
-    # TODO: pin to the SHA of mctlhq/.github main after PR #10 merges
-    uses: mctlhq/.github/.github/workflows/agy-review.yml@main
+    uses: mctlhq/.github/.github/workflows/agy-review.yml@75c6d31b97ff15310cd2eec6602198338633d689
     with:
       blocking: true
       conventions: |
