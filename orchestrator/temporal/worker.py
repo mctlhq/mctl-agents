@@ -25,6 +25,7 @@ from temporalio.client import (
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import submit_and_wait
+from orchestrator.temporal.activities.cleanup import cleanup_closed_issue_workflows
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.incidents import respond_incidents_activity
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
@@ -132,6 +133,7 @@ async def main() -> None:
             detect_orphans,
             poll_issues_activity,
             respond_incidents_activity,
+            cleanup_closed_issue_workflows,
         ],
     )
     logger.info("worker starting on task queue %s", TASK_QUEUE)
