@@ -11,7 +11,6 @@ import pytest
 
 from orchestrator.temporal.activities.cleanup import (
     CleanupResult,
-    WorkflowCancelResult,
     _issue_state,
     _process_running_workflows,
 )

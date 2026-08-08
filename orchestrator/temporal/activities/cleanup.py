@@ -68,8 +68,8 @@ def _issue_state(repo: str, number: int) -> str:
     Returns 'OPEN' on any error (fail-safe: never cancel when uncertain).
     """
     try:
-        proc = subprocess.run(
-            [
+        proc = subprocess.run(  # noqa: S603 — cmd is a fixed list[str], never shell=True
+            [  # noqa: S607 — gh is a trusted CLI tool installed in the container image
                 "gh", "issue", "view", str(number),
                 "--repo", f"{_ORG}/{repo}",
                 "--json", "state",
