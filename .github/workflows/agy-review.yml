@@ -1,0 +1,39 @@
+name: Agy PR review
+
+# Calls the shared reusable reviewer in mctlhq/.github with blocking=true so
+# that any P1 or P2 finding from the Antigravity reviewer fails this check.
+#
+# This job must be added as a required status check on the main branch in
+# the repository's branch-protection settings for the gate to take effect:
+#   Settings → Branches → Branch protection rules → main →
+#   "Require status checks" → add "agy-review / review"
+#
+# Note: depends on mctlhq/.github PR #10 being merged first (adds the
+# blocking input). Pin the SHA below to the new main SHA after that merge.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+jobs:
+  agy-review:
+    # TODO: pin to the SHA of mctlhq/.github main after PR #10 merges
+    uses: mctlhq/.github/.github/workflows/agy-review.yml@main
+    with:
+      blocking: true
+      conventions: |
+        Follow the conventions in this repository's AGENTS.md (Python style,
+        conventional commits, English only, no emoji).
+
+        Focus on:
+        - Correctness and logic errors; edge cases the change misses.
+        - Security: injection, authentication/authorization, secret
+          handling, unsafe input.
+        - Error handling: ignored errors, missing context, unhandled
+          Temporal activity exceptions.
+        - Test coverage: behaviour changed without a corresponding test.
+    permissions:
+      contents: read
+      pull-requests: write
