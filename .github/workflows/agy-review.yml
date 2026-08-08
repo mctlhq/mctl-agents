@@ -8,10 +8,11 @@ permissions: {}
 
 jobs:
   agy-review:
-    uses: mctlhq/.github/.github/workflows/agy-review.yml@main
+    uses: mctlhq/.github/.github/workflows/agy-review.yml@75c6d31b97ff15310cd2eec6602198338633d689
     permissions:
       contents: read
       pull-requests: write
     with:
+      blocking: true
       conventions: |
         Focus on: Python code quality & type safety, orchestrator state machine invariants in `orchestrator/run_shepherd.py` & `run_implementer.py`, idempotency of `.status.yaml` transitions, atomic git branch and PR manipulation logic, `pytest` test coverage, error handling without swallowing exceptions, and security of sub-agent prompt templates in `agents/`.
