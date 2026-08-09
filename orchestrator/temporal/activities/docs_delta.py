@@ -27,12 +27,15 @@ async def process_docs_delta_activity(
     delta_classification: str,
     url: str,
     target_repo: str = "mctlhq/mctl-academy",
-    excerpt: str = "Documentation source excerpt supporting objective claim.",
-    objective: str = "domain-1/foundations",
+    excerpt: str = "Function calling allows LLMs to return JSON structured data matching a tool schema.",
+    objective: str = "domain-2/function-calling",
+    source_sha256: str = "1ced0e48d880014ddcc5b1f91266fb0fe230fef380e414fb267ea8d5c20adc2b",
+    course_id: str = "agentic-ai-builder",
 ) -> DocsDeltaActivityResult:
     logger.info(
-        "Processing docs delta for source_id=%s classification=%s url=%s target_repo=%s",
+        "Processing docs delta for source_id=%s sha256=%s classification=%s url=%s target_repo=%s",
         source_id,
+        source_sha256,
         delta_classification,
         url,
         target_repo,
@@ -47,8 +50,14 @@ async def process_docs_delta_activity(
             generated_question_ids=(),
         )
 
-    # Invoke clean-room question authoring
-    q_data = author_question(source_excerpt=excerpt, objective=objective, source_id=source_id)
+    # Invoke clean-room question authoring passing real source_sha256 from captured snapshot
+    q_data = author_question(
+        source_excerpt=excerpt,
+        objective=objective,
+        source_id=source_id,
+        source_sha256=source_sha256,
+        course_id=course_id,
+    )
     qid = str(q_data["id"])
 
     return DocsDeltaActivityResult(
