@@ -81,7 +81,7 @@ async def setup_schedules(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleIntervalSpec(every=timedelta(minutes=30))],
+            intervals=[ScheduleIntervalSpec(every=timedelta(hours=12))],
         ),
     )
 
