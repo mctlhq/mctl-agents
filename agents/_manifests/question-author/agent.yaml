@@ -1,0 +1,32 @@
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: question-author
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_question_author:author_question
+  prompt:
+    sources:
+      - inline: orchestrator/run_question_author.py:QUESTION_AUTHOR_PROMPT
+  runtimeContext:
+    - targetRepo: content/
+    - targetRepo: SOURCES.md
+  modelPolicy:
+    task: service_agent
+    legacyEnvOverride: QUESTION_AUTHOR_MODEL
+  toolPolicy:
+    allow:
+      - Read
+      - Write
+      - Edit
+      - Glob
+      - Grep
+      - WebSearch
+      - WebFetch
+  execution:
+    budgetUsd: 2.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-question-author
