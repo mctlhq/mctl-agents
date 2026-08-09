@@ -7,6 +7,7 @@ spec:
   runtime:
     type: claude-agent-sdk
     entrypoint: orchestrator.run_question_author:author_question
+    optionsBuilder: orchestrator.options:build_question_author_options
   prompt:
     sources:
       - inline: orchestrator/run_question_author.py:QUESTION_AUTHOR_PROMPT
@@ -29,4 +30,4 @@ spec:
     budgetUsd: 2.00
     sandbox:
       backend: argo
-      clusterWorkflowTemplate: mctl-agents-question-author
+      clusterWorkflowTemplate: mctl-agents-run
