@@ -26,6 +26,7 @@ from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.discovery import discover_and_project
+from orchestrator.temporal.activities.docs_delta import process_docs_delta_activity
 from orchestrator.temporal.activities.incidents import respond_incidents_activity
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.orphans import detect_orphans
@@ -33,6 +34,7 @@ from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
 from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
+from orchestrator.temporal.workflows.docs_delta import DocsDeltaWorkflow
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 from orchestrator.temporal.workflows.issue_poll import IssuePollWorkflow, IssuePollWorkflowInput
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
@@ -123,7 +125,7 @@ async def main() -> None:
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
-        workflows=[DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow],
+        workflows=[DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow],
         activities=[
             resolve_agent_release,
             submit_and_wait,
@@ -132,6 +134,7 @@ async def main() -> None:
             detect_orphans,
             poll_issues_activity,
             respond_incidents_activity,
+            process_docs_delta_activity,
         ],
     )
     logger.info("worker starting on task queue %s", TASK_QUEUE)
