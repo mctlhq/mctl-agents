@@ -2,6 +2,8 @@
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from orchestrator.run_question_author import _build_prompt, author_question
@@ -44,8 +46,14 @@ def test_question_author_agent() -> None:
     res = author_question(excerpt, objective)
     assert res["status"] == "review_ready"
     assert res["objective"] == objective
-    assert res["evidence"][0]["excerpt"] == excerpt[:25]
-    assert res["certification"] == "agentic-ai-builder"
+    assert res["course_id"] == "agentic-ai-builder"
+    assert re.match(r"^q-[a-z0-9]{12}$", res["id"])
+    assert "stem" in res
+    assert len(res["options"]) == 4
+    assert res["options"][0]["correct"] is True
+    assert res["evidence"][0]["excerpt"] == excerpt
+    assert len(res["evidence"][0]["source_sha256"]) == 64
+    assert res["authored"]["by"] == "agent:question-author"
 
 
 def test_docs_delta_workflow_input() -> None:
