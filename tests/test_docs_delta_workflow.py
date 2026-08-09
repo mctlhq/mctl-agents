@@ -77,3 +77,54 @@ def test_docs_delta_workflow_input() -> None:
     assert inp.delta_classification == "deprecated"
     assert inp.target_repo == "mctlhq/mctl-academy"
 
+
+def test_candidate_verification_against_academy_schema_rules() -> None:
+    """Integration contract test asserting that author_question candidates strictly
+
+    comply with mctl-academy's content schema and evidence verification rules.
+    """
+    excerpt = "Function calling allows LLMs to return JSON structured data matching a tool schema."
+    objective = "domain-2/function-calling"
+    source_id = "src-function-calling"
+    valid_snapshot_sha = "1ced0e48d880014ddcc5b1f91266fb0fe230fef380e414fb267ea8d5c20adc2b"
+
+    candidate = author_question(
+        source_excerpt=excerpt,
+        objective=objective,
+        source_id=source_id,
+        source_sha256=valid_snapshot_sha,
+        course_id="agentic-ai-builder",
+    )
+
+    # 1. Structural schema compliance
+    assert candidate["schema_version"] == 1
+    assert re.match(r"^q-[a-z0-9]{12}$", candidate["id"])
+    assert candidate["status"] == "review_ready"
+    assert candidate["course_id"] in ("agentic-ai-builder", "ai-cloudops-engineer", "ai-leader")
+    assert candidate["domain"] == "domain-2"
+    assert candidate["objective"] == objective
+    assert isinstance(candidate["stem"], str) and len(candidate["stem"]) > 0
+
+    # 2. Options compliance: 4 options, exactly 1 correct
+    options = candidate["options"]
+    assert len(options) == 4
+    assert [o["id"] for o in options] == ["a", "b", "c", "d"]
+    assert sum(1 for o in options if o["correct"] is True) == 1
+    for opt in options:
+        assert isinstance(opt["text"], str) and len(opt["text"]) > 0
+        assert isinstance(opt["explanation"], str) and len(opt["explanation"]) > 0
+
+    # 3. Evidence provenance and snapshot sha256 compliance
+    evidence = candidate["evidence"]
+    assert len(evidence) == 1
+    ev = evidence[0]
+    assert ev["source_id"] == source_id
+    assert ev["source_sha256"] == valid_snapshot_sha
+    assert len(ev["source_sha256"]) == 64
+    assert len(ev["excerpt"].split()) <= 25
+
+    # 4. Authored provenance block
+    assert candidate["authored"]["by"] == "agent:question-author"
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", candidate["authored"]["at"])
+
+
