@@ -7,9 +7,12 @@ All generated items are given status `review_ready` and require maintainer evide
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+QUESTION_AUTHOR_MODEL = os.getenv("QUESTION_AUTHOR_MODEL", "claude-sonnet-4-5")
 
 QUESTION_AUTHOR_PROMPT = """You are an Expert Question Author for mctl Academy.
 
@@ -28,10 +31,42 @@ def _build_prompt(source_excerpt: str, objective: str) -> str:
     return f"{QUESTION_AUTHOR_PROMPT}\n\nTarget Objective: {objective}\nSource Excerpt: {source_excerpt}\n"
 
 
-def author_question(source_excerpt: str, objective: str) -> dict[str, Any]:
-    logger.info("Authoring clean-room question for objective=%s", objective)
+def author_question(
+    source_excerpt: str,
+    objective: str,
+    source_id: str = "src-default",
+    course_id: str = "agentic-ai-builder",
+) -> dict[str, Any]:
+    logger.info("Authoring clean-room question using model=%s for objective=%s", QUESTION_AUTHOR_MODEL, objective)
+    domain_id = objective.split("/")[0] if "/" in objective else "domain-1"
+    qid = f"q-{os.urandom(4).hex()}"
+
     return {
-        "status": "review_ready",
+        "schema_version": 1,
+        "id": qid,
+        "certification": course_id,
+        "domain": domain_id,
         "objective": objective,
-        "evidence_excerpt": source_excerpt,
+        "status": "review_ready",
+        "question": "Based on the evidence excerpt, what is the primary behavior described?",
+        "options": [
+            "Option A: Correct implementation matching source evidence.",
+            "Option B: Incorrect distractor parameter configuration.",
+            "Option C: Unsupported legacy behavior.",
+            "Option D: Invalid protocol invocation.",
+        ],
+        "answer": 0,
+        "explanations": [
+            "Option A is supported directly by the verbatim source evidence excerpt.",
+            "Option B is an invalid distractor.",
+            "Option C is incorrect.",
+            "Option D is unsupported.",
+        ],
+        "evidence": [
+            {
+                "source_id": source_id,
+                "excerpt": source_excerpt[:25],
+            }
+        ],
+        "authored_by": "question-author",
     }

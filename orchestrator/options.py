@@ -97,6 +97,7 @@ ISSUE_INVESTIGATOR_BUDGET_USD = float(os.getenv("ISSUE_INVESTIGATOR_BUDGET_USD",
 # caused consistent budget-exhaustion failures after ~3 minutes.  Raised to
 # $5 to match the service-agent and shepherd caps.
 INCIDENT_RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00"))
+QUESTION_AUTHOR_BUDGET_USD = float(os.getenv("QUESTION_AUTHOR_BUDGET_USD", "2.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -275,5 +276,19 @@ def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions
         mcp_servers={},
         permission_mode="acceptEdits",
         max_budget_usd=SHEPHERD_BUDGET_USD,
+        env={**os.environ},
+    )
+
+
+def build_question_author_options(agent_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Options for the clean-room question-author agent."""
+    return ClaudeAgentOptions(
+        cwd=str(agent_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch"],
+        mcp_servers={},
+        permission_mode="acceptEdits",
+        max_budget_usd=QUESTION_AUTHOR_BUDGET_USD,
         env={**os.environ},
     )

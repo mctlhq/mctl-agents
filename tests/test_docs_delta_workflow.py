@@ -22,6 +22,15 @@ async def test_process_docs_delta_activity() -> None:
     assert res.delta_classification == "capability_added"
     assert res.status == "processed"
     assert res.questions_generated == 1
+    assert len(res.generated_question_ids) == 1
+
+    dep_res = await process_docs_delta_activity(
+        source_id="src-nebius-legacy",
+        delta_classification="deprecated",
+        url="https://docs.nebius.com/legacy.md",
+        target_repo="mctlhq/mctl-academy",
+    )
+    assert dep_res.questions_generated == 0
 
 
 def test_question_author_agent() -> None:
@@ -35,7 +44,8 @@ def test_question_author_agent() -> None:
     res = author_question(excerpt, objective)
     assert res["status"] == "review_ready"
     assert res["objective"] == objective
-    assert res["evidence_excerpt"] == excerpt
+    assert res["evidence"][0]["excerpt"] == excerpt[:25]
+    assert res["certification"] == "agentic-ai-builder"
 
 
 def test_docs_delta_workflow_input() -> None:
