@@ -17,12 +17,21 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # Uses mctl-agents, the backend-only automation App — deliberately NOT
+      # MCTL App (secrets.APP_ID), which this used to read. MCTL App is the
+      # App customers install themselves from mctl.ai/#request-access, and it
+      # is being narrowed to contents:read + metadata:read so its published
+      # least-privilege description is actually true (mctlhq/mctl-gitops#761).
+      # A GitHub App's permissions apply to every installation alike, so this
+      # was the single loudest contradiction: release-please here asks for
+      # contents/pull-requests/issues write, which meant customers were asked
+      # for the same three on their own repositories.
       - name: Generate release-please App token
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.AGENTS_APP_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
           owner: mctlhq
           repositories: mctl-agents
           permission-contents: write
@@ -36,13 +45,21 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+      # Uses mctl-agents, the backend-only automation App — deliberately
+      # NOT MCTL App (secrets.APP_ID). MCTL App is the App customers install
+      # themselves from mctl.ai/#request-access, and it is being narrowed to
+      # contents:read + metadata:read so its published least-privilege
+      # description is actually true (mctlhq/mctl-gitops#761). A GitHub App's
+      # permissions apply to every installation alike, so anything needing
+      # write — like actions:write on mctl-gitops to dispatch below — has to
+      # live on the internal App instead.
       - name: Generate Platform App token
         if: ${{ steps.release.outputs.release_created == 'true' }}
         id: app
         uses: actions/create-github-app-token@v3
         with:
-          app-id: ${{ secrets.APP_ID }}
-          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.AGENTS_APP_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
           owner: mctlhq
           repositories: mctl-gitops
 
