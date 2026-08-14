@@ -188,4 +188,15 @@ jobs:
         with:
           context: .
           push: false
+          load: true
           tags: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
+
+      - name: Image must not run as root
+        env:
+          IMAGE: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
+        run: |
+          uid=$(docker run --rm --entrypoint id "$IMAGE" -u)
+          user=$(docker run --rm --entrypoint id "$IMAGE" -un)
+          echo "runtime uid=$uid user=$user"
+          test "$uid" = "1000"
+          test "$user" = "app"

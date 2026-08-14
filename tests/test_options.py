@@ -90,3 +90,26 @@ def test_build_shepherd_options_has_no_mcp_at_all(tmp_path, monkeypatch):
     shepherd_dir.mkdir()
     built = options.build_shepherd_options(shepherd_dir, model="test-model")
     assert built.mcp_servers == {}
+
+
+def test_bash_modes_install_command_audit_hook(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    service_dir = tmp_path / "mctl-api"
+    service_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    incident_dir = tmp_path / "_incident-responder"
+    incident_dir.mkdir()
+
+    builders = [
+        options.build_service_agent_options(service_dir, model="test-model"),
+        options.build_implementer_agent_options(service_dir, model="test-model"),
+        options.build_incident_responder_options(
+            agent_dir=incident_dir, model="test-model", state_dir=tmp_path,
+        ),
+        options.build_issue_investigator_options(
+            service_dir, model="test-model", proposal_dir=proposal_dir,
+        ),
+    ]
+    for built in builders:
+        matchers = (built.hooks or {}).get("PreToolUse") or []
+        assert any(m.matcher == "Bash" for m in matchers)
