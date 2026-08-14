@@ -67,5 +67,14 @@ COPY agents/ ./agents/
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Non-root runtime (SOC F8). uid 1000 matches the worker Helm
+# podSecurityContext and the CWFT clone-gitops `chown -R 1000:1000 /workdir`
+# handoff so STATE_DIR/TMPDIR stay writable after the alpine/git clone step.
+RUN groupadd --gid 1000 app \
+    && useradd --uid 1000 --gid app --create-home --home-dir /home/app app \
+    && chown -R app:app /app /home/app
+ENV HOME=/home/app
+USER app:app
+
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["python", "-m", "orchestrator.run_all"]

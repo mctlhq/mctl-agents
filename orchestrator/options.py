@@ -1,9 +1,10 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk.types import HookMatcher
 
 from config.settings import MCTL_MCP_URL
 
@@ -114,6 +115,49 @@ _SIBLING_REPOS = (
 )
 
 
+async def _audit_pre_tool_use(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: Any,
+) -> dict[str, Any]:
+    """Log Bash invocations. Orchestrator git/gh wrappers already print `$ cmd`;
+    this covers the SDK Bash tool the model runs under acceptEdits (SOC F8)."""
+    tool_name = ""
+    tool_input: dict[str, Any] = {}
+    if isinstance(input_data, dict):
+        tool_name = str(input_data.get("tool_name") or "")
+        raw = input_data.get("tool_input") or {}
+        if isinstance(raw, dict):
+            tool_input = raw
+    if tool_name == "Bash":
+        print(f"AUDIT tool=Bash cmd={tool_input.get('command', '')!r}")
+    else:
+        print(f"AUDIT tool={tool_name}")
+    return {}
+
+
+HookEventName = Literal[
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStop",
+    "PreCompact",
+    "Notification",
+    "SubagentStart",
+    "PermissionRequest",
+]
+
+
+def _command_audit_hooks() -> dict[HookEventName, list[HookMatcher]]:
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="Bash", hooks=[cast(Any, _audit_pre_tool_use)]),
+        ],
+    }
+
+
 def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     """For services that scan sibling repos, expand the workspace to include them."""
     if service_name not in SERVICES_NEEDING_SIBLING_ACCESS:
@@ -137,6 +181,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
         add_dirs=_sibling_add_dirs(service_dir.name),
+        hooks=_command_audit_hooks(),
         # Extend (NOT replace) parent env — child needs HOME for the Claude
         # credentials lookup, and PATH for `git`/`gh`/`node`/`npm`, which the
         # Bash tool shells out to. The Claude Code CLI itself doesn't need
@@ -176,6 +221,7 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Pa
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
         env=env,
+        hooks=_command_audit_hooks(),
     )
 
 
@@ -216,6 +262,7 @@ def build_incident_responder_options(
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
+        hooks=_command_audit_hooks(),
     )
 
 
@@ -250,6 +297,7 @@ def build_issue_investigator_options(
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
         add_dirs=[str(proposal_dir)],
         env=env,
+        hooks=_command_audit_hooks(),
     )
 
 
