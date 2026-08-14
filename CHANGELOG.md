@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.28.0](https://github.com/mctlhq/mctl-agents/compare/1.27.0...1.28.0) (2026-08-14)
+
+
+### Features
+
+* **ci:** enable blocking mode for agy PR reviewer ([2c19574](https://github.com/mctlhq/mctl-agents/commit/2c19574618e230edbe0bcadaa5eb45e46cfc80ea))
+* **ci:** enable blocking mode for agy PR reviewer ([8d6055d](https://github.com/mctlhq/mctl-agents/commit/8d6055d972e906b4812bd522b71a94a19eaa04a5))
+* **temporal:** add DocsDeltaWorkflow and question-author agent ([d6e81bb](https://github.com/mctlhq/mctl-agents/commit/d6e81bb9ecc0809aa59c6a9aeefb4838a6f70146))
+* **temporal:** add DocsDeltaWorkflow and question-author agent ([efaeccb](https://github.com/mctlhq/mctl-agents/commit/efaeccb06e8ffa3cef4961096e29323094300b73))
+
+
+### Bug Fixes
+
+* **manifest:** register question-author in agent inventory and satisfy CI checks ([91e7d05](https://github.com/mctlhq/mctl-agents/commit/91e7d05d6519aa62685a7ba9cf26a63016d120fb))
+* **manifest:** register question-author in agent inventory and satisfy CI checks ([f80e1a7](https://github.com/mctlhq/mctl-agents/commit/f80e1a7e81c162d55979150f2af155d29e65e57f))
+* **question-author:** compute sha256 dynamically from excerpt instead of empty default SHA ([64e1918](https://github.com/mctlhq/mctl-agents/commit/64e19189169baf65cd721acd50cf6f262fec9d83))
+* **question-author:** compute sha256 dynamically from excerpt instead of empty default SHA ([a122720](https://github.com/mctlhq/mctl-agents/commit/a1227204edab96eec94520e6c6c69d1620d392f4))
+* **question-author:** enforce 100% question.schema.json compliance in candidate generation ([62dd526](https://github.com/mctlhq/mctl-agents/commit/62dd52670a6c8fb9e70af4bcf56fbb96d10850b5))
+* **question-author:** enforce 100% question.schema.json compliance in candidate generation ([539e126](https://github.com/mctlhq/mctl-agents/commit/539e1262c1fb6b54a12f5f1c02d01c14d4492d1a))
+* **question-author:** enforce real R2 snapshot sha256 parameter in authoring pipeline ([5597dbd](https://github.com/mctlhq/mctl-agents/commit/5597dbd9253ea9b1f6824ae7c827bae4851de160))
+* **question-author:** enforce real R2 snapshot sha256 parameter in authoring pipeline ([40f5cad](https://github.com/mctlhq/mctl-agents/commit/40f5cad5c5ec0986437ad91317026aba6455fa75))
+* run the agents image as non-root ([f9b70db](https://github.com/mctlhq/mctl-agents/commit/f9b70db869834274da4b520813817523dd7e3da8))
+* run the agents image as non-root ([d1dd7f4](https://github.com/mctlhq/mctl-agents/commit/d1dd7f447a8a3725d31481d23ef8289cc1672f89))
+* **test:** add candidate verifier contract integration test ([db43147](https://github.com/mctlhq/mctl-agents/commit/db4314764d5ef8edd51dc4883eae2a9e0087a06a))
+* **worker:** update issue poll schedule interval to 12 hours ([17915d0](https://github.com/mctlhq/mctl-agents/commit/17915d0ecbc253e66f16897bcef29b452118bf2c))
+* **worker:** update issue poll schedule interval to 12 hours ([b12a85a](https://github.com/mctlhq/mctl-agents/commit/b12a85a1929ba09a65487db3b5d8d014ab9cde24))
+
 ## [1.27.0](https://github.com/mctlhq/mctl-agents/compare/1.26.0...1.27.0) (2026-08-07)
 
 
