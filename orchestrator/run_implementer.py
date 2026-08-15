@@ -89,6 +89,7 @@ from orchestrator.options import (
     IMPLEMENTER_TIMEOUT_SECONDS,
     build_implementer_agent_options,
 )
+from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 # ---------------------------------------------------------------------------
@@ -316,14 +317,10 @@ def _run(
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
     try:
-        return subprocess.run(  # noqa: S603 — cmd is always this wrapper's own list[str] param, never shell=True
-            cmd,
-            cwd=cwd,
-            check=check,
-            text=True,
-            capture_output=True,
-            timeout=effective_timeout,
-        )
+        # run_capturing, not subprocess.run: on check=True a plain
+        # CalledProcessError reaches Temporal as "returned non-zero exit
+        # status 1" with the captured stderr stranded on the exception.
+        return run_capturing(cmd, cwd=cwd, check=check, timeout=effective_timeout)
     except subprocess.TimeoutExpired as exc:
         raise ImplementerOperationTimeout(
             f"command exceeded {effective_timeout:g}s: {' '.join(cmd)}"

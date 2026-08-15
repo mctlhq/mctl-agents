@@ -60,6 +60,7 @@ from orchestrator import run_implementer
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
+from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 # ---------------------------------------------------------------------------
@@ -408,10 +409,15 @@ def _discover_refs(
 # gh CLI helpers
 # ---------------------------------------------------------------------------
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    """Thin wrapper over subprocess.run with consistent logging."""
+    """Thin wrapper over subprocess.run with consistent logging.
+
+    See run_issue_investigator._run — same reason for run_capturing: the
+    shepherd's git/gh failures surface as Argo "exit code 128" with no cause
+    attached unless stderr rides along on the exception.
+    """
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)  # noqa: S603 — cmd is list[str]
+    return run_capturing(cmd, cwd=cwd, check=check)
 
 
 def _gh_api_json(args: list[str]) -> Any:
