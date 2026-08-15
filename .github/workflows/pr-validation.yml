@@ -55,7 +55,12 @@ jobs:
     # required status check, and release-please's own admin-merge path
     # bypasses required checks entirely either way.
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    # Skipped on release-please's own branches. A release PR carries exactly
+    # one commit, `chore(main): release x.y.z`, which by design is not a
+    # releasable type — the release it cuts is the PR, not a change awaiting
+    # one. Running this check there fails a PR that is already correct, and
+    # that red check is what forced `--admin` merges (mctlhq/mctl-gitops#819).
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--branches--')
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
