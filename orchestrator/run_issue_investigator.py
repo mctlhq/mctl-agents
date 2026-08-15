@@ -60,6 +60,7 @@ from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import build_issue_investigator_options
+from orchestrator.proc import run_capturing
 
 DEFAULT_STATE_DIR = Path(
     os.getenv(
@@ -106,10 +107,15 @@ def _now_iso() -> str:
 
 
 def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    """Thin wrapper over subprocess.run with consistent logging."""
+    """Thin wrapper over subprocess.run with consistent logging.
+
+    Uses run_capturing so a failure raises with stderr in the message: this
+    wrapper's callers let the exception propagate to Temporal, where a bare
+    CalledProcessError shows only "returned non-zero exit status 1".
+    """
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=True)  # noqa: S603 — cmd is list[str]
+    return run_capturing(cmd, cwd=cwd, check=check)
 
 
 class IssueURLError(ValueError):
