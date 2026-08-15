@@ -89,7 +89,7 @@ from orchestrator.options import (
     IMPLEMENTER_TIMEOUT_SECONDS,
     build_implementer_agent_options,
 )
-from orchestrator.proc import run_capturing
+from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 
 # ---------------------------------------------------------------------------
@@ -322,8 +322,12 @@ def _run(
         # status 1" with the captured stderr stranded on the exception.
         return run_capturing(cmd, cwd=cwd, check=check, timeout=effective_timeout)
     except subprocess.TimeoutExpired as exc:
+        # TimeoutExpired carries whatever the command printed before it hung.
+        # Dropping it leaves an operator with "command exceeded 600s" and no
+        # way to tell a wedged network call from an interactive prompt.
         raise ImplementerOperationTimeout(
-            f"command exceeded {effective_timeout:g}s: {' '.join(cmd)}"
+            f"command exceeded {effective_timeout:g}s: {' '.join(cmd)} "
+            f"{describe_output(exc.stdout, exc.stderr)}"
         ) from exc
 
 

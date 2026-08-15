@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from orchestrator.proc import CommandFailed, run_capturing
+from orchestrator.proc import CommandFailed, describe_output, run_capturing
 
 
 def test_success_returns_completed_process():
@@ -84,3 +84,16 @@ def test_timeout_still_raises_timeout_expired():
     """run_implementer catches TimeoutExpired by type — don't swallow it."""
     with pytest.raises(subprocess.TimeoutExpired):
         run_capturing(["python", "-c", "import time; time.sleep(5)"], timeout=0.3)
+
+
+def test_describe_output_renders_both_streams():
+    assert describe_output("out", "err") == "stdout: out stderr: err"
+
+
+def test_describe_output_says_so_when_empty():
+    assert describe_output("", None) == "(no output captured)"
+
+
+def test_describe_output_accepts_bytes():
+    """TimeoutExpired hands back bytes when the child was not started in text mode."""
+    assert describe_output(b"out", b"err") == "stdout: out stderr: err"

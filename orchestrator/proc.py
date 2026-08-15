@@ -33,6 +33,30 @@ def _tail(stream: str | bytes | None, limit: int = _MAX_STREAM_CHARS) -> str:
     return "...(truncated)... " + stream[-limit:]
 
 
+def describe_output(stdout, stderr) -> str:
+    """Render captured streams for an error message, bounded and never empty.
+
+    Both streams, never one or the other. Which one holds the reason is not
+    knowable here: git writes progress to stderr and can put the fatal line on
+    stdout, so preferring stderr would print the noise and drop the cause — the
+    exact failure this module exists to prevent. stderr goes last because that
+    is where the reason usually is, and a truncated log is read from the end.
+
+    Public because the timeout path needs it too: `subprocess.TimeoutExpired`
+    also carries partial output, and discarding it leaves an operator with a
+    hung command and no clue what it was doing.
+    """
+    parts = []
+    out, err = _tail(stdout), _tail(stderr)
+    if out:
+        parts.append(f"stdout: {out}")
+    if err:
+        parts.append(f"stderr: {err}")
+    if not parts:
+        return "(no output captured)"
+    return " ".join(parts)
+
+
 class CommandFailed(subprocess.CalledProcessError):
     """A `CalledProcessError` whose message carries the captured output.
 
@@ -42,21 +66,7 @@ class CommandFailed(subprocess.CalledProcessError):
     """
 
     def __str__(self) -> str:
-        # Both streams, never one or the other. Which one holds the reason is
-        # not knowable here: git writes progress to stderr and can put the
-        # fatal line on stdout, so preferring stderr would print the noise and
-        # drop the cause — the exact failure this class exists to prevent.
-        # stderr goes last because that is where the reason usually is, and a
-        # truncated log is read from the end.
-        parts = [super().__str__()]
-        stdout, stderr = _tail(self.stdout), _tail(self.stderr)
-        if stdout:
-            parts.append(f"stdout: {stdout}")
-        if stderr:
-            parts.append(f"stderr: {stderr}")
-        if len(parts) == 1:
-            parts.append("(no output captured)")
-        return " ".join(parts)
+        return f"{super().__str__()} {describe_output(self.stdout, self.stderr)}"
 
 
 def run_capturing(
