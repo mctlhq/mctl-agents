@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.28.1](https://github.com/mctlhq/mctl-agents/compare/1.28.0...1.28.1) (2026-08-15)
+
+
+### Bug Fixes
+
+* **orchestrator:** keep both streams in the CommandFailed message ([0924275](https://github.com/mctlhq/mctl-agents/commit/09242752a6a37ef0b33f558aa07c5bec8e74146f))
+* **orchestrator:** keep captured output when a command times out ([43fe7db](https://github.com/mctlhq/mctl-agents/commit/43fe7db71af6a4247b449c351262b6f16bd94928))
+* **orchestrator:** put stderr in the error when a subprocess fails ([8fd95e4](https://github.com/mctlhq/mctl-agents/commit/8fd95e4dd5a78b3fcd8ac013ecafadbeabcc7ca6))
+* **orchestrator:** put stderr in the error when a subprocess fails ([87057e2](https://github.com/mctlhq/mctl-agents/commit/87057e2e845cec7985aabbe7cc97c7bebb827863))
+
 ## [1.28.0](https://github.com/mctlhq/mctl-agents/compare/1.27.0...1.28.0) (2026-08-14)
 
 
