@@ -31,6 +31,24 @@ def test_failure_is_a_called_process_error():
     assert excinfo.value.returncode == 3
 
 
+def test_keeps_both_streams_when_both_have_output():
+    """git writes progress to stderr and can put the fatal line on stdout.
+
+    Preferring one stream would print the noise and drop the reason.
+    """
+    script = (
+        "import sys; "
+        "sys.stderr.write('remote: Enumerating objects'); "
+        "sys.stdout.write('fatal: the real reason'); "
+        "sys.exit(1)"
+    )
+    with pytest.raises(CommandFailed) as excinfo:
+        run_capturing(["python", "-c", script])
+    message = str(excinfo.value)
+    assert "fatal: the real reason" in message, message
+    assert "remote: Enumerating objects" in message, message
+
+
 def test_falls_back_to_stdout_when_stderr_is_empty():
     """git reports some failures on stdout; an empty stderr must not hide them."""
     with pytest.raises(CommandFailed) as excinfo:

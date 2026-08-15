@@ -42,14 +42,21 @@ class CommandFailed(subprocess.CalledProcessError):
     """
 
     def __str__(self) -> str:
-        base = super().__str__()
-        stderr, stdout = _tail(self.stderr), _tail(self.stdout)
-        if stderr:
-            return f"{base} stderr: {stderr}"
+        # Both streams, never one or the other. Which one holds the reason is
+        # not knowable here: git writes progress to stderr and can put the
+        # fatal line on stdout, so preferring stderr would print the noise and
+        # drop the cause — the exact failure this class exists to prevent.
+        # stderr goes last because that is where the reason usually is, and a
+        # truncated log is read from the end.
+        parts = [super().__str__()]
+        stdout, stderr = _tail(self.stdout), _tail(self.stderr)
         if stdout:
-            # Some tools (git among them) report failures on stdout.
-            return f"{base} stdout: {stdout}"
-        return f"{base} (no output captured)"
+            parts.append(f"stdout: {stdout}")
+        if stderr:
+            parts.append(f"stderr: {stderr}")
+        if len(parts) == 1:
+            parts.append("(no output captured)")
+        return " ".join(parts)
 
 
 def run_capturing(
