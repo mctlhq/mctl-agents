@@ -22,7 +22,13 @@ jobs:
       # by non-human actor", and since branch protection requires an
       # approving review, dependabot PRs then sit unmergeable until a
       # maintainer triggers a review by hand.
-      allowed-bots: "github-actions,mctl-app,dependabot"
+      #
+      # mctl-agents is the App whose token release-please now runs under
+      # (release-please.yml, AGENTS_APP_ID). It is the *actor* of the run,
+      # which is what claude-code-action checks — distinct from the PR
+      # author. Its absence is what failed the review on release PR #141
+      # with the same "non-human actor" error (mctlhq/mctl-gitops#819).
+      allowed-bots: "github-actions,mctl-app,mctl-agents,dependabot"
       conventions: |
         Follow the conventions in this repository's CLAUDE.md (Python style,
         conventional commits, English only, no emoji).
