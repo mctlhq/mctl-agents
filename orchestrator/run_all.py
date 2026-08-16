@@ -10,7 +10,7 @@ Modes:
     full                — all service agents in parallel, then the mentor (default)
     mentor-only         — mentor only, reads existing proposals/ from state
     single-service      — one agent (name in RUN_SERVICE), no mentor
-    incident-responder  — diagnose TypeGeneric analyzing incidents, write accepted proposals
+    incident-responder  — diagnose escalated/analyzing incidents, write accepted proposals
 """
 import os
 import sys
@@ -75,9 +75,13 @@ async def _safe_run_incident_responder() -> None:
     The responder is best-effort diagnostics: any proposals it already
     wrote to state_dir before failing are still useful, and a transient
     failure here should not surface as a platform incident. We log + drop,
-    matching _safe_run_service's rationale — EXCEPT for
-    McpNotConnectedError, which means zero real work happened and must not
-    be reported as a false green (see that exception's docstring).
+    matching _safe_run_service's rationale — EXCEPT for two cases that mean
+    zero real work happened and must not be reported as a false green:
+    McpNotConnectedError (see that exception's docstring), and SystemExit,
+    which the responder raises only for a missing agent directory. Note this
+    differs from _safe_run_service, which does catch SystemExit: there the
+    exception would tear down the surrounding anyio task group and take the
+    other services down with it.
     """
     try:
         await run_incident_responder()
@@ -90,7 +94,14 @@ async def _safe_run_incident_responder() -> None:
         print(f"error: incident-responder: {exc}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
         sys.exit(MCP_NOT_CONNECTED_EXIT_CODE)
-    except (Exception, SystemExit) as exc:  # noqa: BLE001 — intentional broad catch
+    except Exception as exc:  # noqa: BLE001 — intentional broad catch
+        # Exception only. SystemExit deliberately propagates: the one place the
+        # responder raises it is a missing agent directory
+        # (run_incident_responder.py), which is a broken image or mount, not a
+        # transient failure. Swallowing it meant a run that could never do any
+        # work still reported success to Argo — the same false green the
+        # McpNotConnectedError branch above exists to prevent, arriving by a
+        # different route.
         print(
             f"warn: incident-responder failed: {type(exc).__name__}: {exc}",
             file=sys.stderr,
@@ -133,7 +144,7 @@ async def main() -> None:
     elif mode == "single-service":
         await _single_service(service)
     elif mode == "incident-responder":
-        print("=== mode=incident-responder — diagnosing TypeGeneric analyzing incidents ===")
+        print("=== mode=incident-responder — diagnosing escalated and analyzing incidents ===")
         await _safe_run_incident_responder()
     else:
         print(

@@ -248,7 +248,19 @@ def build_incident_responder_options(
 
     Runs with cwd=agents/_incident-responder/ so setting_sources=["project"]
     picks up its CLAUDE.md. Needs mctl MCP for listing/resolving incidents and
-    Write/Bash for creating proposal files and computing timestamps.
+    Read/Write/Glob for the proposal files.
+
+    Deliberately no Bash. This agent reads incident summaries and service logs,
+    which are chosen by whoever can make a service log a line or an alert fire,
+    and everything keeping that text from being followed as an instruction is
+    another instruction in the same context window. With a shell attached, a
+    successful injection is remote code execution on the orchestrator; without
+    one, the worst case is a badly written proposal.
+
+    The two things it used the shell for are now supplied instead: the current
+    UTC timestamp is interpolated into the prompt, and the proposal slug is
+    derived from the incident ID by string manipulation rather than by hashing
+    it in a subprocess. See mctlhq/mctl-agents#183.
     """
     env = {**os.environ}
     if state_dir is not None:
@@ -257,7 +269,7 @@ def build_incident_responder_options(
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=["Read", "Write", "Bash", "Glob", *_mctl_tool_globs()],
+        allowed_tools=["Read", "Write", "Glob", *_mctl_tool_globs()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,

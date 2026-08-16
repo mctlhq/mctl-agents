@@ -24,7 +24,9 @@ here.
 """
 from __future__ import annotations
 
+import re
 import types
+from pathlib import Path
 
 import anyio
 import pytest
@@ -32,6 +34,7 @@ import pytest
 from orchestrator import mcp_guard, run_all
 from orchestrator import run_incident_responder as rir
 from orchestrator.mcp_guard import McpNotConnectedError
+from orchestrator.options import build_incident_responder_options
 
 
 class _FakeClient:
@@ -222,6 +225,19 @@ def test_safe_run_exits_nonzero_on_mcp_not_connected(monkeypatch):
     assert exc_info.value.code == run_all.MCP_NOT_CONNECTED_EXIT_CODE
 
 
+def test_safe_run_propagates_system_exit(monkeypatch):
+    """A missing agent directory is the one place run_incident_responder raises
+    SystemExit. It means the run can do no work at all, so it must fail the step
+    rather than be swallowed into exit 0 — the same reason McpNotConnectedError
+    exits non-zero above."""
+    async def _raise():
+        raise SystemExit("Incident responder agent dir not found: /nope")
+
+    monkeypatch.setattr(run_all, "run_incident_responder", _raise)
+    with pytest.raises(SystemExit):
+        anyio.run(run_all._safe_run_incident_responder)
+
+
 def test_safe_run_still_swallows_unrelated_exceptions(monkeypatch):
     """Existing behavior for transient SDK/budget/network failures must be
     unchanged — only McpNotConnectedError gets the non-zero exit."""
@@ -230,3 +246,36 @@ def test_safe_run_still_swallows_unrelated_exceptions(monkeypatch):
 
     monkeypatch.setattr(run_all, "run_incident_responder", _raise)
     anyio.run(run_all._safe_run_incident_responder)  # must not raise
+
+
+def test_responder_has_no_shell():
+    """The responder reads attacker-influenced text (alert summaries, service
+    logs). With a shell attached, a successful prompt injection is remote code
+    execution on the orchestrator; without one the worst case is a bad
+    proposal. See mctlhq/mctl-agents#183."""
+    opts = build_incident_responder_options(
+        agent_dir=Path("/tmp/agent"),
+        model="claude-sonnet-4-5",
+        state_dir=Path("/tmp/state"),
+    )
+
+    assert "Bash" not in opts.allowed_tools
+    assert "Read" in opts.allowed_tools
+    assert "Write" in opts.allowed_tools
+
+
+def test_prompt_supplies_what_the_shell_used_to():
+    """Removing Bash only works if the two things it was used for arrive some
+    other way: the current time, and a slug that needs no hashing."""
+    prompt = rir._build_prompt(Path("/tmp/state"), 30)
+
+    # A concrete timestamp, not an instruction to go and compute one.
+    assert "python3 -c" not in prompt
+    assert "Use Bash" not in prompt
+    assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", prompt), prompt[:400]
+
+    # Slug from the tail of the ID, since argo-* IDs share a long common prefix.
+    assert "LAST 8 alphanumeric" in prompt
+    assert "SHA-1" not in prompt
+
+
