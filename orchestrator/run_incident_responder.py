@@ -101,8 +101,14 @@ f. Build slug: `incident-` + first 8 hex characters of the SHA-1 hash of the
    full incident ID (NOT a prefix slice of the ID itself — IDs from some
    sources, e.g. `argo-<workflow-name>-<ts>-<ts>`, share a long common
    prefix across unrelated incidents, so slicing the ID collapses them onto
-   the same slug). Compute it with Bash, e.g.:
-   `python3 -c "import hashlib,sys; print(hashlib.sha1(sys.argv[1].encode()).hexdigest()[:8])" '{{incident_id}}'`
+   the same slug). Compute it WITHOUT putting the incident ID into a shell
+   command line — write the ID to a file with the Write tool, then hash the
+   file, so no quoting of external data is involved:
+     Write `/tmp/incident_id` containing exactly the incident ID, then run
+     `python3 -c "import hashlib,pathlib; print(hashlib.sha1(pathlib.Path('/tmp/incident_id').read_bytes()).hexdigest()[:8])"`
+   Do not substitute the ID into any `python3 -c` argument, `echo`, or other
+   shell word. IDs come from alert payloads and workflow names; a quote in one
+   would break out of the surrounding quoting and run as a command.
 g. Guard against collisions before writing: if
    `{state_dir}/{{target_service}}/proposals/{{slug}}/` already exists, read its
    `requirements.md` and compare its `## Incident` -> `- ID:` line to the
