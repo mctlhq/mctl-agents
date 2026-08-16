@@ -222,6 +222,19 @@ def test_safe_run_exits_nonzero_on_mcp_not_connected(monkeypatch):
     assert exc_info.value.code == run_all.MCP_NOT_CONNECTED_EXIT_CODE
 
 
+def test_safe_run_propagates_system_exit(monkeypatch):
+    """A missing agent directory is the one place run_incident_responder raises
+    SystemExit. It means the run can do no work at all, so it must fail the step
+    rather than be swallowed into exit 0 — the same reason McpNotConnectedError
+    exits non-zero above."""
+    async def _raise():
+        raise SystemExit("Incident responder agent dir not found: /nope")
+
+    monkeypatch.setattr(run_all, "run_incident_responder", _raise)
+    with pytest.raises(SystemExit):
+        anyio.run(run_all._safe_run_incident_responder)
+
+
 def test_safe_run_still_swallows_unrelated_exceptions(monkeypatch):
     """Existing behavior for transient SDK/budget/network failures must be
     unchanged — only McpNotConnectedError gets the non-zero exit."""
