@@ -1,0 +1,13 @@
+flowchart LR
+    S1["schedule 15m"] --> REC["ReconcileWorkflow"]
+    REC --> D["discover_and_project<br/>non-terminal proposals → PR на GitHub<br/>merged → merged, closed → rejected<br/>ТОЛЬКО проекция, без записи"]
+    REC --> O["detect_orphans<br/>accepted/in-progress/implemented/review-fixing<br/>с открытым PR и без активного DevLoop → лог ORPHAN"]
+
+    S2["schedule 12h"] --> ISS["IssuePollWorkflow"]
+    ISS --> P["poll_issues_activity → run_issue_poller.poll<br/>label agents:intake, max 5<br/>старт DevLoop + снятие лейбла"]
+
+    S3["schedule 1h<br/>ПРИОСТАНОВЛЕНО"] --> INC["IncidentLoopWorkflow"]
+    INC --> I["submit_and_wait('mctl-agents-incidents')<br/>SDK работает в Argo, не в воркере (agents#179)"]
+
+    S4["по запросу"] --> DOC["DocsDeltaWorkflow"]
+    DOC --> DD["process_docs_delta_activity<br/>deprecated/formatting_only → no-op<br/>иначе author_question → mctl-academy"]

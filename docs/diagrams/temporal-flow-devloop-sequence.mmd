@@ -1,0 +1,36 @@
+sequenceDiagram
+    autonumber
+    participant OP as Оператор / поллер
+    participant T as Temporal DevLoopWorkflow
+    participant R as resolve_agent_release
+    participant S as submit_and_wait
+    participant A as mctl-api → Argo CWFT
+    participant E as record_execution
+
+    OP->>T: start(IssueRef) id=dev-loop-{owner}-{repo}-{N}
+    T->>R: resolve("issue-investigator", production)
+    R-->>T: ResolvedRelease | None (None → дефолтный образ CWFT)
+    T->>S: submit_and_wait("mctl-agents-investigate", {issue_url, agent_image?, agent_version?})
+    S->>A: POST /operations/.../execute
+    A-->>S: workflowName
+    Note over S,A: heartbeat(workflowName) ДО первого poll:<br/>ретрай возобновит polling,<br/>а не пересабмитит
+    loop каждые 15s (до 2ч, heartbeat 2м)
+        S->>A: GET /workflows/{name}
+        A-->>S: phase
+    end
+    S-->>T: WorkflowResult(phase)
+    T->>E: record_execution(agent, version, image_ref, target_repo, argo_workflow, phase)
+    Note over T,E: best-effort — ActivityError гасится, воркфлоу не падает
+
+    alt investigate не Succeeded
+        T-->>OP: DevLoopResult(implement=None)
+    else Succeeded
+        Note over T,R: await workflow.wait_condition(approved) —<br/>durable-ожидание, может длиться днями
+        OP->>T: signal approve()
+        T->>R: resolve("implementer", production)
+        T->>S: submit_and_wait("mctl-agents-implement", {service: target_repo, ...})
+        S->>A: POST /operations/.../execute → poll
+        S-->>T: WorkflowResult
+        T->>E: record_execution("implementer", ...)
+        T-->>OP: DevLoopResult(investigate, implement)
+    end

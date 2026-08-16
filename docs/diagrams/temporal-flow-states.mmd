@@ -1,0 +1,17 @@
+stateDiagram-v2
+    [*] --> ResolveInvestigator
+    ResolveInvestigator --> Investigate: агент запинен один раз
+    Investigate --> Failed: phase != Succeeded
+    Investigate --> AwaitApproval: Succeeded
+    AwaitApproval --> ResolveImplementer: approve()
+    ResolveImplementer --> Implement: service = repo этого issue
+    Implement --> Done
+    Failed --> [*]
+    Done --> [*]
+
+    note right of AwaitApproval
+      wait_condition — ждём сигнала сколько угодно.
+      approve() НЕ флипает .status.yaml:
+      proposed → accepted руками в gitops,
+      иначе implement-CWFT no-op (skipped_reason)
+    end note
