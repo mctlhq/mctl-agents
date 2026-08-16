@@ -1,8 +1,20 @@
-"""Incident responder — diagnoses TypeGeneric `analyzing` incidents, writes accepted proposals.
+"""Incident responder — diagnoses unresolved incidents, writes accepted proposals.
 
-For each TypeGeneric incident stuck in `analyzing` for longer than MIN_AGE_MINUTES,
-the responder runs a Claude sub-agent that:
-  1. Lists analyzing incidents via mctl MCP tools.
+Reads two statuses, and the distinction matters:
+
+  `escalated` — mctl-agent finished with the incident and will not auto-fix it.
+    It diagnosed the problem (or established it cannot), recorded why in
+    `analysis`, and handed it over. This is the normal source of work.
+
+  `analyzing`  — either the pipeline is genuinely mid-flight, or it died holding
+    the ticket. Before mctl-agent#79 every "diagnosed, not auto-fixable" path
+    also ended here, which is why this used to be the only status polled;
+    incidents published straight to mctl-api (the shepherd does this) still
+    arrive in it. MIN_AGE_MINUTES is what separates in-flight from abandoned.
+
+For each qualifying incident older than MIN_AGE_MINUTES, the responder runs a
+Claude sub-agent that:
+  1. Lists escalated and analyzing incidents via mctl MCP tools.
   2. Skips incidents younger than MIN_AGE_MINUTES (they may still self-resolve).
   3. For each qualifying incident, fetches logs and writes a diagnosis proposal to
      agents-state/{target_service}/proposals/incident-{sha1(id)[:8]}/ with status: accepted.
@@ -45,19 +57,27 @@ def _build_prompt(state_dir: Path, min_age_minutes: int) -> str:
 **Output language: English only.**
 **No human present. Do not ask for input. Work with what you have.**
 
-You are the mctl incident responder. Diagnose TypeGeneric incidents stuck in
-`analyzing` status and convert them into accepted implementer proposals.
+You are the mctl incident responder. Take incidents mctl-agent could not fix
+itself and convert them into accepted implementer proposals.
 
 ## Steps
 
 **Step 1 — discover**
-Call `mctl_list_incidents` with `status=analyzing`.
-If the tool is unavailable or returns zero results, print "no analyzing incidents" and stop.
+Call `mctl_list_incidents` TWICE and merge the results by incident id:
+- `status=escalated` — mctl-agent finished with these and will not auto-fix them.
+  Its reason is in the `analysis` field; read it, it usually names the skill that
+  ran or says none matched. This is the main source of work.
+- `status=analyzing` — either still in flight, or abandoned when the pipeline
+  restarted. The age filter below is what tells those apart.
+
+If the tool is unavailable or both return zero results, print
+"no escalated or analyzing incidents" and stop.
 
 **Step 2 — filter**
 Keep only incidents that match ALL of:
-- Type or alert name contains "Generic" (case-insensitive), OR the incident has no
-  skill match (any incident still analyzing after a long time qualifies).
+- Status is `escalated`, OR (status is `analyzing` and the incident has no skill
+  match — type or alert name contains "Generic" case-insensitively, or the
+  `analysis` field is empty).
 - `created_at` is older than {min_age_minutes} minutes.
   Use Bash to compute: `python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).isoformat())"`.
   Compare against each incident's `created_at` field.

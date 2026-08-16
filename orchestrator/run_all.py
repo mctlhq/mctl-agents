@@ -10,7 +10,7 @@ Modes:
     full                — all service agents in parallel, then the mentor (default)
     mentor-only         — mentor only, reads existing proposals/ from state
     single-service      — one agent (name in RUN_SERVICE), no mentor
-    incident-responder  — diagnose TypeGeneric analyzing incidents, write accepted proposals
+    incident-responder  — diagnose escalated/analyzing incidents, write accepted proposals
 """
 import os
 import sys
@@ -133,7 +133,7 @@ async def main() -> None:
     elif mode == "single-service":
         await _single_service(service)
     elif mode == "incident-responder":
-        print("=== mode=incident-responder — diagnosing TypeGeneric analyzing incidents ===")
+        print("=== mode=incident-responder — diagnosing escalated and analyzing incidents ===")
         await _safe_run_incident_responder()
     else:
         print(
