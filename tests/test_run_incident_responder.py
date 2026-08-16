@@ -27,6 +27,8 @@ from __future__ import annotations
 import types
 
 import anyio
+from pathlib import Path
+
 import pytest
 
 from orchestrator import mcp_guard, run_all
@@ -243,3 +245,31 @@ def test_safe_run_still_swallows_unrelated_exceptions(monkeypatch):
 
     monkeypatch.setattr(run_all, "run_incident_responder", _raise)
     anyio.run(run_all._safe_run_incident_responder)  # must not raise
+
+
+def test_prompt_fixes_the_slug_file_path():
+    """The scratch path must come from the orchestrator, not from the model.
+
+    The prompt embeds it inside a `python3 -c` string literal, so any part of
+    that command the model chooses is a value the incident text could have
+    talked it into — which would reintroduce, as Python injection, the shell
+    injection this indirection was added to remove.
+    """
+    prompt = rir._build_prompt(Path("/tmp/state"), 30)
+
+    assert "/tmp/state/.incident-id-" in prompt
+    assert "RAND" not in prompt
+    # No placeholder left unresolved inside the command the agent is told to run.
+    assert "{slug_file}" not in prompt
+
+
+def test_prompt_slug_file_is_unique_per_build():
+    a = rir._build_prompt(Path("/tmp/state"), 30)
+    b = rir._build_prompt(Path("/tmp/state"), 30)
+
+    def scratch(p: str) -> str:
+        marker = "/tmp/state/.incident-id-"
+        i = p.index(marker)
+        return p[i : p.index("`", i)]
+
+    assert scratch(a) != scratch(b), "two runs sharing a workdir would collide"
