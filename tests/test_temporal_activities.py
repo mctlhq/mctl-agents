@@ -447,17 +447,3 @@ class TestDetectOrphans:
         assert result_orphan.orphans[0].slug == "test-slug"
 
 
-class TestIncidentLoopWorkflow:
-    async def test_respond_incidents_activity(self, env, monkeypatch):
-        from orchestrator.temporal.activities.incidents import respond_incidents_activity
-
-        async def dummy_run():
-            return None
-
-        monkeypatch.setattr("orchestrator.temporal.activities.incidents.run_incident_responder", dummy_run)
-
-        result = await env.run(respond_incidents_activity)
-        assert result.success is True
-        assert "successfully" in result.notes
-
-

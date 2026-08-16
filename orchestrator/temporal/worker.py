@@ -21,13 +21,14 @@ from temporalio.client import (
     ScheduleAlreadyRunningError,
     ScheduleIntervalSpec,
     ScheduleSpec,
+    ScheduleUpdate,
+    ScheduleUpdateInput,
 )
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.docs_delta import process_docs_delta_activity
-from orchestrator.temporal.activities.incidents import respond_incidents_activity
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.registry import resolve_agent_release
@@ -52,6 +53,58 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
 
+async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, label: str) -> None:
+    """Create the schedule, or converge an existing one's spec to `desired`.
+
+    `create_schedule` is a no-op once the schedule exists, so for the first
+    year of this worker's life the interval declared here was decorative:
+    editing it changed nothing on a cluster that had already registered the
+    schedule (found 2026-08-16, changing the incidents cadence). Everything
+    but the spec is left alone on purpose — in particular `state`, which
+    carries the paused flag: `incidents-mctl-agents-schedule` is paused
+    pending a manual verification run (mctl-agents#179), and a deploy must
+    not quietly un-pause it.
+    """
+    try:
+        await client.create_schedule(schedule_id, desired)
+        logger.info("Created Temporal schedule %s for %s", schedule_id, label)
+        return
+    except ScheduleAlreadyRunningError:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not register Temporal schedule %s: %s", schedule_id, exc)
+        return
+
+    converged = False
+
+    async def _converge_spec(input: ScheduleUpdateInput) -> ScheduleUpdate | None:
+        nonlocal converged
+        schedule = input.description.schedule
+        if schedule.spec.intervals == desired.spec.intervals:
+            return None
+        logger.info(
+            "Updating Temporal schedule %s spec: %s -> %s",
+            schedule_id,
+            schedule.spec.intervals,
+            desired.spec.intervals,
+        )
+        schedule.spec = desired.spec
+        converged = True
+        return ScheduleUpdate(schedule=schedule)
+
+    try:
+        await client.get_schedule_handle(schedule_id).update(_converge_spec)
+        # Distinct messages, because these logs are the only way to tell from
+        # outside whether a cadence change actually landed — claiming "spec is
+        # current" on the same boot that just rewrote it reads as a no-op.
+        if converged:
+            logger.info("Temporal schedule %s spec converged to the declared one", schedule_id)
+        else:
+            logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not converge Temporal schedule %s: %s", schedule_id, exc)
+
+
 async def setup_schedules(client: Client) -> None:
     reconcile_schedule = Schedule(
         action=ScheduleActionStartWorkflow(
@@ -65,13 +118,7 @@ async def setup_schedules(client: Client) -> None:
         ),
     )
 
-    try:
-        await client.create_schedule(RECONCILE_SCHEDULE_ID, reconcile_schedule)
-        logger.info("Created Temporal schedule %s for ReconcileWorkflow", RECONCILE_SCHEDULE_ID)
-    except ScheduleAlreadyRunningError:
-        logger.info("Temporal schedule %s already exists", RECONCILE_SCHEDULE_ID)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not register Temporal schedule %s: %s", RECONCILE_SCHEDULE_ID, exc)
+    await _ensure_schedule(client, RECONCILE_SCHEDULE_ID, reconcile_schedule, "ReconcileWorkflow")
 
     issue_poll_schedule = Schedule(
         action=ScheduleActionStartWorkflow(
@@ -85,13 +132,7 @@ async def setup_schedules(client: Client) -> None:
         ),
     )
 
-    try:
-        await client.create_schedule(ISSUE_POLL_SCHEDULE_ID, issue_poll_schedule)
-        logger.info("Created Temporal schedule %s for IssuePollWorkflow", ISSUE_POLL_SCHEDULE_ID)
-    except ScheduleAlreadyRunningError:
-        logger.info("Temporal schedule %s already exists", ISSUE_POLL_SCHEDULE_ID)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not register Temporal schedule %s: %s", ISSUE_POLL_SCHEDULE_ID, exc)
+    await _ensure_schedule(client, ISSUE_POLL_SCHEDULE_ID, issue_poll_schedule, "IssuePollWorkflow")
 
     incidents_schedule = Schedule(
         action=ScheduleActionStartWorkflow(
@@ -100,17 +141,17 @@ async def setup_schedules(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleIntervalSpec(every=timedelta(minutes=30))],
+            # Hourly, not the original 30 min: each tick now submits an Argo
+            # workflow whose `workdir` is a fresh RWO Hetzner volume, so the
+            # cadence is also a volume-churn budget (mctl-gitops#856). The
+            # responder ignores incidents younger than MIN_AGE_MINUTES=30
+            # anyway, so halving the tick rate costs no real responsiveness.
+            # Matches what the (suspended) Argo cron did: `15 * * * *`.
+            intervals=[ScheduleIntervalSpec(every=timedelta(hours=1))],
         ),
     )
 
-    try:
-        await client.create_schedule(INCIDENTS_SCHEDULE_ID, incidents_schedule)
-        logger.info("Created Temporal schedule %s for IncidentLoopWorkflow", INCIDENTS_SCHEDULE_ID)
-    except ScheduleAlreadyRunningError:
-        logger.info("Temporal schedule %s already exists", INCIDENTS_SCHEDULE_ID)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not register Temporal schedule %s: %s", INCIDENTS_SCHEDULE_ID, exc)
+    await _ensure_schedule(client, INCIDENTS_SCHEDULE_ID, incidents_schedule, "IncidentLoopWorkflow")
 
 
 async def main() -> None:
@@ -133,7 +174,6 @@ async def main() -> None:
             discover_and_project,
             detect_orphans,
             poll_issues_activity,
-            respond_incidents_activity,
             process_docs_delta_activity,
         ],
     )
