@@ -75,7 +75,10 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         logger.warning("Could not register Temporal schedule %s: %s", schedule_id, exc)
         return
 
+    converged = False
+
     async def _converge_spec(input: ScheduleUpdateInput) -> ScheduleUpdate | None:
+        nonlocal converged
         schedule = input.description.schedule
         if schedule.spec.intervals == desired.spec.intervals:
             return None
@@ -86,11 +89,18 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
             desired.spec.intervals,
         )
         schedule.spec = desired.spec
+        converged = True
         return ScheduleUpdate(schedule=schedule)
 
     try:
         await client.get_schedule_handle(schedule_id).update(_converge_spec)
-        logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
+        # Distinct messages, because these logs are the only way to tell from
+        # outside whether a cadence change actually landed — claiming "spec is
+        # current" on the same boot that just rewrote it reads as a no-op.
+        if converged:
+            logger.info("Temporal schedule %s spec converged to the declared one", schedule_id)
+        else:
+            logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not converge Temporal schedule %s: %s", schedule_id, exc)
 
