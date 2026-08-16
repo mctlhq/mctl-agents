@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.29.0](https://github.com/mctlhq/mctl-agents/compare/1.28.2...1.29.0) (2026-08-16)
+
+
+### Features
+
+* **incident-responder:** state that incident data is untrusted input ([1cf68c2](https://github.com/mctlhq/mctl-agents/commit/1cf68c2cd97cf66c071117627d03272238acdd8f))
+* **incident-responder:** take the shell away ([118a4ce](https://github.com/mctlhq/mctl-agents/commit/118a4ce77bddbea1066f17e4b9f854be0a93ee4c))
+
+
+### Bug Fixes
+
+* **incident-responder:** fence summary and labels, block-scalar the status note ([fb1c099](https://github.com/mctlhq/mctl-agents/commit/fb1c0991cf715d10962712221c6836406be9a577))
+* **incident-responder:** fix the slug scratch path in code, not in the prompt ([50e6d5c](https://github.com/mctlhq/mctl-agents/commit/50e6d5cddcf365a710152d8aa2dcd2991a3a43d4))
+* **incident-responder:** make the slug hash newline-insensitive ([49f9660](https://github.com/mctlhq/mctl-agents/commit/49f9660fd1231d876210dffd41b0fe93d42717ff))
+* **incident-responder:** read escalated incidents, not only analyzing ([c0c07c6](https://github.com/mctlhq/mctl-agents/commit/c0c07c65622b6d568238b47f720e0bf80ea22f27))
+* **incident-responder:** read escalated incidents, not only analyzing ([20a70a7](https://github.com/mctlhq/mctl-agents/commit/20a70a7e7003c049c80a2d1f035bec48c9dbfb91))
+* **incident-responder:** scope the hash file to the state dir, strip backticks from logs ([b8cd3f4](https://github.com/mctlhq/mctl-agents/commit/b8cd3f4ec39ea103aef7a2862bb082cd763aed4a))
+* **incident-responder:** stop instructing the agent to shell-quote incident IDs ([ddb6c16](https://github.com/mctlhq/mctl-agents/commit/ddb6c16c046b687fcd019e756a6a24822527c1d0))
+* **incident-responder:** strip runs of three OR MORE backticks ([8ad8b72](https://github.com/mctlhq/mctl-agents/commit/8ad8b7294ef40aa87cc77791acf5f6ef452da1e5))
+* **incident-responder:** unique filename for the slug-hash scratch file ([c27e83c](https://github.com/mctlhq/mctl-agents/commit/c27e83c3c9c9e760b00d415093deb2a8e7634d72))
+* **run_all:** let a missing agent dir fail the incident-responder run ([b88ee5b](https://github.com/mctlhq/mctl-agents/commit/b88ee5b531396269476d1d40af7e9016a20b875d))
+
 ## [1.28.2](https://github.com/mctlhq/mctl-agents/compare/1.28.1...1.28.2) (2026-08-16)
 
 
