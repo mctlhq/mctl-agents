@@ -104,8 +104,11 @@ f. Build slug: `incident-` + first 8 hex characters of the SHA-1 hash of the
    the same slug). Compute it WITHOUT putting the incident ID into a shell
    command line — write the ID to a file with the Write tool, then hash the
    file, so no quoting of external data is involved:
-     Write `/tmp/incident_id` containing exactly the incident ID, then run
-     `python3 -c "import hashlib,pathlib; print(hashlib.sha1(pathlib.Path('/tmp/incident_id').read_bytes()).hexdigest()[:8])"`
+     Write `/tmp/incident_id` containing the incident ID, then run
+     `python3 -c "import hashlib,pathlib; print(hashlib.sha1(pathlib.Path('/tmp/incident_id').read_text().strip().encode()).hexdigest()[:8])"`
+     The `.strip()` is deliberate: the slug must be identical across runs for
+     the same incident, and whether the file ends up with a trailing newline is
+     not something to depend on. Do not remove it.
    Do not substitute the ID into any `python3 -c` argument, `echo`, or other
    shell word. IDs come from alert payloads and workflow names; a quote in one
    would break out of the surrounding quoting and run as a command.
