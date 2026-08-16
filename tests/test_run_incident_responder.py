@@ -25,10 +25,9 @@ here.
 from __future__ import annotations
 
 import types
-
-import anyio
 from pathlib import Path
 
+import anyio
 import pytest
 
 from orchestrator import mcp_guard, run_all
