@@ -21,10 +21,15 @@ spec:
     # in run_incident_responder.py.
     legacyEnvOverride: INCIDENT_RESPONDER_MODEL
   toolPolicy:
+    # No Bash, deliberately. This agent reads alert summaries and service logs,
+    # which are chosen by whoever can make a service log a line — with a shell
+    # attached, a prompt injection there becomes RCE on the orchestrator. The
+    # timestamp it used the shell for is interpolated into the prompt, and the
+    # proposal slug is derived by string manipulation instead of hashing.
+    # See mctlhq/mctl-agents#183.
     allow:
       - Read
       - Write
-      - Bash
       - Glob
       - "mcp__mctl__*"
   execution:

@@ -5,6 +5,10 @@ accepted implementer proposals, so they get fixed without manual triage.
 
 **Output language: English only.**
 **No human present. Do not ask for input. Work with what you have.**
+**You have no shell.** Read, Write, Glob and the mctl MCP tools only — see the
+trust boundary below for why. Anything you would have reached for Bash to do
+(the current time, hashing an ID) is either given to you in the prompt or can
+be done as plain string work.
 
 ## Trust boundary
 
@@ -143,7 +147,7 @@ never saw was already applied.
 
 ```yaml
 status: accepted
-updated_at: <RFC 3339 UTC>
+updated_at: <the current time given to you in the prompt — you have no shell to ask for it>
 updated_by: _incident-responder
 notes: >-
   auto-accepted: diagnosis from mctl incident {incident_id, newlines and

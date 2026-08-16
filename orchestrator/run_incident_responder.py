@@ -30,7 +30,7 @@ Usage:
 from __future__ import annotations
 
 import os
-import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -54,12 +54,11 @@ RESPONDER_MODEL = os.getenv("INCIDENT_RESPONDER_MODEL", SERVICE_AGENT_MODEL)
 
 
 def _build_prompt(state_dir: Path, min_age_minutes: int) -> str:
-    # Generated here, not chosen by the model. The prompt embeds this path in a
-    # `python3 -c` string literal, so anything the model picks is a value it was
-    # talked into by the incident text — which is the injection this whole
-    # detour exists to avoid. Unique per run so two responders sharing a workdir
-    # cannot read each other's file.
-    slug_file = state_dir / f".incident-id-{uuid.uuid4().hex[:12]}"
+    # Supplied rather than shelled out for: the responder has no Bash tool, on
+    # purpose (see build_incident_responder_options). A run takes minutes, so a
+    # timestamp fixed at prompt-build time is accurate enough for updated_at and
+    # removes the only other reason the agent needed a shell.
+    now_iso = datetime.now(UTC).isoformat(timespec="seconds")
 
     return f"""\
 **Output language: English only.**
@@ -102,9 +101,9 @@ Keep only incidents that match ALL of:
 - Status is `escalated`, OR (status is `analyzing` and the incident has no skill
   match — type or alert name contains "Generic" case-insensitively, or the
   `analysis` field is empty).
-- `created_at` is older than {min_age_minutes} minutes.
-  Use Bash to compute: `python3 -c "from datetime import datetime,timezone; print(datetime.now(timezone.utc).isoformat())"`.
-  Compare against each incident's `created_at` field.
+- `created_at` is older than {min_age_minutes} minutes. The current time is
+  {now_iso} — compare each incident's `created_at` against it. You have no
+  shell; do the arithmetic yourself.
 - Incident is not already resolved or merged.
 
 Limit: process at most 5 incidents per run.
@@ -121,26 +120,17 @@ e. Determine target_service:
    - Go code change → `mctl-agent`
    - Orchestrator change → `mctl-agents`
    - Default: `mctl-gitops`
-f. Build slug: `incident-` + first 8 hex characters of the SHA-1 hash of the
-   full incident ID (NOT a prefix slice of the ID itself — IDs from some
-   sources, e.g. `argo-<workflow-name>-<ts>-<ts>`, share a long common
-   prefix across unrelated incidents, so slicing the ID collapses them onto
-   the same slug). Compute it WITHOUT putting the incident ID into a shell
-   command line — write the ID to a file with the Write tool, then hash the
-   file, so no quoting of external data is involved:
-     Write the incident ID to `{slug_file}` — that exact path, do not invent
-     one — then run this command exactly as written, changing nothing in it:
-     `python3 -c "import hashlib,pathlib; print(hashlib.sha1(pathlib.Path('{slug_file}').read_text().strip().encode()).hexdigest()[:8])"`
-     Process incidents one at a time, since the file is reused between them.
-     The path is fixed by the orchestrator on purpose: any part of that command
-     you choose yourself is a value the incident text could have talked you
-     into, and it lands inside a Python string literal.
-     The `.strip()` is deliberate: the slug must be identical across runs for
-     the same incident, and whether the file ends up with a trailing newline is
-     not something to depend on. Do not remove it.
-   Do not substitute the ID into any `python3 -c` argument, `echo`, or other
-   shell word. IDs come from alert payloads and workflow names; a quote in one
-   would break out of the surrounding quoting and run as a command.
+f. Build slug: `incident-` + the LAST 8 alphanumeric characters of the incident
+   ID, lowercased. Discard everything that is not a letter or digit first, then
+   take the last 8 of what remains; if fewer than 8 remain, use them all.
+
+   The last 8, not the first: IDs like `argo-<workflow-name>-<ts>-<ts>` share a
+   long common prefix across unrelated incidents, so a prefix collapses them
+   onto one slug. They differ at the end. UUIDs differ everywhere, so either
+   end works for them.
+
+   This is plain string work — no shell, no hashing. Step g resolves the
+   occasional collision, so the slug needs to be distinctive, not unique.
 g. Guard against collisions before writing: if
    `{state_dir}/{{target_service}}/proposals/{{slug}}/` already exists, read its
    `requirements.md` and compare its `## Incident` -> `- ID:` line to the

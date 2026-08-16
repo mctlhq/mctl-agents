@@ -24,6 +24,7 @@ here.
 """
 from __future__ import annotations
 
+import re
 import types
 from pathlib import Path
 
@@ -33,6 +34,7 @@ import pytest
 from orchestrator import mcp_guard, run_all
 from orchestrator import run_incident_responder as rir
 from orchestrator.mcp_guard import McpNotConnectedError
+from orchestrator.options import build_incident_responder_options
 
 
 class _FakeClient:
@@ -246,29 +248,34 @@ def test_safe_run_still_swallows_unrelated_exceptions(monkeypatch):
     anyio.run(run_all._safe_run_incident_responder)  # must not raise
 
 
-def test_prompt_fixes_the_slug_file_path():
-    """The scratch path must come from the orchestrator, not from the model.
+def test_responder_has_no_shell():
+    """The responder reads attacker-influenced text (alert summaries, service
+    logs). With a shell attached, a successful prompt injection is remote code
+    execution on the orchestrator; without one the worst case is a bad
+    proposal. See mctlhq/mctl-agents#183."""
+    opts = build_incident_responder_options(
+        agent_dir=Path("/tmp/agent"),
+        model="claude-sonnet-4-5",
+        state_dir=Path("/tmp/state"),
+    )
 
-    The prompt embeds it inside a `python3 -c` string literal, so any part of
-    that command the model chooses is a value the incident text could have
-    talked it into — which would reintroduce, as Python injection, the shell
-    injection this indirection was added to remove.
-    """
+    assert "Bash" not in opts.allowed_tools
+    assert "Read" in opts.allowed_tools
+    assert "Write" in opts.allowed_tools
+
+
+def test_prompt_supplies_what_the_shell_used_to():
+    """Removing Bash only works if the two things it was used for arrive some
+    other way: the current time, and a slug that needs no hashing."""
     prompt = rir._build_prompt(Path("/tmp/state"), 30)
 
-    assert "/tmp/state/.incident-id-" in prompt
-    assert "RAND" not in prompt
-    # No placeholder left unresolved inside the command the agent is told to run.
-    assert "{slug_file}" not in prompt
+    # A concrete timestamp, not an instruction to go and compute one.
+    assert "python3 -c" not in prompt
+    assert "Use Bash" not in prompt
+    assert re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", prompt), prompt[:400]
+
+    # Slug from the tail of the ID, since argo-* IDs share a long common prefix.
+    assert "LAST 8 alphanumeric" in prompt
+    assert "SHA-1" not in prompt
 
 
-def test_prompt_slug_file_is_unique_per_build():
-    a = rir._build_prompt(Path("/tmp/state"), 30)
-    b = rir._build_prompt(Path("/tmp/state"), 30)
-
-    def scratch(p: str) -> str:
-        marker = "/tmp/state/.incident-id-"
-        i = p.index(marker)
-        return p[i : p.index("`", i)]
-
-    assert scratch(a) != scratch(b), "two runs sharing a workdir would collide"
