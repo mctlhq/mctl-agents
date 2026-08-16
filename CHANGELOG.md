@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.28.2](https://github.com/mctlhq/mctl-agents/compare/1.28.1...1.28.2) (2026-08-16)
+
+
+### Bug Fixes
+
+* **temporal:** don't log "spec is current" right after rewriting it ([9259605](https://github.com/mctlhq/mctl-agents/commit/92596050ce71a957242566019a00417174a248c8))
+* **temporal:** run the incident responder in Argo, not inside the worker ([4407414](https://github.com/mctlhq/mctl-agents/commit/4407414faecb5392b9935eea07f4f1379db1d3af))
+* **temporal:** run the incident responder in Argo, not inside the worker ([36cb72d](https://github.com/mctlhq/mctl-agents/commit/36cb72d10f955862f506ecd1dd4b21536ea59610))
+
 ## [1.28.1](https://github.com/mctlhq/mctl-agents/compare/1.28.0...1.28.1) (2026-08-15)
 
 
