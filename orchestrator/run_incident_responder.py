@@ -120,11 +120,14 @@ f. Build slug: `incident-` + first 8 hex characters of the SHA-1 hash of the
    the same slug). Compute it WITHOUT putting the incident ID into a shell
    command line — write the ID to a file with the Write tool, then hash the
    file, so no quoting of external data is involved:
-     Write `{state_dir}/.incident-id` containing the incident ID, then run
-     `python3 -c "import hashlib,pathlib; print(hashlib.sha1(pathlib.Path('{state_dir}/.incident-id').read_text().strip().encode()).hexdigest()[:8])"`
-     Inside the state dir, not /tmp: that path is per-run and already yours to
-     write, so there is no shared, world-writable filename for a concurrent run
-     to clobber or for anything else to have pre-created as a symlink.
+     Pick a random suffix once per incident (any 8+ random hex characters) and
+     call it RAND. Write `{state_dir}/.incident-id-RAND` containing the incident
+     ID, then run
+     `python3 -c "import hashlib,pathlib; print(hashlib.sha1(pathlib.Path('{state_dir}/.incident-id-RAND').read_text().strip().encode()).hexdigest()[:8])"`
+     Delete the file afterwards.
+     Inside the state dir rather than /tmp, because that path is already yours
+     to write; the random suffix so two incidents — or two runs sharing a
+     workdir — cannot read each other's file and hash the wrong ID.
      The `.strip()` is deliberate: the slug must be identical across runs for
      the same incident, and whether the file ends up with a trailing newline is
      not something to depend on. Do not remove it.
