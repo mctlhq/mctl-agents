@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.29.1](https://github.com/mctlhq/mctl-agents/compare/1.29.0...1.29.1) (2026-08-18)
+
+
+### Bug Fixes
+
+* **ci:** correct actions/checkout pin comments after the v7 bump ([47ca152](https://github.com/mctlhq/mctl-agents/commit/47ca15259822b24a422166207b17eee32e3e7992))
+* **ci:** correct actions/checkout pin comments after the v7 bump ([a62654c](https://github.com/mctlhq/mctl-agents/commit/a62654c4d5d7deafefc8af4bf30a9c54befadb55))
+
 ## [1.29.0](https://github.com/mctlhq/mctl-agents/compare/1.28.2...1.29.0) (2026-08-16)
 
 
