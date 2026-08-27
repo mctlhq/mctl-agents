@@ -99,6 +99,9 @@ ISSUE_INVESTIGATOR_BUDGET_USD = float(os.getenv("ISSUE_INVESTIGATOR_BUDGET_USD",
 # $5 to match the service-agent and shepherd caps.
 INCIDENT_RESPONDER_BUDGET_USD = float(os.getenv("INCIDENT_RESPONDER_BUDGET_USD", "5.00"))
 QUESTION_AUTHOR_BUDGET_USD = float(os.getenv("QUESTION_AUTHOR_BUDGET_USD", "2.00"))
+# Weekly platform-health report — MCP reads plus one markdown write. Cheap
+# model, same $2 default as the mentor digest.
+PLATFORM_REPORTER_BUDGET_USD = float(os.getenv("PLATFORM_REPORTER_BUDGET_USD", "2.00"))
 
 
 # Some service agents need read access to sibling mctl-* repos (e.g. mctl-docs
@@ -222,6 +225,28 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Pa
         add_dirs=[],
         env=env,
         hooks=_command_audit_hooks(),
+    )
+
+
+def build_platform_reporter_options(agent_dir: Path, model: str) -> ClaudeAgentOptions:
+    """Options for the weekly platform-health reporter.
+
+    cwd is agents/_platform-reporter/ so setting_sources=["project"] picks
+    up its CLAUDE.md. Writes only into health/ under that cwd (entrypoint.sh
+    symlinks that directory onto STATE_DIR in cluster).
+
+    Deliberately no Bash: the report is assembled from mctl MCP reads, and
+    incident summaries / log lines are untrusted input. The current UTC
+    timestamp is interpolated into the prompt.
+    """
+    return ClaudeAgentOptions(
+        cwd=str(agent_dir),
+        setting_sources=["project"],
+        model=model,
+        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", *_mctl_tool_globs()],
+        mcp_servers=mctl_mcp_config(always_load=True),
+        permission_mode="acceptEdits",
+        max_budget_usd=PLATFORM_REPORTER_BUDGET_USD,
     )
 
 

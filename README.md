@@ -6,7 +6,9 @@ agent, which:
 - drops findings into `inbox/`
 - writes up top proposals in `proposals/<slug>/{requirements,design,tasks}.md`
 
-A mentor agent aggregates proposals and produces a weekly digest.
+A mentor agent aggregates proposals and produces a weekly digest. A
+platform-reporter agent reads live mctl MCP state (tenants, services,
+incidents, resource usage) and writes a weekly operational health report.
 
 ## Structure
 
@@ -22,14 +24,18 @@ agents/
 │   └── proposals/             # finalized spec-driven proposals
 ├── _mentor/                   # platform mentor
 │   ├── CLAUDE.md
-│   └── digest/                # weekly digests
+│   └── digest/                # weekly proposal digests
+├── _platform-reporter/        # weekly operational health
+│   ├── CLAUDE.md
+│   └── health/                # YYYY-WNN.md reports
 config/
 └── settings.py                # SERVICES, mctl MCP URL
 orchestrator/
 ├── auth.py                    # OAuth OR API key
 ├── run_service_agent.py       # run a service agent
 ├── run_mentor.py              # run the mentor
-└── run_all.py                 # run everything in parallel + mentor
+├── run_platform_reporter.py   # weekly operational health from mctl MCP
+└── run_all.py                 # run everything in parallel + mentor + reporter
 ```
 
 ## Auth: two modes
@@ -60,8 +66,11 @@ cp .env.example .env
 # one agent
 uv run python -m orchestrator.run_service_agent mctl-web
 
-# mentor
+# mentor (proposal digest)
 uv run python -m orchestrator.run_mentor
+
+# weekly operational health from mctl MCP
+uv run python -m orchestrator.run_platform_reporter
 
 # everything, all at once
 uv run python -m orchestrator.run_all

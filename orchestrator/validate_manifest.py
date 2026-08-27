@@ -79,6 +79,7 @@ _ENV_VARS_AFFECTING_OPTIONS_DEFAULTS = (
     "ISSUE_INVESTIGATOR_BUDGET_USD",
     "INCIDENT_RESPONDER_BUDGET_USD",
     "QUESTION_AUTHOR_BUDGET_USD",
+    "PLATFORM_REPORTER_BUDGET_USD",
 )
 
 # Agents whose execution.timeoutSeconds claims to mirror a real options.py
@@ -110,8 +111,9 @@ def _builder_call_args(builder_name: str) -> tuple[tuple[object, ...], dict[str,
     """Positional/keyword args for each build_*_options() signature."""
     if builder_name == "build_issue_investigator_options":
         return (_DUMMY_PATH, "dummy-model", _DUMMY_PATH / "proposal"), {}
-    # service_agent / implementer / mentor / incident_responder / shepherd
-    # all take (dir, model) with everything else optional.
+    # service_agent / implementer / mentor / incident_responder / shepherd /
+    # platform_reporter / question_author all take (dir, model) with
+    # everything else optional.
     return (_DUMMY_PATH, "dummy-model"), {}
 
 

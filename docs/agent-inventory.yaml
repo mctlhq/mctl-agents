@@ -251,6 +251,29 @@ agents:
     triggeredBy:
       - cwft-mctl-agents-daily (after the service-agent rotation)
 
+  - name: platform-reporter
+    driver: orchestrator/run_platform_reporter.py
+    entrypoint: orchestrator.run_platform_reporter:run_platform_reporter
+    optionsBuilder: orchestrator.options:build_platform_reporter_options
+    promptSources:
+      - inline: orchestrator/run_platform_reporter.py:build_prompt
+      - file: agents/_platform-reporter/CLAUDE.md
+    modelPolicyTask: platform_report
+    budgetEnv: PLATFORM_REPORTER_BUDGET_USD    # default 2.00
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run
+    writes: agents/_platform-reporter/health/<week>.md
+    riskLevel: low
+    triggeredBy:
+      - cwft-mctl-agents-daily (after mentor, mode=full)
+      - mctl_trigger_platform_report (MCP, admin-only)
+    notes: >-
+      Live operational health from mctl MCP (tenants, services, incidents,
+      resource usage, recent operations). MCP is required — a missed
+      connection is a hard failure, not a degraded digest. Distinct from
+      the mentor, which triages proposals and treats MCP as optional.
+
   - name: question-author
     driver: orchestrator/run_question_author.py
     entrypoint: orchestrator.run_question_author:author_question

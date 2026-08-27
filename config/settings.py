@@ -76,6 +76,7 @@ ROTATING_SERVICES = [s for s in SERVICES if s not in NON_ROTATING_SERVICES]
 
 MENTOR_DIR = AGENTS_DIR / "_mentor"
 SHEPHERD_DIR = AGENTS_DIR / "_shepherd"
+PLATFORM_REPORTER_DIR = AGENTS_DIR / "_platform-reporter"
 
 # mctl MCP — shared by every agent
 MCTL_MCP_URL = "https://api.mctl.ai/mcp"
@@ -94,7 +95,12 @@ SHEPHERD_SELECTION = resolve_model(
     "review_findings_normalize",
     legacy_model_env="SHEPHERD_MODEL",
 )
+PLATFORM_REPORTER_SELECTION = resolve_model(
+    "platform_report",
+    legacy_model_env="PLATFORM_REPORTER_MODEL",
+)
 
 SERVICE_AGENT_MODEL = SERVICE_AGENT_SELECTION.model
 MENTOR_MODEL = MENTOR_SELECTION.model
 SHEPHERD_MODEL = SHEPHERD_SELECTION.model
+PLATFORM_REPORTER_MODEL = PLATFORM_REPORTER_SELECTION.model

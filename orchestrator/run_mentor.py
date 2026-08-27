@@ -30,7 +30,7 @@ def _subtract_iso_weeks(year: int, week: int, weeks: int) -> tuple[int, int]:
     return iso_year, iso_week
 
 
-def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
+def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8, *, log_prefix: str = "mentor") -> None:
     """Move digest files older than the last `keep_weeks` ISO-weeks to archive/.
 
     Called before the SDK writes the new digest. Files matching `YYYY-WNN.md`
@@ -56,7 +56,7 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
         try:
             date.fromisocalendar(iso_year, iso_week, 1)
         except ValueError:
-            print(f"[mentor] skipping invalid digest filename: {entry.name}")
+            print(f"[{log_prefix}] skipping invalid digest filename: {entry.name}")
             continue
         candidates.append(((iso_year, iso_week), entry))
 
@@ -78,13 +78,13 @@ def _rotate_old_digests(digest_dir: Path, keep_weeks: int = 8) -> None:
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 path.rename(archive_dir / path.name)
             except OSError as exc:
-                print(f"[mentor] could not archive {path.name}: {exc}")
+                print(f"[{log_prefix}] could not archive {path.name}: {exc}")
                 continue
             moved += 1
 
     if moved:
         print(
-            f"[mentor] rotated {moved} digest(s) older than "
+            f"[{log_prefix}] rotated {moved} digest(s) older than "
             f"{threshold_year}-W{threshold_week:02d} → archive/"
         )
 

@@ -82,6 +82,7 @@ select = [
 # it becomes literal prompt content, so a per-line noqa isn't an option here.
 "orchestrator/run_service_agent.py" = ["E501"]
 "orchestrator/run_incident_responder.py" = ["E501"]
+"orchestrator/run_platform_reporter.py" = ["E501"]
 
 # S (bandit): measured before deciding, not assumed. A bare `--select S`
 # reported 432 findings; 424 of them (98.1%) are entirely inside tests/ and

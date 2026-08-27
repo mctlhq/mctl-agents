@@ -62,6 +62,18 @@ def test_build_implementer_agent_options_requests_always_load(tmp_path, monkeypa
     assert built.mcp_servers["mctl"]["alwaysLoad"] is True
 
 
+def test_build_platform_reporter_options_requests_always_load(tmp_path, monkeypatch):
+    """MCP is the whole job for this mode — alwaysLoad plus fatal=True in
+    run_platform_reporter.py, matching incident-responder."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    agent_dir = tmp_path / "_platform-reporter"
+    agent_dir.mkdir()
+    built = options.build_platform_reporter_options(agent_dir, model="test-model")
+    assert built.mcp_servers["mctl"]["alwaysLoad"] is True
+    assert "Bash" not in built.allowed_tools
+    assert "mcp__mctl__*" in built.allowed_tools
+
+
 def test_build_mentor_options_requests_always_load(tmp_path, monkeypatch):
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     mentor_dir = tmp_path / "agents" / "_mentor"

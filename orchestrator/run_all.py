@@ -1,16 +1,18 @@
-"""Run every service agent in parallel, then the mentor.
+"""Run every service agent in parallel, then the mentor and platform reporter.
 
 Usage:
     python -m orchestrator.run_all                # mode=full (default)
     RUN_MODE=mentor-only python -m orchestrator.run_all
     RUN_MODE=single-service RUN_SERVICE=mctl-api python -m orchestrator.run_all
     RUN_MODE=incident-responder python -m orchestrator.run_all
+    RUN_MODE=platform-report python -m orchestrator.run_all
 
 Modes:
-    full                — all service agents in parallel, then the mentor (default)
+    full                — all service agents in parallel, then mentor + platform reporter
     mentor-only         — mentor only, reads existing proposals/ from state
     single-service      — one agent (name in RUN_SERVICE), no mentor
     incident-responder  — diagnose escalated/analyzing incidents, write accepted proposals
+    platform-report     — weekly operational health from mctl MCP (no service agents)
 """
 import os
 import sys
@@ -23,6 +25,7 @@ from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import McpNotConnectedError
 from orchestrator.run_incident_responder import run_incident_responder
 from orchestrator.run_mentor import run_mentor
+from orchestrator.run_platform_reporter import run_platform_reporter
 from orchestrator.run_service_agent import run_service_agent
 
 # Distinct exit code so this specific failure mode is distinguishable in
@@ -114,6 +117,10 @@ async def _full() -> None:
         for service in ROTATING_SERVICES:
             tg.start_soon(_safe_run_service, service)
     await run_mentor()
+    # After proposal triage: live operational health from mctl MCP.
+    # Not swallowed — a missed MCP connection is the report's whole job
+    # and must fail the Saturday pipeline rather than skip silently.
+    await run_platform_reporter()
 
 
 async def _mentor_only() -> None:
@@ -146,10 +153,13 @@ async def main() -> None:
     elif mode == "incident-responder":
         print("=== mode=incident-responder — diagnosing escalated and analyzing incidents ===")
         await _safe_run_incident_responder()
+    elif mode == "platform-report":
+        print("=== mode=platform-report — weekly operational health from mctl MCP ===")
+        await run_platform_reporter()
     else:
         print(
             f"ERROR: unknown RUN_MODE '{mode}'. "
-            f"Valid: full, mentor-only, single-service, incident-responder",
+            f"Valid: full, mentor-only, single-service, incident-responder, platform-report",
             file=sys.stderr,
         )
         sys.exit(1)

@@ -12,10 +12,10 @@ outage or an invalid MCTL_TOKEN reproduces the same symptom even with
 alwaysLoad in place.
 
 Every mode that configures mctl MCP (service-agent, implementer, mentor,
-issue-investigator, incident-responder) shares this guard. Only
-incident-responder treats a failed connection as fatal (`fatal=True`) — its
-own prompt explicitly treats "no mcp__mctl__* tools" as a silent, valid
-success, so a missed connection there means zero real work happened. The
+issue-investigator, incident-responder, platform-reporter) shares this
+guard. incident-responder and platform-reporter treat a failed connection
+as fatal (`fatal=True`) — they have no useful work without mcp__mctl__*
+tools, so a missed connection there means zero real work happened. The
 other modes still do useful work without mctl tools (WebSearch/WebFetch/
 Read/Write/Bash), so they log a warning and continue — matching the
 data-driven finding from the 2026-08-02 incident that a real MCTL_TOKEN
@@ -103,8 +103,9 @@ async def wait_for_mctl_connected(client: ClaudeSDKClient) -> None:
 async def ensure_mctl_connected(client: ClaudeSDKClient, *, fatal: bool) -> None:
     """Verify mctl MCP connectivity before dispatching the prompt.
 
-    fatal=True re-raises McpNotConnectedError (incident-responder: no mctl
-    tools means zero real work, must not be a silent success).
+    fatal=True re-raises McpNotConnectedError (incident-responder and
+    platform-reporter: no mctl tools means zero real work, must not be a
+    silent success).
     fatal=False logs a warning and returns normally (every other mode: mctl
     tools are a bonus, not the whole job — but the outage must be visible in
     logs instead of invisible, per the 2026-08-02 finding that this exact

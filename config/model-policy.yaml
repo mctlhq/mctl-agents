@@ -19,3 +19,4 @@ tasks:
   service_agent: balanced
   mentor_digest: cheap
   review_findings_normalize: cheap
+  platform_report: cheap

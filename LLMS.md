@@ -8,6 +8,7 @@
 - **Tier 2 (Implementer)**: `orchestrator/run_implementer.py` picks up accepted proposals, runs the Claude Agent SDK inside Python sub-agents, writes code, creates branches (`feat/agents-<slug>`), and opens pull requests.
 - **Tier 3 (Shepherd)**: `orchestrator/run_shepherd.py` reviews open agent PRs, validates test suites, handles merge conflicts via rebase, and performs safe merges into target `main` branches.
 - **Mentor Agent**: `orchestrator/run_mentor.py` periodically analyzes agent performance, common errors, and updates knowledge bases.
+- **Platform Reporter**: `orchestrator/run_platform_reporter.py` reads live mctl MCP state once a week and writes an operational health report (tenants, services, incidents, MCP itself).
 
 ## Temporal Workflows & Activities
 

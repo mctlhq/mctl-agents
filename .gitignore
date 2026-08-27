@@ -10,3 +10,4 @@ __pycache__/
 agents/*/inbox/
 agents/*/proposals/
 agents/_mentor/digest/
+agents/_platform-reporter/health/

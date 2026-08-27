@@ -1,0 +1,36 @@
+# AgentManifest for platform-reporter. See issue-investigator/agent.yaml for
+# the contract this file follows and orchestrator/validate_manifest.py for
+# how it's checked.
+apiVersion: agents.mctl.ai/v1alpha1
+kind: Agent
+metadata:
+  name: platform-reporter
+  owner: mctl-agents
+spec:
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_platform_reporter:run_platform_reporter
+    optionsBuilder: orchestrator.options:build_platform_reporter_options
+  prompt:
+    sources:
+      - inline: orchestrator/run_platform_reporter.py:build_prompt
+      - file: agents/_platform-reporter/CLAUDE.md
+  modelPolicy:
+    task: platform_report
+  toolPolicy:
+    # No Bash: the report is assembled from mctl MCP reads plus a markdown
+    # write. The current UTC timestamp is interpolated into the prompt.
+    # Incident summaries and log lines are untrusted input; a shell would
+    # turn a successful injection into RCE on the orchestrator.
+    allow:
+      - Read
+      - Write
+      - Edit
+      - Glob
+      - Grep
+      - "mcp__mctl__*"
+  execution:
+    budgetUsd: 2.00          # PLATFORM_REPORTER_BUDGET_USD default
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-run
