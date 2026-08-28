@@ -260,8 +260,11 @@ def build_platform_reporter_options(agent_dir: Path, model: str) -> ClaudeAgentO
     """Options for the weekly platform-health reporter.
 
     cwd is agents/_platform-reporter/ so setting_sources=["project"] picks
-    up its CLAUDE.md. Writes only into health/ under that cwd (entrypoint.sh
-    symlinks that directory onto STATE_DIR in cluster).
+    up its CLAUDE.md. The orchestrator writes health/ itself from the
+    model's final markdown (entrypoint.sh symlinks that directory onto
+    STATE_DIR in cluster). No filesystem tools: Write/Edit would let a
+    prompt injection in incident text forge a proposal under a sibling
+    service directory that the workflow then commits.
 
     Deliberately no Bash: the report is assembled from mctl MCP reads, and
     incident summaries / log lines are untrusted input. The current UTC
@@ -275,7 +278,7 @@ def build_platform_reporter_options(agent_dir: Path, model: str) -> ClaudeAgentO
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", *_platform_reporter_mctl_tools()],
+        allowed_tools=_platform_reporter_mctl_tools(),
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=PLATFORM_REPORTER_BUDGET_USD,

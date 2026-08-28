@@ -65,8 +65,9 @@ def test_build_implementer_agent_options_requests_always_load(tmp_path, monkeypa
 def test_build_platform_reporter_options_requests_always_load(tmp_path, monkeypatch):
     """MCP is the whole job for this mode — alwaysLoad plus fatal=True in
     run_platform_reporter.py, matching incident-responder. Tools are an
-    explicit read-only allowlist: a wildcard would auto-approve deploy
-    and resolve against untrusted incident text."""
+    explicit read-only MCP allowlist: no filesystem tools (the orchestrator
+    writes health/) and no mcp__mctl__* wildcard that would auto-approve
+    deploy/resolve against untrusted incident text."""
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     agent_dir = tmp_path / "_platform-reporter"
     agent_dir.mkdir()
@@ -74,6 +75,8 @@ def test_build_platform_reporter_options_requests_always_load(tmp_path, monkeypa
     assert built.mcp_servers["mctl"]["alwaysLoad"] is True
     assert "Bash" not in built.allowed_tools
     assert "mcp__mctl__*" not in built.allowed_tools
+    for fs_tool in ("Read", "Write", "Edit", "Glob", "Grep"):
+        assert fs_tool not in built.allowed_tools
     for tool in (
         "mcp__mctl__mctl_whoami",
         "mcp__mctl__mctl_list_tenants",

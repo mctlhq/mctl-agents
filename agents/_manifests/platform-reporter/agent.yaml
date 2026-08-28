@@ -18,19 +18,16 @@ spec:
   modelPolicy:
     task: platform_report
   toolPolicy:
-    # No Bash: the report is assembled from mctl MCP reads plus a markdown
-    # write. The current UTC timestamp is interpolated into the prompt.
-    # Incident summaries and log lines are untrusted input; a shell would
-    # turn a successful injection into RCE on the orchestrator.
+    # No Bash and no filesystem tools. The report is assembled from mctl
+    # MCP reads; the orchestrator writes health/YYYY-WNN.md from the
+    # model's final markdown. Incident summaries and log lines are
+    # untrusted input; Write/Edit would let an injection forge a sibling
+    # proposal that entrypoint.sh then commits. The current UTC timestamp
+    # is interpolated into the prompt.
     # MCP tools are an explicit read-only allowlist (no mcp__mctl__*
     # wildcard) so the SDK cannot execute deploy/scale/trigger/resolve
     # even if a prompt injection asks it to.
     allow:
-      - Read
-      - Write
-      - Edit
-      - Glob
-      - Grep
       - mcp__mctl__mctl_whoami
       - mcp__mctl__mctl_list_tenants
       - mcp__mctl__mctl_list_services
