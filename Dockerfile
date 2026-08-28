@@ -1,4 +1,9 @@
-FROM python:3.14-slim
+# Pinned to 3.12: pyproject's requires-python is ">=3.12,<3.13", and under a
+# 3.14 base `uv sync --locked` silently leaves the project deps uninstalled —
+# 1.29.2 shipped without anyio and every implement run died on import (the
+# docker build smoke only builds, it never imports the orchestrator). Bump
+# this together with requires-python + uv.lock, never alone.
+FROM python:3.12-slim
 
 WORKDIR /app
 
