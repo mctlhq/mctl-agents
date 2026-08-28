@@ -12,11 +12,10 @@ import json
 
 import httpx
 import pytest
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
-from temporalio.exceptions import ApplicationError
-
 from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
