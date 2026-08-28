@@ -201,20 +201,30 @@ class DevLoopWorkflow:
         # this workflow ever reached wait_condition), so a missing slug
         # after retries means agents-state is in a state a human needs to
         # look at anyway.
-        issue_number = parse_issue_url(issue.issue_url).number
-        slug = await workflow.execute_activity(
-            find_proposal_slug,
-            args=[target_repo, issue_number],
-            start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-            retry_policy=FAST_ACTIVITY_RETRY_POLICY,
-        )
-        if not slug:
-            raise ApplicationError(
-                f"no proposal dir issue-{issue_number}-* found under "
-                f"agents-state/{target_repo}/proposals on gitops main; "
-                "refusing an unscoped implement run",
-                non_retryable=True,
+        # workflow.patched: histories recorded before this change scheduled
+        # submit_and_wait directly after the implementer resolve — replaying
+        # them through an unconditional find_proposal_slug would be a command
+        # mismatch (nondeterminism) that permanently wedges every in-flight
+        # approved loop at deploy time. Old histories take the legacy
+        # unscoped branch; new executions record the patch marker and get
+        # slug scoping. Drop to workflow.deprecate_patch once no pre-patch
+        # execution can still be running.
+        slug: str | None = None
+        if workflow.patched("slug-scoped-implement"):
+            issue_number = parse_issue_url(issue.issue_url).number
+            slug = await workflow.execute_activity(
+                find_proposal_slug,
+                args=[target_repo, issue_number],
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
             )
+            if not slug:
+                raise ApplicationError(
+                    f"no proposal dir issue-{issue_number}-* found under "
+                    f"agents-state/{target_repo}/proposals on gitops main; "
+                    "refusing an unscoped implement run",
+                    non_retryable=True,
+                )
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to
@@ -228,7 +238,9 @@ class DevLoopWorkflow:
         # if that CWFT is ever changed to drop/rename the parameter, this
         # scoping silently reverts to today's unscoped behavior with no
         # error on this side.
-        implement_params: dict[str, str] = {"service": target_repo, "slug": slug}
+        implement_params: dict[str, str] = {"service": target_repo}
+        if slug:
+            implement_params["slug"] = slug
         if implementer_release and implementer_release.image_ref:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
