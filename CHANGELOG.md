@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.29.2](https://github.com/mctlhq/mctl-agents/compare/1.29.1...1.29.2) (2026-08-28)
+
+
+### Bug Fixes
+
+* **temporal:** address round-2 review on slug lookup ([a8d8553](https://github.com/mctlhq/mctl-agents/commit/a8d8553fc9b40a0463266ea486a8d591549e3c54))
+* **temporal:** fail loudly when GITHUB_TOKEN is empty in find_proposal_slug ([a209232](https://github.com/mctlhq/mctl-agents/commit/a2092324241e97db140215a016b43f5f3c3f5a7b))
+* **temporal:** gate slug lookup with workflow.patched for in-flight histories ([ec4d102](https://github.com/mctlhq/mctl-agents/commit/ec4d102eec050923b702f95eaf2f915265c8eae0))
+* **temporal:** read token without env mutation; non-retryable deterministic listing errors ([bec3093](https://github.com/mctlhq/mctl-agents/commit/bec30935ed31c1ea04dee908d86cb5116657ec5a))
+* **temporal:** scope DevLoop implement to its own proposal slug ([57c8b30](https://github.com/mctlhq/mctl-agents/commit/57c8b3086dedb19bca8c18d351279c4a587c3afe))
+
 ## [1.29.1](https://github.com/mctlhq/mctl-agents/compare/1.29.0...1.29.1) (2026-08-18)
 
 
