@@ -64,14 +64,35 @@ def test_build_implementer_agent_options_requests_always_load(tmp_path, monkeypa
 
 def test_build_platform_reporter_options_requests_always_load(tmp_path, monkeypatch):
     """MCP is the whole job for this mode — alwaysLoad plus fatal=True in
-    run_platform_reporter.py, matching incident-responder."""
+    run_platform_reporter.py, matching incident-responder. Tools are an
+    explicit read-only allowlist: a wildcard would auto-approve deploy
+    and resolve against untrusted incident text."""
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
     agent_dir = tmp_path / "_platform-reporter"
     agent_dir.mkdir()
     built = options.build_platform_reporter_options(agent_dir, model="test-model")
     assert built.mcp_servers["mctl"]["alwaysLoad"] is True
     assert "Bash" not in built.allowed_tools
-    assert "mcp__mctl__*" in built.allowed_tools
+    assert "mcp__mctl__*" not in built.allowed_tools
+    for tool in (
+        "mcp__mctl__mctl_whoami",
+        "mcp__mctl__mctl_list_tenants",
+        "mcp__mctl__mctl_list_services",
+        "mcp__mctl__mctl_incident_summary",
+        "mcp__mctl__mctl_get_service_status",
+    ):
+        assert tool in built.allowed_tools
+    for banned in (
+        "mcp__mctl__mctl_deploy_service",
+        "mcp__mctl__mctl_scale_service",
+        "mcp__mctl__mctl_rollback_service",
+        "mcp__mctl__mctl_retire_service",
+        "mcp__mctl__mctl_resolve_incident",
+        "mcp__mctl__mctl_acknowledge_incident",
+        "mcp__mctl__mctl_trigger_agents_run",
+        "mcp__mctl__mctl_trigger_incident_responder",
+    ):
+        assert banned not in built.allowed_tools
 
 
 def test_build_mentor_options_requests_always_load(tmp_path, monkeypatch):

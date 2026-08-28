@@ -8,6 +8,7 @@ incident-responder (fatal=True). A missing MCTL_TOKEN is also fatal here
 from __future__ import annotations
 
 import types
+from functools import partial
 
 import anyio
 import pytest
@@ -97,6 +98,41 @@ def test_run_all_full_mode_runs_reporter_after_mentor(monkeypatch):
     assert order == ["mentor", "reporter"]
 
 
+def test_run_all_full_mode_swallows_reporter_failure(monkeypatch):
+    """A reporter blip must not abort _full() and skip commit-and-push of
+    the proposals and digest already written earlier in the Saturday run."""
+    order: list[str] = []
+
+    async def _mentor() -> None:
+        order.append("mentor")
+
+    async def _reporter() -> None:
+        order.append("reporter")
+        raise RuntimeError("error_max_budget_usd")
+
+    monkeypatch.setattr(run_all, "ROTATING_SERVICES", [])
+    monkeypatch.setattr(run_all, "run_mentor", _mentor)
+    monkeypatch.setattr(run_all, "run_platform_reporter", _reporter)
+    anyio.run(run_all._full)  # must not raise
+    assert order == ["mentor", "reporter"]
+
+
+def test_run_all_full_mode_swallows_reporter_mcp_failure(monkeypatch):
+    """MCP down on Saturday must not sys.exit(4): that would discard the
+    rest of the pipeline. Dedicated platform-report mode still exits 4."""
+
+    async def _mentor() -> None:
+        return None
+
+    async def _reporter() -> None:
+        raise McpNotConnectedError("mctl MCP server status=failed")
+
+    monkeypatch.setattr(run_all, "ROTATING_SERVICES", [])
+    monkeypatch.setattr(run_all, "run_mentor", _mentor)
+    monkeypatch.setattr(run_all, "run_platform_reporter", _reporter)
+    anyio.run(run_all._full)  # must not raise or sys.exit
+
+
 def test_run_all_platform_report_mode_dispatches(monkeypatch):
     called: list[bool] = []
 
@@ -107,6 +143,33 @@ def test_run_all_platform_report_mode_dispatches(monkeypatch):
     monkeypatch.setattr(run_all, "run_platform_reporter", _fake)
     anyio.run(run_all.main)
     assert called == [True]
+
+
+def test_safe_run_platform_reporter_exits_nonzero_on_mcp_when_aborting(monkeypatch):
+    async def _raise() -> None:
+        raise McpNotConnectedError("mctl MCP server status=pending")
+
+    monkeypatch.setattr(run_all, "run_platform_reporter", _raise)
+    with pytest.raises(SystemExit) as exc_info:
+        anyio.run(partial(run_all._safe_run_platform_reporter, abort_on_mcp=True))
+    assert exc_info.value.code == run_all.MCP_NOT_CONNECTED_EXIT_CODE
+
+
+def test_safe_run_platform_reporter_swallows_transient(monkeypatch):
+    async def _raise() -> None:
+        raise RuntimeError("transient blip")
+
+    monkeypatch.setattr(run_all, "run_platform_reporter", _raise)
+    anyio.run(partial(run_all._safe_run_platform_reporter, abort_on_mcp=True))
+
+
+def test_safe_run_platform_reporter_propagates_system_exit_when_aborting(monkeypatch):
+    async def _raise() -> None:
+        raise SystemExit("Platform reporter agent dir not found: /nope")
+
+    monkeypatch.setattr(run_all, "run_platform_reporter", _raise)
+    with pytest.raises(SystemExit):
+        anyio.run(partial(run_all._safe_run_platform_reporter, abort_on_mcp=True))
 
 
 def test_run_all_unknown_mode_lists_platform_report(monkeypatch, capsys):

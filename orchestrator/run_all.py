@@ -112,15 +112,58 @@ async def _safe_run_incident_responder() -> None:
         traceback.print_exc(file=sys.stderr)
 
 
+async def _safe_run_platform_reporter(*, abort_on_mcp: bool) -> None:
+    """Run the platform reporter without letting it discard other work.
+
+    Transient SDK/budget/network failures are logged and dropped, matching
+    `_safe_run_service` / `_safe_run_incident_responder`. A reporter blip
+    must not skip the Argo commit-and-push of proposals and digests the
+    rest of the Saturday pipeline already wrote.
+
+    McpNotConnectedError is the one case that means zero live state:
+    dedicated `platform-report` mode (abort_on_mcp=True) exits
+    MCP_NOT_CONNECTED_EXIT_CODE so Argo is not a false green and
+    run-fallback can retry on the account-2 token. `_full()` passes
+    abort_on_mcp=False: exiting the Saturday pipeline would throw away
+    the service-agent and mentor output, which is worse than a missed
+    health file. The handshake itself stays fatal=True inside
+    run_platform_reporter so a dead MCP session cannot hallucinate a
+    report; `_full()` just refuses to turn that into a pipeline abort.
+    """
+    try:
+        await run_platform_reporter()
+    except McpNotConnectedError as exc:
+        print(f"error: platform-reporter: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        if abort_on_mcp:
+            sys.exit(MCP_NOT_CONNECTED_EXIT_CODE)
+    except SystemExit as exc:
+        # Missing agent directory. Dedicated mode must fail the step
+        # (broken image). In `_full()` it is logged and dropped so the
+        # rest of the Saturday pipeline still commits.
+        if abort_on_mcp:
+            raise
+        print(
+            f"warn: platform-reporter failed: SystemExit: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — intentional broad catch
+        print(
+            f"warn: platform-reporter failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+
+
 async def _full() -> None:
     async with anyio.create_task_group() as tg:
         for service in ROTATING_SERVICES:
             tg.start_soon(_safe_run_service, service)
     await run_mentor()
     # After proposal triage: live operational health from mctl MCP.
-    # Not swallowed — a missed MCP connection is the report's whole job
-    # and must fail the Saturday pipeline rather than skip silently.
-    await run_platform_reporter()
+    # Failures here must not abort the pipeline — see helper docstring.
+    await _safe_run_platform_reporter(abort_on_mcp=False)
 
 
 async def _mentor_only() -> None:
@@ -155,7 +198,7 @@ async def main() -> None:
         await _safe_run_incident_responder()
     elif mode == "platform-report":
         print("=== mode=platform-report — weekly operational health from mctl MCP ===")
-        await run_platform_reporter()
+        await _safe_run_platform_reporter(abort_on_mcp=True)
     else:
         print(
             f"ERROR: unknown RUN_MODE '{mode}'. "

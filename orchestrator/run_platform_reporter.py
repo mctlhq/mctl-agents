@@ -99,6 +99,12 @@ async def run_platform_reporter() -> None:
 
     print(f"\n=== Running platform reporter ({PLATFORM_REPORTER_MODEL}) ===\n")
     async with ClaudeSDKClient(options=options) as client:
+        # Handshake is fatal: a session with zero mcp tools would invent
+        # numbers. The prompt's "MCP is down" path is for *tool-call*
+        # failures after a live handshake (mctl_whoami errors), not for
+        # skipping this gate. run_all.py decides whether that exception
+        # aborts the process (dedicated mode) or is logged (Saturday
+        # pipeline, so proposals/digests still commit).
         await ensure_mctl_connected(client, fatal=True)
         await client.query(build_prompt())
         async for message in client.receive_response():

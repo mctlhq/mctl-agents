@@ -56,6 +56,34 @@ def _mctl_tool_globs() -> list[str]:
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
+# Read-only mctl MCP tools the platform reporter may call. Named explicitly
+# (no mcp__mctl__* wildcard): this agent reads untrusted incident summaries
+# and log lines, and a wildcard would let a prompt injection reach
+# deploy/scale/trigger/resolve. SDK names are mcp__<server>__<mcp_tool_id>;
+# mctl-api registers the tools as mctl_whoami, mctl_list_tenants, ...
+_PLATFORM_REPORTER_MCTL_TOOLS = (
+    "mcp__mctl__mctl_whoami",
+    "mcp__mctl__mctl_list_tenants",
+    "mcp__mctl__mctl_list_services",
+    "mcp__mctl__mctl_get_resource_usage",
+    "mcp__mctl__mctl_get_service_status",
+    "mcp__mctl__mctl_incident_summary",
+    "mcp__mctl__mctl_list_incidents",
+    "mcp__mctl__mctl_list_recent_operations",
+    "mcp__mctl__mctl_list_recent_agent_runs",
+    "mcp__mctl__mctl_list_previews",
+    "mcp__mctl__mctl_get_incident",
+    "mcp__mctl__mctl_get_service_logs",
+    "mcp__mctl__mctl_list_workflows",
+    "mcp__mctl__mctl_get_tenant",
+)
+
+
+def _platform_reporter_mctl_tools() -> list[str]:
+    """Allow the reporter's read-only MCP tools when MCP is configured."""
+    return list(_PLATFORM_REPORTER_MCTL_TOOLS) if mctl_mcp_config() else []
+
+
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # Tier 2 implementer budget — soft cap per single proposal implementation.
@@ -238,12 +266,16 @@ def build_platform_reporter_options(agent_dir: Path, model: str) -> ClaudeAgentO
     Deliberately no Bash: the report is assembled from mctl MCP reads, and
     incident summaries / log lines are untrusted input. The current UTC
     timestamp is interpolated into the prompt.
+
+    MCP tools are an explicit read-only allowlist, not mcp__mctl__*. The
+    SDK must enforce "observe, do not change the platform" — a prompt
+    instruction is not enough once untrusted incident text is in context.
     """
     return ClaudeAgentOptions(
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", *_mctl_tool_globs()],
+        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", *_platform_reporter_mctl_tools()],
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=PLATFORM_REPORTER_BUDGET_USD,
