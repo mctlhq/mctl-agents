@@ -20,6 +20,7 @@ issue-98's directory).
 """
 from __future__ import annotations
 
+import asyncio
 import os
 
 import httpx
@@ -46,7 +47,9 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     and non-404 HTTP failures raise so Temporal's retry policy re-runs the
     lookup instead of the caller mistaking an outage for a missing proposal.
     """
-    refresh_github_token()
+    # A local mounted-Secret file read (never network), but kept off the
+    # event loop anyway — a slow kubelet volume must not stall the worker.
+    await asyncio.to_thread(refresh_github_token)
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
         # Never fall through to an unauthenticated request: mctl-gitops is
@@ -76,7 +79,7 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.get(url, params={"ref": "main"}, headers=headers)
-    except httpx.TransportError as exc:
+    except httpx.RequestError as exc:
         raise ProposalListingError(f"listing {url} failed: {exc}") from exc
 
     if response.status_code == 404:
