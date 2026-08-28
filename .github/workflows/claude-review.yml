@@ -28,7 +28,12 @@ jobs:
       # which is what claude-code-action checks — distinct from the PR
       # author. Its absence is what failed the review on release PR #141
       # with the same "non-human actor" error (mctlhq/mctl-gitops#819).
-      allowed-bots: "github-actions,mctl-app,mctl-agents,dependabot"
+      #
+      # cursor is the Cloud Agent that pushes follow-up commits. Without
+      # it, every synchronize from a Cursor agent hard-fails both tokens
+      # with "Workflow initiated by non-human actor: cursor" before any
+      # review runs (mctlhq/mctl-agents#202 on 065d4e7 and 0b4d246).
+      allowed-bots: "github-actions,mctl-app,mctl-agents,dependabot,cursor"
       conventions: |
         Follow the conventions in this repository's CLAUDE.md (Python style,
         conventional commits, English only, no emoji).
