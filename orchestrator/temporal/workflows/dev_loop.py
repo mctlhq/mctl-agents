@@ -73,6 +73,21 @@ FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
 # _record's try/except below).
 FAST_ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
+# find_proposal_slug hits GitHub, not mctl-api: its worst realistic failure
+# is a rate limit whose reset window is up to an hour. FAST (5 attempts,
+# default backoff) burns through in under a minute and would permanently
+# fail the workflow over a transient limit — reintroducing the manual
+# re-trigger toil this fix exists to remove. Spread bounded retries across
+# well over an hour instead; the activity is one cheap GET, so patience is
+# free. Still bounded: a genuinely broken lookup must eventually surface.
+SLUG_LOOKUP_TIMEOUT = timedelta(seconds=30)
+SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=15),
+    maximum_attempts=12,
+)
+
 
 @dataclass(frozen=True)
 class IssueRef:
@@ -215,8 +230,8 @@ class DevLoopWorkflow:
             slug = await workflow.execute_activity(
                 find_proposal_slug,
                 args=[target_repo, issue_number],
-                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+                start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+                retry_policy=SLUG_LOOKUP_RETRY_POLICY,
             )
             if not slug:
                 raise ApplicationError(

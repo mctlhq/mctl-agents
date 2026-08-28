@@ -548,3 +548,27 @@ class TestFindProposalSlug:
         with pytest.raises(ProposalListingError, match="GITHUB_TOKEN is empty"):
             await env.run(find_proposal_slug, "mctl-portal", "80")
         assert requests_made == []
+
+    async def test_leading_zero_issue_number_is_normalized(self, env, monkeypatch):
+        """A manually started workflow can carry /issues/007 — the dir on
+        disk is issue-7-*, so the prefix must use the canonical number."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=self._entries("issue-7-some-title"))
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(find_proposal_slug, "mctl-docs", "007") == "issue-7-some-title"
+
+    async def test_listing_at_contents_api_cap_raises(self, env, monkeypatch):
+        """A 1000-entry listing may be silently truncated by the contents
+        API — a missing match proves nothing, so the activity must refuse."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            names = [f"issue-{i}-old" for i in range(1000)]
+            return httpx.Response(200, json=self._entries(*names))
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError, match="listing cap"):
+            await env.run(find_proposal_slug, "mctl-portal", "80")

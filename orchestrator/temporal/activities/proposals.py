@@ -30,6 +30,7 @@ from orchestrator.github_token import refresh_github_token
 GITOPS_REPO = "mctlhq/mctl-gitops"
 AGENTS_STATE_PREFIX = "platform-gitops/agents-state"
 REQUEST_TIMEOUT_SECONDS = 20.0
+CONTENTS_API_LISTING_CAP = 1000
 
 
 class ProposalListingError(Exception):
@@ -68,7 +69,10 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
         f"https://api.github.com/repos/{GITOPS_REPO}/contents/"
         f"{AGENTS_STATE_PREFIX}/{service}/proposals"
     )
-    prefix = f"issue-{issue_number}-"
+    # int() round-trip: a manually started workflow can carry an otherwise
+    # valid URL like /issues/007, but run_issue_investigator built the dir
+    # from the canonical number — issue-7-, never issue-007-.
+    prefix = f"issue-{int(issue_number)}-"
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.get(url, params={"ref": "main"}, headers=headers)
@@ -87,6 +91,15 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     entries = response.json()
     if not isinstance(entries, list):
         raise ProposalListingError(f"unexpected non-directory response from {url}")
+    if len(entries) >= CONTENTS_API_LISTING_CAP:
+        # The contents API silently truncates directory listings at 1000
+        # entries with no pagination — a missing match in a truncated
+        # listing proves nothing. Refuse rather than misreport "no
+        # proposal" (and prune old proposal dirs if this ever fires).
+        raise ProposalListingError(
+            f"{url} returned {len(entries)} entries — at or above the "
+            f"contents-API listing cap; result would be unreliable"
+        )
 
     matches = sorted(
         entry["name"]
