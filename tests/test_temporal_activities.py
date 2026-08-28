@@ -15,6 +15,8 @@ import pytest
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
+from temporalio.exceptions import ApplicationError
+
 from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
@@ -515,8 +517,9 @@ class TestFindProposalSlug:
             )
 
         _mock_async_client(monkeypatch, handler)
-        with pytest.raises(ProposalListingError):
+        with pytest.raises(ApplicationError) as excinfo:
             await env.run(find_proposal_slug, "mctl-portal", "80")
+        assert excinfo.value.non_retryable
 
     async def test_files_matching_prefix_are_ignored(self, env, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
@@ -545,7 +548,7 @@ class TestFindProposalSlug:
             return httpx.Response(404)
 
         _mock_async_client(monkeypatch, handler)
-        with pytest.raises(ProposalListingError, match="GITHUB_TOKEN is empty"):
+        with pytest.raises(ProposalListingError, match="no GitHub token available"):
             await env.run(find_proposal_slug, "mctl-portal", "80")
         assert requests_made == []
 
@@ -570,5 +573,6 @@ class TestFindProposalSlug:
             return httpx.Response(200, json=self._entries(*names))
 
         _mock_async_client(monkeypatch, handler)
-        with pytest.raises(ProposalListingError, match="listing cap"):
+        with pytest.raises(ApplicationError, match="listing cap") as excinfo:
             await env.run(find_proposal_slug, "mctl-portal", "80")
+        assert excinfo.value.non_retryable

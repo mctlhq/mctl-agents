@@ -22,11 +22,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 
 import httpx
 from temporalio import activity
-
-from orchestrator.github_token import refresh_github_token
+from temporalio.exceptions import ApplicationError
 
 GITOPS_REPO = "mctlhq/mctl-gitops"
 AGENTS_STATE_PREFIX = "platform-gitops/agents-state"
@@ -36,6 +36,25 @@ CONTENTS_API_LISTING_CAP = 1000
 
 class ProposalListingError(Exception):
     """Transient failure listing the proposals directory — retryable."""
+
+
+def _resolve_token() -> str:
+    """Read the freshest GitHub token without touching process globals.
+
+    Same source order as refresh_github_token (GITHUB_TOKEN_FILE first,
+    env fallback), but read-only: concurrent activities on the shared
+    event loop each get their own local value instead of racing writes to
+    os.environ. Runs in a thread (file I/O) via asyncio.to_thread.
+    """
+    path = os.environ.get("GITHUB_TOKEN_FILE", "").strip()
+    if path:
+        try:
+            token = Path(path).read_text().strip()
+        except (OSError, ValueError):
+            token = ""
+        if token:
+            return token
+    return os.environ.get("GITHUB_TOKEN", "").strip()
 
 
 @activity.defn
@@ -49,8 +68,7 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     """
     # A local mounted-Secret file read (never network), but kept off the
     # event loop anyway — a slow kubelet volume must not stall the worker.
-    await asyncio.to_thread(refresh_github_token)
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = await asyncio.to_thread(_resolve_token)
     if not token:
         # Never fall through to an unauthenticated request: mctl-gitops is
         # private, and GitHub answers unauthorized contents lookups with 404
@@ -59,9 +77,9 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
         # Raise (retryable) so a token-file refresh between attempts can
         # heal a transient gap, mirroring mctl_client.py's loud mctl_token().
         raise ProposalListingError(
-            "GITHUB_TOKEN is empty after refresh_github_token(); refusing an "
-            "unauthenticated lookup (a private repo would 404 and masquerade "
-            "as a missing proposal)"
+            "no GitHub token available (GITHUB_TOKEN_FILE unreadable and "
+            "GITHUB_TOKEN unset); refusing an unauthenticated lookup (a "
+            "private repo would 404 and masquerade as a missing proposal)"
         )
     headers = {
         "Accept": "application/vnd.github+json",
@@ -99,9 +117,11 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
         # entries with no pagination — a missing match in a truncated
         # listing proves nothing. Refuse rather than misreport "no
         # proposal" (and prune old proposal dirs if this ever fires).
-        raise ProposalListingError(
+        raise ApplicationError(
             f"{url} returned {len(entries)} entries — at or above the "
-            f"contents-API listing cap; result would be unreliable"
+            "contents-API listing cap; result would be unreliable until old "
+            "proposal dirs are pruned",
+            non_retryable=True,
         )
 
     matches = sorted(
@@ -112,7 +132,8 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     if len(matches) > 1:
         # Two directories for one issue should be impossible (the slug is
         # deterministic); refuse to guess rather than implement the wrong one.
-        raise ProposalListingError(
-            f"multiple proposal dirs match {prefix}* under {service}: {matches}"
+        raise ApplicationError(
+            f"multiple proposal dirs match {prefix}* under {service}: {matches}",
+            non_retryable=True,
         )
     return matches[0] if matches else None
