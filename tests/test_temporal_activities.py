@@ -479,6 +479,8 @@ class TestFindProposalSlug:
 
     async def test_prefix_dash_prevents_issue_number_prefix_collision(self, env, monkeypatch):
         """issue-9 must not match issue-98's directory (and vice versa)."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=self._entries("issue-98-fail-closed"))
 
@@ -486,6 +488,8 @@ class TestFindProposalSlug:
         assert await env.run(find_proposal_slug, "mctl-agent", "9") is None
 
     async def test_missing_proposals_dir_is_none_not_error(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(404, json={"message": "Not Found"})
 
@@ -493,6 +497,8 @@ class TestFindProposalSlug:
         assert await env.run(find_proposal_slug, "mctl-docs", "5") is None
 
     async def test_server_error_raises_for_retry(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(502, text="bad gateway")
 
@@ -501,6 +507,8 @@ class TestFindProposalSlug:
             await env.run(find_proposal_slug, "mctl-portal", "80")
 
     async def test_duplicate_dirs_for_one_issue_refuse_to_guess(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200, json=self._entries("issue-80-old-title", "issue-80-new-title")
@@ -511,6 +519,8 @@ class TestFindProposalSlug:
             await env.run(find_proposal_slug, "mctl-portal", "80")
 
     async def test_files_matching_prefix_are_ignored(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
@@ -522,3 +532,19 @@ class TestFindProposalSlug:
 
         _mock_async_client(monkeypatch, handler)
         assert await env.run(find_proposal_slug, "mctl-portal", "80") == "issue-80-enforce-tenant"
+
+    async def test_empty_token_raises_instead_of_unauthenticated_404(self, env, monkeypatch):
+        """An unauthenticated lookup against the private gitops repo would
+        404 and masquerade as a missing proposal — the activity must raise
+        (retryably) instead of ever sending that request."""
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(str(request.url))
+            return httpx.Response(404)
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError, match="GITHUB_TOKEN is empty"):
+            await env.run(find_proposal_slug, "mctl-portal", "80")
+        assert requests_made == []

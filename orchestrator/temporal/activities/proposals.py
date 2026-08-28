@@ -47,9 +47,22 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     """
     refresh_github_token()
     token = os.environ.get("GITHUB_TOKEN", "").strip()
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if not token:
+        # Never fall through to an unauthenticated request: mctl-gitops is
+        # private, and GitHub answers unauthorized contents lookups with 404
+        # — indistinguishable from "no proposal", which would surface as a
+        # misleading permanent workflow failure instead of an auth problem.
+        # Raise (retryable) so a token-file refresh between attempts can
+        # heal a transient gap, mirroring mctl_client.py's loud mctl_token().
+        raise ProposalListingError(
+            "GITHUB_TOKEN is empty after refresh_github_token(); refusing an "
+            "unauthenticated lookup (a private repo would 404 and masquerade "
+            "as a missing proposal)"
+        )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+    }
 
     url = (
         f"https://api.github.com/repos/{GITOPS_REPO}/contents/"
