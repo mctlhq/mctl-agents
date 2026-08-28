@@ -218,6 +218,11 @@ jobs:
               "run_all", "run_implementer", "run_incident_responder",
               "run_issue_investigator", "run_issue_poller", "run_mentor",
               "run_question_author", "run_service_agent", "run_shepherd",
+              # Not a run_* module: the Temporal worker is its own deployed
+              # service (mctl-agents-worker) with its own dependency surface —
+              # a broken activity/workflow import there ships a CrashLoop that
+              # none of the nine CWFT entrypoints would have caught.
+              "temporal.worker",
           ]
           failed = []
           for m in mods:
