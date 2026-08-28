@@ -641,24 +641,26 @@ def _within_settle_window(
 def _extract_severity(body: str) -> str | None:
     """Find the severity marker in a review comment body.
 
-    Supports two formats:
+    Supports the observed formats:
     - Codex badge format:   ``![P2 Badge](...)`` anywhere in body (legacy)
     - Claude review format: ``**P2 —`` anywhere in body (bold prefix), or
-                            ``P2 —`` / ``P2 -`` at the start of any line
+                            ``P2 —`` / ``P2 -`` / ``P2:`` at the start of
+                            any line. The colon variant appeared 2026-08-28
+                            (mctl-portal#88: every inline finding was
+                            ``P1: ...`` and the shepherd parsed 0 findings,
+                            waiting forever on a changes-requested PR).
     """
     for sev in ("P1", "P2", "P3"):
         if f"![{sev} Badge]" in body:
             return sev
         # Claude bold prefix — appears anywhere in the body (inline comment
         # bodies start with it; top-level review bodies embed it mid-text).
-        if f"**{sev} —" in body or f"**{sev} -" in body:
+        if f"**{sev} —" in body or f"**{sev} -" in body or f"**{sev}:" in body:
             return sev
         # Bare prefix — matches at the start of the body or any line.
-        bare_em = f"{sev} —"
-        bare_hyp = f"{sev} -"
-        if (body.startswith(bare_em) or f"\n{bare_em}" in body
-                or body.startswith(bare_hyp) or f"\n{bare_hyp}" in body):
-            return sev
+        for mark in (f"{sev} —", f"{sev} -", f"{sev}:"):
+            if body.startswith(mark) or f"\n{mark}" in body:
+                return sev
     return None
 
 

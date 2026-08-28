@@ -1927,6 +1927,20 @@ def test_extract_severity_bare_prefix_mid_body() -> None:
     assert _extract_severity(body) == "P2"
 
 
+def test_extract_severity_colon_prefix() -> None:
+    """Colon variant P1:/P2: — the format claude[bot] used on
+    mctl-portal#88 (2026-08-28), which the parser previously missed
+    entirely (0 findings on a 2-P1 review; shepherd waited forever)."""
+    from orchestrator.run_shepherd import _extract_severity
+    assert _extract_severity("P1: `/repo-tags` is gated only by auth") == "P1"
+    assert _extract_severity("P2: This new `requireTeamAccess` check") == "P2"
+    assert _extract_severity("**P2: bold colon variant**") == "P2"
+    assert _extract_severity("Summary.\nP1: on a later line") == "P1"
+    # colon mid-line must NOT match (prose like "see P3: below" at line
+    # start does match by design; embedded mid-line does not)
+    assert _extract_severity("talking about P2: mid-line") is None
+
+
 def test_extract_severity_no_match() -> None:
     """Bodies with no severity marker return None."""
     from orchestrator.run_shepherd import _extract_severity
