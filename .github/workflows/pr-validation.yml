@@ -196,6 +196,54 @@ jobs:
           load: true
           tags: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
 
+      # The build alone proves nothing about whether the image RUNS. On
+      # 2026-08-28 release 1.29.2 shipped green from this very job: a
+      # dependabot bump to python:3.14-slim, against a pyproject pinned to
+      # ">=3.12,<3.13", left `uv sync --locked` succeeding while installing
+      # the project deps into a venv with no interpreter on PATH. Every agent
+      # run then died on `import anyio`, the pipeline was down 7 hours, and
+      # CI had said nothing. Importing each entrypoint the CWFTs actually
+      # invoke catches that entire class — image builds, image cannot start.
+      #
+      # Import only, no execution: none of these modules do I/O or need
+      # credentials at import time (verified against the published 1.29.3
+      # image), so this needs no secrets and stays fast.
+      - name: Image must import every entrypoint
+        env:
+          IMAGE: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
+        run: |
+          docker run --rm --entrypoint python "$IMAGE" -c '
+          import importlib, sys, traceback
+          mods = [
+              "run_all", "run_implementer", "run_incident_responder",
+              "run_issue_investigator", "run_issue_poller", "run_mentor",
+              "run_question_author", "run_service_agent", "run_shepherd",
+              # Not a run_* module: the Temporal worker is its own deployed
+              # service (mctl-agents-worker) with its own dependency surface —
+              # a broken activity/workflow import there ships a CrashLoop that
+              # none of the nine CWFT entrypoints would have caught.
+              "temporal.worker",
+          ]
+          failed = []
+          for m in mods:
+              try:
+                  importlib.import_module("orchestrator." + m)
+              # BaseException, not Exception: a module calling sys.exit() at
+              # import time raises SystemExit, which Exception does not catch
+              # — the interpreter would exit 0 and the step would pass while
+              # silently skipping every remaining entrypoint.
+              except BaseException:
+                  failed.append(f"orchestrator.{m}:\n{traceback.format_exc()}")
+          # Full traceback, not just the exception type: an import that dies
+          # deep in a dependency says nothing useful from its top frame, and
+          # rebuilding the image locally to find out is the slowest possible
+          # way to read a stack trace.
+          for f in failed:
+              print(f, file=sys.stderr)
+          print(f"imported {len(mods) - len(failed)}/{len(mods)} entrypoints")
+          sys.exit(1 if failed else 0)
+          '
+
       - name: Image must not run as root
         env:
           IMAGE: mctl-agents:pr-${{ github.event.pull_request.number || github.sha }}
