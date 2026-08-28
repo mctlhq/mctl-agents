@@ -188,6 +188,41 @@ def test_final_report_markdown_drops_narration_and_fences():
     )
 
 
+def test_final_report_markdown_keeps_inner_closing_fence():
+    """A report that ends on a fenced snippet must not lose its closer.
+
+    endswith("```") treated any trailing fence as an outer-wrapper leftover
+    and stripped it, leaving an unclosed block in health/YYYY-WNN.md.
+    """
+    report = (
+        "# Platform health — 2026-W35\n\n"
+        "## Week-over-week\n"
+        "Last week's snapshot:\n\n"
+        "```json\n"
+        '{"incidents": 3}\n'
+        "```"
+    )
+    assert rpr._final_report_markdown([report]) == report
+
+
+def test_final_report_markdown_drops_leftover_outer_closer_around_inner_fence():
+    chunks = [
+        "I'll call mctl_whoami next.\n"
+        "```markdown\n"
+        "# Platform health — 2026-W35\n\n"
+        "```json\n"
+        '{"incidents": 3}\n'
+        "```\n"
+        "```"
+    ]
+    assert rpr._final_report_markdown(chunks) == (
+        "# Platform health — 2026-W35\n\n"
+        "```json\n"
+        '{"incidents": 3}\n'
+        "```"
+    )
+
+
 def test_run_all_full_mode_runs_reporter_after_mentor(monkeypatch):
     order: list[str] = []
 

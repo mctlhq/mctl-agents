@@ -54,16 +54,36 @@ def _extract_text_from_message(message: object) -> str:
     return ""
 
 
+def _is_fence_line(line: str) -> bool:
+    return line.lstrip().startswith("```")
+
+
+def _is_closing_fence_line(line: str) -> bool:
+    stripped = line.strip()
+    return len(stripped) >= 3 and set(stripped) <= {"`"}
+
+
 def _strip_outer_md_fence(text: str) -> str:
+    """Unwrap one outer markdown fence, never a trailing closer alone.
+
+    After `_final_report_markdown` slices to `# Platform health`, an outer
+    ```markdown wrapper can leave a closer with no opener. Drop that only
+    when fence lines are unbalanced (odd count) and the last line is a
+    closer. A report that legitimately ends on a fenced snippet has an
+    even count and must keep its closing fence.
+    """
     candidate = text.strip()
-    if candidate.startswith("```"):
-        lines = candidate.splitlines()
+    if not candidate:
+        return candidate
+    lines = candidate.splitlines()
+    if _is_fence_line(lines[0]):
         lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
+        if lines and _is_closing_fence_line(lines[-1]):
             lines = lines[:-1]
         return "\n".join(lines).strip()
-    if candidate.endswith("```"):
-        return candidate[: candidate.rfind("```")].rstrip()
+    fence_count = sum(1 for line in lines if _is_fence_line(line))
+    if fence_count % 2 == 1 and _is_closing_fence_line(lines[-1]):
+        return "\n".join(lines[:-1]).rstrip()
     return candidate
 
 
