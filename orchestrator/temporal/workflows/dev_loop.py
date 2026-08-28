@@ -35,10 +35,11 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, ApplicationError
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
+    from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
     from orchestrator.temporal.issue_ref import parse_issue_url
@@ -71,6 +72,21 @@ FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
 # _record runs, so its own failure must never block workflow progress (see
 # _record's try/except below).
 FAST_ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
+# find_proposal_slug hits GitHub, not mctl-api: its worst realistic failure
+# is a rate limit whose reset window is up to an hour. FAST (5 attempts,
+# default backoff) burns through in under a minute and would permanently
+# fail the workflow over a transient limit — reintroducing the manual
+# re-trigger toil this fix exists to remove. Spread bounded retries across
+# well over an hour instead; the activity is one cheap GET, so patience is
+# free. Still bounded: a genuinely broken lookup must eventually surface.
+SLUG_LOOKUP_TIMEOUT = timedelta(seconds=30)
+SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=30),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=15),
+    maximum_attempts=12,
+)
 
 
 @dataclass(frozen=True)
@@ -184,10 +200,46 @@ class DevLoopWorkflow:
         await workflow.wait_condition(lambda: self._approved)
 
         implementer_release = await _resolve("implementer")
-        # Scoped to this issue's own repo (see the module docstring): the
-        # implement CWFT only considers proposals under agents-state/<service>/,
-        # so an approve() here can at worst implement a different
-        # already-accepted proposal in the SAME repo, never a different one.
+        # Scoped to this issue's own proposal, not just its repo. Service
+        # scoping alone left a same-repo race: two approved loops for the
+        # same repo both discovered the full accepted list from their own
+        # (stale) gitops clones, claimed overlapping proposals, and their
+        # commit-and-push steps rebase-conflicted on each other's
+        # .status.yaml (2026-08-28, mctl-portal 79/80 — mctl-agents#203).
+        # With the slug pinned, concurrent same-repo loops touch disjoint
+        # proposal dirs and the commit step's rebase-retry stays clean.
+        #
+        # Failing loudly beats falling back to an unscoped run: unscoped,
+        # this loop could implement a DIFFERENT accepted proposal in the
+        # repo — the exact wrong-proposal hazard scoping exists to prevent.
+        # The proposal must exist by now (investigate committed it before
+        # this workflow ever reached wait_condition), so a missing slug
+        # after retries means agents-state is in a state a human needs to
+        # look at anyway.
+        # workflow.patched: histories recorded before this change scheduled
+        # submit_and_wait directly after the implementer resolve — replaying
+        # them through an unconditional find_proposal_slug would be a command
+        # mismatch (nondeterminism) that permanently wedges every in-flight
+        # approved loop at deploy time. Old histories take the legacy
+        # unscoped branch; new executions record the patch marker and get
+        # slug scoping. Drop to workflow.deprecate_patch once no pre-patch
+        # execution can still be running.
+        slug: str | None = None
+        if workflow.patched("slug-scoped-implement"):
+            issue_number = parse_issue_url(issue.issue_url).number
+            slug = await workflow.execute_activity(
+                find_proposal_slug,
+                args=[target_repo, issue_number],
+                start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+                retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+            )
+            if not slug:
+                raise ApplicationError(
+                    f"no proposal dir issue-{issue_number}-* found under "
+                    f"agents-state/{target_repo}/proposals on gitops main; "
+                    "refusing an unscoped implement run",
+                    non_retryable=True,
+                )
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to
@@ -202,6 +254,8 @@ class DevLoopWorkflow:
         # scoping silently reverts to today's unscoped behavior with no
         # error on this side.
         implement_params: dict[str, str] = {"service": target_repo}
+        if slug:
+            implement_params["slug"] = slug
         if implementer_release and implementer_release.image_ref:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
