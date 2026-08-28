@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.4](https://github.com/mctlhq/mctl-agents/compare/1.29.3...1.29.4) (2026-08-28)
+
+
+### Bug Fixes
+
+* **shepherd:** recognize the P1:/P2: colon severity marker ([7239c31](https://github.com/mctlhq/mctl-agents/commit/7239c31ebb2001b7bc30458a33c542149d8e4d8d))
+
 ## [1.29.3](https://github.com/mctlhq/mctl-agents/compare/1.29.2...1.29.3) (2026-08-28)
 
 
