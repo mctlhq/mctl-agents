@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.29.3](https://github.com/mctlhq/mctl-agents/compare/1.29.2...1.29.3) (2026-08-28)
+
+
+### Bug Fixes
+
+* **docker:** revert base image to python:3.12-slim ([8425347](https://github.com/mctlhq/mctl-agents/commit/842534757cbde4da2956252e1a3a74540cb93de1))
+
 ## [1.29.2](https://github.com/mctlhq/mctl-agents/compare/1.29.1...1.29.2) (2026-08-28)
 
 
