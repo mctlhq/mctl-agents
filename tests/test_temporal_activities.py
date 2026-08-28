@@ -15,6 +15,7 @@ import pytest
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
+from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
 
@@ -447,3 +448,77 @@ class TestDetectOrphans:
         assert result_orphan.orphans[0].slug == "test-slug"
 
 
+
+
+class TestFindProposalSlug:
+    def _entries(self, *names: str) -> list[dict[str, str]]:
+        return [{"name": n, "type": "dir"} for n in names]
+
+    async def test_matches_exact_issue_prefix(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == (
+                "/repos/mctlhq/mctl-gitops/contents/"
+                "platform-gitops/agents-state/mctl-portal/proposals"
+            )
+            assert request.url.params["ref"] == "main"
+            assert request.headers["authorization"] == "Bearer gh-test-token"
+            return httpx.Response(
+                200,
+                json=self._entries(
+                    "issue-9-other-thing",
+                    "issue-79-remove-unauthenticated-access-from-githu",
+                    "issue-80-enforce-tenant-ownership-in-custom-domai",
+                ),
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        slug = await env.run(find_proposal_slug, "mctl-portal", "80")
+        assert slug == "issue-80-enforce-tenant-ownership-in-custom-domai"
+
+    async def test_prefix_dash_prevents_issue_number_prefix_collision(self, env, monkeypatch):
+        """issue-9 must not match issue-98's directory (and vice versa)."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=self._entries("issue-98-fail-closed"))
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(find_proposal_slug, "mctl-agent", "9") is None
+
+    async def test_missing_proposals_dir_is_none_not_error(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(find_proposal_slug, "mctl-docs", "5") is None
+
+    async def test_server_error_raises_for_retry(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text="bad gateway")
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError):
+            await env.run(find_proposal_slug, "mctl-portal", "80")
+
+    async def test_duplicate_dirs_for_one_issue_refuse_to_guess(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json=self._entries("issue-80-old-title", "issue-80-new-title")
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError):
+            await env.run(find_proposal_slug, "mctl-portal", "80")
+
+    async def test_files_matching_prefix_are_ignored(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=[
+                    {"name": "issue-80-stray-file.md", "type": "file"},
+                    {"name": "issue-80-enforce-tenant", "type": "dir"},
+                ],
+            )
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(find_proposal_slug, "mctl-portal", "80") == "issue-80-enforce-tenant"

@@ -13,6 +13,7 @@ import uuid
 import anyio
 import pytest
 from temporalio import activity
+from temporalio.client import WorkflowFailureError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -20,6 +21,14 @@ from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowRe
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+
+
+@activity.defn(name="find_proposal_slug")
+async def _fake_find_proposal_slug(service: str, issue_number: str) -> str | None:
+    """Deterministic fake mirroring the real activity's contract: the slug
+    for issue N always starts with issue-<N>-."""
+    return f"issue-{issue_number}-fake-title"
+
 
 pytestmark = pytest.mark.anyio
 
@@ -68,7 +77,12 @@ def _fake_activities(*, released: bool, investigate_phase: str = "Succeeded"):
     async def fake_record_execution(record: ExecutionRecord) -> None:
         return None
 
-    activities = [fake_resolve_agent_release, fake_submit_and_wait, fake_record_execution]
+    activities = [
+        fake_resolve_agent_release,
+        fake_submit_and_wait,
+        fake_record_execution,
+        _fake_find_proposal_slug,
+    ]
     return activities, calls, investigate_ran
 
 
@@ -124,7 +138,12 @@ class TestDevLoopWorkflow:
         async def fake_record_execution(record: ExecutionRecord) -> None:
             return None
 
-        activities = [fake_resolve_agent_release, capturing_submit_and_wait, fake_record_execution]
+        activities = [
+            fake_resolve_agent_release,
+            capturing_submit_and_wait,
+            fake_record_execution,
+            _fake_find_proposal_slug,
+        ]
 
         async with Worker(
             env.client,
@@ -144,6 +163,7 @@ class TestDevLoopWorkflow:
             await handle.result()
 
         assert seen_params["mctl-agents-implement"]["service"] == "mctl-telegram"
+        assert seen_params["mctl-agents-implement"]["slug"] == "issue-42-fake-title"
 
     async def test_unpinned_release_is_not_recorded_as_used(self, env):
         """resolve_agent_release can return a release with no image_ref (a
@@ -168,7 +188,12 @@ class TestDevLoopWorkflow:
         async def capturing_record_execution(record: ExecutionRecord) -> None:
             recorded.append(record)
 
-        activities = [fake_resolve_agent_release, fake_submit_and_wait, capturing_record_execution]
+        activities = [
+            fake_resolve_agent_release,
+            fake_submit_and_wait,
+            capturing_record_execution,
+            _fake_find_proposal_slug,
+        ]
 
         async with Worker(
             env.client,
@@ -237,7 +262,12 @@ class TestDevLoopWorkflow:
         async def fake_record_execution(record: ExecutionRecord) -> None:
             return None
 
-        activities = [fake_resolve_agent_release, capturing_submit_and_wait, fake_record_execution]
+        activities = [
+            fake_resolve_agent_release,
+            capturing_submit_and_wait,
+            fake_record_execution,
+            _fake_find_proposal_slug,
+        ]
 
         async with Worker(
             env.client,
@@ -277,7 +307,12 @@ class TestDevLoopWorkflow:
         async def always_failing_record_execution(record: ExecutionRecord) -> None:
             raise ValueError("mctl-api executions endpoint unreachable")
 
-        activities = [fake_resolve_agent_release, fake_submit_and_wait, always_failing_record_execution]
+        activities = [
+            fake_resolve_agent_release,
+            fake_submit_and_wait,
+            always_failing_record_execution,
+            _fake_find_proposal_slug,
+        ]
 
         async with Worker(
             env.client,
@@ -297,3 +332,57 @@ class TestDevLoopWorkflow:
         assert result.investigate.phase == "Succeeded"
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
+
+    async def test_missing_proposal_slug_fails_instead_of_unscoped_implement(self, env):
+        """When no issue-<N>-* proposal dir exists after approval, the
+        workflow must fail loudly rather than fall back to an unscoped
+        implement run — unscoped, it could implement a different accepted
+        proposal in the repo (the same-repo race of mctl-agents#203)."""
+        implement_calls: list[str] = []
+        investigate_ran = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return None
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            else:
+                implement_calls.append(input.operation)
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        @activity.defn(name="find_proposal_slug")
+        async def missing_find_proposal_slug(service: str, issue_number: str) -> str | None:
+            return None
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[
+                fake_resolve_agent_release,
+                fake_submit_and_wait,
+                fake_record_execution,
+                missing_find_proposal_slug,
+            ],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/7"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        assert "refusing an unscoped implement run" in str(excinfo.value.cause)
+        assert implement_calls == []
