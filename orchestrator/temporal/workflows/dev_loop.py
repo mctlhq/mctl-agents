@@ -31,7 +31,7 @@ different issue's — proposal.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from temporalio import workflow
@@ -53,6 +53,11 @@ with workflow.unsafe.imports_passed_through():
         get_deploy_status,
         get_release_after,
         resolve_deploy_target,
+    )
+    from orchestrator.temporal.activities.incidents import (
+        Incident,
+        IncidentQueryResult,
+        list_service_incidents,
     )
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug
@@ -158,6 +163,14 @@ DEPLOY_POLL_INTERVAL = timedelta(minutes=1)
 DEPLOY_READ_TIMEOUT = timedelta(minutes=2)
 DEPLOY_READ_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
+# Stage 6.4 (ADR-006, #216). After the rollout is observed, watch that
+# service for incidents for a bounded window, then finish. Long enough for
+# a bad rollout to announce itself through alert `for:` durations and the
+# first real traffic; short enough that the loop still ends, and that what
+# it reports is plausibly about THIS deploy rather than the day's news.
+INCIDENT_WATCH_WINDOW = timedelta(minutes=30)
+INCIDENT_POLL_INTERVAL = timedelta(minutes=5)
+
 
 @dataclass(frozen=True)
 class IssueRef:
@@ -191,6 +204,24 @@ class DeployObservation:
 
 
 @dataclass(frozen=True)
+class IncidentWatch:
+    """Incidents seen for the deployed service after the rollout.
+
+    Correlation is service + time window only — incidents carry no link to
+    a release, PR or commit — so this is evidence for a human, not a
+    causal claim and not a trigger for anything. ``watched=False`` means
+    the stage did not run (no deploy target, or nothing released).
+    """
+
+    watched: bool
+    service: str | None = None
+    window_minutes: int = 0
+    since: str | None = None
+    incidents: list[Incident] = field(default_factory=list)
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
     # None if approval was never signalled, investigate failed, or the
@@ -210,6 +241,9 @@ class DevLoopResult:
     # merge produced. None on histories predating the stage and whenever
     # the PR did not merge. See DeployObservation for the outcomes.
     deploy: DeployObservation | None = None
+    # Stage 6.4 (ADR-006, #216): incidents raised against the deployed
+    # service during the watch window. None when the stage did not run.
+    incidents: IncidentWatch | None = None
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -518,12 +552,78 @@ class DevLoopWorkflow:
         ):
             deploy = await self._observe_deploy(target_repo, pr_state)
 
+        # Stage 6.4 (ADR-006, #216): only worth asking when something
+        # actually rolled out. no-release/no-target mean nothing shipped,
+        # so any incident in the window belongs to someone else.
+        incidents: IncidentWatch | None = None
+        if (
+            workflow.patched("incident-watch")
+            and deploy is not None
+            and deploy.outcome in ("healthy", "unverified")
+            and deploy.app
+        ):
+            incidents = await self._watch_incidents(deploy.app)
+
         return DevLoopResult(
             investigate=investigate_result,
             implement=implement_result,
             approve=approve_result,
             pr=pr_state,
             deploy=deploy,
+            incidents=incidents,
+        )
+
+    async def _watch_incidents(self, service: str) -> IncidentWatch:
+        """Collect incidents raised against ``service`` during the window.
+
+        Observational and terminal: whatever it finds lands in the result
+        for a human to read. No remediation, no rollback, and no failing
+        the workflow — by this point implement, the merge and the rollout
+        have all already happened, and an incident here is information
+        about the platform, not about this loop's success.
+        """
+        since = workflow.now().isoformat().replace("+00:00", "Z")
+        deadline = workflow.now() + INCIDENT_WATCH_WINDOW
+        window_minutes = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
+        seen: dict[str, Incident] = {}
+        detail: str | None = None
+        while workflow.now() < deadline:
+            await workflow.sleep(INCIDENT_POLL_INTERVAL)
+            try:
+                result: IncidentQueryResult = await workflow.execute_activity(
+                    list_service_incidents,
+                    args=[service, since],
+                    start_to_close_timeout=DEPLOY_READ_TIMEOUT,
+                    retry_policy=DEPLOY_READ_RETRY_POLICY,
+                )
+            except ActivityError as exc:
+                # Keep watching: one failed read must not discard the
+                # incidents already collected, nor end the window early.
+                detail = f"at least one incident read failed: {exc.cause!r}"
+                workflow.logger.warning(
+                    "incident read failed for %s — continuing the watch: %r", service, exc.cause
+                )
+                continue
+            for incident in result.incidents:
+                # Deduplicated by id across polls: an incident firing for
+                # the whole window would otherwise be reported once per
+                # poll. First sighting wins, so the recorded status is the
+                # one it had when this loop first saw it.
+                seen.setdefault(incident.id, incident)
+        if seen:
+            workflow.logger.warning(
+                "incident watch for %s saw %d incident(s) within %s of the rollout",
+                service,
+                len(seen),
+                INCIDENT_WATCH_WINDOW,
+            )
+        return IncidentWatch(
+            watched=True,
+            service=service,
+            window_minutes=window_minutes,
+            since=since,
+            incidents=list(seen.values()),
+            detail=detail,
         )
 
     async def _observe_deploy(self, service: str, pr_state: PRState) -> DeployObservation:

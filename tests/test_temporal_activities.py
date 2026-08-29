@@ -1043,3 +1043,68 @@ class TestDeployTargetPathSafety:
         )
         target = await env.run(resolve_deploy_target, "mctlhq/evil")
         assert target is not None and (target.team, target.app) == ("admins", "mctl-api")
+
+class TestListServiceIncidents:
+    """#216: scoped incident query — service + window, nothing stronger."""
+
+    def _handler(self, monkeypatch, payload, status=200, capture=None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/incidents":
+                if capture is not None:
+                    capture.update(dict(request.url.params))
+                return httpx.Response(status, json=payload)
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("MCTL_TOKEN", "mctl-test-token")
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_scopes_the_query_to_service_and_window(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        params: dict = {}
+        self._handler(monkeypatch, {"items": [], "count": 0}, capture=params)
+        await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert params["service"] == "mctl-web"
+        assert params["since"] == "2026-08-30T00:00:00Z"
+
+    async def test_maps_incident_fields(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch,
+            {
+                "items": [
+                    {
+                        "id": "alert-7",
+                        "title": "pods crashlooping",
+                        "severity": "critical",
+                        "status": "firing",
+                        "started_at": "2026-08-30T00:05:00Z",
+                    }
+                ],
+                "count": 1,
+            },
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert len(result.incidents) == 1
+        assert result.incidents[0].id == "alert-7"
+        assert result.incidents[0].severity == "critical"
+
+    async def test_falls_back_to_fingerprint_when_there_is_no_id(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch, {"items": [{"fingerprint": "fp-1", "title": "x"}], "count": 1}
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert [i.id for i in result.incidents] == ["fp-1"]
+
+    async def test_unexpected_items_shape_is_an_error_not_a_clean_window(
+        self, env, monkeypatch
+    ):
+        """Reporting "no incidents" for a changed payload would be a lie."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(monkeypatch, {"items": {"unexpected": True}})
+        with pytest.raises(Exception, match="incidents items"):
+            await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
