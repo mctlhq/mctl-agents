@@ -262,6 +262,13 @@ def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
     # so the approve commands below are copy-pasteable — placeholder text
     # sent operators chasing an invalid id (codex P2 on PR #212). Imported
     # lazily: this module's other entry points don't need temporalio.
+    #
+    # The REST route referenced below lives in the SIBLING repo, not here:
+    # mctl-api internal/api/router.go registers
+    # `POST /api/v1/agents/dev-loop/{workflow_id}/approve` →
+    # handlers_dev_loop.go ApproveDevLoopWorkflow → TemporalClient.SignalApprove
+    # (shipped with the phase-4 dev-loop endpoints), so no grep of THIS repo
+    # can find it.
     from orchestrator.temporal.start import workflow_id_for
 
     workflow_id = workflow_id_for(issue_url)
