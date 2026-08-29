@@ -28,7 +28,11 @@ from orchestrator.temporal.activities.proposals import (
     _resolve_token,
 )
 
+# Both canonical PR-URL forms the proposal state supports (mirrors
+# run_shepherd._parse_pr_url): the web form and the API form a repaired
+# .status.yaml may carry.
 _PR_URL_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+_PR_API_URL_RE = re.compile(r"https://api\.github\.com/repos/([\w.-]+/[\w.-]+)/pulls/(\d+)")
 # .status.yaml is flat investigator-written YAML; the pr field is a bare URL
 # on its own line (see run_shepherd's reader, which does data.get("pr")).
 _PR_FIELD_RE = re.compile(r"^pr:\s*['\"]?(\S+?)['\"]?\s*$", re.MULTILINE)
@@ -104,10 +108,25 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         if not field:
             return PRState(found=False)
         recorded_pr_url = field.group(1)
-        pr_match = _PR_URL_RE.search(recorded_pr_url)
+        pr_match = _PR_URL_RE.search(recorded_pr_url) or _PR_API_URL_RE.search(recorded_pr_url)
         if not pr_match:
             return PRState(found=False)
         repo, number = pr_match.group(1), int(pr_match.group(2))
+
+        # The recorded PR must live in this proposal's own repository: a
+        # stale or hand-edited .status.yaml pointing at a valid PR in some
+        # OTHER repo must not complete this loop's merge detection with an
+        # unrelated PR's state.
+        if repo != f"mctlhq/{service}":
+            activity.logger.warning(
+                "pr_state service=%s slug=%s: recorded PR %s is outside "
+                "mctlhq/%s — refusing to track it",
+                service,
+                slug,
+                recorded_pr_url,
+                service,
+            )
+            return PRState(found=False, pr_url=recorded_pr_url, repo=repo, number=number)
 
         pr_api = f"https://api.github.com/repos/{repo}/pulls/{number}"
         try:

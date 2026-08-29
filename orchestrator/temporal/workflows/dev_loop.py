@@ -418,14 +418,22 @@ class DevLoopWorkflow:
                     return state
             else:
                 polls_without_pr += 1
-                if last is None and polls_without_pr >= PR_LOOKUP_GRACE_POLLS:
+                if state.number is not None:
+                    # A PR link IS recorded but cannot be resolved right now
+                    # (repo/PR deleted, token lost access, wrong-repo link).
+                    # Preserve the reference in the result — it is the only
+                    # diagnostic pointer an operator gets.
+                    last = state
+                if polls_without_pr >= PR_LOOKUP_GRACE_POLLS and (last is None or not last.found):
                     workflow.logger.warning(
-                        "no PR link in .status.yaml for %s/%s after %d polls — "
-                        "giving up the merge watch",
+                        "merge watch for %s/%s giving up after %d polls: %s",
                         service,
                         slug,
                         polls_without_pr,
+                        "recorded PR is unresolvable"
+                        if last is not None
+                        else "no PR link in .status.yaml",
                     )
-                    return None
+                    return last
             await workflow.sleep(MERGE_POLL_INTERVAL)
         return last

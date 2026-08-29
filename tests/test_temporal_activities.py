@@ -694,3 +694,31 @@ class TestGetPRState:
         monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
         with pytest.raises(ProposalListingError, match="no GitHub token"):
             await env.run(get_pr_state, "mctl-web", "issue-10-test")
+
+    async def test_api_style_pr_url_is_accepted(self, env, monkeypatch):
+        """run_shepherd._parse_pr_url supports the API URL form too — a
+        repaired .status.yaml carrying it must not read as 'no PR'."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://api.github.com/repos/mctlhq/mctl-web/pulls/99\n",
+            pr_json={"state": "open", "merged": False},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is True
+        assert (state.repo, state.number, state.state) == ("mctlhq/mctl-web", 99, "OPEN")
+
+    async def test_pr_link_outside_proposal_repo_is_refused(self, env, monkeypatch):
+        """A stale/hand-edited link to another repo's PR must not complete
+        merge detection with an unrelated PR's state."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://github.com/mctlhq/mctl-api/pull/99\n",
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+        assert state.repo == "mctlhq/mctl-api"
+        assert state.number == 99

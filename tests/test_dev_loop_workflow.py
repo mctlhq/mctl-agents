@@ -57,6 +57,7 @@ def _fake_activities(
     released: bool,
     investigate_phase: str = "Succeeded",
     pr_states: list[PRState] | None = None,
+    pr_state_raises_after: int | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -101,6 +102,10 @@ def _fake_activities(
 
     @activity.defn(name="get_pr_state")
     async def fake_get_pr_state(service: str, slug: str) -> PRState:
+        if pr_state_raises_after is not None and poll_index["i"] >= pr_state_raises_after:
+            from temporalio.exceptions import ApplicationError
+
+            raise ApplicationError("github unreachable", non_retryable=True)
         i = min(poll_index["i"], len(sequence) - 1)
         poll_index["i"] += 1
         return sequence[i]
@@ -670,3 +675,72 @@ class TestDevLoopWorkflow:
         assert result.pr is not None
         assert result.pr.state == "OPEN"
         assert result.pr.merged is False
+
+    async def test_merge_detection_fail_open_on_persistent_read_failure(self, env):
+        """A get_pr_state that fails even its Temporal retries ends the
+        watch with the last observed state — it must never fail a loop
+        whose implement already succeeded."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr], pr_state_raises_after=1
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/80"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is not None
+        assert result.pr.state == "OPEN"
+
+    async def test_merge_detection_preserves_unresolvable_recorded_pr(self, env):
+        """A recorded PR link that 404s (deleted repo, lost token access)
+        ends the watch after the grace polls with the reference preserved
+        in the result — not the misleading 'no PR link' None."""
+        vanished = PRState(
+            found=False,
+            pr_url="https://github.com/mctlhq/mctl-telegram/pull/81",
+            repo="mctlhq/mctl-telegram",
+            number=81,
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[vanished]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/81"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.found is False
+        assert (result.pr.repo, result.pr.number) == ("mctlhq/mctl-telegram", 81)
