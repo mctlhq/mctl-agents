@@ -676,10 +676,11 @@ class TestDevLoopWorkflow:
         assert result.pr.state == "OPEN"
         assert result.pr.merged is False
 
-    async def test_merge_detection_fail_open_on_persistent_read_failure(self, env):
-        """A get_pr_state that fails even its Temporal retries ends the
-        watch with the last observed state — it must never fail a loop
-        whose implement already succeeded."""
+    async def test_merge_detection_survives_read_failures_until_deadline(self, env):
+        """A get_pr_state that fails even its Temporal retries must not
+        abort the watch (agy P2): the loop rides the outage out to the
+        deadline and ends with the last observed state — and it must never
+        fail a loop whose implement already succeeded."""
         open_pr = PRState(
             found=True,
             pr_url=MERGED_PR.pr_url,
@@ -744,3 +745,39 @@ class TestDevLoopWorkflow:
         assert result.pr is not None
         assert result.pr.found is False
         assert (result.pr.repo, result.pr.number) == ("mctlhq/mctl-telegram", 81)
+
+    async def test_merge_detection_ends_when_status_file_vanishes_after_found(self, env):
+        """A status file deleted AFTER the PR was once resolved must end
+        the watch after the grace polls with the last found state — not
+        leave a zombie loop polling a missing file to the deadline
+        (agy P3)."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr, PRState(found=False)]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/82"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.found is True
+        assert result.pr.state == "OPEN"

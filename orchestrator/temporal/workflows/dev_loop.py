@@ -405,15 +405,20 @@ class DevLoopWorkflow:
                     retry_policy=PR_STATE_RETRY_POLICY,
                 )
             except ActivityError:
+                # A read outage longer than the activity's retries must not
+                # abort a 14-day watch — ride it out and poll again next
+                # interval; the deadline still bounds the loop (agy P2).
                 workflow.logger.warning(
-                    "get_pr_state failed after retries for %s/%s — ending the "
-                    "merge watch with the last observed state",
+                    "get_pr_state failed after retries for %s/%s — retrying "
+                    "next poll interval",
                     service,
                     slug,
                 )
-                return last
+                await workflow.sleep(MERGE_POLL_INTERVAL)
+                continue
             if state.found:
                 last = state
+                polls_without_pr = 0
                 if state.state in ("MERGED", "CLOSED"):
                     return state
             else:
@@ -424,15 +429,20 @@ class DevLoopWorkflow:
                     # Preserve the reference in the result — it is the only
                     # diagnostic pointer an operator gets.
                     last = state
-                if polls_without_pr >= PR_LOOKUP_GRACE_POLLS and (last is None or not last.found):
+                # Give up after GRACE consecutive unresolvable polls — this
+                # covers the link never appearing, a recorded PR that stays
+                # unresolvable, AND a status file deleted after the PR was
+                # once found (agy P3's zombie loop). The counter resets on
+                # every successful resolve, so one transient blip never
+                # ends the watch.
+                if polls_without_pr >= PR_LOOKUP_GRACE_POLLS:
                     workflow.logger.warning(
-                        "merge watch for %s/%s giving up after %d polls: %s",
+                        "merge watch for %s/%s giving up after %d consecutive "
+                        "polls without a resolvable PR (last=%s)",
                         service,
                         slug,
                         polls_without_pr,
-                        "recorded PR is unresolvable"
-                        if last is not None
-                        else "no PR link in .status.yaml",
+                        "none" if last is None else (last.pr_url or "unresolved"),
                     )
                     return last
             await workflow.sleep(MERGE_POLL_INTERVAL)

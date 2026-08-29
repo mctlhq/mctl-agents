@@ -722,3 +722,27 @@ class TestGetPRState:
         assert state.found is False
         assert state.repo == "mctlhq/mctl-api"
         assert state.number == 99
+
+    async def test_repo_comparison_is_case_insensitive(self, env, monkeypatch):
+        """GitHub URLs are case-insensitive — a mixed-case recorded link to
+        the proposal's own repo must still be tracked."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self.STATUS_PATH:
+                return httpx.Response(
+                    200,
+                    json=self._status_payload(
+                        "pr: https://github.com/MCTLHQ/MCTL-Web/pull/99\n"
+                    ),
+                )
+            if request.url.path == "/repos/MCTLHQ/MCTL-Web/pulls/99":
+                return httpx.Response(200, json={"state": "open", "merged": False})
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is True
+        assert state.state == "OPEN"

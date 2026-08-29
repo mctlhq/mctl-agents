@@ -117,7 +117,7 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         # stale or hand-edited .status.yaml pointing at a valid PR in some
         # OTHER repo must not complete this loop's merge detection with an
         # unrelated PR's state.
-        if repo != f"mctlhq/{service}":
+        if repo.lower() != f"mctlhq/{service}".lower():
             activity.logger.warning(
                 "pr_state service=%s slug=%s: recorded PR %s is outside "
                 "mctlhq/%s — refusing to track it",
