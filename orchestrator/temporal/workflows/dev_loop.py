@@ -102,7 +102,9 @@ class IssueRef:
 @dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
-    implement: WorkflowResult | None  # None if approval was never signalled
+    # None if approval was never signalled, investigate failed, or the
+    # approve flip failed (see `approve` below to tell those apart).
+    implement: WorkflowResult | None
     # None on pre-atomic-approve histories (legacy manual flip) and when the
     # workflow never reached the approve stage. Defaulted so results recorded
     # before this field existed still deserialize.
@@ -222,7 +224,6 @@ class DevLoopWorkflow:
         # as missing from the current polling-cron pipeline.
         await workflow.wait_condition(lambda: self._approved)
 
-        implementer_release = await _resolve("implementer")
         # Scoped to this issue's own proposal, not just its repo. Service
         # scoping alone left a same-repo race: two approved loops for the
         # same repo both discovered the full accepted list from their own
@@ -286,13 +287,27 @@ class DevLoopWorkflow:
                     },
                     step_timeout=APPROVE_STEP_TIMEOUT,
                 )
-                await _record("approve", None, approve_result, target_repo)
+                # No record_execution here: the executions ledger is for
+                # SDK-backed agent runs (see docs/agent-inventory.yaml), and
+                # this deterministic flip is already triply audited — the
+                # .status.yaml approval block, the gitops commit message,
+                # and this workflow's own history all carry the approver.
                 if not approve_result.succeeded:
                     return DevLoopResult(
                         investigate=investigate_result,
                         implement=None,
                         approve=approve_result,
                     )
+        # Resolve the implementer only AFTER the approval flip is durable:
+        # _resolve can fail permanently (registry outage outlasting its five
+        # retries), and if that happened before the flip, the operator's
+        # approval would evaporate with the failed workflow — and the
+        # REJECT_DUPLICATE start policy would turn a transient outage into a
+        # permanently stuck issue (codex P1 on PR #212). Replay-safe for
+        # pre-patch histories: the patched branches above schedule no
+        # commands for them, so their command order (resolve → implement)
+        # is unchanged.
+        implementer_release = await _resolve("implementer")
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to

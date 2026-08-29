@@ -215,10 +215,12 @@ class TestDevLoopWorkflow:
             await handle.signal(DevLoopWorkflow.approve)
             await handle.result()
 
-        # All three steps (investigate, the approve flip, then implement)
-        # record with no pinned release in this fake -- none should ever be
-        # recorded as if a specific version had actually run.
-        assert len(recorded) == 3
+        # Investigate and implement record with no pinned release in this
+        # fake -- neither should ever be recorded as if a specific version
+        # had actually run. The approve flip deliberately does NOT write an
+        # executions row (it is not an SDK agent run; its audit trail is the
+        # .status.yaml approval block + gitops commit + workflow history).
+        assert len(recorded) == 2
         for record in recorded:
             assert record.version == ""
             assert record.image_ref == ""
