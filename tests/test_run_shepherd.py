@@ -17,6 +17,7 @@ fixture so the YAML serialisation is exercised.
 from __future__ import annotations
 
 import json
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -2087,3 +2088,343 @@ def test_extract_severity_no_match() -> None:
     assert _extract_severity("Some random review text") is None
     # P3 in prose does not count as a severity marker
     assert _extract_severity("There are P3 nits to consider") is None
+
+
+# ---------------------------------------------------------------------------
+# #213: sweeper skips proposals a running DevLoop owns
+# ---------------------------------------------------------------------------
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def _opener(handler):
+    """Stand in for run_shepherd._no_redirect_opener with a fake .open()."""
+
+    class _Opener:
+        def open(self, request, timeout=None):
+            return handler(request, timeout=timeout)
+
+    return lambda: _Opener()
+
+
+def test_dev_loop_owns_running_workflow(monkeypatch) -> None:
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["auth"] = request.get_header("Authorization")
+        return _FakeHTTPResponse(b'{"workflow_id": "x", "status": "Running", "shepherd_in_loop": true}')
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is True
+    assert seen["url"].endswith("/api/v1/agents/dev-loop/dev-loop-mctlhq-mctl-web-10")
+    assert seen["auth"] == "Bearer tok"
+
+
+def test_dev_loop_owns_completed_workflow_is_not_owned(monkeypatch) -> None:
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(
+        run_shepherd,
+        "_no_redirect_opener",
+        _opener(lambda request, timeout=None: _FakeHTTPResponse(b'{"status": "Completed"}')),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_404_means_not_owned(monkeypatch) -> None:
+    import urllib.error
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, None)
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_network_error_fails_open_to_sweep(monkeypatch, capsys) -> None:
+    import urllib.error
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+    assert "liveness check failed" in capsys.readouterr().out
+
+
+def test_dev_loop_owns_requires_issue_slug_and_token(monkeypatch) -> None:
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    # incident-* / pre-Temporal slugs never had a DevLoop — no HTTP call.
+    monkeypatch.setattr(
+        run_shepherd.urllib.request,
+        "urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not call")),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "incident-123-oom") is False
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_filter_dev_loop_owned_drops_only_owned(monkeypatch, capsys) -> None:
+    owned = run_shepherd.ProposalRef(
+        service="mctl-web",
+        slug="issue-10-owned",
+        proposal_dir=Path("/tmp/x"),
+        status="implemented",
+    )
+    free = run_shepherd.ProposalRef(
+        service="mctl-web",
+        slug="incident-9-free",
+        proposal_dir=Path("/tmp/y"),
+        status="implemented",
+    )
+    monkeypatch.setattr(
+        run_shepherd,
+        "_dev_loop_owns",
+        lambda service, slug: slug == "issue-10-owned",
+    )
+    kept = run_shepherd._filter_dev_loop_owned([owned, free])
+    assert kept == [free]
+    assert "driven by a running DevLoopWorkflow" in capsys.readouterr().out
+
+
+def test_dev_loop_owns_non_https_url_skips_the_call(monkeypatch, capsys) -> None:
+    """A non-https MCTL_API_URL must fail open WITHOUT a request.
+
+    The scheme guard is what lets the urlopen call carry `# noqa: S310`;
+    if it ever stopped short-circuiting, the noqa would be covering a
+    real unaudited-scheme call rather than a pinned one.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "http://api.internal")
+    monkeypatch.setattr(
+        run_shepherd.urllib.request,
+        "urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not call")),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+    assert "non-https MCTL_API_URL" in capsys.readouterr().out
+
+
+def test_dev_loop_owns_http_exception_fails_open(monkeypatch) -> None:
+    """http.client.HTTPException subclasses Exception, not OSError.
+
+    Uncaught it would escape _filter_dev_loop_owned and abort the whole
+    sweep tick — the opposite of the per-proposal fail-open this function
+    documents. Regression for claude P3 on PR #230.
+    """
+    import http.client
+
+    def fake_urlopen(request, timeout=None):
+        raise http.client.IncompleteRead(b"half")
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_filter_dev_loop_owned_keeps_unanswered_refs_when_budget_expires(
+    monkeypatch, capsys
+) -> None:
+    """A degraded mctl-api must not stretch the sweep past its interval.
+
+    One proposal answers "owned" immediately; the other hangs. Once the
+    budget expires the hung one is KEPT (swept) rather than dropped or
+    waited on, so the tick's cost is bounded by the budget and not by the
+    number of proposals. Regression for the claude+agy P2 on PR #230.
+    """
+    import threading
+
+    release = threading.Event()
+
+    def slow_or_fast(service: str, slug: str) -> bool:
+        if slug == "issue-10-owned":
+            return True
+        release.wait(timeout=5)
+        return True  # would claim ownership — but must never be consulted
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns", slow_or_fast)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
+
+    refs = [
+        run_shepherd.ProposalRef(
+            service="mctl-web",
+            slug=slug,
+            proposal_dir=Path("/tmp/x"),
+            status="implemented",
+        )
+        for slug in ("issue-10-owned", "issue-11-hung")
+    ]
+    try:
+        kept = run_shepherd._filter_dev_loop_owned(refs)
+    finally:
+        release.set()
+
+    assert [r.slug for r in kept] == ["issue-11-hung"]
+    assert "budget with 1 proposal(s) unchecked" in capsys.readouterr().out
+
+
+def test_main_applies_the_ownership_filter_only_in_sweep_mode(
+    tmp_path, monkeypatch
+) -> None:
+    """The gate at main()'s call site is the actual behaviour change.
+
+    Sweep mode filters; a targeted --slug run (which is how the DevLoop's
+    own in-loop tick invokes the shepherd) and --reconcile must not, or
+    the workflow would filter itself out and the projection would stop
+    recording terminal states for owned slugs.
+    """
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+    calls: list[str] = []
+
+    def run(argv: list[str], label: str) -> None:
+        monkeypatch.setattr("sys.argv", ["run_shepherd", "--dry-run",
+                                         "--state-dir", str(state_dir), *argv])
+        with patch.object(run_shepherd, "_discover_refs", return_value=[]), \
+             patch.object(run_shepherd, "_filter_dev_loop_owned",
+                          side_effect=lambda refs: calls.append(label) or refs):
+            run_shepherd.main()
+
+    run([], "sweep")
+    assert calls == ["sweep"]
+    run(["--slug", "issue-10-test"], "slug")
+    run(["--reconcile"], "reconcile")
+    assert calls == ["sweep"]
+
+
+def test_dev_loop_owns_running_but_pre_patch_workflow_is_not_owned(monkeypatch) -> None:
+    """Running is not the same as ticking (Codex P1 on PR #230).
+
+    An execution started before the shepherd-in-loop patch replays that
+    branch as False and never submits a tick, yet stays Running for up to
+    the 14-day merge deadline. Treating it as owned would leave its PR
+    with no shepherd at all until it drained.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(
+        run_shepherd,
+        "_no_redirect_opener",
+        _opener(
+            lambda request, timeout=None: _FakeHTTPResponse(
+                b'{"status": "Running", "shepherd_in_loop": false}'
+            )
+        ),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_missing_field_is_not_owned(monkeypatch) -> None:
+    """An mctl-api predating the field answers nothing — sweep, as before."""
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(
+        run_shepherd,
+        "_no_redirect_opener",
+        _opener(lambda request, timeout=None: _FakeHTTPResponse(b'{"status": "Running"}')),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_does_not_follow_redirects(monkeypatch) -> None:
+    """A 3xx must surface as an error, not replay the bearer token elsewhere.
+
+    urllib's default opener copies request headers onto the redirect
+    target, so following one would leak MCTL_TOKEN to whatever host the
+    redirect names and defeat the https check (Codex P2 on PR #230).
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    opener = run_shepherd._no_redirect_opener()
+    handler = next(
+        h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+    )
+    assert (
+        handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example/x") is None
+    )
+
+
+def test_filter_dev_loop_owned_returns_within_budget_with_queued_work(
+    monkeypatch,
+) -> None:
+    """The budget must be wall-clock, not advisory (#230 round 3 P2).
+
+    More refs than workers means most tasks are still QUEUED when the
+    budget expires. `with ThreadPoolExecutor(...)` would block on exit
+    until every one of them had run — ceil(N/workers) * per-call timeout
+    — so the pass could still outlive the 5-minute cron interval it was
+    bounded to. Twelve hung refs across two workers: with the shutdown
+    bug this takes ~6s, bounded it returns immediately.
+    """
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def hangs(service: str, slug: str) -> bool:
+        release.wait(timeout=1.0)
+        return False
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns", hangs)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_WORKERS", 2)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
+
+    refs = [
+        run_shepherd.ProposalRef(
+            service="mctl-web",
+            slug=f"issue-{i}-hung",
+            proposal_dir=Path("/tmp/x"),
+            status="implemented",
+        )
+        for i in range(12)
+    ]
+    started = time.monotonic()
+    try:
+        kept = run_shepherd._filter_dev_loop_owned(refs)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert len(kept) == 12
+    assert elapsed < 3.0, f"ownership pass overshot its budget: {elapsed:.1f}s"
+
+
+def test_dev_loop_owns_malformed_url_fails_open(monkeypatch) -> None:
+    """A malformed https URL must not abort the sweep (#230 round 4 P2).
+
+    `urllib.request.Request.__init__` parses the url and raises
+    ValueError on e.g. an unmatched IPv6 bracket. Constructed outside the
+    guarded block that exception escaped `_dev_loop_owns` entirely,
+    surfaced on the future in `_filter_dev_loop_owned`, and took down the
+    whole tick instead of failing open for the one proposal.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "https://[::1:8080")
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_filter_survives_a_malformed_url_for_every_ref(monkeypatch) -> None:
+    """Counterpart at the call site: the sweep still returns every ref."""
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "https://[::1:8080")
+    refs = [
+        run_shepherd.ProposalRef(
+            service="mctl-web",
+            slug=f"issue-{i}-test",
+            proposal_dir=Path("/tmp/x"),
+            status="implemented",
+        )
+        for i in range(3)
+    ]
+    assert run_shepherd._filter_dev_loop_owned(refs) == refs

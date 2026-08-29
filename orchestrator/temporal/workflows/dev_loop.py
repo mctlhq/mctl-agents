@@ -117,6 +117,19 @@ PR_LOOKUP_GRACE_POLLS = 4
 PR_STATE_TIMEOUT = timedelta(minutes=2)
 PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
+# Stage 6.1 review loop (#213): while the PR stays open, the workflow runs
+# its OWN shepherd ticks instead of relying on the global cron (which
+# narrows to a sweeper and skips slugs a running DevLoop owns — see
+# run_shepherd._dev_loop_owns). Cadence: every 8th poll ≈ 4 h — each tick
+# provisions a Hetzner volume, so hours not minutes (ADR-006 cost note),
+# and never on the first poll (claude review auto-fires on PR open; an
+# immediate tick would just observe "review pending"). Capped: after
+# SHEPHERD_TICKS_MAX active ticks the loop keeps watching passively —
+# the shepherd itself flips review-stuck after 3 address-review attempts,
+# so a stuck PR must not burn a volume every 4 h for two weeks.
+SHEPHERD_TICK_EVERY_POLLS = 8
+SHEPHERD_TICKS_MAX = 12
+
 
 @dataclass(frozen=True)
 class IssueRef:
@@ -213,6 +226,20 @@ class DevLoopWorkflow:
     def __init__(self) -> None:
         self._approved = False
         self._approver: str | None = None
+        self._shepherd_in_loop = False
+
+    @workflow.query
+    def shepherd_in_loop(self) -> bool:
+        """Does THIS execution run its own shepherd ticks? (#213)
+
+        The shepherd cron asks mctl-api, which asks this query, because
+        "Running" alone cannot answer it: an execution that started before
+        the `shepherd-in-loop` patch replays that branch as False and will
+        never tick, yet stays Running until the merge-watch deadline. The
+        cron must keep sweeping those proposals, so it needs the patch
+        marker this workflow actually recorded — not its status.
+        """
+        return self._shepherd_in_loop
 
     @workflow.signal
     def approve(self, *args: object) -> None:
@@ -402,6 +429,16 @@ class DevLoopWorkflow:
         deadline = workflow.now() + MERGE_WATCH_DEADLINE
         polls_without_pr = 0
         last: PRState | None = None
+        # In-loop shepherd (#213): evaluated once — the marker also fixes
+        # whether tick commands appear in this execution's history at all.
+        shepherd_in_loop = workflow.patched("shepherd-in-loop")
+        # Published to the sweeper via the shepherd_in_loop query the moment
+        # the watch starts, not at the first tick 4 h later: between those
+        # two points this execution IS the owner, and the cron must already
+        # be standing down.
+        self._shepherd_in_loop = shepherd_in_loop
+        poll_index = 0
+        shepherd_ticks = 0
         while workflow.now() < deadline:
             try:
                 state: PRState = await workflow.execute_activity(
@@ -450,6 +487,43 @@ class DevLoopWorkflow:
                 polls_without_pr = 0
                 if state.state in ("MERGED", "CLOSED"):
                     return state
+                # Counted only on a successful read, so a transient
+                # get_pr_state failure delays the next tick instead of
+                # consuming its boundary and dropping it for ~4 h.
+                poll_index += 1
+                if (
+                    shepherd_in_loop
+                    and poll_index % SHEPHERD_TICK_EVERY_POLLS == 0
+                    and shepherd_ticks < SHEPHERD_TICKS_MAX
+                ):
+                    # The tick is the same one-shot the cron ran, scoped to
+                    # exactly this proposal (service+slug → run_shepherd's
+                    # targeted mode, which bypasses the ownership filter).
+                    # A failed tick is logged, not fatal: the watch itself
+                    # is the durable part, and the next tick retries.
+                    shepherd_ticks += 1
+                    try:
+                        # Pin the released shepherd image exactly like the
+                        # investigate/implement steps do, so a promotion or
+                        # rollback in the agent registry reaches in-loop
+                        # ticks too — otherwise DevLoop-owned proposals
+                        # would silently run the CWFT's baked-in default
+                        # while cron-driven ones ran the intended release.
+                        shepherd_release = await _resolve("shepherd")
+                        tick_params = {"service": service, "slug": slug}
+                        if shepherd_release and shepherd_release.image_ref:
+                            tick_params["agent_image"] = shepherd_release.image_ref
+                            tick_params["agent_version"] = f"shepherd@{shepherd_release.version}"
+                        tick_result = await _run_cwft("mctl-agents-shepherd", tick_params)
+                        await _record("shepherd", shepherd_release, tick_result, service)
+                    except ActivityError as exc:
+                        workflow.logger.warning(
+                            "in-loop shepherd tick failed for %s/%s — the "
+                            "watch continues: %r",
+                            service,
+                            slug,
+                            exc.cause,
+                        )
             else:
                 polls_without_pr += 1
                 if last is None and state.number is not None:

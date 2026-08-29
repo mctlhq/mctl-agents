@@ -42,11 +42,17 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -62,6 +68,7 @@ from orchestrator.github_token import refresh_github_token
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
 
 # ---------------------------------------------------------------------------
 # State directory resolution — mirrors run_implementer.py.
@@ -82,6 +89,166 @@ REVIEW_BOT = "claude[bot]"
 # P1/P2 from whichever bots actually reviewed). See #67.
 CODEX_CONNECTOR_BOT = "chatgpt-codex-connector[bot]"
 GATING_BOTS = (REVIEW_BOT, CODEX_CONNECTOR_BOT)
+
+# Sweeper ownership (#213 / ADR-006 §6.1): a proposal whose DevLoopWorkflow
+# is still Running drives its own review loop in-workflow; the cron sweep
+# must not double-drive it. Liveness is read through mctl-api's describe
+# endpoint (this pod deliberately holds no Temporal client). Any failure —
+# missing token, endpoint absent (older mctl-api 404s the route), network
+# error — means "not owned": the sweeper keeps today's behavior of driving
+# everything, which is the safe default for a safety net.
+# Same env var the Temporal activities read (orchestrator/temporal/mctl_client
+# — imported for the constant only; that module pulls in nothing heavier
+# than os). A deployment pointing MCTL_API_BASE_URL at a staging API must
+# not have this one check silently talk to production instead.
+MCTL_API_URL = MCTL_API_BASE_URL.rstrip("/")
+DEV_LOOP_LIVENESS_TIMEOUT_S = 10
+
+# The sweep tick runs every 5 minutes (see the module docstring), so the
+# ownership pass must finish well inside that window no matter how many
+# proposals are open or how badly mctl-api is degraded. Serially, N slow
+# proposals cost N*10s and overlapping ticks would pile load onto an
+# already-sick API. Two bounds together make the worst case independent
+# of N: a small thread pool, and a hard wall-clock budget after which the
+# remaining refs are kept unchecked (fail-open, same as any other failure).
+def _no_redirect_opener() -> urllib.request.OpenerDirector:
+    """Opener that surfaces a 3xx as an HTTPError instead of following it."""
+
+    class _NoRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(_NoRedirects)
+
+
+DEV_LOOP_LIVENESS_WORKERS = 8
+DEV_LOOP_LIVENESS_BUDGET_S = 60
+
+
+def _dev_loop_owns(service: str, slug: str) -> bool:
+    """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
+
+    The workflow id is derived exactly the way start.py derives it
+    (dev-loop-mctlhq-{service}-{issue-number}); slugs without the
+    issue-<N>- prefix (incident-*, pre-Temporal) never had a DevLoop.
+    Every failure path returns False — see the MCTL_API_URL note above.
+    """
+    m = re.match(r"issue-(\d+)-", slug)
+    if not m:
+        return False
+    token = os.environ.get("MCTL_TOKEN", "").strip()
+    if not token:
+        return False
+    # `mctlhq` is hardcoded because a ProposalRef carries no repo owner —
+    # unlike orphans.py, which derives one from `pr.repo`. Every proposal the
+    # shepherd sweeps lives under this org today; a wrong owner would only
+    # produce a 404, i.e. the fail-open "not owned" path.
+    workflow_id = f"dev-loop-mctlhq-{service}-{m.group(1)}"
+    url = f"{MCTL_API_URL}/api/v1/agents/dev-loop/{workflow_id}"
+    if not url.startswith("https://"):
+        # MCTL_API_URL is operator-provided env; refuse non-https schemes
+        # (also satisfies ruff S310's audited-scheme requirement).
+        print(f"warn: dev-loop liveness check skipped: non-https MCTL_API_URL {MCTL_API_URL}")
+        return False
+    try:
+        # Constructed INSIDE the guard: Request.__init__ parses the url and
+        # raises ValueError on a malformed one (an unmatched IPv6 bracket,
+        # say). Outside, that escaped every except clause here, surfaced on
+        # the future in _filter_dev_loop_owned, and aborted the whole sweep
+        # instead of failing open for the one proposal.
+        request = urllib.request.Request(  # noqa: S310 — scheme pinned to https above
+            url, headers={"Authorization": f"Bearer {token}"}
+        )
+        # _NoRedirects, not the default opener: urllib replays the request
+        # headers — MCTL_TOKEN included — at whatever a 3xx points to, so a
+        # misconfigured or hostile redirect to http:// or another host would
+        # leak the bearer token and defeat the https check above.
+        with _no_redirect_opener().open(request, timeout=DEV_LOOP_LIVENESS_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ) as exc:
+        # 404 = no such workflow (or an mctl-api predating the endpoint) —
+        # genuinely not owned. Anything else is an infra failure; log it so
+        # an operator can see the ownership check degraded, then sweep.
+        if not (isinstance(exc, urllib.error.HTTPError) and exc.code == 404):
+            print(f"warn: dev-loop liveness check failed for {workflow_id}: {exc}")
+        return False
+    if not isinstance(payload, dict) or payload.get("status") != "Running":
+        return False
+    # Running is not the same as ticking: an execution that started before
+    # the shepherd-in-loop patch replays that branch as False and never
+    # submits a tick, yet stays Running for up to the 14-day merge
+    # deadline. Skipping it would leave its PR with no shepherd at all.
+    # An mctl-api without the field answers None → swept, as before.
+    return payload.get("shepherd_in_loop") is True
+
+
+def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
+    """Drop refs a running DevLoop owns; used only in sweep mode (no
+    explicit --slug — a targeted one-shot, including the DevLoop's own
+    in-loop tick, must always process the slug it was given).
+
+    Checks run concurrently and under a wall-clock budget so a degraded
+    mctl-api cannot stretch one tick past the cron interval — see the
+    DEV_LOOP_LIVENESS_* notes above. Anything not answered inside the
+    budget is kept, which is the same fail-open outcome as an error.
+    """
+    if not refs:
+        return refs
+    owned: set[int] = set()
+    workers = min(DEV_LOOP_LIVENESS_WORKERS, len(refs))
+    # NOT `with ThreadPoolExecutor(...)`: __exit__ runs shutdown(wait=True,
+    # cancel_futures=False), which blocks until every *queued* task has also
+    # run — so the budget below would be advisory and the pass could still
+    # cost ceil(N/workers)*DEV_LOOP_LIVENESS_TIMEOUT_S. Shutting down
+    # explicitly with cancel_futures drops what has not started and does not
+    # wait on what has; the in-flight calls carry their own socket timeout,
+    # so the pool's threads retire on their own.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(_dev_loop_owns, ref.service, ref.slug): i
+            for i, ref in enumerate(refs)
+        }
+        try:
+            for future in as_completed(futures, timeout=DEV_LOOP_LIVENESS_BUDGET_S):
+                if future.result():
+                    owned.add(futures[future])
+        except FuturesTimeoutError:
+            # Budget spent. Whatever already answered still counts; the
+            # rest stay unchecked and get swept.
+            unanswered = sum(1 for f in futures if not f.done())
+            print(
+                f"warn: dev-loop ownership pass hit its "
+                f"{DEV_LOOP_LIVENESS_BUDGET_S}s budget with {unanswered} "
+                "proposal(s) unchecked — sweeping them"
+            )
+    finally:
+        # Bounds this function; it cannot make an already-started worker
+        # free. concurrent.futures.thread registers a process-wide
+        # _python_exit atexit hook that joins every live pool thread, so a
+        # hung call can still delay interpreter exit — but only by its own
+        # DEV_LOOP_LIVENESS_TIMEOUT_S socket timeout, which is why that
+        # timeout is 10s and not the budget. The tick's *work* stays inside
+        # the budget either way; only the process's last breath waits.
+        pool.shutdown(wait=False, cancel_futures=True)
+    kept: list[ProposalRef] = []
+    for i, ref in enumerate(refs):
+        if i in owned:
+            print(
+                f"info: {ref.service}/{ref.slug} is driven by a running "
+                "DevLoopWorkflow — skipping (sweeper mode, #213)"
+            )
+        else:
+            kept.append(ref)
+    return kept
+
+
 COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 
 # Statuses that the shepherd's discovery pass picks up. `implemented`
@@ -1868,6 +2035,13 @@ def main() -> None:
         reconcile=args.reconcile,
         dry_run=args.dry_run,
     )
+
+    # Sweep mode only (#213): a targeted --slug run — including the
+    # DevLoop's own in-loop shepherd tick — always processes its slug;
+    # reconcile stays unfiltered too (read-only idempotent projection,
+    # and terminal states must be projected even for owned slugs).
+    if not args.slug and not args.reconcile:
+        refs = _filter_dev_loop_owned(refs)
 
     if not refs:
         if args.reconcile:

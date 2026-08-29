@@ -21,7 +21,12 @@ from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowRe
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
-from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+from orchestrator.temporal.workflows.dev_loop import (
+    SHEPHERD_TICK_EVERY_POLLS,
+    SHEPHERD_TICKS_MAX,
+    DevLoopWorkflow,
+    IssueRef,
+)
 
 MERGED_PR = PRState(
     found=True,
@@ -59,6 +64,8 @@ def _fake_activities(
     pr_states: list[PRState] | None = None,
     pr_state_raises_after: int | None = None,
     pr_state_error_type: str | None = None,
+    pr_state_raises_at: set[int] | None = None,
+    shepherd_fails: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -72,6 +79,9 @@ def _fake_activities(
         ),
         "implementer": ResolvedRelease(
             agent="implementer", environment="production", version="2.0.0", image_ref="ghcr.io/x@sha256:bbb"
+        ),
+        "shepherd": ResolvedRelease(
+            agent="shepherd", environment="production", version="3.0.0", image_ref="ghcr.io/x@sha256:ccc"
         ),
     }
 
@@ -89,6 +99,21 @@ def _fake_activities(
             assert input.params.get("issue_url")
             investigate_ran.set()
             return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=investigate_phase)
+        if input.operation == "mctl-agents-shepherd":
+            # In-loop tick (#213) must be scoped to exactly this proposal.
+            assert input.params.get("service")
+            assert input.params.get("slug", "").startswith("issue-")
+            # ...and must run the RELEASED shepherd, not the CWFT's baked-in
+            # default, so a promotion/rollback reaches in-loop ticks too
+            # (Codex P2 on PR #230).
+            if released:
+                assert input.params.get("agent_image") == "ghcr.io/x@sha256:ccc"
+                assert input.params.get("agent_version") == "shepherd@3.0.0"
+            if shepherd_fails:
+                from temporalio.exceptions import ApplicationError
+
+                raise ApplicationError("tick exploded", non_retryable=True)
+            return WorkflowResult(workflow_name="mctl-agents-shepherd-fake", phase="Succeeded")
         return WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded")
 
     @activity.defn(name="record_execution")
@@ -103,6 +128,16 @@ def _fake_activities(
 
     @activity.defn(name="get_pr_state")
     async def fake_get_pr_state(service: str, slug: str) -> PRState:
+        # `raises_after` is sticky (outage); `raises_at` fails those polls
+        # only, then recovers — a transient hiccup, and it does NOT consume
+        # an entry from `sequence`.
+        if pr_state_raises_at is not None and poll_index["i"] in pr_state_raises_at:
+            from temporalio.exceptions import ApplicationError
+
+            pr_state_raises_at.discard(poll_index["i"])
+            raise ApplicationError(
+                "github unreachable", type=pr_state_error_type, non_retryable=True
+            )
         if pr_state_raises_after is not None and poll_index["i"] >= pr_state_raises_after:
             from temporalio.exceptions import ApplicationError
 
@@ -870,3 +905,204 @@ class TestDevLoopWorkflow:
         assert result.pr is not None
         assert result.pr.found is True
         assert result.pr.state == "OPEN"
+
+    async def test_shepherd_tick_runs_while_pr_stays_open(self, env):
+        """Stage 6.1 review loop (#213): while the PR is open, every 8th
+        poll submits a slug-scoped shepherd tick; the merged poll after it
+        ends the watch."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr] * 8 + [MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/85"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert calls == [
+            "mctl-agents-investigate",
+            "mctl-agents-approve",
+            "mctl-agents-implement",
+            "mctl-agents-shepherd",
+        ]
+
+    async def test_shepherd_in_loop_query_answers_true_during_the_watch(self, env):
+        """The sweeper asks the workflow, not its status (Codex P1 on #230).
+
+        While the merge watch runs under the shepherd-in-loop patch, the
+        query must already answer True — the cron has to stand down from
+        the moment the watch starts, not from the first tick 4 h later.
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        seen: list[bool] = []
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/87"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            # Before the watch exists the workflow is not shepherding.
+            seen.append(await handle.query(DevLoopWorkflow.shepherd_in_loop))
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+            seen.append(await handle.query(DevLoopWorkflow.shepherd_in_loop))
+
+        assert seen[0] is False
+        assert seen[1] is True
+
+    async def test_failed_shepherd_tick_does_not_end_the_watch(self, env):
+        """A failing shepherd tick is logged, not fatal — the watch keeps
+        polling and still reports the merge."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * 8 + [MERGED_PR],
+            shepherd_fails=True,
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/86"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert "mctl-agents-shepherd" in calls
+
+    async def test_transient_poll_failure_delays_the_tick_instead_of_dropping_it(
+        self, env
+    ):
+        """A failed read must not consume a tick boundary (#230 P3).
+
+        `poll_index` counts successful reads only. Polls 1-7 see an open
+        PR, poll 8 — what would have been the boundary — fails
+        transiently, and the poll after it recovers and becomes the 8th
+        successful read, so the tick still fires. Counting every attempt
+        instead would spend the boundary on the failure and defer the
+        tick by a full 8 polls (~4 h).
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * 8 + [MERGED_PR],
+            pr_state_raises_at={7},
+            pr_state_error_type="ProposalListingError",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/87"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert "mctl-agents-shepherd" in calls
+
+    async def test_shepherd_ticks_stop_at_the_cap(self, env):
+        """SHEPHERD_TICKS_MAX must actually stop ticking (#230 P3).
+
+        Each tick provisions a Hetzner volume, and the shepherd itself
+        flips review-stuck after 3 address-review attempts — so a wedged
+        PR must not burn one every ~4 h for the full 14-day watch. Drive
+        the watch past 13 tick boundaries and assert the 13th produces
+        nothing.
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        polls = SHEPHERD_TICK_EVERY_POLLS * (SHEPHERD_TICKS_MAX + 1)
+        activities, calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr] * polls + [MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/88"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
