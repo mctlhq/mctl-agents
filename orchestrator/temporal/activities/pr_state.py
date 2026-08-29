@@ -101,7 +101,10 @@ async def get_pr_state(service: str, slug: str) -> PRState:
             raise ProposalListingError(f"undecodable contents payload from {status_url}") from exc
 
         field = _PR_FIELD_RE.search(content)
-        pr_match = _PR_URL_RE.search(field.group(1)) if field else None
+        if not field:
+            return PRState(found=False)
+        recorded_pr_url = field.group(1)
+        pr_match = _PR_URL_RE.search(recorded_pr_url)
         if not pr_match:
             return PRState(found=False)
         repo, number = pr_match.group(1), int(pr_match.group(2))
@@ -113,7 +116,7 @@ async def get_pr_state(service: str, slug: str) -> PRState:
             raise ProposalListingError(f"reading {pr_api} failed: {exc}") from exc
         if pr_response.status_code == 404:
             # Recorded PR vanished (repo/PR deleted, token lost access).
-            return PRState(found=False, pr_url=field.group(1), repo=repo, number=number)
+            return PRState(found=False, pr_url=recorded_pr_url, repo=repo, number=number)
         if pr_response.status_code != 200:
             raise ProposalListingError(
                 f"reading {pr_api} returned HTTP {pr_response.status_code}: {pr_response.text[:200]}"
@@ -129,7 +132,7 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         state = "OPEN"
     result = PRState(
         found=True,
-        pr_url=data.get("html_url") or field.group(1),
+        pr_url=data.get("html_url") or recorded_pr_url,
         repo=repo,
         number=number,
         state=state,
