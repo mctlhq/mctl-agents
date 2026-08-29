@@ -893,6 +893,144 @@ def test_has_responded_set_on_issue_comment_findings() -> None:
 
 
 # ---------------------------------------------------------------------------
+# #67: chatgpt-codex-connector[bot] findings gate; its silence never blocks
+# ---------------------------------------------------------------------------
+def _route_gh(pr, *, reviews=None, review_comments=None, issue_comments=None):
+    """Build a _gh_api_json side_effect routing by endpoint suffix."""
+    def fake(args: list[str]):
+        endpoint = args[0]
+        if endpoint.endswith("/reviews"):
+            return reviews or []
+        if endpoint.endswith(f"/pulls/{pr.number}/comments"):
+            return review_comments or []
+        if endpoint.endswith(f"/issues/{pr.number}/comments"):
+            return issue_comments or []
+        return []
+    return fake
+
+
+def test_connector_inline_finding_gates_merge() -> None:
+    """Repro of #67 (mctl-gitops#626): claude approves clean at head, the
+    connector posts a real inline P2 two minutes later — decide() must route
+    to address-review, not merge."""
+    pr = make_pr()
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "body": "LGTM",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    review_comments = [{
+        "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+        "commit_id": HEAD_SHA,
+        "path": "src/app.py",
+        "line": 7,
+        "body": "![P2 Badge] Fix premise: the retry loop never re-reads state.",
+        "created_at": "2026-04-29T11:02:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is True
+    assert len(review.findings) == 1
+    assert review.findings[0].author == run_shepherd.CODEX_CONNECTOR_BOT
+    decision, payload = decide(pr, review)
+    assert decision == "address-review"
+    assert payload == review.findings
+
+
+def test_connector_stale_commit_finding_does_not_gate() -> None:
+    """A connector P2 anchored to an earlier commit is dropped by
+    findings_p1_p2(at=head_sha) — the fixed-up head merges."""
+    pr = make_pr()
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "body": "LGTM",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    review_comments = [{
+        "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+        "commit_id": "b" * 40,
+        "path": "src/app.py",
+        "line": 7,
+        "body": "![P2 Badge] Already fixed in the follow-up.",
+        "created_at": "2026-04-29T09:00:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.findings_p1_p2(at=pr.head_sha) == []
+    decision, _ = decide(pr, review)
+    assert decision == "merge"
+
+
+def test_connector_alone_never_flips_has_responded() -> None:
+    """The connector is best-effort: its review/comments must not satisfy
+    the primary-reviewer gate — decide() keeps waiting for claude[bot]."""
+    pr = make_pr()
+    reviews = [{
+        "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+        "commit_id": HEAD_SHA,
+        "body": "Didn't find any major issues. Swish!",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is False
+    decision, _ = decide(pr, review)
+    assert decision == "wait"
+
+
+def test_connector_issue_comment_finding_time_anchored() -> None:
+    """Connector top-level issue-comment findings gate only when newer than
+    head_pushed_at; stale ones from a previous head are ignored."""
+    pr = make_pr()
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "body": "LGTM",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    issue_comments = [
+        {
+            "id": 1,
+            "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+            "body": "![P1 Badge] Stale finding from the previous head.",
+            "created_at": "2026-04-29T09:00:00Z",  # older than head push
+        },
+        {
+            "id": 2,
+            "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+            "body": "![P1 Badge] Fresh finding on the current head.",
+            "created_at": "2026-04-29T11:30:00Z",
+        },
+    ]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, issue_comments=issue_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is True
+    assert [f.body for f in review.findings] == [
+        "![P1 Badge] Fresh finding on the current head."
+    ]
+    decision, _payload = decide(pr, review)
+    assert decision == "address-review"
+
+
+# ---------------------------------------------------------------------------
 # T6: outer-loop 3-attempt cap
 # ---------------------------------------------------------------------------
 def test_outer_loop_review_stuck_after_three_attempts(tmp_path, monkeypatch) -> None:

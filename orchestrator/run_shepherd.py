@@ -75,6 +75,13 @@ DEFAULT_STATE_DIR = Path(
 
 # Claude review bot login (the actor on review/comment/reaction events).
 REVIEW_BOT = "claude[bot]"
+# Codex Review connector — the org-wide "Auto review" bot. Its trigger is
+# best-effort (does NOT fire on every push), so it never drives
+# has_responded; when it HAS posted P1/P2 findings on the current head they
+# gate the merge exactly like claude[bot]'s (org policy: 0 unaddressed
+# P1/P2 from whichever bots actually reviewed). See #67.
+CODEX_CONNECTOR_BOT = "chatgpt-codex-connector[bot]"
+GATING_BOTS = (REVIEW_BOT, CODEX_CONNECTOR_BOT)
 COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 
 # Statuses that the shepherd's discovery pass picks up. `implemented`
@@ -215,6 +222,7 @@ class CodexFinding:
     commit_id: str | None
     created_at: str | None
     severity: str  # "P1" or "P2"
+    author: str | None = None  # bot login; None in fixtures predating #67
 
 
 @dataclass
@@ -678,6 +686,11 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
     findings_p1_p2(at=head_sha) drops any finding whose commit_id is
     set but != head_sha so a P1 from an earlier commit that the
     follow-up already fixed cannot make the loop spin forever.
+
+    Findings are collected from BOTH gating bots (claude[bot] and
+    chatgpt-codex-connector[bot], see GATING_BOTS / #67); has_responded is
+    driven by claude[bot] alone — the connector's trigger is best-effort
+    and a PR must never wait on it.
     """
     has_responded = False
     findings: list[CodexFinding] = []
@@ -692,10 +705,13 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         print(f"warn: code reviews fetch failed for {pr.repo}#{pr.number}: {e.stderr.strip()}")
         reviews = []
     for r in reviews:
-        if (r.get("user") or {}).get("login") != REVIEW_BOT:
+        login = (r.get("user") or {}).get("login")
+        if login not in GATING_BOTS:
             continue
         commit_id = r.get("commit_id")
-        if commit_id and commit_id == pr.head_sha:
+        # Only the primary reviewer flips has_responded — the connector is
+        # best-effort and must not be waited on (see GATING_BOTS note).
+        if login == REVIEW_BOT and commit_id and commit_id == pr.head_sha:
             has_responded = True
         # Top-level review body can carry findings too.
         body = r.get("body") or ""
@@ -708,6 +724,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                 commit_id=commit_id,
                 created_at=r.get("submitted_at"),
                 severity=sev,
+                author=login,
             ))
 
     # 2. Line-anchored review comments — `gh api repos/.../pulls/<n>/comments`.
@@ -720,10 +737,11 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         print(f"warn: codex pull comments fetch failed: {e.stderr.strip()}")
         review_comments = []
     for c in review_comments:
-        if (c.get("user") or {}).get("login") != REVIEW_BOT:
+        login = (c.get("user") or {}).get("login")
+        if login not in GATING_BOTS:
             continue
         commit_id = c.get("commit_id")
-        if commit_id and commit_id == pr.head_sha:
+        if login == REVIEW_BOT and commit_id and commit_id == pr.head_sha:
             has_responded = True
         body = c.get("body") or ""
         sev = _extract_severity(body)
@@ -735,6 +753,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                 commit_id=commit_id,
                 created_at=c.get("created_at"),
                 severity=sev,
+                author=login,
             ))
 
     # 3. Issue comments — top-level `No P1/P2 findings` newer
@@ -779,6 +798,23 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                     commit_id=None,
                     created_at=created_at,
                     severity=sev,
+                    author=login,
+                ))
+        elif login == CODEX_CONNECTOR_BOT:
+            # Connector findings gate, but its presence/absence never
+            # drives has_responded — it does not review every push, and a
+            # PR must not wait on a reviewer that may never come.
+            created_at = c.get("created_at")
+            sev = _extract_severity(body)
+            if sev in ("P1", "P2") and _iso_gt(created_at, pr.head_pushed_at):
+                findings.append(CodexFinding(
+                    body=body,
+                    path=None,
+                    line=None,
+                    commit_id=None,
+                    created_at=created_at,
+                    severity=sev,
+                    author=login,
                 ))
 
     # +1 reaction by claude review bot on the latest @claude review trigger.
@@ -981,8 +1017,9 @@ def _serialise_findings(findings: list[CodexFinding]) -> str:
         loc = ""
         if f.path:
             loc = f.path + (f":{f.line}" if f.line else "")
+        who = f", {f.author}" if f.author else ""
         parts.append(
-            f"--- Finding {i} ({f.severity}) ---\n"
+            f"--- Finding {i} ({f.severity}{who}) ---\n"
             f"Location: {loc or '(top-level comment)'}\n"
             f"Body:\n{f.body}\n"
         )
@@ -1253,6 +1290,7 @@ def process_one(
         f"info: pr={pr.repo}#{pr.number} head={pr.head_sha[:8]} "
         f"merge_state={pr.merge_state_status} checks_green={pr.checks_green} "
         f"codex_responded={codex.has_responded} codex_findings={len(codex.findings)} "
+        f"connector_findings={sum(1 for f in codex.findings if f.author == CODEX_CONNECTOR_BOT)} "
         f"copilot_responded={copilot.has_responded} copilot_findings={copilot.findings_count} "
         f"-> {decision}"
     )
