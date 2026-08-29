@@ -35,10 +35,17 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+)
+from temporalio.exceptions import (
+    TimeoutError as TemporalTimeoutError,
+)
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
+    from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
@@ -93,6 +100,23 @@ SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
 # would just mean a wedged mutex holding the loop for hours.
 APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 
+# Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
+# state until it merges/closes. Two cheap GitHub reads per poll — 30 min is
+# responsive enough for a merge event nothing downstream reacts to in
+# real time yet, and ~2.9k history events over the full 14-day deadline
+# stays far under Temporal's 50k event limit. The deadline bounds the
+# workflow's lifetime: a PR still open after two weeks is returned as-is
+# (state="OPEN"), not waited on forever.
+MERGE_POLL_INTERVAL = timedelta(minutes=30)
+MERGE_WATCH_DEADLINE = timedelta(days=14)
+# The implementer writes the pr: link into .status.yaml in the same commit
+# that flips it to implemented, so the link should be visible on the first
+# poll. A few polls of grace absorb gitops main lag; after that, a missing
+# link means the status write failed — give up rather than poll for 14 days.
+PR_LOOKUP_GRACE_POLLS = 4
+PR_STATE_TIMEOUT = timedelta(minutes=2)
+PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
 
 @dataclass(frozen=True)
 class IssueRef:
@@ -109,6 +133,12 @@ class DevLoopResult:
     # workflow never reached the approve stage. Defaulted so results recorded
     # before this field existed still deserialize.
     approve: WorkflowResult | None = None
+    # Stage 6.1 merge detection (ADR-006, #214): the last PR state observed
+    # by the post-implement polling loop. None on pre-merge-detection
+    # histories and when implement never produced a PR to watch; a PRState
+    # with state="OPEN" means the watch deadline expired with the PR still
+    # open (the workflow does not wait forever).
+    pr: PRState | None = None
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -345,8 +375,106 @@ class DevLoopWorkflow:
         implement_result = await _run_cwft("mctl-agents-implement", implement_params)
         await _record("implementer", implementer_release, implement_result, target_repo)
 
+        # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
+        # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
+        # the slug (the PR is resolved from this proposal's .status.yaml);
+        # any execution new enough to record this marker also recorded
+        # slug-scoped-implement, so slug is set whenever the branch is taken.
+        pr_state: PRState | None = None
+        if workflow.patched("merge-detection") and implement_result.succeeded and slug:
+            pr_state = await self._watch_pr(target_repo, slug)
+
         return DevLoopResult(
             investigate=investigate_result,
             implement=implement_result,
             approve=approve_result,
+            pr=pr_state,
         )
+
+    async def _watch_pr(self, service: str, slug: str) -> PRState | None:
+        """Poll get_pr_state until the PR reaches a terminal state.
+
+        Observational, fail-open: a persistently failing read (GitHub outage
+        outlasting the activity retries) returns the last known state
+        instead of failing a loop whose implement already succeeded. Returns
+        None when no PR link ever appeared within the grace polls.
+        """
+        deadline = workflow.now() + MERGE_WATCH_DEADLINE
+        polls_without_pr = 0
+        last: PRState | None = None
+        while workflow.now() < deadline:
+            try:
+                state: PRState = await workflow.execute_activity(
+                    get_pr_state,
+                    args=[service, slug],
+                    start_to_close_timeout=PR_STATE_TIMEOUT,
+                    retry_policy=PR_STATE_RETRY_POLICY,
+                )
+            except ActivityError as exc:
+                # A read outage longer than the activity's retries must not
+                # abort a 14-day watch — ride KNOWN-transient failures out
+                # and poll again next interval (the deadline still bounds
+                # the loop). But only those: get_pr_state wraps every
+                # expected read failure in ProposalListingError, and an
+                # activity timeout is transport by definition, so anything
+                # else here is an unexpected bug in the activity — retrying
+                # that for 14 days would silently mask the defect (agy P2
+                # round 3). End the watch with the last observed state
+                # instead; implement already succeeded, so the loop's
+                # outcome must still not become a workflow failure.
+                cause = exc.cause
+                transient = isinstance(cause, TemporalTimeoutError) or (
+                    isinstance(cause, ApplicationError)
+                    and cause.type == "ProposalListingError"
+                )
+                if not transient:
+                    workflow.logger.warning(
+                        "get_pr_state failed with a non-transient error for "
+                        "%s/%s — ending the merge watch with the last "
+                        "observed state: %r",
+                        service,
+                        slug,
+                        cause,
+                    )
+                    return last
+                workflow.logger.warning(
+                    "get_pr_state failed after retries for %s/%s — retrying "
+                    "next poll interval",
+                    service,
+                    slug,
+                )
+                await workflow.sleep(MERGE_POLL_INTERVAL)
+                continue
+            if state.found:
+                last = state
+                polls_without_pr = 0
+                if state.state in ("MERGED", "CLOSED"):
+                    return state
+            else:
+                polls_without_pr += 1
+                if last is None and state.number is not None:
+                    # A PR link IS recorded but cannot be resolved right now
+                    # (repo/PR deleted, token lost access, wrong-repo link).
+                    # Preserve the reference in the result — it is the only
+                    # diagnostic pointer an operator gets. Only when nothing
+                    # better exists: a previously RESOLVED state must not be
+                    # downgraded to a found=False reference by a later 404.
+                    last = state
+                # Give up after GRACE consecutive unresolvable polls — this
+                # covers the link never appearing, a recorded PR that stays
+                # unresolvable, AND a status file deleted after the PR was
+                # once found (agy P3's zombie loop). The counter resets on
+                # every successful resolve, so one transient blip never
+                # ends the watch.
+                if polls_without_pr >= PR_LOOKUP_GRACE_POLLS:
+                    workflow.logger.warning(
+                        "merge watch for %s/%s giving up after %d consecutive "
+                        "polls without a resolvable PR (last=%s)",
+                        service,
+                        slug,
+                        polls_without_pr,
+                        "none" if last is None else (last.pr_url or "unresolved"),
+                    )
+                    return last
+            await workflow.sleep(MERGE_POLL_INTERVAL)
+        return last

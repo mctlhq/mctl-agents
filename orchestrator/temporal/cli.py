@@ -50,6 +50,19 @@ async def status(workflow_id: str) -> None:
             print("  implement:   not reached (the approve flip failed — see above)")
         else:
             print("  implement:   not reached (never approved, or investigate did not succeed)")
+        # Merge-detection outcome (stage 6.1, #214). Absent on results from
+        # pre-merge-detection histories and when implement never produced a
+        # PR to watch.
+        if result.pr is not None:
+            if result.pr.found:
+                print(f"  pr:          {result.pr.state} ({result.pr.pr_url})")
+            else:
+                print(
+                    "  pr:          unresolvable"
+                    + (f" ({result.pr.pr_url})" if result.pr.pr_url else " (no PR link recorded)")
+                )
+        elif result.implement and result.implement.succeeded:
+            print("  pr:          not watched (pre-merge-detection history, or no PR link appeared)")
 
 
 def main() -> None:
