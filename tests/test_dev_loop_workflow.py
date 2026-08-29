@@ -18,6 +18,7 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
@@ -27,6 +28,9 @@ from orchestrator.temporal.workflows.dev_loop import (
     DevLoopWorkflow,
     IssueRef,
 )
+
+_SENTINEL_TARGET = DeployTarget(team="admins", app="mctl-telegram")
+_DEFAULT_RELEASE = ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z")
 
 MERGED_PR = PRState(
     found=True,
@@ -66,6 +70,9 @@ def _fake_activities(
     pr_state_error_type: str | None = None,
     pr_state_raises_at: set[int] | None = None,
     shepherd_fails: bool = False,
+    deploy_target: DeployTarget | None = _SENTINEL_TARGET,
+    release: ReleaseInfo | None = _DEFAULT_RELEASE,
+    deploy_statuses: list[DeployStatus] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -120,6 +127,27 @@ def _fake_activities(
     async def fake_record_execution(record: ExecutionRecord) -> None:
         return None
 
+    # Stages 6.2/6.3 (#215). Defaults describe the happy path: the repo
+    # deploys an app, a release appears, and it goes Healthy at once.
+    @activity.defn(name="resolve_deploy_target")
+    async def fake_resolve_deploy_target(repo: str) -> DeployTarget | None:
+        return deploy_target
+
+    @activity.defn(name="get_release_after")
+    async def fake_get_release_after(repo: str, after: str) -> ReleaseInfo | None:
+        return release
+
+    deploy_sequence = deploy_statuses if deploy_statuses is not None else [
+        DeployStatus(found=True, image_tag="9.9.9", health="Healthy", sync_status="Synced")
+    ]
+    deploy_index = {"i": 0}
+
+    @activity.defn(name="get_deploy_status")
+    async def fake_get_deploy_status(team: str, app: str) -> DeployStatus:
+        i = min(deploy_index["i"], len(deploy_sequence) - 1)
+        deploy_index["i"] += 1
+        return deploy_sequence[i]
+
     # Merge-detection polls this after implement; the sequence is consumed
     # one state per poll, then the last entry repeats (a real PR's state is
     # sticky once terminal). Default: merged on the first poll.
@@ -154,6 +182,9 @@ def _fake_activities(
         fake_record_execution,
         _fake_find_proposal_slug,
         fake_get_pr_state,
+        fake_resolve_deploy_target,
+        fake_get_release_after,
+        fake_get_deploy_status,
     ]
     return activities, calls, investigate_ran
 
@@ -985,6 +1016,129 @@ class TestDevLoopWorkflow:
 
         assert seen[0] is False
         assert seen[1] is True
+
+    async def _run_to_completion(self, env, activities, investigate_ran, issue: int):
+        handle = await env.client.start_workflow(
+            DevLoopWorkflow.run,
+            IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+            id=f"dev-loop-test-{uuid.uuid4()}",
+            task_queue=TASK_QUEUE,
+        )
+        with anyio.fail_after(10):
+            await investigate_ran.wait()
+        await handle.signal(DevLoopWorkflow.approve)
+        return await handle.result()
+
+    async def test_deploy_observed_healthy_on_the_released_tag(self, env):
+        """Stage 6.2/6.3 happy path (#215): merged → release → Healthy."""
+        activities, _calls, investigate_ran = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 90)
+
+        assert result.deploy is not None
+        assert result.deploy.outcome == "healthy"
+        assert result.deploy.release_tag == "9.9.9"
+        assert result.deploy.image_tag == "9.9.9"
+        assert (result.deploy.team, result.deploy.app) == ("admins", "mctl-telegram")
+
+    async def test_deploy_waits_for_the_tag_to_catch_up(self, env):
+        """Synced/Healthy on the PREVIOUS tag is not this release landing.
+
+        The app is Healthy throughout — on the old image. Reporting that as
+        verified would call every rollout successful the instant it was
+        asked, before the new tag ever reached the cluster.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            deploy_statuses=[
+                DeployStatus(found=True, image_tag="9.9.8", health="Healthy", sync_status="Synced"),
+                DeployStatus(found=True, image_tag="9.9.9", health="Progressing", sync_status="Synced"),
+                DeployStatus(found=True, image_tag="9.9.9", health="Healthy", sync_status="Synced"),
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 91)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+        assert result.deploy.image_tag == "9.9.9"
+
+    async def test_deploy_unverified_when_it_never_goes_healthy(self, env):
+        """The deadline passing is an observation, not a workflow failure."""
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            deploy_statuses=[
+                DeployStatus(found=True, image_tag="9.9.9", health="Degraded", sync_status="Synced")
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 92)
+
+        assert result.deploy is not None
+        assert result.deploy.outcome == "unverified"
+        assert result.deploy.health == "Degraded"
+        # The rest of the loop still reports success — implement landed and
+        # the PR merged; an unverified rollout must not retro-fail either.
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert result.implement is not None and result.implement.succeeded
+
+    async def test_no_release_for_a_docs_only_merge(self, env):
+        """release-please cutting nothing is normal, not a fault."""
+        activities, _calls, investigate_ran = _fake_activities(released=True, release=None)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 93)
+
+        assert result.deploy is not None and result.deploy.outcome == "no-release"
+
+    async def test_no_target_when_the_repo_deploys_no_app(self, env):
+        """A repo whose release only bumps cluster templates has nothing to verify."""
+        activities, _calls, investigate_ran = _fake_activities(released=True, deploy_target=None)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 94)
+
+        assert result.deploy is not None and result.deploy.outcome == "no-target"
+
+    async def test_deploy_verifies_on_sync_health_when_no_image_tag_is_reported(self, env):
+        """Platform apps (mctl-api itself) resolve no service record.
+
+        mctl-api reports argocd health/sync but no imageTag for those, so
+        waiting for a tag match would time out every such loop.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            deploy_statuses=[
+                DeployStatus(found=True, image_tag=None, health="Healthy", sync_status="Synced")
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 95)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+        assert result.deploy.image_tag is None
+
+    async def test_unknown_argocd_application_stops_polling_immediately(self, env):
+        """A name that resolves to no app will not start existing."""
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, deploy_statuses=[DeployStatus(found=False)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 96)
+
+        assert result.deploy is not None and result.deploy.outcome == "unverified"
+        assert "no ArgoCD application" in (result.deploy.detail or "")
 
     async def test_failed_shepherd_tick_does_not_end_the_watch(self, env):
         """A failing shepherd tick is logged, not fatal — the watch keeps

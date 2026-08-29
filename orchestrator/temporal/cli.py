@@ -63,6 +63,18 @@ async def status(workflow_id: str) -> None:
                 )
         elif result.implement and result.implement.succeeded:
             print("  pr:          not watched (pre-merge-detection history, or no PR link appeared)")
+        # Deploy observation (stages 6.2/6.3, #215). Absent unless the PR
+        # merged under a history new enough to carry the stage.
+        if result.deploy is not None:
+            d = result.deploy
+            where = f"{d.team}/{d.app}" if d.team and d.app else "-"
+            print(f"  deploy:      {d.outcome} ({where})")
+            if d.release_tag:
+                print(f"    release:   {d.release_tag}")
+            if d.health or d.sync_status:
+                print(f"    argocd:    {d.sync_status or '?'}/{d.health or '?'} tag={d.image_tag or '-'}")
+            if d.detail:
+                print(f"    detail:    {d.detail}")
 
 
 def main() -> None:

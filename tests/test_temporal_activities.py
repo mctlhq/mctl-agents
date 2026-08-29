@@ -817,3 +817,175 @@ class TestGetPRState:
         _mock_async_client(monkeypatch, handler)
         with pytest.raises(ProposalListingError, match="non-JSON"):
             await env.run(get_pr_state, "mctl-web", "issue-10-test")
+
+
+class TestResolveDeployTarget:
+    """#215: repo → (team, app), the mapping that exists only as dispatch args."""
+
+    PATH = "/repos/mctlhq/mctl-agents/contents/.github/workflows/release-please.yml"
+
+    @staticmethod
+    def _contents(body: str) -> dict:
+        import base64 as _b64
+
+        return {"content": _b64.b64encode(body.encode()).decode()}
+
+    def _handler(self, monkeypatch, *, body: str | None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self.PATH:
+                if body is None:
+                    return httpx.Response(404, json={"message": "Not Found"})
+                return httpx.Response(200, json=self._contents(body))
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_values_path_wins_over_component_name(self, env, monkeypatch):
+        """The real mctl-agents case, and the whole reason this is not trivial.
+
+        component_name is `mctl-agents`, but the deployed ArgoCD app is
+        `admins-mctl-agents-worker`; asking mctl-api for admins/mctl-agents
+        returns "application not found".
+        """
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            body=(
+                "            -f team_name=admins \\\n"
+                "            -f component_name=mctl-agents \\\n"
+                '            -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-*.yaml" \\\n'
+                '            -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml"\n'
+            ),
+        )
+        target = await env.run(resolve_deploy_target, "mctlhq/mctl-agents")
+        assert target is not None
+        assert (target.team, target.app) == ("admins", "mctl-agents-worker")
+
+    async def test_falls_back_to_component_when_values_path_is_not_a_service(
+        self, env, monkeypatch
+    ):
+        """mctl-api bumps a bootstrap template, which names no service dir."""
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            body=(
+                "            -f team_name=admins \\\n"
+                "            -f component_name=mctl-api \\\n"
+                '            -f values_path="platform-gitops/bootstrap/templates/mctl-platform/mctl-api.yaml"\n'
+            ),
+        )
+        target = await env.run(resolve_deploy_target, "mctlhq/mctl-agents")
+        assert target is not None
+        assert (target.team, target.app) == ("admins", "mctl-api")
+
+    async def test_no_dispatch_args_means_no_target(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(monkeypatch, body="name: release-please\non: push\n")
+        assert await env.run(resolve_deploy_target, "mctlhq/mctl-agents") is None
+
+    async def test_missing_workflow_file_means_no_target(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(monkeypatch, body=None)
+        assert await env.run(resolve_deploy_target, "mctlhq/mctl-agents") is None
+
+
+class TestGetReleaseAfter:
+    PATH = "/repos/mctlhq/mctl-web/releases"
+
+    def _handler(self, monkeypatch, payload):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self.PATH:
+                return httpx.Response(200, json=payload)
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_picks_the_newest_release_after_the_merge(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import get_release_after
+
+        self._handler(
+            monkeypatch,
+            [
+                {"tag_name": "1.0.0", "published_at": "2026-08-29T10:00:00Z"},
+                {"tag_name": "1.2.0", "published_at": "2026-08-30T12:00:00Z"},
+                {"tag_name": "1.1.0", "published_at": "2026-08-30T09:00:00Z"},
+            ],
+        )
+        release = await env.run(get_release_after, "mctlhq/mctl-web", "2026-08-30T08:00:00Z")
+        assert release is not None and release.tag == "1.2.0"
+
+    async def test_a_release_older_than_the_merge_is_not_ours(self, env, monkeypatch):
+        """Otherwise every merge would 'observe' the previous release."""
+        from orchestrator.temporal.activities.deploy_state import get_release_after
+
+        self._handler(
+            monkeypatch, [{"tag_name": "1.0.0", "published_at": "2026-08-29T10:00:00Z"}]
+        )
+        assert await env.run(get_release_after, "mctlhq/mctl-web", "2026-08-30T08:00:00Z") is None
+
+    async def test_drafts_are_ignored(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import get_release_after
+
+        self._handler(
+            monkeypatch,
+            [{"tag_name": "1.3.0", "published_at": "2026-08-30T12:00:00Z", "draft": True}],
+        )
+        assert await env.run(get_release_after, "mctlhq/mctl-web", "2026-08-30T08:00:00Z") is None
+
+
+class TestGetDeployStatus:
+    def _handler(self, monkeypatch, payload, status=200):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/status/admins/mctl-web":
+                return httpx.Response(status, json=payload)
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("MCTL_TOKEN", "mctl-test-token")
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_reads_tag_health_and_sync(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import get_deploy_status
+
+        self._handler(
+            monkeypatch,
+            {
+                "argocd": {"health": "Healthy", "syncStatus": "Synced"},
+                "service": {"imageTag": "7.4.0"},
+            },
+        )
+        status = await env.run(get_deploy_status, "admins", "mctl-web")
+        assert (status.found, status.image_tag, status.health, status.sync_status) == (
+            True,
+            "7.4.0",
+            "Healthy",
+            "Synced",
+        )
+
+    async def test_platform_app_without_a_service_record_has_no_tag(self, env, monkeypatch):
+        """mctl-api answers argocd-only for its own platform application."""
+        from orchestrator.temporal.activities.deploy_state import get_deploy_status
+
+        self._handler(
+            monkeypatch,
+            {"argocd": {"health": "Healthy", "syncStatus": "Synced"}, "service": None},
+        )
+        status = await env.run(get_deploy_status, "admins", "mctl-web")
+        assert status.found is True and status.image_tag is None
+
+    async def test_missing_application_is_not_found(self, env, monkeypatch):
+        """mctl-api answers 200 with argocd:null and a note, not a 404."""
+        from orchestrator.temporal.activities.deploy_state import get_deploy_status
+
+        self._handler(
+            monkeypatch, {"argocd": None, "note": "ArgoCD application not found", "service": None}
+        )
+        status = await env.run(get_deploy_status, "admins", "mctl-web")
+        assert status.found is False

@@ -55,6 +55,11 @@ class PRState:
     state: str | None = None
     merged: bool = False
     merge_commit: str | None = None
+    # Merge timestamp (ISO-8601, GitHub's own). Stage 6.2 needs it to tell
+    # the release this merge produced from one cut moments earlier by an
+    # unrelated merge. Defaulted so results recorded before this field
+    # existed still deserialize.
+    merged_at: str | None = None
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -167,6 +172,7 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         state=state,
         merged=merged,
         merge_commit=data.get("merge_commit_sha") if merged else None,
+        merged_at=data.get("merged_at") if merged else None,
     )
     activity.logger.info(
         "pr_state service=%s slug=%s pr=%s#%s state=%s", service, slug, repo, number, state
