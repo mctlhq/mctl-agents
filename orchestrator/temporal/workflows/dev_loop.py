@@ -634,6 +634,13 @@ class DevLoopWorkflow:
                                 slug,
                             )
                         else:
+                            # Drain the previous, already-finished tick
+                            # before dropping the reference: after this
+                            # rebind nothing else can retrieve its
+                            # exception, and only the final task is
+                            # guaranteed to reach _settle_tick.
+                            if tick_task is not None:
+                                _drain_tick(tick_task, service, slug)
                             shepherd_ticks += 1
                             tick_task = asyncio.create_task(self._shepherd_tick(service, slug))
                 else:
