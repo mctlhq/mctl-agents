@@ -30,6 +30,7 @@ different issue's — proposal.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -418,6 +419,60 @@ class DevLoopWorkflow:
             pr=pr_state,
         )
 
+    async def _shepherd_tick(self, service: str, slug: str) -> None:
+        """One in-loop shepherd run for exactly this proposal (#213).
+
+        The same one-shot the cron ran, scoped to service+slug (which puts
+        run_shepherd in targeted mode, bypassing the ownership filter). A
+        failed tick is logged, not raised: the watch itself is the durable
+        part, and the next boundary retries.
+        """
+        try:
+            # Pin the released shepherd image exactly like the
+            # investigate/implement steps do, so a promotion or rollback in
+            # the agent registry reaches in-loop ticks too — otherwise
+            # DevLoop-owned proposals would silently run the CWFT's
+            # baked-in default while cron-driven ones ran the intended
+            # release.
+            shepherd_release = await _resolve("shepherd")
+            tick_params = {"service": service, "slug": slug}
+            if shepherd_release and shepherd_release.image_ref:
+                tick_params["agent_image"] = shepherd_release.image_ref
+                tick_params["agent_version"] = f"shepherd@{shepherd_release.version}"
+            tick_result = await _run_cwft("mctl-agents-shepherd", tick_params)
+            await _record("shepherd", shepherd_release, tick_result, service)
+        except ActivityError as exc:
+            workflow.logger.warning(
+                "in-loop shepherd tick failed for %s/%s — the watch "
+                "continues: %r",
+                service,
+                slug,
+                exc.cause,
+            )
+
+    async def _settle_tick(self, tick_task: asyncio.Task[None] | None, service: str, slug: str) -> None:
+        """Leave no pending tick behind when the watch ends (#231).
+
+        A workflow that completes with an outstanding task is a Temporal
+        error, and once the PR is merged/closed the tick's verdict is moot
+        — so cancel rather than wait, which is the whole point of running
+        it concurrently. Cancelling the activity does not stop the Argo
+        workflow it submitted; that run finishes on its own, exactly as it
+        would have if this loop had never waited for it.
+        """
+        if tick_task is None or tick_task.done():
+            return
+        workflow.logger.info(
+            "cancelling an in-flight shepherd tick for %s/%s — the watch is ending",
+            service,
+            slug,
+        )
+        tick_task.cancel()
+        try:
+            await tick_task
+        except Exception as exc:  # noqa: BLE001 — CancelledError, or anything the tick raised on its way out
+            workflow.logger.debug("in-flight shepherd tick ended with %r", exc)
+
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
         """Poll get_pr_state until the PR reaches a terminal state.
 
@@ -437,118 +492,130 @@ class DevLoopWorkflow:
         # two points this execution IS the owner, and the cron must already
         # be standing down.
         self._shepherd_in_loop = shepherd_in_loop
+        # #231: run the tick concurrently so polling continues while it
+        # runs. Awaiting it inline stalled merge detection for the tick's
+        # whole duration — up to the 2 h SDK_STEP_TIMEOUT when the shepherd
+        # spawns a follow-up implementation, against a 30-min poll
+        # interval. Its own marker, because it changes the ORDER of
+        # commands in history: executions that already recorded a
+        # sequential tick must keep replaying one.
+        concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
+        tick_task: asyncio.Task[None] | None = None
         poll_index = 0
         shepherd_ticks = 0
-        while workflow.now() < deadline:
-            try:
-                state: PRState = await workflow.execute_activity(
-                    get_pr_state,
-                    args=[service, slug],
-                    start_to_close_timeout=PR_STATE_TIMEOUT,
-                    retry_policy=PR_STATE_RETRY_POLICY,
-                )
-            except ActivityError as exc:
-                # A read outage longer than the activity's retries must not
-                # abort a 14-day watch — ride KNOWN-transient failures out
-                # and poll again next interval (the deadline still bounds
-                # the loop). But only those: get_pr_state wraps every
-                # expected read failure in ProposalListingError, and an
-                # activity timeout is transport by definition, so anything
-                # else here is an unexpected bug in the activity — retrying
-                # that for 14 days would silently mask the defect (agy P2
-                # round 3). End the watch with the last observed state
-                # instead; implement already succeeded, so the loop's
-                # outcome must still not become a workflow failure.
-                cause = exc.cause
-                transient = isinstance(cause, TemporalTimeoutError) or (
-                    isinstance(cause, ApplicationError)
-                    and cause.type == "ProposalListingError"
-                )
-                if not transient:
-                    workflow.logger.warning(
-                        "get_pr_state failed with a non-transient error for "
-                        "%s/%s — ending the merge watch with the last "
-                        "observed state: %r",
-                        service,
-                        slug,
-                        cause,
+        try:
+            while workflow.now() < deadline:
+                try:
+                    state: PRState = await workflow.execute_activity(
+                        get_pr_state,
+                        args=[service, slug],
+                        start_to_close_timeout=PR_STATE_TIMEOUT,
+                        retry_policy=PR_STATE_RETRY_POLICY,
                     )
-                    return last
-                workflow.logger.warning(
-                    "get_pr_state failed after retries for %s/%s — retrying "
-                    "next poll interval",
-                    service,
-                    slug,
-                )
-                await workflow.sleep(MERGE_POLL_INTERVAL)
-                continue
-            if state.found:
-                last = state
-                polls_without_pr = 0
-                if state.state in ("MERGED", "CLOSED"):
-                    return state
-                # Counted only on a successful read, so a transient
-                # get_pr_state failure delays the next tick instead of
-                # consuming its boundary and dropping it for ~4 h.
-                poll_index += 1
-                if (
-                    shepherd_in_loop
-                    and poll_index % SHEPHERD_TICK_EVERY_POLLS == 0
-                    and shepherd_ticks < SHEPHERD_TICKS_MAX
-                ):
-                    # The tick is the same one-shot the cron ran, scoped to
-                    # exactly this proposal (service+slug → run_shepherd's
-                    # targeted mode, which bypasses the ownership filter).
-                    # A failed tick is logged, not fatal: the watch itself
-                    # is the durable part, and the next tick retries.
-                    shepherd_ticks += 1
-                    try:
-                        # Pin the released shepherd image exactly like the
-                        # investigate/implement steps do, so a promotion or
-                        # rollback in the agent registry reaches in-loop
-                        # ticks too — otherwise DevLoop-owned proposals
-                        # would silently run the CWFT's baked-in default
-                        # while cron-driven ones ran the intended release.
-                        shepherd_release = await _resolve("shepherd")
-                        tick_params = {"service": service, "slug": slug}
-                        if shepherd_release and shepherd_release.image_ref:
-                            tick_params["agent_image"] = shepherd_release.image_ref
-                            tick_params["agent_version"] = f"shepherd@{shepherd_release.version}"
-                        tick_result = await _run_cwft("mctl-agents-shepherd", tick_params)
-                        await _record("shepherd", shepherd_release, tick_result, service)
-                    except ActivityError as exc:
+                except ActivityError as exc:
+                    # A read outage longer than the activity's retries must not
+                    # abort a 14-day watch — ride KNOWN-transient failures out
+                    # and poll again next interval (the deadline still bounds
+                    # the loop). But only those: get_pr_state wraps every
+                    # expected read failure in ProposalListingError, and an
+                    # activity timeout is transport by definition, so anything
+                    # else here is an unexpected bug in the activity — retrying
+                    # that for 14 days would silently mask the defect (agy P2
+                    # round 3). End the watch with the last observed state
+                    # instead; implement already succeeded, so the loop's
+                    # outcome must still not become a workflow failure.
+                    cause = exc.cause
+                    transient = isinstance(cause, TemporalTimeoutError) or (
+                        isinstance(cause, ApplicationError)
+                        and cause.type == "ProposalListingError"
+                    )
+                    if not transient:
                         workflow.logger.warning(
-                            "in-loop shepherd tick failed for %s/%s — the "
-                            "watch continues: %r",
+                            "get_pr_state failed with a non-transient error for "
+                            "%s/%s — ending the merge watch with the last "
+                            "observed state: %r",
                             service,
                             slug,
-                            exc.cause,
+                            cause,
                         )
-            else:
-                polls_without_pr += 1
-                if last is None and state.number is not None:
-                    # A PR link IS recorded but cannot be resolved right now
-                    # (repo/PR deleted, token lost access, wrong-repo link).
-                    # Preserve the reference in the result — it is the only
-                    # diagnostic pointer an operator gets. Only when nothing
-                    # better exists: a previously RESOLVED state must not be
-                    # downgraded to a found=False reference by a later 404.
-                    last = state
-                # Give up after GRACE consecutive unresolvable polls — this
-                # covers the link never appearing, a recorded PR that stays
-                # unresolvable, AND a status file deleted after the PR was
-                # once found (agy P3's zombie loop). The counter resets on
-                # every successful resolve, so one transient blip never
-                # ends the watch.
-                if polls_without_pr >= PR_LOOKUP_GRACE_POLLS:
+                        return last
                     workflow.logger.warning(
-                        "merge watch for %s/%s giving up after %d consecutive "
-                        "polls without a resolvable PR (last=%s)",
+                        "get_pr_state failed after retries for %s/%s — retrying "
+                        "next poll interval",
                         service,
                         slug,
-                        polls_without_pr,
-                        "none" if last is None else (last.pr_url or "unresolved"),
                     )
-                    return last
-            await workflow.sleep(MERGE_POLL_INTERVAL)
+                    await workflow.sleep(MERGE_POLL_INTERVAL)
+                    continue
+                if state.found:
+                    last = state
+                    polls_without_pr = 0
+                    if state.state in ("MERGED", "CLOSED"):
+                        return state
+                    # Counted only on a successful read, so a transient
+                    # get_pr_state failure delays the next tick instead of
+                    # consuming its boundary and dropping it for ~4 h.
+                    poll_index += 1
+                    if (
+                        shepherd_in_loop
+                        and poll_index % SHEPHERD_TICK_EVERY_POLLS == 0
+                        and shepherd_ticks < SHEPHERD_TICKS_MAX
+                    ):
+                        # The tick is the same one-shot the cron ran, scoped to
+                        # exactly this proposal (service+slug → run_shepherd's
+                        # targeted mode, which bypasses the ownership filter).
+                        # A failed tick is logged, not fatal: the watch itself
+                        # is the durable part, and the next tick retries.
+                        if not concurrent_ticks:
+                            # Legacy sequential path. Histories recorded before
+                            # the concurrent-shepherd-tick marker interleave the
+                            # tick's commands with the poll's in exactly this
+                            # order; running them as a task instead would be a
+                            # command mismatch on replay.
+                            shepherd_ticks += 1
+                            await self._shepherd_tick(service, slug)
+                        elif tick_task is not None and not tick_task.done():
+                            # Never two shepherds on one proposal: they would
+                            # race on the same .status.yaml, and the tick cap
+                            # accounting assumes one at a time. A boundary that
+                            # lands on a still-running tick is skipped, not
+                            # queued — and does not consume the budget.
+                            workflow.logger.info(
+                                "in-loop shepherd tick still running for %s/%s — "
+                                "skipping this tick boundary",
+                                service,
+                                slug,
+                            )
+                        else:
+                            shepherd_ticks += 1
+                            tick_task = asyncio.create_task(self._shepherd_tick(service, slug))
+                else:
+                    polls_without_pr += 1
+                    if last is None and state.number is not None:
+                        # A PR link IS recorded but cannot be resolved right now
+                        # (repo/PR deleted, token lost access, wrong-repo link).
+                        # Preserve the reference in the result — it is the only
+                        # diagnostic pointer an operator gets. Only when nothing
+                        # better exists: a previously RESOLVED state must not be
+                        # downgraded to a found=False reference by a later 404.
+                        last = state
+                    # Give up after GRACE consecutive unresolvable polls — this
+                    # covers the link never appearing, a recorded PR that stays
+                    # unresolvable, AND a status file deleted after the PR was
+                    # once found (agy P3's zombie loop). The counter resets on
+                    # every successful resolve, so one transient blip never
+                    # ends the watch.
+                    if polls_without_pr >= PR_LOOKUP_GRACE_POLLS:
+                        workflow.logger.warning(
+                            "merge watch for %s/%s giving up after %d consecutive "
+                            "polls without a resolvable PR (last=%s)",
+                            service,
+                            slug,
+                            polls_without_pr,
+                            "none" if last is None else (last.pr_url or "unresolved"),
+                        )
+                        return last
+                await workflow.sleep(MERGE_POLL_INTERVAL)
+        finally:
+            await self._settle_tick(tick_task, service, slug)
         return last
