@@ -87,7 +87,7 @@ researcher / analyst / spec-writer  (Tier 1: per-service rotation)
         |                                          |
         v                                          v
    proposals/<slug>/{requirements,design,tasks}.md  (status: proposed)
-        |  (mentor or human flips status: accepted)
+        |  (approve: DevLoop-сигнал / mctl-agents-approve → status: accepted)
         v
    run_implementer.py  (Tier 2)  -->  feat/agents-<slug> + open PR
         |                              status: implemented, pr: <url>
@@ -111,8 +111,11 @@ human-filed feature request) and converts it into the same
 4. Writes `.status.yaml` with `status: proposed` plus a `source` block
    linking back to the issue, and comments the proposal link on the issue.
 
-The proposal then follows the normal path: a human flips it to
-`accepted`, Tier 2 implements it, and the PR carries `Closes <repo>#<N>`
+The proposal then follows the normal path: a human approves it (the
+DevLoopWorkflow's `approve()` signal submits the `mctl-agents-approve`
+CWFT, which commits the `proposed → accepted` flip to gitops; outside a
+DevLoop the same operation can be run directly), Tier 2 implements it,
+and the PR carries `Closes <repo>#<N>`
 (read from the `source` block) so the issue auto-closes on merge.
 Triggered on demand — by the `mctl_trigger_issue` MCP tool or an operator
 submitting the `mctl-agents-investigate` workflow.

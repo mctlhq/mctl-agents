@@ -3,15 +3,22 @@ stateDiagram-v2
     ResolveInvestigator --> Investigate: агент запинен один раз
     Investigate --> Failed: phase != Succeeded
     Investigate --> AwaitApproval: Succeeded
-    AwaitApproval --> ResolveImplementer: approve()
-    ResolveImplementer --> Implement: service = repo этого issue
+    AwaitApproval --> ResolveSlug: approve({approver}?)
+    ResolveSlug --> Approve: slug issue-N-* найден
+    ResolveSlug --> Failed: слага нет — отказ от unscoped-рана
+    Approve --> ResolveImplementer: флип proposed→accepted закоммичен
+    Approve --> Failed: флип не удался — implement не запускается
+    ResolveImplementer --> Implement: service + slug этого issue
     Implement --> Done
     Failed --> [*]
     Done --> [*]
 
     note right of AwaitApproval
       wait_condition — ждём сигнала сколько угодно.
-      approve() НЕ флипает .status.yaml:
-      proposed → accepted руками в gitops,
-      иначе implement-CWFT no-op (skipped_reason)
+      approve() теперь ФЛИПАЕТ .status.yaml:
+      CWFT mctl-agents-approve коммитит
+      proposed → accepted под mutex (идемпотентно,
+      approver в approval-блоке и коммите).
+      Старые in-flight histories (до патча
+      atomic-approve) — прежняя ветка: флип руками.
     end note
