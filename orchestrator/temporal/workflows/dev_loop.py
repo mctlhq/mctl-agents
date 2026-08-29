@@ -452,11 +452,13 @@ class DevLoopWorkflow:
                     return state
             else:
                 polls_without_pr += 1
-                if state.number is not None:
+                if last is None and state.number is not None:
                     # A PR link IS recorded but cannot be resolved right now
                     # (repo/PR deleted, token lost access, wrong-repo link).
                     # Preserve the reference in the result — it is the only
-                    # diagnostic pointer an operator gets.
+                    # diagnostic pointer an operator gets. Only when nothing
+                    # better exists: a previously RESOLVED state must not be
+                    # downgraded to a found=False reference by a later 404.
                     last = state
                 # Give up after GRACE consecutive unresolvable polls — this
                 # covers the link never appearing, a recorded PR that stays

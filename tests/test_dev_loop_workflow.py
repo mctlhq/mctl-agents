@@ -829,3 +829,44 @@ class TestDevLoopWorkflow:
         assert result.implement is not None and result.implement.phase == "Succeeded"
         assert result.pr is not None
         assert result.pr.state == "OPEN"
+
+    async def test_merge_detection_keeps_resolved_state_over_later_404(self, env):
+        """A recorded PR that 404s AFTER a successful resolve must not
+        downgrade the result: the watch ends with the confirmed OPEN state,
+        not the poorer found=False reference."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        vanished_with_ref = PRState(
+            found=False,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr, vanished_with_ref]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/84"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.found is True
+        assert result.pr.state == "OPEN"
