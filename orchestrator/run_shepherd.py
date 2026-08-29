@@ -150,8 +150,15 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
         # (also satisfies ruff S310's audited-scheme requirement).
         print(f"warn: dev-loop liveness check skipped: non-https MCTL_API_URL {MCTL_API_URL}")
         return False
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})  # noqa: S310 — scheme pinned to https above
     try:
+        # Constructed INSIDE the guard: Request.__init__ parses the url and
+        # raises ValueError on a malformed one (an unmatched IPv6 bracket,
+        # say). Outside, that escaped every except clause here, surfaced on
+        # the future in _filter_dev_loop_owned, and aborted the whole sweep
+        # instead of failing open for the one proposal.
+        request = urllib.request.Request(  # noqa: S310 — scheme pinned to https above
+            url, headers={"Authorization": f"Bearer {token}"}
+        )
         # _NoRedirects, not the default opener: urllib replays the request
         # headers — MCTL_TOKEN included — at whatever a 3xx points to, so a
         # misconfigured or hostile redirect to http:// or another host would
@@ -222,6 +229,13 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
                 "proposal(s) unchecked — sweeping them"
             )
     finally:
+        # Bounds this function; it cannot make an already-started worker
+        # free. concurrent.futures.thread registers a process-wide
+        # _python_exit atexit hook that joins every live pool thread, so a
+        # hung call can still delay interpreter exit — but only by its own
+        # DEV_LOOP_LIVENESS_TIMEOUT_S socket timeout, which is why that
+        # timeout is 10s and not the budget. The tick's *work* stays inside
+        # the budget either way; only the process's last breath waits.
         pool.shutdown(wait=False, cancel_futures=True)
     kept: list[ProposalRef] = []
     for i, ref in enumerate(refs):

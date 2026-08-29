@@ -2398,3 +2398,33 @@ def test_filter_dev_loop_owned_returns_within_budget_with_queued_work(
 
     assert len(kept) == 12
     assert elapsed < 3.0, f"ownership pass overshot its budget: {elapsed:.1f}s"
+
+
+def test_dev_loop_owns_malformed_url_fails_open(monkeypatch) -> None:
+    """A malformed https URL must not abort the sweep (#230 round 4 P2).
+
+    `urllib.request.Request.__init__` parses the url and raises
+    ValueError on e.g. an unmatched IPv6 bracket. Constructed outside the
+    guarded block that exception escaped `_dev_loop_owns` entirely,
+    surfaced on the future in `_filter_dev_loop_owned`, and took down the
+    whole tick instead of failing open for the one proposal.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "https://[::1:8080")
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_filter_survives_a_malformed_url_for_every_ref(monkeypatch) -> None:
+    """Counterpart at the call site: the sweep still returns every ref."""
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "https://[::1:8080")
+    refs = [
+        run_shepherd.ProposalRef(
+            service="mctl-web",
+            slug=f"issue-{i}-test",
+            proposal_dir=Path("/tmp/x"),
+            status="implemented",
+        )
+        for i in range(3)
+    ]
+    assert run_shepherd._filter_dev_loop_owned(refs) == refs
