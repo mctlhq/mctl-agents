@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.32.0](https://github.com/mctlhq/mctl-agents/compare/1.31.0...1.32.0) (2026-08-29)
+
+
+### Features
+
+* **agents:** define AgentDefinition and ExecutionProfile contract ([7bf55c2](https://github.com/mctlhq/mctl-agents/commit/7bf55c241efafa588999e09f93752003fe13a35a))
+* **agents:** issue-226-architecture-agent-platform-define-agent ([7bf55c2](https://github.com/mctlhq/mctl-agents/commit/7bf55c241efafa588999e09f93752003fe13a35a))
+* **agents:** issue-226-architecture-agent-platform-define-agent ([7dfaf06](https://github.com/mctlhq/mctl-agents/commit/7dfaf06a511cebb2c8b6f5f178e6fac0412cc071))
+
 ## [1.31.0](https://github.com/mctlhq/mctl-agents/compare/1.30.0...1.31.0) (2026-08-29)
 
 
