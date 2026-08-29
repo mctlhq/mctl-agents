@@ -78,7 +78,8 @@ jobs:
             -f image_tag="$TAG" \
             -f team_name=admins \
             -f component_name=mctl-agents \
-            -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml"
+            -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml" \
+            -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml"
 
       - name: Notify Telegram on release/deploy failure
         if: ${{ failure() && steps.release.outputs.release_created == 'true' }}
