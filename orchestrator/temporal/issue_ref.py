@@ -25,3 +25,13 @@ def parse_issue_url(issue_url: str) -> IssueRefParts:
         raise ValueError(f"{issue_url!r} does not look like a mctlhq GitHub issue URL")
     repo, number = match.groups()
     return IssueRefParts(owner="mctlhq", repo=repo, number=number)
+
+
+def workflow_id_for(issue_url: str) -> str:
+    # dev-loop-{owner}-{repo}-{issue} — Temporal's own workflow-ID dedup
+    # replaces the hand-rolled "already past proposed" guard the cron
+    # pipeline needed pre-Temporal. Lives here (not start.py) so callers
+    # that only need the id string — e.g. the investigator's issue comment,
+    # which runs inside the agent container — never import temporalio.
+    parts = parse_issue_url(issue_url)
+    return f"dev-loop-{parts.owner}-{parts.repo}-{parts.number}"

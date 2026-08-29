@@ -42,8 +42,12 @@ async def status(workflow_id: str) -> None:
     if desc.status is not None and desc.status.name == "COMPLETED":
         result: DevLoopResult = await handle.result()
         print(f"  investigate: {result.investigate.phase} ({result.investigate.workflow_name})")
+        if result.approve:
+            print(f"  approve:     {result.approve.phase} ({result.approve.workflow_name})")
         if result.implement:
             print(f"  implement:   {result.implement.phase} ({result.implement.workflow_name})")
+        elif result.approve and not result.approve.succeeded:
+            print("  implement:   not reached (the approve flip failed — see above)")
         else:
             print("  implement:   not reached (never approved, or investigate did not succeed)")
 

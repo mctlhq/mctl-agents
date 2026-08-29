@@ -9,24 +9,24 @@ approval signal -> implement -> PR"). The review/fix loop (shepherd) and
 deploy/monitor stages are phase 5/6 work, layered on top of this workflow
 once the slice is proven, not reimplemented here.
 
-Known simplification: approval is signal-only in this version, and does NOT
-itself flip the proposal's `.status.yaml` from `proposed` to `accepted` — an
-operator still does that by editing gitops directly (the pre-Temporal
-affordance), same as the legacy cron-driven pipeline. `approve()` only
-unblocks this workflow's wait_condition; the implement step below still
-requires the proposal to already be `accepted` by the time it runs, or the
-CWFT skips it with `skipped_reason` (a safe no-op, not an error). Automating
-that flip requires a new gitops-committing step, which per this plan's
-"gitops commit step" constraint must run inside Argo (the only place holding
-the `mctl-gitops-main-writes` mutex) — i.e. a new CWFT parameter, a
-cross-repo change deferred to phase 5's cutover rather than done here.
+Approval is atomic as of the phase-5 cutover (mctl-agents#150): `approve()`
+unblocks this workflow's wait_condition AND the workflow then submits the
+`mctl-agents-approve` CWFT, which flips exactly this issue's proposal from
+`proposed` to `accepted` as a gitops commit under the
+`mctl-gitops-main-writes` mutex. The flip runs inside Argo because this
+worker deliberately holds no gitops checkout or deploy key — every gitops
+write must go through Argo. The signal optionally carries the approver's
+identity, which lands in the proposal's approval block, the gitops commit
+message, and the execution audit trail. The flip CWFT is idempotent
+(already-accepted is a successful no-op), so a Temporal retry or a racing
+manual approve never fails the loop. Histories recorded before this change
+replay the legacy signal-only branch via workflow.patched("atomic-approve");
+for those in-flight loops the manual gitops flip remains the affordance.
 
-To keep that gap from ever implementing the WRONG proposal in the meantime,
-the implement step is scoped to this issue's own repo via the CWFT's existing
-`service` parameter (see `_target_repo` below) — so an approve() on this
-workflow can at worst no-op (nothing accepted yet in this repo) or implement
-a different already-accepted proposal in the SAME repo, never a different
-repo's issue.
+The implement step stays scoped to this issue's own repo AND its own
+proposal slug (see `_target_repo` and `find_proposal_slug` below), so even
+a mis-signalled approve can never implement a different repo's — or a
+different issue's — proposal.
 """
 from __future__ import annotations
 
@@ -88,6 +88,11 @@ SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
     maximum_attempts=12,
 )
 
+# The approve CWFT is clone + one-line flip + push — no agent, no SDK, and
+# its own activeDeadlineSeconds is 600. Anything near SDK_STEP_TIMEOUT here
+# would just mean a wedged mutex holding the loop for hours.
+APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
+
 
 @dataclass(frozen=True)
 class IssueRef:
@@ -97,7 +102,13 @@ class IssueRef:
 @dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
-    implement: WorkflowResult | None  # None if approval was never signalled
+    # None if approval was never signalled, investigate failed, or the
+    # approve flip failed (see `approve` below to tell those apart).
+    implement: WorkflowResult | None
+    # None on pre-atomic-approve histories (legacy manual flip) and when the
+    # workflow never reached the approve stage. Defaulted so results recorded
+    # before this field existed still deserialize.
+    approve: WorkflowResult | None = None
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -109,11 +120,13 @@ async def _resolve(agent: str) -> ResolvedRelease | None:
     )
 
 
-async def _run_cwft(operation: str, params: dict[str, str]) -> WorkflowResult:
+async def _run_cwft(
+    operation: str, params: dict[str, str], *, step_timeout: timedelta = SDK_STEP_TIMEOUT
+) -> WorkflowResult:
     return await workflow.execute_activity(
         submit_and_wait,
         SubmitAndWaitInput(operation=operation, params=params),
-        start_to_close_timeout=SDK_STEP_TIMEOUT,
+        start_to_close_timeout=step_timeout,
         heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
         retry_policy=SDK_STEP_RETRY_POLICY,
     )
@@ -169,9 +182,21 @@ async def _record(
 class DevLoopWorkflow:
     def __init__(self) -> None:
         self._approved = False
+        self._approver: str | None = None
 
     @workflow.signal
     def approve(self, *args: object) -> None:
+        # Optional payload for the audit trail: legacy senders signal with no
+        # args (still valid), new senders pass {"approver": "..."} or a bare
+        # approver string. Signals must never raise, so parse defensively and
+        # treat anything unrecognized as an approve with no identity.
+        for arg in args:
+            if isinstance(arg, dict):
+                approver = arg.get("approver")
+                if isinstance(approver, str) and approver:
+                    self._approver = approver
+            elif isinstance(arg, str) and arg:
+                self._approver = arg
         self._approved = True
 
     @workflow.run
@@ -199,7 +224,6 @@ class DevLoopWorkflow:
         # as missing from the current polling-cron pipeline.
         await workflow.wait_condition(lambda: self._approved)
 
-        implementer_release = await _resolve("implementer")
         # Scoped to this issue's own proposal, not just its repo. Service
         # scoping alone left a same-repo race: two approved loops for the
         # same repo both discovered the full accepted list from their own
@@ -225,6 +249,21 @@ class DevLoopWorkflow:
         # slug scoping. Drop to workflow.deprecate_patch once no pre-patch
         # execution can still be running.
         slug: str | None = None
+        approve_result: WorkflowResult | None = None
+        implementer_release: ResolvedRelease | None = None
+        # Evaluate the atomic-approve patch ONCE, up front, because it also
+        # decides the position of the implementer resolve. Histories from the
+        # slug-scoped-but-pre-approve era (1.29.2..1.29.4) recorded
+        # resolve → slug-lookup → implement; unconditionally moving the
+        # resolve after the flip would be a command mismatch that wedges
+        # every such in-flight loop on replay (codex P1 round 2, PR #212).
+        # patched() returns a stable answer per execution, so both branches
+        # below see the same value.
+        atomic_approve = workflow.patched("atomic-approve")
+        if not atomic_approve:
+            # Legacy position: pre-atomic-approve histories resolved the
+            # implementer before the slug lookup — keep their command order.
+            implementer_release = await _resolve("implementer")
         if workflow.patched("slug-scoped-implement"):
             issue_number = parse_issue_url(issue.issue_url).number
             slug = await workflow.execute_activity(
@@ -240,6 +279,49 @@ class DevLoopWorkflow:
                     "refusing an unscoped implement run",
                     non_retryable=True,
                 )
+            # Atomic approve (phase-5 cutover, mctl-agents#150): flip THIS
+            # proposal proposed → accepted as an Argo-executed gitops commit,
+            # instead of relying on the operator's manual edit. Nested inside
+            # the slug-scoped branch because the flip needs the slug, and any
+            # execution new enough to record this patch marker records the
+            # outer one too; old in-flight histories replay the legacy
+            # signal-only path (manual flip stays their affordance). The CWFT
+            # is idempotent on already-accepted, so a Temporal retry or a
+            # racing manual approve is a successful no-op — but any other
+            # failure (missing proposal dir, unexpected status, push failure)
+            # stops the loop HERE: proceeding to implement without a durable
+            # accepted status would just be a silent no-op run.
+            if atomic_approve:
+                approve_result = await _run_cwft(
+                    "mctl-agents-approve",
+                    {
+                        "service": target_repo,
+                        "slug": slug,
+                        "approver": self._approver or "unknown",
+                    },
+                    step_timeout=APPROVE_STEP_TIMEOUT,
+                )
+                # No record_execution here: the executions ledger is for
+                # SDK-backed agent runs (see docs/agent-inventory.yaml), and
+                # this deterministic flip is already triply audited — the
+                # .status.yaml approval block, the gitops commit message,
+                # and this workflow's own history all carry the approver.
+                if not approve_result.succeeded:
+                    return DevLoopResult(
+                        investigate=investigate_result,
+                        implement=None,
+                        approve=approve_result,
+                    )
+        if atomic_approve:
+            # Resolve the implementer only AFTER the approval flip is
+            # durable: _resolve can fail permanently (registry outage
+            # outlasting its five retries), and if that happened before the
+            # flip, the operator's approval would evaporate with the failed
+            # workflow — and the REJECT_DUPLICATE start policy would turn a
+            # transient outage into a permanently stuck issue (codex P1 on
+            # PR #212). Pre-atomic-approve histories already resolved above,
+            # in their recorded position.
+            implementer_release = await _resolve("implementer")
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to
@@ -263,4 +345,8 @@ class DevLoopWorkflow:
         implement_result = await _run_cwft("mctl-agents-implement", implement_params)
         await _record("implementer", implementer_release, implement_result, target_repo)
 
-        return DevLoopResult(investigate=investigate_result, implement=implement_result)
+        return DevLoopResult(
+            investigate=investigate_result,
+            implement=implement_result,
+            approve=approve_result,
+        )

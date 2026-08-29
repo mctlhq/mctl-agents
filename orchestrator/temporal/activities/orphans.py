@@ -6,6 +6,7 @@ DevLoopWorkflow running in Temporal.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,10 +51,23 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
 
-        # Expected workflow ID for this proposal
-        expected_workflow_id = f"dev-loop-mctlhq-{ref.service}-{ref.slug}"
-        if expected_workflow_id in active_ids:
-            continue
+        # Expected workflow ID for this proposal. Real DevLoop IDs are
+        # dev-loop-{owner}-{repo}-{issue-number} (see start.py:workflow_id_for),
+        # NOT ...-{slug} — the old slug-based reconstruction matched nothing,
+        # so every actionable proposal was reported as an orphan
+        # (mctl-agents#151). The issue number is recoverable from the slug's
+        # issue-<N>- prefix; slugs without it (incident-*, pre-Temporal) never
+        # had a DevLoop, so no active-ID check applies to them.
+        m = re.match(r"issue-(\d+)-", ref.slug)
+        if m:
+            # Owner comes from the PR snapshot rather than a hardcoded
+            # "mctlhq": parse_issue_url currently only admits mctlhq issues,
+            # but deriving it keeps this comparison correct if that ever
+            # widens (agy P2 on PR #212).
+            owner = pr.repo.split("/")[0] if pr.repo and "/" in pr.repo else "mctlhq"
+            expected_workflow_id = f"dev-loop-{owner}-{ref.service}-{m.group(1)}"
+            if expected_workflow_id in active_ids:
+                continue
 
         reason = "No active DevLoopWorkflow found for open PR proposal"
         signal = OrphanSignal(
