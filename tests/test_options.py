@@ -12,7 +12,9 @@ tests exercise the real function output instead, for every builder.
 """
 from __future__ import annotations
 
-from orchestrator import options
+import dataclasses
+
+from orchestrator import options, resolver
 
 
 def test_mctl_mcp_config_default_omits_always_load(monkeypatch):
@@ -113,3 +115,53 @@ def test_bash_modes_install_command_audit_hook(tmp_path, monkeypatch):
     for built in builders:
         matchers = (built.hooks or {}).get("PreToolUse") or []
         assert any(m.matcher == "Bash" for m in matchers)
+
+
+# ---------------------------------------------------------------------------
+# build_issue_investigator_options_from_plan — legacy/declarative equivalence
+# (mctlhq/mctl-agents#227's "T6. Legacy and declarative options are
+# equivalent" acceptance test). MCTL_TOKEN is set for both sides, same as
+# orchestrator/validate_manifest.py's own comparison, so the mcp_servers
+# and allowed_tools "mcp__mctl__*" entry aren't a false-diff artifact of
+# whichever environment the test happens to run in.
+# ---------------------------------------------------------------------------
+def test_build_issue_investigator_options_from_plan_matches_legacy_builder(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_MODEL", raising=False)
+    monkeypatch.delenv("CLAUDE_BALANCED_MODEL", raising=False)
+
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    legacy = options.build_issue_investigator_options(
+        repo_dir, model=plan.model, proposal_dir=proposal_dir,
+    )
+    declarative = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+
+    assert declarative.cwd == legacy.cwd
+    assert declarative.model == legacy.model
+    assert sorted(declarative.allowed_tools) == sorted(legacy.allowed_tools)
+    assert declarative.mcp_servers == legacy.mcp_servers
+    assert declarative.permission_mode == legacy.permission_mode
+    assert declarative.max_budget_usd == legacy.max_budget_usd
+    assert declarative.add_dirs == legacy.add_dirs
+    assert declarative.env == legacy.env
+
+
+def test_build_issue_investigator_options_from_plan_uses_the_plans_model_and_budget(tmp_path, monkeypatch):
+    """The plan-based builder is built FROM the plan, not from
+    orchestrator.options's own ISSUE_INVESTIGATOR_MODEL/_BUDGET_USD
+    constants — a plan carrying a different model/budget must be reflected
+    verbatim, independent of those constants."""
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="d" * 40))
+    fake_plan = dataclasses.replace(plan, model="a-completely-different-model", budget_usd=42.0)
+
+    built = options.build_issue_investigator_options_from_plan(fake_plan, repo_dir, proposal_dir)
+    assert built.model == "a-completely-different-model"
+    assert built.max_budget_usd == 42.0

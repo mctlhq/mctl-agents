@@ -80,6 +80,36 @@ DEFAULT_STATE_DIR = Path(
 )
 INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
 
+# mctlhq/mctl-agents#227 declarative resolver pilot. "legacy" (the default)
+# does not import or call orchestrator/resolver.py at all — today's
+# `build_issue_investigator_options` path, unchanged. "declarative" resolves
+# one immutable ExecutionPlan (against checked-in compatibility fixtures
+# only; see orchestrator/resolver.py's module docstring — production
+# activation is blocked on mctlhq/mctl-gitops#950) and builds options from
+# it. Read fresh per call, not cached at import time, so a test (or an
+# operator explicitly forcing a legacy rollback — see that module's
+# "Rollback" note) can set the env var and see it take effect without a
+# module reload.
+_RESOLVER_MODES = ("legacy", "declarative")
+
+
+def _resolver_mode() -> str:
+    mode = os.getenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "legacy").strip().lower()
+    if mode not in _RESOLVER_MODES:
+        raise SystemExit(
+            f"ISSUE_INVESTIGATOR_RESOLVER_MODE must be one of {_RESOLVER_MODES}, got {mode!r}"
+        )
+    return mode
+
+
+def _target_repository_sha(repo_dir: Path) -> str:
+    """HEAD SHA of the read-only target-repo clone `_clone_repo` produced —
+    pins the declarative ExecutionPlan's `target_repository_sha` (see
+    docs/agent-inventory.yaml's runtimeContextInputs note: an agent version
+    is reproducible only against a fixed target SHA)."""
+    proc = run_capturing(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    return proc.stdout.strip()
+
 # A proposal whose .status.yaml is missing or still `proposed` can be
 # (re-)investigated. Anything past that means the implementer/shepherd has
 # taken ownership — re-running the investigator would clobber in-flight work.
@@ -1198,10 +1228,36 @@ class RateLimitExhaustedError(RuntimeError):
 async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
+    # Imported here, not at module scope, for the reason given at the top of
+    # this file: run_issue_poller reuses this module's pure helpers from
+    # inside the long-lived Temporal worker, and options/mcp_guard drag in
+    # the agent SDK. `resolver` follows the same rule — not because it
+    # imports the SDK itself, but because a module-scope import of it would
+    # be the one line a reader has to check by hand every time
+    # test_worker_isolation goes red.
+    from orchestrator import resolver
     from orchestrator.mcp_guard import ensure_mctl_connected
-    from orchestrator.options import build_issue_investigator_options
+    from orchestrator.options import (
+        build_issue_investigator_options,
+        build_issue_investigator_options_from_plan,
+    )
 
-    options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
+    mode = _resolver_mode()
+    # Observable regardless of mode — including the explicit legacy rollback
+    # this line exists to make provable (see orchestrator/resolver.py's
+    # "Rollback" note and mctlhq/mctl-agents#227's acceptance criteria:
+    # "Legacy fallback is available only when explicit ... is selected and
+    # is observable").
+    print(f"[resolver] issue-investigator resolver_mode={mode!r}")
+    if mode == "declarative":
+        plan = resolver.execute(
+            "issue-investigator",
+            resolver.Task(target_repository_sha=_target_repository_sha(repo_dir)),
+        )
+        plan.log()
+        options = build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+    else:
+        options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
     mcp_configured = bool(options.mcp_servers)
     async with ClaudeSDKClient(options=options) as client:
         if mcp_configured:

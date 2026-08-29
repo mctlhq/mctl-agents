@@ -1,22 +1,28 @@
-# AgentManifest for issue-investigator.
+# AgentDefinition for issue-investigator — migrated to agents.mctl.ai/v1alpha2
+# as the mctlhq/mctl-agents#227 declarative resolver pilot (see ADR 007,
+# docs/adr/007-agent-definition-execution-profile-contract.md, and
+# orchestrator/resolver.py). This is the ONE agent migrated by the pilot;
+# every other agents/_manifests/*/agent.yaml stays v1alpha1.
 #
-# This file does not invent behaviour: every field below is a claim about
-# what orchestrator/options.py:build_issue_investigator_options() already
-# does, checked against the real function by
-# orchestrator/validate_manifest.py rather than taken on faith. See
-# docs/agent-inventory.yaml for the classification this manifest formalises,
-# and orchestrator/manifest.py's module docstring for why toolPolicy/execution
-# are a lint target, not a second implementation.
-apiVersion: agents.mctl.ai/v1alpha1
-kind: Agent
+# The execution shape that used to live inline here (toolPolicy, execution,
+# runtime.optionsBuilder/entrypoint) now lives in the referenced
+# ExecutionProfile — see tests/fixtures/resolver/profiles/investigator-default.yaml
+# for the pilot's compatibility fixture (checked-in, explicitly
+# non-promotable; NOT a second production catalog — see that file's header).
+#
+# orchestrator/manifest.py's v1alpha2 branch still resolves this file's
+# executionProfileRef down to the identical toolPolicy/execution/runtime
+# shape v1alpha1 exposed, so orchestrator/validate_manifest.py and
+# tests/test_manifest.py keep checking the exact same claims (entrypoint
+# resolves, allowed_tools/budget match orchestrator/options.py, modelPolicy
+# task is real) they always have — just sourced from the profile instead of
+# this file.
+apiVersion: agents.mctl.ai/v1alpha2
+kind: AgentDefinition
 metadata:
   name: issue-investigator
   owner: mctl-agents
 spec:
-  runtime:
-    type: claude-agent-sdk
-    entrypoint: orchestrator.run_issue_investigator:investigate
-    optionsBuilder: orchestrator.options:build_issue_investigator_options
   prompt:
     sources:
       - inline: orchestrator/run_issue_investigator.py:_build_prompt
@@ -30,30 +36,15 @@ spec:
   runtimeContext:
     - targetRepo: CLAUDE.md
     - targetRepo: source tree (Glob/Grep/Read to ground the design)
-  modelPolicy:
-    task: service_agent
-    # INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
-    # in run_issue_investigator.py — highest-priority override before the
-    # service_agent task's own model-policy.yaml resolution.
-    legacyEnvOverride: ISSUE_INVESTIGATOR_MODEL
-  # allow must equal build_issue_investigator_options()'s actual
-  # allowed_tools exactly — validate_manifest.py calls the builder and
-  # diffs the two sets. Write/Edit are here because the agent writes the
-  # requirements/design/tasks triplet into proposal_dir (granted via
-  # add_dirs), not because it edits the target repo it's read-only against.
-  toolPolicy:
-    allow:
-      - Read
-      - Write
-      - Edit
-      - Glob
-      - Grep
-      - WebSearch
-      - WebFetch
-      - Bash
-      - "mcp__mctl__*"
-  execution:
-    budgetUsd: 3.00          # ISSUE_INVESTIGATOR_BUDGET_USD default
-    sandbox:
-      backend: argo
-      clusterWorkflowTemplate: mctl-agents-investigate
+  triggers:
+    - mctl_trigger_issue (MCP, admin-only)
+    - orchestrator/run_issue_poller.py (agents:intake label)
+  executionProfileRef:
+    name: investigator-default
+    # Checked against the CONCRETE selected ExecutionProfile version
+    # (orchestrator/resolver.py's execute(): the profile fixture's own
+    # content hash), never read from a profile-owned range (mctlhq/mctl-agents#227
+    # requirements). A profile edit that is not also re-pinned here fails
+    # resolution closed instead of silently accepting an incompatible
+    # profile version.
+    compatibility: "sha256:ea35387723c6837b6aef275617db7cbf52f145f9619c58f6217c7a2c0ccd8f2f"

@@ -217,6 +217,81 @@ def test_inventory_duplicate_agent_names_are_rejected() -> None:
     assert any("duplicate agent names" in e and real_inventory["agents"][0]["name"] in e for e in errors), errors
 
 
+# ---------------------------------------------------------------------------
+# v1alpha2 (mctlhq/mctl-agents#227 declarative resolver pilot)
+# ---------------------------------------------------------------------------
+def test_issue_investigator_manifest_is_v1alpha2() -> None:
+    """The one agent this pilot migrates — every other manifest stays
+    v1alpha1 (see test_only_issue_investigator_is_v1alpha2 below)."""
+    manifest = MANIFESTS["issue-investigator"]
+    assert manifest.api_version == "agents.mctl.ai/v1alpha2"
+    assert manifest.execution_profile_ref == {
+        "name": "investigator-default",
+        "compatibility": manifest.execution_profile_ref["compatibility"],
+    }
+    assert manifest.execution_profile_ref["compatibility"].startswith("sha256:")
+
+
+def test_only_issue_investigator_is_v1alpha2() -> None:
+    """T1: v1alpha1 remains valid for every other agent — the pilot migrates
+    exactly one manifest, not the whole directory."""
+    for name, manifest in MANIFESTS.items():
+        if name == "issue-investigator":
+            continue
+        assert manifest.api_version == "agents.mctl.ai/v1alpha1", name
+        assert manifest.execution_profile_ref is None, name
+
+
+def test_unknown_api_version_fails_loudly() -> None:
+    """T1: an apiVersion that is neither v1alpha1 nor v1alpha2 must fail
+    loudly, not silently fall back to either schema."""
+    document = {
+        "apiVersion": "agents.mctl.ai/v1alpha99",
+        "kind": "Agent",
+        "metadata": {"name": "badtest", "owner": "test-owner"},
+        "spec": {},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "badtest" / "agent.yaml"
+        path.parent.mkdir()
+        path.write_text(yaml.dump(document))
+        with pytest.raises(ManifestError, match="unsupported apiVersion"):
+            load(path)
+
+
+def test_v1alpha2_wrong_kind_is_rejected() -> None:
+    document = {
+        "apiVersion": "agents.mctl.ai/v1alpha2",
+        "kind": "Agent",  # v1alpha1's kind, not v1alpha2's "AgentDefinition"
+        "metadata": {"name": "badtest", "owner": "test-owner"},
+        "spec": {
+            "prompt": {"sources": [{"file": "x"}]},
+            "executionProfileRef": {"name": "x", "compatibility": "sha256:00"},
+        },
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "badtest" / "agent.yaml"
+        path.parent.mkdir()
+        path.write_text(yaml.dump(document))
+        with pytest.raises(ManifestError, match="kind must be 'AgentDefinition'"):
+            load(path)
+
+
+def test_v1alpha2_missing_execution_profile_ref_is_rejected() -> None:
+    document = {
+        "apiVersion": "agents.mctl.ai/v1alpha2",
+        "kind": "AgentDefinition",
+        "metadata": {"name": "badtest", "owner": "test-owner"},
+        "spec": {"prompt": {"sources": [{"file": "x"}]}},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "badtest" / "agent.yaml"
+        path.parent.mkdir()
+        path.write_text(yaml.dump(document))
+        with pytest.raises(ManifestError, match="executionProfileRef"):
+            load(path)
+
+
 def test_manifest_without_owner_is_rejected() -> None:
     """metadata.owner used to default to "" silently — nothing else checks
     it, so an omitted/misspelled owner would lose phase-1's ownership

@@ -7,6 +7,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
 from config.settings import MCTL_MCP_URL
+from orchestrator.resolver import ExecutionPlan
 
 
 def mctl_mcp_config(*, always_load: bool = False) -> dict:
@@ -307,6 +308,40 @@ def build_issue_investigator_options(
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
+        add_dirs=[str(proposal_dir)],
+        env=env,
+        hooks=_command_audit_hooks(),
+    )
+
+
+def build_issue_investigator_options_from_plan(
+    plan: ExecutionPlan,
+    repo_dir: Path,
+    proposal_dir: Path,
+) -> ClaudeAgentOptions:
+    """Options for issue-investigator's `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`
+    path (orchestrator/run_issue_investigator.py): built from a resolved
+    `orchestrator.resolver.ExecutionPlan` instead of the module-level
+    ``ISSUE_INVESTIGATOR_MODEL``/``ISSUE_INVESTIGATOR_BUDGET_USD`` constants
+    ``build_issue_investigator_options`` above uses.
+
+    Only the fields the plan actually owns (model, tools, budget) come from
+    it — every structural field the plan does NOT declare (cwd, mcp_servers,
+    permission_mode, add_dirs, env, hooks) matches
+    ``build_issue_investigator_options`` exactly, by construction, so the two
+    builders resolve identical `ClaudeAgentOptions` for the same repo/model/
+    tools/budget input (the equivalence tests in tests/test_options.py
+    assert this directly).
+    """
+    env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
+    return ClaudeAgentOptions(
+        cwd=str(repo_dir),
+        setting_sources=["project"],
+        model=plan.model,
+        allowed_tools=list(plan.tools),
+        mcp_servers=mctl_mcp_config(always_load=True),
+        permission_mode="acceptEdits",
+        max_budget_usd=plan.budget_usd,
         add_dirs=[str(proposal_dir)],
         env=env,
         hooks=_command_audit_hooks(),

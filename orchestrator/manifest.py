@@ -14,7 +14,7 @@ See docs/agent-inventory.yaml for the classification this formalises.
 from __future__ import annotations
 
 import importlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +25,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFESTS_DIR = REPO_ROOT / "agents" / "_manifests"
 
 SUPPORTED_API_VERSION = "agents.mctl.ai/v1alpha1"
+# v1alpha2 (mctlhq/mctl-agents#227's declarative resolver pilot, ADR 007):
+# identity/prompt/triggers plus exactly one `executionProfileRef`; the
+# execution shape v1alpha1 carried inline (toolPolicy/execution/runtime)
+# moves to an independently published `ExecutionProfile`. Maps apiVersion to
+# the `kind` a document under it must declare. Unknown apiVersion continues
+# to fail loudly in `load()` below — this dict is the complete allow-list,
+# not a prefix/pattern match.
+SUPPORTED_API_VERSIONS = {
+    SUPPORTED_API_VERSION: "Agent",
+    "agents.mctl.ai/v1alpha2": "AgentDefinition",
+}
 # The only runtime.type v1 knows how to execute. See docs/agent-inventory.yaml's
 # L3 roadmap note (plan phase L3) for why a second runtime is a bigger step
 # than adding a string here.
@@ -84,6 +95,15 @@ class AgentManifest:
     sandbox_backend: str
     cluster_workflow_template: str
     path: Path
+    # v1alpha2 only (mctlhq/mctl-agents#227 pilot). None for every v1alpha1
+    # manifest. `execution_profile_ref` is the raw {name, compatibility}
+    # claim from spec.executionProfileRef; every field above it is still
+    # populated for a v1alpha2 manifest too, resolved from the referenced
+    # ExecutionProfile fixture — see _parse_fields_v1alpha2 below for why
+    # that keeps every existing check in this module and
+    # orchestrator/validate_manifest.py working unchanged.
+    api_version: str = SUPPORTED_API_VERSION
+    execution_profile_ref: Mapping[str, str] | None = None
 
     def _resolve_callable(self, ref: str, field: str) -> Callable[..., Any]:
         module, symbol = _resolve_ref(ref)
@@ -112,16 +132,20 @@ def load(path: Path) -> AgentManifest:
     if not isinstance(document, dict):
         raise ManifestError(f"{path}: root must be a mapping")
 
-    if document.get("apiVersion") != SUPPORTED_API_VERSION:
+    api_version = document.get("apiVersion")
+    expected_kind = SUPPORTED_API_VERSIONS.get(api_version) if isinstance(api_version, str) else None
+    if expected_kind is None:
         raise ManifestError(
-            f"{path}: unsupported apiVersion {document.get('apiVersion')!r}, "
-            f"expected {SUPPORTED_API_VERSION!r}"
+            f"{path}: unsupported apiVersion {api_version!r}, expected one of "
+            f"{sorted(SUPPORTED_API_VERSIONS)!r}"
         )
-    if document.get("kind") != "Agent":
-        raise ManifestError(f"{path}: kind must be 'Agent'")
+    if document.get("kind") != expected_kind:
+        raise ManifestError(f"{path}: kind must be {expected_kind!r} for apiVersion {api_version!r}")
 
     try:
-        return _parse_fields(document, path)
+        if api_version == SUPPORTED_API_VERSION:
+            return _parse_fields_v1alpha1(document, path)
+        return _parse_fields_v1alpha2(document, path)
     except ManifestError:
         raise
     except (AttributeError, TypeError, ValueError) as exc:
@@ -135,7 +159,7 @@ def load(path: Path) -> AgentManifest:
         raise ManifestError(f"{path}: malformed manifest field: {exc}") from exc
 
 
-def _parse_fields(document: dict[str, Any], path: Path) -> AgentManifest:
+def _parse_fields_v1alpha1(document: dict[str, Any], path: Path) -> AgentManifest:
     metadata = document.get("metadata") or {}
     spec = document.get("spec") or {}
     runtime = spec.get("runtime") or {}
@@ -196,6 +220,87 @@ def _parse_fields(document: dict[str, Any], path: Path) -> AgentManifest:
         sandbox_backend=sandbox.get("backend", ""),
         cluster_workflow_template=sandbox.get("clusterWorkflowTemplate", ""),
         path=path,
+    )
+
+
+def _parse_fields_v1alpha2(document: dict[str, Any], path: Path) -> AgentManifest:
+    """Parse an `agents.mctl.ai/v1alpha2` `AgentDefinition` — the
+    mctlhq/mctl-agents#227 declarative resolver pilot (ADR 007 sec. 2).
+
+    v1alpha2 carries only identity/prompt/triggers plus a single
+    `executionProfileRef {name, compatibility}`; the execution shape
+    v1alpha1 declared inline (toolPolicy/execution/runtime) now lives in the
+    referenced `ExecutionProfile`. This function resolves that reference
+    (via orchestrator/resolver.py's `load_profile`, imported lazily below to
+    avoid a circular import — resolver.py itself imports PromptSource/
+    ManifestError from this module) and populates the SAME toolPolicy/
+    execution/runtime-shaped fields v1alpha1 always has, so every existing
+    consumer (orchestrator/validate_manifest.py, tests/test_manifest.py)
+    keeps comparing the identical claim shape against orchestrator/options.py
+    it always has — just sourced from the profile instead of this file. See
+    orchestrator/resolver.py's module docstring for why that coupling to a
+    tests/fixtures/ path is pilot-only, not a production dependency.
+    """
+    # Deferred import: orchestrator.resolver imports PromptSource/ManifestError
+    # from this module at ITS top level. Importing it back here at
+    # manifest.py's own module level would be circular; deferring to call
+    # time (only reached once this module has fully finished loading) is not.
+    from orchestrator import resolver as _resolver
+
+    metadata = document.get("metadata") or {}
+    spec = document.get("spec") or {}
+    prompt = spec.get("prompt") or {}
+    profile_ref = spec.get("executionProfileRef") or {}
+
+    name = metadata.get("name")
+    if not name:
+        raise ManifestError(f"{path}: metadata.name is required")
+    owner = metadata.get("owner")
+    if not owner:
+        raise ManifestError(f"{path}: metadata.owner is required")
+    if path.parent.name != name:
+        raise ManifestError(
+            f"{path}: metadata.name {name!r} must match its directory name "
+            f"(agents/_manifests/{path.parent.name}/agent.yaml)"
+        )
+
+    prompt_sources = tuple(PromptSource.from_dict(s) for s in prompt.get("sources", []))
+    if not prompt_sources:
+        raise ManifestError(f"{path}: spec.prompt.sources must not be empty")
+
+    profile_name = profile_ref.get("name")
+    compatibility = profile_ref.get("compatibility")
+    if not profile_name or not compatibility:
+        raise ManifestError(f"{path}: spec.executionProfileRef.name and .compatibility are required")
+
+    try:
+        profile = _resolver.load_profile(profile_name)
+    except _resolver.ResolverError as exc:
+        raise ManifestError(f"{path}: cannot resolve executionProfileRef {profile_name!r}: {exc}") from exc
+
+    return AgentManifest(
+        name=name,
+        owner=owner,
+        runtime_type=SUPPORTED_RUNTIME_TYPE,
+        entrypoint=profile.entrypoint,
+        options_builder=profile.options_builder,
+        prompt_sources=prompt_sources,
+        model_policy_task=profile.model_policy_task,
+        model_policy_legacy_env_override=profile.model_policy_legacy_env_override,
+        tool_allow=profile.tools,
+        budget_usd=profile.budget_usd,
+        # Only 'implementer' declares execution.timeoutSeconds today (a
+        # Python-enforced wall-clock bound) — see
+        # orchestrator/validate_manifest.py's _TIMEOUT_CONSTANT_BY_AGENT.
+        # issue-investigator's profile.timeoutSeconds mirrors the Argo CWFT
+        # deadline instead (not Python-enforced), matching its v1alpha1
+        # manifest, which never declared timeoutSeconds either.
+        timeout_seconds=None,
+        sandbox_backend=profile.sandbox_backend,
+        cluster_workflow_template=profile.cluster_workflow_template,
+        path=path,
+        api_version="agents.mctl.ai/v1alpha2",
+        execution_profile_ref={"name": profile_name, "compatibility": compatibility},
     )
 
 
