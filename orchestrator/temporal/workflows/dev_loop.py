@@ -486,12 +486,13 @@ class DevLoopWorkflow:
                             {"service": service, "slug": slug},
                         )
                         await _record("shepherd", None, tick_result, service)
-                    except ActivityError:
+                    except ActivityError as exc:
                         workflow.logger.warning(
                             "in-loop shepherd tick failed for %s/%s — the "
-                            "watch continues",
+                            "watch continues: %r",
                             service,
                             slug,
+                            exc.cause,
                         )
             else:
                 polls_without_pr += 1

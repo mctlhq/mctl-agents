@@ -111,6 +111,10 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
         return False
+    # `mctlhq` is hardcoded because a ProposalRef carries no repo owner —
+    # unlike orphans.py, which derives one from `pr.repo`. Every proposal the
+    # shepherd sweeps lives under this org today; a wrong owner would only
+    # produce a 404, i.e. the fail-open "not owned" path.
     workflow_id = f"dev-loop-mctlhq-{service}-{m.group(1)}"
     url = f"{MCTL_API_URL}/api/v1/agents/dev-loop/{workflow_id}"
     if not url.startswith("https://"):
@@ -146,6 +150,8 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
         else:
             kept.append(ref)
     return kept
+
+
 COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 
 # Statuses that the shepherd's discovery pass picks up. `implemented`
