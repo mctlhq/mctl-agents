@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.33.0](https://github.com/mctlhq/mctl-agents/compare/1.32.0...1.33.0) (2026-08-29)
+
+
+### Features
+
+* **dev-loop:** shepherd inside DevLoop, cron becomes a sweeper ([a2b4fd2](https://github.com/mctlhq/mctl-agents/commit/a2b4fd2ecfa92986a0d9d9337cd61fa76b1bdfeb))
+
+
+### Bug Fixes
+
+* **dev-loop:** bound the ownership pass, fail open on every path ([52a51e4](https://github.com/mctlhq/mctl-agents/commit/52a51e45552b41498254f7a540dd7c831cd35fdf))
+* **dev-loop:** build the liveness request inside the guard ([dffb35b](https://github.com/mctlhq/mctl-agents/commit/dffb35b0d543e1875c1e269777d78132d6a1cda0))
+* **dev-loop:** make the ownership budget wall-clock, cover the tick cap ([3a84878](https://github.com/mctlhq/mctl-agents/commit/3a84878fe340234942b6a852995444035eeff20a))
+* **dev-loop:** ownership asks the workflow, not its status ([e6e78e1](https://github.com/mctlhq/mctl-agents/commit/e6e78e1462029607a3b1138b7ea8a46fc6dfd5d3))
+* **dev-loop:** review follow-ups on the sweeper ([f330d33](https://github.com/mctlhq/mctl-agents/commit/f330d3393d73025bc11a135ed3f1b25f22de07f1))
+
 ## [1.32.0](https://github.com/mctlhq/mctl-agents/compare/1.31.0...1.32.0) (2026-08-29)
 
 
