@@ -35,7 +35,13 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError, ApplicationError
+from temporalio.exceptions import (
+    ActivityError,
+    ApplicationError,
+)
+from temporalio.exceptions import (
+    TimeoutError as TemporalTimeoutError,
+)
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
@@ -404,10 +410,33 @@ class DevLoopWorkflow:
                     start_to_close_timeout=PR_STATE_TIMEOUT,
                     retry_policy=PR_STATE_RETRY_POLICY,
                 )
-            except ActivityError:
+            except ActivityError as exc:
                 # A read outage longer than the activity's retries must not
-                # abort a 14-day watch — ride it out and poll again next
-                # interval; the deadline still bounds the loop (agy P2).
+                # abort a 14-day watch — ride KNOWN-transient failures out
+                # and poll again next interval (the deadline still bounds
+                # the loop). But only those: get_pr_state wraps every
+                # expected read failure in ProposalListingError, and an
+                # activity timeout is transport by definition, so anything
+                # else here is an unexpected bug in the activity — retrying
+                # that for 14 days would silently mask the defect (agy P2
+                # round 3). End the watch with the last observed state
+                # instead; implement already succeeded, so the loop's
+                # outcome must still not become a workflow failure.
+                cause = exc.cause
+                transient = isinstance(cause, TemporalTimeoutError) or (
+                    isinstance(cause, ApplicationError)
+                    and cause.type == "ProposalListingError"
+                )
+                if not transient:
+                    workflow.logger.warning(
+                        "get_pr_state failed with a non-transient error for "
+                        "%s/%s — ending the merge watch with the last "
+                        "observed state: %r",
+                        service,
+                        slug,
+                        cause,
+                    )
+                    return last
                 workflow.logger.warning(
                     "get_pr_state failed after retries for %s/%s — retrying "
                     "next poll interval",

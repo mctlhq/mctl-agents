@@ -58,6 +58,7 @@ def _fake_activities(
     investigate_phase: str = "Succeeded",
     pr_states: list[PRState] | None = None,
     pr_state_raises_after: int | None = None,
+    pr_state_error_type: str | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -105,7 +106,9 @@ def _fake_activities(
         if pr_state_raises_after is not None and poll_index["i"] >= pr_state_raises_after:
             from temporalio.exceptions import ApplicationError
 
-            raise ApplicationError("github unreachable", non_retryable=True)
+            raise ApplicationError(
+                "github unreachable", type=pr_state_error_type, non_retryable=True
+            )
         i = min(poll_index["i"], len(sequence) - 1)
         poll_index["i"] += 1
         return sequence[i]
@@ -689,7 +692,13 @@ class TestDevLoopWorkflow:
             state="OPEN",
         )
         activities, _calls, investigate_ran = _fake_activities(
-            released=True, pr_states=[open_pr], pr_state_raises_after=1
+            released=True,
+            pr_states=[open_pr],
+            pr_state_raises_after=1,
+            # The type get_pr_state wraps all expected read failures in —
+            # the loop treats exactly this (and activity timeouts) as
+            # transient and rides it out.
+            pr_state_error_type="ProposalListingError",
         )
         async with Worker(
             env.client,
@@ -780,4 +789,43 @@ class TestDevLoopWorkflow:
 
         assert result.pr is not None
         assert result.pr.found is True
+        assert result.pr.state == "OPEN"
+
+    async def test_merge_detection_stops_on_unexpected_activity_bug(self, env):
+        """An unexpected (non-ProposalListingError) failure is a bug in the
+        activity, not weather — the watch ends immediately with the last
+        observed state instead of masking the defect for 14 days, and the
+        workflow itself still succeeds."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            pr_states=[open_pr],
+            pr_state_raises_after=1,
+            pr_state_error_type="AttributeError",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/83"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is not None
         assert result.pr.state == "OPEN"

@@ -100,7 +100,14 @@ async def get_pr_state(service: str, slug: str) -> PRState:
                 f"reading {status_url} returned HTTP {response.status_code}: {response.text[:200]}"
             )
         try:
-            content = base64.b64decode(response.json().get("content", "")).decode("utf-8", "replace")
+            payload = response.json()
+        except ValueError as exc:
+            raise ProposalListingError(f"non-JSON contents payload from {status_url}") from exc
+        if not isinstance(payload, dict):
+            # A directory listing (JSON list) instead of a file payload.
+            raise ProposalListingError(f"unexpected contents payload type from {status_url}")
+        try:
+            content = base64.b64decode(payload.get("content", "")).decode("utf-8", "replace")
         except (ValueError, TypeError) as exc:
             raise ProposalListingError(f"undecodable contents payload from {status_url}") from exc
 
@@ -140,7 +147,10 @@ async def get_pr_state(service: str, slug: str) -> PRState:
             raise ProposalListingError(
                 f"reading {pr_api} returned HTTP {pr_response.status_code}: {pr_response.text[:200]}"
             )
-        data = pr_response.json()
+        try:
+            data = pr_response.json()
+        except ValueError as exc:
+            raise ProposalListingError(f"non-JSON payload from {pr_api}") from exc
 
     merged = bool(data.get("merged"))
     if merged:
