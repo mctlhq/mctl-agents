@@ -46,10 +46,9 @@ class ReconcileWorkflow:
             retry_policy=ACTIVITY_RETRY_POLICY,
         )
 
-        active_ids: list[str] | None = None
         if workflow.patched("orphan-active-ids"):
             try:
-                active_ids = await workflow.execute_activity(
+                active_ids: list[str] = await workflow.execute_activity(
                     "list_active_dev_loop_ids",
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=ACTIVITY_RETRY_POLICY,
@@ -72,12 +71,23 @@ class ReconcileWorkflow:
                     ),
                 )
 
-        orphans_result: OrphanDetectionResult = await workflow.execute_activity(
-            detect_orphans,
-            args=[state_dir_path, active_ids],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=ACTIVITY_RETRY_POLICY,
-        )
+            orphans_result: OrphanDetectionResult = await workflow.execute_activity(
+                detect_orphans,
+                args=[state_dir_path, active_ids],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=ACTIVITY_RETRY_POLICY,
+            )
+        else:
+            # Unpatched replay branch: schedule detect_orphans with exactly
+            # the one argument the old history recorded — a second (even
+            # None) argument here would be a payload mismatch on replay
+            # (agy P1 on this PR).
+            orphans_result = await workflow.execute_activity(
+                detect_orphans,
+                args=[state_dir_path],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=ACTIVITY_RETRY_POLICY,
+            )
 
         return ReconcileWorkflowResult(
             discovery=discovery_result,
