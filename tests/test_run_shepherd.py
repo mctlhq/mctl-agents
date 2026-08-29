@@ -17,6 +17,7 @@ fixture so the YAML serialisation is exercised.
 from __future__ import annotations
 
 import json
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -2106,16 +2107,26 @@ class _FakeHTTPResponse:
         return False
 
 
+def _opener(handler):
+    """Stand in for run_shepherd._no_redirect_opener with a fake .open()."""
+
+    class _Opener:
+        def open(self, request, timeout=None):
+            return handler(request, timeout=timeout)
+
+    return lambda: _Opener()
+
+
 def test_dev_loop_owns_running_workflow(monkeypatch) -> None:
     seen = {}
 
     def fake_urlopen(request, timeout=None):
         seen["url"] = request.full_url
         seen["auth"] = request.get_header("Authorization")
-        return _FakeHTTPResponse(b'{"workflow_id": "x", "status": "Running"}')
+        return _FakeHTTPResponse(b'{"workflow_id": "x", "status": "Running", "shepherd_in_loop": true}')
 
     monkeypatch.setenv("MCTL_TOKEN", "tok")
-    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
     assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is True
     assert seen["url"].endswith("/api/v1/agents/dev-loop/dev-loop-mctlhq-mctl-web-10")
     assert seen["auth"] == "Bearer tok"
@@ -2124,9 +2135,9 @@ def test_dev_loop_owns_running_workflow(monkeypatch) -> None:
 def test_dev_loop_owns_completed_workflow_is_not_owned(monkeypatch) -> None:
     monkeypatch.setenv("MCTL_TOKEN", "tok")
     monkeypatch.setattr(
-        run_shepherd.urllib.request,
-        "urlopen",
-        lambda request, timeout=None: _FakeHTTPResponse(b'{"status": "Completed"}'),
+        run_shepherd,
+        "_no_redirect_opener",
+        _opener(lambda request, timeout=None: _FakeHTTPResponse(b'{"status": "Completed"}')),
     )
     assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
 
@@ -2138,7 +2149,7 @@ def test_dev_loop_owns_404_means_not_owned(monkeypatch) -> None:
         raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, None)
 
     monkeypatch.setenv("MCTL_TOKEN", "tok")
-    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
     assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
 
 
@@ -2149,7 +2160,7 @@ def test_dev_loop_owns_network_error_fails_open_to_sweep(monkeypatch, capsys) ->
         raise urllib.error.URLError("connection refused")
 
     monkeypatch.setenv("MCTL_TOKEN", "tok")
-    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
     assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
     assert "liveness check failed" in capsys.readouterr().out
 
@@ -2221,7 +2232,7 @@ def test_dev_loop_owns_http_exception_fails_open(monkeypatch) -> None:
         raise http.client.IncompleteRead(b"half")
 
     monkeypatch.setenv("MCTL_TOKEN", "tok")
-    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(fake_urlopen))
     assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
 
 
@@ -2293,3 +2304,52 @@ def test_main_applies_the_ownership_filter_only_in_sweep_mode(
     run(["--slug", "issue-10-test"], "slug")
     run(["--reconcile"], "reconcile")
     assert calls == ["sweep"]
+
+
+def test_dev_loop_owns_running_but_pre_patch_workflow_is_not_owned(monkeypatch) -> None:
+    """Running is not the same as ticking (Codex P1 on PR #230).
+
+    An execution started before the shepherd-in-loop patch replays that
+    branch as False and never submits a tick, yet stays Running for up to
+    the 14-day merge deadline. Treating it as owned would leave its PR
+    with no shepherd at all until it drained.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(
+        run_shepherd,
+        "_no_redirect_opener",
+        _opener(
+            lambda request, timeout=None: _FakeHTTPResponse(
+                b'{"status": "Running", "shepherd_in_loop": false}'
+            )
+        ),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_missing_field_is_not_owned(monkeypatch) -> None:
+    """An mctl-api predating the field answers nothing — sweep, as before."""
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(
+        run_shepherd,
+        "_no_redirect_opener",
+        _opener(lambda request, timeout=None: _FakeHTTPResponse(b'{"status": "Running"}')),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_does_not_follow_redirects(monkeypatch) -> None:
+    """A 3xx must surface as an error, not replay the bearer token elsewhere.
+
+    urllib's default opener copies request headers onto the redirect
+    target, so following one would leak MCTL_TOKEN to whatever host the
+    redirect names and defeat the https check (Codex P2 on PR #230).
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    opener = run_shepherd._no_redirect_opener()
+    handler = next(
+        h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)
+    )
+    assert (
+        handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example/x") is None
+    )

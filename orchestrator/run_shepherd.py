@@ -68,6 +68,7 @@ from orchestrator.github_token import refresh_github_token
 from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
 
 # ---------------------------------------------------------------------------
 # State directory resolution — mirrors run_implementer.py.
@@ -96,7 +97,11 @@ GATING_BOTS = (REVIEW_BOT, CODEX_CONNECTOR_BOT)
 # missing token, endpoint absent (older mctl-api 404s the route), network
 # error — means "not owned": the sweeper keeps today's behavior of driving
 # everything, which is the safe default for a safety net.
-MCTL_API_URL = os.environ.get("MCTL_API_URL", "https://api.mctl.ai").rstrip("/")
+# Same env var the Temporal activities read (orchestrator/temporal/mctl_client
+# — imported for the constant only; that module pulls in nothing heavier
+# than os). A deployment pointing MCTL_API_BASE_URL at a staging API must
+# not have this one check silently talk to production instead.
+MCTL_API_URL = MCTL_API_BASE_URL.rstrip("/")
 DEV_LOOP_LIVENESS_TIMEOUT_S = 10
 
 # The sweep tick runs every 5 minutes (see the module docstring), so the
@@ -106,6 +111,16 @@ DEV_LOOP_LIVENESS_TIMEOUT_S = 10
 # already-sick API. Two bounds together make the worst case independent
 # of N: a small thread pool, and a hard wall-clock budget after which the
 # remaining refs are kept unchecked (fail-open, same as any other failure).
+def _no_redirect_opener() -> urllib.request.OpenerDirector:
+    """Opener that surfaces a 3xx as an HTTPError instead of following it."""
+
+    class _NoRedirects(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(_NoRedirects)
+
+
 DEV_LOOP_LIVENESS_WORKERS = 8
 DEV_LOOP_LIVENESS_BUDGET_S = 60
 
@@ -137,7 +152,11 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
         return False
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})  # noqa: S310 — scheme pinned to https above
     try:
-        with urllib.request.urlopen(request, timeout=DEV_LOOP_LIVENESS_TIMEOUT_S) as resp:  # noqa: S310
+        # _NoRedirects, not the default opener: urllib replays the request
+        # headers — MCTL_TOKEN included — at whatever a 3xx points to, so a
+        # misconfigured or hostile redirect to http:// or another host would
+        # leak the bearer token and defeat the https check above.
+        with _no_redirect_opener().open(request, timeout=DEV_LOOP_LIVENESS_TIMEOUT_S) as resp:
             payload = json.loads(resp.read().decode("utf-8", "replace"))
     except (
         urllib.error.URLError,
@@ -152,7 +171,14 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
         if not (isinstance(exc, urllib.error.HTTPError) and exc.code == 404):
             print(f"warn: dev-loop liveness check failed for {workflow_id}: {exc}")
         return False
-    return isinstance(payload, dict) and payload.get("status") == "Running"
+    if not isinstance(payload, dict) or payload.get("status") != "Running":
+        return False
+    # Running is not the same as ticking: an execution that started before
+    # the shepherd-in-loop patch replays that branch as False and never
+    # submits a tick, yet stays Running for up to the 14-day merge
+    # deadline. Skipping it would leave its PR with no shepherd at all.
+    # An mctl-api without the field answers None → swept, as before.
+    return payload.get("shepherd_in_loop") is True
 
 
 def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:

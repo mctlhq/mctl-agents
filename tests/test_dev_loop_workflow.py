@@ -75,6 +75,9 @@ def _fake_activities(
         "implementer": ResolvedRelease(
             agent="implementer", environment="production", version="2.0.0", image_ref="ghcr.io/x@sha256:bbb"
         ),
+        "shepherd": ResolvedRelease(
+            agent="shepherd", environment="production", version="3.0.0", image_ref="ghcr.io/x@sha256:ccc"
+        ),
     }
 
     @activity.defn(name="resolve_agent_release")
@@ -95,6 +98,12 @@ def _fake_activities(
             # In-loop tick (#213) must be scoped to exactly this proposal.
             assert input.params.get("service")
             assert input.params.get("slug", "").startswith("issue-")
+            # ...and must run the RELEASED shepherd, not the CWFT's baked-in
+            # default, so a promotion/rollback reaches in-loop ticks too
+            # (Codex P2 on PR #230).
+            if released:
+                assert input.params.get("agent_image") == "ghcr.io/x@sha256:ccc"
+                assert input.params.get("agent_version") == "shepherd@3.0.0"
             if shepherd_fails:
                 from temporalio.exceptions import ApplicationError
 
@@ -930,6 +939,47 @@ class TestDevLoopWorkflow:
             "mctl-agents-implement",
             "mctl-agents-shepherd",
         ]
+
+    async def test_shepherd_in_loop_query_answers_true_during_the_watch(self, env):
+        """The sweeper asks the workflow, not its status (Codex P1 on #230).
+
+        While the merge watch runs under the shepherd-in-loop patch, the
+        query must already answer True — the cron has to stand down from
+        the moment the watch starts, not from the first tick 4 h later.
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        seen: list[bool] = []
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/87"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            # Before the watch exists the workflow is not shepherding.
+            seen.append(await handle.query(DevLoopWorkflow.shepherd_in_loop))
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+            seen.append(await handle.query(DevLoopWorkflow.shepherd_in_loop))
+
+        assert seen[0] is False
+        assert seen[1] is True
 
     async def test_failed_shepherd_tick_does_not_end_the_watch(self, env):
         """A failing shepherd tick is logged, not fatal — the watch keeps
