@@ -86,6 +86,8 @@ class TestReconcileWorkflow:
         assert received["active_workflow_ids"] == ["dev-loop-mctlhq-mctl-web-10"]
         assert result.discovery.total_inspected == 1
         assert len(result.orphans.orphans) == 1
+        # A tick that actually ran detection carries no skipped marker.
+        assert result.orphans.skipped_reason is None
 
     async def test_visibility_failure_skips_orphan_detection(self, env):
         """Unknown active set → no orphan report this tick, not a page for
@@ -108,5 +110,9 @@ class TestReconcileWorkflow:
         assert "active_workflow_ids" not in received
         assert result.orphans.orphans == []
         assert result.orphans.total_actionable == 0
+        # A skipped tick is distinguishable from a genuinely clean one, and
+        # the reason carries the underlying error for the on-call engineer.
+        assert result.orphans.skipped_reason is not None
+        assert "visibility" in result.orphans.skipped_reason
         # Discovery still ran and is reported.
         assert result.discovery.total_inspected == 1

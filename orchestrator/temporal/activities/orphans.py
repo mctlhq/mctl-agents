@@ -34,6 +34,10 @@ class OrphanSignal:
 class OrphanDetectionResult:
     total_actionable: int
     orphans: list[OrphanSignal]
+    # Set when orphan detection did NOT run (e.g. the active-workflow
+    # visibility query failed and the tick skipped the check) so result
+    # consumers can tell a skipped tick from a genuinely clean one.
+    skipped_reason: str | None = None
 
 
 def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None = None) -> OrphanDetectionResult:

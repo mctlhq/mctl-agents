@@ -54,16 +54,22 @@ class ReconcileWorkflow:
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=ACTIVITY_RETRY_POLICY,
                 )
-            except Exception:  # noqa: BLE001 — ActivityError after retries
+            except Exception as exc:  # noqa: BLE001 — ActivityError after retries
                 # Active set unknown: skip orphan detection for this tick
                 # instead of reporting every actionable proposal as an
                 # orphan. The next scheduled run retries from scratch.
                 workflow.logger.warning(
-                    "list_active_dev_loop_ids failed; skipping orphan detection this tick"
+                    "list_active_dev_loop_ids failed; skipping orphan detection "
+                    "this tick: %s",
+                    exc,
                 )
                 return ReconcileWorkflowResult(
                     discovery=discovery_result,
-                    orphans=OrphanDetectionResult(total_actionable=0, orphans=[]),
+                    orphans=OrphanDetectionResult(
+                        total_actionable=0,
+                        orphans=[],
+                        skipped_reason=f"active-DevLoop visibility query failed: {exc}",
+                    ),
                 )
 
         orphans_result: OrphanDetectionResult = await workflow.execute_activity(
