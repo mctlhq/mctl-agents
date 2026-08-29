@@ -13,16 +13,12 @@ from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.issue_ref import parse_issue_url
+
+# workflow_id_for moved to issue_ref (temporalio-free) so agent-container
+# callers can import it without the SDK; re-exported here because this
+# module is where every Temporal-side caller historically found it.
+from orchestrator.temporal.issue_ref import workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
-
-
-def workflow_id_for(issue_url: str) -> str:
-    # dev-loop-{owner}-{repo}-{issue} — Temporal's own workflow-ID dedup
-    # replaces the hand-rolled "already past proposed" guard the cron
-    # pipeline needed pre-Temporal.
-    parts = parse_issue_url(issue_url)
-    return f"dev-loop-{parts.owner}-{parts.repo}-{parts.number}"
 
 
 async def connect() -> Client:

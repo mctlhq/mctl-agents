@@ -60,7 +60,12 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
         # had a DevLoop, so no active-ID check applies to them.
         m = re.match(r"issue-(\d+)-", ref.slug)
         if m:
-            expected_workflow_id = f"dev-loop-mctlhq-{ref.service}-{m.group(1)}"
+            # Owner comes from the PR snapshot rather than a hardcoded
+            # "mctlhq": parse_issue_url currently only admits mctlhq issues,
+            # but deriving it keeps this comparison correct if that ever
+            # widens (agy P2 on PR #212).
+            owner = pr.repo.split("/")[0] if pr.repo and "/" in pr.repo else "mctlhq"
+            expected_workflow_id = f"dev-loop-{owner}-{ref.service}-{m.group(1)}"
             if expected_workflow_id in active_ids:
                 continue
 
