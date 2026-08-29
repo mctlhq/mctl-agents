@@ -1,7 +1,8 @@
 # ADR 007 — `AgentDefinition` and `ExecutionProfile` contract
 
-> **Status:** proposed (pending circulation against the GitOps catalog-schema
-> and runtime-resolver follow-up issues — see Implementation map)
+> **Status:** accepted
+> **Accepted:** 2026-08-29, after contract circulation against
+> `mctlhq/mctl-gitops#950` and `mctlhq/mctl-agents#227`
 > **Date:** 2026-08-29
 > **Supersedes:** nothing — this is a design document, no code changes
 
@@ -360,10 +361,21 @@ The contract is normative for both children of `mctlhq/.github#18`:
 | `mctl-gitops#950` GitOps catalog/schema | v1alpha2 split, required policy fields, version lifecycle, atomic `ReleaseBinding`, fail-closed validation, exact-pair rollback. |
 | `mctl-agents#227` runtime resolver | immutable `ExecutionPlan`, legacy-only fallback, v1alpha2 pre-submit rejection, exact resolved tuple and execution identity. |
 
-Circulation against both follow-ups is the final acceptance gate for this
-`proposed` ADR. A follow-up may add schema or API implementation detail, but
-must not reopen: who owns desired state versus releases versus live runs;
-whether activation/rollback is atomic; whether v1alpha2 may silently
-fallback; or whether tool names alone constitute authorization. Questions
-in any of those areas must be resolved in this ADR before it becomes
-`accepted`.
+Circulation against both follow-ups is complete. A follow-up may add schema
+or API implementation detail, but must not reopen: who owns desired state
+versus releases versus live runs; whether activation/rollback is atomic;
+whether v1alpha2 may silently fallback; or whether tool names alone
+constitute authorization.
+
+### Downstream sequencing
+
+- Investigation and proposal creation for #950 and #227 may proceed in
+  parallel after this ADR is merged.
+- #227 may implement and test the resolver against checked-in compatibility
+  fixtures while #950 implements the catalog schemas and atomic release
+  binding.
+- Production activation of the declarative resolver is blocked on #950:
+  the catalog schema, compatibility validation, and atomic
+  `ReleaseBinding` must exist before a v1alpha2 agent is promoted.
+- Each implementation still requires its own proposal review and human
+  `.status.yaml: proposed -> accepted` gate.
