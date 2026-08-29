@@ -1,5 +1,29 @@
 # Changelog
 
+## [1.31.0](https://github.com/mctlhq/mctl-agents/compare/1.30.0...1.31.0) (2026-08-29)
+
+
+### Features
+
+* **dev-loop:** merge detection — get_pr_state polling + pr result stage ([bf3e767](https://github.com/mctlhq/mctl-agents/commit/bf3e767c0e901c1cb303fc540bfe115cecdf749c))
+* **dev-loop:** merge detection — get_pr_state polling + pr result stage ([362a741](https://github.com/mctlhq/mctl-agents/commit/362a7417146f5b46cfb13a879ea639d49f0c0565)), closes [#214](https://github.com/mctlhq/mctl-agents/issues/214)
+* **dev-loop:** show the merge-watch outcome in the status command ([8dfe76a](https://github.com/mctlhq/mctl-agents/commit/8dfe76a81e5b1d11e1e14633424f74dca748497f))
+
+
+### Bug Fixes
+
+* **dev-loop:** harden merge-detection per review ([ae7afd5](https://github.com/mctlhq/mctl-agents/commit/ae7afd5cc9a644303e36d7d1dac7d7d1b7b09830))
+* **dev-loop:** narrow the optional status-field match for mypy ([e35d039](https://github.com/mctlhq/mctl-agents/commit/e35d03974fe8e55ac92c4956247206f2790ffd37))
+* **dev-loop:** never downgrade a resolved PR state to a 404 reference ([c594c24](https://github.com/mctlhq/mctl-agents/commit/c594c2430472892be7ac21bb87fd7306486bec81))
+* **dev-loop:** ride out read outages; end the watch when the PR vanishes ([a15894b](https://github.com/mctlhq/mctl-agents/commit/a15894b7fea6092857c4496683f8f7de5e03e60f))
+* **dev-loop:** stop masking activity bugs in the merge watch ([8b785a5](https://github.com/mctlhq/mctl-agents/commit/8b785a537837ce4a7955fc0d8d89c2431b77756e))
+* **reconcile:** carry the visibility failure into log and result ([ad21063](https://github.com/mctlhq/mctl-agents/commit/ad21063f033564e9ff46fe4ed362c77ffb0a7e6b))
+* **reconcile:** feed real active DevLoop ids into orphan detection ([da87247](https://github.com/mctlhq/mctl-agents/commit/da8724738afbd2e5d54a35616f1333957c53c075))
+* **reconcile:** feed real active DevLoop ids into orphan detection ([7b56ba7](https://github.com/mctlhq/mctl-agents/commit/7b56ba71a18cc36f11f52bcc4ae2cb64dc818125)), closes [#151](https://github.com/mctlhq/mctl-agents/issues/151)
+* **reconcile:** match the unpatched history's detect_orphans arity ([4c990cf](https://github.com/mctlhq/mctl-agents/commit/4c990cf7fa45f27712bedeadfc69d3d2587e78f4))
+* **shepherd:** gate merges on chatgpt-codex-connector[bot] P1/P2 findings ([d7ba726](https://github.com/mctlhq/mctl-agents/commit/d7ba726e7e758e6484f91f1873102932f556d798))
+* **shepherd:** gate merges on chatgpt-codex-connector[bot] P1/P2 findings ([13fe7a2](https://github.com/mctlhq/mctl-agents/commit/13fe7a2271c2b8f3da4f40a033509fa0986a6b55)), closes [#67](https://github.com/mctlhq/mctl-agents/issues/67)
+
 ## [1.30.0](https://github.com/mctlhq/mctl-agents/compare/1.29.4...1.30.0) (2026-08-29)
 
 
