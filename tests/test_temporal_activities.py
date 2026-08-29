@@ -453,6 +453,40 @@ class TestDetectOrphans:
         assert result_orphan.orphans[0].slug == "issue-10-test-slug"
 
 
+class TestVisibilityActivities:
+    async def test_list_active_dev_loop_ids_collects_running_ids(self, env):
+        from orchestrator.temporal.activities.visibility import (
+            ACTIVE_DEV_LOOPS_QUERY,
+            VisibilityActivities,
+        )
+
+        class _Exec:
+            def __init__(self, wid: str) -> None:
+                self.id = wid
+
+        class _FakeClient:
+            def __init__(self) -> None:
+                self.query = None
+
+            def list_workflows(self, query: str):
+                self.query = query
+
+                async def gen():
+                    yield _Exec("dev-loop-mctlhq-mctl-web-10")
+                    yield _Exec("dev-loop-mctlhq-mctl-api-7")
+
+                return gen()
+
+        client = _FakeClient()
+        acts = VisibilityActivities(client)
+        ids = await env.run(acts.list_active_dev_loop_ids)
+        assert ids == ["dev-loop-mctlhq-mctl-web-10", "dev-loop-mctlhq-mctl-api-7"]
+        assert client.query == ACTIVE_DEV_LOOPS_QUERY
+        # Running-only is load-bearing: closed DevLoops are exactly the
+        # orphan case detect_orphans exists to catch.
+        assert "ExecutionStatus = 'Running'" in ACTIVE_DEV_LOOPS_QUERY
+
+
 
 
 class TestFindProposalSlug:

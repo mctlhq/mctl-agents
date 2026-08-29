@@ -34,6 +34,7 @@ from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.proposals import find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
+from orchestrator.temporal.activities.visibility import VisibilityActivities
 from orchestrator.temporal.constants import TASK_QUEUE
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.docs_delta import DocsDeltaWorkflow
@@ -164,6 +165,8 @@ async def main() -> None:
 
     await setup_schedules(client)
 
+    visibility = VisibilityActivities(client)
+
     worker = Worker(
         client,
         task_queue=TASK_QUEUE,
@@ -175,6 +178,7 @@ async def main() -> None:
             find_proposal_slug,
             discover_and_project,
             detect_orphans,
+            visibility.list_active_dev_loop_ids,
             poll_issues_activity,
             process_docs_delta_activity,
         ],
