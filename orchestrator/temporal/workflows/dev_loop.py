@@ -279,6 +279,22 @@ async def _record(
         )
 
 
+def _is_transient(exc: ActivityError) -> bool:
+    """Is this activity failure a known-transient one, or a bug?
+
+    The read activities wrap every expected failure in
+    ProposalListingError, and an activity timeout is transport by
+    definition. Anything else escaping an activity is an unexpected defect
+    — retrying THAT for the rest of a long deadline would silently mask
+    it, which is the lesson _watch_pr already learned (agy P2, round 3 on
+    #224).
+    """
+    cause = exc.cause
+    return isinstance(cause, TemporalTimeoutError) or (
+        isinstance(cause, ApplicationError) and cause.type == "ProposalListingError"
+    )
+
+
 def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
     """Retrieve a finished tick's exception so it is never swallowed.
 
@@ -565,6 +581,14 @@ class DevLoopWorkflow:
                     retry_policy=DEPLOY_READ_RETRY_POLICY,
                 )
             except ActivityError as exc:
+                if not _is_transient(exc):
+                    workflow.logger.warning(
+                        "release lookup for %s failed with a non-transient error — "
+                        "giving up on the release watch: %r",
+                        repo,
+                        exc.cause,
+                    )
+                    return None
                 workflow.logger.warning(
                     "release lookup failed for %s — retrying next interval: %r", repo, exc.cause
                 )
@@ -588,6 +612,14 @@ class DevLoopWorkflow:
                     retry_policy=DEPLOY_READ_RETRY_POLICY,
                 )
             except ActivityError as exc:
+                if not _is_transient(exc):
+                    return DeployObservation(
+                        outcome="unverified",
+                        team=target.team,
+                        app=target.app,
+                        release_tag=release.tag,
+                        detail=f"deploy status read failed with a non-transient error: {exc.cause!r}",
+                    )
                 workflow.logger.warning(
                     "deploy status read failed for %s/%s — retrying next interval: %r",
                     target.team,

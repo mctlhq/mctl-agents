@@ -73,6 +73,8 @@ def _fake_activities(
     deploy_target: DeployTarget | None = _SENTINEL_TARGET,
     release: ReleaseInfo | None = _DEFAULT_RELEASE,
     deploy_statuses: list[DeployStatus] | None = None,
+    release_lookup_bug: bool = False,
+    deploy_status_bug: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -135,6 +137,12 @@ def _fake_activities(
 
     @activity.defn(name="get_release_after")
     async def fake_get_release_after(repo: str, after: str) -> ReleaseInfo | None:
+        if release_lookup_bug:
+            from temporalio.exceptions import ApplicationError
+
+            # NOT a ProposalListingError: an unexpected defect, which must
+            # not be retried for the whole lookup deadline.
+            raise ApplicationError("boom", type="TypeError", non_retryable=True)
         return release
 
     deploy_sequence = deploy_statuses if deploy_statuses is not None else [
@@ -144,6 +152,10 @@ def _fake_activities(
 
     @activity.defn(name="get_deploy_status")
     async def fake_get_deploy_status(team: str, app: str) -> DeployStatus:
+        if deploy_status_bug:
+            from temporalio.exceptions import ApplicationError
+
+            raise ApplicationError("boom", type="KeyError", non_retryable=True)
         i = min(deploy_index["i"], len(deploy_sequence) - 1)
         deploy_index["i"] += 1
         return deploy_sequence[i]
@@ -1096,6 +1108,35 @@ class TestDevLoopWorkflow:
             result = await self._run_to_completion(env, activities, investigate_ran, 93)
 
         assert result.deploy is not None and result.deploy.outcome == "no-release"
+
+    async def test_a_bug_in_the_release_lookup_is_not_retried_for_the_deadline(self, env):
+        """Same rule _watch_pr already follows: mask transport, not defects.
+
+        An unexpected exception type is a bug in the activity; retrying it
+        for the whole 20-minute lookup window would hide it behind a
+        plausible-looking no-release.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, release_lookup_bug=True
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 101)
+
+        assert result.deploy is not None and result.deploy.outcome == "no-release"
+
+    async def test_a_bug_in_the_status_read_ends_the_verify_immediately(self, env):
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, deploy_status_bug=True
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 102)
+
+        assert result.deploy is not None and result.deploy.outcome == "unverified"
+        assert "non-transient" in (result.deploy.detail or "")
 
     async def test_no_target_when_the_repo_deploys_no_app(self, env):
         """A repo whose release only bumps cluster templates has nothing to verify."""

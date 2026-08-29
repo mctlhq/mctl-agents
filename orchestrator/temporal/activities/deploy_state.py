@@ -114,7 +114,12 @@ async def resolve_deploy_target(repo: str) -> DeployTarget | None:
     url = f"https://api.github.com/repos/{repo}/contents/{RELEASE_PLEASE_WORKFLOW}"
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         try:
-            response = await client.get(url, params={"ref": "main"}, headers=_github_headers(token))
+            # No explicit ref: the contents API then reads the repo's own
+            # default branch. Pinning "main" would 404 on any repo whose
+            # default is named otherwise, and that 404 is indistinguishable
+            # here from "this repo has no release-please workflow" — it
+            # would silently report no-target instead of the real cause.
+            response = await client.get(url, headers=_github_headers(token))
         except httpx.RequestError as exc:
             raise ProposalListingError(f"reading {url} failed: {exc}") from exc
     if response.status_code == 404:
