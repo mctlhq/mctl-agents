@@ -59,6 +59,7 @@ def _fake_activities(
     pr_states: list[PRState] | None = None,
     pr_state_raises_after: int | None = None,
     pr_state_error_type: str | None = None,
+    pr_state_raises_at: set[int] | None = None,
     shepherd_fails: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
@@ -113,6 +114,16 @@ def _fake_activities(
 
     @activity.defn(name="get_pr_state")
     async def fake_get_pr_state(service: str, slug: str) -> PRState:
+        # `raises_after` is sticky (outage); `raises_at` fails those polls
+        # only, then recovers — a transient hiccup, and it does NOT consume
+        # an entry from `sequence`.
+        if pr_state_raises_at is not None and poll_index["i"] in pr_state_raises_at:
+            from temporalio.exceptions import ApplicationError
+
+            pr_state_raises_at.discard(poll_index["i"])
+            raise ApplicationError(
+                "github unreachable", type=pr_state_error_type, non_retryable=True
+            )
         if pr_state_raises_after is not None and poll_index["i"] >= pr_state_raises_after:
             from temporalio.exceptions import ApplicationError
 
@@ -953,5 +964,50 @@ class TestDevLoopWorkflow:
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert "mctl-agents-shepherd" in calls
+
+    async def test_transient_poll_failure_delays_the_tick_instead_of_dropping_it(
+        self, env
+    ):
+        """A failed read must not consume a tick boundary (#230 P3).
+
+        `poll_index` counts successful reads only. Polls 1-7 see an open
+        PR, poll 8 — what would have been the boundary — fails
+        transiently, and the poll after it recovers and becomes the 8th
+        successful read, so the tick still fires. Counting every attempt
+        instead would spend the boundary on the failure and defer the
+        tick by a full 8 polls (~4 h).
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * 8 + [MERGED_PR],
+            pr_state_raises_at={7},
+            pr_state_error_type="ProposalListingError",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/87"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
         assert result.pr is not None and result.pr.state == "MERGED"
         assert "mctl-agents-shepherd" in calls

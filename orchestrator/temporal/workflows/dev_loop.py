@@ -226,6 +226,20 @@ class DevLoopWorkflow:
     def __init__(self) -> None:
         self._approved = False
         self._approver: str | None = None
+        self._shepherd_in_loop = False
+
+    @workflow.query
+    def shepherd_in_loop(self) -> bool:
+        """Does THIS execution run its own shepherd ticks? (#213)
+
+        The shepherd cron asks mctl-api, which asks this query, because
+        "Running" alone cannot answer it: an execution that started before
+        the `shepherd-in-loop` patch replays that branch as False and will
+        never tick, yet stays Running until the merge-watch deadline. The
+        cron must keep sweeping those proposals, so it needs the patch
+        marker this workflow actually recorded — not its status.
+        """
+        return self._shepherd_in_loop
 
     @workflow.signal
     def approve(self, *args: object) -> None:
@@ -418,10 +432,14 @@ class DevLoopWorkflow:
         # In-loop shepherd (#213): evaluated once — the marker also fixes
         # whether tick commands appear in this execution's history at all.
         shepherd_in_loop = workflow.patched("shepherd-in-loop")
+        # Published to the sweeper via the shepherd_in_loop query the moment
+        # the watch starts, not at the first tick 4 h later: between those
+        # two points this execution IS the owner, and the cron must already
+        # be standing down.
+        self._shepherd_in_loop = shepherd_in_loop
         poll_index = 0
         shepherd_ticks = 0
         while workflow.now() < deadline:
-            poll_index += 1
             try:
                 state: PRState = await workflow.execute_activity(
                     get_pr_state,
@@ -469,6 +487,10 @@ class DevLoopWorkflow:
                 polls_without_pr = 0
                 if state.state in ("MERGED", "CLOSED"):
                     return state
+                # Counted only on a successful read, so a transient
+                # get_pr_state failure delays the next tick instead of
+                # consuming its boundary and dropping it for ~4 h.
+                poll_index += 1
                 if (
                     shepherd_in_loop
                     and poll_index % SHEPHERD_TICK_EVERY_POLLS == 0
@@ -481,11 +503,19 @@ class DevLoopWorkflow:
                     # is the durable part, and the next tick retries.
                     shepherd_ticks += 1
                     try:
-                        tick_result = await _run_cwft(
-                            "mctl-agents-shepherd",
-                            {"service": service, "slug": slug},
-                        )
-                        await _record("shepherd", None, tick_result, service)
+                        # Pin the released shepherd image exactly like the
+                        # investigate/implement steps do, so a promotion or
+                        # rollback in the agent registry reaches in-loop
+                        # ticks too — otherwise DevLoop-owned proposals
+                        # would silently run the CWFT's baked-in default
+                        # while cron-driven ones ran the intended release.
+                        shepherd_release = await _resolve("shepherd")
+                        tick_params = {"service": service, "slug": slug}
+                        if shepherd_release and shepherd_release.image_ref:
+                            tick_params["agent_image"] = shepherd_release.image_ref
+                            tick_params["agent_version"] = f"shepherd@{shepherd_release.version}"
+                        tick_result = await _run_cwft("mctl-agents-shepherd", tick_params)
+                        await _record("shepherd", shepherd_release, tick_result, service)
                     except ActivityError as exc:
                         workflow.logger.warning(
                             "in-loop shepherd tick failed for %s/%s — the "

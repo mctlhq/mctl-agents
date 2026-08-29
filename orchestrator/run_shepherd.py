@@ -42,6 +42,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -50,6 +51,8 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -96,6 +99,16 @@ GATING_BOTS = (REVIEW_BOT, CODEX_CONNECTOR_BOT)
 MCTL_API_URL = os.environ.get("MCTL_API_URL", "https://api.mctl.ai").rstrip("/")
 DEV_LOOP_LIVENESS_TIMEOUT_S = 10
 
+# The sweep tick runs every 5 minutes (see the module docstring), so the
+# ownership pass must finish well inside that window no matter how many
+# proposals are open or how badly mctl-api is degraded. Serially, N slow
+# proposals cost N*10s and overlapping ticks would pile load onto an
+# already-sick API. Two bounds together make the worst case independent
+# of N: a small thread pool, and a hard wall-clock budget after which the
+# remaining refs are kept unchecked (fail-open, same as any other failure).
+DEV_LOOP_LIVENESS_WORKERS = 8
+DEV_LOOP_LIVENESS_BUDGET_S = 60
+
 
 def _dev_loop_owns(service: str, slug: str) -> bool:
     """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
@@ -126,7 +139,13 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
     try:
         with urllib.request.urlopen(request, timeout=DEV_LOOP_LIVENESS_TIMEOUT_S) as resp:  # noqa: S310
             payload = json.loads(resp.read().decode("utf-8", "replace"))
-    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ) as exc:
         # 404 = no such workflow (or an mctl-api predating the endpoint) —
         # genuinely not owned. Anything else is an infra failure; log it so
         # an operator can see the ownership check degraded, then sweep.
@@ -139,10 +158,40 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
 def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
     """Drop refs a running DevLoop owns; used only in sweep mode (no
     explicit --slug — a targeted one-shot, including the DevLoop's own
-    in-loop tick, must always process the slug it was given)."""
+    in-loop tick, must always process the slug it was given).
+
+    Checks run concurrently and under a wall-clock budget so a degraded
+    mctl-api cannot stretch one tick past the cron interval — see the
+    DEV_LOOP_LIVENESS_* notes above. Anything not answered inside the
+    budget is kept, which is the same fail-open outcome as an error.
+    """
+    if not refs:
+        return refs
+    owned: set[int] = set()
+    workers = min(DEV_LOOP_LIVENESS_WORKERS, len(refs))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_dev_loop_owns, ref.service, ref.slug): i
+            for i, ref in enumerate(refs)
+        }
+        try:
+            for future in as_completed(futures, timeout=DEV_LOOP_LIVENESS_BUDGET_S):
+                if future.result():
+                    owned.add(futures[future])
+        except FuturesTimeoutError:
+            # Budget spent. Whatever already answered still counts; the
+            # rest stay unchecked and get swept, and the in-flight calls
+            # are abandoned (each carries its own 10s socket timeout, so
+            # the pool drains on its own rather than leaking).
+            unanswered = sum(1 for f in futures if not f.done())
+            print(
+                f"warn: dev-loop ownership pass hit its "
+                f"{DEV_LOOP_LIVENESS_BUDGET_S}s budget with {unanswered} "
+                "proposal(s) unchecked — sweeping them"
+            )
     kept: list[ProposalRef] = []
-    for ref in refs:
-        if _dev_loop_owns(ref.service, ref.slug):
+    for i, ref in enumerate(refs):
+        if i in owned:
             print(
                 f"info: {ref.service}/{ref.slug} is driven by a running "
                 "DevLoopWorkflow — skipping (sweeper mode, #213)"

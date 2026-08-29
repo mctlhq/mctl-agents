@@ -2188,3 +2188,108 @@ def test_filter_dev_loop_owned_drops_only_owned(monkeypatch, capsys) -> None:
     kept = run_shepherd._filter_dev_loop_owned([owned, free])
     assert kept == [free]
     assert "driven by a running DevLoopWorkflow" in capsys.readouterr().out
+
+
+def test_dev_loop_owns_non_https_url_skips_the_call(monkeypatch, capsys) -> None:
+    """A non-https MCTL_API_URL must fail open WITHOUT a request.
+
+    The scheme guard is what lets the urlopen call carry `# noqa: S310`;
+    if it ever stopped short-circuiting, the noqa would be covering a
+    real unaudited-scheme call rather than a pinned one.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "http://api.internal")
+    monkeypatch.setattr(
+        run_shepherd.urllib.request,
+        "urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not call")),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+    assert "non-https MCTL_API_URL" in capsys.readouterr().out
+
+
+def test_dev_loop_owns_http_exception_fails_open(monkeypatch) -> None:
+    """http.client.HTTPException subclasses Exception, not OSError.
+
+    Uncaught it would escape _filter_dev_loop_owned and abort the whole
+    sweep tick — the opposite of the per-proposal fail-open this function
+    documents. Regression for claude P3 on PR #230.
+    """
+    import http.client
+
+    def fake_urlopen(request, timeout=None):
+        raise http.client.IncompleteRead(b"half")
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_filter_dev_loop_owned_keeps_unanswered_refs_when_budget_expires(
+    monkeypatch, capsys
+) -> None:
+    """A degraded mctl-api must not stretch the sweep past its interval.
+
+    One proposal answers "owned" immediately; the other hangs. Once the
+    budget expires the hung one is KEPT (swept) rather than dropped or
+    waited on, so the tick's cost is bounded by the budget and not by the
+    number of proposals. Regression for the claude+agy P2 on PR #230.
+    """
+    import threading
+
+    release = threading.Event()
+
+    def slow_or_fast(service: str, slug: str) -> bool:
+        if slug == "issue-10-owned":
+            return True
+        release.wait(timeout=5)
+        return True  # would claim ownership — but must never be consulted
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns", slow_or_fast)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
+
+    refs = [
+        run_shepherd.ProposalRef(
+            service="mctl-web",
+            slug=slug,
+            proposal_dir=Path("/tmp/x"),
+            status="implemented",
+        )
+        for slug in ("issue-10-owned", "issue-11-hung")
+    ]
+    try:
+        kept = run_shepherd._filter_dev_loop_owned(refs)
+    finally:
+        release.set()
+
+    assert [r.slug for r in kept] == ["issue-11-hung"]
+    assert "budget with 1 proposal(s) unchecked" in capsys.readouterr().out
+
+
+def test_main_applies_the_ownership_filter_only_in_sweep_mode(
+    tmp_path, monkeypatch
+) -> None:
+    """The gate at main()'s call site is the actual behaviour change.
+
+    Sweep mode filters; a targeted --slug run (which is how the DevLoop's
+    own in-loop tick invokes the shepherd) and --reconcile must not, or
+    the workflow would filter itself out and the projection would stop
+    recording terminal states for owned slugs.
+    """
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+    calls: list[str] = []
+
+    def run(argv: list[str], label: str) -> None:
+        monkeypatch.setattr("sys.argv", ["run_shepherd", "--dry-run",
+                                         "--state-dir", str(state_dir), *argv])
+        with patch.object(run_shepherd, "_discover_refs", return_value=[]), \
+             patch.object(run_shepherd, "_filter_dev_loop_owned",
+                          side_effect=lambda refs: calls.append(label) or refs):
+            run_shepherd.main()
+
+    run([], "sweep")
+    assert calls == ["sweep"]
+    run(["--slug", "issue-10-test"], "slug")
+    run(["--reconcile"], "reconcile")
+    assert calls == ["sweep"]
