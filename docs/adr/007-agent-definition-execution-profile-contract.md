@@ -266,6 +266,24 @@ fields imply. Providers continue to enforce these scopes server-side.
 - Rollback selects the prior binding revision; it never synthesizes a pair
   by rolling back each half independently.
 
+### Validation expectations
+
+The schema and resolver follow-ups must make this contract executable through
+tests, not documentation convention:
+
+- positive fixtures for the three mapped agents;
+- negative schema tests for missing owner, policy, bounds, sandbox, and
+  unknown model/skill/tool/profile references;
+- compatibility tests rejecting a profile outside the definition constraint;
+- transition-table tests for publish, promote, deprecate, disable, and
+  exact-pair rollback;
+- v1alpha1 compatibility tests proving fallback is explicit and observable;
+- v1alpha2 tests proving missing/disabled/incompatible references fail before
+  Argo submission;
+- options-builder equivalence tests proving a migrated investigator resolves
+  the same prompt, tools, budget, timeout, and runtime as the legacy path;
+- deterministic snapshot tests proving the same binding revision and task
+  produce the same immutable `ExecutionPlan` identifiers.
 ## Alternatives
 
 1. **Keep `AgentManifest` as a single flat resource; add lifecycle fields
