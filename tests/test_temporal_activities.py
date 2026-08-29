@@ -416,10 +416,14 @@ class TestDetectOrphans:
         from orchestrator.run_shepherd import ProposalRef, PRSnapshot
         from orchestrator.temporal.activities.orphans import detect_orphans
 
+        # Slug carries the issue-<N>- prefix the investigator always writes;
+        # the expected workflow id is derived from that issue number (the id
+        # scheme in start.py:workflow_id_for), NOT from the full slug — the
+        # old slug-based reconstruction matched nothing (mctl-agents#151).
         fake_ref = ProposalRef(
             service="mctl-web",
-            slug="test-slug",
-            proposal_dir=tmp_path / "mctl-web" / "proposals" / "test-slug",
+            slug="issue-10-test-slug",
+            proposal_dir=tmp_path / "mctl-web" / "proposals" / "issue-10-test-slug",
             status="accepted",
             pr_url="https://github.com/mctlhq/mctl-web/pull/10",
         )
@@ -441,12 +445,12 @@ class TestDetectOrphans:
         monkeypatch.setattr("orchestrator.temporal.activities.orphans._discover_refs", lambda *a, **kw: [fake_ref])
         monkeypatch.setattr("orchestrator.temporal.activities.orphans.find_pr_for_proposal", lambda *a, **kw: fake_pr)
 
-        result_active = await env.run(detect_orphans, str(tmp_path), ["dev-loop-mctlhq-mctl-web-test-slug"])
+        result_active = await env.run(detect_orphans, str(tmp_path), ["dev-loop-mctlhq-mctl-web-10"])
         assert len(result_active.orphans) == 0
 
         result_orphan = await env.run(detect_orphans, str(tmp_path), [])
         assert len(result_orphan.orphans) == 1
-        assert result_orphan.orphans[0].slug == "test-slug"
+        assert result_orphan.orphans[0].slug == "issue-10-test-slug"
 
 
 
