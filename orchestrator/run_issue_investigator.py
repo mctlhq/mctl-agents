@@ -258,18 +258,26 @@ def _gitops_tree_url(service: str, slug: str) -> str:
 
 def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
     """Comment on the issue with a link to the freshly written proposal."""
+    # Render the CONCRETE workflow id (single source: start.workflow_id_for)
+    # so the approve commands below are copy-pasteable — placeholder text
+    # sent operators chasing an invalid id (codex P2 on PR #212). Imported
+    # lazily: this module's other entry points don't need temporalio.
+    from orchestrator.temporal.start import workflow_id_for
+
+    workflow_id = workflow_id_for(issue_url)
     body = (
         "mctl-agents issue-investigator has analyzed this issue and created "
         "a proposal:\n\n"
         f"{_gitops_tree_url(service, slug)}\n\n"
         "Status: `proposed` — pending human approval. Review `requirements.md`, "
-        "`design.md` and `tasks.md`, then approve: signal the issue's "
-        "DevLoopWorkflow (`POST /api/v1/agents/dev-loop/{workflow_id}/approve`, "
-        "or `python -m orchestrator.temporal.cli approve <workflow-id>`) — the "
+        "`design.md` and `tasks.md`, then approve: signal this issue's "
+        f"DevLoopWorkflow (mctl-api `POST /api/v1/agents/dev-loop/{workflow_id}/approve`, "
+        f"or `python -m orchestrator.temporal.cli approve {workflow_id}`) — the "
         "workflow flips `.status.yaml` to `accepted` via the "
         "`mctl-agents-approve` operation and runs the Tier 2 implementer. "
-        "For a proposal with no DevLoop, run the `mctl-agents-approve` "
-        "operation directly."
+        "If no DevLoopWorkflow is running for this issue (pre-Temporal "
+        "proposal), run the `mctl-agents-approve` operation directly with "
+        f"`service={service} slug={slug}`."
     )
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 

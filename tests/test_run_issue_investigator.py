@@ -445,3 +445,22 @@ def test_investigate_sets_rate_limited_on_429(tmp_path, monkeypatch):
 # Keep an explicit reference so an accidental removal of the public helper
 # trips the import at collection time.
 assert callable(gh_issue_view)
+
+
+def test_post_proposal_comment_renders_concrete_workflow_id(monkeypatch):
+    """The approve instructions must carry the real Temporal workflow id
+    (copy-pasteable), not a placeholder — and it must come from the same
+    id scheme start_dev_loop_workflow uses (codex P2 on PR #212)."""
+    captured: list[list[str]] = []
+    monkeypatch.setattr(run_issue_investigator, "_run", lambda cmd, **kw: captured.append(cmd))
+
+    run_issue_investigator.post_proposal_comment(
+        "https://github.com/mctlhq/mctl-telegram/issues/123", "mctl-telegram", "issue-123-fix-foo"
+    )
+
+    assert len(captured) == 1
+    body = captured[0][captured[0].index("--body") + 1]
+    assert "dev-loop-mctlhq-mctl-telegram-123" in body
+    assert "{workflow_id}" not in body
+    assert "<workflow-id>" not in body
+    assert "service=mctl-telegram slug=issue-123-fix-foo" in body
