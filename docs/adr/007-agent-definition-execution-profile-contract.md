@@ -240,7 +240,7 @@ a new atomic release binding; rolling back restores the previous exact pair.
 | Agent | Profile execution shape | Required permissions/policy | Approval boundary |
 |---|---|---|---|
 | `issue-investigator` | `service_agent`, $3 budget, Argo `mctl-agents-investigate`, current prompt/tool claim | Target repository read-only; controlled write only to its GitOps proposal path and proposal issue comment; no production mutation. | No approval for investigation; proposal remains `proposed`. |
-| `implementer` | `service_agent`, $3 budget, 900s, Argo `mctl-agents-implement` | Target repository branch/commit/PR write; no merge; GitOps status write scoped to its proposal. | Human acceptance before code-authoring run. |
+| `implementer` | `service_agent`, $20 effective budget, 2400s effective timeout (production CWFT overrides Python defaults of $3/900s), Argo `mctl-agents-implement` | Target repository branch/commit/PR write; no merge; GitOps status write scoped to its proposal. | Human acceptance before code-authoring run. |
 | `shepherd` | `review_findings_normalize`, Read-only SDK tools, no mctl MCP, $5 budget, Argo `mctl-agents-shepherd` | Read review state; merge only repositories allowed by ownership policy; no arbitrary MCP/Kubernetes access. | Approval and verified head/check state before merge. |
 
 The tool names above remain grounded in existing manifests, while the new
