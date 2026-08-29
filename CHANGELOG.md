@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.30.0](https://github.com/mctlhq/mctl-agents/compare/1.29.4...1.30.0) (2026-08-29)
+
+
+### Features
+
+* **dev-loop:** atomic proposal approval via mctl-agents-approve CWFT ([832ed0b](https://github.com/mctlhq/mctl-agents/commit/832ed0b71a00f225790b504b8cb0ee3ff76dc1c0))
+* **dev-loop:** atomic proposal approval via mctl-agents-approve CWFT ([6f96471](https://github.com/mctlhq/mctl-agents/commit/6f964715fe2886dddfe80a6318a254af961370fe))
+
+
+### Bug Fixes
+
+* **ci:** assert the image can import every entrypoint, not just build ([5faddd5](https://github.com/mctlhq/mctl-agents/commit/5faddd5afd227a3044a453bcc7b360f8a2d05bf7))
+* **ci:** cover the Temporal worker in the entrypoint import smoke ([f2d6bc1](https://github.com/mctlhq/mctl-agents/commit/f2d6bc1def15c7c58c3a58d1a91b7a3efbb3e836))
+* **dev-loop:** make approval durable before implementer resolve; review fixes ([638e32c](https://github.com/mctlhq/mctl-agents/commit/638e32cf46f4793636ce3e2e53ae60cb3e5438a4))
+* **dev-loop:** replay-safe implementer-resolve position; approve-flow comment ([834ad4d](https://github.com/mctlhq/mctl-agents/commit/834ad4dcc78852c2b915722dc0cc5fcb282a96f2))
+* **investigator:** harden prompt against issue-body injection; agy review fixes ([e1160c1](https://github.com/mctlhq/mctl-agents/commit/e1160c16c185dc2251f8569533281c862fc94592))
+* **investigator:** neutralize forged delimiter tags in untrusted issue text ([0888b38](https://github.com/mctlhq/mctl-agents/commit/0888b38c4761d316c51f4cc7903685f4c56e3ea1))
+* **investigator:** render the concrete workflow id in approve instructions ([0076378](https://github.com/mctlhq/mctl-agents/commit/0076378cdca52b25005c3d569d326299ffb1cfa5))
+* **investigator:** strip forged delimiter tags carrying attributes ([53c5df7](https://github.com/mctlhq/mctl-agents/commit/53c5df7a1a3aee6a54b21ede82cd8a7d25ea3fc7))
+
 ## [1.29.4](https://github.com/mctlhq/mctl-agents/compare/1.29.3...1.29.4) (2026-08-28)
 
 
