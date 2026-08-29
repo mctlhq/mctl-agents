@@ -236,13 +236,19 @@ counter — it stays trivially testable with hand-built fixtures.
 
 **Bot signals.**
 
-- `claude[bot]` — the **only** gating signal.
-  `has_responded` is anchored to `pr.head_sha` (review with matching
+- `claude[bot]` — the primary reviewer. It alone drives
+  `has_responded`, anchored to `pr.head_sha` (review with matching
   `commit_id`, line-anchored comment with matching `commit_id`,
   top-level "No P1/P2 findings" comment newer than
   `head_pushed_at`, or `+1` reaction on a `@claude review` trigger
   newer than `head_pushed_at`). Any signal predating the head push
-  is ignored.
+  is ignored. Its P1/P2 findings gate the merge.
+- `chatgpt-codex-connector[bot]` (Codex Review) — second **gating**
+  signal for findings only (#67): its P1/P2 on the current head
+  route to `address-review` exactly like claude's, but its
+  presence/absence never drives `has_responded` — the connector's
+  trigger is best-effort and does not fire on every push, so a PR
+  must never wait on it.
 - `copilot-pull-request-reviewer[bot]` — observed only. Findings
   ride along to the per-tick operator log so they are visible
   without gating the merge.
