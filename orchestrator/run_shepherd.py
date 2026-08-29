@@ -195,7 +195,15 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
         return refs
     owned: set[int] = set()
     workers = min(DEV_LOOP_LIVENESS_WORKERS, len(refs))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    # NOT `with ThreadPoolExecutor(...)`: __exit__ runs shutdown(wait=True,
+    # cancel_futures=False), which blocks until every *queued* task has also
+    # run — so the budget below would be advisory and the pass could still
+    # cost ceil(N/workers)*DEV_LOOP_LIVENESS_TIMEOUT_S. Shutting down
+    # explicitly with cancel_futures drops what has not started and does not
+    # wait on what has; the in-flight calls carry their own socket timeout,
+    # so the pool's threads retire on their own.
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
         futures = {
             pool.submit(_dev_loop_owns, ref.service, ref.slug): i
             for i, ref in enumerate(refs)
@@ -206,15 +214,15 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
                     owned.add(futures[future])
         except FuturesTimeoutError:
             # Budget spent. Whatever already answered still counts; the
-            # rest stay unchecked and get swept, and the in-flight calls
-            # are abandoned (each carries its own 10s socket timeout, so
-            # the pool drains on its own rather than leaking).
+            # rest stay unchecked and get swept.
             unanswered = sum(1 for f in futures if not f.done())
             print(
                 f"warn: dev-loop ownership pass hit its "
                 f"{DEV_LOOP_LIVENESS_BUDGET_S}s budget with {unanswered} "
                 "proposal(s) unchecked — sweeping them"
             )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     kept: list[ProposalRef] = []
     for i, ref in enumerate(refs):
         if i in owned:

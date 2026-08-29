@@ -21,7 +21,12 @@ from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowRe
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
-from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+from orchestrator.temporal.workflows.dev_loop import (
+    SHEPHERD_TICK_EVERY_POLLS,
+    SHEPHERD_TICKS_MAX,
+    DevLoopWorkflow,
+    IssueRef,
+)
 
 MERGED_PR = PRState(
     found=True,
@@ -1061,3 +1066,43 @@ class TestDevLoopWorkflow:
 
         assert result.pr is not None and result.pr.state == "MERGED"
         assert "mctl-agents-shepherd" in calls
+
+    async def test_shepherd_ticks_stop_at_the_cap(self, env):
+        """SHEPHERD_TICKS_MAX must actually stop ticking (#230 P3).
+
+        Each tick provisions a Hetzner volume, and the shepherd itself
+        flips review-stuck after 3 address-review attempts — so a wedged
+        PR must not burn one every ~4 h for the full 14-day watch. Drive
+        the watch past 13 tick boundaries and assert the 13th produces
+        nothing.
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        polls = SHEPHERD_TICK_EVERY_POLLS * (SHEPHERD_TICKS_MAX + 1)
+        activities, calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr] * polls + [MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/88"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX

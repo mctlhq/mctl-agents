@@ -2353,3 +2353,48 @@ def test_dev_loop_owns_does_not_follow_redirects(monkeypatch) -> None:
     assert (
         handler.redirect_request(None, None, 302, "Found", {}, "http://evil.example/x") is None
     )
+
+
+def test_filter_dev_loop_owned_returns_within_budget_with_queued_work(
+    monkeypatch,
+) -> None:
+    """The budget must be wall-clock, not advisory (#230 round 3 P2).
+
+    More refs than workers means most tasks are still QUEUED when the
+    budget expires. `with ThreadPoolExecutor(...)` would block on exit
+    until every one of them had run — ceil(N/workers) * per-call timeout
+    — so the pass could still outlive the 5-minute cron interval it was
+    bounded to. Twelve hung refs across two workers: with the shutdown
+    bug this takes ~6s, bounded it returns immediately.
+    """
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def hangs(service: str, slug: str) -> bool:
+        release.wait(timeout=1.0)
+        return False
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns", hangs)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_WORKERS", 2)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
+
+    refs = [
+        run_shepherd.ProposalRef(
+            service="mctl-web",
+            slug=f"issue-{i}-hung",
+            proposal_dir=Path("/tmp/x"),
+            status="implemented",
+        )
+        for i in range(12)
+    ]
+    started = time.monotonic()
+    try:
+        kept = run_shepherd._filter_dev_loop_owned(refs)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert len(kept) == 12
+    assert elapsed < 3.0, f"ownership pass overshot its budget: {elapsed:.1f}s"
