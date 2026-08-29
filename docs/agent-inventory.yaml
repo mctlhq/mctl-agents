@@ -12,6 +12,9 @@
 #
 # Consumed by orchestrator/validate_manifest.py (phase 1) to assert that every
 # agent listed here has a manifest and vice versa.
+#
+# See docs/adr/007-agent-definition-execution-profile-contract.md for the
+# AgentDefinition/ExecutionProfile split this file's fields map onto.
 
 version: 1
 
