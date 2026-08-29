@@ -26,11 +26,15 @@ sequenceDiagram
         T-->>OP: DevLoopResult(implement=None)
     else Succeeded
         Note over T,R: await workflow.wait_condition(approved) —<br/>durable-ожидание, может длиться днями
-        OP->>T: signal approve()
+        OP->>T: signal approve({approver}?)
+        T->>T: find_proposal_slug(repo, N) → slug issue-N-*<br/>(нет слага → non-retryable fail)
+        T->>S: submit_and_wait("mctl-agents-approve", {service, slug, approver})
+        Note over S,A: атомарный флип proposed→accepted<br/>в gitops под mutex; идемпотентен<br/>(уже accepted → no-op). Fail → стоп до implement
         T->>R: resolve("implementer", production)
-        T->>S: submit_and_wait("mctl-agents-implement", {service: target_repo, ...})
+        Note over T,R: resolve ПОСЛЕ флипа: сбой registry<br/>не должен испарить одобрение (codex P1, PR #212)
+        T->>S: submit_and_wait("mctl-agents-implement", {service, slug, ...})
         S->>A: POST /operations/.../execute → poll
         S-->>T: WorkflowResult
         T->>E: record_execution("implementer", ...)
-        T-->>OP: DevLoopResult(investigate, implement)
+        T-->>OP: DevLoopResult(investigate, approve, implement)
     end

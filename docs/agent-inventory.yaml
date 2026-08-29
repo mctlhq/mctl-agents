@@ -305,9 +305,10 @@ orchestration:
   - name: cluster-workflow-templates
     path: mctl-gitops/platform-gitops/argo-workflows/cluster-templates/
     what: >-
-      cwft-mctl-agents-{investigate,implement,shepherd,run,daily,reconcile,
-      issue-poll}. Clone, run one driver, commit back to gitops main under the
-      mctl-gitops-main-writes mutex, notify Telegram on exit.
+      cwft-mctl-agents-{investigate,approve,implement,shepherd,run,daily,
+      reconcile,issue-poll}. Clone, run one driver, commit back to gitops main
+      under the mctl-gitops-main-writes mutex, notify Telegram on exit
+      (approve is driver-less: clone → flip .status.yaml → commit).
     becomes: >-
       Stays. These remain the sandboxed execution backend invoked from Temporal
       activities; phase 3 makes their agent image a workflow parameter so the

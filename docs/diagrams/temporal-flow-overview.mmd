@@ -9,23 +9,24 @@ flowchart TB
         DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>REJECT_DUPLICATE + USE_EXISTING"]
         REC["ReconcileWorkflow<br/>schedule 15m"]
         ISS["IssuePollWorkflow<br/>schedule 12h"]
-        INC["IncidentLoopWorkflow<br/>schedule 1h · ПРИОСТАНОВЛЕНО"]
+        INC["IncidentLoopWorkflow<br/>schedule 1h · создаётся paused (#179)"]
         DOC["DocsDeltaWorkflow<br/>(по запросу)"]
     end
 
-    subgraph ACT["Activities (в воркере, не в Argo)"]
+    subgraph ACT["Activities воркера (тонкие HTTP/GitHub-вызовы; SDK — только в Argo)"]
         RES["resolve_agent_release<br/>GET /agents/:a/resolve + /versions"]
         SUB["submit_and_wait<br/>POST /operations/:op/execute → poll 15s"]
         RECD["record_execution<br/>POST /agents/executions"]
+        FPS["find_proposal_slug<br/>GitHub contents API"]
         DISC["discover_and_project (read-only)"]
         ORPH["detect_orphans"]
         IPA["poll_issues_activity<br/>→ run_issue_poller.poll<br/>gh search label:agents:intake<br/>старт DevLoop + снятие лейбла"]
-        DDA["process_docs_delta_activity"]
+        DDA["process_docs_delta_activity<br/>⚠ SDK в воркере — остаток #149"]
     end
 
     subgraph EXT["Внешние системы"]
         API["mctl-api"]
-        ARGO["Argo CWFT<br/>mctl-agents-investigate / -implement / -incidents"]
+        ARGO["Argo CWFT<br/>mctl-agents-investigate / -approve / -implement / -incidents"]
         GH["GitHub<br/>issues + PR"]
         GITOPS["mctl-gitops agents-state/&lt;svc&gt;/proposals/&lt;slug&gt;/.status.yaml<br/>(коммит только внутри CWFT, mutex mctl-gitops-main-writes)"]
     end
@@ -38,6 +39,8 @@ flowchart TB
     DEV --> RES
     DEV --> SUB
     DEV --> RECD
+    DEV --> FPS
+    FPS --> GH
     REC --> DISC
     REC --> ORPH
     INC --> SUB
