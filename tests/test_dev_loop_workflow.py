@@ -491,10 +491,12 @@ class TestDevLoopWorkflow:
         anyway would be a silent no-op against a proposal that never became
         accepted."""
         calls: list[str] = []
+        resolved_agents: list[str] = []
         investigate_ran = anyio.Event()
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            resolved_agents.append(agent)
             return None
 
         @activity.defn(name="submit_and_wait")
@@ -537,3 +539,7 @@ class TestDevLoopWorkflow:
         assert result.approve.phase == "Failed"
         assert result.implement is None
         assert calls == ["mctl-agents-investigate", "mctl-agents-approve"]
+        # The implementer registry lookup must be skipped entirely on a
+        # failed flip — the resolve happens only after approval is durable
+        # (codex P1 on PR #212).
+        assert resolved_agents == ["issue-investigator"]

@@ -263,8 +263,13 @@ def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
         "a proposal:\n\n"
         f"{_gitops_tree_url(service, slug)}\n\n"
         "Status: `proposed` — pending human approval. Review `requirements.md`, "
-        "`design.md` and `tasks.md`, then flip the proposal's `.status.yaml` "
-        "to `accepted` to let the Tier 2 implementer open a PR."
+        "`design.md` and `tasks.md`, then approve: signal the issue's "
+        "DevLoopWorkflow (`POST /api/v1/agents/dev-loop/{workflow_id}/approve`, "
+        "or `python -m orchestrator.temporal.cli approve <workflow-id>`) — the "
+        "workflow flips `.status.yaml` to `accepted` via the "
+        "`mctl-agents-approve` operation and runs the Tier 2 implementer. "
+        "For a proposal with no DevLoop, run the `mctl-agents-approve` "
+        "operation directly."
     )
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 

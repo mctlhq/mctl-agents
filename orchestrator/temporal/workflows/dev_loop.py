@@ -250,6 +250,20 @@ class DevLoopWorkflow:
         # execution can still be running.
         slug: str | None = None
         approve_result: WorkflowResult | None = None
+        implementer_release: ResolvedRelease | None = None
+        # Evaluate the atomic-approve patch ONCE, up front, because it also
+        # decides the position of the implementer resolve. Histories from the
+        # slug-scoped-but-pre-approve era (1.29.2..1.29.4) recorded
+        # resolve → slug-lookup → implement; unconditionally moving the
+        # resolve after the flip would be a command mismatch that wedges
+        # every such in-flight loop on replay (codex P1 round 2, PR #212).
+        # patched() returns a stable answer per execution, so both branches
+        # below see the same value.
+        atomic_approve = workflow.patched("atomic-approve")
+        if not atomic_approve:
+            # Legacy position: pre-atomic-approve histories resolved the
+            # implementer before the slug lookup — keep their command order.
+            implementer_release = await _resolve("implementer")
         if workflow.patched("slug-scoped-implement"):
             issue_number = parse_issue_url(issue.issue_url).number
             slug = await workflow.execute_activity(
@@ -277,7 +291,7 @@ class DevLoopWorkflow:
             # failure (missing proposal dir, unexpected status, push failure)
             # stops the loop HERE: proceeding to implement without a durable
             # accepted status would just be a silent no-op run.
-            if workflow.patched("atomic-approve"):
+            if atomic_approve:
                 approve_result = await _run_cwft(
                     "mctl-agents-approve",
                     {
@@ -298,16 +312,16 @@ class DevLoopWorkflow:
                         implement=None,
                         approve=approve_result,
                     )
-        # Resolve the implementer only AFTER the approval flip is durable:
-        # _resolve can fail permanently (registry outage outlasting its five
-        # retries), and if that happened before the flip, the operator's
-        # approval would evaporate with the failed workflow — and the
-        # REJECT_DUPLICATE start policy would turn a transient outage into a
-        # permanently stuck issue (codex P1 on PR #212). Replay-safe for
-        # pre-patch histories: the patched branches above schedule no
-        # commands for them, so their command order (resolve → implement)
-        # is unchanged.
-        implementer_release = await _resolve("implementer")
+        if atomic_approve:
+            # Resolve the implementer only AFTER the approval flip is
+            # durable: _resolve can fail permanently (registry outage
+            # outlasting its five retries), and if that happened before the
+            # flip, the operator's approval would evaporate with the failed
+            # workflow — and the REJECT_DUPLICATE start policy would turn a
+            # transient outage into a permanently stuck issue (codex P1 on
+            # PR #212). Pre-atomic-approve histories already resolved above,
+            # in their recorded position.
+            implementer_release = await _resolve("implementer")
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to
