@@ -78,7 +78,8 @@ async def status(workflow_id: str) -> None:
         # Incident watch (stage 6.4, #216).
         if result.incidents is not None and result.incidents.watched:
             w = result.incidents
-            print(f"  incidents:   {len(w.incidents)} in {w.window_minutes}m after the rollout")
+            more = " (truncated — more than the query cap)" if w.truncated else ""
+            print(f"  incidents:   {len(w.incidents)} in {w.window_minutes}m after the rollout{more}")
             for incident in w.incidents:
                 print(f"    - [{incident.severity or '?'}] {incident.id} {incident.title}")
             if w.detail:

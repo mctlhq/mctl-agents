@@ -218,6 +218,9 @@ class IncidentWatch:
     window_minutes: int = 0
     since: str | None = None
     incidents: list[Incident] = field(default_factory=list)
+    # The store had more incidents than the query cap returned on at least
+    # one poll — the list below is a sample, not the whole window.
+    truncated: bool = False
     detail: str | None = None
 
 
@@ -586,6 +589,7 @@ class DevLoopWorkflow:
         deadline = workflow.now() + INCIDENT_WATCH_WINDOW
         window_minutes = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
         seen: dict[str, Incident] = {}
+        truncated = False
         detail: str | None = None
         while workflow.now() < deadline:
             await workflow.sleep(INCIDENT_POLL_INTERVAL)
@@ -604,6 +608,7 @@ class DevLoopWorkflow:
                     "incident read failed for %s — continuing the watch: %r", service, exc.cause
                 )
                 continue
+            truncated = truncated or result.truncated
             for incident in result.incidents:
                 # Deduplicated by id across polls: an incident firing for
                 # the whole window would otherwise be reported once per
@@ -623,6 +628,7 @@ class DevLoopWorkflow:
             window_minutes=window_minutes,
             since=since,
             incidents=list(seen.values()),
+            truncated=truncated,
             detail=detail,
         )
 

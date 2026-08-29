@@ -1108,3 +1108,32 @@ class TestListServiceIncidents:
         self._handler(monkeypatch, {"items": {"unexpected": True}})
         with pytest.raises(Exception, match="incidents items"):
             await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+
+    async def test_non_string_id_falls_through_to_fingerprint(self, env, monkeypatch):
+        """An int id must not shadow a usable fingerprint (claude P3 on #236)."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch,
+            {"items": [{"id": 12345, "fingerprint": "fp-2", "title": "x"}], "count": 1},
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert [i.id for i in result.incidents] == ["fp-2"]
+
+    async def test_truncation_is_reported(self, env, monkeypatch):
+        """A storm exceeding the cap must not read like a quiet window."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch,
+            {"items": [{"id": "alert-1", "title": "x"}], "count": 400},
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert result.truncated is True
+
+    async def test_not_truncated_when_count_matches(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(monkeypatch, {"items": [{"id": "alert-1", "title": "x"}], "count": 1})
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert result.truncated is False
