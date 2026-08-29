@@ -44,9 +44,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -82,6 +85,67 @@ REVIEW_BOT = "claude[bot]"
 # P1/P2 from whichever bots actually reviewed). See #67.
 CODEX_CONNECTOR_BOT = "chatgpt-codex-connector[bot]"
 GATING_BOTS = (REVIEW_BOT, CODEX_CONNECTOR_BOT)
+
+# Sweeper ownership (#213 / ADR-006 §6.1): a proposal whose DevLoopWorkflow
+# is still Running drives its own review loop in-workflow; the cron sweep
+# must not double-drive it. Liveness is read through mctl-api's describe
+# endpoint (this pod deliberately holds no Temporal client). Any failure —
+# missing token, endpoint absent (older mctl-api 404s the route), network
+# error — means "not owned": the sweeper keeps today's behavior of driving
+# everything, which is the safe default for a safety net.
+MCTL_API_URL = os.environ.get("MCTL_API_URL", "https://api.mctl.ai").rstrip("/")
+DEV_LOOP_LIVENESS_TIMEOUT_S = 10
+
+
+def _dev_loop_owns(service: str, slug: str) -> bool:
+    """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
+
+    The workflow id is derived exactly the way start.py derives it
+    (dev-loop-mctlhq-{service}-{issue-number}); slugs without the
+    issue-<N>- prefix (incident-*, pre-Temporal) never had a DevLoop.
+    Every failure path returns False — see the MCTL_API_URL note above.
+    """
+    m = re.match(r"issue-(\d+)-", slug)
+    if not m:
+        return False
+    token = os.environ.get("MCTL_TOKEN", "").strip()
+    if not token:
+        return False
+    workflow_id = f"dev-loop-mctlhq-{service}-{m.group(1)}"
+    url = f"{MCTL_API_URL}/api/v1/agents/dev-loop/{workflow_id}"
+    if not url.startswith("https://"):
+        # MCTL_API_URL is operator-provided env; refuse non-https schemes
+        # (also satisfies ruff S310's audited-scheme requirement).
+        print(f"warn: dev-loop liveness check skipped: non-https MCTL_API_URL {MCTL_API_URL}")
+        return False
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})  # noqa: S310 — scheme pinned to https above
+    try:
+        with urllib.request.urlopen(request, timeout=DEV_LOOP_LIVENESS_TIMEOUT_S) as resp:  # noqa: S310
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        # 404 = no such workflow (or an mctl-api predating the endpoint) —
+        # genuinely not owned. Anything else is an infra failure; log it so
+        # an operator can see the ownership check degraded, then sweep.
+        if not (isinstance(exc, urllib.error.HTTPError) and exc.code == 404):
+            print(f"warn: dev-loop liveness check failed for {workflow_id}: {exc}")
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "Running"
+
+
+def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
+    """Drop refs a running DevLoop owns; used only in sweep mode (no
+    explicit --slug — a targeted one-shot, including the DevLoop's own
+    in-loop tick, must always process the slug it was given)."""
+    kept: list[ProposalRef] = []
+    for ref in refs:
+        if _dev_loop_owns(ref.service, ref.slug):
+            print(
+                f"info: {ref.service}/{ref.slug} is driven by a running "
+                "DevLoopWorkflow — skipping (sweeper mode, #213)"
+            )
+        else:
+            kept.append(ref)
+    return kept
 COPILOT_BOT = "copilot-pull-request-reviewer[bot]"
 
 # Statuses that the shepherd's discovery pass picks up. `implemented`
@@ -1868,6 +1932,13 @@ def main() -> None:
         reconcile=args.reconcile,
         dry_run=args.dry_run,
     )
+
+    # Sweep mode only (#213): a targeted --slug run — including the
+    # DevLoop's own in-loop shepherd tick — always processes its slug;
+    # reconcile stays unfiltered too (read-only idempotent projection,
+    # and terminal states must be projected even for owned slugs).
+    if not args.slug and not args.reconcile:
+        refs = _filter_dev_loop_owned(refs)
 
     if not refs:
         if args.reconcile:

@@ -2087,3 +2087,104 @@ def test_extract_severity_no_match() -> None:
     assert _extract_severity("Some random review text") is None
     # P3 in prose does not count as a severity marker
     assert _extract_severity("There are P3 nits to consider") is None
+
+
+# ---------------------------------------------------------------------------
+# #213: sweeper skips proposals a running DevLoop owns
+# ---------------------------------------------------------------------------
+class _FakeHTTPResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_dev_loop_owns_running_workflow(monkeypatch) -> None:
+    seen = {}
+
+    def fake_urlopen(request, timeout=None):
+        seen["url"] = request.full_url
+        seen["auth"] = request.get_header("Authorization")
+        return _FakeHTTPResponse(b'{"workflow_id": "x", "status": "Running"}')
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is True
+    assert seen["url"].endswith("/api/v1/agents/dev-loop/dev-loop-mctlhq-mctl-web-10")
+    assert seen["auth"] == "Bearer tok"
+
+
+def test_dev_loop_owns_completed_workflow_is_not_owned(monkeypatch) -> None:
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(
+        run_shepherd.urllib.request,
+        "urlopen",
+        lambda request, timeout=None: _FakeHTTPResponse(b'{"status": "Completed"}'),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_404_means_not_owned(monkeypatch) -> None:
+    import urllib.error
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, None)
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_dev_loop_owns_network_error_fails_open_to_sweep(monkeypatch, capsys) -> None:
+    import urllib.error
+
+    def fake_urlopen(request, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    monkeypatch.setattr(run_shepherd.urllib.request, "urlopen", fake_urlopen)
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+    assert "liveness check failed" in capsys.readouterr().out
+
+
+def test_dev_loop_owns_requires_issue_slug_and_token(monkeypatch) -> None:
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    # incident-* / pre-Temporal slugs never had a DevLoop — no HTTP call.
+    monkeypatch.setattr(
+        run_shepherd.urllib.request,
+        "urlopen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not call")),
+    )
+    assert run_shepherd._dev_loop_owns("mctl-web", "incident-123-oom") is False
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    assert run_shepherd._dev_loop_owns("mctl-web", "issue-10-test") is False
+
+
+def test_filter_dev_loop_owned_drops_only_owned(monkeypatch, capsys) -> None:
+    owned = run_shepherd.ProposalRef(
+        service="mctl-web",
+        slug="issue-10-owned",
+        proposal_dir=Path("/tmp/x"),
+        status="implemented",
+    )
+    free = run_shepherd.ProposalRef(
+        service="mctl-web",
+        slug="incident-9-free",
+        proposal_dir=Path("/tmp/y"),
+        status="implemented",
+    )
+    monkeypatch.setattr(
+        run_shepherd,
+        "_dev_loop_owns",
+        lambda service, slug: slug == "issue-10-owned",
+    )
+    kept = run_shepherd._filter_dev_loop_owned([owned, free])
+    assert kept == [free]
+    assert "driven by a running DevLoopWorkflow" in capsys.readouterr().out

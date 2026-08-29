@@ -59,6 +59,7 @@ def _fake_activities(
     pr_states: list[PRState] | None = None,
     pr_state_raises_after: int | None = None,
     pr_state_error_type: str | None = None,
+    shepherd_fails: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -89,6 +90,15 @@ def _fake_activities(
             assert input.params.get("issue_url")
             investigate_ran.set()
             return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=investigate_phase)
+        if input.operation == "mctl-agents-shepherd":
+            # In-loop tick (#213) must be scoped to exactly this proposal.
+            assert input.params.get("service")
+            assert input.params.get("slug", "").startswith("issue-")
+            if shepherd_fails:
+                from temporalio.exceptions import ApplicationError
+
+                raise ApplicationError("tick exploded", non_retryable=True)
+            return WorkflowResult(workflow_name="mctl-agents-shepherd-fake", phase="Succeeded")
         return WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded")
 
     @activity.defn(name="record_execution")
@@ -870,3 +880,78 @@ class TestDevLoopWorkflow:
         assert result.pr is not None
         assert result.pr.found is True
         assert result.pr.state == "OPEN"
+
+    async def test_shepherd_tick_runs_while_pr_stays_open(self, env):
+        """Stage 6.1 review loop (#213): while the PR is open, every 8th
+        poll submits a slug-scoped shepherd tick; the merged poll after it
+        ends the watch."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr] * 8 + [MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/85"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert calls == [
+            "mctl-agents-investigate",
+            "mctl-agents-approve",
+            "mctl-agents-implement",
+            "mctl-agents-shepherd",
+        ]
+
+    async def test_failed_shepherd_tick_does_not_end_the_watch(self, env):
+        """A failing shepherd tick is logged, not fatal — the watch keeps
+        polling and still reports the merge."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * 8 + [MERGED_PR],
+            shepherd_fails=True,
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/86"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert "mctl-agents-shepherd" in calls

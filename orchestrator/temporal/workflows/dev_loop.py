@@ -117,6 +117,19 @@ PR_LOOKUP_GRACE_POLLS = 4
 PR_STATE_TIMEOUT = timedelta(minutes=2)
 PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
+# Stage 6.1 review loop (#213): while the PR stays open, the workflow runs
+# its OWN shepherd ticks instead of relying on the global cron (which
+# narrows to a sweeper and skips slugs a running DevLoop owns — see
+# run_shepherd._dev_loop_owns). Cadence: every 8th poll ≈ 4 h — each tick
+# provisions a Hetzner volume, so hours not minutes (ADR-006 cost note),
+# and never on the first poll (claude review auto-fires on PR open; an
+# immediate tick would just observe "review pending"). Capped: after
+# SHEPHERD_TICKS_MAX active ticks the loop keeps watching passively —
+# the shepherd itself flips review-stuck after 3 address-review attempts,
+# so a stuck PR must not burn a volume every 4 h for two weeks.
+SHEPHERD_TICK_EVERY_POLLS = 8
+SHEPHERD_TICKS_MAX = 12
+
 
 @dataclass(frozen=True)
 class IssueRef:
@@ -402,7 +415,13 @@ class DevLoopWorkflow:
         deadline = workflow.now() + MERGE_WATCH_DEADLINE
         polls_without_pr = 0
         last: PRState | None = None
+        # In-loop shepherd (#213): evaluated once — the marker also fixes
+        # whether tick commands appear in this execution's history at all.
+        shepherd_in_loop = workflow.patched("shepherd-in-loop")
+        poll_index = 0
+        shepherd_ticks = 0
         while workflow.now() < deadline:
+            poll_index += 1
             try:
                 state: PRState = await workflow.execute_activity(
                     get_pr_state,
@@ -450,6 +469,30 @@ class DevLoopWorkflow:
                 polls_without_pr = 0
                 if state.state in ("MERGED", "CLOSED"):
                     return state
+                if (
+                    shepherd_in_loop
+                    and poll_index % SHEPHERD_TICK_EVERY_POLLS == 0
+                    and shepherd_ticks < SHEPHERD_TICKS_MAX
+                ):
+                    # The tick is the same one-shot the cron ran, scoped to
+                    # exactly this proposal (service+slug → run_shepherd's
+                    # targeted mode, which bypasses the ownership filter).
+                    # A failed tick is logged, not fatal: the watch itself
+                    # is the durable part, and the next tick retries.
+                    shepherd_ticks += 1
+                    try:
+                        tick_result = await _run_cwft(
+                            "mctl-agents-shepherd",
+                            {"service": service, "slug": slug},
+                        )
+                        await _record("shepherd", None, tick_result, service)
+                    except ActivityError:
+                        workflow.logger.warning(
+                            "in-loop shepherd tick failed for %s/%s — the "
+                            "watch continues",
+                            service,
+                            slug,
+                        )
             else:
                 polls_without_pr += 1
                 if last is None and state.number is not None:
