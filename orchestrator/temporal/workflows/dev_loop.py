@@ -222,6 +222,28 @@ async def _record(
         )
 
 
+def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
+    """Retrieve a finished tick's exception so it is never swallowed.
+
+    _shepherd_tick catches its own failures, so this should find nothing —
+    but a task whose exception is never retrieved disappears silently
+    (with only an asyncio "exception was never retrieved" warning), and
+    the watch loop drops the reference on the next poll. Reading it is the
+    cheap way to guarantee that cannot happen.
+    """
+    if tick_task.cancelled():
+        return
+    exc = tick_task.exception()
+    if exc is not None:
+        workflow.logger.error(
+            "in-loop shepherd tick for %s/%s ended with an unretrieved %s: %r",
+            service,
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+
+
 @workflow.defn
 class DevLoopWorkflow:
     def __init__(self) -> None:
@@ -449,6 +471,18 @@ class DevLoopWorkflow:
                 slug,
                 exc.cause,
             )
+        except Exception as exc:  # noqa: BLE001 — a bug in the tick must not sink silently
+            # Running as a task means an escaping exception is stored on
+            # the task instead of raised: nothing would surface it, and
+            # the next poll overwrites the reference. Log it here, at the
+            # only point that still has the context.
+            workflow.logger.error(
+                "in-loop shepherd tick for %s/%s raised an unexpected %s: %r",
+                service,
+                slug,
+                type(exc).__name__,
+                exc,
+            )
 
     async def _settle_tick(self, tick_task: asyncio.Task[None] | None, service: str, slug: str) -> None:
         """Leave no pending tick behind when the watch ends (#231).
@@ -460,7 +494,10 @@ class DevLoopWorkflow:
         workflow it submitted; that run finishes on its own, exactly as it
         would have if this loop had never waited for it.
         """
-        if tick_task is None or tick_task.done():
+        if tick_task is None:
+            return
+        if tick_task.done():
+            _drain_tick(tick_task, service, slug)
             return
         workflow.logger.info(
             "cancelling an in-flight shepherd tick for %s/%s — the watch is ending",
@@ -470,8 +507,18 @@ class DevLoopWorkflow:
         tick_task.cancel()
         try:
             await tick_task
-        except Exception as exc:  # noqa: BLE001 — CancelledError, or anything the tick raised on its way out
-            workflow.logger.debug("in-flight shepherd tick ended with %r", exc)
+        except asyncio.CancelledError:
+            # The expected outcome of the cancel above. CancelledError is a
+            # BaseException since 3.8, so `except Exception` does NOT catch
+            # it: letting it escape here would propagate out of _watch_pr's
+            # finally, discard the state the watch was about to return, and
+            # fail a workflow whose implement and merge both succeeded —
+            # in exactly the case this concurrency exists to handle.
+            workflow.logger.debug("in-flight shepherd tick cancelled for %s/%s", service, slug)
+        except Exception as exc:  # noqa: BLE001 — whatever the tick raised on its way out
+            workflow.logger.warning(
+                "in-flight shepherd tick for %s/%s ended with %r", service, slug, exc
+            )
 
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
         """Poll get_pr_state until the PR reaches a terminal state.
