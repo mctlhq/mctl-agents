@@ -559,7 +559,17 @@ class DevLoopWorkflow:
         # anchoring on "now" only risks missing a release cut in the same
         # instant, which the next poll picks up anyway.
         after = pr_state.merged_at or workflow.now().isoformat().replace("+00:00", "Z")
-        release = await self._await_release(repo, after)
+        release, failure = await self._await_release(repo, after)
+        if failure is not None:
+            # A broken read is not the same as nothing being released, and
+            # labelling it no-release would hide a defect behind an
+            # outcome that reads as normal (agy P2).
+            return DeployObservation(
+                outcome="unverified",
+                team=target.team,
+                app=target.app,
+                detail=failure,
+            )
         if release is None:
             return DeployObservation(
                 outcome="no-release",
@@ -569,8 +579,13 @@ class DevLoopWorkflow:
             )
         return await self._verify_rollout(target, release)
 
-    async def _await_release(self, repo: str, after: str) -> ReleaseInfo | None:
-        """Poll until release-please publishes a release newer than ``after``."""
+    async def _await_release(self, repo: str, after: str) -> tuple[ReleaseInfo | None, str | None]:
+        """Poll until release-please publishes a release newer than ``after``.
+
+        Returns (release, failure). A failure string means the lookup
+        itself broke; the caller must not read that as "nothing was
+        released", which is what a bare None would have looked like.
+        """
         deadline = workflow.now() + RELEASE_LOOKUP_DEADLINE
         while workflow.now() < deadline:
             try:
@@ -588,16 +603,16 @@ class DevLoopWorkflow:
                         repo,
                         exc.cause,
                     )
-                    return None
+                    return None, f"release lookup failed with a non-transient error: {exc.cause!r}"
                 workflow.logger.warning(
                     "release lookup failed for %s — retrying next interval: %r", repo, exc.cause
                 )
                 await workflow.sleep(RELEASE_POLL_INTERVAL)
                 continue
             if release is not None:
-                return release
+                return release, None
             await workflow.sleep(RELEASE_POLL_INTERVAL)
-        return None
+        return None, None
 
     async def _verify_rollout(self, target: DeployTarget, release: ReleaseInfo) -> DeployObservation:
         """Wait until the app reports Synced/Healthy on the released tag."""
@@ -643,8 +658,18 @@ class DevLoopWorkflow:
             # tag — for platform applications such as mctl-api itself.
             # Waiting for a tag that will never be reported would make
             # every such loop time out, so sync+health is the signal there.
-            tag_matches = status.image_tag is None or status.image_tag == release.tag
-            if tag_matches and status.health == "Healthy" and status.sync_status == "Synced":
+            if status.image_tag is not None:
+                landed = status.image_tag == release.tag
+            else:
+                # No service record, so no tag to compare (mctl-api's own
+                # platform application). Healthy/Synced alone would be
+                # satisfied by the state the app was ALREADY in before this
+                # release synced, so the first poll would report success
+                # without anything having happened (claude P3). ArgoCD's
+                # own updatedAt is the freshness signal: it must be at
+                # least as new as the release we are waiting for.
+                landed = status.updated_at is not None and status.updated_at >= release.published_at
+            if landed and status.health == "Healthy" and status.sync_status == "Synced":
                 return DeployObservation(
                     outcome="healthy",
                     team=target.team,

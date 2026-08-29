@@ -1124,7 +1124,11 @@ class TestDevLoopWorkflow:
         ):
             result = await self._run_to_completion(env, activities, investigate_ran, 101)
 
-        assert result.deploy is not None and result.deploy.outcome == "no-release"
+        assert result.deploy is not None
+        # Not "no-release": that would read as a normal outcome and hide
+        # the defect (agy P2).
+        assert result.deploy.outcome == "unverified"
+        assert "non-transient" in (result.deploy.detail or "")
 
     async def test_a_bug_in_the_status_read_ends_the_verify_immediately(self, env):
         activities, _calls, investigate_ran = _fake_activities(
@@ -1157,7 +1161,21 @@ class TestDevLoopWorkflow:
         activities, _calls, investigate_ran = _fake_activities(
             released=True,
             deploy_statuses=[
-                DeployStatus(found=True, image_tag=None, health="Healthy", sync_status="Synced")
+                # Stale: ArgoCD last synced BEFORE this release existed.
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-29T00:00:00Z",
+                ),
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-30T00:01:00Z",
+                ),
             ],
         )
         async with Worker(
@@ -1167,6 +1185,33 @@ class TestDevLoopWorkflow:
 
         assert result.deploy is not None and result.deploy.outcome == "healthy"
         assert result.deploy.image_tag is None
+
+    async def test_tagless_app_already_healthy_on_the_old_revision_is_not_verified(self, env):
+        """The freshness gate, stated as its own case (claude P3).
+
+        A platform app reports no image tag, so Healthy/Synced alone is
+        satisfied by the state it was in BEFORE this release synced. With
+        ArgoCD's updatedAt permanently older than the release, the rollout
+        must never be reported as verified.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            deploy_statuses=[
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-29T00:00:00Z",
+                )
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 103)
+
+        assert result.deploy is not None and result.deploy.outcome == "unverified"
 
     async def test_unknown_argocd_application_stops_polling_immediately(self, env):
         """A name that resolves to no app will not start existing."""

@@ -79,6 +79,10 @@ class DeployStatus:
     image_tag: str | None = None
     health: str | None = None
     sync_status: str | None = None
+    # ArgoCD's own last-update time. For a tagless application it is the
+    # only way to tell "already Healthy on the old revision" from "Healthy
+    # because this release synced".
+    updated_at: str | None = None
 
 
 def _github_headers(token: str) -> dict[str, str]:
@@ -243,6 +247,7 @@ async def get_deploy_status(team: str, app: str) -> DeployStatus:
         image_tag=image_tag if isinstance(image_tag, str) and image_tag else None,
         health=argocd.get("health"),
         sync_status=argocd.get("syncStatus"),
+        updated_at=argocd.get("updatedAt") if isinstance(argocd.get("updatedAt"), str) else None,
     )
     activity.logger.info(
         "deploy_status %s/%s tag=%s health=%s sync=%s",
