@@ -746,3 +746,40 @@ class TestGetPRState:
         state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
         assert state.found is True
         assert state.state == "OPEN"
+
+    async def test_directory_contents_payload_raises_listing_error(self, env, monkeypatch):
+        """The contents API returns a JSON list for a directory — that must
+        surface as a retryable ProposalListingError, not an AttributeError."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+        from orchestrator.temporal.activities.proposals import ProposalListingError
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[{"name": "x", "type": "file"}])
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError, match="payload type"):
+            await env.run(get_pr_state, "mctl-web", "issue-10-test")
+
+    async def test_malformed_pulls_json_raises_listing_error(self, env, monkeypatch):
+        """A 200 with a non-JSON pulls body (broken proxy) must stay a
+        retryable read error, not an unhandled ValueError."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+        from orchestrator.temporal.activities.proposals import ProposalListingError
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self.STATUS_PATH:
+                return httpx.Response(
+                    200,
+                    json=self._status_payload(
+                        "pr: https://github.com/mctlhq/mctl-web/pull/99\n"
+                    ),
+                )
+            return httpx.Response(200, text="<html>gateway</html>")
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError, match="non-JSON"):
+            await env.run(get_pr_state, "mctl-web", "issue-10-test")
