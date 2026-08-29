@@ -18,9 +18,20 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+
+MERGED_PR = PRState(
+    found=True,
+    pr_url="https://github.com/mctlhq/mctl-telegram/pull/77",
+    repo="mctlhq/mctl-telegram",
+    number=77,
+    state="MERGED",
+    merged=True,
+    merge_commit="cafe1234",
+)
 
 
 @activity.defn(name="find_proposal_slug")
@@ -41,7 +52,12 @@ async def env():
         yield env
 
 
-def _fake_activities(*, released: bool, investigate_phase: str = "Succeeded"):
+def _fake_activities(
+    *,
+    released: bool,
+    investigate_phase: str = "Succeeded",
+    pr_states: list[PRState] | None = None,
+):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
     activity names DevLoopWorkflow's workflow.execute_activity references
@@ -77,11 +93,24 @@ def _fake_activities(*, released: bool, investigate_phase: str = "Succeeded"):
     async def fake_record_execution(record: ExecutionRecord) -> None:
         return None
 
+    # Merge-detection polls this after implement; the sequence is consumed
+    # one state per poll, then the last entry repeats (a real PR's state is
+    # sticky once terminal). Default: merged on the first poll.
+    sequence = pr_states if pr_states is not None else [MERGED_PR]
+    poll_index = {"i": 0}
+
+    @activity.defn(name="get_pr_state")
+    async def fake_get_pr_state(service: str, slug: str) -> PRState:
+        i = min(poll_index["i"], len(sequence) - 1)
+        poll_index["i"] += 1
+        return sequence[i]
+
     activities = [
         fake_resolve_agent_release,
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        fake_get_pr_state,
     ]
     return activities, calls, investigate_ran
 
@@ -543,3 +572,101 @@ class TestDevLoopWorkflow:
         # failed flip — the resolve happens only after approval is durable
         # (codex P1 on PR #212).
         assert resolved_agents == ["issue-investigator"]
+
+    async def test_merge_detection_reports_merged_pr(self, env):
+        """Stage 6.1 (#214): after implement succeeds, the loop polls
+        get_pr_state and returns the terminal PR state in the result."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/77"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is not None
+        assert result.pr.state == "MERGED"
+        assert result.pr.merged is True
+        assert result.pr.merge_commit == "cafe1234"
+
+    async def test_merge_detection_gives_up_when_pr_link_never_appears(self, env):
+        """A proposal whose .status.yaml never gains a pr: link stops the
+        watch after the grace polls (result.pr is None), instead of polling
+        for the full 14-day deadline."""
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[PRState(found=False)]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/78"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.pr is None
+
+    async def test_merge_detection_deadline_returns_last_open_state(self, env):
+        """A PR still open when MERGE_WATCH_DEADLINE expires is returned
+        as-is (state OPEN) — the workflow is bounded, not eternal. The
+        time-skipping environment fast-forwards the 14 days of sleeps."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, pr_states=[open_pr]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/79"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.state == "OPEN"
+        assert result.pr.merged is False

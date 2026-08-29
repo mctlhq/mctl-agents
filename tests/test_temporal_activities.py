@@ -579,3 +579,118 @@ class TestFindProposalSlug:
         with pytest.raises(ApplicationError, match="listing cap") as excinfo:
             await env.run(find_proposal_slug, "mctl-portal", "80")
         assert excinfo.value.non_retryable
+
+
+class TestGetPRState:
+    STATUS_PATH = (
+        "/repos/mctlhq/mctl-gitops/contents/platform-gitops/agents-state/"
+        "mctl-web/proposals/issue-10-test/.status.yaml"
+    )
+
+    @staticmethod
+    def _status_payload(body: str) -> dict:
+        import base64 as _b64
+
+        return {"content": _b64.b64encode(body.encode()).decode()}
+
+    def _handler(self, monkeypatch, *, status_yaml, pr_json=None, pr_status=200):
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == "Bearer gh-test-token"
+            if request.url.path == self.STATUS_PATH:
+                if status_yaml is None:
+                    return httpx.Response(404, json={"message": "Not Found"})
+                return httpx.Response(200, json=self._status_payload(status_yaml))
+            if request.url.path == "/repos/mctlhq/mctl-web/pulls/99":
+                return httpx.Response(pr_status, json=pr_json or {})
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_open_pr(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="status: implemented\npr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_json={"state": "open", "merged": False, "html_url": "https://github.com/mctlhq/mctl-web/pull/99"},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is True
+        assert (state.repo, state.number, state.state, state.merged) == ("mctlhq/mctl-web", 99, "OPEN", False)
+
+    async def test_merged_pr_carries_merge_commit(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_json={"state": "closed", "merged": True, "merge_commit_sha": "cafe1234"},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.state == "MERGED"
+        assert state.merged is True
+        assert state.merge_commit == "cafe1234"
+
+    async def test_closed_unmerged_pr(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_json={"state": "closed", "merged": False},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.state == "CLOSED"
+        assert state.merged is False
+        assert state.merge_commit is None
+
+    async def test_missing_status_file_is_not_found(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(monkeypatch, status_yaml=None)
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+
+    async def test_status_without_pr_field_is_not_found(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(monkeypatch, status_yaml="status: implemented\n")
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+
+    async def test_vanished_pr_is_not_found_but_keeps_reference(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_status=404,
+            pr_json={"message": "Not Found"},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+        assert (state.repo, state.number) == ("mctlhq/mctl-web", 99)
+
+    async def test_server_error_raises_for_retry(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+        from orchestrator.temporal.activities.proposals import ProposalListingError
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_status=502,
+            pr_json={"message": "bad gateway"},
+        )
+        with pytest.raises(ProposalListingError):
+            await env.run(get_pr_state, "mctl-web", "issue-10-test")
+
+    async def test_no_token_raises_instead_of_unauthenticated_404(self, env, monkeypatch):
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+        from orchestrator.temporal.activities.proposals import ProposalListingError
+
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        with pytest.raises(ProposalListingError, match="no GitHub token"):
+            await env.run(get_pr_state, "mctl-web", "issue-10-test")
