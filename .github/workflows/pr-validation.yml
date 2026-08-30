@@ -91,8 +91,21 @@ jobs:
           # config/ and entrypoint.sh, which do ship. .github/ has to be in
           # the list for this very change to pass its own check, which is
           # the same reasoning, not an exception to it.
-          if ! FILES=$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}"); then
-            echo "::error::git diff failed for range ${BASE_SHA}..${HEAD_SHA} — cannot check changed paths."
+          # Three dots, not two, and not the same shape as the `git log`
+          # range below. `pull_request.base.sha` is the tip of the target
+          # branch at event time, so it ADVANCES while a PR sits open: a
+          # two-point `git diff base head` compares the two trees and
+          # therefore reports every file main changed since the branch
+          # forked, as though this PR had touched it. A tests-only PR would
+          # then be told to add a `fix:` commit purely because someone else
+          # merged production code — failing on rebase state rather than on
+          # its own content. `base...head` diffs from the merge base, which
+          # is exactly the set of paths this PR is responsible for.
+          # (`git log base..head` below stays two-dot: for COMMITS that
+          # already means "reachable from head but not base", which is the
+          # right set. Same-looking syntax, different semantics.)
+          if ! FILES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}"); then
+            echo "::error::git diff failed for range ${BASE_SHA}...${HEAD_SHA} — cannot check changed paths."
             exit 1
           fi
           # An empty diff is not "all paths are allowlisted" — grep -qv finds
