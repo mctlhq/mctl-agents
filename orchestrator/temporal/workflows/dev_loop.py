@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -332,12 +332,27 @@ def _at_or_after(later: str | None, earlier: str) -> bool:
     if not later:
         return False
     try:
-        return datetime.fromisoformat(later.replace("Z", "+00:00")) >= datetime.fromisoformat(
-            earlier.replace("Z", "+00:00")
-        )
-    except ValueError:
-        workflow.logger.warning("unparseable timestamp %r or %r", later, earlier)
+        return _as_utc(later) >= _as_utc(earlier)
+    except (ValueError, TypeError):
+        # TypeError as well as ValueError: this runs inside the workflow
+        # loop, and an unhandled exception there is retried by Temporal
+        # forever on identical input — a wedged state machine rather than
+        # a wrong answer (agy P1). _as_utc already normalises the
+        # naive/aware mix that would raise it, so this is the backstop.
+        workflow.logger.warning("uncomparable timestamps %r and %r", later, earlier)
         return False
+
+
+def _as_utc(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp as UTC, tolerating a missing offset.
+
+    A payload without an offset would otherwise parse naive, and
+    comparing naive to aware raises TypeError. These are all UTC in
+    practice — GitHub and ArgoCD both emit Zulu — so an absent offset is
+    read as UTC rather than refused.
+    """
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _is_transient(exc: ActivityError) -> bool:

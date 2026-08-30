@@ -1252,6 +1252,33 @@ class TestDevLoopWorkflow:
 
         assert result.deploy is not None and result.deploy.outcome == "healthy"
 
+    async def test_a_timestamp_without_an_offset_does_not_wedge_the_workflow(self, env):
+        """agy P1: naive vs aware datetimes raise TypeError.
+
+        Inside the workflow loop that is not a wrong answer, it is a
+        workflow task Temporal retries forever on identical input. An
+        offset-less timestamp must simply be read as UTC.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
+            deploy_statuses=[
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-30T00:00:01",  # no offset at all
+                )
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 106)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
     async def test_a_new_argocd_application_is_waited_for(self, env):
         """A release can introduce the app; ArgoCD registers it a bit later."""
         activities, _calls, investigate_ran = _fake_activities(
