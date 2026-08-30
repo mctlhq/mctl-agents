@@ -81,6 +81,34 @@ jobs:
             -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml" \
             -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml"
 
+      # Refresh the agent registry so DevLoopWorkflow resolves THIS release
+      # rather than whatever was published last by hand. Nothing did this
+      # before, and the pins drifted: shepherd sat on 1.25.0 from
+      # 2026-08-07 while the repo released 1.33.0 — and once the in-loop
+      # shepherd tick started pinning the released image, that stale row
+      # became the image those ticks would run.
+      #
+      # Skipped, not failed, when MCTL_TOKEN is absent: the credential is
+      # provisioned separately, and a release must not fail because the
+      # registry refresh could not authenticate. The step is idempotent
+      # (an already-published version returns 409 and is still promoted),
+      # so a re-run after the secret lands catches the registry up.
+      - name: Refresh agent registry
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          MCTL_TOKEN: ${{ secrets.MCTL_TOKEN }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          if [ -z "${MCTL_TOKEN:-}" ]; then
+            echo "::warning::MCTL_TOKEN is not configured — skipping the agent registry refresh for $TAG"
+            exit 0
+          fi
+          python -m pip install --quiet httpx pyyaml
+          # Tags are what the tool reads every file from; the checkout above
+          # is shallow and release-please has just pushed this one.
+          git fetch --tags --force --quiet
+          python tools/publish_agent_release.py "$TAG"
+
       - name: Notify Telegram on release/deploy failure
         if: ${{ failure() && steps.release.outputs.release_created == 'true' }}
         env:
