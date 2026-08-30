@@ -304,6 +304,18 @@ def test_load_definition_fails_on_unknown_agent(tmp_path, monkeypatch):
         resolver.load_definition("nonexistent-agent")
 
 
+def test_load_definition_fails_closed_on_non_mapping_metadata(tmp_path, monkeypatch):
+    """A scalar where `metadata` must be a mapping raises `ResolverError`,
+    not a raw `AttributeError` from a bare `.get()` call."""
+    definitions_dir = tmp_path / "manifests"
+    monkeypatch.setattr(resolver, "DEFINITIONS_DIR", definitions_dir)
+    doc = _base_definition_doc("sha256:" + "0" * 64)
+    doc["metadata"] = "oops"
+    _write(definitions_dir / _AGENT / "agent.yaml", doc)
+    with pytest.raises(resolver.ResolverError, match="metadata must be a mapping"):
+        resolver.load_definition(_AGENT)
+
+
 # ---------------------------------------------------------------------------
 # T8 — fixtures cannot be interpreted as promotable registry state.
 # ---------------------------------------------------------------------------
@@ -313,6 +325,17 @@ def test_load_profile_requires_explicit_promotable_false(tmp_path, monkeypatch):
     del doc["metadata"]["promotable"]
     _write(tmp_path / "profiles" / f"{_PROFILE}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="promotable"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_load_profile_fails_closed_on_non_mapping_model_policy_ref(tmp_path, monkeypatch):
+    """A scalar where `spec.modelPolicyRef` must be a mapping raises
+    `ResolverError`, not a raw `AttributeError` from a bare `.get()` call."""
+    monkeypatch.setattr(resolver, "PROFILES_FIXTURE_DIR", tmp_path / "profiles")
+    doc = _base_profile_doc()
+    doc["spec"]["modelPolicyRef"] = "oops"
+    _write(tmp_path / "profiles" / f"{_PROFILE}.yaml", doc)
+    with pytest.raises(resolver.ResolverError, match="modelPolicyRef must be a mapping"):
         resolver.load_profile(_PROFILE)
 
 
@@ -331,6 +354,17 @@ def test_load_release_binding_requires_promotable_false(tmp_path, monkeypatch):
     doc["promotable"] = True
     _write(tmp_path / "releases" / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="promotable"):
+        resolver.load_release_binding(_AGENT)
+
+
+def test_load_release_binding_fails_closed_on_non_mapping_registry_lifecycle(tmp_path, monkeypatch):
+    """A scalar where `registryLifecycle` must be a mapping raises
+    `ResolverError`, not a raw `AttributeError` from a bare `.get()` call."""
+    monkeypatch.setattr(resolver, "RELEASES_FIXTURE_DIR", tmp_path / "releases")
+    doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
+    doc["registryLifecycle"] = "oops"
+    _write(tmp_path / "releases" / f"{_AGENT}.yaml", doc)
+    with pytest.raises(resolver.ResolverError, match="registryLifecycle must be a mapping"):
         resolver.load_release_binding(_AGENT)
 
 

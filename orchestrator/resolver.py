@@ -219,6 +219,15 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return document
 
 
+def _require_mapping(value: Any, *, path: Path, field_path: str) -> dict[str, Any]:
+    """Validate an already `or {}`-defaulted field is actually a mapping
+    before any caller does `.get()` on it — a fixture supplying a scalar or
+    list here must raise `ResolverError`, not a raw `AttributeError`."""
+    if not isinstance(value, dict):
+        raise ResolverError(f"{path}: {field_path} must be a mapping, got {type(value).__name__}")
+    return value
+
+
 def _bounded(value: Any, *, maximum: float) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= maximum
 
@@ -249,8 +258,8 @@ def load_definition(agent: str) -> AgentDefinition:
     if document.get("kind") != "AgentDefinition":
         raise ResolverError(f"{path}: kind must be 'AgentDefinition' for apiVersion {api_version!r}")
 
-    metadata = document.get("metadata") or {}
-    spec = document.get("spec") or {}
+    metadata = _require_mapping(document.get("metadata") or {}, path=path, field_path="metadata")
+    spec = _require_mapping(document.get("spec") or {}, path=path, field_path="spec")
     name = metadata.get("name")
     owner = metadata.get("owner")
     if not name or not owner:
@@ -261,12 +270,14 @@ def load_definition(agent: str) -> AgentDefinition:
             f"(agents/_manifests/{path.parent.name}/agent.yaml)"
         )
 
-    prompt = spec.get("prompt") or {}
+    prompt = _require_mapping(spec.get("prompt") or {}, path=path, field_path="spec.prompt")
     prompt_sources = tuple(_parse_prompt_source(s, path) for s in prompt.get("sources", []))
     if not prompt_sources:
         raise ResolverError(f"{path}: spec.prompt.sources must not be empty")
 
-    profile_ref = spec.get("executionProfileRef") or {}
+    profile_ref = _require_mapping(
+        spec.get("executionProfileRef") or {}, path=path, field_path="spec.executionProfileRef"
+    )
     profile_name = profile_ref.get("name")
     compatibility = profile_ref.get("compatibility")
     if not profile_name or not compatibility:
@@ -296,8 +307,8 @@ def load_profile(name: str) -> ExecutionProfile:
     if document.get("kind") != "ExecutionProfile":
         raise ResolverError(f"{path}: kind must be 'ExecutionProfile'")
 
-    metadata = document.get("metadata") or {}
-    spec = document.get("spec") or {}
+    metadata = _require_mapping(document.get("metadata") or {}, path=path, field_path="metadata")
+    spec = _require_mapping(document.get("spec") or {}, path=path, field_path="spec")
     profile_name = metadata.get("name")
     if profile_name != name:
         raise ResolverError(f"{path}: metadata.name {profile_name!r} must match fixture file name {name!r}")
@@ -307,7 +318,9 @@ def load_profile(name: str) -> ExecutionProfile:
             "never be interpretable as promotable registry state"
         )
 
-    model_policy_ref = spec.get("modelPolicyRef") or {}
+    model_policy_ref = _require_mapping(
+        spec.get("modelPolicyRef") or {}, path=path, field_path="spec.modelPolicyRef"
+    )
     model_policy_task = model_policy_ref.get("task")
     if not model_policy_task:
         raise ResolverError(f"{path}: spec.modelPolicyRef.task is required")
@@ -329,7 +342,7 @@ def load_profile(name: str) -> ExecutionProfile:
     budget = cast("int | float", budget)
     timeout = cast("int | float", timeout)
 
-    runtime = spec.get("runtime") or {}
+    runtime = _require_mapping(spec.get("runtime") or {}, path=path, field_path="spec.runtime")
     if runtime.get("type") != SUPPORTED_RUNTIME_TYPE:
         raise ResolverError(f"{path}: spec.runtime.type must be {SUPPORTED_RUNTIME_TYPE!r}")
     entrypoint = runtime.get("entrypoint")
@@ -337,7 +350,7 @@ def load_profile(name: str) -> ExecutionProfile:
     if not entrypoint or not options_builder:
         raise ResolverError(f"{path}: spec.runtime.entrypoint and .optionsBuilder are required")
 
-    sandbox = runtime.get("sandbox") or {}
+    sandbox = _require_mapping(runtime.get("sandbox") or {}, path=path, field_path="spec.runtime.sandbox")
     sandbox_backend = sandbox.get("backend")
     cluster_workflow_template = sandbox.get("clusterWorkflowTemplate")
     if sandbox_backend != "argo" or not cluster_workflow_template or sandbox.get("approved") is not True:
@@ -392,7 +405,9 @@ def load_release_binding(agent: str) -> ReleaseBinding:
     if not environment:
         raise ResolverError(f"{path}: environment is required")
 
-    lifecycle = document.get("registryLifecycle") or {}
+    lifecycle = _require_mapping(
+        document.get("registryLifecycle") or {}, path=path, field_path="registryLifecycle"
+    )
     if lifecycle.get("definition") != "published" or lifecycle.get("profile") != "published":
         raise ResolverError(
             f"{path}: registryLifecycle.definition and .profile must both be 'published' — a "
@@ -403,8 +418,8 @@ def load_release_binding(agent: str) -> ReleaseBinding:
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
         raise ResolverError(f"{path}: releaseRevision must be a positive integer")
 
-    definition = document.get("definition") or {}
-    profile = document.get("profile") or {}
+    definition = _require_mapping(document.get("definition") or {}, path=path, field_path="definition")
+    profile = _require_mapping(document.get("profile") or {}, path=path, field_path="profile")
     def_name, def_version = definition.get("name"), definition.get("version")
     prof_name, prof_version = profile.get("name"), profile.get("version")
     if not def_name or not def_version or not prof_name or not prof_version:
