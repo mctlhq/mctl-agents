@@ -150,6 +150,31 @@ def test_build_issue_investigator_options_from_plan_matches_legacy_builder(tmp_p
     assert declarative.env == legacy.env
 
 
+def test_build_issue_investigator_options_from_plan_omits_mctl_tools_without_token(tmp_path, monkeypatch):
+    """The profile fixture hardcodes `mcp__mctl__*` in spec.tools unconditionally,
+    but the legacy builder only allows it when MCTL_TOKEN is set (via
+    `_mctl_tool_globs()`). Without MCTL_TOKEN, the declarative path must match
+    that and omit `mcp__mctl__*` too — otherwise it would silently diverge
+    from the "matches the legacy builder exactly, by construction" claim."""
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="f" * 40))
+    legacy = options.build_issue_investigator_options(
+        repo_dir, model=plan.model, proposal_dir=proposal_dir,
+    )
+    declarative = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+
+    assert "mcp__mctl__*" not in declarative.allowed_tools
+    assert "mcp__mctl__*" not in legacy.allowed_tools
+    assert sorted(declarative.allowed_tools) == sorted(legacy.allowed_tools)
+    assert declarative.mcp_servers == {}
+    assert declarative.mcp_servers == legacy.mcp_servers
+
+
 def test_build_issue_investigator_options_from_plan_uses_the_plans_model_and_budget(tmp_path, monkeypatch):
     """The plan-based builder is built FROM the plan, not from
     orchestrator.options's own ISSUE_INVESTIGATOR_MODEL/_BUDGET_USD

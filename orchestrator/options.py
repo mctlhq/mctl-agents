@@ -332,13 +332,22 @@ def build_issue_investigator_options_from_plan(
     builders resolve identical `ClaudeAgentOptions` for the same repo/model/
     tools/budget input (the equivalence tests in tests/test_options.py
     assert this directly).
+
+    The profile fixture's `spec.tools` hardcodes `mcp__mctl__*` unconditionally
+    (it is meant to equal the legacy builder's tools when mctl MCP is
+    configured), so plan.tools is filtered the same way
+    ``_mctl_tool_globs()`` gates the legacy builder: drop `mcp__mctl__*`
+    unless `MCTL_TOKEN` is actually set. Without this, an unset MCTL_TOKEN
+    would make the two builders diverge (declarative keeps a dead
+    allow-list entry the legacy path omits).
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
+    allowed_tools = [t for t in plan.tools if t != "mcp__mctl__*"] + _mctl_tool_globs()
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=plan.model,
-        allowed_tools=list(plan.tools),
+        allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=plan.budget_usd,
