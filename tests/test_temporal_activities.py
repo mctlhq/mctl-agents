@@ -990,6 +990,33 @@ class TestGetDeployStatus:
         status = await env.run(get_deploy_status, "admins", "mctl-web")
         assert status.found is False
 
+    async def test_a_non_string_updated_at_is_dropped_at_the_boundary(self, env, monkeypatch):
+        """agy P1 (#236): an int epoch must never enter the dataclass.
+
+        This is where that gets decided. Downstream, `_at_or_after` would
+        call `.replace()` on it and raise AttributeError inside the
+        workflow loop — Temporal retries that forever on identical input,
+        wedging the state machine. It cannot get that far twice over:
+        Temporal's own converter refuses to decode a non-str into this
+        `str | None` field, and the activity drops it here first. Assert
+        the drop, so tightening this parse is never mistaken for dead code.
+        """
+        from orchestrator.temporal.activities.deploy_state import get_deploy_status
+
+        self._handler(
+            monkeypatch,
+            {
+                "argocd": {
+                    "health": "Healthy",
+                    "syncStatus": "Synced",
+                    "updatedAt": 1756512000,  # epoch, not ISO-8601
+                },
+                "service": {"imageTag": "7.4.0"},
+            },
+        )
+        status = await env.run(get_deploy_status, "admins", "mctl-web")
+        assert status.updated_at is None
+
 
 class TestDeployTargetPathSafety:
     """agy P1 on #235: the target ends up in an mctl-api URL path.

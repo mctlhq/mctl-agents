@@ -350,7 +350,19 @@ def _as_utc(value: str) -> datetime:
     comparing naive to aware raises TypeError. These are all UTC in
     practice — GitHub and ArgoCD both emit Zulu — so an absent offset is
     read as UTC rather than refused.
+
+    A non-string value raises TypeError rather than the AttributeError
+    ``.replace()`` would give, so callers' ``except (ValueError,
+    TypeError)`` covers it. Belt-and-braces only: agy read this as a live
+    P1 (an int epoch from the API wedging the workflow), but a non-str
+    cannot actually get here — ``deploy_state`` isinstance-guards both
+    ``updatedAt`` and ``published_at`` at the HTTP boundary, and Temporal's
+    own converter refuses to decode a non-str into these ``str`` fields
+    before the workflow ever sees them. This keeps the helper total for
+    its declared contract rather than relying on those two distant checks.
     """
+    if not isinstance(value, str):
+        raise TypeError(f"expected an ISO-8601 string, got {type(value).__name__}")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
@@ -668,10 +680,11 @@ class DevLoopWorkflow:
                 seen.setdefault(incident.id, incident)
         if seen:
             workflow.logger.warning(
-                "incident watch for %s saw %d incident(s) within %s of the rollout",
+                "incident watch for %s saw %d incident(s) within %d minute(s) "
+                "of the rollout",
                 service,
                 len(seen),
-                INCIDENT_WATCH_WINDOW,
+                window_minutes,
             )
         return IncidentWatch(
             watched=True,
