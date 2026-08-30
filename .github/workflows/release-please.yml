@@ -8,6 +8,10 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  # Mint the OIDC token the agent-registry refresh exchanges at Vault for
+  # a short-lived, read-only credential. No long-lived secret exists for
+  # this — see the "Refresh agent registry" step.
+  id-token: write
 
 concurrency:
   group: release-please-${{ github.ref }}
@@ -88,26 +92,40 @@ jobs:
       # shepherd tick started pinning the released image, that stale row
       # became the image those ticks would run.
       #
-      # Skipped, not failed, when MCTL_TOKEN is absent: the credential is
-      # provisioned separately, and a release must not fail because the
-      # registry refresh could not authenticate. The step is idempotent
-      # (an already-published version returns 409 and is still promoted),
-      # so a re-run after the secret lands catches the registry up.
+      # The mctl-api token comes from Vault via GitHub OIDC, not from an
+      # Actions secret: a repo secret is readable by every workflow on the
+      # repo, whereas the Vault role `mctl-agents-release` is bound to
+      # this repository AND this workflow file, mints a 10-minute token,
+      # and its policy can read exactly one KV path. Same pattern as
+      # mctl-gitops' build-image.yaml.
       - name: Refresh agent registry
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:
-          MCTL_TOKEN: ${{ secrets.MCTL_TOKEN }}
+          VAULT_ADDR: https://secrets.mctl.ai
           TAG: ${{ steps.release.outputs.tag_name }}
         run: |
-          if [ -z "${MCTL_TOKEN:-}" ]; then
-            echo "::warning::MCTL_TOKEN is not configured — skipping the agent registry refresh for $TAG"
-            exit 0
-          fi
+          set -euo pipefail
+          JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://github.com/mctlhq" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["value"])')
+
+          # Fail loudly rather than fall open: build-image.yaml silently
+          # skipped its Vault step for months because the login failed and
+          # nothing said so (see the F9 incident, 2026-08-15).
+          VAULT_TOKEN=$(curl -sf -X POST "$VAULT_ADDR/v1/auth/jwt/login" \
+            -d "{\"role\":\"mctl-agents-release\",\"jwt\":\"$JWT\"}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["auth"]["client_token"])')
+
+          MCTL_TOKEN=$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" \
+            "$VAULT_ADDR/v1/secret/data/platform/mctl-agents" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["data"]["mctl-token"])')
+          echo "::add-mask::$MCTL_TOKEN"
+
           python -m pip install --quiet httpx pyyaml
-          # Tags are what the tool reads every file from; the checkout above
-          # is shallow and release-please has just pushed this one.
+          # The tool reads every file out of the tag's own tree, and the
+          # checkout above is shallow — release-please has just pushed it.
           git fetch --tags --force --quiet
-          python tools/publish_agent_release.py "$TAG"
+          MCTL_TOKEN="$MCTL_TOKEN" python tools/publish_agent_release.py "$TAG"
 
       - name: Notify Telegram on release/deploy failure
         if: ${{ failure() && steps.release.outputs.release_created == 'true' }}
