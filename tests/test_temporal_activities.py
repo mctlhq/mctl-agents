@@ -989,3 +989,57 @@ class TestGetDeployStatus:
         )
         status = await env.run(get_deploy_status, "admins", "mctl-web")
         assert status.found is False
+
+
+class TestDeployTargetPathSafety:
+    """agy P1 on #235: the target ends up in an mctl-api URL path.
+
+    release-please.yml is editable by any merged PR, so a crafted
+    team/component would otherwise normalise into an authenticated GET
+    against an arbitrary internal endpoint — whose body this module quotes
+    back in its exception messages.
+    """
+
+    PATH = "/repos/mctlhq/evil/contents/.github/workflows/release-please.yml"
+
+    def _handler(self, monkeypatch, body: str):
+        import base64 as _b64
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self.PATH:
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_traversal_in_dispatch_args_is_refused(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            "            -f team_name=.. \\\n            -f component_name=admin/secrets\n",
+        )
+        assert await env.run(resolve_deploy_target, "mctlhq/evil") is None
+
+    async def test_traversal_in_values_path_is_refused(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            '            -f values_path="platform-gitops/services/../admin/values.yaml"\n',
+        )
+        assert await env.run(resolve_deploy_target, "mctlhq/evil") is None
+
+    async def test_ordinary_names_still_resolve(self, env, monkeypatch):
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            "            -f team_name=admins \\\n            -f component_name=mctl-api\n",
+        )
+        target = await env.run(resolve_deploy_target, "mctlhq/evil")
+        assert target is not None and (target.team, target.app) == ("admins", "mctl-api")

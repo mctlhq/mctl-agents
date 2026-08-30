@@ -49,6 +49,14 @@ _DISPATCH_ARG_RE = r"-f\s+{name}=[\"']?([^\s\"'\\]+)"
 _SERVICE_VALUES_RE = re.compile(
     r"platform-gitops/services/(?P<team>[\w.-]+)/(?P<app>[\w.-]+)/values\.ya?ml"
 )
+# team/app end up interpolated into mctl-api's /api/v1/status/{team}/{app}
+# path, and they come from a workflow file any merged PR can edit. Without
+# this, `team_name=..` plus `component_name=admin/secrets` normalises to an
+# authenticated GET against an arbitrary internal endpoint, whose response
+# body this module would then quote back in an exception message — SSRF
+# plus exfiltration through the orchestrator's own token (agy P1 on #235).
+# One path segment, no separators, no traversal, no leading dot.
+_SAFE_SEGMENT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
 
 
 @dataclass(frozen=True)
@@ -147,7 +155,7 @@ async def resolve_deploy_target(repo: str) -> DeployTarget | None:
     if values_path:
         match = _SERVICE_VALUES_RE.search(values_path)
         if match:
-            return DeployTarget(team=match.group("team"), app=match.group("app"))
+            return _safe_target(repo, match.group("team"), match.group("app"))
         # A values_path outside services/ (bootstrap templates, for
         # instance) names no service directory; fall through to the
         # dispatch's own team/component, which is what release-deploy
@@ -157,7 +165,27 @@ async def resolve_deploy_target(repo: str) -> DeployTarget | None:
     component = _find_arg(content, "component_name")
     if not team or not component:
         return None
-    return DeployTarget(team=team, app=component)
+    return _safe_target(repo, team, component)
+
+
+def _safe_target(repo: str, team: str, app: str) -> DeployTarget | None:
+    """Reject anything that is not a single safe path segment.
+
+    Returning None (i.e. "this repo deploys no application") is the right
+    failure here: a workflow file naming something unroutable is not a
+    deploy this loop can observe, and refusing to build the URL at all is
+    the only way to keep a crafted value out of it.
+    """
+    for label, value in (("team", team), ("app", app)):
+        if not _SAFE_SEGMENT_RE.match(value):
+            activity.logger.warning(
+                "refusing deploy target from %s: %s=%r is not a single safe path segment",
+                repo,
+                label,
+                value,
+            )
+            return None
+    return DeployTarget(team=team, app=app)
 
 
 def _find_arg(content: str, name: str) -> str | None:
