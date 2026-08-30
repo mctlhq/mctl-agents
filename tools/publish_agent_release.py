@@ -160,28 +160,7 @@ def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str])
     return f"sha256:{digest.hexdigest()}"
 
 
-def image_digest(tag: str) -> str:
-    """Resolve the published image's digest, or "" when it cannot be read.
-
-    Empty is acceptable: registry.py falls back to "<repo>:<version>",
-    which resolves to the same image as long as the tag is not moved. A
-    wrong digest would be worse than none.
-    """
-    result = subprocess.run(  # noqa: S603 — fixed argv from PATH, no shell
-        ["docker", "buildx", "imagetools", "inspect", f"{IMAGE_REPOSITORY}:{tag}", "--raw"],  # noqa: S607
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print(f"  note: could not resolve image digest for {tag}; publishing without one")
-        return ""
-    return "sha256:" + hashlib.sha256(result.stdout.encode()).hexdigest()
-
-
-def publish(
-    agent: str, version: str, git_sha: str, digest: str, tree: list[str], *, dry_run: bool
-) -> bool:
+def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run: bool) -> bool:
     relpath = f"agents/_manifests/{agent}/agent.yaml"
     raw = _read_at_tag(version, relpath)
     if raw is None:
@@ -193,8 +172,13 @@ def publish(
         # Postgres as SQLSTATE 22P02 rather than by any validation here.
         "manifest_json": json.dumps(manifest),
         "git_sha": git_sha,
+        # No image_digest. The release workflow dispatches the image build
+        # to mctl-gitops asynchronously and runs this immediately after, so
+        # the image does not exist yet — resolving a digest here could only
+        # ever fail, and publishing an empty one pretends otherwise.
+        # registry.py falls back to "<repo>:<version>", which is the tag
+        # release-deploy pins anyway.
         "image_repository": IMAGE_REPOSITORY,
-        "image_digest": digest,
         "prompt_hash": prompt_hash(manifest, agent, version, tree),
     }
     if dry_run:
@@ -273,13 +257,18 @@ def main() -> int:
         print(f"error: no manifest in {args.version} for: {', '.join(unknown)}", file=sys.stderr)
         return 2
 
-    digest = "" if args.dry_run else image_digest(args.version)
     print(f"publishing {len(agents)} agent(s) at {args.version} ({git_sha[:8]})")
-    failed = [
-        a
-        for a in agents
-        if not publish(a, args.version, git_sha, digest, tree, dry_run=args.dry_run)
-    ]
+    # Each agent is independent: one bad manifest must not abandon the
+    # rest half-published, which would leave the registry in a state no
+    # single re-run reproduces (agy P2).
+    failed: list[str] = []
+    for agent in agents:
+        try:
+            if not publish(agent, args.version, git_sha, tree, dry_run=args.dry_run):
+                failed.append(agent)
+        except (PublishError, httpx.HTTPError) as exc:
+            print(f"  ERROR {agent}: {exc}", file=sys.stderr)
+            failed.append(agent)
     if failed:
         print(f"failed: {', '.join(failed)}", file=sys.stderr)
         return 1
