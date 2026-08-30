@@ -35,10 +35,10 @@ prompts.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -111,6 +111,61 @@ def _read_at_tag(tag: str, relpath: str) -> bytes | None:
     return result.stdout if result.returncode == 0 else None
 
 
+_GLOB_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile one manifest glob with path-aware wildcards.
+
+    NOT fnmatch: its ``*`` happily crosses ``/``, so
+    ``agents/[!_]*/CLAUDE.md`` also matches
+    ``agents/x/nested/deeper/CLAUDE.md``. Every extra file it swept in
+    would land in prompt_hash, making the hash change on edits to files
+    the manifest never declared — and drift detection that fires on
+    unrelated files is drift detection nobody reads. Shell semantics
+    instead: ``*`` and ``?`` stay within one segment, ``**`` spans them,
+    and ``[...]`` classes (including ``[!x]`` negation) pass through.
+    """
+    out = ["^"]
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "*":
+            if pattern.startswith("**", i):
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+            continue
+        if char == "?":
+            out.append("[^/]")
+        elif char == "[":
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                # An unclosed class is a literal bracket, as in fnmatch.
+                out.append(re.escape(char))
+            else:
+                body = pattern[i + 1 : end]
+                if body.startswith(("!", "^")):
+                    body = "^" + body[1:]
+                out.append(f"[{body}]")
+                i = end + 1
+                continue
+        else:
+            out.append(re.escape(char))
+        i += 1
+    out.append("$")
+    return re.compile("".join(out))
+
+
+def _glob_match(path: str, pattern: str) -> bool:
+    compiled = _GLOB_CACHE.get(pattern)
+    if compiled is None:
+        compiled = _GLOB_CACHE[pattern] = _glob_to_regex(pattern)
+    return compiled.match(path) is not None
+
+
 def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str]) -> str:
     """Hash the manifest's declared prompt surface. See the module docstring.
 
@@ -122,8 +177,6 @@ def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str])
     sources = manifest.get("spec", {}).get("prompt", {}).get("sources", [])
     if not sources:
         raise PublishError(f"{agent}: manifest declares no prompt sources")
-    # (identifier, path) pairs — one per real file, so a glob contributes
-    # every file it currently matches.
     # (identifier, repo-relative path or None) — one entry per real file,
     # so a glob contributes every file it matched at this tag.
     entries: list[tuple[str, str | None]] = []
@@ -132,7 +185,7 @@ def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str])
             raise PublishError(f"{agent}: malformed prompt source {source!r}")
         if isinstance(source.get("glob"), str):
             pattern = source["glob"]
-            matches = sorted(p for p in tree if fnmatch.fnmatchcase(p, pattern))
+            matches = sorted(p for p in tree if _glob_match(p, pattern))
             # A glob matching nothing is legitimate — the per-tenant
             # implementer prompts live in directories this repo need not
             # carry. Record the pattern anyway, so the hash changes the

@@ -161,7 +161,7 @@ jobs:
         run: uv sync --locked
 
       - name: Run ruff
-        run: uv run --locked ruff check orchestrator config tests
+        run: uv run --locked ruff check orchestrator config tests tools
 
       - name: Run mypy
         # No target dirs on the CLI: mypy's own [tool.mypy].files in

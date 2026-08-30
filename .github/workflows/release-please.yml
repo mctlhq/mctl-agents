@@ -98,6 +98,18 @@ jobs:
       # this repository AND this workflow file, mints a 10-minute token,
       # and its policy can read exactly one KV path. Same pattern as
       # mctl-gitops' build-image.yaml.
+      # Only when a release was actually cut, and only after it was: the
+      # job otherwise has no repository on disk at all (release-please
+      # itself works entirely through the API). fetch-depth: 0 because the
+      # publish tool reads files out of the new tag's tree via `git show`,
+      # and a shallow clone has neither the tag nor the objects behind it.
+      - name: Check out the released commit
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+          fetch-depth: 0
+
       - name: Refresh agent registry
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:
@@ -122,9 +134,6 @@ jobs:
           echo "::add-mask::$MCTL_TOKEN"
 
           python -m pip install --quiet httpx pyyaml
-          # The tool reads every file out of the tag's own tree, and the
-          # checkout above is shallow — release-please has just pushed it.
-          git fetch --tags --force --quiet
           MCTL_TOKEN="$MCTL_TOKEN" python tools/publish_agent_release.py "$TAG"
 
       - name: Notify Telegram on release/deploy failure
