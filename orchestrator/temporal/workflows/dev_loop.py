@@ -295,6 +295,36 @@ def _is_transient(exc: ActivityError) -> bool:
     )
 
 
+def _require_release(agent: str, release: ResolvedRelease | None) -> ResolvedRelease | None:
+    """Enforce that ``agent`` resolves to a pinned image, once patched (A4).
+
+    Until now an unresolvable agent silently fell back to whatever image
+    the ClusterWorkflowTemplate had baked in — the phase-5 compatibility
+    shim, which existed because the registry was not yet authoritative.
+    It is now: every manifest is published and promoted by the release
+    pipeline (tools/publish_agent_release.py), so a missing row is a real
+    misconfiguration and running an unknown image instead of saying so
+    defeats the point of pinning.
+
+    The check lives here, not in resolve_agent_release: the activity's
+    signature and return value must stay identical for histories recorded
+    before this marker, and changing what it raises would break their
+    replay just as surely as changing its arity would (the lesson from
+    #223).
+    """
+    if not workflow.patched("registry-required"):
+        return release
+    if release is None or not release.image_ref:
+        raise ApplicationError(
+            f"no released image for {agent} in {ENVIRONMENT} — the agent registry must "
+            "pin every agent this loop runs; publish and promote it "
+            "(tools/publish_agent_release.py) and retry",
+            type="AgentReleaseMissing",
+            non_retryable=True,
+        )
+    return release
+
+
 def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
     """Retrieve a finished tick's exception so it is never swallowed.
 
@@ -359,7 +389,9 @@ class DevLoopWorkflow:
         # Pin the investigator version ONCE, at the start of this step. A
         # later promote/rollback in the registry must not retroactively
         # change what an in-flight (or replayed) workflow already ran.
-        investigator_release = await _resolve("issue-investigator")
+        investigator_release = _require_release(
+            "issue-investigator", await _resolve("issue-investigator")
+        )
         investigate_params = {"issue_url": issue.issue_url}
         if investigator_release and investigator_release.image_ref:
             investigate_params["agent_image"] = investigator_release.image_ref
@@ -416,7 +448,7 @@ class DevLoopWorkflow:
         if not atomic_approve:
             # Legacy position: pre-atomic-approve histories resolved the
             # implementer before the slug lookup — keep their command order.
-            implementer_release = await _resolve("implementer")
+            implementer_release = _require_release("implementer", await _resolve("implementer"))
         if workflow.patched("slug-scoped-implement"):
             issue_number = parse_issue_url(issue.issue_url).number
             slug = await workflow.execute_activity(
@@ -474,7 +506,7 @@ class DevLoopWorkflow:
             # transient outage into a permanently stuck issue (codex P1 on
             # PR #212). Pre-atomic-approve histories already resolved above,
             # in their recorded position.
-            implementer_release = await _resolve("implementer")
+            implementer_release = _require_release("implementer", await _resolve("implementer"))
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to
@@ -706,7 +738,7 @@ class DevLoopWorkflow:
             # DevLoop-owned proposals would silently run the CWFT's
             # baked-in default while cron-driven ones ran the intended
             # release.
-            shepherd_release = await _resolve("shepherd")
+            shepherd_release = _require_release("shepherd", await _resolve("shepherd"))
             tick_params = {"service": service, "slug": slug}
             if shepherd_release and shepherd_release.image_ref:
                 tick_params["agent_image"] = shepherd_release.image_ref

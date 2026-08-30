@@ -242,7 +242,11 @@ class TestDevLoopWorkflow:
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            return None
+            # Every agent resolves: since A4 an unpinned agent is fatal,
+            # so a test about something else must not trip that gate.
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
 
         @activity.defn(name="submit_and_wait")
         async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
@@ -285,33 +289,36 @@ class TestDevLoopWorkflow:
         assert seen_params["mctl-agents-approve"]["service"] == "mctl-telegram"
         assert seen_params["mctl-agents-approve"]["slug"] == "issue-42-fake-title"
 
-    async def test_unpinned_release_is_not_recorded_as_used(self, env):
-        """resolve_agent_release can return a release with no image_ref (a
-        version exists but couldn't be turned into a pullable image) — the
-        CWFT then runs its own baked-in default, NOT that version. The
-        execution record must reflect that (empty version/image_ref), or the
-        audit trail would falsely claim a specific registry version produced
-        the result."""
-        recorded: list[ExecutionRecord] = []
+    async def test_a_release_without_an_image_is_fatal(self, env):
+        """A version row exists but yields no pullable image.
+
+        Before A4 this fell through to the CWFT default and was merely
+        recorded as "no pinned version". Now it fails: a half-resolved
+        release is exactly as unpinned as a missing one, and the audit
+        trail claiming a version that never ran the work was the reason
+        this case was singled out in the first place.
+        """
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            # version resolved, but no image_ref -- e.g. the /versions
+            # version resolved, but no image_ref — e.g. the /versions
             # response had no matching entry to build one from.
-            return ResolvedRelease(agent=agent, environment=environment, version="9.9.9", image_ref="")
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.2.3", image_ref=""
+            )
 
         @activity.defn(name="submit_and_wait")
         async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
-            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+            raise AssertionError("no CWFT may run without a pinned image")
 
         @activity.defn(name="record_execution")
-        async def capturing_record_execution(record: ExecutionRecord) -> None:
-            recorded.append(record)
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
 
         activities = [
             fake_resolve_agent_release,
             fake_submit_and_wait,
-            capturing_record_execution,
+            fake_record_execution,
             _fake_find_proposal_slug,
         ]
 
@@ -323,62 +330,33 @@ class TestDevLoopWorkflow:
         ):
             handle = await env.client.start_workflow(
                 DevLoopWorkflow.run,
-                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5"),
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/4"),
                 id=f"dev-loop-test-{uuid.uuid4()}",
                 task_queue=TASK_QUEUE,
             )
-            await handle.signal(DevLoopWorkflow.approve)
-            await handle.result()
+            with pytest.raises(Exception) as caught:
+                await handle.result()
 
-        # Investigate and implement record with no pinned release in this
-        # fake -- neither should ever be recorded as if a specific version
-        # had actually run. The approve flip deliberately does NOT write an
-        # executions row (it is not an SDK agent run; its audit trail is the
-        # .status.yaml approval block + gitops commit + workflow history).
-        assert len(recorded) == 2
-        for record in recorded:
-            assert record.version == ""
-            assert record.image_ref == ""
-            assert record.target_repo == "mctl-telegram"
+        assert "issue-investigator" in str(caught.value.cause)  # type: ignore[attr-defined]
 
-    async def test_failed_investigate_never_implements(self, env):
-        activities, calls, _investigate_ran = _fake_activities(released=True, investigate_phase="Failed")
-        async with Worker(
-            env.client,
-            task_queue=TASK_QUEUE,
-            workflows=[DevLoopWorkflow],
-            activities=activities,
-        ):
-            handle = await env.client.start_workflow(
-                DevLoopWorkflow.run,
-                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/2"),
-                id=f"dev-loop-test-{uuid.uuid4()}",
-                task_queue=TASK_QUEUE,
-            )
-            result = await handle.result()
+    async def test_unregistered_agent_fails_the_loop(self, env):
+        """A4 (#220 follow-up): the CWFT-default fallback is retired.
 
-        assert result.investigate.phase == "Failed"
-        assert result.implement is None
-        assert calls == ["mctl-agents-investigate"]
-
-    async def test_unregistered_agent_falls_back_to_cwft_default(self, env):
-        """resolve_agent_release returning None (nothing ever promoted) must
-        not fail the workflow — DevLoopWorkflow omits agent_image/agent_version
-        entirely and lets the CWFT's own baked-in default apply."""
+        Until the registry was authoritative, an agent nothing had ever
+        promoted fell through to whatever image the ClusterWorkflowTemplate
+        had baked in. The release pipeline now publishes and promotes every
+        manifest, so a missing row is a real misconfiguration — and
+        silently running an unknown image is the one outcome that makes
+        pinning pointless.
+        """
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
             return None
 
-        seen_params: dict[str, dict[str, str]] = {}
-        investigate_ran = anyio.Event()
-
         @activity.defn(name="submit_and_wait")
-        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
-            seen_params[input.operation] = input.params
-            if input.operation == "mctl-agents-investigate":
-                investigate_ran.set()
-            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+        async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            raise AssertionError("no CWFT may run without a pinned image")
 
         @activity.defn(name="record_execution")
         async def fake_record_execution(record: ExecutionRecord) -> None:
@@ -386,7 +364,7 @@ class TestDevLoopWorkflow:
 
         activities = [
             fake_resolve_agent_release,
-            capturing_submit_and_wait,
+            fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
         ]
@@ -403,13 +381,10 @@ class TestDevLoopWorkflow:
                 id=f"dev-loop-test-{uuid.uuid4()}",
                 task_queue=TASK_QUEUE,
             )
-            with anyio.fail_after(10):
-                await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
-            await handle.result()
+            with pytest.raises(Exception) as caught:
+                await handle.result()
 
-        assert "agent_image" not in seen_params["mctl-agents-investigate"]
-        assert "agent_version" not in seen_params["mctl-agents-investigate"]
+        assert "issue-investigator" in str(caught.value.cause)  # type: ignore[attr-defined]
 
     async def test_persistent_record_execution_failure_does_not_fail_workflow(self, env):
         """record_execution is an audit-trail write, not the real work — a
@@ -419,7 +394,11 @@ class TestDevLoopWorkflow:
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            return None
+            # Every agent resolves: since A4 an unpinned agent is fatal,
+            # so a test about something else must not trip that gate.
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
 
         @activity.defn(name="submit_and_wait")
         async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
@@ -465,7 +444,11 @@ class TestDevLoopWorkflow:
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            return None
+            # Every agent resolves: since A4 an unpinned agent is fatal,
+            # so a test about something else must not trip that gate.
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
 
         @activity.defn(name="submit_and_wait")
         async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
@@ -518,7 +501,11 @@ class TestDevLoopWorkflow:
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            return None
+            # Every agent resolves: since A4 an unpinned agent is fatal,
+            # so a test about something else must not trip that gate.
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
 
         @activity.defn(name="submit_and_wait")
         async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
@@ -563,7 +550,11 @@ class TestDevLoopWorkflow:
 
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
-            return None
+            # Every agent resolves: since A4 an unpinned agent is fatal,
+            # so a test about something else must not trip that gate.
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
 
         @activity.defn(name="submit_and_wait")
         async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
@@ -612,7 +603,9 @@ class TestDevLoopWorkflow:
         @activity.defn(name="resolve_agent_release")
         async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
             resolved_agents.append(agent)
-            return None
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
 
         @activity.defn(name="submit_and_wait")
         async def failing_approve_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
