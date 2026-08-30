@@ -8,6 +8,8 @@ server binary (cached under ~/.cache after the first run).
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 
 import anyio
@@ -22,6 +24,7 @@ from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTa
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
+from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
@@ -1346,3 +1349,165 @@ class TestDevLoopWorkflow:
 
         assert result.pr is not None and result.pr.state == "MERGED"
         assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
+
+
+SERVICE = "mctl-telegram"
+SLUG = "issue-88-fake-title"
+
+
+@pytest.fixture
+def tick_logger(monkeypatch: pytest.MonkeyPatch) -> logging.Logger:
+    """A plain logger standing in for `workflow.logger` (#231).
+
+    temporalio's workflow logger is an adapter that asks the workflow
+    runtime whether it is replaying; called outside a workflow event loop
+    it raises _NotInWorkflowEventLoopError, so the tick helpers below —
+    which log on every branch they take — cannot be exercised directly
+    without this swap. Replacing the module attribute also makes the log
+    lines assertable via caplog, which is how these tests observe that a
+    finished tick's exception was actually retrieved.
+    """
+    logger = logging.getLogger("dev-loop-tick-unit")
+    monkeypatch.setattr(dev_loop.workflow, "logger", logger)
+    return logger
+
+
+class TestTickSettling:
+    """Direct unit tests for the in-loop tick helpers (#231).
+
+    Deliberately not run through the Temporal harness. The branch that
+    matters here — a shepherd tick STILL IN FLIGHT when the watch ends —
+    is unreachable under the time-skipping test server: an outstanding
+    activity stops it advancing timers, so a workflow-level test can never
+    get a poll to land past a running tick, and `_settle_tick` is always
+    reached with `tick_task.done()` already true. That is precisely how a
+    P1 (`except Exception` does not catch `asyncio.CancelledError`, which
+    is a BaseException) shipped through a green suite: the cancel-and-await
+    path never executed in CI. These call the methods on a bare
+    DevLoopWorkflow instance so that path executes for real.
+    """
+
+    async def test_settle_tick_cancels_an_in_flight_tick_without_raising(
+        self, tick_logger: logging.Logger
+    ) -> None:
+        """The P1 regression.
+
+        `_settle_tick` cancels the task and awaits it; `await` on a task
+        that has been cancelled re-raises CancelledError in the awaiter.
+        Since it inherits from BaseException, an `except Exception` there
+        does not catch it — it escapes `_settle_tick`, escapes `_watch_pr`'s
+        `finally`, and (because an exception raised in a `finally` replaces
+        the pending return) discards the MERGED state the watch was about
+        to return and fails a workflow whose implement and merge both
+        succeeded.
+        """
+        workflow_obj = DevLoopWorkflow()
+        running = asyncio.Event()
+
+        async def never_finishes() -> None:
+            running.set()
+            await asyncio.sleep(3600)
+
+        tick_task = asyncio.create_task(never_finishes())
+        # Await the task's own signal rather than sleeping: `_settle_tick`
+        # must be entered with the tick genuinely in flight, which is the
+        # whole point of the test. A task that had not started yet would
+        # take the same code path but prove less.
+        with anyio.fail_after(5):
+            await running.wait()
+        assert not tick_task.done()
+
+        await workflow_obj._settle_tick(tick_task, SERVICE, SLUG)
+
+        assert tick_task.cancelled()
+
+    async def test_settle_tick_survives_an_already_cancelled_tick(
+        self, tick_logger: logging.Logger
+    ) -> None:
+        """A task cancelled from elsewhere is `done()`, so `_settle_tick`
+        takes the drain branch — and `Task.exception()` on a cancelled task
+        raises CancelledError rather than returning it. `_drain_tick`'s
+        `cancelled()` guard is the only thing standing between that and the
+        same workflow failure the test above covers.
+        """
+        workflow_obj = DevLoopWorkflow()
+
+        async def never_finishes() -> None:
+            await asyncio.sleep(3600)
+
+        tick_task = asyncio.create_task(never_finishes())
+        await asyncio.sleep(0)
+        tick_task.cancel()
+        with anyio.fail_after(5):
+            with pytest.raises(asyncio.CancelledError):
+                await tick_task
+        assert tick_task.cancelled()
+
+        await workflow_obj._settle_tick(tick_task, SERVICE, SLUG)
+
+    async def test_settle_tick_retrieves_a_finished_ticks_exception(
+        self, tick_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A tick that finished by raising must have its exception read.
+
+        `_shepherd_tick` catches its own failures, so this should normally
+        find nothing — but if one ever escapes, the task holds it, the
+        watch loop drops the reference on the next boundary, and the only
+        trace is asyncio's "exception was never retrieved" warning at GC
+        time. The error log is the observable proof that `_drain_tick` ran.
+        """
+        workflow_obj = DevLoopWorkflow()
+
+        async def raises_immediately() -> None:
+            raise RuntimeError("tick blew up")
+
+        tick_task = asyncio.create_task(raises_immediately())
+        # asyncio.wait, specifically: it reports the task as done without
+        # reading its exception, so the retrieval under test below is still
+        # genuinely the first one. Awaiting the task itself would raise it
+        # here and destroy the thing being measured.
+        with anyio.fail_after(5):
+            await asyncio.wait({tick_task})
+
+        with caplog.at_level(logging.ERROR, logger=tick_logger.name):
+            await workflow_obj._settle_tick(tick_task, SERVICE, SLUG)
+
+        assert "unretrieved" in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert SLUG in caplog.text
+        # Reading it here is what makes the assertion above meaningful: had
+        # _drain_tick not called .exception(), this would be the first read.
+        assert isinstance(tick_task.exception(), RuntimeError)
+
+    async def test_settle_tick_accepts_a_watch_that_never_ticked(
+        self, tick_logger: logging.Logger
+    ) -> None:
+        """Most watches end without a tick ever starting (the first
+        boundary is ~4 h in). `finally` still calls `_settle_tick`, with
+        None."""
+        await DevLoopWorkflow()._settle_tick(None, SERVICE, SLUG)
+
+    async def test_shepherd_tick_swallows_an_unexpected_error(
+        self,
+        tick_logger: logging.Logger,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`_shepherd_tick` runs as a task, so anything escaping it is
+        stored on that task instead of raised — and the next poll overwrites
+        the reference. It caught only ActivityError, which left every other
+        failure (a KeyError in the params, a bug in _record) silent. It must
+        log and return instead, at the one point that still has the
+        service/slug context.
+        """
+
+        async def resolve_explodes(agent: str) -> None:
+            raise RuntimeError("registry client is broken")
+
+        monkeypatch.setattr(dev_loop, "_resolve", resolve_explodes)
+
+        with caplog.at_level(logging.ERROR, logger=tick_logger.name):
+            await DevLoopWorkflow()._shepherd_tick(SERVICE, SLUG)
+
+        assert "unexpected RuntimeError" in caplog.text
+        assert SERVICE in caplog.text and SLUG in caplog.text
