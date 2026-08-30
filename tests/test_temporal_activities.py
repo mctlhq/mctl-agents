@@ -1044,6 +1044,27 @@ class TestDeployTargetPathSafety:
         target = await env.run(resolve_deploy_target, "mctlhq/evil")
         assert target is not None and (target.team, target.app) == ("admins", "mctl-api")
 
+    async def test_dotted_names_are_allowed(self, env, monkeypatch):
+        """ArgoCD app names are DNS subdomains and may contain dots (agy P2)."""
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            "            -f team_name=admins \\\n            -f component_name=api.mctl.ai\n",
+        )
+        target = await env.run(resolve_deploy_target, "mctlhq/evil")
+        assert target is not None and target.app == "api.mctl.ai"
+
+    async def test_a_leading_dot_is_still_refused(self, env, monkeypatch):
+        """Allowing interior dots must not let ".." back in."""
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            "            -f team_name=admins \\\n            -f component_name=..evil\n",
+        )
+        assert await env.run(resolve_deploy_target, "mctlhq/evil") is None
+
 class TestListServiceIncidents:
     """#216: scoped incident query — service + window, nothing stronger."""
 

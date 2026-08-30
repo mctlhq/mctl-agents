@@ -1225,11 +1225,55 @@ class TestDevLoopWorkflow:
 
         assert result.deploy is not None and result.deploy.outcome == "unverified"
 
-    async def test_unknown_argocd_application_stops_polling_immediately(self, env):
-        """A name that resolves to no app will not start existing."""
+    async def test_fractional_seconds_do_not_read_as_older(self, env):
+        """agy P2: ArgoCD emits fractional seconds, GitHub does not.
+
+        "…:00.500Z" sorts BEFORE "…:00Z" as a string, because "." < "Z",
+        so a lexicographic compare would call a sync that happened half a
+        second AFTER the release older than it — and never verify.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
+            deploy_statuses=[
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-30T00:00:00.500Z",
+                )
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 104)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
+    async def test_a_new_argocd_application_is_waited_for(self, env):
+        """A release can introduce the app; ArgoCD registers it a bit later."""
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            deploy_statuses=[
+                DeployStatus(found=False),
+                DeployStatus(found=False),
+                DeployStatus(found=True, image_tag="9.9.9", health="Healthy", sync_status="Synced"),
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 105)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
+    async def test_unknown_argocd_application_gives_up_after_the_grace(self, env):
+        """Past the grace polls, a name resolving to nothing is a wrong name."""
         activities, _calls, investigate_ran = _fake_activities(
             released=True, deploy_statuses=[DeployStatus(found=False)]
-        )
+        )  # repeated for every poll — the grace runs out and the watch gives up
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):

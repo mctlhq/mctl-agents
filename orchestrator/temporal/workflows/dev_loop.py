@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -160,6 +160,10 @@ RELEASE_LOOKUP_DEADLINE = timedelta(minutes=20)
 RELEASE_POLL_INTERVAL = timedelta(minutes=2)
 DEPLOY_VERIFY_DEADLINE = timedelta(minutes=45)
 DEPLOY_POLL_INTERVAL = timedelta(minutes=1)
+# A release can introduce a brand-new ArgoCD application, which takes a
+# few reconciliations to appear. Wait that out, but not the full deadline:
+# past this, a name that resolves to nothing is a wrong name.
+NEW_APP_GRACE_POLLS = 5
 DEPLOY_READ_TIMEOUT = timedelta(minutes=2)
 DEPLOY_READ_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
@@ -314,6 +318,26 @@ async def _record(
             agent,
             result.workflow_name,
         )
+
+
+def _at_or_after(later: str | None, earlier: str) -> bool:
+    """Is ``later`` at or after ``earlier``, comparing real instants?
+
+    Not a string compare: GitHub emits whole seconds ("...:01Z") while
+    ArgoCD may emit fractional ones ("...:01.123Z"), and "." sorts BEFORE
+    "Z", so the fractional value would read as older than the very second
+    it belongs to (agy P2). An unparseable value is treated as "not yet",
+    which only ever delays a verdict.
+    """
+    if not later:
+        return False
+    try:
+        return datetime.fromisoformat(later.replace("Z", "+00:00")) >= datetime.fromisoformat(
+            earlier.replace("Z", "+00:00")
+        )
+    except ValueError:
+        workflow.logger.warning("unparseable timestamp %r or %r", later, earlier)
+        return False
 
 
 def _is_transient(exc: ActivityError) -> bool:
@@ -724,6 +748,7 @@ class DevLoopWorkflow:
         """Wait until the app reports Synced/Healthy on the released tag."""
         deadline = workflow.now() + DEPLOY_VERIFY_DEADLINE
         last: DeployStatus | None = None
+        polls_without_app = 0
         while workflow.now() < deadline:
             try:
                 status: DeployStatus = await workflow.execute_activity(
@@ -750,15 +775,27 @@ class DevLoopWorkflow:
                 await workflow.sleep(DEPLOY_POLL_INTERVAL)
                 continue
             if not status.found:
-                # The name resolves to no ArgoCD application. Polling it
-                # for 45 minutes would only delay the same answer.
-                return DeployObservation(
-                    outcome="unverified",
-                    team=target.team,
-                    app=target.app,
-                    release_tag=release.tag,
-                    detail=f"no ArgoCD application {target.team}/{target.app}",
-                )
+                # A PR can introduce a NEW application, which ArgoCD only
+                # registers a little after the release lands (app-of-apps)
+                # — so this is a pending state at first, not a verdict
+                # (agy P2). Still bounded: after the grace polls a name
+                # that resolves to nothing is a wrong name, and waiting
+                # out the full deadline would only delay the same answer.
+                polls_without_app += 1
+                if polls_without_app >= NEW_APP_GRACE_POLLS:
+                    return DeployObservation(
+                        outcome="unverified",
+                        team=target.team,
+                        app=target.app,
+                        release_tag=release.tag,
+                        detail=(
+                            f"no ArgoCD application {target.team}/{target.app} after "
+                            f"{polls_without_app} polls"
+                        ),
+                    )
+                await workflow.sleep(DEPLOY_POLL_INTERVAL)
+                continue
+            polls_without_app = 0
             last = status
             # mctl-api resolves no service record — and therefore no image
             # tag — for platform applications such as mctl-api itself.
@@ -774,7 +811,7 @@ class DevLoopWorkflow:
                 # without anything having happened (claude P3). ArgoCD's
                 # own updatedAt is the freshness signal: it must be at
                 # least as new as the release we are waiting for.
-                landed = status.updated_at is not None and status.updated_at >= release.published_at
+                landed = _at_or_after(status.updated_at, release.published_at)
             if landed and status.health == "Healthy" and status.sync_status == "Synced":
                 return DeployObservation(
                     outcome="healthy",
