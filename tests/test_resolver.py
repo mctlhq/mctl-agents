@@ -19,6 +19,7 @@ import pytest
 import yaml
 
 from orchestrator import resolver
+from orchestrator.manifest import PromptSource
 
 # ---------------------------------------------------------------------------
 # Fixture-tree builder
@@ -358,3 +359,18 @@ def test_prompt_hash_changes_when_prompt_source_changes():
     expected = "sha256:" + hashlib.sha256(inspect.getsource(run_issue_investigator._build_prompt).encode()).hexdigest()
     plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="g" * 40))
     assert plan.prompt_hashes == (expected,)
+
+
+def test_hash_prompt_source_fails_closed_on_empty_module_path():
+    """`importlib.import_module("")` raises `ValueError`, not `ImportError` —
+    a malformed `inline:` ref must still raise `ResolverError`, never a raw
+    traceback (module docstring's fail-closed contract)."""
+    with pytest.raises(resolver.ResolverError):
+        resolver._hash_prompt_source(PromptSource(kind="inline", value=":symbol"))
+
+
+def test_hash_prompt_source_fails_closed_on_unretrievable_source():
+    """`inspect.getsource()` on a builtin with no source raises `TypeError`,
+    outside the import/getattr error set — must still raise `ResolverError`."""
+    with pytest.raises(resolver.ResolverError):
+        resolver._hash_prompt_source(PromptSource(kind="inline", value="builtins:len"))

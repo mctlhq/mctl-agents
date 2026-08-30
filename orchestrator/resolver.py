@@ -461,9 +461,10 @@ def _hash_prompt_source(source: PromptSource) -> str:
         try:
             module = importlib.import_module(module_name.replace("/", ".").removesuffix(".py"))
             obj = getattr(module, symbol)
-        except (ImportError, AttributeError) as exc:
+            source_text = inspect.getsource(obj)
+        except (ImportError, AttributeError, ValueError, TypeError, OSError) as exc:
             raise ResolverError(f"prompt source inline ref does not resolve: {source.value} ({exc})") from exc
-        return "sha256:" + hashlib.sha256(inspect.getsource(obj).encode()).hexdigest()
+        return "sha256:" + hashlib.sha256(source_text.encode()).hexdigest()
     raise ResolverError(f"unknown prompt source kind {source.kind!r}")
 
 
