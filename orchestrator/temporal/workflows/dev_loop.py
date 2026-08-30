@@ -46,6 +46,14 @@ from temporalio.exceptions import (
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
+    from orchestrator.temporal.activities.deploy_state import (
+        DeployStatus,
+        DeployTarget,
+        ReleaseInfo,
+        get_deploy_status,
+        get_release_after,
+        resolve_deploy_target,
+    )
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
@@ -131,10 +139,55 @@ PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 SHEPHERD_TICK_EVERY_POLLS = 8
 SHEPHERD_TICKS_MAX = 12
 
+# Stages 6.2/6.3 (ADR-006, #215). After the PR merges, release-please cuts
+# a release on the app repo, that dispatches mctl-gitops release-deploy,
+# which bumps the image tag and ArgoCD auto-syncs within ~30 s. The loop
+# only watches; it never drives any of it.
+#
+# Two separate waits, because they fail for different reasons. A release
+# that never appears means release-please had nothing to release (a
+# docs-only or non-conventional merge) — common, and settled within a few
+# minutes, so a short window. A release that appeared but has not gone
+# Healthy is a real rollout in progress: image build, gitops commit, sync,
+# rollout, probes — minutes, occasionally much longer under a busy runner,
+# so a wider window before giving up as "unverified".
+RELEASE_LOOKUP_DEADLINE = timedelta(minutes=20)
+RELEASE_POLL_INTERVAL = timedelta(minutes=2)
+DEPLOY_VERIFY_DEADLINE = timedelta(minutes=45)
+DEPLOY_POLL_INTERVAL = timedelta(minutes=1)
+DEPLOY_READ_TIMEOUT = timedelta(minutes=2)
+DEPLOY_READ_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
 
 @dataclass(frozen=True)
 class IssueRef:
     issue_url: str
+
+
+@dataclass(frozen=True)
+class DeployObservation:
+    """Outcome of watching this merge's release reach the cluster.
+
+    ``outcome`` is one of:
+
+    - ``healthy``    — the app reports Synced/Healthy on the released tag
+    - ``unverified`` — the deadline passed first; ``detail`` says what the
+      last read showed. NOT a workflow failure: the deploy may still be
+      progressing, and this loop never rolls anything back
+    - ``no-release`` — release-please cut nothing for this merge (docs-only
+      or non-conventional commits); nothing to observe, and not a fault
+    - ``no-target``  — the repo's release deploys no application (it only
+      bumps cluster templates, or has no release-please dispatch)
+    """
+
+    outcome: str
+    team: str | None = None
+    app: str | None = None
+    release_tag: str | None = None
+    image_tag: str | None = None
+    health: str | None = None
+    sync_status: str | None = None
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +206,10 @@ class DevLoopResult:
     # with state="OPEN" means the watch deadline expired with the PR still
     # open (the workflow does not wait forever).
     pr: PRState | None = None
+    # Stages 6.2/6.3 (ADR-006, #215): what happened to the release this
+    # merge produced. None on histories predating the stage and whenever
+    # the PR did not merge. See DeployObservation for the outcomes.
+    deploy: DeployObservation | None = None
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -220,6 +277,22 @@ async def _record(
             agent,
             result.workflow_name,
         )
+
+
+def _is_transient(exc: ActivityError) -> bool:
+    """Is this activity failure a known-transient one, or a bug?
+
+    The read activities wrap every expected failure in
+    ProposalListingError, and an activity timeout is transport by
+    definition. Anything else escaping an activity is an unexpected defect
+    — retrying THAT for the rest of a long deadline would silently mask
+    it, which is the lesson _watch_pr already learned (agy P2, round 3 on
+    #224).
+    """
+    cause = exc.cause
+    return isinstance(cause, TemporalTimeoutError) or (
+        isinstance(cause, ApplicationError) and cause.type == "ProposalListingError"
+    )
 
 
 def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
@@ -434,11 +507,188 @@ class DevLoopWorkflow:
         if workflow.patched("merge-detection") and implement_result.succeeded and slug:
             pr_state = await self._watch_pr(target_repo, slug)
 
+        # Stages 6.2/6.3 (ADR-006, #215): only a merged PR produces a
+        # release to observe. A closed-unmerged or still-open PR ends the
+        # loop here, exactly as before.
+        deploy: DeployObservation | None = None
+        if (
+            workflow.patched("deploy-observation")
+            and pr_state is not None
+            and pr_state.merged
+        ):
+            deploy = await self._observe_deploy(target_repo, pr_state)
+
         return DevLoopResult(
             investigate=investigate_result,
             implement=implement_result,
             approve=approve_result,
             pr=pr_state,
+            deploy=deploy,
+        )
+
+    async def _observe_deploy(self, service: str, pr_state: PRState) -> DeployObservation:
+        """Watch this merge's release land, then verify the rollout (#215).
+
+        Read-only and non-fatal by construction: every unhappy path
+        returns a DeployObservation describing what was seen. implement
+        already succeeded and the PR already merged — an unobserved deploy
+        must not turn that into a failed workflow, and this loop has no
+        rollback to offer (wft-rollback-service stays human-invoked).
+        """
+        repo = pr_state.repo or f"mctlhq/{service}"
+        try:
+            target: DeployTarget | None = await workflow.execute_activity(
+                resolve_deploy_target,
+                args=[repo],
+                start_to_close_timeout=DEPLOY_READ_TIMEOUT,
+                retry_policy=DEPLOY_READ_RETRY_POLICY,
+            )
+        except ActivityError as exc:
+            return DeployObservation(
+                outcome="unverified",
+                detail=f"could not resolve the deploy target for {repo}: {exc.cause!r}",
+            )
+        if target is None:
+            return DeployObservation(
+                outcome="no-target",
+                detail=f"{repo} releases deploy no application",
+            )
+
+        # merged_at is absent on PRStates recorded before the field
+        # existed; the merge commit is still minutes old at worst here, so
+        # anchoring on "now" only risks missing a release cut in the same
+        # instant, which the next poll picks up anyway.
+        after = pr_state.merged_at or workflow.now().isoformat().replace("+00:00", "Z")
+        release, failure = await self._await_release(repo, after)
+        if failure is not None:
+            # A broken read is not the same as nothing being released, and
+            # labelling it no-release would hide a defect behind an
+            # outcome that reads as normal (agy P2).
+            return DeployObservation(
+                outcome="unverified",
+                team=target.team,
+                app=target.app,
+                detail=failure,
+            )
+        if release is None:
+            return DeployObservation(
+                outcome="no-release",
+                team=target.team,
+                app=target.app,
+                detail=f"no release published for {repo} within {RELEASE_LOOKUP_DEADLINE}",
+            )
+        return await self._verify_rollout(target, release)
+
+    async def _await_release(self, repo: str, after: str) -> tuple[ReleaseInfo | None, str | None]:
+        """Poll until release-please publishes a release newer than ``after``.
+
+        Returns (release, failure). A failure string means the lookup
+        itself broke; the caller must not read that as "nothing was
+        released", which is what a bare None would have looked like.
+        """
+        deadline = workflow.now() + RELEASE_LOOKUP_DEADLINE
+        while workflow.now() < deadline:
+            try:
+                release: ReleaseInfo | None = await workflow.execute_activity(
+                    get_release_after,
+                    args=[repo, after],
+                    start_to_close_timeout=DEPLOY_READ_TIMEOUT,
+                    retry_policy=DEPLOY_READ_RETRY_POLICY,
+                )
+            except ActivityError as exc:
+                if not _is_transient(exc):
+                    workflow.logger.warning(
+                        "release lookup for %s failed with a non-transient error — "
+                        "giving up on the release watch: %r",
+                        repo,
+                        exc.cause,
+                    )
+                    return None, f"release lookup failed with a non-transient error: {exc.cause!r}"
+                workflow.logger.warning(
+                    "release lookup failed for %s — retrying next interval: %r", repo, exc.cause
+                )
+                await workflow.sleep(RELEASE_POLL_INTERVAL)
+                continue
+            if release is not None:
+                return release, None
+            await workflow.sleep(RELEASE_POLL_INTERVAL)
+        return None, None
+
+    async def _verify_rollout(self, target: DeployTarget, release: ReleaseInfo) -> DeployObservation:
+        """Wait until the app reports Synced/Healthy on the released tag."""
+        deadline = workflow.now() + DEPLOY_VERIFY_DEADLINE
+        last: DeployStatus | None = None
+        while workflow.now() < deadline:
+            try:
+                status: DeployStatus = await workflow.execute_activity(
+                    get_deploy_status,
+                    args=[target.team, target.app],
+                    start_to_close_timeout=DEPLOY_READ_TIMEOUT,
+                    retry_policy=DEPLOY_READ_RETRY_POLICY,
+                )
+            except ActivityError as exc:
+                if not _is_transient(exc):
+                    return DeployObservation(
+                        outcome="unverified",
+                        team=target.team,
+                        app=target.app,
+                        release_tag=release.tag,
+                        detail=f"deploy status read failed with a non-transient error: {exc.cause!r}",
+                    )
+                workflow.logger.warning(
+                    "deploy status read failed for %s/%s — retrying next interval: %r",
+                    target.team,
+                    target.app,
+                    exc.cause,
+                )
+                await workflow.sleep(DEPLOY_POLL_INTERVAL)
+                continue
+            if not status.found:
+                # The name resolves to no ArgoCD application. Polling it
+                # for 45 minutes would only delay the same answer.
+                return DeployObservation(
+                    outcome="unverified",
+                    team=target.team,
+                    app=target.app,
+                    release_tag=release.tag,
+                    detail=f"no ArgoCD application {target.team}/{target.app}",
+                )
+            last = status
+            # mctl-api resolves no service record — and therefore no image
+            # tag — for platform applications such as mctl-api itself.
+            # Waiting for a tag that will never be reported would make
+            # every such loop time out, so sync+health is the signal there.
+            if status.image_tag is not None:
+                landed = status.image_tag == release.tag
+            else:
+                # No service record, so no tag to compare (mctl-api's own
+                # platform application). Healthy/Synced alone would be
+                # satisfied by the state the app was ALREADY in before this
+                # release synced, so the first poll would report success
+                # without anything having happened (claude P3). ArgoCD's
+                # own updatedAt is the freshness signal: it must be at
+                # least as new as the release we are waiting for.
+                landed = status.updated_at is not None and status.updated_at >= release.published_at
+            if landed and status.health == "Healthy" and status.sync_status == "Synced":
+                return DeployObservation(
+                    outcome="healthy",
+                    team=target.team,
+                    app=target.app,
+                    release_tag=release.tag,
+                    image_tag=status.image_tag,
+                    health=status.health,
+                    sync_status=status.sync_status,
+                )
+            await workflow.sleep(DEPLOY_POLL_INTERVAL)
+        return DeployObservation(
+            outcome="unverified",
+            team=target.team,
+            app=target.app,
+            release_tag=release.tag,
+            image_tag=last.image_tag if last else None,
+            health=last.health if last else None,
+            sync_status=last.sync_status if last else None,
+            detail=f"still not Synced/Healthy on {release.tag} after {DEPLOY_VERIFY_DEADLINE}",
         )
 
     async def _shepherd_tick(self, service: str, slug: str) -> None:

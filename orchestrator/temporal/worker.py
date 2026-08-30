@@ -27,6 +27,11 @@ from temporalio.client import (
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import submit_and_wait
+from orchestrator.temporal.activities.deploy_state import (
+    get_deploy_status,
+    get_release_after,
+    resolve_deploy_target,
+)
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.docs_delta import process_docs_delta_activity
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
@@ -178,6 +183,9 @@ async def main() -> None:
             record_execution,
             find_proposal_slug,
             get_pr_state,
+            resolve_deploy_target,
+            get_release_after,
+            get_deploy_status,
             discover_and_project,
             detect_orphans,
             visibility.list_active_dev_loop_ids,
