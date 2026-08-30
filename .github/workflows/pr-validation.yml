@@ -110,7 +110,13 @@ jobs:
           # anchored allowlist below cannot match. A tests-only PR would
           # then be read as shipping. (Spaces alone are NOT quoted; the
           # trigger is non-ASCII, verified rather than assumed.)
-          if ! FILES=$(git -c core.quotePath=false diff --name-only "${BASE_SHA}...${HEAD_SHA}"); then
+          # --no-renames because rename detection collapses a move into the
+          # DESTINATION path alone: `git mv orchestrator/x.py tests/x.py`
+          # reports just `tests/x.py`, the allowlist sees a tests-only PR,
+          # and the check waves through a change that deletes a file the
+          # image ships. Classifying both endpoints is the whole job here,
+          # so the detection that normally helps a reader hurts.
+          if ! FILES=$(git -c core.quotePath=false diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}"); then
             echo "::error::git diff failed for range ${BASE_SHA}...${HEAD_SHA} — cannot check changed paths."
             exit 1
           fi
