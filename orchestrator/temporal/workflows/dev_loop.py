@@ -586,6 +586,12 @@ class DevLoopWorkflow:
         # Stages 6.2/6.3 (ADR-006, #215): only a merged PR produces a
         # release to observe. A closed-unmerged or still-open PR ends the
         # loop here, exactly as before.
+        # Stage 6.4's window opens HERE, not after the deploy observation:
+        # _observe_deploy can block for over an hour, and a rollout that
+        # breaks the app does it immediately — those incidents fire while
+        # the observation is still running, and a window opened afterwards
+        # would miss exactly the ones worth catching (agy P2).
+        watch_since = workflow.now().isoformat().replace("+00:00", "Z")
         deploy: DeployObservation | None = None
         if (
             workflow.patched("deploy-observation")
@@ -604,7 +610,7 @@ class DevLoopWorkflow:
             and deploy.outcome in ("healthy", "unverified")
             and deploy.app
         ):
-            incidents = await self._watch_incidents(deploy.app)
+            incidents = await self._watch_incidents(deploy.app, watch_since)
 
         return DevLoopResult(
             investigate=investigate_result,
@@ -615,7 +621,7 @@ class DevLoopWorkflow:
             incidents=incidents,
         )
 
-    async def _watch_incidents(self, service: str) -> IncidentWatch:
+    async def _watch_incidents(self, service: str, since: str) -> IncidentWatch:
         """Collect incidents raised against ``service`` during the window.
 
         Observational and terminal: whatever it finds lands in the result
@@ -624,7 +630,6 @@ class DevLoopWorkflow:
         have all already happened, and an incident here is information
         about the platform, not about this loop's success.
         """
-        since = workflow.now().isoformat().replace("+00:00", "Z")
         deadline = workflow.now() + INCIDENT_WATCH_WINDOW
         window_minutes = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
         seen: dict[str, Incident] = {}

@@ -78,6 +78,7 @@ def _fake_activities(
     deploy_status_bug: bool = False,
     incidents: list[Incident] | None = None,
     incident_reads_fail: bool = False,
+    incident_query: dict[str, str] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -155,6 +156,8 @@ def _fake_activities(
 
     @activity.defn(name="list_service_incidents")
     async def fake_list_service_incidents(service: str, since: str) -> IncidentQueryResult:
+        if incident_query is not None:
+            incident_query.setdefault("since", since)
         if incident_reads_fail:
             from temporalio.exceptions import ApplicationError
 
@@ -1321,6 +1324,34 @@ class TestDevLoopWorkflow:
         assert result.incidents.watched is True
         assert result.incidents.service == "mctl-telegram"
         assert result.incidents.incidents == []
+
+    async def test_incident_window_opens_before_the_deploy_observation(self, env):
+        """agy P2: a bad rollout breaks things WHILE the deploy is watched.
+
+        _observe_deploy can block for over an hour. A window opened after
+        it would start past the incidents that rollout caused — exactly
+        the ones this stage exists to surface. The queried `since` must
+        therefore predate the deploy stage, not follow it.
+        """
+        query: dict[str, str] = {}
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            incident_query=query,
+            deploy_statuses=[
+                DeployStatus(found=True, image_tag="9.9.8", health="Progressing", sync_status="Synced"),
+                DeployStatus(found=True, image_tag="9.9.9", health="Healthy", sync_status="Synced"),
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 107)
+
+        assert result.incidents is not None
+        since = query["since"]
+        # The watch reports the same instant it queried from, and that
+        # instant is before the deploy polling consumed its intervals.
+        assert result.incidents.since == since
 
     async def test_incident_watch_deduplicates_across_polls(self, env):
         """An incident firing for the whole window is one finding, not six.
