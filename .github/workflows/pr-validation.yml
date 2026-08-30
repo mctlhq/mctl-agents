@@ -73,6 +73,46 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
+          # A PR that ships nothing has nothing to release, and this check
+          # firing there is not a caught mistake — it is a standing
+          # invitation to retype an honest `test:`/`ci:`/`docs:` commit as
+          # `fix:` purely to clear the check, which cuts a release whose
+          # CHANGELOG entry describes production work that release does not
+          # contain. That is strictly worse than the silent no-release this
+          # job exists to prevent: a wrong entry misleads, a missing one is
+          # merely absent. First hit: #243, a tests-only regression PR for
+          # the #231 concurrency fix.
+          #
+          # Deliberately a tight allowlist rather than "no source files
+          # changed". tests/, docs/ and .github/ are the three trees that
+          # reach neither the built image nor the published package, so
+          # nothing under them can ship unreleased. Anything outside them
+          # still has to justify itself with a releasable commit — including
+          # config/ and entrypoint.sh, which do ship. .github/ has to be in
+          # the list for this very change to pass its own check, which is
+          # the same reasoning, not an exception to it.
+          if ! FILES=$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}"); then
+            echo "::error::git diff failed for range ${BASE_SHA}..${HEAD_SHA} — cannot check changed paths."
+            exit 1
+          fi
+          # An empty diff is not "all paths are allowlisted" — grep -qv finds
+          # no non-matching line on empty input either, so the check below
+          # would pass it for the wrong reason. Say so explicitly instead.
+          if [ -z "$FILES" ]; then
+            echo "This PR changes no files — nothing to release."
+            exit 0
+          fi
+          # `grep -qv` succeeds when at least ONE path falls outside the
+          # allowlist, i.e. the PR does ship something. Inverted here: no
+          # such path means nothing ships. Here-string for the same reason
+          # as the SUBJECTS check below.
+          SHIPPING_PATHS='^(tests/|docs/|\.github/)'
+          if ! grep -qvE "$SHIPPING_PATHS" <<< "$FILES"; then
+            echo "Every changed path is under tests/, docs/ or .github/ — this PR ships nothing:"
+            sed 's/^/  · /' <<< "$FILES"
+            echo "Skipping the releasable-commit requirement."
+            exit 0
+          fi
           # Same type set release-please's default config treats as
           # releasable (bumps minor/patch, gets a CHANGELOG entry): feat/fix,
           # plus perf and revert which it also bumps by default.
