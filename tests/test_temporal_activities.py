@@ -1158,3 +1158,12 @@ class TestListServiceIncidents:
         self._handler(monkeypatch, {"items": [{"id": "alert-1", "title": "x"}], "count": 1})
         result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
         assert result.truncated is False
+
+    async def test_a_numeric_id_is_kept_not_dropped(self, env, monkeypatch):
+        """Dropping an alert because its id was an int would report a clean
+        window while it was firing — the one lie this stage must not tell."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(monkeypatch, {"items": [{"id": 4242, "title": "x"}], "count": 1})
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert [i.id for i in result.incidents] == ["4242"]

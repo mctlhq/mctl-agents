@@ -91,14 +91,17 @@ async def list_service_incidents(service: str, since: str) -> IncidentQueryResul
         # than the first truthy one: an `id` arriving as a non-string
         # (an int, say) would otherwise shadow a perfectly good
         # fingerprint and silently drop the incident (claude P3).
-        incident_id = next(
-            (
-                value
-                for value in (item.get("id"), item.get("fingerprint"))
-                if isinstance(value, str) and value
-            ),
-            None,
-        )
+        candidates = (item.get("id"), item.get("fingerprint"))
+        incident_id = next((v for v in candidates if isinstance(v, str) and v), None)
+        if incident_id is None:
+            # An int id (a database key) is still a usable identifier.
+            # Dropping the incident because its id was not a string would
+            # report a clean window while an alert was firing — the one
+            # outcome this stage must never produce (agy P2).
+            incident_id = next(
+                (str(v) for v in candidates if isinstance(v, int | float) and not isinstance(v, bool)),
+                None,
+            )
         if incident_id is None:
             continue
         incidents.append(

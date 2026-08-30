@@ -631,7 +631,14 @@ class DevLoopWorkflow:
         about the platform, not about this loop's success.
         """
         deadline = workflow.now() + INCIDENT_WATCH_WINDOW
-        window_minutes = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
+        # Derived, not the constant: `since` predates the deploy
+        # observation, which can add an hour of its own, so reporting a
+        # flat 30 would understate the span these incidents were drawn
+        # from (claude P2).
+        try:
+            window_minutes = int((deadline - _as_utc(since)).total_seconds() // 60)
+        except (ValueError, TypeError):
+            window_minutes = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
         seen: dict[str, Incident] = {}
         truncated = False
         detail: str | None = None

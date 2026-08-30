@@ -24,6 +24,7 @@ from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows.dev_loop import (
+    INCIDENT_WATCH_WINDOW,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
     DevLoopWorkflow,
@@ -1348,10 +1349,15 @@ class TestDevLoopWorkflow:
             result = await self._run_to_completion(env, activities, investigate_ran, 107)
 
         assert result.incidents is not None
-        since = query["since"]
-        # The watch reports the same instant it queried from, and that
-        # instant is before the deploy polling consumed its intervals.
-        assert result.incidents.since == since
+        assert result.incidents.since == query["since"]
+        # The real assertion: the reported window spans MORE than
+        # INCIDENT_WATCH_WINDOW, which is only possible if `since` was
+        # taken before the deploy stage consumed its poll intervals.
+        # Comparing since to itself would hold no matter when it was
+        # captured — the earlier version of this test did exactly that
+        # and would not have caught a revert (claude P2).
+        flat_window = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
+        assert result.incidents.window_minutes > flat_window
 
     async def test_incident_watch_deduplicates_across_polls(self, env):
         """An incident firing for the whole window is one finding, not six.
