@@ -35,13 +35,22 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
     once and pass that ``Client`` in, instead of reconnecting to the
     Temporal frontend once per issue.
 
-    id_reuse_policy=REJECT_DUPLICATE + id_conflict_policy=USE_EXISTING makes
-    a repeated start against an issue with a currently-RUNNING workflow a
-    true no-op (returns the existing run). A prior CLOSED run for the same
-    issue instead raises temporalio.exceptions.WorkflowAlreadyStartedError —
-    callers that may see a re-added label on an already-completed issue
-    (i.e. the poller) must catch that and treat it as "already handled",
-    not a bug.
+    id_conflict_policy=USE_EXISTING makes a repeated start against an issue
+    with a currently-RUNNING workflow a true no-op (returns the existing
+    run). A prior SUCCEEDED run for the same issue instead raises
+    temporalio.exceptions.WorkflowAlreadyStartedError — callers that may see
+    a re-added label on an already-completed issue (i.e. the poller) must
+    catch that and treat it as "already handled", not a bug.
+
+    ALLOW_DUPLICATE_FAILED_ONLY, not REJECT_DUPLICATE: a FAILED run must
+    stay restartable. The A4 registry gate (#241) fails the loop
+    non-retryably when an agent has no pinned image, and its own message
+    tells the operator to publish, promote and retry — under
+    REJECT_DUPLICATE that instruction was impossible to follow, because
+    the same issue could never be started again without an out-of-band
+    Temporal reset (codex P1 on #241). The same trap applied to every
+    other terminal failure; only a run that actually completed is "already
+    handled".
     """
     if client is None:
         client = await connect()
@@ -50,6 +59,6 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
         IssueRef(issue_url=issue_url),
         id=workflow_id_for(issue_url),
         task_queue=TASK_QUEUE,
-        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )

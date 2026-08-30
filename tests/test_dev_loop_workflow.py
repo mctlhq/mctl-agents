@@ -289,6 +289,33 @@ class TestDevLoopWorkflow:
         assert seen_params["mctl-agents-approve"]["service"] == "mctl-telegram"
         assert seen_params["mctl-agents-approve"]["slug"] == "issue-42-fake-title"
 
+    async def test_failed_investigate_never_implements(self, env):
+        """A Failed investigate short-circuits before implement.
+
+        Unrelated to the A4 gate (every agent resolves here) — it guards
+        the `if not investigate_result.succeeded: return` branch. Restored
+        after review caught it being dropped as collateral of the A4
+        rewrite rather than deliberately (claude P2 on #241).
+        """
+        activities, calls, _investigate_ran = _fake_activities(released=True, investigate_phase="Failed")
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/2"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            result = await handle.result()
+
+        assert result.investigate.phase == "Failed"
+        assert result.implement is None
+        assert calls == ["mctl-agents-investigate"]
+
     async def test_a_release_without_an_image_is_fatal(self, env):
         """A version row exists but yields no pullable image.
 
@@ -334,10 +361,10 @@ class TestDevLoopWorkflow:
                 id=f"dev-loop-test-{uuid.uuid4()}",
                 task_queue=TASK_QUEUE,
             )
-            with pytest.raises(Exception) as caught:
+            with pytest.raises(WorkflowFailureError) as caught:
                 await handle.result()
 
-        assert "issue-investigator" in str(caught.value.cause)  # type: ignore[attr-defined]
+        assert "issue-investigator" in str(caught.value.cause)
 
     async def test_unregistered_agent_fails_the_loop(self, env):
         """A4 (#220 follow-up): the CWFT-default fallback is retired.
@@ -381,10 +408,101 @@ class TestDevLoopWorkflow:
                 id=f"dev-loop-test-{uuid.uuid4()}",
                 task_queue=TASK_QUEUE,
             )
-            with pytest.raises(Exception) as caught:
+            with pytest.raises(WorkflowFailureError) as caught:
                 await handle.result()
 
-        assert "issue-investigator" in str(caught.value.cause)  # type: ignore[attr-defined]
+        assert "issue-investigator" in str(caught.value.cause)
+
+    async def _run_with_gate(self, env, *, unpinned: str, issue: int):
+        """Drive a loop where exactly ``unpinned`` has no released image.
+
+        Every other agent resolves, so the gate is the only thing that can
+        fail the workflow — and the call site under test is the one that
+        reaches ``unpinned`` first.
+        """
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            if agent == unpinned:
+                return None
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
+
+        calls: list[str] = []
+        investigate_ran = anyio.Event()
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            calls.append(input.operation)
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        activities = [
+            fake_resolve_agent_release,
+            fake_submit_and_wait,
+            fake_record_execution,
+            _fake_find_proposal_slug,
+        ]
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with pytest.raises(WorkflowFailureError) as caught:
+                await handle.result()
+        return calls, caught
+
+    async def test_the_implementer_gate_fires_after_the_approval_is_durable(self, env):
+        """The operationally sharpest call site (claude P2 on #241).
+
+        By the time the implementer is resolved, mctl-agents-approve has
+        already flipped this proposal to `accepted` as a gitops commit —
+        so this gate fails AFTER a durable side effect, leaving an
+        accepted proposal that never implements. That is the intended
+        trade-off (fail loud beats running an unknown image), and the
+        recovery path is real: the start policy is
+        ALLOW_DUPLICATE_FAILED_ONLY, so re-adding the intake label after
+        publishing the release restarts the issue, and the approve CWFT is
+        a no-op on an already-accepted proposal. Asserted here so the
+        ordering is not silently reversed later.
+        """
+        calls, caught = await self._run_with_gate(env, unpinned="implementer", issue=5)
+
+        assert "implementer" in str(caught.value.cause)
+        # The flip ran and the implement did not: the exact window this
+        # trade-off accepts.
+        assert calls == ["mctl-agents-investigate", "mctl-agents-approve"]
+
+    async def test_the_shepherd_gate_fires_before_the_loop_claims_ownership(self, env):
+        """codex P1 on #241: a swallowed gate would starve the proposal.
+
+        _shepherd_tick runs as a background task and deliberately logs its
+        failures instead of raising, so a missing shepherd pin discovered
+        in there would vanish — while the loop kept answering
+        shepherd_in_loop=True and the cron sweeper kept standing down. The
+        proposal would then get no shepherd at all for the full 14-day
+        watch. The gate therefore runs at the start of the watch, before
+        the claim.
+        """
+        calls, caught = await self._run_with_gate(env, unpinned="shepherd", issue=6)
+
+        assert "shepherd" in str(caught.value.cause)
+        # Failed before claiming: no tick ran, and the sweeper is free to
+        # pick the proposal up as unowned.
+        assert "mctl-agents-shepherd" not in calls
 
     async def test_persistent_record_execution_failure_does_not_fail_workflow(self, env):
         """record_execution is an audit-trail write, not the real work — a

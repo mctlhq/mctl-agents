@@ -18,10 +18,12 @@ Pipeline for one poll cycle:
           a misconfiguration the operator should see.
        b. Start (or attach to) that issue's DevLoopWorkflow. Temporal's own
           workflow-ID dedup (`dev-loop-{owner}-{repo}-{issue}`,
-          REJECT_DUPLICATE + USE_EXISTING) makes a repeated start against an
-          already-RUNNING workflow a true no-op; a prior CLOSED run for the
-          same issue is treated as "already handled" (see
-          ``WorkflowAlreadyStartedError`` handling below), not a failure.
+          ALLOW_DUPLICATE_FAILED_ONLY + USE_EXISTING) makes a repeated start
+          against an already-RUNNING workflow a true no-op; a prior SUCCEEDED
+          run for the same issue is treated as "already handled" (see
+          ``WorkflowAlreadyStartedError`` handling below), not a failure. A
+          prior FAILED run starts fresh, so a re-added label is the retry
+          affordance after the cause is fixed.
        c. Remove the label so the next cycle does not re-scan an issue
           already handed off to the pipeline.
        d. On error, leave the label so the next cycle retries.
@@ -225,10 +227,12 @@ async def poll(
             handle = await start_dev_loop_workflow(ref.url, client=client)
         except WorkflowAlreadyStartedError:
             # A prior DevLoopWorkflow for this issue already ran to
-            # completion (REJECT_DUPLICATE rejects id-reuse against a
-            # CLOSED run) — this issue has already been handled by the
-            # pipeline once; a re-added label is not a new request. Not a
-            # failure: drop the label like any other handled issue.
+            # SUCCESSFUL completion (ALLOW_DUPLICATE_FAILED_ONLY rejects
+            # id-reuse only against a run that succeeded) — this issue has
+            # been handled by the pipeline once; a re-added label is not a
+            # new request. Not a failure: drop the label like any other
+            # handled issue. A failed run does NOT land here: it restarts,
+            # which is how an operator retries after fixing the cause.
             print(f"OK (already handled): {workflow_id_for(ref.url)} already ran to completion")
         except Exception as e:  # noqa: BLE001 — surfaced as a per-issue failure, label kept for retry
             print(f"FAIL: could not start workflow for {ref.url}: {e} — label kept for retry")
@@ -245,8 +249,8 @@ async def poll(
             # The workflow IS started, but the label is still on the issue —
             # so the next cycle re-dispatches it (harmless no-op via
             # id_conflict_policy=USE_EXISTING while it's running, but noisy,
-            # and once it completes REJECT_DUPLICATE turns every subsequent
-            # cycle into a logged failure). Count it as a failure so a broken
+            # and once it succeeds ALLOW_DUPLICATE_FAILED_ONLY turns every
+            # subsequent cycle into a logged failure). Count it as a failure so a broken
             # label-write permission surfaces instead of silently repeating.
             print(
                 f"FAIL: workflow started but '{label}' label removal failed "

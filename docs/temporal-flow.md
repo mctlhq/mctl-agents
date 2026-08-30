@@ -20,7 +20,7 @@ flowchart TB
 
     subgraph TMP["Temporal · ns=mctl-agents · queue=mctl-dev-loop"]
         direction TB
-        DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>REJECT_DUPLICATE + USE_EXISTING"]
+        DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>ALLOW_DUPLICATE_FAILED_ONLY + USE_EXISTING"]
         REC["ReconcileWorkflow<br/>schedule 15m"]
         ISS["IssuePollWorkflow<br/>schedule 12h"]
         INC["IncidentLoopWorkflow<br/>schedule 1h · создаётся paused (#179)"]

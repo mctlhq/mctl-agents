@@ -237,9 +237,10 @@ def test_poll_success_removes_label(monkeypatch):
 
 
 def test_poll_already_started_still_removes_label(monkeypatch):
-    """A prior DevLoopWorkflow for this issue already ran to completion
-    (REJECT_DUPLICATE rejects id-reuse against a CLOSED run) — treated as
-    already-handled, not a failure, and the label is still dropped."""
+    """A prior DevLoopWorkflow for this issue already ran to SUCCESSFUL
+    completion (ALLOW_DUPLICATE_FAILED_ONLY rejects id-reuse only against a
+    succeeded run) — treated as already-handled, not a failure, and the
+    label is still dropped."""
     ref = _ref(number=7)
     monkeypatch.setattr(run_issue_poller, "search_labeled_issues", lambda label: [ref])
     monkeypatch.setattr(run_issue_poller, "start_dev_loop_workflow", _start_already_started)

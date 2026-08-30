@@ -295,6 +295,20 @@ def _is_transient(exc: ActivityError) -> bool:
     )
 
 
+async def _require_release_async(agent: str) -> ResolvedRelease | None:
+    """Resolve ``agent`` and gate it, or do nothing at all when unpatched.
+
+    The patch check has to come BEFORE the resolve, not after: histories
+    recorded before this marker replay command-for-command, and an
+    unconditional activity here would be a command in a position they
+    never recorded. Unpatched executions therefore skip the lookup
+    entirely and keep their old behaviour.
+    """
+    if not workflow.patched("registry-required"):
+        return None
+    return _require_release(agent, await _resolve(agent))
+
+
 def _require_release(agent: str, release: ResolvedRelease | None) -> ResolvedRelease | None:
     """Enforce that ``agent`` resolves to a pinned image, once patched (A4).
 
@@ -502,10 +516,14 @@ class DevLoopWorkflow:
             # durable: _resolve can fail permanently (registry outage
             # outlasting its five retries), and if that happened before the
             # flip, the operator's approval would evaporate with the failed
-            # workflow — and the REJECT_DUPLICATE start policy would turn a
-            # transient outage into a permanently stuck issue (codex P1 on
-            # PR #212). Pre-atomic-approve histories already resolved above,
-            # in their recorded position.
+            # workflow (codex P1 on PR #212). The reverse case — the gate
+            # below failing AFTER the flip — leaves an accepted proposal
+            # that never implements; recovery is to publish the missing
+            # release and re-add the intake label, which restarts this
+            # issue now that the start policy is
+            # ALLOW_DUPLICATE_FAILED_ONLY, and the approve CWFT is a no-op
+            # on an already-accepted proposal. Pre-atomic-approve histories
+            # already resolved above, in their recorded position.
             implementer_release = _require_release("implementer", await _resolve("implementer"))
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
@@ -753,6 +771,19 @@ class DevLoopWorkflow:
                 slug,
                 exc.cause,
             )
+        except ApplicationError as exc:
+            if exc.type != "AgentReleaseMissing":
+                raise
+            # The watch gated this before claiming ownership, so getting
+            # here means the pin disappeared mid-watch (a rollback that
+            # unpublished the row). Not fatal at this point: the loop is
+            # already the owner, and tearing it down would abandon merge
+            # detection for a PR that is open and being reviewed. Skip the
+            # tick loudly instead — the next boundary retries, and the
+            # message says which agent to republish.
+            workflow.logger.error(
+                "in-loop shepherd tick for %s/%s skipped: %s", service, slug, exc.message
+            )
         except Exception as exc:  # noqa: BLE001 — a bug in the tick must not sink silently
             # Running as a task means an escaping exception is stored on
             # the task instead of raised: nothing would surface it, and
@@ -820,6 +851,18 @@ class DevLoopWorkflow:
         # the watch starts, not at the first tick 4 h later: between those
         # two points this execution IS the owner, and the cron must already
         # be standing down.
+        if shepherd_in_loop:
+            # Gate the shepherd's registry pin HERE, before this execution
+            # claims ownership — not at the first tick 4 h later (codex P1,
+            # claude P2 on #241). _shepherd_tick runs as a background task
+            # whose exceptions it deliberately swallows, so a missing pin
+            # raised in there would be logged and dropped: the loop would
+            # keep reporting shepherd_in_loop=True, the sweeper would keep
+            # standing down, and the PR would go the full 14 days with no
+            # shepherd at all. Failing before the claim inverts that — the
+            # workflow stops, shepherd_in_loop stays False, and the cron
+            # sweeper picks the proposal up as unowned.
+            await _require_release_async("shepherd")
         self._shepherd_in_loop = shepherd_in_loop
         # #231: run the tick concurrently so polling continues while it
         # runs. Awaiting it inline stalled merge detection for the tick's
