@@ -104,7 +104,13 @@ jobs:
           # (`git log base..head` below stays two-dot: for COMMITS that
           # already means "reachable from head but not base", which is the
           # right set. Same-looking syntax, different semantics.)
-          if ! FILES=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}"); then
+          # core.quotePath=false because git escapes non-ASCII paths by
+          # default — `tests/данные.json` comes back as
+          # "tests/\320\264..." , leading double-quote included, which the
+          # anchored allowlist below cannot match. A tests-only PR would
+          # then be read as shipping. (Spaces alone are NOT quoted; the
+          # trigger is non-ASCII, verified rather than assumed.)
+          if ! FILES=$(git -c core.quotePath=false diff --name-only "${BASE_SHA}...${HEAD_SHA}"); then
             echo "::error::git diff failed for range ${BASE_SHA}...${HEAD_SHA} — cannot check changed paths."
             exit 1
           fi
@@ -129,7 +135,13 @@ jobs:
           # Same type set release-please's default config treats as
           # releasable (bumps minor/patch, gets a CHANGELOG entry): feat/fix,
           # plus perf and revert which it also bumps by default.
-          PATTERN='^(feat|fix|perf|revert)(\([^)]+\))?!?:'
+          # Trailing space is load-bearing: Conventional Commits requires it
+          # after the colon, and release-please's parser will not read
+          # `fix:typo` as a commit at all — it would skip exactly the commit
+          # this check just certified as releasable, which is the silent
+          # no-release this job exists to catch. `!` stays optional so
+          # `fix!: x` and `fix(scope)!: x` still match.
+          PATTERN='^(feat|fix|perf|revert)(\([^)]+\))?!?: '
           # Capture git log's own exit status explicitly rather than via a
           # process substitution feeding the loop below — under `set -e` a
           # failure inside `< <(...)` is not propagated to the script, so an
