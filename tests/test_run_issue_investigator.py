@@ -477,8 +477,10 @@ def _investigate_harness(tmp_path, monkeypatch, *, agent, number=7, title="Some 
         body="Body text",
         state="OPEN",
     )
+    # _clone_repo returns the WRAPPER; the checkout is <wrapper>/repo, and
+    # the wrapper is what investigate() deletes.
     clone_dir = tmp_path / "clone"
-    clone_dir.mkdir(exist_ok=True)
+    (clone_dir / "repo").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: issue)
     monkeypatch.setattr(run_issue_investigator, "_clone_repo", lambda repo, slug: clone_dir)
     monkeypatch.setattr(run_issue_investigator, "_run_agent", agent)
@@ -522,12 +524,13 @@ def test_a_previous_runs_files_do_not_count_as_this_runs_output(tmp_path, monkey
     assert (first.proposal_dir / ".status.yaml").is_file()
 
 
-def test_a_rewrite_with_the_same_content_is_not_reported_as_missing(tmp_path, monkeypatch):
-    """Content, not mtime — but a byte-identical rewrite IS indistinguishable.
+def test_an_identical_rewrite_is_accepted(tmp_path, monkeypatch):
+    """A re-investigation that reproduces the same documents is a success.
 
-    Pins the documented trade-off rather than leaving it to be rediscovered:
-    an agent that regenerates all three files identically is reported as
-    having written nothing, which for this check is the same thing.
+    The first attempt at this check compared content hashes across the run
+    and therefore reported a byte-identical rewrite as "the agent wrote
+    nothing" — a contradiction that clearing the directory first removes
+    (agy P2 on #247).
     """
     def same_agent(repo_dir, prompt, proposal_dir):
         for name in ("requirements.md", "design.md", "tasks.md"):
@@ -535,10 +538,38 @@ def test_a_rewrite_with_the_same_content_is_not_reported_as_missing(tmp_path, mo
 
     issue = _investigate_harness(tmp_path, monkeypatch, agent=same_agent, number=8)
     assert investigate(issue.ref.url, state_dir=tmp_path).error is None
+    assert investigate(issue.ref.url, state_dir=tmp_path).error is None
 
+
+def test_a_partial_overwrite_restores_the_previous_proposal(tmp_path, monkeypatch):
+    """A crash mid-write must leave the old proposal exactly as it was.
+
+    This is the case a compare-after-the-fact check could not handle at
+    all: an agent that rewrites one document and then dies on a rate limit
+    leaves the directory permanently half-new, and the existing rollback
+    skips a directory it did not create. Holding the bytes is what makes
+    clearing the directory safe.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=9,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"good {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    def crashing_agent(repo_dir, prompt, proposal_dir):
+        (proposal_dir / "requirements.md").write_text("HALF-WRITTEN")
+        raise RateLimitExhaustedError("SDK reported api_error_status=429: boom")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", crashing_agent)
     second = investigate(issue.ref.url, state_dir=tmp_path)
-    assert second.error is not None
-    assert "requirements.md" in second.error
+
+    assert second.rate_limited is True
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        assert (first.proposal_dir / name).read_text() == f"good {name}"
 
 
 def test_investigate_sets_rate_limited_on_429(tmp_path, monkeypatch):
