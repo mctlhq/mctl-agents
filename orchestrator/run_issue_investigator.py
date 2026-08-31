@@ -764,9 +764,15 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
+    # Not in dry-run: it resolves the issue and the slug and stops before
+    # the agent, so requiring Claude credentials to do that would break the
+    # one mode whose whole point is to work without them — and the --dry-run
+    # help text already promises as much (agy P2 on #248). Same guard as
+    # run_shepherd.main().
+    if not args.dry_run:
+        from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
 
-    ensure_auth_for_sdk()
+        ensure_auth_for_sdk()
 
     try:
         result = investigate(

@@ -642,3 +642,29 @@ def test_neutralize_prompt_tags_strips_forged_delimiters():
     # Legit angle-bracket content is untouched.
     assert _neutralize_prompt_tags("List<Map<String, Object>> x") == "List<Map<String, Object>> x"
     assert _neutralize_prompt_tags(None if False else "") == ""
+
+
+def test_investigator_dry_run_skips_sdk_auth(tmp_path, monkeypatch, capsys):
+    """`--dry-run` resolves the issue and slug and stops before the agent.
+
+    So it must run where there are no Claude credentials at all — an ops
+    check asking "which proposal would this issue land in?" should not
+    need an API key, and the --dry-run help text promises it does not
+    (agy P2 on #248).
+    """
+    issue = _issue(number=11, title="Some feature")
+    monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: issue)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_issue_investigator", "--issue-url", issue.ref.url,
+         "--state-dir", str(tmp_path), "--dry-run"],
+    )
+
+    def _explode() -> None:
+        raise AssertionError("dry-run must not require SDK credentials")
+
+    monkeypatch.setattr("orchestrator.auth.ensure_auth_for_sdk", _explode)
+
+    run_issue_investigator.main()
+
+    assert "dry-run" in capsys.readouterr().out
