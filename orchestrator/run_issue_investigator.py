@@ -734,8 +734,17 @@ def investigate(
                     ),
                 )
 
+            # Directories too, not just files: a proposal can hold an
+            # images/ or assets/ folder a human added. Copying only files
+            # left those out of staging, and the swap then destroyed them
+            # with the aside copy — silent data loss on re-investigation
+            # (agy P2 on #247).
             for kept in proposal_dir.iterdir():
-                if kept.is_file() and not (staging / kept.name).exists():
+                if (staging / kept.name).exists():
+                    continue
+                if kept.is_dir():
+                    shutil.copytree(kept, staging / kept.name)
+                else:
                     shutil.copy2(kept, staging / kept.name)
 
         #    Rename the live proposal aside, move staging into its place,

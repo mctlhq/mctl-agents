@@ -966,3 +966,40 @@ def test_an_approval_landing_mid_run_is_not_overwritten(tmp_path, monkeypatch):
     assert yaml.safe_load(status_path.read_text())["status"] == "accepted"
     assert (first.proposal_dir / "design.md").read_text() == "v1 design.md"
     assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []
+
+
+def test_a_subdirectory_in_the_proposal_survives_the_swap(tmp_path, monkeypatch):
+    """Carrying forward only files loses whole folders.
+
+    A proposal can hold an images/ or assets/ directory someone added by
+    hand. Left out of staging, it went away with the aside copy the moment
+    the swap succeeded — permanent loss, on an ordinary re-investigation
+    (agy P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=27,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    assets = first.proposal_dir / "assets"
+    (assets / "nested").mkdir(parents=True)
+    (assets / "diagram.svg").write_text("<svg/>")
+    (assets / "nested" / "note.txt").write_text("deep")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    assert (assets / "diagram.svg").read_text() == "<svg/>"
+    assert (assets / "nested" / "note.txt").read_text() == "deep"
+    assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
