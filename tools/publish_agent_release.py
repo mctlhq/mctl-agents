@@ -23,7 +23,12 @@ forward by hand, which makes it useless for detecting prompt drift — the
 one thing it is for. This defines the hash instead:
 
     sha256 over each prompt source, in sorted order by its identifier,
-    as "<identifier>\\n<file bytes>" concatenated.
+    as length-prefixed "<len>\\n<identifier><len>\\n<file bytes>" pairs.
+
+The length prefixes are what make the encoding unambiguous: plain
+concatenation lets text move between one source's content and the next
+source's identifier without changing the digest, so two different prompt
+surfaces could hash equal and the drift would go unreported.
 
 An `inline: path.py:function` source hashes the whole file it names — the
 function boundary is not something this can parse reliably, and a change
@@ -202,13 +207,33 @@ def prompt_hash(manifest: dict[str, Any], agent: str, tag: str, tree: list[str])
 
     digest = hashlib.sha256()
     for identifier, relpath in sorted(entries, key=lambda e: e[0]):
-        digest.update(identifier.encode())
-        digest.update(b"\n")
+        # Length-prefixed, not newline-separated. Concatenating
+        # "<identifier>\n<content>" with no bound between one entry's
+        # content and the next entry's identifier makes the encoding
+        # ambiguous: moving text out of one declared file and into
+        # another's identifier can reproduce the exact same digest across
+        # genuinely different prompt surfaces (agy P2). Prefixing each
+        # part with its length makes the parse unique.
+        identifier_bytes = identifier.encode()
+        digest.update(f"{len(identifier_bytes)}\n".encode())
+        digest.update(identifier_bytes)
         if relpath is None:
+            digest.update(b"-\n")
             continue
+        if relpath not in tree:
+            # `git show <tag>:<dir>` prints a DIRECTORY LISTING and exits
+            # 0, so a manifest naming a directory would hash its file
+            # names while every edit inside it went unnoticed — drift
+            # detection reporting "unchanged" for changed prompts (agy
+            # P2). `tree` comes from `git ls-tree -r` without -t, so it
+            # contains blobs only: membership is the blob check.
+            raise PublishError(
+                f"{agent}: prompt source {identifier} is not a file in {tag}'s tree"
+            )
         content = _read_at_tag(tag, relpath)
         if content is None:
             raise PublishError(f"{agent}: prompt source {identifier} is not in {tag}'s tree")
+        digest.update(f"{len(content)}\n".encode())
         digest.update(content)
     return f"sha256:{digest.hexdigest()}"
 
@@ -301,8 +326,14 @@ def main() -> int:
     # The set of agents comes from the tag too, not from the working copy:
     # a manifest added after the release must not be published as part of it.
     manifest_prefix = str(MANIFEST_DIR.relative_to(REPO_ROOT)) + "/"
+    # Anchored on agent.yaml, not on "anything under _manifests/": a
+    # README or OWNERS dropped in that directory would otherwise be read
+    # as an agent name and fail the release looking for its manifest
+    # (agy P3).
     in_tag = sorted(
-        {p[len(manifest_prefix):].split("/", 1)[0] for p in tree if p.startswith(manifest_prefix)}
+        p[len(manifest_prefix):].split("/", 1)[0]
+        for p in tree
+        if p.startswith(manifest_prefix) and p.endswith("/agent.yaml")
     )
     agents = args.agent or in_tag
     unknown = [a for a in agents if a not in in_tag]
@@ -319,8 +350,14 @@ def main() -> int:
         try:
             if not publish(agent, args.version, git_sha, tree, dry_run=args.dry_run):
                 failed.append(agent)
-        except (PublishError, httpx.HTTPError) as exc:
-            print(f"  ERROR {agent}: {exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 — isolation is the point
+            # Deliberately every exception, not just PublishError/HTTPError:
+            # a malformed manifest reaches this loop as yaml.YAMLError, or
+            # TypeError from json.dumps on a datetime, or AttributeError on
+            # an empty document — and each of those aborted the whole run,
+            # which is exactly the half-published registry this isolation
+            # exists to prevent (agy P2). The run still fails below.
+            print(f"  ERROR {agent}: {exc!r}", file=sys.stderr)
             failed.append(agent)
     if failed:
         print(f"failed: {', '.join(failed)}", file=sys.stderr)

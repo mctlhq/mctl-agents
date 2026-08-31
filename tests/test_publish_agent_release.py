@@ -100,12 +100,17 @@ class TestPromptHash:
         assert sorted(reads) == ["agents/a/CLAUDE.md", "agents/b/CLAUDE.md"]
 
     def test_a_missing_source_is_fatal_not_a_short_hash(self, monkeypatch):
+        """A source the tag does not carry must stop the publish.
+
+        Skipping it would produce a shorter digest that compares equal
+        across genuinely different prompt surfaces.
+        """
         monkeypatch.setattr(publish_agent_release, "_read_at_tag", lambda tag, relpath: None)
         with pytest.raises(publish_agent_release.PublishError) as caught:
             publish_agent_release.prompt_hash(
                 self._manifest([{"inline": "orchestrator/gone.py:build"}]), "x", "1.0.0", []
             )
-        assert "not in 1.0.0's tree" in str(caught.value)
+        assert "1.0.0's tree" in str(caught.value)
 
     def test_a_glob_matching_nothing_still_contributes_the_pattern(self, monkeypatch):
         """Otherwise the hash would not change when the first file appears."""
@@ -117,6 +122,48 @@ class TestPromptHash:
             self._manifest([{"glob": "agents/[!_]*/different.md"}]), "x", "1.0.0", []
         )
         assert empty != other
+
+    def test_a_directory_source_is_refused_not_hashed_as_a_listing(self, monkeypatch):
+        """agy P2: `git show <tag>:<dir>` prints a listing and exits 0.
+
+        Hashing that listing would make the digest track file NAMES in the
+        directory while every edit to their contents went unnoticed —
+        drift detection reporting "unchanged" for a changed prompt, which
+        is worse than no hash at all.
+        """
+        monkeypatch.setattr(
+            publish_agent_release, "_read_at_tag", lambda tag, relpath: b"a.md\nb.md\n"
+        )
+        with pytest.raises(publish_agent_release.PublishError) as caught:
+            publish_agent_release.prompt_hash(
+                self._manifest([{"file": "agents/mctl-api/context"}]),
+                "x",
+                "1.0.0",
+                ["agents/mctl-api/context/a.md"],  # ls-tree -r: blobs only
+            )
+        assert "is not a file" in str(caught.value)
+
+    def test_moving_text_between_identifier_and_content_changes_the_hash(self, monkeypatch):
+        """agy P2: the encoding must be unambiguous.
+
+        Without length prefixes, "<identifier>\\n<content>" concatenation
+        lets one surface be re-cut into a different one with the same
+        byte stream — equal digests for genuinely different prompts.
+        """
+        files = {
+            "a/one.md": b"XY",
+            "a/oneXY.md": b"",
+        }
+        monkeypatch.setattr(
+            publish_agent_release, "_read_at_tag", lambda tag, relpath: files[relpath]
+        )
+        first = publish_agent_release.prompt_hash(
+            self._manifest([{"file": "a/one.md"}]), "x", "1.0.0", ["a/one.md"]
+        )
+        second = publish_agent_release.prompt_hash(
+            self._manifest([{"file": "a/oneXY.md"}]), "x", "1.0.0", ["a/oneXY.md"]
+        )
+        assert first != second
 
     def test_a_manifest_without_sources_is_refused(self):
         with pytest.raises(publish_agent_release.PublishError):
@@ -176,6 +223,45 @@ class TestPerAgentIsolation:
         )
         assert published == ["beta", "gamma"]
         assert code == 1
+
+    def test_a_malformed_manifest_is_isolated_like_any_other_failure(self, monkeypatch, capsys):
+        """agy P2: PublishError/HTTPError were not the only ways to fail.
+
+        Invalid YAML, a datetime json.dumps refuses, or an empty document
+        each reached the loop as a plain exception and aborted the whole
+        run — abandoning the remaining agents half-published, which is the
+        exact state this isolation exists to prevent.
+        """
+        published: list[str] = []
+        code = self._run(
+            monkeypatch, capsys, published, {"beta": TypeError("Object of type datetime is not JSON serializable")}
+        )
+        assert published == ["alpha", "gamma"]
+        assert code == 1
+
+    def test_a_stray_file_in_the_manifests_dir_is_not_an_agent(self, monkeypatch, capsys):
+        """agy P3: a README dropped beside the manifests is not a release
+        failure. Agent names come from agent.yaml paths, not from anything
+        that happens to sit under _manifests/."""
+        monkeypatch.setattr(publish_agent_release, "_git", lambda *a: "cafe1234cafe")
+        monkeypatch.setattr(
+            publish_agent_release,
+            "_tree_paths",
+            lambda tag: [
+                "agents/_manifests/README.md",
+                "agents/_manifests/alpha/agent.yaml",
+            ],
+        )
+        seen: list[str] = []
+
+        def fake_publish(agent, version, git_sha, tree, *, dry_run):
+            seen.append(agent)
+            return True
+
+        monkeypatch.setattr(publish_agent_release, "publish", fake_publish)
+        monkeypatch.setattr(sys, "argv", ["publish_agent_release.py", "1.33.0"])
+        assert publish_agent_release.main() == 0
+        assert seen == ["alpha"]
 
     def test_a_v_prefixed_tag_is_refused(self, monkeypatch, capsys):
         """This org's tags carry no v prefix; a v-tag means a caller bug,
