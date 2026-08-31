@@ -383,6 +383,67 @@ def _is_transient(exc: ActivityError) -> bool:
     )
 
 
+async def _shepherd_is_pinned() -> bool:
+    """Does the shepherd resolve to a pullable image right now?
+
+    A question, not a gate: unlike the investigator and implementer, a
+    missing shepherd pin must not fail the loop (see _watch_pr). Answers
+    True when unpatched, so histories recorded before this marker keep
+    their behaviour — the patch check comes BEFORE the resolve because
+    they replay command-for-command, and an unconditional activity here
+    would be a command in a position they never recorded.
+
+    A registry outage answers False rather than propagating: this runs
+    inside the watch, i.e. after implement already succeeded, and letting
+    an ActivityError out here would fail the whole loop over a read — the
+    exact fail-open breach this function was written to avoid (agy P2).
+    Declining is also the safe direction, since the cron sweeper picks up
+    any proposal the loop does not claim.
+    """
+    if not workflow.patched("registry-required"):
+        return True
+    try:
+        release = await _resolve("shepherd")
+    except ActivityError as exc:
+        workflow.logger.warning(
+            "could not resolve the shepherd release (%r) — declining the "
+            "in-loop claim and leaving it to the cron sweeper",
+            exc.cause,
+        )
+        return False
+    return release is not None and bool(release.image_ref)
+
+
+def _require_release(agent: str, release: ResolvedRelease | None) -> ResolvedRelease | None:
+    """Enforce that ``agent`` resolves to a pinned image, once patched (A4).
+
+    Until now an unresolvable agent silently fell back to whatever image
+    the ClusterWorkflowTemplate had baked in — the phase-5 compatibility
+    shim, which existed because the registry was not yet authoritative.
+    It is now: every manifest is published and promoted by the release
+    pipeline (tools/publish_agent_release.py), so a missing row is a real
+    misconfiguration and running an unknown image instead of saying so
+    defeats the point of pinning.
+
+    The check lives here, not in resolve_agent_release: the activity's
+    signature and return value must stay identical for histories recorded
+    before this marker, and changing what it raises would break their
+    replay just as surely as changing its arity would (the lesson from
+    #223).
+    """
+    if not workflow.patched("registry-required"):
+        return release
+    if release is None or not release.image_ref:
+        raise ApplicationError(
+            f"no released image for {agent} in {ENVIRONMENT} — the agent registry must "
+            "pin every agent this loop runs; publish and promote it "
+            "(tools/publish_agent_release.py) and retry",
+            type="AgentReleaseMissing",
+            non_retryable=True,
+        )
+    return release
+
+
 def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
     """Retrieve a finished tick's exception so it is never swallowed.
 
@@ -447,7 +508,9 @@ class DevLoopWorkflow:
         # Pin the investigator version ONCE, at the start of this step. A
         # later promote/rollback in the registry must not retroactively
         # change what an in-flight (or replayed) workflow already ran.
-        investigator_release = await _resolve("issue-investigator")
+        investigator_release = _require_release(
+            "issue-investigator", await _resolve("issue-investigator")
+        )
         investigate_params = {"issue_url": issue.issue_url}
         if investigator_release and investigator_release.image_ref:
             investigate_params["agent_image"] = investigator_release.image_ref
@@ -504,7 +567,7 @@ class DevLoopWorkflow:
         if not atomic_approve:
             # Legacy position: pre-atomic-approve histories resolved the
             # implementer before the slug lookup — keep their command order.
-            implementer_release = await _resolve("implementer")
+            implementer_release = _require_release("implementer", await _resolve("implementer"))
         if workflow.patched("slug-scoped-implement"):
             issue_number = parse_issue_url(issue.issue_url).number
             slug = await workflow.execute_activity(
@@ -558,11 +621,21 @@ class DevLoopWorkflow:
             # durable: _resolve can fail permanently (registry outage
             # outlasting its five retries), and if that happened before the
             # flip, the operator's approval would evaporate with the failed
-            # workflow — and the REJECT_DUPLICATE start policy would turn a
-            # transient outage into a permanently stuck issue (codex P1 on
-            # PR #212). Pre-atomic-approve histories already resolved above,
+            # workflow (codex P1 on PR #212). The reverse case — the gate
+            # below failing AFTER the flip — leaves an accepted proposal
+            # that never implements. Recovery is to publish the missing
+            # release and re-add the intake label: ALLOW_DUPLICATE_FAILED_ONLY
+            # lets the issue start again, and the approve CWFT is a no-op on
+            # an already-accepted proposal. It is a restart, not a resume —
+            # the new run re-investigates and waits for a fresh approve
+            # signal, and if the issue TITLE changed in between, the
+            # investigator derives a different slug and find_proposal_slug
+            # then refuses the ambiguous issue-<N>-* match (codex P2). Both
+            # are acceptable for a misconfiguration that should not happen
+            # once every release refreshes the registry, and neither is
+            # silent. Pre-atomic-approve histories already resolved above,
             # in their recorded position.
-            implementer_release = await _resolve("implementer")
+            implementer_release = _require_release("implementer", await _resolve("implementer"))
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
         # declaring this `service` parameter and threading it to
@@ -889,7 +962,7 @@ class DevLoopWorkflow:
             # DevLoop-owned proposals would silently run the CWFT's
             # baked-in default while cron-driven ones ran the intended
             # release.
-            shepherd_release = await _resolve("shepherd")
+            shepherd_release = _require_release("shepherd", await _resolve("shepherd"))
             tick_params = {"service": service, "slug": slug}
             if shepherd_release and shepherd_release.image_ref:
                 tick_params["agent_image"] = shepherd_release.image_ref
@@ -903,6 +976,19 @@ class DevLoopWorkflow:
                 service,
                 slug,
                 exc.cause,
+            )
+        except ApplicationError as exc:
+            if exc.type != "AgentReleaseMissing":
+                raise
+            # The watch gated this before claiming ownership, so getting
+            # here means the pin disappeared mid-watch (a rollback that
+            # unpublished the row). Not fatal at this point: the loop is
+            # already the owner, and tearing it down would abandon merge
+            # detection for a PR that is open and being reviewed. Skip the
+            # tick loudly instead — the next boundary retries, and the
+            # message says which agent to republish.
+            workflow.logger.error(
+                "in-loop shepherd tick for %s/%s skipped: %s", service, slug, exc.message
             )
         except Exception as exc:  # noqa: BLE001 — a bug in the tick must not sink silently
             # Running as a task means an escaping exception is stored on
@@ -971,6 +1057,27 @@ class DevLoopWorkflow:
         # the watch starts, not at the first tick 4 h later: between those
         # two points this execution IS the owner, and the cron must already
         # be standing down.
+        if shepherd_in_loop and not await _shepherd_is_pinned():
+            # Decline the claim rather than fail (round 2 on #241). The
+            # first fix raised here, which failed the whole workflow after
+            # investigate, approve and implement had all succeeded —
+            # contradicting this function's own fail-open contract and
+            # throwing away merge detection and deploy observation over a
+            # tick that is an optimisation, not correctness. But it cannot
+            # simply be left to _shepherd_tick either: that runs as a
+            # background task whose exceptions it swallows, so the loop
+            # would keep answering shepherd_in_loop=True while the sweeper
+            # stood down and nothing shepherded the PR for 14 days (codex
+            # P1, claude P2). Declining gives the same protection with no
+            # loss: nothing runs unpinned, and the cron sweeper picks the
+            # proposal up exactly as it did before #213.
+            workflow.logger.warning(
+                "no released shepherd image — %s/%s keeps watching but leaves "
+                "shepherding to the cron sweeper",
+                service,
+                slug,
+            )
+            shepherd_in_loop = False
         self._shepherd_in_loop = shepherd_in_loop
         # #231: run the tick concurrently so polling continues while it
         # runs. Awaiting it inline stalled merge detection for the tick's
@@ -1005,11 +1112,7 @@ class DevLoopWorkflow:
                     # instead; implement already succeeded, so the loop's
                     # outcome must still not become a workflow failure.
                     cause = exc.cause
-                    transient = isinstance(cause, TemporalTimeoutError) or (
-                        isinstance(cause, ApplicationError)
-                        and cause.type == "ProposalListingError"
-                    )
-                    if not transient:
+                    if not _is_transient(exc):
                         workflow.logger.warning(
                             "get_pr_state failed with a non-transient error for "
                             "%s/%s — ending the merge watch with the last "

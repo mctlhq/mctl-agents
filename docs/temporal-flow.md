@@ -20,7 +20,7 @@ flowchart TB
 
     subgraph TMP["Temporal · ns=mctl-agents · queue=mctl-dev-loop"]
         direction TB
-        DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>REJECT_DUPLICATE + USE_EXISTING"]
+        DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>ALLOW_DUPLICATE_FAILED_ONLY + USE_EXISTING"]
         REC["ReconcileWorkflow<br/>schedule 15m"]
         ISS["IssuePollWorkflow<br/>schedule 12h"]
         INC["IncidentLoopWorkflow<br/>schedule 1h · создаётся paused (#179)"]
@@ -86,7 +86,7 @@ sequenceDiagram
 
     OP->>T: start(IssueRef) id=dev-loop-{owner}-{repo}-{N}
     T->>R: resolve("issue-investigator", production)
-    R-->>T: ResolvedRelease | None (None → дефолтный образ CWFT)
+    R-->>T: ResolvedRelease (None → воркфлоу падает, A4 #241)
     T->>S: submit_and_wait("mctl-agents-investigate", {issue_url, agent_image?, agent_version?})
     S->>A: POST /operations/.../execute
     A-->>S: workflowName
