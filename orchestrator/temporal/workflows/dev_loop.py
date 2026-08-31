@@ -304,10 +304,25 @@ async def _shepherd_is_pinned() -> bool:
     their behaviour — the patch check comes BEFORE the resolve because
     they replay command-for-command, and an unconditional activity here
     would be a command in a position they never recorded.
+
+    A registry outage answers False rather than propagating: this runs
+    inside the watch, i.e. after implement already succeeded, and letting
+    an ActivityError out here would fail the whole loop over a read — the
+    exact fail-open breach this function was written to avoid (agy P2).
+    Declining is also the safe direction, since the cron sweeper picks up
+    any proposal the loop does not claim.
     """
     if not workflow.patched("registry-required"):
         return True
-    release = await _resolve("shepherd")
+    try:
+        release = await _resolve("shepherd")
+    except ActivityError as exc:
+        workflow.logger.warning(
+            "could not resolve the shepherd release (%r) — declining the "
+            "in-loop claim and leaving it to the cron sweeper",
+            exc.cause,
+        )
+        return False
     return release is not None and bool(release.image_ref)
 
 
@@ -914,11 +929,7 @@ class DevLoopWorkflow:
                     # instead; implement already succeeded, so the loop's
                     # outcome must still not become a workflow failure.
                     cause = exc.cause
-                    transient = isinstance(cause, TemporalTimeoutError) or (
-                        isinstance(cause, ApplicationError)
-                        and cause.type == "ProposalListingError"
-                    )
-                    if not transient:
+                    if not _is_transient(exc):
                         workflow.logger.warning(
                             "get_pr_state failed with a non-transient error for "
                             "%s/%s — ending the merge watch with the last "

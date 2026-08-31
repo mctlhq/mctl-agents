@@ -14,6 +14,7 @@ import anyio
 import pytest
 from temporalio import activity
 from temporalio.client import WorkflowFailureError
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
@@ -76,6 +77,7 @@ def _fake_activities(
     release_lookup_bug: bool = False,
     deploy_status_bug: bool = False,
     unpinned: set[str] | None = None,
+    resolve_unavailable: set[str] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -97,6 +99,12 @@ def _fake_activities(
 
     @activity.defn(name="resolve_agent_release")
     async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+        if agent in (resolve_unavailable or set()):
+            # A registry read that fails outright, as opposed to one that
+            # answers "no release" — the two must not share a code path.
+            raise ApplicationError(
+                "registry unreachable", type="RegistryUnavailable", non_retryable=True
+            )
         if agent in (unpinned or set()):
             return None
         return resolved.get(agent) if released else None
@@ -536,6 +544,47 @@ class TestDevLoopWorkflow:
         assert "mctl-agents-shepherd" not in calls
         # ...and the sweeper is told the proposal is unowned, which is the
         # only thing standing between it and a PR nobody shepherds.
+        assert owned is False
+
+    async def test_a_registry_outage_at_the_gate_declines_rather_than_raises(self, env):
+        """The gate reads the registry — the read itself must stay fail-open.
+
+        Companion to the test above, and the case that fix missed: there
+        the registry answers "no release", here it does not answer at
+        all. An unguarded await would let the ActivityError out of
+        _shepherd_is_pinned and fail a loop whose implement had already
+        succeeded — reintroducing, through the read, exactly the breach
+        the decline was written to close (agy P2 on #241).
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True,
+            resolve_unavailable={"shepherd"},
+            pr_states=[open_pr, open_pr, MERGED_PR],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/7"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+            owned = await handle.query(DevLoopWorkflow.shepherd_in_loop)
+
+        assert result.implement is not None and result.pr is not None
+        assert "mctl-agents-shepherd" not in calls
         assert owned is False
 
     async def test_persistent_record_execution_failure_does_not_fail_workflow(self, env):
