@@ -323,8 +323,18 @@ def _clone_repo(full_repo: str, slug: str) -> Path:
     only this process can enter.
     """
     wrapper = Path(tempfile.mkdtemp(prefix=f"investigate-{slug}-"))
-    # Shallow — the investigator only reads the current tree, never history.
-    _run(["gh", "repo", "clone", full_repo, str(wrapper / "repo"), "--", "--depth=1"])
+    try:
+        # Shallow — the investigator only reads the current tree, never history.
+        _run(["gh", "repo", "clone", full_repo, str(wrapper / "repo"), "--", "--depth=1"])
+    except BaseException:
+        # The wrapper exists BEFORE the clone is attempted, unlike the old
+        # path which git itself created — so a clone that fails (auth,
+        # rate limit, network) never returns, the caller's `clone` stays
+        # None, and its cleanup has nothing to remove. One orphaned 0700
+        # directory per failed attempt is an unbounded leak in a poller
+        # that retries across many issues.
+        shutil.rmtree(wrapper, ignore_errors=True)
+        raise
     return wrapper
 
 
@@ -672,11 +682,16 @@ def investigate(
                 service, slug, proposal_dir,
                 error=f"agent did not write: {', '.join(missing)}",
             )
-        triplet_written = True
 
         # 5. Write .status.yaml (status: proposed + source block). After this
         # the proposal is complete and durable on disk.
         write_status_yaml(proposal_dir, issue)
+        # Only now is the replacement complete. Setting this at the triplet
+        # check instead would strand a proposal whose new documents landed
+        # but whose .status.yaml write then failed: the restore would be
+        # skipped and the new docs left paired with the old status (codex
+        # P2 on #247).
+        triplet_written = True
 
         # 6. Link the proposal back to the issue. A failure here (e.g. the
         # token lacks `issues: write`) must NOT mark the investigation as

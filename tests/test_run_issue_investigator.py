@@ -7,6 +7,7 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 """
 from __future__ import annotations
 
+import subprocess
 import types
 
 import anyio
@@ -642,3 +643,57 @@ def test_neutralize_prompt_tags_strips_forged_delimiters():
     # Legit angle-bracket content is untouched.
     assert _neutralize_prompt_tags("List<Map<String, Object>> x") == "List<Map<String, Object>> x"
     assert _neutralize_prompt_tags(None if False else "") == ""
+
+
+def test_a_failed_clone_leaves_no_temp_directory_behind(tmp_path, monkeypatch):
+    """The wrapper now exists before the clone is attempted, so a failure
+    must clean it up — otherwise a poller retrying across many issues
+    leaks one 0700 directory per attempt, which the old path (created by
+    git itself) never did."""
+    monkeypatch.setattr(run_issue_investigator.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    def failing_run(cmd, cwd=None, check=True):
+        raise subprocess.CalledProcessError(1, cmd, stderr="auth failed")
+
+    monkeypatch.setattr(run_issue_investigator, "_run", failing_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        run_issue_investigator._clone_repo("mctlhq/mctl-telegram", "issue-7-x")
+
+    assert list(tmp_path.glob("investigate-*")) == []
+
+
+def test_a_failed_status_write_restores_the_previous_proposal(tmp_path, monkeypatch):
+    """The replacement is complete only once .status.yaml is durable.
+
+    Marking success at the triplet check instead would strand a proposal
+    whose new documents landed but whose status write then failed — the
+    restore skipped, new docs paired with the old status.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=12,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"good {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"new {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+
+    def failing_write(proposal_dir, issue_data):
+        raise OSError("read-only .status.yaml")
+
+    monkeypatch.setattr(run_issue_investigator, "write_status_yaml", failing_write)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        assert (first.proposal_dir / name).read_text() == f"good {name}"
