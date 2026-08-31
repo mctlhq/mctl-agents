@@ -1003,3 +1003,72 @@ def test_a_subdirectory_in_the_proposal_survives_the_swap(tmp_path, monkeypatch)
     assert (assets / "diagram.svg").read_text() == "<svg/>"
     assert (assets / "nested" / "note.txt").read_text() == "deep"
     assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
+
+
+def test_the_agent_writing_into_a_folder_does_not_wipe_the_rest_of_it(
+    tmp_path, monkeypatch
+):
+    """A per-name existence check hides a per-leaf loss.
+
+    Carrying a directory forward only when staging has no entry of that
+    name treats the folder as one opaque object. Let the agent write a
+    single new file into assets/ and staging/assets exists — so the old
+    assets/ was skipped whole, and the swap deleted every hand-added file
+    in it while the folder itself appeared to survive (agy P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=28,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    assets = first.proposal_dir / "assets"
+    (assets / "deep").mkdir(parents=True)
+    (assets / "architecture.png").write_text("by hand")
+    (assets / "deep" / "kept.txt").write_text("also by hand")
+
+    def _agent_touches_assets(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v2 {name}")
+        (proposal_dir / "assets" / "deep").mkdir(parents=True)
+        (proposal_dir / "assets" / "new_model.md").write_text("fresh")
+        (proposal_dir / "assets" / "deep" / "new_leaf.txt").write_text("fresh leaf")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", _agent_touches_assets)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    # The agent's own output survives...
+    assert (assets / "new_model.md").read_text() == "fresh"
+    assert (assets / "deep" / "new_leaf.txt").read_text() == "fresh leaf"
+    # ...and so does everything it never touched, at both depths.
+    assert (assets / "architecture.png").read_text() == "by hand"
+    assert (assets / "deep" / "kept.txt").read_text() == "also by hand"
+
+
+def test_the_agent_wins_a_collision_with_a_carried_forward_name(tmp_path, monkeypatch):
+    """Carry-forward preserves what the run did not touch, never overrules it."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=29,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("stale")
+
+    def _agent_rewrites_notes(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v2 {name}")
+        (proposal_dir / "notes.md").write_text("rewritten")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", _agent_rewrites_notes)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    assert (first.proposal_dir / "notes.md").read_text() == "rewritten"

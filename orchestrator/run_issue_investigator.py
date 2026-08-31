@@ -211,6 +211,40 @@ def _staging_dir(proposal_dir: Path) -> Path:
     return Path(tempfile.mkdtemp(dir=service_dir, prefix=".staging-"))
 
 
+def _carry_forward(live: Path, staging: Path) -> None:
+    """Merge whatever the agent did NOT rewrite from ``live`` into ``staging``.
+
+    Recursive, because the swap that follows replaces the proposal
+    directory wholesale: anything missing from staging when the rename
+    happens is destroyed along with the aside copy. A proposal can hold an
+    ``assets/`` or ``images/`` folder someone added by hand, and those
+    have to survive an ordinary re-investigation.
+
+    A top-level ``if (staging / name).exists(): continue`` was not enough
+    for directories, which is the subtle half: it treats a directory as a
+    single opaque name, so the agent writing ONE file into ``assets/``
+    made ``staging/assets`` exist and skipped carrying the rest of the old
+    ``assets/`` — deleting every human-added file in it while the folder
+    appeared to survive (agy P2 on #247). Recursing means the check is
+    per-leaf, so the agent's fresh file and the old siblings coexist.
+
+    Staging always wins a collision, including a type collision (old
+    directory, new file of the same name, or the reverse): staging holds
+    this run's output, and carry-forward exists to preserve what the run
+    did not touch, never to overrule what it did.
+    """
+    for kept in live.iterdir():
+        target = staging / kept.name
+        if kept.is_dir() and target.is_dir():
+            _carry_forward(kept, target)
+        elif target.exists():
+            continue
+        elif kept.is_dir():
+            shutil.copytree(kept, target)
+        else:
+            shutil.copy2(kept, target)
+
+
 class ProposalAmbiguityError(RuntimeError):
     """One issue owns more than one proposal directory.
 
@@ -734,18 +768,7 @@ def investigate(
                     ),
                 )
 
-            # Directories too, not just files: a proposal can hold an
-            # images/ or assets/ folder a human added. Copying only files
-            # left those out of staging, and the swap then destroyed them
-            # with the aside copy — silent data loss on re-investigation
-            # (agy P2 on #247).
-            for kept in proposal_dir.iterdir():
-                if (staging / kept.name).exists():
-                    continue
-                if kept.is_dir():
-                    shutil.copytree(kept, staging / kept.name)
-                else:
-                    shutil.copy2(kept, staging / kept.name)
+            _carry_forward(proposal_dir, staging)
 
         #    Rename the live proposal aside, move staging into its place,
         #    and put the original back if that second rename fails. Two
