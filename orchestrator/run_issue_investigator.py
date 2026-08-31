@@ -40,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -187,6 +188,37 @@ def build_slug(issue_number: int, title: str) -> str:
     return f"issue-{issue_number}-{slugify(title)}"
 
 
+TRIPLET = ("requirements.md", "design.md", "tasks.md")
+
+
+def _triplet_fingerprint(proposal_dir: Path) -> dict[str, str | None]:
+    """Content hash of each triplet file, or None where it is absent.
+
+    Content rather than mtime: a coarse filesystem timestamp can be equal
+    across a fast rewrite, which would report a file the agent really did
+    write as stale. A rewrite with byte-identical content is indeed
+    indistinguishable from no write at all — and is also, for this
+    purpose, the same thing.
+    """
+    out: dict[str, str | None] = {}
+    for name in TRIPLET:
+        path = proposal_dir / name
+        out[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return out
+
+
+class ProposalAmbiguityError(RuntimeError):
+    """One issue owns more than one proposal directory.
+
+    A RuntimeError rather than SystemExit: `investigate` is a library
+    function whose contract is to RETURN an InvestigateResult, and this is
+    raised before its try block, so a SystemExit here would leave the
+    process-exit decision to a caller that may not be a CLI at all (agy P2
+    on #247). main() still exits cleanly — it converts this to SystemExit
+    at the actual process boundary.
+    """
+
+
 def existing_slugs(proposals_dir: Path, issue_number: int) -> list[str]:
     """Every proposal directory already claimed by this issue number.
 
@@ -218,7 +250,7 @@ def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
     """
     matches = existing_slugs(proposals_dir, issue_number)
     if len(matches) > 1:
-        raise SystemExit(
+        raise ProposalAmbiguityError(
             f"issue #{issue_number} already has {len(matches)} proposal dirs "
             f"({', '.join(matches)}) — refusing to guess which one is real; "
             "remove the stale one from gitops first"
@@ -255,10 +287,14 @@ def _load_status(path: Path) -> dict:
 
 def _clone_repo(full_repo: str, slug: str) -> Path:
     """Read-only `gh repo clone` of the target repo to a fresh tmp dir."""
-    ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
-    target = Path(tempfile.gettempdir()) / f"investigate-{slug}-{ts}"
-    if target.exists():
-        shutil.rmtree(target)
+    # mkdtemp, not a hand-built predictable path: the old
+    # /tmp/investigate-<slug>-<timestamp> was guessable, and anything
+    # sharing /tmp could pre-create it as a symlink or file so the
+    # rmtree below died with NotADirectoryError (agy P2 on #247).
+    # mkdtemp creates the directory atomically, 0700, with a random
+    # suffix — nothing to collide with and nothing to clean up first.
+    target = Path(tempfile.mkdtemp(prefix=f"investigate-{slug}-"))
+    target.rmdir()  # gh repo clone insists on a non-existent destination
     # Shallow — the investigator only reads the current tree, never history.
     _run(["gh", "repo", "clone", full_repo, str(target), "--", "--depth=1"])
     return target
@@ -587,6 +623,14 @@ def investigate(
     # `proposed` proposal). If it did NOT, a failure path must roll it back
     # so a half-written orphan is never committed to gitops main.
     proposal_preexisted = proposal_dir.exists()
+    # Fingerprint the triplet BEFORE the agent runs. Re-investigation now
+    # reuses the directory (#246), so a file left by a PREVIOUS run would
+    # otherwise satisfy the "did the agent write it?" check below and a
+    # proposal assembled from two different runs would be committed as if
+    # it were coherent (agy P2 on #247). Deleting the files up front is the
+    # obvious fix and the wrong one: an agent failure would then destroy a
+    # good proposal that the rollback below deliberately preserves.
+    before = _triplet_fingerprint(proposal_dir)
     clone = None
     try:
         # 1. Read-only clone so the agent can ground the design in real code.
@@ -599,10 +643,13 @@ def investigate(
         prompt = _build_prompt(issue, service, slug)
         anyio.run(_run_agent, clone, prompt, proposal_dir.resolve())
 
-        # 4. Verify the agent produced the triplet.
+        # 4. Verify THIS run produced the triplet — not merely that the
+        #    files exist, which a previous run's leftovers would also
+        #    satisfy on a reused directory.
+        after = _triplet_fingerprint(proposal_dir)
         missing = [
-            name for name in ("requirements.md", "design.md", "tasks.md")
-            if not (proposal_dir / name).is_file()
+            name for name in TRIPLET
+            if after.get(name) is None or after[name] == before.get(name)
         ]
         if missing:
             return InvestigateResult(
@@ -691,11 +738,16 @@ def main() -> None:
 
     ensure_auth_for_sdk()
 
-    result = investigate(
-        issue_url=args.issue_url,
-        state_dir=Path(args.state_dir),
-        dry_run=args.dry_run,
-    )
+    try:
+        result = investigate(
+            issue_url=args.issue_url,
+            state_dir=Path(args.state_dir),
+            dry_run=args.dry_run,
+        )
+    except ProposalAmbiguityError as exc:
+        # The process boundary is where a clean exit belongs — the library
+        # function itself only raises (see ProposalAmbiguityError).
+        raise SystemExit(str(exc)) from None
 
     print("\n=== Investigate summary ===")
     if result.error:

@@ -23,6 +23,7 @@ from orchestrator.run_implementer import (
 from orchestrator.run_issue_investigator import (
     IssueData,
     IssueRef,
+    ProposalAmbiguityError,
     RateLimitExhaustedError,
     build_slug,
     gh_issue_view,
@@ -160,7 +161,7 @@ def test_two_dirs_for_one_issue_is_refused_not_guessed(tmp_path):
     (proposals / "issue-7-old-title").mkdir(parents=True)
     (proposals / "issue-7-new-title").mkdir(parents=True)
 
-    with pytest.raises(SystemExit) as excinfo:
+    with pytest.raises(ProposalAmbiguityError) as excinfo:
         resolve_slug(proposals, 7, "whatever")
 
     message = str(excinfo.value)
@@ -465,6 +466,79 @@ def test_run_agent_failed_mcp_warns_but_still_dispatches(tmp_path, monkeypatch, 
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
     assert "boom" in capsys.readouterr().err
+
+
+def _investigate_harness(tmp_path, monkeypatch, *, agent, number=7, title="Some feature"):
+    """Drive investigate() with a stubbed clone and a caller-supplied agent."""
+    issue = IssueData(
+        ref=IssueRef(owner="mctlhq", repo="mctl-telegram", number=number,
+                     url=f"https://github.com/mctlhq/mctl-telegram/issues/{number}"),
+        title=title,
+        body="Body text",
+        state="OPEN",
+    )
+    clone_dir = tmp_path / "clone"
+    clone_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: issue)
+    monkeypatch.setattr(run_issue_investigator, "_clone_repo", lambda repo, slug: clone_dir)
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", agent)
+    monkeypatch.setattr(run_issue_investigator.anyio, "run", lambda fn, *a: fn(*a))
+    monkeypatch.setattr(run_issue_investigator, "post_proposal_comment", lambda *a, **k: None)
+    return issue
+
+
+def test_a_previous_runs_files_do_not_count_as_this_runs_output(tmp_path, monkeypatch):
+    """The staleness hole a reused proposal directory opened (#247, agy P2).
+
+    Re-investigation now writes into the directory the first run created.
+    A mere existence check would then be satisfied by whatever the FIRST
+    run left there — so an agent that produced only two of the three docs
+    would look successful, and a proposal stitched together from two
+    different runs would be committed as if it were coherent.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"run one {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    # Second run: the agent writes two of the three. tasks.md survives from
+    # run one, and must NOT be accepted as this run's work.
+    def partial_agent(repo_dir, prompt, proposal_dir):
+        (proposal_dir / "requirements.md").write_text("run two requirements")
+        (proposal_dir / "design.md").write_text("run two design")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", partial_agent)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert "tasks.md" in second.error
+    # The good proposal from run one is preserved — the rollback deliberately
+    # spares a directory it did not create.
+    assert (first.proposal_dir / ".status.yaml").is_file()
+
+
+def test_a_rewrite_with_the_same_content_is_not_reported_as_missing(tmp_path, monkeypatch):
+    """Content, not mtime — but a byte-identical rewrite IS indistinguishable.
+
+    Pins the documented trade-off rather than leaving it to be rediscovered:
+    an agent that regenerates all three files identically is reported as
+    having written nothing, which for this check is the same thing.
+    """
+    def same_agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"identical {name}")
+
+    issue = _investigate_harness(tmp_path, monkeypatch, agent=same_agent, number=8)
+    assert investigate(issue.ref.url, state_dir=tmp_path).error is None
+
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+    assert second.error is not None
+    assert "requirements.md" in second.error
 
 
 def test_investigate_sets_rate_limited_on_429(tmp_path, monkeypatch):
