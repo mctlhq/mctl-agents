@@ -91,7 +91,17 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
     except ScheduleAlreadyRunningError:
         pass
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not register Temporal schedule %s: %s", schedule_id, exc)
+        # Deliberately not fatal — see the test in test_worker_schedules.py.
+        # ERROR, not WARNING: the concern this swallow trades away is a
+        # worker that comes up healthy and never registers reconcile or
+        # intake for its whole lifetime (agy P2 on #249). Riding out a blip
+        # is worth it; doing so quietly is not.
+        logger.error(
+            "Temporal schedule %s NOT registered (%s) — this worker is "
+            "serving its task queue but its schedules are not current",
+            schedule_id,
+            exc,
+        )
         return
 
     converged = False
@@ -121,7 +131,12 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         else:
             logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not converge Temporal schedule %s: %s", schedule_id, exc)
+        logger.error(
+            "Temporal schedule %s NOT converged (%s) — its live spec may "
+            "differ from the one declared here",
+            schedule_id,
+            exc,
+        )
 
 
 async def setup_schedules(client: Client) -> None:
@@ -206,7 +221,7 @@ def owns_schedules(role: str) -> bool:
     existing spec in place, that lie would actively overwrite the truth.
 
     A named function rather than an inline check in main(), for the same
-    reason worker_plan exists: main() needs a live Temporal client, so
+    reason worker_plans exists: main() needs a live Temporal client, so
     anything decided inside it is untestable (claude P3 on #249).
     """
     return role in ("all", "control")

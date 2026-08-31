@@ -7,7 +7,7 @@ half that ships now — that `--role all` is byte-for-byte the old
 behaviour, and that the two new roles register the right things on the
 right queues.
 
-These assert on `worker_plan`, the pure function that decides the layout,
+These assert on `worker_plans`, the pure function that decides the layout,
 rather than on a constructed `Worker`. That is not a convenience: a real
 Worker insists on a live bridge client and dials on construction, so the
 routing decision is only unit-testable once it is separated from the
