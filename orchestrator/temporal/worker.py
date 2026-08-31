@@ -15,7 +15,6 @@ import logging
 import os
 import signal
 from collections.abc import Callable
-from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -356,26 +355,30 @@ async def main() -> None:
 
 
 async def run_until_signalled(workers: list[Worker]) -> None:
-    """Run every worker until SIGTERM/SIGINT, then drain them all.
+    """Run every worker until SIGTERM/SIGINT or a worker dies, then drain.
 
-    The Python SDK does NOT install signal handlers (unlike some of the
-    other Temporal SDKs — `add_signal_handler` appears nowhere in
-    temporalio), so until now SIGTERM hit Python's default and killed the
-    process outright: no drain, in-flight activities cut mid-flight. That
-    was already true of the single worker; it just becomes more visible
-    with two, and a queue split whose whole point is rollouts should not
-    leave rollouts ungraceful (raised as a P1 by agy on #249, on a
-    premise about SDK-installed handlers that does not hold — the gap is
-    real, the mechanism described was not).
+    The Python SDK installs no signal handlers (unlike some of the other
+    Temporal SDKs — `add_signal_handler` appears nowhere in temporalio),
+    so SIGTERM used to hit Python's default and end the process outright:
+    no drain, in-flight activities cut mid-flight. That was already true
+    of the single worker; a queue split whose whole purpose is rollouts
+    should not leave rollouts ungraceful.
 
-    Entering each worker as an async context manager is what STARTS it:
-    Worker.__aenter__ is documented as "a wrapper around run()" and
-    schedules self.run() as a task, and __aexit__ awaits shutdown(). So
-    every worker polls, and every worker drains — not just one. (Reviewed
-    as a P1 on the claim that Worker implements no context-manager
-    protocol and that this would start nothing; it does, and
-    test_worker_roles.py pins that contract so an SDK upgrade cannot
-    quietly break it.)
+    A worker that dies on its own must still take the process down. The
+    pre-split code got that for free from a bare `await worker.run()`. Two
+    workers make it something that has to be arranged: if only the control
+    worker's poll loop dies — a dropped connection, an auth failure — the
+    execution worker keeps the process alive and looking healthy while
+    reconcile, intake and every DevLoop go dark, with nothing to restart
+    because nothing crashed. So the shutdown signal is RACED against the
+    run tasks and a worker's failure is re-raised (claude P1 / codex P1 on
+    #249).
+
+    Explicit tasks rather than `async with`: the SDK's context manager
+    does propagate a fatal error, but by cancelling whichever task entered
+    it, which is subtle enough under AsyncExitStack that a reader cannot
+    check it locally. `run()` plus `shutdown()` is the SDK's own
+    documented pair and says what it does.
     """
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -385,11 +388,23 @@ async def run_until_signalled(workers: list[Worker]) -> None:
         except NotImplementedError:  # pragma: no cover — non-POSIX only
             pass
 
-    async with AsyncExitStack() as stack:
-        for worker in workers:
-            await stack.enter_async_context(worker)
-        await shutdown.wait()
-        logger.info("shutdown signal received; draining %d worker(s)", len(workers))
+    run_tasks = [asyncio.create_task(worker.run()) for worker in workers]
+    signal_task = asyncio.create_task(shutdown.wait())
+    try:
+        await asyncio.wait([*run_tasks, signal_task], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        signal_task.cancel()
+
+    logger.info("draining %d worker(s)", len(workers))
+    # shutdown() is safe to call repeatedly and on a worker that already
+    # stopped, so this needs no bookkeeping about which one finished first.
+    await asyncio.gather(*(worker.shutdown() for worker in workers), return_exceptions=True)
+    results = await asyncio.gather(*run_tasks, return_exceptions=True)
+
+    for result in results:
+        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+            raise result
+
 
 
 if __name__ == "__main__":

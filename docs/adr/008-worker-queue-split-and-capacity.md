@@ -137,13 +137,18 @@ histories that record the patch, which is why it is last and alone.
   three weeks (#238), and it is the most likely way this ADR goes wrong.
 - Memory doubles at idle (two 256Mi ceilings instead of one). At current
   scale that is noise against the Argo pods.
-- Two workers in one process (`--role all`) forced the shutdown question
-  that a single worker let us ignore: the Python SDK installs no signal
-  handlers, so SIGTERM used to end the process outright with no drain.
-  `run_until_signalled` now enters every worker as a context manager and
-  leaves the block on SIGTERM/SIGINT, which is the SDK's own shutdown
-  path. That is a fix to pre-existing behaviour, not a consequence of the
-  split — but the split is what made it visible.
+- Two workers in one process (`--role all`) forced two questions a single
+  worker let us ignore, both handled in `run_until_signalled`:
+  - **Shutdown.** The Python SDK installs no signal handlers, so SIGTERM
+    used to end the process outright with no drain. Pre-existing, but a
+    split whose purpose is rollouts should not leave rollouts ungraceful.
+  - **A worker dying alone.** A bare `await worker.run()` propagated any
+    failure and crashed the pod. With two workers that has to be
+    arranged: if only the control worker's loop dies, the execution
+    worker keeps the process alive and healthy-looking while reconcile,
+    intake and every DevLoop go dark — and nothing restarts, because
+    nothing crashed. The signal is raced against the run tasks and a
+    worker's failure is re-raised.
 - `--role all` remains supported indefinitely, for local development and
   as the rollback target. It is not deprecated — and because it is the
   rollback target for a state where routing has ALREADY flipped, it runs

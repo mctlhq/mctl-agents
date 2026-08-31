@@ -146,19 +146,23 @@ def test_no_control_ceiling_is_lowered_before_the_routing_flip():
 # Graceful shutdown across every worker in the process (agy P1 on #249)
 # ---------------------------------------------------------------------------
 class _FakeWorker:
-    """Records enter/exit, which is what shutdown actually means here."""
+    """Mimics the SDK pair this design uses: run() blocks, shutdown() ends it."""
 
-    def __init__(self) -> None:
-        self.entered = False
-        self.exited = False
+    def __init__(self, fail_with: BaseException | None = None) -> None:
+        self._stop = asyncio.Event()
+        self._fail_with = fail_with
+        self.ran = False
+        self.shut_down = False
 
-    async def __aenter__(self):
-        self.entered = True
-        return self
+    async def run(self) -> None:
+        self.ran = True
+        if self._fail_with is not None:
+            raise self._fail_with
+        await self._stop.wait()
 
-    async def __aexit__(self, *exc):
-        self.exited = True
-        return False
+    async def shutdown(self) -> None:
+        self.shut_down = True
+        self._stop.set()
 
 
 @pytest.mark.anyio
@@ -168,22 +172,39 @@ async def test_every_worker_is_drained_on_shutdown():
     `--role all` runs two workers in one process. The SDK installs no
     signal handlers of its own, so without this the pod's SIGTERM ended
     the process outright and in-flight activities were cut mid-flight.
-    Entering each worker as a context manager and leaving the block is the
-    SDK's own shutdown path.
     """
     workers = [_FakeWorker(), _FakeWorker()]
 
-    async def trigger_then_run():
-        task = asyncio.create_task(run_until_signalled(workers))  # type: ignore[arg-type]
-        await asyncio.sleep(0)
-        # Stand in for the signal: the handler's only job is setting this.
-        signal.raise_signal(signal.SIGTERM)
-        await asyncio.wait_for(task, timeout=5)
+    task = asyncio.create_task(run_until_signalled(workers))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    signal.raise_signal(signal.SIGTERM)
+    await asyncio.wait_for(task, timeout=5)
 
-    await trigger_then_run()
+    assert all(w.ran for w in workers)
+    assert all(w.shut_down for w in workers)
 
-    assert all(w.entered for w in workers)
-    assert all(w.exited for w in workers)
+
+@pytest.mark.anyio
+async def test_a_worker_dying_alone_takes_the_process_down():
+    """A dead poller must not leave the process looking healthy.
+
+    The pre-split code got this from a bare `await worker.run()`. With two
+    workers it has to be arranged: if only the control worker's loop dies,
+    the execution worker keeps the process alive while reconcile, intake
+    and every DevLoop go dark — and nothing restarts, because nothing
+    crashed (claude P1 / codex P1 on #249).
+    """
+    healthy = _FakeWorker()
+    doomed = _FakeWorker(fail_with=RuntimeError("connection lost"))
+
+    with pytest.raises(RuntimeError, match="connection lost"):
+        await asyncio.wait_for(
+            run_until_signalled([healthy, doomed]),  # type: ignore[arg-type]
+            timeout=5,
+        )
+
+    # ...and the survivor is drained rather than abandoned mid-flight.
+    assert healthy.shut_down
 
 
 def test_the_sdk_context_manager_really_starts_and_drains_a_worker():
