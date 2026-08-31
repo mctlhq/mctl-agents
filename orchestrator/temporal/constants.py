@@ -15,11 +15,19 @@ TASK_QUEUE = "mctl-dev-loop"
 # it — otherwise the activity waits on a queue nobody reads.
 EXECUTION_TASK_QUEUE = "mctl-dev-loop-exec"
 
-# Slot limits, deliberately below the SDK's defaults (100 activities).
-# The goal is not throughput: it is that exhaustion shows up as a bounded
-# backlog on one queue with a schedule-to-start latency you can alert on,
-# rather than as an invisible global stall. Starting values — ADR-008 D3
-# says to move them from metrics, not from first principles.
-CONTROL_MAX_CONCURRENT_ACTIVITIES = 20
+# Slot limits. Explicit values rather than the SDK's implicit defaults, so
+# capacity is something configuration states and metrics can be read
+# against — ADR-008 D3 says to move them from real numbers, not from first
+# principles.
+#
+# The control limit deliberately MATCHES the SDK default it replaces, and
+# stays there until the routing flip. Between step 2 (both roles deployed)
+# and step 3 (submit_and_wait routed away), the control worker still
+# carries every long Argo poll; tightening it to 20 in that window would
+# reintroduce the starvation this split exists to remove, at a threshold
+# five times lower than today's — with 9-11 concurrent loops in
+# production, a self-inflicted outage during the soak. Step 3 tightens it
+# in the same PR that removes the workload.
+CONTROL_MAX_CONCURRENT_ACTIVITIES = 100
 CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS = 40
 EXECUTION_MAX_CONCURRENT_ACTIVITIES = 40

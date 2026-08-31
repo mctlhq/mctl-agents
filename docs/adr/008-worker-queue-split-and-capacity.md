@@ -62,11 +62,18 @@ a short activity in reconcile belong together.
 unchanged, and so a rollback is a values edit rather than a code revert.
 
 **D3 — Explicit slot limits per role, in configuration.**
-Control: `max_concurrent_activities=20`, `max_concurrent_workflow_tasks=40`.
-Execution: `max_concurrent_activities=40`. These are deliberately below the
-SDK defaults: the point is that exhaustion becomes visible as a bounded
-backlog on one queue instead of an invisible global stall. The numbers are
-starting values to be moved by the metrics in D5, not derived constants.
+The point is that capacity is something configuration states and metrics
+can be read against, so exhaustion becomes a bounded backlog on one queue
+instead of an invisible global stall. The numbers themselves are starting
+values to be moved by D5, not derived constants.
+
+The control limit is set to the SDK default it replaces (100) and **stays
+there until step 3**. Between step 2 and step 3 the control worker still
+carries every long Argo poll, so tightening it during that window would
+reintroduce the starvation this ADR removes — at a threshold five times
+lower than today's, for the whole soak, with 9–11 concurrent loops in
+production. Step 3 tightens it in the same change that takes the
+workload away. Execution starts at 40.
 
 **D4 — The routing flip is guarded by `workflow.patched("exec-queue")`.**
 `execute_activity(task_queue=...)` changes the scheduled command, and
@@ -100,7 +107,9 @@ there until timeout.
    `--role execution`, and `--role control` on the existing one. Both
    poll; nothing yet schedules to the exec queue.
 3. **mctl-agents:** flip `submit_and_wait` onto the exec queue behind
-   `workflow.patched("exec-queue")`.
+   `workflow.patched("exec-queue")`, and only now tighten the control
+   limit (D3) — the same change removes the workload it would otherwise
+   be squeezing.
 4. Soak one full dev-loop, then tune D3 from D5's numbers.
 
 Steps 1 and 2 are individually reversible. Step 3 is one-way for

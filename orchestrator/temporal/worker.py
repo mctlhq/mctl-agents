@@ -197,6 +197,21 @@ class WorkerPlan:
         return {getattr(a, "__temporal_activity_definition").name for a in self.activities}
 
 
+def owns_schedules(role: str) -> bool:
+    """Does this role create and converge the Temporal schedules?
+
+    Only a role that runs the workflows may assert their specs. An
+    execution worker declaring a cadence for workflows it does not run is
+    a lie waiting to drift — and since _ensure_schedule converges an
+    existing spec in place, that lie would actively overwrite the truth.
+
+    A named function rather than an inline check in main(), for the same
+    reason worker_plan exists: main() needs a live Temporal client, so
+    anything decided inside it is untestable (claude P3 on #249).
+    """
+    return role in ("all", "control")
+
+
 def worker_plan(role: str, visibility: VisibilityActivities) -> WorkerPlan:
     """The queue/registration layout for one role.
 
@@ -294,11 +309,7 @@ async def main() -> None:
     logger.info("connecting to Temporal at %s (namespace=%s)", address, namespace)
     client = await Client.connect(address, namespace=namespace)
 
-    # Only a role that owns the workflows owns their schedules. Two
-    # processes racing to create the same schedule is harmless
-    # (_ensure_schedule is idempotent), but an execution worker asserting
-    # a spec it does not run is a lie waiting to drift.
-    if args.role in ("all", "control"):
+    if owns_schedules(args.role):
         await setup_schedules(client)
 
     visibility = VisibilityActivities(client)

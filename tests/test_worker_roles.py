@@ -26,7 +26,7 @@ from orchestrator.temporal.constants import (
     EXECUTION_TASK_QUEUE,
     TASK_QUEUE,
 )
-from orchestrator.temporal.worker import worker_plan
+from orchestrator.temporal.worker import owns_schedules, worker_plan
 
 
 @pytest.fixture
@@ -97,3 +97,24 @@ def test_an_unknown_role_is_refused(visibility):
     """argparse guards the CLI, but worker_plan is also called directly."""
     with pytest.raises(SystemExit):
         worker_plan("orchestration", visibility)
+
+
+def test_only_workflow_running_roles_own_the_schedules():
+    """An execution worker must not assert a spec for workflows it does not run.
+
+    Not merely redundant: `_ensure_schedule` converges an existing spec in
+    place, so a role declaring a cadence it does not serve would actively
+    overwrite the real one.
+    """
+    assert owns_schedules("all") is True
+    assert owns_schedules("control") is True
+    assert owns_schedules("execution") is False
+
+
+def test_the_control_limit_does_not_tighten_before_the_routing_flip():
+    """Between step 2 and step 3 the control worker still carries every long
+    Argo poll. Dropping its ceiling below the SDK default in that window
+    would reintroduce the starvation the split removes, at a lower
+    threshold than today's (claude P2 on #249). Step 3 tightens it in the
+    same PR that removes the workload."""
+    assert CONTROL_MAX_CONCURRENT_ACTIVITIES >= 100
