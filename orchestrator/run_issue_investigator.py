@@ -211,6 +211,27 @@ def _staging_dir(proposal_dir: Path) -> Path:
     return Path(tempfile.mkdtemp(dir=service_dir, prefix=".staging-"))
 
 
+def _is_plain_file(path: Path) -> bool:
+    """A regular file, and not a symlink to one."""
+    return path.is_file() and not path.is_symlink()
+
+
+def _ignore_special(directory: str, names: list[str]) -> set[str]:
+    """copytree filter: everything that is not a file, directory or symlink.
+
+    copytree copies a FIFO by opening it, which blocks until a writer
+    appears — the same hang as the top-level case below, one level down and
+    reached even when the entry the walk sees is an ordinary directory.
+    """
+    base = Path(directory)
+    return {
+        name for name in names
+        if not (base / name).is_symlink()
+        and not (base / name).is_file()
+        and not (base / name).is_dir()
+    }
+
+
 def _carry_forward(live: Path, staging: Path) -> None:
     """Merge whatever the agent did NOT rewrite from ``live`` into ``staging``.
 
@@ -257,13 +278,32 @@ def _carry_forward(live: Path, staging: Path) -> None:
         ):
             _carry_forward(kept, target)
         elif target.is_symlink() or target.exists():
-            continue
+            # This run rewrote it. Its CONTENT wins — but the mode it was
+            # created with is a property of the scratch directory, not a
+            # decision, so a deliberate mode on the file being replaced
+            # would otherwise be dropped on every re-investigation (codex
+            # P2 on #247). Same rule as the directory and .status.yaml,
+            # applied once here instead of case by case.
+            if _is_plain_file(kept) and _is_plain_file(target):
+                shutil.copymode(kept, target)
         elif kept.is_symlink():
             os.symlink(os.readlink(kept), target)
         elif kept.is_dir():
-            shutil.copytree(kept, target, symlinks=True)
-        else:
+            shutil.copytree(kept, target, symlinks=True, ignore=_ignore_special)
+        elif kept.is_file():
             shutil.copy2(kept, target)
+        else:
+            # A FIFO, socket or device node. shutil.copy2 would OPEN it,
+            # and opening a FIFO for reading blocks until a writer appears
+            # — the investigator would hang before publication, on this
+            # run and on every retry after it (codex P2 on #247). Git
+            # cannot store these either, so one can only have arrived from
+            # a Bash-enabled agent run; dropping it loses nothing.
+            print(
+                f"warn: skipping {kept.name} — not a regular file, directory "
+                "or symlink, so it cannot be part of a proposal",
+                file=sys.stderr,
+            )
 
 
 class ProposalRestoreFailed(BaseException):
@@ -893,18 +933,13 @@ def investigate(
                 # #247). The rule is that a swap preserves the modes of
                 # what it replaces — the directory, and .status.yaml.
                 #
-                # The status file needs saying separately because
-                # write_status_yaml's own "an existing file keeps its
-                # mode" branch cannot fire here: it writes into STAGING,
-                # which is empty, so it always takes the umask default;
-                # and _carry_forward then skips .status.yaml precisely
-                # because staging already has one. A mode someone set
-                # deliberately was silently reset by re-investigation
-                # (agy P2 on #247).
+                # The directory only. Every FILE inside it, .status.yaml
+                # included, gets its mode carried by _carry_forward's
+                # collision branch — one rule rather than a special case
+                # per filename, which is what the special case for
+                # .status.yaml turned into as soon as codex pointed out
+                # that requirements/design/tasks have the same problem.
                 shutil.copymode(aside, staging)
-                old_status = aside / ".status.yaml"
-                if old_status.is_file():
-                    shutil.copymode(old_status, staging / ".status.yaml")
             else:
                 shutil.copymode(proposal_dir.parent, staging)
 

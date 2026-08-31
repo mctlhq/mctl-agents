@@ -1443,3 +1443,136 @@ def test_a_deliberate_status_mode_survives_re_investigation(tmp_path, monkeypatc
     assert second.error is None
     assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
     assert stat.S_IMODE(status.stat().st_mode) == chosen
+
+
+def _investigate_without_hanging(url, state_dir, seconds=15):
+    """Run investigate() on a thread and fail rather than hang.
+
+    The failure mode under test IS a hang — shutil.copy2 opening a FIFO
+    blocks until a writer appears — so calling investigate() directly
+    would wedge the whole suite (and any mutation run) instead of
+    reporting one red test.
+    """
+    import threading
+
+    box = {}
+
+    def _go():
+        try:
+            box["result"] = investigate(url, state_dir=state_dir)
+        except BaseException as exc:  # noqa: BLE001 — reported below
+            box["error"] = exc
+
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    t.join(seconds)
+    assert not t.is_alive(), f"investigate() did not return within {seconds}s — it hung"
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def test_a_fifo_in_the_proposal_does_not_hang_the_investigator(tmp_path, monkeypatch):
+    """copy2 on a FIFO opens it, and opening blocks until a writer appears.
+
+    A Bash-enabled agent run can leave one behind; the triplet check does
+    not look at it, so it gets published, and the NEXT investigation hangs
+    before publication — on that run and on every retry after it (codex P2
+    on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=40,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    os.mkfifo(first.proposal_dir / "pipe")
+    (first.proposal_dir / "notes.md").write_text("ordinary content")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = _investigate_without_hanging(issue.ref.url, tmp_path)
+
+    assert second.error is None
+    assert not (first.proposal_dir / "pipe").exists()
+    # ...and the ordinary content beside it still came across.
+    assert (first.proposal_dir / "notes.md").read_text() == "ordinary content"
+    assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
+
+
+def test_a_fifo_nested_in_a_carried_folder_does_not_hang_either(tmp_path, monkeypatch):
+    """copytree copies a FIFO the same way, one level down.
+
+    Reached even when the entry the walk sees is an ordinary directory, so
+    filtering only at the top level would leave the hang in place.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=41,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    assets = first.proposal_dir / "assets"
+    assets.mkdir()
+    (assets / "diagram.svg").write_text("<svg/>")
+    os.mkfifo(assets / "pipe")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = _investigate_without_hanging(issue.ref.url, tmp_path)
+
+    assert second.error is None
+    assert not (assets / "pipe").exists()
+    assert (assets / "diagram.svg").read_text() == "<svg/>"
+
+
+def test_a_regenerated_file_keeps_the_mode_of_the_one_it_replaces(tmp_path, monkeypatch):
+    """The agent's content wins; the scratch directory's permissions do not.
+
+    Every regenerated triplet file hits the collision branch, so before
+    this the swap published agent-created files at the umask default and
+    dropped whatever mode was set on the ones they replaced — while the
+    directory and .status.yaml were preserved by name (codex P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=42,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    design = first.proposal_dir / "design.md"
+    chosen = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP | stat.S_IWGRP
+    os.chmod(design, chosen)
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    assert design.read_text() == "v2 design.md"
+    assert stat.S_IMODE(design.stat().st_mode) == chosen
