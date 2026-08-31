@@ -891,13 +891,21 @@ def test_a_failed_aside_rename_leaks_no_scratch_directory(tmp_path, monkeypatch)
     assert list(service_dir.glob(".staging-*")) == []
 
 
-def test_a_failed_restore_reraises_the_original_failure(tmp_path, monkeypatch):
-    """A bare `raise` in the restore handler would re-raise the OSError.
+def test_a_failed_restore_is_not_swallowed_as_an_ordinary_result(tmp_path, monkeypatch):
+    """A lost proposal must never be reported as a soft error.
 
-    That masks whatever actually triggered the rollback: a
-    KeyboardInterrupt or SystemExit would surface as an ordinary error and
-    be swallowed by investigate()'s outer handler instead of ending the
-    process (agy P2 on #247).
+    investigate() is contracted to RETURN an InvestigateResult, so its
+    outer handlers turn any Exception into an error string. Re-raising the
+    publish failure therefore let the caller receive something benign --
+    "proposal advanced to \'accepted\'..." -- while the proposal was in
+    fact gone, stranded in a scratch .aside-* directory nobody would look
+    in (agy P2 on #247).
+
+    Note what the previous version of this test got wrong: it triggered
+    the rollback with KeyboardInterrupt, which skips `except Exception`
+    for reasons that have nothing to do with the fix. It passed against
+    the bug. The failure here is an ORDINARY OSError, which is what the
+    soft handlers actually swallow.
     """
     issue = _investigate_harness(
         tmp_path, monkeypatch, number=25,
@@ -910,10 +918,45 @@ def test_a_failed_restore_reraises_the_original_failure(tmp_path, monkeypatch):
     assert first.error is None
 
     real_replace = run_issue_investigator.os.replace
+    calls = []
 
-    # Distinct types on purpose: the publish fails with the exception that
-    # must survive, the restore with a different one. A test using the same
-    # type for both passes even with a bare `raise`, and so proves nothing.
+    def both_renames_fail(src, dst):
+        if Path(dst) == first.proposal_dir:
+            calls.append(dst)
+            raise OSError("publish failed" if len(calls) == 1 else "read-only fs")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run_issue_investigator.os, "replace", both_renames_fail)
+    with pytest.raises(run_issue_investigator.ProposalRestoreFailed) as caught:
+        investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
+
+    # Both halves of the story reach the operator: what went wrong, and
+    # that the restore then failed too.
+    assert "publish failed" in str(caught.value)
+    assert isinstance(caught.value.__cause__, OSError)
+    assert "read-only fs" in str(caught.value.__cause__)
+
+    # The only surviving copy is kept, not cleaned up, and named.
+    asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
+    assert len(asides) == 1
+    assert str(asides[0]) in str(caught.value)
+    assert (asides[0] / "design.md").read_text() == "v1 design.md"
+
+
+def test_a_failed_restore_survives_a_base_exception_too(tmp_path, monkeypatch):
+    """The rollback must not let a KeyboardInterrupt become an OSError either."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=36,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    real_replace = run_issue_investigator.os.replace
     calls = []
 
     def both_renames_fail(src, dst):
@@ -923,14 +966,38 @@ def test_a_failed_restore_reraises_the_original_failure(tmp_path, monkeypatch):
         return real_replace(src, dst)
 
     monkeypatch.setattr(run_issue_investigator.os, "replace", both_renames_fail)
-    with pytest.raises(KeyboardInterrupt):
+    with pytest.raises(run_issue_investigator.ProposalRestoreFailed):
         investigate(issue.ref.url, state_dir=tmp_path)
     monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
 
-    # The only surviving copy is kept, not cleaned up.
     asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
     assert len(asides) == 1
-    assert (asides[0] / "design.md").read_text() == "v1 design.md"
+
+
+def test_the_status_file_is_not_published_with_scratch_permissions(tmp_path, monkeypatch):
+    """mkstemp forces 0600 and os.replace carries it onto the real file.
+
+    `.status.yaml` is what every other component reads -- the implementer,
+    the approve CWFT, the reconcile sweep -- and several of them do not run
+    as this user (agy P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=37,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    status = first.proposal_dir / ".status.yaml"
+    mode = stat.S_IMODE(status.stat().st_mode)
+    assert mode != 0o600, "published with mkstemp's private mode"
+    # What an ordinary open() would have produced.
+    umask = os.umask(0)
+    os.umask(umask)
+    assert mode == 0o666 & ~umask
 
 
 def test_an_approval_landing_mid_run_is_not_overwritten(tmp_path, monkeypatch):

@@ -266,6 +266,22 @@ def _carry_forward(live: Path, staging: Path) -> None:
             shutil.copy2(kept, target)
 
 
+class ProposalRestoreFailed(BaseException):
+    """The previous proposal could not be put back, and only the aside copy
+    survives.
+
+    A BaseException, deliberately, and the only one this module defines.
+    `investigate` is contracted to RETURN an InvestigateResult, so every
+    ordinary failure becomes a soft error string — which is exactly wrong
+    here: re-raising the original failure let an outer `except Exception`
+    report something benign ("proposal advanced to 'accepted'...") while
+    the proposal was in fact gone, stranded in a scratch `.aside-*`
+    directory nobody would look in (agy P2 on #247). Deriving from
+    BaseException is what makes it unswallowable by those handlers, so the
+    process dies where the data was lost instead of a hundred steps later.
+    """
+
+
 class _ProposalAdvanced(RuntimeError):
     """The proposal was approved while the agent was running.
 
@@ -438,6 +454,27 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
             yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
             f.flush()
             os.fsync(f.fileno())
+        # mkstemp forces 0600, and os.replace carries that onto the real
+        # file: the same scratch-permissions bug the published directory
+        # had, one level down and just as invisible (agy P2 on #247).
+        # `.status.yaml` is the file every other component reads — the
+        # implementer, the approve CWFT, the reconcile sweep — and several
+        # of them do not run as this user.
+        #
+        # An existing file keeps its mode -- someone may have chosen it.
+        # Otherwise take what an ordinary open() would have produced: the
+        # process umask applied to 0666. NOT the containing directory's
+        # mode, which was the first attempt and is wrong for the case that
+        # matters: on a first investigation this function writes into
+        # STAGING, so the directory in question is the 0700 scratch dir
+        # whose permissions are exactly what we are trying not to inherit.
+        # Deriving from it reproduced 0600 and the test caught it.
+        if status_path.exists():
+            shutil.copymode(status_path, tmp_path)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp_path, 0o666 & ~umask)
         os.replace(tmp_path, status_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -869,7 +906,10 @@ def investigate(
                         f"({restore_error}); the previous proposal is at {aside}",
                         file=sys.stderr,
                     )
-                    raise publish_error from restore_error
+                    raise ProposalRestoreFailed(
+                        f"could not restore {proposal_dir} after {publish_error!r}; "
+                        f"the only copy of the previous proposal is at {aside}"
+                    ) from restore_error
             raise
 
         # 7. Link the proposal back to the issue. A failure here (e.g. the
