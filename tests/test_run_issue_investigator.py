@@ -761,7 +761,7 @@ def test_a_failed_unlink_still_hands_the_caller_what_it_read(tmp_path):
     for name in ("requirements.md", "design.md", "tasks.md"):
         (proposal_dir / name).write_text(f"content {name}")
 
-    saved: dict[str, bytes] = {}
+    saved: dict[str, bytes | None] = {}
     real_unlink = Path.unlink
 
     def flaky_unlink(self, missing_ok=False):
@@ -775,6 +775,7 @@ def test_a_failed_unlink_still_hands_the_caller_what_it_read(tmp_path):
             run_issue_investigator._take_triplet(proposal_dir, saved)
 
     assert set(saved) == {"requirements.md", "design.md", "tasks.md"}
+    assert all(v is not None for v in saved.values())
     run_issue_investigator._restore_triplet(proposal_dir, saved)
     for name in ("requirements.md", "design.md", "tasks.md"):
         assert (proposal_dir / name).read_text() == f"content {name}"
@@ -802,3 +803,37 @@ def test_restore_removes_a_document_that_was_not_there_before(tmp_path, monkeypa
     assert result.error is not None
     assert (proposal_dir / "requirements.md").read_text() == "only this one existed"
     assert not (proposal_dir / "design.md").exists()
+
+
+def test_a_read_failure_does_not_let_the_rollback_delete_the_proposal(tmp_path, monkeypatch):
+    """The rollback must never destroy a document it never observed.
+
+    A read that fails on the second document leaves the third unobserved.
+    Treating "not in the mapping" as "was not there" made _restore_triplet
+    unlink it — so an I/O blip during the backup silently and permanently
+    deleted the very proposal the backup exists to protect.
+
+    Tested through investigate(), not against _take_triplet alone: the
+    isolated test passed while this failed, because the destruction
+    happens in the rollback that only the real call path reaches.
+    """
+    issue = _investigate_harness(tmp_path, monkeypatch, number=17, agent=lambda *a: None)
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / "issue-17-some-feature"
+    proposal_dir.mkdir(parents=True)
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (proposal_dir / name).write_text(f"precious {name}")
+
+    real_read = Path.read_bytes
+
+    def flaky_read(self):
+        if self.name == "design.md":
+            raise OSError("transient I/O error")
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky_read)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(Path, "read_bytes", real_read)
+
+    assert result.error is not None
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        assert (proposal_dir / name).read_text() == f"precious {name}"

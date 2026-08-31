@@ -188,7 +188,7 @@ def build_slug(issue_number: int, title: str) -> str:
 TRIPLET = ("requirements.md", "design.md", "tasks.md")
 
 
-def _take_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
+def _take_triplet(proposal_dir: Path, saved: dict[str, bytes | None]) -> None:
     """Read the existing triplet into ``saved`` AND remove it from disk.
 
     Clearing the slate is what makes the post-run check honest: with the
@@ -207,6 +207,13 @@ def _take_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
     An unlink that fails part-way through would otherwise never return,
     so the caller's rollback would see an empty mapping and restore
     nothing — while files were already gone (codex P2 on #247).
+
+    Absence is recorded explicitly as None rather than by omission. A
+    name missing from the mapping means "never observed", which is not
+    the same claim at all: a read that fails on the second document
+    leaves the third unobserved, and treating that as "was not there"
+    would have _restore_triplet delete a file it never saw (agy P1 on
+    #247) — data loss caused by the rollback itself.
     """
     # Read EVERY file before removing ANY. Interleaving them means a read
     # that fails on the third document leaves the first two already gone
@@ -214,26 +221,34 @@ def _take_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
     # the directory is still untouched.
     for name in TRIPLET:
         path = proposal_dir / name
-        if path.is_file():
-            saved[name] = path.read_bytes()
-    for name in list(saved):
-        (proposal_dir / name).unlink(missing_ok=True)
+        if not path.is_file():
+            saved[name] = None
+            continue
+        saved[name] = path.read_bytes()
+    for name, content in saved.items():
+        if content is not None:
+            (proposal_dir / name).unlink(missing_ok=True)
 
 
-def _restore_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
-    """Undo _take_triplet exactly — put back what was there, and only that.
+def _restore_triplet(proposal_dir: Path, saved: dict[str, bytes | None]) -> None:
+    """Undo _take_triplet exactly — restore what was observed, only that.
 
-    Rewriting the saved files is half of it. A document that was ABSENT
-    before must also be absent after: if the previous proposal was
-    incomplete and this run created the missing document before failing,
-    leaving it behind would hand the next reader a directory that is
-    neither the old proposal nor a new one (codex P2 on #247).
+    Rewriting the saved files is half of it. A document recorded as ABSENT
+    must also be absent after: if the previous proposal was incomplete and
+    this run created the missing document before failing, leaving it
+    behind would hand the next reader a directory that is neither the old
+    proposal nor a new one (codex P2 on #247).
+
+    Iterating the MAPPING rather than TRIPLET is the other half. A name
+    _take_triplet never got to observe must be left strictly alone —
+    deleting it on the assumption it was absent is how a rollback becomes
+    the thing that destroys the proposal (agy P1 on #247).
     """
-    for name in TRIPLET:
+    for name, content in saved.items():
         path = proposal_dir / name
         try:
-            if name in saved:
-                path.write_bytes(saved[name])
+            if content is not None:
+                path.write_bytes(content)
             else:
                 path.unlink(missing_ok=True)
         except OSError:
@@ -696,7 +711,7 @@ def investigate(
     # Take the previous run's documents off disk and hold them, so the
     # check below sees only what THIS run wrote and a failure can put the
     # old proposal back exactly as it was. See _take_triplet.
-    saved_triplet: dict[str, bytes] = {}
+    saved_triplet: dict[str, bytes | None] = {}
     triplet_written = False
     clone = None
     try:
