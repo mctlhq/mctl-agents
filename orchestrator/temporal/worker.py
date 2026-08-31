@@ -239,7 +239,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
     """The queue/registration layout for one role — one plan per queue.
 
     A list, because `all` must poll BOTH queues. It is the documented
-    rollback target, and after step 3 patched histories schedule
+    rollback target, and after the routing flip patched histories schedule
     submit_and_wait onto the execution queue: an `all` process listening
     only on the control queue would leave those activities with no poller
     until they time out, so collapsing the split deployments back would
@@ -299,7 +299,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
         )]
     # `all`: one process, both queues, no limits — the pre-split shape plus
-    # a poller for the queue step 3 starts using.
+    # a poller for the queue the routing flip starts using.
     return [
         WorkerPlan(
             task_queue=TASK_QUEUE,
@@ -426,15 +426,33 @@ async def run_until_signalled(workers: list[Worker]) -> None:
 
     # shutdown() is safe to call repeatedly and on a worker that already
     # stopped, so this needs no bookkeeping about which one finished first.
+    #
+    # ONE deadline over the shutdowns AND the run tasks, rather than a
+    # bounded wait on each. Two sequential waits let a slow drain spend
+    # the cap twice — 40 s under a 20 s policy — and, worse, the second
+    # one was `asyncio.wait`, which does not raise on timeout: it returns
+    # (done, pending) quietly, so the `except TimeoutError` that was
+    # supposed to log why the pod is about to die could never fire (agy P3
+    # on #249). The pending set is the signal; ask it directly.
     timeout = CRASH_DRAIN_TIMEOUT_SECONDS if crashed else None
-    drain = asyncio.gather(
-        *(worker.shutdown() for worker in workers), return_exceptions=True
-    )
-    try:
-        await asyncio.wait_for(drain, timeout)
-        await asyncio.wait(run_tasks, timeout=timeout)
-    except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
-        logger.error("workers did not drain within %ss; crashing without them", timeout)
+    shutdowns = [asyncio.ensure_future(worker.shutdown()) for worker in workers]
+    _, pending = await asyncio.wait([*shutdowns, *run_tasks], timeout=timeout)
+    if pending:
+        logger.error(
+            "%d task(s) still running %ss after shutdown was requested; "
+            "crashing without them",
+            len(pending),
+            timeout,
+        )
+        for task in pending:
+            task.cancel()
+
+    # A shutdown() that raised is not itself fatal — the worker failure
+    # below is the real story — but its exception has to be retrieved, or
+    # asyncio logs it as never-retrieved noise right as the pod dies.
+    for task in shutdowns:
+        if task.done() and not task.cancelled():
+            task.exception()
 
     for task in run_tasks:
         if not task.done() or task.cancelled():

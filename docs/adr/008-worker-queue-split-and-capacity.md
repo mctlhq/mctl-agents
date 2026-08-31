@@ -67,17 +67,24 @@ can be read against, so exhaustion becomes a bounded backlog on one queue
 instead of an invisible global stall. The numbers themselves are starting
 values to be moved by D5, not derived constants.
 
-**Neither control ceiling is lowered before step 3.** Between step 2 and
-step 3 the control worker still carries every long Argo poll *and* all
-five workflow types, so any ceiling below current behaviour in that
+**Neither control ceiling is lowered until the last step.** Until the
+routing flip the control worker still carries every long Argo poll *and*
+all five workflow types, so any ceiling below current behaviour in that
 window reintroduces the starvation this ADR removes — for the whole soak,
 with 9–11 concurrent loops in production. So `max_concurrent_activities`
 is set to the 100 it replaces, and `max_concurrent_workflow_tasks` is
 left unset: with no value the SDK does not fall back to 100, it builds a
 **500**-thread pool, so any number there is a far larger step down than
-it looks. Step 3 picks both values, in the same change that takes the
-workload away and with D5's numbers in hand. Execution starts at 40 —
-it is a new queue with no existing load to protect.
+it looks. Execution starts at 40 — it is a new queue with no existing
+load to protect.
+
+Tightening therefore comes **after** the flip and after the soak, not
+with it. An earlier draft of this ADR put the tightening in the same step
+as the flip while D5's exporter arrived in the step after, which asked
+operators to pick numbers from data that did not exist yet (codex P2 on
+#249). Two conditions gate the change and both are now upstream of it:
+the workload has moved off the control queue, and the exporter is running
+so the effect is visible.
 
 **D4 — The routing flip is guarded by `workflow.patched("exec-queue")`.**
 `execute_activity(task_queue=...)` changes the scheduled command, and
@@ -93,7 +100,7 @@ latency and activity failure counts, but it does not export them merely
 because limits are configured: this worker calls `Client.connect` with
 the default runtime, and the repository has no `TelemetryConfig` or
 `PrometheusConfig` anywhere (checked — codex P2 on #249). Wiring an
-exporter and scraping it is therefore step 4's first task, before any
+exporter and scraping it therefore comes before the flip, and before any
 number in D3 can be tuned against reality. The signal to alert on is
 sustained schedule-to-start on the control queue: that is starvation in
 one number, and it is what was previously unobservable.
@@ -118,15 +125,19 @@ there until timeout.
 2. **mctl-gitops:** second deployment `mctl-agents-worker-exec` with
    `--role execution`, and `--role control` on the existing one. Both
    poll; nothing yet schedules to the exec queue.
-3. **mctl-agents:** flip `submit_and_wait` onto the exec queue behind
-   `workflow.patched("exec-queue")`, and only now tighten the control
-   limit (D3) — the same change removes the workload it would otherwise
-   be squeezing.
-4. Wire the metrics exporter (D5), soak one full dev-loop, then tune D3
-from real numbers.
+3. **mctl-agents:** wire the metrics exporter (D5). Independent of the
+   split and safe on its own, and it goes BEFORE the flip so the flip has
+   a baseline to be read against rather than being the first thing the
+   new dashboards ever see.
+4. **mctl-agents:** flip `submit_and_wait` onto the exec queue behind
+   `workflow.patched("exec-queue")`. Limits unchanged here — this step is
+   one-way, and pairing it with a capacity change would make a bad
+   number indistinguishable from a bad flip.
+5. Soak one full dev-loop, then tighten the control limits (D3) from real
+   numbers.
 
-Steps 1 and 2 are individually reversible. Step 3 is one-way for
-histories that record the patch, which is why it is last and alone.
+Steps 1–3 are individually reversible. Step 4 is one-way for histories
+that record the patch, which is why it is alone.
 
 ## Consequences
 

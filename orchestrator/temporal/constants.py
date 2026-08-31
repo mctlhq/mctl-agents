@@ -22,19 +22,20 @@ EXECUTION_TASK_QUEUE = "mctl-dev-loop-exec"
 #
 # The control limit deliberately MATCHES the SDK default it replaces, and
 # stays there until the routing flip. Between step 2 (both roles deployed)
-# and step 3 (submit_and_wait routed away), the control worker still
+# and the routing flip (submit_and_wait routed away), the control worker still
 # carries every long Argo poll; tightening it to 20 in that window would
 # reintroduce the starvation this split exists to remove, at a threshold
 # five times lower than today's — with 9-11 concurrent loops in
-# production, a self-inflicted outage during the soak. Step 3 tightens it
-# in the same PR that removes the workload.
+# production, a self-inflicted outage during the soak. The tightening comes
+# after the flip AND after the soak, when the workload has moved off this
+# queue and the exporter can show what the new number did.
 CONTROL_MAX_CONCURRENT_ACTIVITIES = 100
 
 # Left unbounded for the same reason, and it is the sharper case: with
 # max_concurrent_workflow_tasks unset the SDK does not fall back to 100 —
 # it builds a thread pool of 500. So ANY number here is a new ceiling far
 # below current behaviour, imposed on a control worker still running all
-# five workflow types against 9-11 concurrent loops. Step 3 picks a value
+# five workflow types against 9-11 concurrent loops. A value is picked
 # once D5's numbers exist; guessing one during the soak is how a capacity
 # limit becomes an outage.
 CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS: int | None = None

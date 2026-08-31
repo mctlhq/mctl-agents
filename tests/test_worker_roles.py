@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import signal
 from unittest import mock
 from unittest.mock import MagicMock
@@ -63,7 +64,7 @@ def test_all_keeps_the_original_control_queue_shape(visibility):
 def test_all_also_polls_the_execution_queue(visibility):
     """`all` is the documented rollback target, so it has to work as one.
 
-    After step 3, patched histories schedule submit_and_wait onto the
+    After the routing flip, patched histories schedule submit_and_wait onto the
     execution queue. Collapsing the split deployments back to a process
     that listens only on the control queue would leave those activities
     with no poller until they time out — a rollback that strands work is
@@ -129,11 +130,12 @@ def test_only_workflow_running_roles_own_the_schedules():
 
 
 def test_no_control_ceiling_is_lowered_before_the_routing_flip():
-    """Between step 2 and step 3 the control worker still carries every long
+    """Until the routing flip the control worker still carries every long
     Argo poll AND all five workflow types. Any ceiling below current
     behaviour in that window reintroduces the starvation the split removes
-    (claude P2 on #249, twice — once per limit). Step 3 tightens them in
-    the same change that takes the workload away.
+    (claude P2 on #249, twice — once per limit). They are tightened only
+    after the flip has taken the workload away and the soak has produced
+    numbers to pick from (codex P2 on #249).
 
     Both limits, because fixing one and leaving the sibling is exactly how
     this was got wrong the first time. Note the workflow-task default is
@@ -237,6 +239,36 @@ async def test_a_survivor_that_will_not_drain_cannot_hold_the_crash_open():
             )
 
     assert stuck.shut_down, "the drain should still be attempted, just not waited on"
+
+
+@pytest.mark.anyio
+async def test_the_undrained_tasks_are_reported_before_the_crash(caplog):
+    """The one diagnostic explaining why the pod died must actually print.
+
+    `asyncio.wait` does NOT raise on timeout — it returns (done, pending)
+    quietly — so an `except TimeoutError` around it could never fire, and
+    the log line meant to name the stuck tasks never reached the pod's
+    output (agy P3 on #249). The pending set is the signal, so assert on
+    what the pending set produced.
+    """
+    class _StuckWorker(_FakeWorker):
+        async def shutdown(self) -> None:
+            self.shut_down = True
+            await asyncio.Event().wait()
+
+    workers = [_StuckWorker(), _FakeWorker(fail_with=RuntimeError("connection lost"))]
+
+    with caplog.at_level(logging.ERROR, logger=worker_module.__name__):
+        with mock.patch.object(worker_module, "CRASH_DRAIN_TIMEOUT_SECONDS", 0.05):
+            with pytest.raises(RuntimeError, match="connection lost"):
+                await asyncio.wait_for(
+                    run_until_signalled(workers),  # type: ignore[arg-type]
+                    timeout=5,
+                )
+
+    assert any(
+        "still running" in record.getMessage() for record in caplog.records
+    ), f"no diagnostic named the undrained tasks: {[r.getMessage() for r in caplog.records]}"
 
 
 @pytest.mark.anyio
