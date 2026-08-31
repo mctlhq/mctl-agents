@@ -51,6 +51,16 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
     Temporal reset (codex P1 on #241). The same trap applied to every
     other terminal failure; only a run that actually completed is "already
     handled".
+
+    One caveat this policy inherits rather than introduces: a restart
+    re-runs investigate, which derives the proposal slug from the issue
+    title. Rename the issue between the failure and the retry and the
+    investigator's idempotency guard — which checks only its own exact
+    directory — writes a SECOND proposal beside the first, after which
+    find_proposal_slug refuses the now-ambiguous issue-<N>-* lookup
+    (codex P2 on #241). Retry before renaming. The real fix is to anchor
+    the guard on the issue number rather than the full slug, which lives
+    in the investigator CWFT, not here — tracked as #246.
     """
     if client is None:
         client = await connect()
