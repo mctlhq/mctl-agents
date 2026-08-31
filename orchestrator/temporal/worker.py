@@ -13,7 +13,9 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -350,9 +352,38 @@ async def main() -> None:
         args.role,
         ", ".join(plan.task_queue for plan in plans),
     )
-    # gather, not sequential: each Worker.run() blocks until shutdown, so a
-    # role serving two queues has to poll both at once.
-    await asyncio.gather(*(w.run() for w in workers))
+    await run_until_signalled(workers)
+
+
+async def run_until_signalled(workers: list[Worker]) -> None:
+    """Run every worker until SIGTERM/SIGINT, then drain them all.
+
+    The Python SDK does NOT install signal handlers (unlike some of the
+    other Temporal SDKs — `add_signal_handler` appears nowhere in
+    temporalio), so until now SIGTERM hit Python's default and killed the
+    process outright: no drain, in-flight activities cut mid-flight. That
+    was already true of the single worker; it just becomes more visible
+    with two, and a queue split whose whole point is rollouts should not
+    leave rollouts ungraceful (raised as a P1 by agy on #249, on a
+    premise about SDK-installed handlers that does not hold — the gap is
+    real, the mechanism described was not).
+
+    Entering each worker as an async context manager and leaving the block
+    is the SDK's own shutdown path, so every worker drains, not just one.
+    """
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except NotImplementedError:  # pragma: no cover — non-POSIX only
+            pass
+
+    async with AsyncExitStack() as stack:
+        for worker in workers:
+            await stack.enter_async_context(worker)
+        await shutdown.wait()
+        logger.info("shutdown signal received; draining %d worker(s)", len(workers))
 
 
 if __name__ == "__main__":

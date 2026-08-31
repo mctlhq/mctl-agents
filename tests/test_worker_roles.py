@@ -15,6 +15,8 @@ object that acts on it.
 """
 from __future__ import annotations
 
+import asyncio
+import signal
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,7 +28,7 @@ from orchestrator.temporal.constants import (
     EXECUTION_TASK_QUEUE,
     TASK_QUEUE,
 )
-from orchestrator.temporal.worker import owns_schedules, worker_plans
+from orchestrator.temporal.worker import owns_schedules, run_until_signalled, worker_plans
 
 
 @pytest.fixture
@@ -137,3 +139,47 @@ def test_no_control_ceiling_is_lowered_before_the_routing_flip():
     """
     assert CONTROL_MAX_CONCURRENT_ACTIVITIES >= 100
     assert CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS is None
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown across every worker in the process (agy P1 on #249)
+# ---------------------------------------------------------------------------
+class _FakeWorker:
+    """Records enter/exit, which is what shutdown actually means here."""
+
+    def __init__(self) -> None:
+        self.entered = False
+        self.exited = False
+
+    async def __aenter__(self):
+        self.entered = True
+        return self
+
+    async def __aexit__(self, *exc):
+        self.exited = True
+        return False
+
+
+@pytest.mark.anyio
+async def test_every_worker_is_drained_on_shutdown():
+    """Both workers must drain, not just one.
+
+    `--role all` runs two workers in one process. The SDK installs no
+    signal handlers of its own, so without this the pod's SIGTERM ended
+    the process outright and in-flight activities were cut mid-flight.
+    Entering each worker as a context manager and leaving the block is the
+    SDK's own shutdown path.
+    """
+    workers = [_FakeWorker(), _FakeWorker()]
+
+    async def trigger_then_run():
+        task = asyncio.create_task(run_until_signalled(workers))  # type: ignore[arg-type]
+        await asyncio.sleep(0)
+        # Stand in for the signal: the handler's only job is setting this.
+        signal.raise_signal(signal.SIGTERM)
+        await asyncio.wait_for(task, timeout=5)
+
+    await trigger_then_run()
+
+    assert all(w.entered for w in workers)
+    assert all(w.exited for w in workers)
