@@ -21,6 +21,7 @@ import pytest
 
 from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_ACTIVITIES,
+    CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
     TASK_QUEUE,
@@ -85,7 +86,11 @@ def test_slot_limits_are_set_for_the_split_roles(visibility):
     execution = worker_plan("execution", visibility)
 
     assert control.max_concurrent_activities == CONTROL_MAX_CONCURRENT_ACTIVITIES
+    assert control.max_concurrent_workflow_tasks == CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS
     assert execution.max_concurrent_activities == EXECUTION_MAX_CONCURRENT_ACTIVITIES
+    # The execution worker runs no workflows, so a workflow-task limit there
+    # would be a number with nothing to bound.
+    assert execution.max_concurrent_workflow_tasks is None
 
 
 def test_an_unknown_role_is_refused(visibility):
