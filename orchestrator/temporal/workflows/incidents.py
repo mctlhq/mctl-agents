@@ -30,9 +30,12 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
+from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
+    from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
+    from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
 
 # mctl-api operation name; maps 1:1 to the `mctl-agents-run` CWFT with
 # mode=incident-responder (see mctl-api internal/operations/registry.go).
@@ -49,6 +52,18 @@ INCIDENTS_MODE = "incident-responder"
 SDK_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 SDK_STEP_TIMEOUT = timedelta(hours=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
+
+# Registry lookup and audit write: short calls against mctl-api, not agent
+# work. Same values DevLoopWorkflow uses for the same two activities.
+FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
+FAST_ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
+ENVIRONMENT = "production"
+
+# The registry name of the agent this loop runs — agents/_manifests/
+# incident-responder/agent.yaml, published and promoted by the release
+# pipeline like every other agent.
+RESPONDER_AGENT = "incident-responder"
 
 
 @dataclass(frozen=True)
@@ -70,12 +85,100 @@ class IncidentLoopWorkflow:
         # responder failures, so Argo can report Succeeded for a run that
         # diagnosed nothing. That predates this workflow (it is what the
         # Argo cron did before it was suspended) and is tracked separately.
+        params = {"mode": INCIDENTS_MODE}
+        release: ResolvedRelease | None = None
+
+        if workflow.patched("incident-registry-and-record"):
+            # Pin the released responder image, exactly as the dev loop
+            # pins investigate/implement/shepherd. Without this the run
+            # took whatever image `cwft-mctl-agents-run` had baked in, so
+            # a promotion or a rollback in the agent registry reached
+            # every agent EXCEPT the one that runs unattended on a
+            # schedule and writes auto-accepted proposals — the one where
+            # nobody is watching the version it used.
+            #
+            # mctl-api passes parameters it does not declare straight
+            # through (ValidateInput only walks declared ones), and
+            # cwft-mctl-agents-run already declares agent_image and uses
+            # it as the container image, so this needs no change in the
+            # sibling repos — checked, rather than assumed, before
+            # writing it.
+            release = await workflow.execute_activity(
+                resolve_agent_release,
+                args=[RESPONDER_AGENT, ENVIRONMENT],
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+            if release and release.image_ref:
+                params["agent_image"] = release.image_ref
+                params["agent_version"] = f"{RESPONDER_AGENT}@{release.version}"
+            else:
+                # Deliberately NOT the dev loop's fail-closed gate. A
+                # scheduled tick has no operator waiting to read the error
+                # and republish; failing here would silently stop incident
+                # response until someone noticed the schedule going red.
+                # Running the CWFT default and saying so keeps the loop
+                # working while the missing pin stays visible in the log
+                # and in the execution record's empty version.
+                workflow.logger.warning(
+                    "no released image for %s in %s — running the CWFT's baked-in "
+                    "default; publish and promote it to pin this loop",
+                    RESPONDER_AGENT,
+                    ENVIRONMENT,
+                )
+
         responder_result: WorkflowResult = await workflow.execute_activity(
             submit_and_wait,
-            SubmitAndWaitInput(operation=INCIDENTS_OPERATION, params={"mode": INCIDENTS_MODE}),
+            SubmitAndWaitInput(operation=INCIDENTS_OPERATION, params=params),
             start_to_close_timeout=SDK_STEP_TIMEOUT,
             heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
             retry_policy=SDK_STEP_RETRY_POLICY,
         )
 
+        if workflow.patched("incident-registry-and-record"):
+            await self._record(release, responder_result)
+
         return IncidentLoopWorkflowResult(responder_result=responder_result)
+
+    async def _record(self, release: ResolvedRelease | None, result: WorkflowResult) -> None:
+        """Link this Temporal workflow to the Argo run it submitted.
+
+        #149 asks for incident runs to be traceable from a Temporal
+        workflow ID to an Argo workflow name. Until now they were not:
+        DevLoopWorkflow writes an execution record for every CWFT it
+        submits, and this loop — the one that runs unattended and resolves
+        incidents on its own — wrote none, so the only trace was a log
+        line in a pod that has since been recycled.
+
+        Best-effort for the same reason it is in the dev loop: the CWFT
+        being recorded has already finished, and letting an mctl-api blip
+        fail the tick would turn a missing audit row into a missed
+        incident response.
+        """
+        pinned = release if release and release.image_ref else None
+        try:
+            await workflow.execute_activity(
+                record_execution,
+                ExecutionRecord(
+                    temporal_workflow_id=workflow.info().workflow_id,
+                    agent=RESPONDER_AGENT,
+                    environment=ENVIRONMENT,
+                    version=pinned.version if pinned else "",
+                    image_ref=pinned.image_ref if pinned else "",
+                    # No single target repo: one run diagnoses incidents
+                    # across every service, and the proposals it writes
+                    # name their own. Empty rather than a guess.
+                    target_repo="",
+                    argo_workflow_name=result.workflow_name,
+                    phase=result.phase,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+        except ActivityError:
+            workflow.logger.warning(
+                "record_execution failed after retries for %s argo_workflow=%s — "
+                "continuing without a durable execution record for this tick",
+                RESPONDER_AGENT,
+                result.workflow_name,
+            )
