@@ -742,8 +742,63 @@ def test_taking_the_triplet_reads_everything_before_removing_anything(tmp_path, 
 
     monkeypatch.setattr(Path, "read_bytes", flaky_read)
     with pytest.raises(OSError):
-        run_issue_investigator._take_triplet(proposal_dir)
+        run_issue_investigator._take_triplet(proposal_dir, {})
 
     monkeypatch.setattr(Path, "read_bytes", real_read)
     for name in ("requirements.md", "design.md", "tasks.md"):
         assert (proposal_dir / name).read_text() == f"content {name}"
+
+
+def test_a_failed_unlink_still_hands_the_caller_what_it_read(tmp_path):
+    """The rollback needs the bytes even when _take_triplet does not return.
+
+    An unlink that raises part-way leaves files already gone. If the
+    mapping were a return value, the caller would see nothing and restore
+    nothing — so it is filled in place instead.
+    """
+    proposal_dir = tmp_path / "issue-15-x"
+    proposal_dir.mkdir(parents=True)
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (proposal_dir / name).write_text(f"content {name}")
+
+    saved: dict[str, bytes] = {}
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self, missing_ok=False):
+        if self.name == "design.md":
+            raise OSError("operation not permitted")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "unlink", flaky_unlink)
+        with pytest.raises(OSError):
+            run_issue_investigator._take_triplet(proposal_dir, saved)
+
+    assert set(saved) == {"requirements.md", "design.md", "tasks.md"}
+    run_issue_investigator._restore_triplet(proposal_dir, saved)
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        assert (proposal_dir / name).read_text() == f"content {name}"
+
+
+def test_restore_removes_a_document_that_was_not_there_before(tmp_path, monkeypatch):
+    """Restore must be an exact inverse, not just a rewrite.
+
+    If the previous proposal was incomplete and this run created the
+    missing document before failing, leaving it behind hands the next
+    reader a directory that is neither the old proposal nor a new one.
+    """
+    issue = _investigate_harness(tmp_path, monkeypatch, number=16, agent=lambda *a: None)
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / "issue-16-some-feature"
+    proposal_dir.mkdir(parents=True)
+    (proposal_dir / "requirements.md").write_text("only this one existed")
+
+    def partial_agent(repo_dir, prompt, proposal_dir):
+        (proposal_dir / "requirements.md").write_text("rewritten")
+        (proposal_dir / "design.md").write_text("brand new")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", partial_agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert (proposal_dir / "requirements.md").read_text() == "only this one existed"
+    assert not (proposal_dir / "design.md").exists()

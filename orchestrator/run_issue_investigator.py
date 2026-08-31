@@ -188,8 +188,8 @@ def build_slug(issue_number: int, title: str) -> str:
 TRIPLET = ("requirements.md", "design.md", "tasks.md")
 
 
-def _take_triplet(proposal_dir: Path) -> dict[str, bytes]:
-    """Read the existing triplet into memory AND remove it from disk.
+def _take_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
+    """Read the existing triplet into ``saved`` AND remove it from disk.
 
     Clearing the slate is what makes the post-run check honest: with the
     directory reused across investigations (#246), a plain existence check
@@ -201,27 +201,41 @@ def _take_triplet(proposal_dir: Path) -> dict[str, bytes]:
     leaving the files and comparing content hashes — cannot roll back a
     PARTIAL overwrite: an agent that rewrites one document and then dies
     on a rate limit leaves the proposal permanently half-new, and no
-    after-the-fact comparison can undo that (agy P2 on #247).
+    after-the-fact comparison can undo that.
+
+    ``saved`` is the CALLER's dict, filled in place rather than returned.
+    An unlink that fails part-way through would otherwise never return,
+    so the caller's rollback would see an empty mapping and restore
+    nothing — while files were already gone (codex P2 on #247).
     """
     # Read EVERY file before removing ANY. Interleaving them means a read
     # that fails on the third document leaves the first two already gone
     # and unrecoverable; this way the caller either holds all of them or
     # the directory is still untouched.
-    saved: dict[str, bytes] = {}
     for name in TRIPLET:
         path = proposal_dir / name
         if path.is_file():
             saved[name] = path.read_bytes()
-    for name in saved:
+    for name in list(saved):
         (proposal_dir / name).unlink(missing_ok=True)
-    return saved
 
 
 def _restore_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
-    """Put the previous investigation's documents back, byte for byte."""
-    for name, content in saved.items():
+    """Undo _take_triplet exactly — put back what was there, and only that.
+
+    Rewriting the saved files is half of it. A document that was ABSENT
+    before must also be absent after: if the previous proposal was
+    incomplete and this run created the missing document before failing,
+    leaving it behind would hand the next reader a directory that is
+    neither the old proposal nor a new one (codex P2 on #247).
+    """
+    for name in TRIPLET:
+        path = proposal_dir / name
         try:
-            (proposal_dir / name).write_bytes(content)
+            if name in saved:
+                path.write_bytes(saved[name])
+            else:
+                path.unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -690,7 +704,7 @@ def investigate(
         # a failure part-way through would leave documents removed with no
         # restore path at all (codex P2 on #247).
         if proposal_preexisted:
-            saved_triplet = _take_triplet(proposal_dir)
+            _take_triplet(proposal_dir, saved_triplet)
         # 1. Read-only clone so the agent can ground the design in real code.
         clone = _clone_repo(issue.ref.full_repo, slug)
 
@@ -754,7 +768,10 @@ def investigate(
         # Put the previous investigation back if this one did not replace
         # it. Covers the partial-overwrite case as well as the clean
         # failure: the agent may have written one document before dying.
-        if not triplet_written and saved_triplet:
+        # proposal_preexisted, not `saved_triplet` being non-empty: a
+        # directory that existed with NO triplet still needs this run's
+        # partial output cleared out of it.
+        if not triplet_written and proposal_preexisted:
             _restore_triplet(proposal_dir, saved_triplet)
         # Drop the throwaway /tmp clone — the wrapper _clone_repo returned,
         # which takes the checkout inside it with it.
