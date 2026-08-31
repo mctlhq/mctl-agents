@@ -3,7 +3,7 @@
 # 1.29.2 shipped without anyio and every implement run died on import (the
 # docker build smoke only builds, it never imports the orchestrator). Bump
 # this together with requires-python + uv.lock, never alone.
-FROM python:3.12-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
