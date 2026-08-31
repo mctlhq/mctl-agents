@@ -934,8 +934,16 @@ def test_a_failed_restore_is_not_swallowed_as_an_ordinary_result(tmp_path, monke
     # Both halves of the story reach the operator: what went wrong, and
     # that the restore then failed too.
     assert "publish failed" in str(caught.value)
-    assert isinstance(caught.value.__cause__, OSError)
-    assert "read-only fs" in str(caught.value.__cause__)
+    # The whole chain survives: the rollback failure, and under it what
+    # triggered the rollback. `raise ... from` would have set an explicit
+    # cause and suppressed this context (agy P3 on #247).
+    assert not caught.value.__suppress_context__, (
+        "an explicit `raise ... from` hides the chain in the traceback"
+    )
+    assert caught.value.__cause__ is None
+    assert isinstance(caught.value.__context__, OSError)
+    assert "read-only fs" in str(caught.value.__context__)
+    assert "publish failed" in str(caught.value.__context__.__context__)
 
     # The only surviving copy is kept, not cleaned up, and named.
     asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
@@ -1398,3 +1406,40 @@ def test_the_published_proposal_is_not_left_with_scratch_permissions(
     second = investigate(issue.ref.url, state_dir=tmp_path)
     assert second.error is None
     assert stat.S_IMODE(first.proposal_dir.stat().st_mode) == distinctive
+
+
+def test_a_deliberate_status_mode_survives_re_investigation(tmp_path, monkeypatch):
+    """A swap preserves the modes of what it replaces — the directory, and
+    .status.yaml.
+
+    write_status_yaml's own "an existing file keeps its mode" branch cannot
+    fire during publication: it writes into STAGING, which is empty, so it
+    always takes the umask default; and _carry_forward then skips
+    .status.yaml precisely because staging already has one (agy P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=39,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    status = first.proposal_dir / ".status.yaml"
+    chosen = stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP
+    os.chmod(status, chosen)
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
+    assert stat.S_IMODE(status.stat().st_mode) == chosen

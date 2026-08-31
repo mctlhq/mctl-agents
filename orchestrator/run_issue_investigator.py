@@ -890,8 +890,21 @@ def investigate(
                 # hand the proposal a scratch directory's permissions
                 # instead of the checkout's, so anything running as
                 # another user stops being able to read it (codex P2 on
-                # #247). Take the mode from what is being replaced.
+                # #247). The rule is that a swap preserves the modes of
+                # what it replaces — the directory, and .status.yaml.
+                #
+                # The status file needs saying separately because
+                # write_status_yaml's own "an existing file keeps its
+                # mode" branch cannot fire here: it writes into STAGING,
+                # which is empty, so it always takes the umask default;
+                # and _carry_forward then skips .status.yaml precisely
+                # because staging already has one. A mode someone set
+                # deliberately was silently reset by re-investigation
+                # (agy P2 on #247).
                 shutil.copymode(aside, staging)
+                old_status = aside / ".status.yaml"
+                if old_status.is_file():
+                    shutil.copymode(old_status, staging / ".status.yaml")
             else:
                 shutil.copymode(proposal_dir.parent, staging)
 
@@ -901,7 +914,7 @@ def investigate(
                 try:
                     os.replace(aside, proposal_dir)
                     aside = None
-                except BaseException as restore_error:
+                except BaseException as restore_error:  # noqa: BLE001 — see below
                     # BaseException, not OSError: a restore that fails for
                     # any other reason must still keep the copy. Catching
                     # only OSError let the outer cleanup delete the last
@@ -918,10 +931,17 @@ def investigate(
                         f"({restore_error}); the previous proposal is at {aside}",
                         file=sys.stderr,
                     )
-                    raise ProposalRestoreFailed(
+                    # No `from restore_error`: an explicit cause sets
+                    # __suppress_context__, which hides the chain Python
+                    # already built for free. Raising bare keeps
+                    # ProposalRestoreFailed -> restore_error ->
+                    # publish_error, so the traceback shows the rollback
+                    # failure AND what triggered the rollback (agy P3 on
+                    # #247).
+                    raise ProposalRestoreFailed(  # noqa: B904 — context, not cause
                         f"could not restore {proposal_dir} after {publish_error!r}; "
                         f"the only copy of the previous proposal is at {aside}"
-                    ) from restore_error
+                    )
             raise
 
         # 7. Link the proposal back to the issue. A failure here (e.g. the
