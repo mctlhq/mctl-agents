@@ -40,7 +40,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import re
@@ -191,20 +190,37 @@ def build_slug(issue_number: int, title: str) -> str:
 TRIPLET = ("requirements.md", "design.md", "tasks.md")
 
 
-def _triplet_fingerprint(proposal_dir: Path) -> dict[str, str | None]:
-    """Content hash of each triplet file, or None where it is absent.
+def _take_triplet(proposal_dir: Path) -> dict[str, bytes]:
+    """Read the existing triplet into memory AND remove it from disk.
 
-    Content rather than mtime: a coarse filesystem timestamp can be equal
-    across a fast rewrite, which would report a file the agent really did
-    write as stale. A rewrite with byte-identical content is indeed
-    indistinguishable from no write at all — and is also, for this
-    purpose, the same thing.
+    Clearing the slate is what makes the post-run check honest: with the
+    directory reused across investigations (#246), a plain existence check
+    would be satisfied by whatever the PREVIOUS run left behind, so an
+    agent that produced two of the three documents would look successful
+    and a proposal stitched from two runs would be committed as coherent.
+
+    Holding the bytes is what makes clearing it safe. The alternative —
+    leaving the files and comparing content hashes — cannot roll back a
+    PARTIAL overwrite: an agent that rewrites one document and then dies
+    on a rate limit leaves the proposal permanently half-new, and no
+    after-the-fact comparison can undo that (agy P2 on #247).
     """
-    out: dict[str, str | None] = {}
+    saved: dict[str, bytes] = {}
     for name in TRIPLET:
         path = proposal_dir / name
-        out[name] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
-    return out
+        if path.is_file():
+            saved[name] = path.read_bytes()
+            path.unlink()
+    return saved
+
+
+def _restore_triplet(proposal_dir: Path, saved: dict[str, bytes]) -> None:
+    """Put the previous investigation's documents back, byte for byte."""
+    for name, content in saved.items():
+        try:
+            (proposal_dir / name).write_bytes(content)
+        except OSError:
+            pass
 
 
 class ProposalAmbiguityError(RuntimeError):
@@ -286,18 +302,32 @@ def _load_status(path: Path) -> dict:
 
 
 def _clone_repo(full_repo: str, slug: str) -> Path:
-    """Read-only `gh repo clone` of the target repo to a fresh tmp dir."""
-    # mkdtemp, not a hand-built predictable path: the old
-    # /tmp/investigate-<slug>-<timestamp> was guessable, and anything
-    # sharing /tmp could pre-create it as a symlink or file so the
-    # rmtree below died with NotADirectoryError (agy P2 on #247).
-    # mkdtemp creates the directory atomically, 0700, with a random
-    # suffix — nothing to collide with and nothing to clean up first.
-    target = Path(tempfile.mkdtemp(prefix=f"investigate-{slug}-"))
-    target.rmdir()  # gh repo clone insists on a non-existent destination
+    """Read-only `gh repo clone` of the target repo.
+
+    Returns the mkdtemp WRAPPER; the checkout is at `<wrapper>/repo`. The
+    caller deletes exactly what it was given, rather than reaching for a
+    parent directory it does not own — deleting `clone.parent` works only
+    as long as every caller and stub happens to nest the clone one level
+    deep, and silently wipes the surrounding directory when one does not.
+
+    The wrapper is the whole point. `gh repo clone` needs a destination
+    that does not exist, so a directory created for it must be one an
+    attacker cannot pre-empt. The original code guessed a path
+    (/tmp/investigate-<slug>-<timestamp>) that anything sharing /tmp could
+    predict and pre-create. Calling mkdtemp and then rmdir'ing its result
+    is worse, not better: it opens a window between the delete and the
+    clone in which the path can be replaced by a symlink, and the clone
+    then lands wherever the symlink points — code the agent will read and
+    treat as ground truth (agy P1 on #247).
+
+    Cloning INTO the mkdtemp directory keeps its atomic, 0700, unguessable
+    creation and still hands git a fresh path: /repo inside a directory
+    only this process can enter.
+    """
+    wrapper = Path(tempfile.mkdtemp(prefix=f"investigate-{slug}-"))
     # Shallow — the investigator only reads the current tree, never history.
-    _run(["gh", "repo", "clone", full_repo, str(target), "--", "--depth=1"])
-    return target
+    _run(["gh", "repo", "clone", full_repo, str(wrapper / "repo"), "--", "--depth=1"])
+    return wrapper
 
 
 def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
@@ -623,14 +653,11 @@ def investigate(
     # `proposed` proposal). If it did NOT, a failure path must roll it back
     # so a half-written orphan is never committed to gitops main.
     proposal_preexisted = proposal_dir.exists()
-    # Fingerprint the triplet BEFORE the agent runs. Re-investigation now
-    # reuses the directory (#246), so a file left by a PREVIOUS run would
-    # otherwise satisfy the "did the agent write it?" check below and a
-    # proposal assembled from two different runs would be committed as if
-    # it were coherent (agy P2 on #247). Deleting the files up front is the
-    # obvious fix and the wrong one: an agent failure would then destroy a
-    # good proposal that the rollback below deliberately preserves.
-    before = _triplet_fingerprint(proposal_dir)
+    # Take the previous run's documents off disk and hold them, so the
+    # check below sees only what THIS run wrote and a failure can put the
+    # old proposal back exactly as it was. See _take_triplet.
+    saved_triplet = _take_triplet(proposal_dir) if proposal_preexisted else {}
+    triplet_written = False
     clone = None
     try:
         # 1. Read-only clone so the agent can ground the design in real code.
@@ -641,21 +668,18 @@ def investigate(
 
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.
         prompt = _build_prompt(issue, service, slug)
-        anyio.run(_run_agent, clone, prompt, proposal_dir.resolve())
+        anyio.run(_run_agent, clone / "repo", prompt, proposal_dir.resolve())
 
-        # 4. Verify THIS run produced the triplet — not merely that the
-        #    files exist, which a previous run's leftovers would also
-        #    satisfy on a reused directory.
-        after = _triplet_fingerprint(proposal_dir)
-        missing = [
-            name for name in TRIPLET
-            if after.get(name) is None or after[name] == before.get(name)
-        ]
+        # 4. Verify the agent produced the triplet. Plain existence is
+        #    sufficient now: _take_triplet emptied the directory first, so
+        #    anything here was written by this run.
+        missing = [name for name in TRIPLET if not (proposal_dir / name).is_file()]
         if missing:
             return InvestigateResult(
                 service, slug, proposal_dir,
                 error=f"agent did not write: {', '.join(missing)}",
             )
+        triplet_written = True
 
         # 5. Write .status.yaml (status: proposed + source block). After this
         # the proposal is complete and durable on disk.
@@ -691,8 +715,14 @@ def investigate(
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
     finally:
-        # Drop the throwaway /tmp clone.
-        if clone and clone.exists():
+        # Put the previous investigation back if this one did not replace
+        # it. Covers the partial-overwrite case as well as the clean
+        # failure: the agent may have written one document before dying.
+        if not triplet_written and saved_triplet:
+            _restore_triplet(proposal_dir, saved_triplet)
+        # Drop the throwaway /tmp clone — the wrapper _clone_repo returned,
+        # which takes the checkout inside it with it.
+        if clone is not None and clone.exists():
             try:
                 shutil.rmtree(clone)
             except OSError:
