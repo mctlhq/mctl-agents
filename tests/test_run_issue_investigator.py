@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import subprocess
 import types
-from pathlib import Path
 
 import anyio
 import pytest
@@ -492,13 +491,14 @@ def _investigate_harness(tmp_path, monkeypatch, *, agent, number=7, title="Some 
 
 
 def test_a_previous_runs_files_do_not_count_as_this_runs_output(tmp_path, monkeypatch):
-    """The staleness hole a reused proposal directory opened (#247, agy P2).
+    """The staleness hole a reused proposal directory opened (#246).
 
-    Re-investigation now writes into the directory the first run created.
-    A mere existence check would then be satisfied by whatever the FIRST
-    run left there — so an agent that produced only two of the three docs
-    would look successful, and a proposal stitched together from two
-    different runs would be committed as if it were coherent.
+    Once re-investigation writes into the directory the first run created,
+    an existence check against that directory is satisfied by whatever the
+    FIRST run left there — so an agent producing two of the three
+    documents looks successful and a proposal stitched from two runs is
+    committed as if it were coherent. Staging closes it by construction:
+    the check runs against a directory that starts empty.
     """
     issue = _investigate_harness(
         tmp_path, monkeypatch,
@@ -543,14 +543,13 @@ def test_an_identical_rewrite_is_accepted(tmp_path, monkeypatch):
     assert investigate(issue.ref.url, state_dir=tmp_path).error is None
 
 
-def test_a_partial_overwrite_restores_the_previous_proposal(tmp_path, monkeypatch):
-    """A crash mid-write must leave the old proposal exactly as it was.
+def test_a_partial_overwrite_leaves_the_previous_proposal_untouched(tmp_path, monkeypatch):
+    """An agent that dies mid-write must not leave the proposal half-new.
 
-    This is the case a compare-after-the-fact check could not handle at
-    all: an agent that rewrites one document and then dies on a rate limit
-    leaves the directory permanently half-new, and the existing rollback
-    skips a directory it did not create. Holding the bytes is what makes
-    clearing the directory safe.
+    The live documents are never opened by the agent, so there is nothing
+    to half-overwrite and nothing to restore — the previous proposal is
+    untouched because it was never in the write path, not because a
+    rollback put it back.
     """
     issue = _investigate_harness(
         tmp_path, monkeypatch, number=9,
@@ -664,12 +663,13 @@ def test_a_failed_clone_leaves_no_temp_directory_behind(tmp_path, monkeypatch):
     assert list(tmp_path.glob("investigate-*")) == []
 
 
-def test_a_failed_status_write_restores_the_previous_proposal(tmp_path, monkeypatch):
-    """The replacement is complete only once .status.yaml is durable.
+def test_a_failed_status_write_publishes_nothing(tmp_path, monkeypatch):
+    """A failed status write must publish nothing, not new-docs-old-status.
 
-    Marking success at the triplet check instead would strand a proposal
-    whose new documents landed but whose status write then failed — the
-    restore skipped, new docs paired with the old status.
+    .status.yaml is written into staging alongside the documents, so a
+    failure there means the whole set is abandoned. Writing it after the
+    documents were already live would leave the new documents paired with
+    the previous run's status.
     """
     issue = _investigate_harness(
         tmp_path, monkeypatch, number=12,
@@ -723,117 +723,51 @@ def test_status_write_is_atomic_and_leaves_no_debris(tmp_path, monkeypatch):
     # ...and the aborted attempt left no temp file behind for the CWFT to commit.
     assert [p.name for p in proposal_dir.iterdir()] == [".status.yaml"]
 
+def test_staging_lives_where_the_gitops_commit_cannot_reach_it(tmp_path):
+    """A leftover staging directory must not be committable.
 
-def test_taking_the_triplet_reads_everything_before_removing_anything(tmp_path, monkeypatch):
-    """A read that fails on the third document must not have destroyed the
-    first two — the caller either holds all of them or the directory is
-    still untouched."""
-    proposal_dir = tmp_path / "issue-14-x"
-    proposal_dir.mkdir(parents=True)
-    for name in ("requirements.md", "design.md", "tasks.md"):
-        (proposal_dir / name).write_text(f"content {name}")
+    The investigate CWFT stages with
+    `git add ':(glob)platform-gitops/agents-state/*/proposals/*/**'`, so
+    anything under `proposals/` would be swept into a commit if a hard
+    kill left it behind. One level up is outside that pathspec.
 
-    real_read = Path.read_bytes
-
-    def flaky_read(self):
-        if self.name == "tasks.md":
-            raise OSError("I/O error")
-        return real_read(self)
-
-    monkeypatch.setattr(Path, "read_bytes", flaky_read)
-    with pytest.raises(OSError):
-        run_issue_investigator._take_triplet(proposal_dir, {})
-
-    monkeypatch.setattr(Path, "read_bytes", real_read)
-    for name in ("requirements.md", "design.md", "tasks.md"):
-        assert (proposal_dir / name).read_text() == f"content {name}"
-
-
-def test_a_failed_unlink_still_hands_the_caller_what_it_read(tmp_path):
-    """The rollback needs the bytes even when _take_triplet does not return.
-
-    An unlink that raises part-way leaves files already gone. If the
-    mapping were a return value, the caller would see nothing and restore
-    nothing — so it is filled in place instead.
+    It also has to be on the proposal's own filesystem — os.replace is
+    atomic only within one — which /tmp is not in the CWFT pod.
     """
-    proposal_dir = tmp_path / "issue-15-x"
-    proposal_dir.mkdir(parents=True)
-    for name in ("requirements.md", "design.md", "tasks.md"):
-        (proposal_dir / name).write_text(f"content {name}")
+    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / "issue-20-x"
 
-    saved: dict[str, bytes | None] = {}
-    real_unlink = Path.unlink
+    staging = run_issue_investigator._staging_dir(proposal_dir)
 
-    def flaky_unlink(self, missing_ok=False):
-        if self.name == "design.md":
-            raise OSError("operation not permitted")
-        return real_unlink(self, missing_ok=missing_ok)
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(Path, "unlink", flaky_unlink)
-        with pytest.raises(OSError):
-            run_issue_investigator._take_triplet(proposal_dir, saved)
-
-    assert set(saved) == {"requirements.md", "design.md", "tasks.md"}
-    assert all(v is not None for v in saved.values())
-    run_issue_investigator._restore_triplet(proposal_dir, saved)
-    for name in ("requirements.md", "design.md", "tasks.md"):
-        assert (proposal_dir / name).read_text() == f"content {name}"
+    assert "proposals" not in staging.relative_to(tmp_path).parts
+    assert staging.parent == tmp_path / "mctl-telegram"
 
 
-def test_restore_removes_a_document_that_was_not_there_before(tmp_path, monkeypatch):
-    """Restore must be an exact inverse, not just a rewrite.
+def test_a_failing_agent_never_touches_the_live_proposal(tmp_path, monkeypatch):
+    """The property the whole redesign buys: the agent writes elsewhere.
 
-    If the previous proposal was incomplete and this run created the
-    missing document before failing, leaving it behind hands the next
-    reader a directory that is neither the old proposal nor a new one.
+    Nothing needs backing up or restoring, because the live documents are
+    never in the write path at all.
     """
-    issue = _investigate_harness(tmp_path, monkeypatch, number=16, agent=lambda *a: None)
-    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / "issue-16-some-feature"
-    proposal_dir.mkdir(parents=True)
-    (proposal_dir / "requirements.md").write_text("only this one existed")
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=21,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"good {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    before = {p.name: p.read_text() for p in first.proposal_dir.iterdir() if p.is_file()}
 
-    def partial_agent(repo_dir, prompt, proposal_dir):
-        (proposal_dir / "requirements.md").write_text("rewritten")
-        (proposal_dir / "design.md").write_text("brand new")
+    def hostile_agent(repo_dir, prompt, proposal_dir):
+        (proposal_dir / "requirements.md").write_text("garbage")
+        raise RateLimitExhaustedError("SDK reported api_error_status=429: boom")
 
-    monkeypatch.setattr(run_issue_investigator, "_run_agent", partial_agent)
-    result = investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", hostile_agent)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
 
-    assert result.error is not None
-    assert (proposal_dir / "requirements.md").read_text() == "only this one existed"
-    assert not (proposal_dir / "design.md").exists()
-
-
-def test_a_read_failure_does_not_let_the_rollback_delete_the_proposal(tmp_path, monkeypatch):
-    """The rollback must never destroy a document it never observed.
-
-    A read that fails on the second document leaves the third unobserved.
-    Treating "not in the mapping" as "was not there" made _restore_triplet
-    unlink it — so an I/O blip during the backup silently and permanently
-    deleted the very proposal the backup exists to protect.
-
-    Tested through investigate(), not against _take_triplet alone: the
-    isolated test passed while this failed, because the destruction
-    happens in the rollback that only the real call path reaches.
-    """
-    issue = _investigate_harness(tmp_path, monkeypatch, number=17, agent=lambda *a: None)
-    proposal_dir = tmp_path / "mctl-telegram" / "proposals" / "issue-17-some-feature"
-    proposal_dir.mkdir(parents=True)
-    for name in ("requirements.md", "design.md", "tasks.md"):
-        (proposal_dir / name).write_text(f"precious {name}")
-
-    real_read = Path.read_bytes
-
-    def flaky_read(self):
-        if self.name == "design.md":
-            raise OSError("transient I/O error")
-        return real_read(self)
-
-    monkeypatch.setattr(Path, "read_bytes", flaky_read)
-    result = investigate(issue.ref.url, state_dir=tmp_path)
-    monkeypatch.setattr(Path, "read_bytes", real_read)
-
-    assert result.error is not None
-    for name in ("requirements.md", "design.md", "tasks.md"):
-        assert (proposal_dir / name).read_text() == f"precious {name}"
+    assert second.rate_limited is True
+    after = {p.name: p.read_text() for p in first.proposal_dir.iterdir() if p.is_file()}
+    assert after == before
+    # ...and no staging directory survived the run.
+    assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []

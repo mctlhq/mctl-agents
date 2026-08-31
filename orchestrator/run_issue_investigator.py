@@ -16,12 +16,15 @@ Pipeline for one issue:
        clobbered. A missing file or `proposed` status is overwritable.
     5. `gh repo clone mctlhq/<service>` (read-only) so the agent can ground
        the design in real code.
-    6. Run the Claude Agent SDK: the agent reads the issue (passed in the
-       prompt) + the cloned code and writes requirements.md / design.md /
-       tasks.md into $PROPOSAL_DIR.
-    7. Write .status.yaml — `status: proposed` plus a `source` block linking
-       the proposal back to the GitHub issue, and a `control` block marking
-       it as requiring human approval.
+    6. Run the Claude Agent SDK against a STAGING directory: the agent reads
+       the issue (passed in the prompt) + the cloned code and writes
+       requirements.md / design.md / tasks.md there, never into the live
+       proposal. Write .status.yaml into staging too.
+    7. Publish: once all three documents exist, rename staging's files over
+       the live ones (same filesystem, so each rename is atomic), status
+       last. Until that point the existing proposal is untouched, so a
+       crash, a rate limit or a kill cannot leave it half-replaced —
+       there is nothing to back up and nothing to restore.
     8. Comment on the issue with a link to the proposal.
 
 The proposal stops at `status: proposed`. A human reviews the spec and flips
@@ -188,71 +191,22 @@ def build_slug(issue_number: int, title: str) -> str:
 TRIPLET = ("requirements.md", "design.md", "tasks.md")
 
 
-def _take_triplet(proposal_dir: Path, saved: dict[str, bytes | None]) -> None:
-    """Read the existing triplet into ``saved`` AND remove it from disk.
+def _staging_dir(proposal_dir: Path) -> Path:
+    """A scratch directory for the agent's output, beside the live proposal.
 
-    Clearing the slate is what makes the post-run check honest: with the
-    directory reused across investigations (#246), a plain existence check
-    would be satisfied by whatever the PREVIOUS run left behind, so an
-    agent that produced two of the three documents would look successful
-    and a proposal stitched from two runs would be committed as coherent.
+    Under ``agents-state/<service>/``, deliberately NOT under
+    ``proposals/``: the investigate CWFT stages with
+    ``git add ':(glob)platform-gitops/agents-state/*/proposals/*/**'``, so
+    a staging directory one level up cannot be committed even if a hard
+    kill leaves it behind.
 
-    Holding the bytes is what makes clearing it safe. The alternative —
-    leaving the files and comparing content hashes — cannot roll back a
-    PARTIAL overwrite: an agent that rewrites one document and then dies
-    on a rate limit leaves the proposal permanently half-new, and no
-    after-the-fact comparison can undo that.
-
-    ``saved`` is the CALLER's dict, filled in place rather than returned.
-    An unlink that fails part-way through would otherwise never return,
-    so the caller's rollback would see an empty mapping and restore
-    nothing — while files were already gone (codex P2 on #247).
-
-    Absence is recorded explicitly as None rather than by omission. A
-    name missing from the mapping means "never observed", which is not
-    the same claim at all: a read that fails on the second document
-    leaves the third unobserved, and treating that as "was not there"
-    would have _restore_triplet delete a file it never saw (agy P1 on
-    #247) — data loss caused by the rollback itself.
+    Same filesystem as the proposal, which is the point — ``os.replace``
+    is only atomic within one filesystem, and /tmp is a different one in
+    the CWFT pod.
     """
-    # Read EVERY file before removing ANY. Interleaving them means a read
-    # that fails on the third document leaves the first two already gone
-    # and unrecoverable; this way the caller either holds all of them or
-    # the directory is still untouched.
-    for name in TRIPLET:
-        path = proposal_dir / name
-        if not path.is_file():
-            saved[name] = None
-            continue
-        saved[name] = path.read_bytes()
-    for name, content in saved.items():
-        if content is not None:
-            (proposal_dir / name).unlink(missing_ok=True)
-
-
-def _restore_triplet(proposal_dir: Path, saved: dict[str, bytes | None]) -> None:
-    """Undo _take_triplet exactly — restore what was observed, only that.
-
-    Rewriting the saved files is half of it. A document recorded as ABSENT
-    must also be absent after: if the previous proposal was incomplete and
-    this run created the missing document before failing, leaving it
-    behind would hand the next reader a directory that is neither the old
-    proposal nor a new one (codex P2 on #247).
-
-    Iterating the MAPPING rather than TRIPLET is the other half. A name
-    _take_triplet never got to observe must be left strictly alone —
-    deleting it on the assumption it was absent is how a rollback becomes
-    the thing that destroys the proposal (agy P1 on #247).
-    """
-    for name, content in saved.items():
-        path = proposal_dir / name
-        try:
-            if content is not None:
-                path.write_bytes(content)
-            else:
-                path.unlink(missing_ok=True)
-        except OSError:
-            pass
+    service_dir = proposal_dir.parent.parent
+    service_dir.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(dir=service_dir, prefix=".staging-"))
 
 
 class ProposalAmbiguityError(RuntimeError):
@@ -708,49 +662,57 @@ def investigate(
     # `proposed` proposal). If it did NOT, a failure path must roll it back
     # so a half-written orphan is never committed to gitops main.
     proposal_preexisted = proposal_dir.exists()
-    # Take the previous run's documents off disk and hold them, so the
-    # check below sees only what THIS run wrote and a failure can put the
-    # old proposal back exactly as it was. See _take_triplet.
-    saved_triplet: dict[str, bytes | None] = {}
-    triplet_written = False
     clone = None
+    staging = None
     try:
-        # Inside the try, so the finally below covers it: taken outside,
-        # a failure part-way through would leave documents removed with no
-        # restore path at all (codex P2 on #247).
-        if proposal_preexisted:
-            _take_triplet(proposal_dir, saved_triplet)
         # 1. Read-only clone so the agent can ground the design in real code.
         clone = _clone_repo(issue.ref.full_repo, slug)
 
-        # 2. Pre-create the proposal dir (add_dirs needs it to exist).
-        proposal_dir.mkdir(parents=True, exist_ok=True)
+        # 2. The agent writes into STAGING, never into the live proposal.
+        #    Everything downstream follows from that: the existing
+        #    documents are not touched until a complete new set exists, so
+        #    there is nothing to back up, nothing to restore, and no
+        #    failure — a crash, a rate limit, a kill — that can leave the
+        #    proposal half-replaced. The previous design took the documents
+        #    off disk first and put them back on failure; every round of
+        #    review found another way for that inverse to be wrong.
+        staging = _staging_dir(proposal_dir)
 
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.
         prompt = _build_prompt(issue, service, slug)
-        anyio.run(_run_agent, clone / "repo", prompt, proposal_dir.resolve())
+        anyio.run(_run_agent, clone / "repo", prompt, staging.resolve())
 
-        # 4. Verify the agent produced the triplet. Plain existence is
-        #    sufficient now: _take_triplet emptied the directory first, so
-        #    anything here was written by this run.
-        missing = [name for name in TRIPLET if not (proposal_dir / name).is_file()]
+        # 4. Verify the agent produced the triplet. Staging is empty at the
+        #    start of every run, so existence here proves THIS run wrote it
+        #    — no comparison against the previous run needed.
+        missing = [name for name in TRIPLET if not (staging / name).is_file()]
         if missing:
             return InvestigateResult(
                 service, slug, proposal_dir,
                 error=f"agent did not write: {', '.join(missing)}",
             )
 
-        # 5. Write .status.yaml (status: proposed + source block). After this
-        # the proposal is complete and durable on disk.
-        write_status_yaml(proposal_dir, issue)
-        # Only now is the replacement complete. Setting this at the triplet
-        # check instead would strand a proposal whose new documents landed
-        # but whose .status.yaml write then failed: the restore would be
-        # skipped and the new docs left paired with the old status (codex
-        # P2 on #247).
-        triplet_written = True
+        # 5. Write .status.yaml into STAGING as well, so a failure there
+        #    publishes nothing at all rather than leaving the new
+        #    documents paired with the previous run's status.
+        write_status_yaml(staging, issue)
 
-        # 6. Link the proposal back to the issue. A failure here (e.g. the
+        # 6. Publish: rename each file over its live counterpart. Same
+        #    filesystem, so each replace is atomic and a reader never sees
+        #    a partially written document. Everything the agent produced
+        #    moves, not just the triplet, matching what it could write
+        #    directly before. .status.yaml goes LAST: its presence is what
+        #    marks the proposal complete and suppresses the rollback
+        #    below, so it must not appear before the documents it
+        #    describes.
+        proposal_dir.mkdir(parents=True, exist_ok=True)
+        produced = sorted(f for f in staging.iterdir() if f.is_file())
+        for f in [p for p in produced if p.name != ".status.yaml"]:
+            os.replace(f, proposal_dir / f.name)
+        for f in [p for p in produced if p.name == ".status.yaml"]:
+            os.replace(f, proposal_dir / f.name)
+
+        # 7. Link the proposal back to the issue. A failure here (e.g. the
         # token lacks `issues: write`) must NOT mark the investigation as
         # failed — the proposal is already written and re-running is
         # idempotent on `proposed`. Downgrade to a warning.
@@ -780,14 +742,11 @@ def investigate(
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
     finally:
-        # Put the previous investigation back if this one did not replace
-        # it. Covers the partial-overwrite case as well as the clean
-        # failure: the agent may have written one document before dying.
-        # proposal_preexisted, not `saved_triplet` being non-empty: a
-        # directory that existed with NO triplet still needs this run's
-        # partial output cleared out of it.
-        if not triplet_written and proposal_preexisted:
-            _restore_triplet(proposal_dir, saved_triplet)
+        # Drop the staging directory. Whatever the agent left there is
+        # this run's work and either landed in step 5 or is being
+        # abandoned; either way the live proposal was never touched.
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
         # Drop the throwaway /tmp clone — the wrapper _clone_repo returned,
         # which takes the checkout inside it with it.
         if clone is not None and clone.exists():
