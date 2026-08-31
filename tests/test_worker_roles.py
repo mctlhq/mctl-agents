@@ -18,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import signal
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest
 
+from orchestrator.temporal import worker as worker_module
 from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_ACTIVITIES,
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
@@ -207,24 +209,72 @@ async def test_a_worker_dying_alone_takes_the_process_down():
     assert healthy.shut_down
 
 
-def test_the_sdk_context_manager_really_starts_and_drains_a_worker():
-    """Pin the SDK contract run_until_signalled depends on.
+@pytest.mark.anyio
+async def test_a_survivor_that_will_not_drain_cannot_hold_the_crash_open():
+    """The crash path must not wait on a drain nobody is timing.
 
-    `async with worker:` is what starts polling here — `Worker.__aenter__`
-    is documented as "a wrapper around run()" and schedules `self.run()`,
-    and `__aexit__` awaits `shutdown()`. Reviewed as a P1 on the claim
-    that Worker implements no context-manager protocol and that the
-    process would therefore start and do nothing; it does, and it would
-    not. But the fake above cannot tell the difference, so if a future SDK
-    upgrade changed this the fake would keep passing while production
-    silently stopped polling.
+    A worker died with no signal, so there was no SIGTERM and there is no
+    SIGKILL coming either. A survivor whose shutdown does not return
+    therefore parks the process in exactly the state the crash exists to
+    escape: Running, healthy-looking, one queue unpolled. Today every
+    activity is async and unwinds on the first await, so the drain is
+    quick — but that is a property of the activity set, not of this
+    function (agy P1 on #249).
+    """
+    class _StuckWorker(_FakeWorker):
+        async def shutdown(self) -> None:
+            self.shut_down = True
+            await asyncio.Event().wait()  # never returns
 
-    Asserting on source is deliberate. The behaviour needs a live Temporal
-    to exercise, and the thing worth catching is the SDK changing under us
-    — at which point this fails and says to go re-read it.
+    stuck = _StuckWorker()
+    doomed = _FakeWorker(fail_with=RuntimeError("connection lost"))
+
+    with mock.patch.object(worker_module, "CRASH_DRAIN_TIMEOUT_SECONDS", 0.05):
+        with pytest.raises(RuntimeError, match="connection lost"):
+            await asyncio.wait_for(
+                run_until_signalled([stuck, doomed]),  # type: ignore[arg-type]
+                timeout=5,
+            )
+
+    assert stuck.shut_down, "the drain should still be attempted, just not waited on"
+
+
+@pytest.mark.anyio
+async def test_a_worker_that_stops_polling_without_an_error_is_still_fatal():
+    """`run()` returning cleanly is not a healthy state without a signal.
+
+    Nothing raises, so the exception check above sees nothing to re-raise
+    — and the queue has still stopped being polled, with only a restart to
+    resume it.
+    """
+    class _QuietlyStoppingWorker(_FakeWorker):
+        async def run(self) -> None:
+            self.ran = True
+
+    with pytest.raises(RuntimeError, match="stopped polling without raising"):
+        await asyncio.wait_for(
+            run_until_signalled([_FakeWorker(), _QuietlyStoppingWorker()]),  # type: ignore[arg-type]
+            timeout=5,
+        )
+
+
+def test_the_sdk_still_offers_the_run_shutdown_pair_this_module_drives():
+    """Pin the SDK surface run_until_signalled actually calls.
+
+    `_FakeWorker` cannot tell the difference if a future SDK upgrade moves
+    this: the fake would keep passing while production stopped polling.
+    So the contract worth pinning is the one production depends on —
+    `run()` to poll and `shutdown()` to drain, both awaitable.
+
+    This deliberately does NOT pin `__aenter__`/`__aexit__` any more. It
+    did while the code used `async with`; the code now drives run() and
+    shutdown() directly, and a test guarding an API this module never
+    calls would fail the build over an SDK change that cannot affect us
+    (agy P2 on #249).
     """
     from temporalio.worker import Worker
 
-    assert "__aenter__" in vars(Worker), "Worker no longer defines its own __aenter__"
-    assert "await self.run()" in inspect.getsource(Worker.__aenter__)
-    assert "await self.shutdown()" in inspect.getsource(Worker.__aexit__)
+    for name in ("run", "shutdown"):
+        member = getattr(Worker, name, None)
+        assert member is not None, f"Worker no longer has {name}()"
+        assert inspect.iscoroutinefunction(member), f"Worker.{name}() is no longer awaitable"

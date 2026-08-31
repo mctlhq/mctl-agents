@@ -148,7 +148,25 @@ histories that record the patch, which is why it is last and alone.
     worker keeps the process alive and healthy-looking while reconcile,
     intake and every DevLoop go dark — and nothing restarts, because
     nothing crashed. The signal is raced against the run tasks and a
-    worker's failure is re-raised.
+    worker's failure is re-raised. A `run()` that returns cleanly with no
+    signal is fatal too: nothing raised, and that queue has still stopped
+    being polled.
+  - **Draining on the crash path is capped, on the signal path is not.**
+    A signalled shutdown has Kubernetes holding the stopwatch — SIGTERM
+    now, SIGKILL at the end of the grace period. A crash has neither, so
+    an unbounded drain of the survivors can park the process in the exact
+    state the crash exists to escape. Capped at 20 s there; the restart,
+    not the drain, is the fix.
+- **No `graceful_shutdown_timeout` is set, deliberately.** The SDK
+  default of 0 means `shutdown()` cancels in-flight activities rather
+  than waiting for them. That is the behaviour we want: `submit_and_wait`
+  polls an Argo run for up to two hours, which no Kubernetes grace period
+  will ever accommodate, and Temporal reschedules the cancelled activity
+  on another worker — the Argo run itself is untouched and the retry
+  resumes polling it from the heartbeat rather than resubmitting. A
+  non-zero window would delay every rollout to no end. Recorded here
+  because it has been raised twice as an oversight (codex P2, claude P3
+  on #249); it is a choice, not a gap.
 - `--role all` remains supported indefinitely, for local development and
   as the rollback target. It is not deprecated — and because it is the
   rollback target for a state where routing has ALREADY flipped, it runs

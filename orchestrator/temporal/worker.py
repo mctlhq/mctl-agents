@@ -72,6 +72,13 @@ INCIDENTS_WORKFLOW_ID = "incidents-mctl-agents"
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
+# How long to let the surviving workers drain when a worker died on its own
+# rather than on a signal. Short on purpose: on that path the drain is a
+# courtesy and the restart is the fix, so the cap only has to be long enough
+# for cancelled activities to unwind. A signalled shutdown is not capped —
+# there Kubernetes already holds the stopwatch.
+CRASH_DRAIN_TIMEOUT_SECONDS = 20.0
+
 
 async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, label: str) -> None:
     """Create the schedule, or converge an existing one's spec to `desired`.
@@ -391,19 +398,58 @@ async def run_until_signalled(workers: list[Worker]) -> None:
     run_tasks = [asyncio.create_task(worker.run()) for worker in workers]
     signal_task = asyncio.create_task(shutdown.wait())
     try:
-        await asyncio.wait([*run_tasks, signal_task], return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            [*run_tasks, signal_task], return_when=asyncio.FIRST_COMPLETED
+        )
     finally:
         signal_task.cancel()
 
-    logger.info("draining %d worker(s)", len(workers))
+    crashed = signal_task not in done
+    if crashed:
+        # Nobody asked for this shutdown, so nothing is holding a stopwatch
+        # over it: there was no SIGTERM, so there is no SIGKILL coming 30 s
+        # later either. An unbounded drain here can only end one way — the
+        # pod stays Running with a queue nobody polls, which is the exact
+        # state the race above exists to escape. Every activity is async
+        # today and dies on the first await after cancellation, so the
+        # drain is quick; that is a property of the current activity set,
+        # not of this function, and one sync activity would silently make
+        # it untrue (agy P1 on #249, whose reasoning assumed the drain
+        # already blocks for hours — it does not, but nothing stops it
+        # from starting to).
+        logger.error(
+            "a worker stopped on its own; draining with a %ss cap, then crashing",
+            CRASH_DRAIN_TIMEOUT_SECONDS,
+        )
+    else:
+        logger.info("draining %d worker(s)", len(workers))
+
     # shutdown() is safe to call repeatedly and on a worker that already
     # stopped, so this needs no bookkeeping about which one finished first.
-    await asyncio.gather(*(worker.shutdown() for worker in workers), return_exceptions=True)
-    results = await asyncio.gather(*run_tasks, return_exceptions=True)
+    timeout = CRASH_DRAIN_TIMEOUT_SECONDS if crashed else None
+    drain = asyncio.gather(
+        *(worker.shutdown() for worker in workers), return_exceptions=True
+    )
+    try:
+        await asyncio.wait_for(drain, timeout)
+        await asyncio.wait(run_tasks, timeout=timeout)
+    except TimeoutError:  # asyncio.TimeoutError is an alias since 3.11
+        logger.error("workers did not drain within %ss; crashing without them", timeout)
 
-    for result in results:
-        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-            raise result
+    for task in run_tasks:
+        if not task.done() or task.cancelled():
+            continue
+        exc = task.exception()
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            raise exc
+
+    if crashed:
+        # run() returning cleanly without a signal is still fatal: that
+        # queue has stopped being polled and only a restart resumes it.
+        raise RuntimeError(
+            "a worker stopped polling without raising and without a shutdown "
+            "signal — crashing so the pod restarts"
+        )
 
 
 
