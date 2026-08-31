@@ -232,15 +232,36 @@ def _carry_forward(live: Path, staging: Path) -> None:
     directory, new file of the same name, or the reverse): staging holds
     this run's output, and carry-forward exists to preserve what the run
     did not touch, never to overrule what it did.
+
+    Symlinks are copied AS symlinks and never followed, on either side.
+    Both halves matter, and neither is hypothetical once you accept that
+    the agent's output is attacker-influenced through the issue body it
+    is handed (agy P1 on #247):
+
+    * ``shutil.copytree`` dereferences by default, so a link left in the
+      proposal pointing at, say, ``/etc`` would have its TARGET's contents
+      copied into staging as ordinary files — and then committed to the
+      gitops repo by the CWFT. Exfiltration by ordinary re-investigation.
+    * ``Path.exists()`` follows too, so a BROKEN link in staging reads as
+      absent, and the copy underneath it opens the link for writing and
+      lands wherever it points. Arbitrary write outside the proposal.
+
+    Hence ``is_symlink() or exists()`` for the occupancy test, and a
+    recursion guard that insists both sides are real directories.
     """
     for kept in live.iterdir():
         target = staging / kept.name
-        if kept.is_dir() and target.is_dir():
+        if (
+            kept.is_dir() and not kept.is_symlink()
+            and target.is_dir() and not target.is_symlink()
+        ):
             _carry_forward(kept, target)
-        elif target.exists():
+        elif target.is_symlink() or target.exists():
             continue
+        elif kept.is_symlink():
+            os.symlink(os.readlink(kept), target)
         elif kept.is_dir():
-            shutil.copytree(kept, target)
+            shutil.copytree(kept, target, symlinks=True)
         else:
             shutil.copy2(kept, target)
 
@@ -748,28 +769,6 @@ def investigate(
         #    Anything the agent did not rewrite is carried into staging
         #    first, so the swap does not silently drop files a previous
         #    investigation left behind.
-        if proposal_dir.is_dir():
-            # Re-read the status. The guard at the top of this function ran
-            # BEFORE an agent call that takes minutes, and approval is a
-            # human action that can land inside that window: the flip to
-            # `accepted` is exactly what someone does while reading the
-            # proposal. Swapping a freshly-generated `proposed` status over
-            # it would silently revoke a human approval and strand the
-            # implementer, which no later step could detect (agy P2 on
-            # #247). Cheap to check, and the only moment it is meaningful
-            # is here, immediately before the swap.
-            live_status = _load_status(proposal_dir / ".status.yaml").get("status")
-            if live_status and live_status not in _OVERWRITABLE_STATUSES:
-                return InvestigateResult(
-                    service, slug, proposal_dir,
-                    error=(
-                        f"proposal advanced to '{live_status}' while the agent "
-                        "was running — refusing to overwrite it"
-                    ),
-                )
-
-            _carry_forward(proposal_dir, staging)
-
         #    Rename the live proposal aside, move staging into its place,
         #    and put the original back if that second rename fails. Two
         #    renames rather than one because os.replace refuses to
@@ -787,6 +786,49 @@ def investigate(
             aside_root = Path(tempfile.mkdtemp(dir=proposal_dir.parent.parent, prefix=".aside-"))
             aside = aside_root / "proposal"
             os.replace(proposal_dir, aside)
+
+            # Only NOW re-read the status. The guard at the top of this
+            # function ran BEFORE an agent call that takes minutes, and
+            # approval is a human action that can land inside that window:
+            # the flip to `accepted` is exactly what someone does while
+            # reading the proposal. Swapping a freshly-generated `proposed`
+            # over it would silently revoke a human approval and strand the
+            # implementer, which no later step could detect.
+            #
+            # Reading it before the rename only narrowed that window, it did
+            # not close it — the carry-forward walk sits between the check
+            # and the swap, and an approval landing there was still lost
+            # (agy P2 on #247, second round). Checking the renamed-aside
+            # copy makes the answer authoritative instead of merely fresh:
+            # the proposal is no longer at the path an approver writes to,
+            # so nothing can change it between this read and the swap.
+            live_status = _load_status(aside / ".status.yaml").get("status")
+            if live_status and live_status not in _OVERWRITABLE_STATUSES:
+                try:
+                    os.replace(aside, proposal_dir)
+                    aside = None
+                except BaseException:
+                    # Same rule as the publish rollback below: the aside copy
+                    # is now the only one, so cleanup must not run.
+                    keep_aside = True
+                    print(
+                        f"CRITICAL: refused to overwrite an approved proposal but "
+                        f"could not put it back at {proposal_dir}; it is at {aside}",
+                        file=sys.stderr,
+                    )
+                    raise
+                return InvestigateResult(
+                    service, slug, proposal_dir,
+                    error=(
+                        f"proposal advanced to '{live_status}' while the agent "
+                        "was running — refusing to overwrite it"
+                    ),
+                )
+
+            #    Anything the agent did not rewrite is carried into staging,
+            #    so the swap does not silently drop files a previous
+            #    investigation left behind.
+            _carry_forward(aside, staging)
         try:
             os.replace(staging, proposal_dir)
         except BaseException as publish_error:

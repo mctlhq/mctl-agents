@@ -7,6 +7,7 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 """
 from __future__ import annotations
 
+import pathlib
 import subprocess
 import types
 from pathlib import Path
@@ -1072,3 +1073,172 @@ def test_the_agent_wins_a_collision_with_a_carried_forward_name(tmp_path, monkey
 
     assert second.error is None
     assert (first.proposal_dir / "notes.md").read_text() == "rewritten"
+
+
+def test_a_symlink_inside_a_carried_folder_is_not_dereferenced(tmp_path, monkeypatch):
+    """copytree dereferences by default — that is the exfiltration path.
+
+    The link has to be INSIDE a folder that gets copied wholesale, which
+    is the only way copytree's symlinks= flag is reached at all: a
+    top-level link takes the explicit os.symlink branch instead. Without
+    symlinks=True the link's TARGET is copied in as ordinary files,
+    published, and committed to the gitops repo by the CWFT (agy P1
+    on #247).
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "id_rsa").write_text("PRIVATE KEY")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=30,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    assets = first.proposal_dir / "assets"
+    assets.mkdir()
+    (assets / "leak").symlink_to(outside)
+
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    leak = first.proposal_dir / "assets" / "leak"
+    assert leak.is_symlink(), "the link was dereferenced instead of preserved"
+    # The secret was never materialised as a real file inside the proposal.
+    real_files = [
+        q for q in (first.proposal_dir / "assets").rglob("*")
+        if q.is_file() and not q.is_symlink()
+    ]
+    assert real_files == [], f"copied real files out of the link target: {real_files}"
+
+
+def test_a_broken_symlink_in_staging_is_not_written_through(tmp_path, monkeypatch):
+    """exists() follows links, so a broken one reads as absent.
+
+    The copy underneath then opens the link for writing and lands wherever
+    it points — an arbitrary write outside the proposal (agy P1 on #247).
+    """
+    victim = tmp_path / "victim.txt"
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=31,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("carry me forward")
+
+    def _agent_plants_a_broken_link(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v2 {name}")
+        (proposal_dir / "notes.md").symlink_to(victim)  # target does not exist
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent", _agent_plants_a_broken_link
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    assert not victim.exists(), "carry-forward wrote through the link"
+
+
+def test_the_approval_check_reads_the_proposal_after_it_is_renamed_aside(
+    tmp_path, monkeypatch
+):
+    """Reading the status before the carry-forward walk only narrows the race.
+
+    The walk sits between a pre-rename check and the swap, so an approval
+    landing inside it was still lost. Reading the renamed-aside copy makes
+    the answer authoritative rather than merely fresh: once the proposal
+    is no longer at the path an approver writes to, nothing can change it
+    between the read and the swap (agy P2 on #247, second round).
+
+    This pins the ORDER, because that is what the guarantee rests on. The
+    outcome-level tests above cannot distinguish it: an approval can only
+    be delivered to the live path, which after the rename no longer
+    exists, so no fixture can observe the difference from outside.
+    """
+    events: list[str] = []
+    real_replace = run_issue_investigator.os.replace
+    real_load = run_issue_investigator._load_status
+
+    def _spy_replace(src, dst):
+        events.append(f"rename:{pathlib.Path(src).name}")
+        return real_replace(src, dst)
+
+    def _spy_load(path):
+        if pathlib.Path(path).name == ".status.yaml":
+            events.append(f"read:{pathlib.Path(path).parent.name}")
+        return real_load(path)
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=32,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    monkeypatch.setattr(run_issue_investigator.os, "replace", _spy_replace)
+    monkeypatch.setattr(run_issue_investigator, "_load_status", _spy_load)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+    assert second.error is None
+
+    # The rename that takes the proposal out of reach must come first, and
+    # the check must then read the copy it produced -- not the live path.
+    renames = [i for i, e in enumerate(events) if e.startswith("rename:")]
+    reads = [i for i, e in enumerate(events) if e == "read:proposal"]
+    assert reads, f"the approval check no longer reads the aside copy: {events}"
+    assert renames[0] < reads[0], f"status read before the proposal was moved: {events}"
+
+
+def test_an_approval_during_the_agent_run_still_wins(tmp_path, monkeypatch):
+    """The window the check exists for: minutes of agent time.
+
+    Someone reading the proposal flips it to `accepted` while the agent is
+    still writing. Publishing a fresh `proposed` over that silently
+    revokes a human approval and strands the implementer.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=33,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    proposal_dir = first.proposal_dir
+    (proposal_dir / "notes.md").write_text("carry me")
+
+    def _agent_racing_an_approver(repo_dir, prompt, staging):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (staging / name).write_text(f"v2 {name}")
+        status = proposal_dir / ".status.yaml"
+        data = yaml.safe_load(status.read_text())
+        data["status"] = "accepted"
+        status.write_text(yaml.safe_dump(data))
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", _agent_racing_an_approver)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None and "refusing to overwrite" in second.error
+    live = yaml.safe_load((proposal_dir / ".status.yaml").read_text())
+    assert live["status"] == "accepted", "the approval was revoked"
+    assert (proposal_dir / "design.md").read_text() == "v1 design.md"
+    assert (proposal_dir / "notes.md").read_text() == "carry me"
