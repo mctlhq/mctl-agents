@@ -53,13 +53,15 @@ from pathlib import Path
 
 import anyio
 import yaml
-from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
+# The agent SDK and everything that pulls it in (auth, mcp_guard, options)
+# are imported inside _run_agent/main, not here: run_issue_poller reuses
+# this module's pure URL/slug helpers, and the poller runs as a Temporal
+# ACTIVITY inside the long-lived worker. A module-level import would drag
+# the whole agent stack into that process, which is exactly what #149
+# forbids — the agent itself only ever runs in an Argo sandbox.
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
-from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
-from orchestrator.mcp_guard import ensure_mctl_connected
-from orchestrator.options import build_issue_investigator_options
 from orchestrator.proc import run_capturing
 
 DEFAULT_STATE_DIR = Path(
@@ -484,6 +486,11 @@ class RateLimitExhaustedError(RuntimeError):
 
 
 async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
+    from claude_agent_sdk import ClaudeSDKClient, ResultMessage
+
+    from orchestrator.mcp_guard import ensure_mctl_connected
+    from orchestrator.options import build_issue_investigator_options
+
     options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
     mcp_configured = bool(options.mcp_servers)
     async with ClaudeSDKClient(options=options) as client:
@@ -679,6 +686,8 @@ def main() -> None:
         help="Resolve issue + slug only; don't clone, run the SDK, or comment",
     )
     args = ap.parse_args()
+
+    from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
 
     ensure_auth_for_sdk()
 

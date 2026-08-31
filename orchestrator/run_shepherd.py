@@ -59,13 +59,9 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-from claude_agent_sdk import query
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator import run_implementer
-from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
-from orchestrator.options import SHEPHERD_BUDGET_USD, build_shepherd_options
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
@@ -1103,6 +1099,15 @@ async def _format_bundle_via_sdk(findings: list[CodexFinding]) -> dict:
         "Emit a single JSON object: {\"p1\": bool, \"p2\": bool, "
         "\"summaries\": [str, ...]}. Nothing else."
     )
+    # Deferred, not top-level: this module's read-only helpers
+    # (_discover_refs, find_pr_for_proposal) are reused by the Temporal
+    # reconcile activities, and a module-level import would drag the agent
+    # SDK into the long-lived worker process — the thing #149 exists to
+    # prevent. Nothing on the reconcile path reaches this line.
+    from claude_agent_sdk import query
+
+    from orchestrator.options import build_shepherd_options
+
     options = build_shepherd_options(SHEPHERD_DIR, SHEPHERD_MODEL)
 
     collected_text: list[str] = []
@@ -1276,6 +1281,8 @@ def apply_followup(
     # Forward --state-dir only when it differs from the implementer's
     # own DEFAULT_STATE_DIR. The implementer's argparse default is the
     # same env-driven path; appending it unconditionally would be noise.
+    from orchestrator import run_implementer  # deferred — see the SDK import above
+
     if state_dir is not None and Path(state_dir) != run_implementer.DEFAULT_STATE_DIR:
         cmd.extend(["--state-dir", str(state_dir)])
     print(f"$ {' '.join(cmd)}")
@@ -1695,6 +1702,8 @@ def reconcile_one(
     This never reviews, fixes, or merges. It is safe for both shepherd-owned
     and steward-owned repositories.
     """
+    from orchestrator import run_implementer  # deferred — see the SDK import above
+
     status_data = _load_status(ref.status_path)
     existing_failure = status_data.get("failure")
     failure_code = (
@@ -2017,6 +2026,8 @@ def main() -> None:
         sys.exit(2)
 
     # Resolve effective budget.
+    from orchestrator.options import SHEPHERD_BUDGET_USD  # deferred — see the SDK import above
+
     budget = args.budget if args.budget is not None else SHEPHERD_BUDGET_USD
     if budget <= 0:
         print(f"warn: SHEPHERD_BUDGET_USD={budget} is non-positive; nothing will run")
@@ -2025,6 +2036,8 @@ def main() -> None:
     # (reconcile only reads PR state + writes terminal status) and must work
     # in environments without Claude credentials.
     if not args.dry_run and not args.reconcile:
+        from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the SDK import above
+
         ensure_auth_for_sdk()
 
     state_dir = Path(args.state_dir)

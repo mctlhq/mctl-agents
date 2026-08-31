@@ -352,9 +352,9 @@ def test_reconcile_dry_run_reports_orphan_branch_without_writing(tmp_path) -> No
     with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
          patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
          patch.object(
-             run_shepherd.run_implementer,
+             run_implementer,
              "_preflight_existing_result",
-             return_value=run_shepherd.run_implementer.ExistingResult(
+             return_value=run_implementer.ExistingResult(
                  action="branch-ready",
                  reason="useful branch exists without PR",
              ),
@@ -409,9 +409,9 @@ def test_reconcile_one_missing_result_is_needs_triage(tmp_path) -> None:
     with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
          patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
          patch.object(
-             run_shepherd.run_implementer,
+             run_implementer,
              "_preflight_existing_result",
-             return_value=run_shepherd.run_implementer.ExistingResult(action="none"),
+             return_value=run_implementer.ExistingResult(action="none"),
          ):
         result = run_shepherd.reconcile_one(ref)
     assert result.decision == "needs-triage"
@@ -437,7 +437,7 @@ def test_reconcile_preserves_terminal_status_without_pr(
     with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
          patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
          patch.object(
-             run_shepherd.run_implementer,
+             run_implementer,
              "_preflight_existing_result",
          ) as preflight:
         result = run_shepherd.reconcile_one(ref)
@@ -470,9 +470,9 @@ def test_reconcile_preserves_existing_triage_failure_without_pr(tmp_path) -> Non
     with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
          patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
          patch.object(
-             run_shepherd.run_implementer,
+             run_implementer,
              "_preflight_existing_result",
-             return_value=run_shepherd.run_implementer.ExistingResult(action="none"),
+             return_value=run_implementer.ExistingResult(action="none"),
          ):
         result = run_shepherd.reconcile_one(ref)
     assert result.decision == "needs-triage"
@@ -1549,7 +1549,7 @@ def test_main_dry_run_skips_sdk_auth(tmp_path, monkeypatch) -> None:
         ["run_shepherd", "--dry-run", "--state-dir", str(state_dir)],
     )
 
-    with patch.object(run_shepherd, "ensure_auth_for_sdk") as mocked_auth, \
+    with patch("orchestrator.auth.ensure_auth_for_sdk") as mocked_auth, \
          patch.object(run_shepherd, "_discover_refs", return_value=[]):
         run_shepherd.main()
 
@@ -1566,7 +1566,7 @@ def test_main_non_dry_run_calls_sdk_auth(tmp_path, monkeypatch) -> None:
         ["run_shepherd", "--state-dir", str(state_dir)],
     )
 
-    with patch.object(run_shepherd, "ensure_auth_for_sdk") as mocked_auth, \
+    with patch("orchestrator.auth.ensure_auth_for_sdk") as mocked_auth, \
          patch.object(run_shepherd, "_discover_refs", return_value=[]):
         run_shepherd.main()
 

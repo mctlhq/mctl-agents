@@ -395,7 +395,7 @@ def test_run_agent_raises_on_429_result(tmp_path, monkeypatch):
     """A final ResultMessage with is_error + api_error_status=429 must raise
     RateLimitExhaustedError, not just be printed and swallowed."""
     monkeypatch.setattr(
-        run_issue_investigator, "ClaudeSDKClient",
+        "claude_agent_sdk.ClaudeSDKClient",
         _fake_client_factory([_result_message(is_error=True, api_error_status=429)]),
     )
     with pytest.raises(RateLimitExhaustedError):
@@ -406,7 +406,7 @@ def test_run_agent_does_not_raise_on_clean_success(tmp_path, monkeypatch):
     """A normal, non-error ResultMessage must NOT be mistaken for a
     rate-limit exhaustion."""
     monkeypatch.setattr(
-        run_issue_investigator, "ClaudeSDKClient",
+        "claude_agent_sdk.ClaudeSDKClient",
         _fake_client_factory([_result_message(is_error=False, api_error_status=None)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
@@ -419,7 +419,7 @@ def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
     RateLimitExhaustedError, so it is never counted toward
     poll()'s rate_limited_failures."""
     monkeypatch.setattr(
-        run_issue_investigator, "ClaudeSDKClient",
+        "claude_agent_sdk.ClaudeSDKClient",
         _fake_client_factory([_result_message(is_error=True, api_error_status=500)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
@@ -436,7 +436,7 @@ def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 def _stub_build_options(monkeypatch, *, mcp_servers):
     monkeypatch.setattr(
-        run_issue_investigator, "build_issue_investigator_options",
+        "orchestrator.options.build_issue_investigator_options",
         lambda *args, **kwargs: types.SimpleNamespace(mcp_servers=mcp_servers),
     )
 
@@ -444,7 +444,7 @@ def _stub_build_options(monkeypatch, *, mcp_servers):
 def test_run_agent_connected_mcp_dispatches_without_warning(tmp_path, monkeypatch, capsys):
     _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
     monkeypatch.setattr(
-        run_issue_investigator, "ClaudeSDKClient",
+        "claude_agent_sdk.ClaudeSDKClient",
         fake_mcp_client_factory(
             statuses=[{"mcpServers": [{"name": "mctl", "status": "connected"}]}]
         ),
@@ -458,7 +458,7 @@ def test_run_agent_failed_mcp_warns_but_still_dispatches(tmp_path, monkeypatch, 
     from grounding its proposal in the repo via Read/Glob/Grep."""
     _stub_build_options(monkeypatch, mcp_servers={"mctl": {}})
     monkeypatch.setattr(
-        run_issue_investigator, "ClaudeSDKClient",
+        "claude_agent_sdk.ClaudeSDKClient",
         fake_mcp_client_factory(
             statuses=[{"mcpServers": [{"name": "mctl", "status": "failed", "error": "boom"}]}]
         ),
