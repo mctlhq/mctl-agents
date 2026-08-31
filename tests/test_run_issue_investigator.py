@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import types
+from pathlib import Path
 
 import anyio
 import pytest
@@ -697,3 +698,52 @@ def test_a_failed_status_write_restores_the_previous_proposal(tmp_path, monkeypa
     assert second.error is not None
     for name in ("requirements.md", "design.md", "tasks.md"):
         assert (first.proposal_dir / name).read_text() == f"good {name}"
+
+
+def test_status_write_is_atomic_and_leaves_no_debris(tmp_path, monkeypatch):
+    """A failed dump must not truncate the live .status.yaml.
+
+    Truncation is not just lost work: a corrupt file still satisfies the
+    `.is_file()` check that suppresses investigate()'s rollback, and
+    `_load_status` then fails on every retry — the issue cannot be
+    investigated again without hand-editing gitops.
+    """
+    proposal_dir = tmp_path / "issue-13-x"
+    good = write_status_yaml(proposal_dir, _issue(number=13))
+    original = good.read_text()
+
+    def failing_dump(*args, **kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(run_issue_investigator.yaml, "safe_dump", failing_dump)
+    with pytest.raises(OSError):
+        write_status_yaml(proposal_dir, _issue(number=13))
+
+    assert good.read_text() == original
+    # ...and the aborted attempt left no temp file behind for the CWFT to commit.
+    assert [p.name for p in proposal_dir.iterdir()] == [".status.yaml"]
+
+
+def test_taking_the_triplet_reads_everything_before_removing_anything(tmp_path, monkeypatch):
+    """A read that fails on the third document must not have destroyed the
+    first two — the caller either holds all of them or the directory is
+    still untouched."""
+    proposal_dir = tmp_path / "issue-14-x"
+    proposal_dir.mkdir(parents=True)
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (proposal_dir / name).write_text(f"content {name}")
+
+    real_read = Path.read_bytes
+
+    def flaky_read(self):
+        if self.name == "tasks.md":
+            raise OSError("I/O error")
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky_read)
+    with pytest.raises(OSError):
+        run_issue_investigator._take_triplet(proposal_dir)
+
+    monkeypatch.setattr(Path, "read_bytes", real_read)
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        assert (proposal_dir / name).read_text() == f"content {name}"

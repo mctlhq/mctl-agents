@@ -203,12 +203,17 @@ def _take_triplet(proposal_dir: Path) -> dict[str, bytes]:
     on a rate limit leaves the proposal permanently half-new, and no
     after-the-fact comparison can undo that (agy P2 on #247).
     """
+    # Read EVERY file before removing ANY. Interleaving them means a read
+    # that fails on the third document leaves the first two already gone
+    # and unrecoverable; this way the caller either holds all of them or
+    # the directory is still untouched.
     saved: dict[str, bytes] = {}
     for name in TRIPLET:
         path = proposal_dir / name
         if path.is_file():
             saved[name] = path.read_bytes()
-            path.unlink()
+    for name in saved:
+        (proposal_dir / name).unlink(missing_ok=True)
     return saved
 
 
@@ -362,8 +367,26 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
     }
     proposal_dir.mkdir(parents=True, exist_ok=True)
     status_path = proposal_dir / ".status.yaml"
-    with status_path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+    # Atomic: serialise to a sibling temp file, then rename over the target.
+    # Opening the real path with "w" truncates it first, so a crash, a kill
+    # or a full disk mid-dump leaves a half-written .status.yaml — and that
+    # is not merely lost work. A corrupt file still satisfies the
+    # `.is_file()` check that suppresses investigate()'s rollback, and
+    # _load_status then fails on every retry, so the issue cannot be
+    # investigated again without hand-editing gitops (agy P2 / codex P2 on
+    # #247). rename(2) within a directory is atomic, so a reader sees the
+    # old file or the new one and never a partial one.
+    fd, tmp_name = tempfile.mkstemp(dir=proposal_dir, prefix=".status.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, status_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return status_path
 
 
@@ -659,10 +682,15 @@ def investigate(
     # Take the previous run's documents off disk and hold them, so the
     # check below sees only what THIS run wrote and a failure can put the
     # old proposal back exactly as it was. See _take_triplet.
-    saved_triplet = _take_triplet(proposal_dir) if proposal_preexisted else {}
+    saved_triplet: dict[str, bytes] = {}
     triplet_written = False
     clone = None
     try:
+        # Inside the try, so the finally below covers it: taken outside,
+        # a failure part-way through would leave documents removed with no
+        # restore path at all (codex P2 on #247).
+        if proposal_preexisted:
+            saved_triplet = _take_triplet(proposal_dir)
         # 1. Read-only clone so the agent can ground the design in real code.
         clone = _clone_repo(issue.ref.full_repo, slug)
 
