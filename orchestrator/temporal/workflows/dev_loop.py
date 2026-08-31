@@ -31,8 +31,8 @@ different issue's — proposal.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -53,6 +53,11 @@ with workflow.unsafe.imports_passed_through():
         get_deploy_status,
         get_release_after,
         resolve_deploy_target,
+    )
+    from orchestrator.temporal.activities.incidents import (
+        Incident,
+        IncidentQueryResult,
+        list_service_incidents,
     )
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug
@@ -155,8 +160,20 @@ RELEASE_LOOKUP_DEADLINE = timedelta(minutes=20)
 RELEASE_POLL_INTERVAL = timedelta(minutes=2)
 DEPLOY_VERIFY_DEADLINE = timedelta(minutes=45)
 DEPLOY_POLL_INTERVAL = timedelta(minutes=1)
+# A release can introduce a brand-new ArgoCD application, which takes a
+# few reconciliations to appear. Wait that out, but not the full deadline:
+# past this, a name that resolves to nothing is a wrong name.
+NEW_APP_GRACE_POLLS = 5
 DEPLOY_READ_TIMEOUT = timedelta(minutes=2)
 DEPLOY_READ_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
+# Stage 6.4 (ADR-006, #216). After the rollout is observed, watch that
+# service for incidents for a bounded window, then finish. Long enough for
+# a bad rollout to announce itself through alert `for:` durations and the
+# first real traffic; short enough that the loop still ends, and that what
+# it reports is plausibly about THIS deploy rather than the day's news.
+INCIDENT_WATCH_WINDOW = timedelta(minutes=30)
+INCIDENT_POLL_INTERVAL = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
@@ -191,6 +208,27 @@ class DeployObservation:
 
 
 @dataclass(frozen=True)
+class IncidentWatch:
+    """Incidents seen for the deployed service after the rollout.
+
+    Correlation is service + time window only — incidents carry no link to
+    a release, PR or commit — so this is evidence for a human, not a
+    causal claim and not a trigger for anything. ``watched=False`` means
+    the stage did not run (no deploy target, or nothing released).
+    """
+
+    watched: bool
+    service: str | None = None
+    window_minutes: int = 0
+    since: str | None = None
+    incidents: list[Incident] = field(default_factory=list)
+    # The store had more incidents than the query cap returned on at least
+    # one poll — the list below is a sample, not the whole window.
+    truncated: bool = False
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
     # None if approval was never signalled, investigate failed, or the
@@ -210,6 +248,9 @@ class DevLoopResult:
     # merge produced. None on histories predating the stage and whenever
     # the PR did not merge. See DeployObservation for the outcomes.
     deploy: DeployObservation | None = None
+    # Stage 6.4 (ADR-006, #216): incidents raised against the deployed
+    # service during the watch window. None when the stage did not run.
+    incidents: IncidentWatch | None = None
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -277,6 +318,53 @@ async def _record(
             agent,
             result.workflow_name,
         )
+
+
+def _at_or_after(later: str | None, earlier: str) -> bool:
+    """Is ``later`` at or after ``earlier``, comparing real instants?
+
+    Not a string compare: GitHub emits whole seconds ("...:01Z") while
+    ArgoCD may emit fractional ones ("...:01.123Z"), and "." sorts BEFORE
+    "Z", so the fractional value would read as older than the very second
+    it belongs to (agy P2). An unparseable value is treated as "not yet",
+    which only ever delays a verdict.
+    """
+    if not later:
+        return False
+    try:
+        return _as_utc(later) >= _as_utc(earlier)
+    except (ValueError, TypeError):
+        # TypeError as well as ValueError: this runs inside the workflow
+        # loop, and an unhandled exception there is retried by Temporal
+        # forever on identical input — a wedged state machine rather than
+        # a wrong answer (agy P1). _as_utc already normalises the
+        # naive/aware mix that would raise it, so this is the backstop.
+        workflow.logger.warning("uncomparable timestamps %r and %r", later, earlier)
+        return False
+
+
+def _as_utc(value: str) -> datetime:
+    """Parse an ISO-8601 timestamp as UTC, tolerating a missing offset.
+
+    A payload without an offset would otherwise parse naive, and
+    comparing naive to aware raises TypeError. These are all UTC in
+    practice — GitHub and ArgoCD both emit Zulu — so an absent offset is
+    read as UTC rather than refused.
+
+    A non-string value raises TypeError rather than the AttributeError
+    ``.replace()`` would give, so callers' ``except (ValueError,
+    TypeError)`` covers it. Belt-and-braces only: agy read this as a live
+    P1 (an int epoch from the API wedging the workflow), but a non-str
+    cannot actually get here — ``deploy_state`` isinstance-guards both
+    ``updatedAt`` and ``published_at`` at the HTTP boundary, and Temporal's
+    own converter refuses to decode a non-str into these ``str`` fields
+    before the workflow ever sees them. This keeps the helper total for
+    its declared contract rather than relying on those two distant checks.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"expected an ISO-8601 string, got {type(value).__name__}")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _is_transient(exc: ActivityError) -> bool:
@@ -510,6 +598,12 @@ class DevLoopWorkflow:
         # Stages 6.2/6.3 (ADR-006, #215): only a merged PR produces a
         # release to observe. A closed-unmerged or still-open PR ends the
         # loop here, exactly as before.
+        # Stage 6.4's window opens HERE, not after the deploy observation:
+        # _observe_deploy can block for over an hour, and a rollout that
+        # breaks the app does it immediately — those incidents fire while
+        # the observation is still running, and a window opened afterwards
+        # would miss exactly the ones worth catching (agy P2).
+        watch_since = workflow.now().isoformat().replace("+00:00", "Z")
         deploy: DeployObservation | None = None
         if (
             workflow.patched("deploy-observation")
@@ -518,12 +612,88 @@ class DevLoopWorkflow:
         ):
             deploy = await self._observe_deploy(target_repo, pr_state)
 
+        # Stage 6.4 (ADR-006, #216): only worth asking when something
+        # actually rolled out. no-release/no-target mean nothing shipped,
+        # so any incident in the window belongs to someone else.
+        incidents: IncidentWatch | None = None
+        if (
+            workflow.patched("incident-watch")
+            and deploy is not None
+            and deploy.outcome in ("healthy", "unverified")
+            and deploy.app
+        ):
+            incidents = await self._watch_incidents(deploy.app, watch_since)
+
         return DevLoopResult(
             investigate=investigate_result,
             implement=implement_result,
             approve=approve_result,
             pr=pr_state,
             deploy=deploy,
+            incidents=incidents,
+        )
+
+    async def _watch_incidents(self, service: str, since: str) -> IncidentWatch:
+        """Collect incidents raised against ``service`` during the window.
+
+        Observational and terminal: whatever it finds lands in the result
+        for a human to read. No remediation, no rollback, and no failing
+        the workflow — by this point implement, the merge and the rollout
+        have all already happened, and an incident here is information
+        about the platform, not about this loop's success.
+        """
+        deadline = workflow.now() + INCIDENT_WATCH_WINDOW
+        # Derived, not the constant: `since` predates the deploy
+        # observation, which can add an hour of its own, so reporting a
+        # flat 30 would understate the span these incidents were drawn
+        # from (claude P2).
+        try:
+            window_minutes = int((deadline - _as_utc(since)).total_seconds() // 60)
+        except (ValueError, TypeError):
+            window_minutes = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
+        seen: dict[str, Incident] = {}
+        truncated = False
+        detail: str | None = None
+        while workflow.now() < deadline:
+            await workflow.sleep(INCIDENT_POLL_INTERVAL)
+            try:
+                result: IncidentQueryResult = await workflow.execute_activity(
+                    list_service_incidents,
+                    args=[service, since],
+                    start_to_close_timeout=DEPLOY_READ_TIMEOUT,
+                    retry_policy=DEPLOY_READ_RETRY_POLICY,
+                )
+            except ActivityError as exc:
+                # Keep watching: one failed read must not discard the
+                # incidents already collected, nor end the window early.
+                detail = f"at least one incident read failed: {exc.cause!r}"
+                workflow.logger.warning(
+                    "incident read failed for %s — continuing the watch: %r", service, exc.cause
+                )
+                continue
+            truncated = truncated or result.truncated
+            for incident in result.incidents:
+                # Deduplicated by id across polls: an incident firing for
+                # the whole window would otherwise be reported once per
+                # poll. First sighting wins, so the recorded status is the
+                # one it had when this loop first saw it.
+                seen.setdefault(incident.id, incident)
+        if seen:
+            workflow.logger.warning(
+                "incident watch for %s saw %d incident(s) within %d minute(s) "
+                "of the rollout",
+                service,
+                len(seen),
+                window_minutes,
+            )
+        return IncidentWatch(
+            watched=True,
+            service=service,
+            window_minutes=window_minutes,
+            since=since,
+            incidents=list(seen.values()),
+            truncated=truncated,
+            detail=detail,
         )
 
     async def _observe_deploy(self, service: str, pr_state: PRState) -> DeployObservation:
@@ -618,6 +788,7 @@ class DevLoopWorkflow:
         """Wait until the app reports Synced/Healthy on the released tag."""
         deadline = workflow.now() + DEPLOY_VERIFY_DEADLINE
         last: DeployStatus | None = None
+        polls_without_app = 0
         while workflow.now() < deadline:
             try:
                 status: DeployStatus = await workflow.execute_activity(
@@ -644,15 +815,27 @@ class DevLoopWorkflow:
                 await workflow.sleep(DEPLOY_POLL_INTERVAL)
                 continue
             if not status.found:
-                # The name resolves to no ArgoCD application. Polling it
-                # for 45 minutes would only delay the same answer.
-                return DeployObservation(
-                    outcome="unverified",
-                    team=target.team,
-                    app=target.app,
-                    release_tag=release.tag,
-                    detail=f"no ArgoCD application {target.team}/{target.app}",
-                )
+                # A PR can introduce a NEW application, which ArgoCD only
+                # registers a little after the release lands (app-of-apps)
+                # — so this is a pending state at first, not a verdict
+                # (agy P2). Still bounded: after the grace polls a name
+                # that resolves to nothing is a wrong name, and waiting
+                # out the full deadline would only delay the same answer.
+                polls_without_app += 1
+                if polls_without_app >= NEW_APP_GRACE_POLLS:
+                    return DeployObservation(
+                        outcome="unverified",
+                        team=target.team,
+                        app=target.app,
+                        release_tag=release.tag,
+                        detail=(
+                            f"no ArgoCD application {target.team}/{target.app} after "
+                            f"{polls_without_app} polls"
+                        ),
+                    )
+                await workflow.sleep(DEPLOY_POLL_INTERVAL)
+                continue
+            polls_without_app = 0
             last = status
             # mctl-api resolves no service record — and therefore no image
             # tag — for platform applications such as mctl-api itself.
@@ -668,7 +851,7 @@ class DevLoopWorkflow:
                 # without anything having happened (claude P3). ArgoCD's
                 # own updatedAt is the freshness signal: it must be at
                 # least as new as the release we are waiting for.
-                landed = status.updated_at is not None and status.updated_at >= release.published_at
+                landed = _at_or_after(status.updated_at, release.published_at)
             if landed and status.health == "Healthy" and status.sync_status == "Synced":
                 return DeployObservation(
                     outcome="healthy",

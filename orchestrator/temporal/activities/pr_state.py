@@ -156,6 +156,12 @@ async def get_pr_state(service: str, slug: str) -> PRState:
             data = pr_response.json()
         except ValueError as exc:
             raise ProposalListingError(f"non-JSON payload from {pr_api}") from exc
+        if not isinstance(data, dict):
+            # Same guard the contents read above already has: without it a
+            # list or string payload raises AttributeError, which is not a
+            # ProposalListingError and so reads as a defect to the merge
+            # watch's transient check rather than a retryable read.
+            raise ProposalListingError(f"unexpected payload type from {pr_api}")
 
     merged = bool(data.get("merged"))
     if merged:

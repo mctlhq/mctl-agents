@@ -34,6 +34,7 @@ from orchestrator.temporal.activities.deploy_state import (
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.docs_delta import process_docs_delta_activity
+from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.pr_state import get_pr_state
@@ -186,6 +187,7 @@ async def main() -> None:
             resolve_deploy_target,
             get_release_after,
             get_deploy_status,
+            list_service_incidents,
             discover_and_project,
             detect_orphans,
             visibility.list_active_dev_loop_ids,
