@@ -26,7 +26,7 @@ from orchestrator.temporal.constants import (
     EXECUTION_TASK_QUEUE,
     TASK_QUEUE,
 )
-from orchestrator.temporal.worker import owns_schedules, worker_plan
+from orchestrator.temporal.worker import owns_schedules, worker_plans
 
 
 @pytest.fixture
@@ -46,23 +46,35 @@ def _named_activity(name):
     return _fn
 
 
-def test_all_is_the_default_shape_and_keeps_one_queue(visibility):
-    """The rollback target. `all` must not change under this PR — the whole
-    point of shipping the flag before the routing is that step 1 is a
-    no-op in production."""
-    worker = worker_plan("all", visibility)
+def test_all_keeps_the_original_control_queue_shape(visibility):
+    """`all` must still be today's worker — step 1 is a no-op in production."""
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
 
-    assert worker.task_queue == TASK_QUEUE
-    assert "submit_and_wait" in worker.activity_names
-    assert "find_proposal_slug" in worker.activity_names
+    assert "submit_and_wait" in control.activity_names
+    assert "find_proposal_slug" in control.activity_names
+    assert control.max_concurrent_activities is None
+
+
+def test_all_also_polls_the_execution_queue(visibility):
+    """`all` is the documented rollback target, so it has to work as one.
+
+    After step 3, patched histories schedule submit_and_wait onto the
+    execution queue. Collapsing the split deployments back to a process
+    that listens only on the control queue would leave those activities
+    with no poller until they time out — a rollback that strands work is
+    not a rollback (codex P1 on #249).
+    """
+    queues = {p.task_queue for p in worker_plans("all", visibility)}
+
+    assert queues == {TASK_QUEUE, EXECUTION_TASK_QUEUE}
 
 
 def test_the_execution_worker_polls_only_the_new_queue(visibility):
     """It services activities scheduled by workflows it does not run."""
-    worker = worker_plan("execution", visibility)
+    plans = worker_plans("execution", visibility)
 
-    assert worker.task_queue == EXECUTION_TASK_QUEUE
-    assert worker.activity_names == {"submit_and_wait"}
+    assert [p.task_queue for p in plans] == [EXECUTION_TASK_QUEUE]
+    assert plans[0].activity_names == {"submit_and_wait"}
 
 
 def test_the_control_worker_still_serves_submit_and_wait(visibility):
@@ -73,17 +85,17 @@ def test_the_control_worker_still_serves_submit_and_wait(visibility):
     submit the moment it rolled out — a self-inflicted outage in the gap
     between two PRs.
     """
-    worker = worker_plan("control", visibility)
+    plans = worker_plans("control", visibility)
 
-    assert worker.task_queue == TASK_QUEUE
-    assert "submit_and_wait" in worker.activity_names
+    assert [p.task_queue for p in plans] == [TASK_QUEUE]
+    assert "submit_and_wait" in plans[0].activity_names
 
 
 def test_slot_limits_are_set_for_the_split_roles(visibility):
     """Explicit limits are the point: an unbounded pool is what turns
     exhaustion into an invisible stall instead of a visible backlog."""
-    control = worker_plan("control", visibility)
-    execution = worker_plan("execution", visibility)
+    control = worker_plans("control", visibility)[0]
+    execution = worker_plans("execution", visibility)[0]
 
     assert control.max_concurrent_activities == CONTROL_MAX_CONCURRENT_ACTIVITIES
     assert control.max_concurrent_workflow_tasks == CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS
@@ -94,9 +106,9 @@ def test_slot_limits_are_set_for_the_split_roles(visibility):
 
 
 def test_an_unknown_role_is_refused(visibility):
-    """argparse guards the CLI, but worker_plan is also called directly."""
+    """argparse guards the CLI, but worker_plans is also called directly."""
     with pytest.raises(SystemExit):
-        worker_plan("orchestration", visibility)
+        worker_plans("orchestration", visibility)
 
 
 def test_only_workflow_running_roles_own_the_schedules():

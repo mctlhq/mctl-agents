@@ -86,11 +86,17 @@ running right now, an unguarded change would wedge every active loop —
 the same failure the `slug-scoped-implement` and `atomic-approve` markers
 exist to prevent.
 
-**D5 — Metrics before tuning.** Temporal's SDK already exports
+**D5 — Metrics before tuning, and the exporter is a prerequisite rather
+than a given.** The SDK *can* produce
 `temporal_worker_task_slots_available`, per-queue schedule-to-start
-latency, and activity failure counts. Alert on sustained
-schedule-to-start on the control queue — that is the starvation signal in
-one number, and it is the thing that was previously unobservable.
+latency and activity failure counts, but it does not export them merely
+because limits are configured: this worker calls `Client.connect` with
+the default runtime, and the repository has no `TelemetryConfig` or
+`PrometheusConfig` anywhere (checked — codex P2 on #249). Wiring an
+exporter and scraping it is therefore step 4's first task, before any
+number in D3 can be tuned against reality. The signal to alert on is
+sustained schedule-to-start on the control queue: that is starvation in
+one number, and it is what was previously unobservable.
 
 **D6 — No HPA in this slice.** Replica count stays fixed per role. Both
 roles are I/O-bound waiters, so CPU-based autoscaling would measure the
@@ -106,7 +112,9 @@ it — otherwise activities are scheduled onto a queue nobody polls and sit
 there until timeout.
 
 1. **mctl-agents:** `--role` flag, queue constants, slot limits. Routing
-   unchanged; `all` behaves exactly as today. Safe to release alone.
+   unchanged; `all` behaves exactly as today on the control queue, and
+   also polls the execution queue that nothing schedules to yet. Safe to
+   release alone.
 2. **mctl-gitops:** second deployment `mctl-agents-worker-exec` with
    `--role execution`, and `--role control` on the existing one. Both
    poll; nothing yet schedules to the exec queue.
@@ -114,7 +122,8 @@ there until timeout.
    `workflow.patched("exec-queue")`, and only now tighten the control
    limit (D3) — the same change removes the workload it would otherwise
    be squeezing.
-4. Soak one full dev-loop, then tune D3 from D5's numbers.
+4. Wire the metrics exporter (D5), soak one full dev-loop, then tune D3
+from real numbers.
 
 Steps 1 and 2 are individually reversible. Step 3 is one-way for
 histories that record the patch, which is why it is last and alone.
@@ -129,7 +138,11 @@ histories that record the patch, which is why it is last and alone.
 - Memory doubles at idle (two 256Mi ceilings instead of one). At current
   scale that is noise against the Argo pods.
 - `--role all` remains supported indefinitely, for local development and
-  as the rollback target. It is not deprecated.
+  as the rollback target. It is not deprecated — and because it is the
+  rollback target for a state where routing has ALREADY flipped, it runs
+  a worker on both queues, not only the control one. An `all` process
+  listening on one queue would leave patched executions with no poller
+  until they time out, which is not a rollback.
 
 ## Non-goals
 

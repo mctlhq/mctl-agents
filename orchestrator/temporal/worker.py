@@ -212,8 +212,15 @@ def owns_schedules(role: str) -> bool:
     return role in ("all", "control")
 
 
-def worker_plan(role: str, visibility: VisibilityActivities) -> WorkerPlan:
-    """The queue/registration layout for one role.
+def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan]:
+    """The queue/registration layout for one role — one plan per queue.
+
+    A list, because `all` must poll BOTH queues. It is the documented
+    rollback target, and after step 3 patched histories schedule
+    submit_and_wait onto the execution queue: an `all` process listening
+    only on the control queue would leave those activities with no poller
+    until they time out, so collapsing the split deployments back would
+    not be a rollback at all (codex P1 on #249).
 
     `all` is the default and is byte-for-byte the single-queue worker this
     repo has always run — same queue, same activities, no slot limits — so
@@ -247,15 +254,17 @@ def worker_plan(role: str, visibility: VisibilityActivities) -> WorkerPlan:
         DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow
     ]
 
+    execution_plan = WorkerPlan(
+        task_queue=EXECUTION_TASK_QUEUE,
+        workflows=[],
+        activities=[submit_and_wait],
+        max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
+    )
+
     if role == "execution":
-        return WorkerPlan(
-            task_queue=EXECUTION_TASK_QUEUE,
-            workflows=[],
-            activities=[submit_and_wait],
-            max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
-        )
+        return [execution_plan]
     if role == "control":
-        return WorkerPlan(
+        return [WorkerPlan(
             task_queue=TASK_QUEUE,
             workflows=workflows,
             # submit_and_wait stays registered here too: nothing routes to
@@ -265,17 +274,22 @@ def worker_plan(role: str, visibility: VisibilityActivities) -> WorkerPlan:
             activities=[*short_activities, submit_and_wait],
             max_concurrent_activities=CONTROL_MAX_CONCURRENT_ACTIVITIES,
             max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
-        )
-    return WorkerPlan(
-        task_queue=TASK_QUEUE,
-        workflows=workflows,
-        activities=[*short_activities, submit_and_wait],
-    )
+        )]
+    # `all`: one process, both queues, no limits — the pre-split shape plus
+    # a poller for the queue step 3 starts using.
+    return [
+        WorkerPlan(
+            task_queue=TASK_QUEUE,
+            workflows=workflows,
+            activities=[*short_activities, submit_and_wait],
+        ),
+        execution_plan,
+    ]
 
 
 def build_worker(client: Client, plan: WorkerPlan) -> Worker:
     """Turn a plan into a Worker. Kept trivial on purpose — everything
-    worth testing lives in worker_plan()."""
+    worth testing lives in worker_plans()."""
     kwargs: dict[str, Any] = {}
     if plan.max_concurrent_activities is not None:
         kwargs["max_concurrent_activities"] = plan.max_concurrent_activities
@@ -313,11 +327,17 @@ async def main() -> None:
         await setup_schedules(client)
 
     visibility = VisibilityActivities(client)
-    plan = worker_plan(args.role, visibility)
-    worker = build_worker(client, plan)
+    plans = worker_plans(args.role, visibility)
+    workers = [build_worker(client, plan) for plan in plans]
 
-    logger.info("worker starting: role=%s task_queue=%s", args.role, worker.task_queue)
-    await worker.run()
+    logger.info(
+        "worker starting: role=%s task_queues=%s",
+        args.role,
+        ", ".join(plan.task_queue for plan in plans),
+    )
+    # gather, not sequential: each Worker.run() blocks until shutdown, so a
+    # role serving two queues has to poll both at once.
+    await asyncio.gather(*(w.run() for w in workers))
 
 
 if __name__ == "__main__":
