@@ -67,13 +67,17 @@ can be read against, so exhaustion becomes a bounded backlog on one queue
 instead of an invisible global stall. The numbers themselves are starting
 values to be moved by D5, not derived constants.
 
-The control limit is set to the SDK default it replaces (100) and **stays
-there until step 3**. Between step 2 and step 3 the control worker still
-carries every long Argo poll, so tightening it during that window would
-reintroduce the starvation this ADR removes — at a threshold five times
-lower than today's, for the whole soak, with 9–11 concurrent loops in
-production. Step 3 tightens it in the same change that takes the
-workload away. Execution starts at 40.
+**Neither control ceiling is lowered before step 3.** Between step 2 and
+step 3 the control worker still carries every long Argo poll *and* all
+five workflow types, so any ceiling below current behaviour in that
+window reintroduces the starvation this ADR removes — for the whole soak,
+with 9–11 concurrent loops in production. So `max_concurrent_activities`
+is set to the 100 it replaces, and `max_concurrent_workflow_tasks` is
+left unset: with no value the SDK does not fall back to 100, it builds a
+**500**-thread pool, so any number there is a far larger step down than
+it looks. Step 3 picks both values, in the same change that takes the
+workload away and with D5's numbers in hand. Execution starts at 40 —
+it is a new queue with no existing load to protect.
 
 **D4 — The routing flip is guarded by `workflow.patched("exec-queue")`.**
 `execute_activity(task_queue=...)` changes the scheduled command, and

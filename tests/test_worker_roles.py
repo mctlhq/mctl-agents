@@ -111,10 +111,17 @@ def test_only_workflow_running_roles_own_the_schedules():
     assert owns_schedules("execution") is False
 
 
-def test_the_control_limit_does_not_tighten_before_the_routing_flip():
+def test_no_control_ceiling_is_lowered_before_the_routing_flip():
     """Between step 2 and step 3 the control worker still carries every long
-    Argo poll. Dropping its ceiling below the SDK default in that window
-    would reintroduce the starvation the split removes, at a lower
-    threshold than today's (claude P2 on #249). Step 3 tightens it in the
-    same PR that removes the workload."""
+    Argo poll AND all five workflow types. Any ceiling below current
+    behaviour in that window reintroduces the starvation the split removes
+    (claude P2 on #249, twice — once per limit). Step 3 tightens them in
+    the same change that takes the workload away.
+
+    Both limits, because fixing one and leaving the sibling is exactly how
+    this was got wrong the first time. Note the workflow-task default is
+    not 100: unset, the SDK builds a 500-thread pool, so any number there
+    is a much bigger step down than it looks.
+    """
     assert CONTROL_MAX_CONCURRENT_ACTIVITIES >= 100
+    assert CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS is None

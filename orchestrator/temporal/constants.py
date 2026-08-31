@@ -29,5 +29,14 @@ EXECUTION_TASK_QUEUE = "mctl-dev-loop-exec"
 # production, a self-inflicted outage during the soak. Step 3 tightens it
 # in the same PR that removes the workload.
 CONTROL_MAX_CONCURRENT_ACTIVITIES = 100
-CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS = 40
+
+# Left unbounded for the same reason, and it is the sharper case: with
+# max_concurrent_workflow_tasks unset the SDK does not fall back to 100 —
+# it builds a thread pool of 500. So ANY number here is a new ceiling far
+# below current behaviour, imposed on a control worker still running all
+# five workflow types against 9-11 concurrent loops. Step 3 picks a value
+# once D5's numbers exist; guessing one during the soak is how a capacity
+# limit becomes an outage.
+CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS: int | None = None
+
 EXECUTION_MAX_CONCURRENT_ACTIVITIES = 40
