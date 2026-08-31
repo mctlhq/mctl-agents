@@ -266,6 +266,21 @@ def _carry_forward(live: Path, staging: Path) -> None:
             shutil.copy2(kept, target)
 
 
+class _ProposalAdvanced(RuntimeError):
+    """The proposal was approved while the agent was running.
+
+    Raised INSIDE the publish block rather than returned from it, so the
+    rollback that puts the renamed-aside proposal back is the same one
+    every other failure uses. Returning early from there was how the
+    restore came to be duplicated, and then how carry-forward ended up
+    outside it entirely (codex P2 on #247).
+    """
+
+    def __init__(self, status: str) -> None:
+        super().__init__(status)
+        self.status = status
+
+
 class ProposalAmbiguityError(RuntimeError):
     """One issue owns more than one proposal directory.
 
@@ -802,39 +817,41 @@ def investigate(
             # copy makes the answer authoritative instead of merely fresh:
             # the proposal is no longer at the path an approver writes to,
             # so nothing can change it between this read and the swap.
-            live_status = _load_status(aside / ".status.yaml").get("status")
-            if live_status and live_status not in _OVERWRITABLE_STATUSES:
-                try:
-                    os.replace(aside, proposal_dir)
-                    aside = None
-                except BaseException:
-                    # Same rule as the publish rollback below: the aside copy
-                    # is now the only one, so cleanup must not run.
-                    keep_aside = True
-                    print(
-                        f"CRITICAL: refused to overwrite an approved proposal but "
-                        f"could not put it back at {proposal_dir}; it is at {aside}",
-                        file=sys.stderr,
-                    )
-                    raise
-                return InvestigateResult(
-                    service, slug, proposal_dir,
-                    error=(
-                        f"proposal advanced to '{live_status}' while the agent "
-                        "was running — refusing to overwrite it"
-                    ),
-                )
-
-            #    Anything the agent did not rewrite is carried into staging,
-            #    so the swap does not silently drop files a previous
-            #    investigation left behind.
-            _carry_forward(aside, staging)
+        # EVERYTHING after that first rename runs under the rollback, not
+        # just the swap. The status read and the carry-forward walk can
+        # both fail — an unreadable supplemental file, a full filesystem —
+        # and while they sat outside this block the exception went
+        # straight to `finally`, which deleted aside_root because
+        # keep_aside was still false: the previous proposal destroyed and
+        # its live path left empty (codex P2 on #247). The rule is the
+        # rename, not the swap: once the proposal is aside, no path out of
+        # here may leave it there.
         try:
+            if aside is not None:
+                live_status = _load_status(aside / ".status.yaml").get("status")
+                if live_status and live_status not in _OVERWRITABLE_STATUSES:
+                    raise _ProposalAdvanced(live_status)
+
+                # Anything the agent did not rewrite is carried into
+                # staging, so the swap does not silently drop files a
+                # previous investigation left behind.
+                _carry_forward(aside, staging)
+
+                # mkdtemp made staging 0700. Publishing it as-is would
+                # hand the proposal a scratch directory's permissions
+                # instead of the checkout's, so anything running as
+                # another user stops being able to read it (codex P2 on
+                # #247). Take the mode from what is being replaced.
+                shutil.copymode(aside, staging)
+            else:
+                shutil.copymode(proposal_dir.parent, staging)
+
             os.replace(staging, proposal_dir)
         except BaseException as publish_error:
             if aside is not None:
                 try:
                     os.replace(aside, proposal_dir)
+                    aside = None
                 except BaseException as restore_error:
                     # BaseException, not OSError: a restore that fails for
                     # any other reason must still keep the copy. Catching
@@ -872,6 +889,16 @@ def investigate(
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         return InvestigateResult(service, slug, proposal_dir, error=msg)
+    except _ProposalAdvanced as e:
+        # The rollback already put the proposal back; this is an ordinary
+        # refusal, not a crash.
+        return InvestigateResult(
+            service, slug, proposal_dir,
+            error=(
+                f"proposal advanced to '{e.status}' while the agent was "
+                "running — refusing to overwrite it"
+            ),
+        )
     except SystemExit as e:
         return InvestigateResult(service, slug, proposal_dir, error=f"SystemExit: {e}")
     except RateLimitExhaustedError as e:

@@ -7,7 +7,9 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 """
 from __future__ import annotations
 
+import os
 import pathlib
+import stat
 import subprocess
 import types
 from pathlib import Path
@@ -1242,3 +1244,79 @@ def test_an_approval_during_the_agent_run_still_wins(tmp_path, monkeypatch):
     assert live["status"] == "accepted", "the approval was revoked"
     assert (proposal_dir / "design.md").read_text() == "v1 design.md"
     assert (proposal_dir / "notes.md").read_text() == "carry me"
+
+
+def test_a_failing_carry_forward_does_not_destroy_the_proposal(tmp_path, monkeypatch):
+    """The rollback boundary is the rename, not the swap.
+
+    `_carry_forward` can raise — an unreadable supplemental file, a full
+    filesystem — after the live directory was already renamed aside. While
+    that call sat outside the publish rollback the exception went straight
+    to `finally`, which deleted the aside copy because keep_aside was
+    still false: the previous proposal destroyed and its live path left
+    empty (codex P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=34,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    proposal_dir = first.proposal_dir
+    (proposal_dir / "notes.md").write_text("irreplaceable")
+
+    def _boom(live, staging):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(run_issue_investigator, "_carry_forward", _boom)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert proposal_dir.is_dir(), "the proposal was left absent"
+    assert (proposal_dir / "notes.md").read_text() == "irreplaceable"
+    assert (proposal_dir / "design.md").read_text() == "v1 design.md"
+
+
+def test_the_published_proposal_is_not_left_with_scratch_permissions(
+    tmp_path, monkeypatch
+):
+    """mkdtemp makes staging 0700; publishing it as-is hands the proposal a
+    scratch directory's permissions instead of the checkout's, so anything
+    running as another user stops being able to read it (codex P2 on #247)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=35,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    mode = stat.S_IMODE(first.proposal_dir.stat().st_mode)
+    assert mode != 0o700, "published with mkdtemp's private mode"
+    assert mode == stat.S_IMODE(first.proposal_dir.parent.stat().st_mode)
+
+    # And a re-investigation keeps whatever mode the live proposal had.
+    distinctive = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP
+    os.chmod(first.proposal_dir, distinctive)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+    assert second.error is None
+    assert stat.S_IMODE(first.proposal_dir.stat().st_mode) == distinctive
