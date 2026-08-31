@@ -67,6 +67,20 @@ jobs:
           owner: mctlhq
           repositories: mctl-gitops
 
+      # Both worker deployments are named, not just the control one. The
+      # queue split (ADR-008) runs two Deployments off this one image, and
+      # values_path names exactly the files to bump: a worker nobody names
+      # is bumped by nobody and pins to whatever tag it launched with.
+      # That is not a hypothetical — it is what left the shepherd on
+      # 1.25.0 for three weeks (#220, fixed in #238), and ADR-008 calls it
+      # the most likely way that ADR goes wrong.
+      #
+      # release-deploy requires EVERY named path to match an image pattern
+      # (mctl-gitops#962) and errors otherwise, so a rename or a deleted
+      # deployment fails the release loudly instead of quietly skipping a
+      # worker. If this dispatch ever starts failing with "no image tag
+      # pattern for ... in explicitly requested ...", that is the guard
+      # working: fix the list, do not drop the path.
       - name: Dispatch centralized release-deploy
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:
@@ -83,7 +97,7 @@ jobs:
             -f team_name=admins \
             -f component_name=mctl-agents \
             -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml" \
-            -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml"
+            -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml,platform-gitops/services/admins/mctl-agents-worker-exec/values.yaml"
 
       # Refresh the agent registry so DevLoopWorkflow resolves THIS release
       # rather than whatever was published last by hand. Nothing did this
