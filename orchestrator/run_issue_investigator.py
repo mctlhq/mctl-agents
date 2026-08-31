@@ -20,11 +20,13 @@ Pipeline for one issue:
        the issue (passed in the prompt) + the cloned code and writes
        requirements.md / design.md / tasks.md there, never into the live
        proposal. Write .status.yaml into staging too.
-    7. Publish: once all three documents exist, rename staging's files over
-       the live ones (same filesystem, so each rename is atomic), status
-       last. Until that point the existing proposal is untouched, so a
-       crash, a rate limit or a kill cannot leave it half-replaced —
-       there is nothing to back up and nothing to restore.
+    7. Publish by swapping directories: rename the live proposal aside,
+       rename staging into its place, and put the original back if that
+       fails. Until this step the existing proposal is untouched, so a
+       crash, a rate limit or a kill during the agent run cannot affect
+       it at all. The swap itself is two renames, so a kill between them
+       leaves the proposal absent rather than mixed — recoverable by
+       re-running, unlike a proposal stitched from two runs.
     8. Comment on the issue with a link to the proposal.
 
 The proposal stops at `status: proposed`. A human reviews the spec and flips
@@ -697,20 +699,57 @@ def investigate(
         #    documents paired with the previous run's status.
         write_status_yaml(staging, issue)
 
-        # 6. Publish: rename each file over its live counterpart. Same
-        #    filesystem, so each replace is atomic and a reader never sees
-        #    a partially written document. Everything the agent produced
-        #    moves, not just the triplet, matching what it could write
-        #    directly before. .status.yaml goes LAST: its presence is what
-        #    marks the proposal complete and suppresses the rollback
-        #    below, so it must not appear before the documents it
-        #    describes.
-        proposal_dir.mkdir(parents=True, exist_ok=True)
-        produced = sorted(f for f in staging.iterdir() if f.is_file())
-        for f in [p for p in produced if p.name != ".status.yaml"]:
-            os.replace(f, proposal_dir / f.name)
-        for f in [p for p in produced if p.name == ".status.yaml"]:
-            os.replace(f, proposal_dir / f.name)
+        # 6. Publish by swapping DIRECTORIES, not file by file. Four
+        #    individual os.replace calls are each atomic but the sequence
+        #    is not: a kill or an OSError on a later one, after an earlier
+        #    one landed, leaves a re-investigation holding a mix of new and
+        #    old documents — the stitched-from-two-runs proposal this
+        #    redesign exists to prevent (claude P2 on #247).
+        #
+        #    Anything the agent did not rewrite is carried into staging
+        #    first, so the swap does not silently drop files a previous
+        #    investigation left behind.
+        if proposal_dir.is_dir():
+            for kept in proposal_dir.iterdir():
+                if kept.is_file() and not (staging / kept.name).exists():
+                    shutil.copy2(kept, staging / kept.name)
+
+        #    Rename the live proposal aside, move staging into its place,
+        #    and put the original back if that second rename fails. Two
+        #    renames rather than one because os.replace refuses to
+        #    overwrite a non-empty directory. The residual window is
+        #    exactly that: a kill BETWEEN the two renames leaves the
+        #    proposal absent rather than mixed. That is deliberate — an
+        #    absent proposal is regenerated wholesale by the next run,
+        #    whereas a mixed one looks valid and is not — but it is a
+        #    window, and claiming otherwise is what this comment replaces.
+        proposal_dir.parent.mkdir(parents=True, exist_ok=True)
+        aside = None
+        if proposal_dir.is_dir():
+            aside = Path(tempfile.mkdtemp(dir=proposal_dir.parent.parent, prefix=".aside-")) / "proposal"
+            os.replace(proposal_dir, aside)
+        try:
+            os.replace(staging, proposal_dir)
+        except BaseException:
+            if aside is not None:
+                try:
+                    os.replace(aside, proposal_dir)
+                except OSError:
+                    # Never delete the only copy. If it cannot go back,
+                    # say exactly where it is: the alternative is a
+                    # cleanup step destroying the proposal it was meant
+                    # to protect.
+                    print(
+                        f"CRITICAL: could not restore {proposal_dir}; the "
+                        f"previous proposal is at {aside}",
+                        file=sys.stderr,
+                    )
+                    raise
+                shutil.rmtree(aside.parent, ignore_errors=True)
+            raise
+        else:
+            if aside is not None:
+                shutil.rmtree(aside.parent, ignore_errors=True)
 
         # 7. Link the proposal back to the issue. A failure here (e.g. the
         # token lacks `issues: write`) must NOT mark the investigation as

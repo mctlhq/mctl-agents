@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import types
+from pathlib import Path
 
 import anyio
 import pytest
@@ -771,3 +772,88 @@ def test_a_failing_agent_never_touches_the_live_proposal(tmp_path, monkeypatch):
     assert after == before
     # ...and no staging directory survived the run.
     assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []
+
+
+def test_a_failed_publish_puts_the_original_proposal_back(tmp_path, monkeypatch):
+    """The publish window has a deterministic inverse: one rename back.
+
+    Replacing the documents one os.replace at a time was atomic per file
+    but not as a sequence — a failure on a later one, after an earlier one
+    landed, left a re-investigation holding a mix of old and new documents
+    (claude P2 on #247). Swapping directories makes the failure recoverable
+    by a single rename instead of a byte-level restore.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=22,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"good {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    before = {p.name: p.read_text() for p in first.proposal_dir.iterdir() if p.is_file()}
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"new {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    real_replace = run_issue_investigator.os.replace
+
+    # Fails once, on the publish rename. The restore rename targets the
+    # same path, so a stub that always raised would break recovery too and
+    # test nothing.
+    failed = []
+
+    def failing_second_rename(src, dst):
+        if Path(dst) == first.proposal_dir and not failed:
+            failed.append(True)
+            raise OSError("disk full")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run_issue_investigator.os, "replace", failing_second_rename)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
+
+    assert second.error is not None
+    after = {p.name: p.read_text() for p in first.proposal_dir.iterdir() if p.is_file()}
+    assert after == before
+    # No scratch directories survive a failed publish.
+    service_dir = tmp_path / "mctl-telegram"
+    assert list(service_dir.glob(".aside-*")) == []
+    assert list(service_dir.glob(".staging-*")) == []
+
+
+def test_files_the_agent_did_not_rewrite_survive_the_swap(tmp_path, monkeypatch):
+    """A directory swap must not silently drop what a previous run left.
+
+    The agent writes only the triplet, so anything else in the proposal —
+    a note, an extra design doc — would vanish if staging simply replaced
+    the directory wholesale.
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=23,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("hand-written note")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is None
+    assert (first.proposal_dir / "notes.md").read_text() == "hand-written note"
+    assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
