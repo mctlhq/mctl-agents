@@ -9,10 +9,14 @@ Deployed as its own service (mctl-agents-worker, ingress disabled).
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from temporalio.client import (
     Client,
@@ -42,7 +46,13 @@ from orchestrator.temporal.activities.proposals import find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
 from orchestrator.temporal.activities.visibility import VisibilityActivities
-from orchestrator.temporal.constants import TASK_QUEUE
+from orchestrator.temporal.constants import (
+    CONTROL_MAX_CONCURRENT_ACTIVITIES,
+    CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
+    EXECUTION_MAX_CONCURRENT_ACTIVITIES,
+    EXECUTION_TASK_QUEUE,
+    TASK_QUEUE,
+)
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.docs_delta import DocsDeltaWorkflow
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
@@ -163,39 +173,139 @@ async def setup_schedules(client: Client) -> None:
     await _ensure_schedule(client, INCIDENTS_SCHEDULE_ID, incidents_schedule, "IncidentLoopWorkflow")
 
 
+ROLES = ("all", "control", "execution")
+
+
+@dataclass(frozen=True)
+class WorkerPlan:
+    """What one role registers, and where. See ADR-008.
+
+    A plain description rather than a Worker, so the routing decision — the
+    part with the actual consequences — is a pure function that can be
+    asserted on without a live Temporal connection (Worker() insists on a
+    real bridge client and dials on construction).
+    """
+
+    task_queue: str
+    workflows: list[type]
+    activities: list[Callable[..., Any]]
+    max_concurrent_activities: int | None = None
+    max_concurrent_workflow_tasks: int | None = None
+
+    @property
+    def activity_names(self) -> set[str]:
+        return {getattr(a, "__temporal_activity_definition").name for a in self.activities}
+
+
+def worker_plan(role: str, visibility: VisibilityActivities) -> WorkerPlan:
+    """The queue/registration layout for one role.
+
+    `all` is the default and is byte-for-byte the single-queue worker this
+    repo has always run — same queue, same activities, no slot limits — so
+    this change is releasable on its own and a rollback is a values edit
+    rather than a code revert.
+
+    Workflows go on the control queue only. The execution worker never
+    needs them: it services activities scheduled BY those workflows, and a
+    workflow task is short by construction, so putting them on the
+    long-holding queue would reintroduce the starvation the split removes.
+    """
+    if role not in ROLES:
+        raise SystemExit(f"--role must be one of {', '.join(ROLES)}, got {role!r}")
+
+    short_activities: list[Callable[..., Any]] = [
+        resolve_agent_release,
+        record_execution,
+        find_proposal_slug,
+        get_pr_state,
+        resolve_deploy_target,
+        get_release_after,
+        get_deploy_status,
+        list_service_incidents,
+        discover_and_project,
+        detect_orphans,
+        visibility.list_active_dev_loop_ids,
+        poll_issues_activity,
+        process_docs_delta_activity,
+    ]
+    workflows: list[type] = [
+        DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow
+    ]
+
+    if role == "execution":
+        return WorkerPlan(
+            task_queue=EXECUTION_TASK_QUEUE,
+            workflows=[],
+            activities=[submit_and_wait],
+            max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
+        )
+    if role == "control":
+        return WorkerPlan(
+            task_queue=TASK_QUEUE,
+            workflows=workflows,
+            # submit_and_wait stays registered here too: nothing routes to
+            # the execution queue until the patched flip lands, so removing
+            # it now would strand every Argo submit in the gap between the
+            # two PRs.
+            activities=[*short_activities, submit_and_wait],
+            max_concurrent_activities=CONTROL_MAX_CONCURRENT_ACTIVITIES,
+            max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
+        )
+    return WorkerPlan(
+        task_queue=TASK_QUEUE,
+        workflows=workflows,
+        activities=[*short_activities, submit_and_wait],
+    )
+
+
+def build_worker(client: Client, plan: WorkerPlan) -> Worker:
+    """Turn a plan into a Worker. Kept trivial on purpose — everything
+    worth testing lives in worker_plan()."""
+    kwargs: dict[str, Any] = {}
+    if plan.max_concurrent_activities is not None:
+        kwargs["max_concurrent_activities"] = plan.max_concurrent_activities
+    if plan.max_concurrent_workflow_tasks is not None:
+        kwargs["max_concurrent_workflow_tasks"] = plan.max_concurrent_workflow_tasks
+    return Worker(
+        client,
+        task_queue=plan.task_queue,
+        workflows=plan.workflows,
+        activities=plan.activities,
+        **kwargs,
+    )
+
+
 async def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--role",
+        default=os.environ.get("WORKER_ROLE", "all"),
+        choices=ROLES,
+        help=(
+            "which half of the split this process serves (ADR-008). "
+            "'all' — one process, one queue, as before (default)."
+        ),
+    )
+    args = parser.parse_args()
+
     address = os.environ.get("TEMPORAL_ADDRESS", "temporal-frontend.temporal.svc.cluster.local:7233")
     namespace = os.environ.get("TEMPORAL_NAMESPACE", "mctl-agents")
 
     logger.info("connecting to Temporal at %s (namespace=%s)", address, namespace)
     client = await Client.connect(address, namespace=namespace)
 
-    await setup_schedules(client)
+    # Only a role that owns the workflows owns their schedules. Two
+    # processes racing to create the same schedule is harmless
+    # (_ensure_schedule is idempotent), but an execution worker asserting
+    # a spec it does not run is a lie waiting to drift.
+    if args.role in ("all", "control"):
+        await setup_schedules(client)
 
     visibility = VisibilityActivities(client)
+    plan = worker_plan(args.role, visibility)
+    worker = build_worker(client, plan)
 
-    worker = Worker(
-        client,
-        task_queue=TASK_QUEUE,
-        workflows=[DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow],
-        activities=[
-            resolve_agent_release,
-            submit_and_wait,
-            record_execution,
-            find_proposal_slug,
-            get_pr_state,
-            resolve_deploy_target,
-            get_release_after,
-            get_deploy_status,
-            list_service_incidents,
-            discover_and_project,
-            detect_orphans,
-            visibility.list_active_dev_loop_ids,
-            poll_issues_activity,
-            process_docs_delta_activity,
-        ],
-    )
-    logger.info("worker starting on task queue %s", TASK_QUEUE)
+    logger.info("worker starting: role=%s task_queue=%s", args.role, worker.task_queue)
     await worker.run()
 
 
