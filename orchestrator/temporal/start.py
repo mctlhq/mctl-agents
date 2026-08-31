@@ -52,15 +52,13 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
     other terminal failure; only a run that actually completed is "already
     handled".
 
-    One caveat this policy inherits rather than introduces: a restart
-    re-runs investigate, which derives the proposal slug from the issue
-    title. Rename the issue between the failure and the retry and the
-    investigator's idempotency guard — which checks only its own exact
-    directory — writes a SECOND proposal beside the first, after which
-    find_proposal_slug refuses the now-ambiguous issue-<N>-* lookup
-    (codex P2 on #241). Retry before renaming. The real fix is to anchor
-    the guard on the issue number rather than the full slug, which lives
-    in the investigator CWFT, not here — tracked as #246.
+    A restart re-runs investigate, which used to derive the proposal slug
+    from the issue title — so renaming the issue between the failure and
+    the retry wrote a SECOND proposal beside the first, after which
+    find_proposal_slug refused the now-ambiguous issue-<N>-* lookup (codex
+    P2 on #241). run_issue_investigator.resolve_slug closed that by keying
+    the directory on the issue number and reusing whatever dir already
+    exists (#246), so a restart is safe across renames.
     """
     if client is None:
         client = await connect()

@@ -174,12 +174,54 @@ def slugify(text: str, max_len: int = 40) -> str:
 
 
 def build_slug(issue_number: int, title: str) -> str:
-    """Deterministic proposal slug: `issue-<N>-<kebab-title>`.
+    """Proposal slug for a FIRST investigation: `issue-<N>-<kebab-title>`.
 
-    Deterministic on (number, title) so a re-run for the same issue targets
-    the same proposal directory instead of spawning a `-v2` duplicate.
+    Deterministic on (number, title) — which is the catch, and why callers
+    must go through `resolve_slug` instead of calling this directly: the
+    title is not immutable. Rename the issue and this returns a different
+    slug for the same issue, which is how one issue ends up with two
+    proposal directories (#246).
     """
     return f"issue-{issue_number}-{slugify(title)}"
+
+
+def existing_slugs(proposals_dir: Path, issue_number: int) -> list[str]:
+    """Every proposal directory already claimed by this issue number.
+
+    The issue number is the part of the slug that cannot change, so it —
+    not the full slug — is what identifies an issue's proposal. Sorted so
+    the error message below is stable.
+    """
+    prefix = f"issue-{int(issue_number)}-"
+    if not proposals_dir.is_dir():
+        return []
+    return sorted(p.name for p in proposals_dir.iterdir() if p.is_dir() and p.name.startswith(prefix))
+
+
+def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
+    """The slug this issue's proposal lives at, reusing one if it exists.
+
+    An issue's proposal directory is identified by its NUMBER; the title
+    fragment is decoration that happens to be part of the path. So when a
+    directory for this issue already exists, keep writing to it whatever
+    the issue is called today. Only a genuinely new issue gets a slug
+    built from the current title.
+
+    Without this, a rename between two investigations of the same issue
+    produced a second directory beside the first, and `find_proposal_slug`
+    then refused the ambiguous `issue-<N>-*` lookup — the loop could not
+    proceed and gitops kept a stray proposal (codex P2 on #241, #246).
+    Two directories is already-broken state, so say which ones rather than
+    silently picking one.
+    """
+    matches = existing_slugs(proposals_dir, issue_number)
+    if len(matches) > 1:
+        raise SystemExit(
+            f"issue #{issue_number} already has {len(matches)} proposal dirs "
+            f"({', '.join(matches)}) — refusing to guess which one is real; "
+            "remove the stale one from gitops first"
+        )
+    return matches[0] if matches else build_slug(issue_number, title)
 
 
 def gh_issue_view(url: str) -> IssueData:
@@ -507,8 +549,9 @@ def investigate(
             f"Known: {', '.join(SERVICES)}"
         )
 
-    slug = build_slug(issue.ref.number, issue.title)
-    proposal_dir = state_dir / service / "proposals" / slug
+    proposals_dir = state_dir / service / "proposals"
+    slug = resolve_slug(proposals_dir, issue.ref.number, issue.title)
+    proposal_dir = proposals_dir / slug
     status_path = proposal_dir / ".status.yaml"
 
     # Idempotency guard — never clobber a proposal an implementer owns.

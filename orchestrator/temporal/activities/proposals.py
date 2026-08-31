@@ -130,8 +130,13 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
         if entry.get("type") == "dir" and str(entry.get("name", "")).startswith(prefix)
     )
     if len(matches) > 1:
-        # Two directories for one issue should be impossible (the slug is
-        # deterministic); refuse to guess rather than implement the wrong one.
+        # Two directories for one issue means the investigator forked the
+        # proposal — which it did whenever the issue was renamed between
+        # runs, because the slug is deterministic on (number, TITLE), not
+        # on the number alone. resolve_slug now reuses an existing
+        # issue-<N>-* dir (#246), so this should no longer be reachable
+        # from the normal path; refuse to guess rather than implement the
+        # wrong one, and leave the pair for a human to reconcile.
         raise ApplicationError(
             f"multiple proposal dirs match {prefix}* under {service}: {matches}",
             non_retryable=True,

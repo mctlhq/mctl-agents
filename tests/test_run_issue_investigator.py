@@ -28,6 +28,7 @@ from orchestrator.run_issue_investigator import (
     gh_issue_view,
     investigate,
     parse_issue_url,
+    resolve_slug,
     slugify,
     try_parse_issue_url,
     write_status_yaml,
@@ -121,6 +122,59 @@ def test_build_slug_deterministic():
     b = build_slug(123, title)
     assert a == b
     assert a.startswith("issue-123-")
+
+
+# ---------------------------------------------------------------------------
+# resolve_slug — the issue NUMBER owns the directory, not the title (#246)
+# ---------------------------------------------------------------------------
+def test_a_new_issue_gets_a_slug_built_from_its_title(tmp_path):
+    assert resolve_slug(tmp_path, 123, "Add monitoring") == build_slug(123, "Add monitoring")
+
+
+def test_a_renamed_issue_keeps_writing_to_its_original_proposal(tmp_path):
+    """The bug #246 is about: a rename must not fork the proposal.
+
+    Investigation one wrote issue-7-old-title. The issue is then renamed
+    and the run retried (which #241's reuse policy made possible). Keying
+    on the title would derive issue-7-new-title, leave the original dir
+    untouched beside it, and `find_proposal_slug` would then refuse the
+    ambiguous issue-7-* lookup for good.
+    """
+    proposals = tmp_path / "proposals"
+    (proposals / "issue-7-old-title").mkdir(parents=True)
+
+    assert resolve_slug(proposals, 7, "Completely different title now") == "issue-7-old-title"
+
+
+def test_another_issues_proposal_is_not_mistaken_for_this_ones(tmp_path):
+    """`issue-7-` must not match issue-70: prefix, not substring."""
+    proposals = tmp_path / "proposals"
+    (proposals / "issue-70-something").mkdir(parents=True)
+
+    assert resolve_slug(proposals, 7, "New work") == build_slug(7, "New work")
+
+
+def test_two_dirs_for_one_issue_is_refused_not_guessed(tmp_path):
+    """Already-broken state — name both rather than silently pick one."""
+    proposals = tmp_path / "proposals"
+    (proposals / "issue-7-old-title").mkdir(parents=True)
+    (proposals / "issue-7-new-title").mkdir(parents=True)
+
+    with pytest.raises(SystemExit) as excinfo:
+        resolve_slug(proposals, 7, "whatever")
+
+    message = str(excinfo.value)
+    assert "issue-7-old-title" in message
+    assert "issue-7-new-title" in message
+
+
+def test_a_file_is_not_a_proposal_directory(tmp_path):
+    """Only directories count — a stray file must not shadow the slug."""
+    proposals = tmp_path / "proposals"
+    proposals.mkdir(parents=True)
+    (proposals / "issue-7-stray-file").write_text("not a proposal")
+
+    assert resolve_slug(proposals, 7, "Real work") == build_slug(7, "Real work")
 
 
 # ---------------------------------------------------------------------------
