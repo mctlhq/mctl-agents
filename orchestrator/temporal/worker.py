@@ -368,8 +368,14 @@ async def run_until_signalled(workers: list[Worker]) -> None:
     premise about SDK-installed handlers that does not hold — the gap is
     real, the mechanism described was not).
 
-    Entering each worker as an async context manager and leaving the block
-    is the SDK's own shutdown path, so every worker drains, not just one.
+    Entering each worker as an async context manager is what STARTS it:
+    Worker.__aenter__ is documented as "a wrapper around run()" and
+    schedules self.run() as a task, and __aexit__ awaits shutdown(). So
+    every worker polls, and every worker drains — not just one. (Reviewed
+    as a P1 on the claim that Worker implements no context-manager
+    protocol and that this would start nothing; it does, and
+    test_worker_roles.py pins that contract so an SDK upgrade cannot
+    quietly break it.)
     """
     shutdown = asyncio.Event()
     loop = asyncio.get_running_loop()

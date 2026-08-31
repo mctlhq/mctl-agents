@@ -16,6 +16,7 @@ object that acts on it.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import signal
 from unittest.mock import MagicMock
 
@@ -183,3 +184,26 @@ async def test_every_worker_is_drained_on_shutdown():
 
     assert all(w.entered for w in workers)
     assert all(w.exited for w in workers)
+
+
+def test_the_sdk_context_manager_really_starts_and_drains_a_worker():
+    """Pin the SDK contract run_until_signalled depends on.
+
+    `async with worker:` is what starts polling here — `Worker.__aenter__`
+    is documented as "a wrapper around run()" and schedules `self.run()`,
+    and `__aexit__` awaits `shutdown()`. Reviewed as a P1 on the claim
+    that Worker implements no context-manager protocol and that the
+    process would therefore start and do nothing; it does, and it would
+    not. But the fake above cannot tell the difference, so if a future SDK
+    upgrade changed this the fake would keep passing while production
+    silently stopped polling.
+
+    Asserting on source is deliberate. The behaviour needs a live Temporal
+    to exercise, and the thing worth catching is the SDK changing under us
+    — at which point this fails and says to go re-read it.
+    """
+    from temporalio.worker import Worker
+
+    assert "__aenter__" in vars(Worker), "Worker no longer defines its own __aenter__"
+    assert "await self.run()" in inspect.getsource(Worker.__aenter__)
+    assert "await self.shutdown()" in inspect.getsource(Worker.__aexit__)
