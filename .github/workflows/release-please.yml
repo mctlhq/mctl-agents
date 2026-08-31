@@ -110,6 +110,18 @@ jobs:
           ref: ${{ steps.release.outputs.tag_name }}
           fetch-depth: 0
 
+      # Own interpreter rather than the image's system python: a system-wide
+      # `pip install` on a PEP 668 image ("externally managed environment")
+      # fails outright, and this step is the release pipeline — it must not
+      # depend on whether the runner image happens to ship that marker, or
+      # on `python` being symlinked to `python3` (agy P1). setup-python puts
+      # a non-managed interpreter on PATH under both names.
+      - name: Set up Python
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Refresh agent registry
         if: ${{ steps.release.outputs.release_created == 'true' }}
         env:

@@ -102,7 +102,17 @@ def _git(*args: str) -> str:
 
 
 def _tree_paths(tag: str) -> list[str]:
-    return _git("ls-tree", "-r", "--name-only", tag).splitlines()
+    """Every file path in ``tag``'s tree.
+
+    ``-z`` because git's default output C-quotes any path containing a
+    space or a non-ASCII byte (``"agents/x/my prompt.md"``), quotes and
+    all. Those literal quotes would then travel into the tree set and into
+    `git show <tag>:<path>`, which cannot resolve them — so a prompt file
+    with a space in its name would be reported as missing from a tree it
+    is plainly in (agy P2). NUL-terminated output is never quoted.
+    """
+    raw = _git("ls-tree", "-r", "-z", "--name-only", tag)
+    return [p for p in raw.split("\0") if p]
 
 
 def _read_at_tag(tag: str, relpath: str) -> bytes | None:
@@ -294,6 +304,12 @@ def publish(agent: str, version: str, git_sha: str, tree: list[str], *, dry_run:
     else:
         print(f"  published {agent}@{version}")
 
+    # No 409 allowance here, deliberately, unlike /versions above: promotion
+    # is idempotent server-side — PromoteRelease returns 200 for a version
+    # already released to this environment, and mctl-api's only 409 on this
+    # route is ErrNoRollbackTarget, which needs rollback=true (a flag this
+    # script never sends). A 409 here would therefore be a genuine surprise
+    # and should fail loudly rather than be reported as success.
     status, body = _request(
         "POST",
         f"/api/v1/agents/{agent}/releases",

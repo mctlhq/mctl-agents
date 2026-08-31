@@ -78,6 +78,31 @@ class TestGlobMatch:
         ]
 
 
+class TestTreePaths:
+    """`git ls-tree`'s default output is C-quoted; the parser must not be."""
+
+    def test_a_path_with_a_space_survives_unquoted(self, monkeypatch):
+        """A quoted path would be unresolvable by `git show tag:<path>`.
+
+        git wraps any path with a space or a non-ASCII byte in literal
+        double quotes unless asked not to. Carrying those quotes into the
+        tree set makes a file that IS in the tree look absent, and the
+        publish then fails on a prompt whose only sin is a space in its
+        name.
+        """
+        captured: list[tuple[str, ...]] = []
+
+        def fake_git(*args: str) -> str:
+            captured.append(args)
+            return "agents/x/agent.yaml\0agents/x/my prompt.md\0"
+
+        monkeypatch.setattr(publish_agent_release, "_git", fake_git)
+        paths = publish_agent_release._tree_paths("1.0.0")
+
+        assert "-z" in captured[0]
+        assert paths == ["agents/x/agent.yaml", "agents/x/my prompt.md"]
+
+
 class TestPromptHash:
     def _manifest(self, sources):
         return {"spec": {"prompt": {"sources": sources}}}
