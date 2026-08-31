@@ -295,18 +295,20 @@ def _is_transient(exc: ActivityError) -> bool:
     )
 
 
-async def _require_release_async(agent: str) -> ResolvedRelease | None:
-    """Resolve ``agent`` and gate it, or do nothing at all when unpatched.
+async def _shepherd_is_pinned() -> bool:
+    """Does the shepherd resolve to a pullable image right now?
 
-    The patch check has to come BEFORE the resolve, not after: histories
-    recorded before this marker replay command-for-command, and an
-    unconditional activity here would be a command in a position they
-    never recorded. Unpatched executions therefore skip the lookup
-    entirely and keep their old behaviour.
+    A question, not a gate: unlike the investigator and implementer, a
+    missing shepherd pin must not fail the loop (see _watch_pr). Answers
+    True when unpatched, so histories recorded before this marker keep
+    their behaviour — the patch check comes BEFORE the resolve because
+    they replay command-for-command, and an unconditional activity here
+    would be a command in a position they never recorded.
     """
     if not workflow.patched("registry-required"):
-        return None
-    return _require_release(agent, await _resolve(agent))
+        return True
+    release = await _resolve("shepherd")
+    return release is not None and bool(release.image_ref)
 
 
 def _require_release(agent: str, release: ResolvedRelease | None) -> ResolvedRelease | None:
@@ -518,12 +520,18 @@ class DevLoopWorkflow:
             # flip, the operator's approval would evaporate with the failed
             # workflow (codex P1 on PR #212). The reverse case — the gate
             # below failing AFTER the flip — leaves an accepted proposal
-            # that never implements; recovery is to publish the missing
-            # release and re-add the intake label, which restarts this
-            # issue now that the start policy is
-            # ALLOW_DUPLICATE_FAILED_ONLY, and the approve CWFT is a no-op
-            # on an already-accepted proposal. Pre-atomic-approve histories
-            # already resolved above, in their recorded position.
+            # that never implements. Recovery is to publish the missing
+            # release and re-add the intake label: ALLOW_DUPLICATE_FAILED_ONLY
+            # lets the issue start again, and the approve CWFT is a no-op on
+            # an already-accepted proposal. It is a restart, not a resume —
+            # the new run re-investigates and waits for a fresh approve
+            # signal, and if the issue TITLE changed in between, the
+            # investigator derives a different slug and find_proposal_slug
+            # then refuses the ambiguous issue-<N>-* match (codex P2). Both
+            # are acceptable for a misconfiguration that should not happen
+            # once every release refreshes the registry, and neither is
+            # silent. Pre-atomic-approve histories already resolved above,
+            # in their recorded position.
             implementer_release = _require_release("implementer", await _resolve("implementer"))
         #
         # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
@@ -851,18 +859,27 @@ class DevLoopWorkflow:
         # the watch starts, not at the first tick 4 h later: between those
         # two points this execution IS the owner, and the cron must already
         # be standing down.
-        if shepherd_in_loop:
-            # Gate the shepherd's registry pin HERE, before this execution
-            # claims ownership — not at the first tick 4 h later (codex P1,
-            # claude P2 on #241). _shepherd_tick runs as a background task
-            # whose exceptions it deliberately swallows, so a missing pin
-            # raised in there would be logged and dropped: the loop would
-            # keep reporting shepherd_in_loop=True, the sweeper would keep
-            # standing down, and the PR would go the full 14 days with no
-            # shepherd at all. Failing before the claim inverts that — the
-            # workflow stops, shepherd_in_loop stays False, and the cron
-            # sweeper picks the proposal up as unowned.
-            await _require_release_async("shepherd")
+        if shepherd_in_loop and not await _shepherd_is_pinned():
+            # Decline the claim rather than fail (round 2 on #241). The
+            # first fix raised here, which failed the whole workflow after
+            # investigate, approve and implement had all succeeded —
+            # contradicting this function's own fail-open contract and
+            # throwing away merge detection and deploy observation over a
+            # tick that is an optimisation, not correctness. But it cannot
+            # simply be left to _shepherd_tick either: that runs as a
+            # background task whose exceptions it swallows, so the loop
+            # would keep answering shepherd_in_loop=True while the sweeper
+            # stood down and nothing shepherded the PR for 14 days (codex
+            # P1, claude P2). Declining gives the same protection with no
+            # loss: nothing runs unpinned, and the cron sweeper picks the
+            # proposal up exactly as it did before #213.
+            workflow.logger.warning(
+                "no released shepherd image — %s/%s keeps watching but leaves "
+                "shepherding to the cron sweeper",
+                service,
+                slug,
+            )
+            shepherd_in_loop = False
         self._shepherd_in_loop = shepherd_in_loop
         # #231: run the tick concurrently so polling continues while it
         # runs. Awaiting it inline stalled merge detection for the tick's

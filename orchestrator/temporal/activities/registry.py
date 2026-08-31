@@ -60,11 +60,19 @@ async def resolve_agent_release(agent: str, environment: str) -> ResolvedRelease
     """Resolve which version is released to `environment` for `agent`.
 
     Returns None — not an exception — when nothing has ever been promoted
-    for this (agent, environment) pair. That is the expected steady state
-    for an agent the registry does not yet track (e.g. before its first
-    `mctl_promote_agent`), not a failure: DevLoopWorkflow falls back to the
-    target ClusterWorkflowTemplate's own baked-in default image, exactly
-    the compatibility shim the plan's phase 5 describes.
+    for this (agent, environment) pair. This activity stays neutral about
+    what that means, deliberately: its signature and return value must not
+    change, or histories recorded before the A4 marker would fail to
+    replay.
+
+    What None MEANS is now the caller's decision, and it is no longer a
+    fallback. Since A4 (#241) DevLoopWorkflow fails non-retryably for the
+    investigator and implementer rather than running the CWFT's baked-in
+    default image, and declines in-loop shepherd ticks (leaving them to
+    the cron sweeper). The registry is authoritative — every release
+    publishes and promotes every manifest via
+    tools/publish_agent_release.py — so an unresolvable agent is a real
+    misconfiguration, not the steady state it was during phase 5.
     """
     headers = auth_headers()
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS) as client:

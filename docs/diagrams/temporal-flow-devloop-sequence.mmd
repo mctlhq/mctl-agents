@@ -9,7 +9,7 @@ sequenceDiagram
 
     OP->>T: start(IssueRef) id=dev-loop-{owner}-{repo}-{N}
     T->>R: resolve("issue-investigator", production)
-    R-->>T: ResolvedRelease | None (None → дефолтный образ CWFT)
+    R-->>T: ResolvedRelease (None → воркфлоу падает, A4 #241)
     T->>S: submit_and_wait("mctl-agents-investigate", {issue_url, agent_image?, agent_version?})
     S->>A: POST /operations/.../execute
     A-->>S: workflowName

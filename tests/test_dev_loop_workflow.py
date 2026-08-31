@@ -75,6 +75,7 @@ def _fake_activities(
     deploy_statuses: list[DeployStatus] | None = None,
     release_lookup_bug: bool = False,
     deploy_status_bug: bool = False,
+    unpinned: set[str] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -96,6 +97,8 @@ def _fake_activities(
 
     @activity.defn(name="resolve_agent_release")
     async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+        if agent in (unpinned or set()):
+            return None
         return resolved.get(agent) if released else None
 
     calls: list[str] = []
@@ -486,23 +489,54 @@ class TestDevLoopWorkflow:
         # trade-off accepts.
         assert calls == ["mctl-agents-investigate", "mctl-agents-approve"]
 
-    async def test_the_shepherd_gate_fires_before_the_loop_claims_ownership(self, env):
-        """codex P1 on #241: a swallowed gate would starve the proposal.
+    async def test_an_unpinned_shepherd_declines_the_claim_instead_of_failing(self, env):
+        """The shepherd gate is fail-open-to-sweeper, not fatal (#241).
 
-        _shepherd_tick runs as a background task and deliberately logs its
-        failures instead of raising, so a missing shepherd pin discovered
-        in there would vanish — while the loop kept answering
-        shepherd_in_loop=True and the cron sweeper kept standing down. The
-        proposal would then get no shepherd at all for the full 14-day
-        watch. The gate therefore runs at the start of the watch, before
-        the claim.
+        Two failure modes had to be excluded at once. Raising here would
+        fail a workflow whose investigate, approve and implement all
+        succeeded, throwing away merge detection and deploy observation
+        over a tick that is an optimisation (claude P2). Leaving it to
+        _shepherd_tick would swallow it — that task logs its exceptions
+        rather than raising — so the loop would answer
+        shepherd_in_loop=True while the sweeper stood down and nothing
+        shepherded the PR for 14 days (codex P1). Declining the claim
+        does neither: the watch runs to completion, no unpinned image
+        runs, and the cron sweeper owns the proposal.
         """
-        calls, caught = await self._run_with_gate(env, unpinned="shepherd", issue=6)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, calls, investigate_ran = _fake_activities(
+            released=True,
+            unpinned={"shepherd"},
+            pr_states=[open_pr, open_pr, MERGED_PR],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/6"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+            owned = await handle.query(DevLoopWorkflow.shepherd_in_loop)
 
-        assert "shepherd" in str(caught.value.cause)
-        # Failed before claiming: no tick ran, and the sweeper is free to
-        # pick the proposal up as unowned.
+        # The loop finished its real work rather than dying on the tick.
+        assert result.implement is not None and result.pr is not None
+        # Nothing unpinned ran...
         assert "mctl-agents-shepherd" not in calls
+        # ...and the sweeper is told the proposal is unowned, which is the
+        # only thing standing between it and a PR nobody shepherds.
+        assert owned is False
 
     async def test_persistent_record_execution_failure_does_not_fail_workflow(self, env):
         """record_execution is an audit-trail write, not the real work — a
