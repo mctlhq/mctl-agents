@@ -715,6 +715,25 @@ def investigate(
         #    first, so the swap does not silently drop files a previous
         #    investigation left behind.
         if proposal_dir.is_dir():
+            # Re-read the status. The guard at the top of this function ran
+            # BEFORE an agent call that takes minutes, and approval is a
+            # human action that can land inside that window: the flip to
+            # `accepted` is exactly what someone does while reading the
+            # proposal. Swapping a freshly-generated `proposed` status over
+            # it would silently revoke a human approval and strand the
+            # implementer, which no later step could detect (agy P2 on
+            # #247). Cheap to check, and the only moment it is meaningful
+            # is here, immediately before the swap.
+            live_status = _load_status(proposal_dir / ".status.yaml").get("status")
+            if live_status and live_status not in _OVERWRITABLE_STATUSES:
+                return InvestigateResult(
+                    service, slug, proposal_dir,
+                    error=(
+                        f"proposal advanced to '{live_status}' while the agent "
+                        "was running — refusing to overwrite it"
+                    ),
+                )
+
             for kept in proposal_dir.iterdir():
                 if kept.is_file() and not (staging / kept.name).exists():
                     shutil.copy2(kept, staging / kept.name)

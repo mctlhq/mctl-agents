@@ -928,3 +928,41 @@ def test_a_failed_restore_reraises_the_original_failure(tmp_path, monkeypatch):
     asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
     assert len(asides) == 1
     assert (asides[0] / "design.md").read_text() == "v1 design.md"
+
+
+def test_an_approval_landing_mid_run_is_not_overwritten(tmp_path, monkeypatch):
+    """The guard at the top of investigate() is not enough on its own.
+
+    It runs before an agent call that takes minutes, and approving is
+    precisely what a human does while reading the proposal. Publishing a
+    freshly-generated `proposed` status over an `accepted` one would
+    silently revoke that approval and strand the implementer, with nothing
+    downstream able to tell it happened (agy P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=26,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    status_path = first.proposal_dir / ".status.yaml"
+
+    def approving_agent(repo_dir, prompt, proposal_dir):
+        # A human approves while the agent is working.
+        data = yaml.safe_load(status_path.read_text())
+        data["status"] = "accepted"
+        status_path.write_text(yaml.safe_dump(data, sort_keys=False))
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v2 {name}")
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", approving_agent)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert "accepted" in second.error
+    assert yaml.safe_load(status_path.read_text())["status"] == "accepted"
+    assert (first.proposal_dir / "design.md").read_text() == "v1 design.md"
+    assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []
