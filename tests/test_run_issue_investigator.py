@@ -857,3 +857,74 @@ def test_files_the_agent_did_not_rewrite_survive_the_swap(tmp_path, monkeypatch)
     assert second.error is None
     assert (first.proposal_dir / "notes.md").read_text() == "hand-written note"
     assert (first.proposal_dir / "design.md").read_text() == "v2 design.md"
+
+
+def test_a_failed_aside_rename_leaks_no_scratch_directory(tmp_path, monkeypatch):
+    """The wrapper is created before the rename that can fail (agy P3)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=24,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    real_replace = run_issue_investigator.os.replace
+
+    def failing_aside(src, dst):
+        if Path(src) == first.proposal_dir:
+            raise OSError("device busy")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run_issue_investigator.os, "replace", failing_aside)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
+
+    assert second.error is not None
+    service_dir = tmp_path / "mctl-telegram"
+    assert list(service_dir.glob(".aside-*")) == []
+    assert list(service_dir.glob(".staging-*")) == []
+
+
+def test_a_failed_restore_reraises_the_original_failure(tmp_path, monkeypatch):
+    """A bare `raise` in the restore handler would re-raise the OSError.
+
+    That masks whatever actually triggered the rollback: a
+    KeyboardInterrupt or SystemExit would surface as an ordinary error and
+    be swallowed by investigate()'s outer handler instead of ending the
+    process (agy P2 on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=25,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    real_replace = run_issue_investigator.os.replace
+
+    # Distinct types on purpose: the publish fails with the exception that
+    # must survive, the restore with a different one. A test using the same
+    # type for both passes even with a bare `raise`, and so proves nothing.
+    calls = []
+
+    def both_renames_fail(src, dst):
+        if Path(dst) == first.proposal_dir:
+            calls.append(dst)
+            raise KeyboardInterrupt() if len(calls) == 1 else OSError("read-only fs")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(run_issue_investigator.os, "replace", both_renames_fail)
+    with pytest.raises(KeyboardInterrupt):
+        investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
+
+    # The only surviving copy is kept, not cleaned up.
+    asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
+    assert len(asides) == 1
+    assert (asides[0] / "design.md").read_text() == "v1 design.md"

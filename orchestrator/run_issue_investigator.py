@@ -666,6 +666,11 @@ def investigate(
     proposal_preexisted = proposal_dir.exists()
     clone = None
     staging = None
+    aside: Path | None = None
+    aside_root: Path | None = None
+    # Set only when the previous proposal could not be put back, in which
+    # case the scratch copy is the ONLY one left and cleanup must not run.
+    keep_aside = False
     try:
         # 1. Read-only clone so the agent can ground the design in real code.
         clone = _clone_repo(issue.ref.full_repo, slug)
@@ -724,32 +729,38 @@ def investigate(
         #    whereas a mixed one looks valid and is not — but it is a
         #    window, and claiming otherwise is what this comment replaces.
         proposal_dir.parent.mkdir(parents=True, exist_ok=True)
-        aside = None
         if proposal_dir.is_dir():
-            aside = Path(tempfile.mkdtemp(dir=proposal_dir.parent.parent, prefix=".aside-")) / "proposal"
+            # aside_root is assigned BEFORE the rename that can fail, and
+            # cleaned in the outer finally, so a failure here does not leak
+            # the wrapper directory.
+            aside_root = Path(tempfile.mkdtemp(dir=proposal_dir.parent.parent, prefix=".aside-"))
+            aside = aside_root / "proposal"
             os.replace(proposal_dir, aside)
         try:
             os.replace(staging, proposal_dir)
-        except BaseException:
+        except BaseException as publish_error:
             if aside is not None:
                 try:
                     os.replace(aside, proposal_dir)
-                except OSError:
-                    # Never delete the only copy. If it cannot go back,
-                    # say exactly where it is: the alternative is a
-                    # cleanup step destroying the proposal it was meant
-                    # to protect.
+                except BaseException as restore_error:
+                    # BaseException, not OSError: a restore that fails for
+                    # any other reason must still keep the copy. Catching
+                    # only OSError let the outer cleanup delete the last
+                    # remaining proposal.
+                    # Never delete the only copy, and never let the restore
+                    # failure impersonate the original one: a bare `raise`
+                    # here would re-raise the OSError, so a KeyboardInterrupt
+                    # or SystemExit that triggered the rollback would come
+                    # out as an ordinary error and be swallowed by the outer
+                    # handler instead of ending the process.
+                    keep_aside = True
                     print(
-                        f"CRITICAL: could not restore {proposal_dir}; the "
-                        f"previous proposal is at {aside}",
+                        f"CRITICAL: could not restore {proposal_dir} "
+                        f"({restore_error}); the previous proposal is at {aside}",
                         file=sys.stderr,
                     )
-                    raise
-                shutil.rmtree(aside.parent, ignore_errors=True)
+                    raise publish_error from restore_error
             raise
-        else:
-            if aside is not None:
-                shutil.rmtree(aside.parent, ignore_errors=True)
 
         # 7. Link the proposal back to the issue. A failure here (e.g. the
         # token lacks `issues: write`) must NOT mark the investigation as
@@ -782,10 +793,12 @@ def investigate(
         return InvestigateResult(service, slug, proposal_dir, error=f"{type(e).__name__}: {e}")
     finally:
         # Drop the staging directory. Whatever the agent left there is
-        # this run's work and either landed in step 5 or is being
+        # this run's work and either landed in the swap or is being
         # abandoned; either way the live proposal was never touched.
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
+        if aside_root is not None and not keep_aside:
+            shutil.rmtree(aside_root, ignore_errors=True)
         # Drop the throwaway /tmp clone — the wrapper _clone_repo returned,
         # which takes the checkout inside it with it.
         if clone is not None and clone.exists():
