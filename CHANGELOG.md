@@ -1,5 +1,39 @@
 # Changelog
 
+## [1.34.0](https://github.com/mctlhq/mctl-agents/compare/1.33.0...1.34.0) (2026-08-31)
+
+
+### Features
+
+* **dev-loop:** bounded incident watch after the rollout ([8867429](https://github.com/mctlhq/mctl-agents/commit/8867429b18bdeab9de64c1512a7a29d10c8a13f7))
+* **dev-loop:** observe the release and verify the rollout ([79c0e00](https://github.com/mctlhq/mctl-agents/commit/79c0e00e2d2e7cb08a182965399829fcd1a21525))
+* **dev-loop:** require a registry-pinned image for every agent ([336bed6](https://github.com/mctlhq/mctl-agents/commit/336bed6154f395f3cf6bef6f3a2530509e02d2b4))
+* **release:** refresh the agent registry on every release ([f669eba](https://github.com/mctlhq/mctl-agents/commit/f669eba5d4b368ebf594181f7dbc892eb6de641c))
+* **release:** take the registry token from Vault via OIDC ([706101a](https://github.com/mctlhq/mctl-agents/commit/706101a101147803e169bff8b601a99a8a4e6ebf))
+
+
+### Bug Fixes
+
+* **dev-loop:** catch CancelledError when settling a tick ([077e149](https://github.com/mctlhq/mctl-agents/commit/077e1490a781f5e7abf305367e104b6029756df6))
+* **dev-loop:** decline the shepherd claim instead of failing the loop ([86941ed](https://github.com/mctlhq/mctl-agents/commit/86941ed6bd4c83dc3eca592ee4239edaf1e979f0))
+* **dev-loop:** do not label a broken read as no-release ([3b4eeeb](https://github.com/mctlhq/mctl-agents/commit/3b4eeebe13908bb2fd457beaa3c12e2573ee51ba))
+* **dev-loop:** drain a finished tick before dropping its reference ([e66c6e6](https://github.com/mctlhq/mctl-agents/commit/e66c6e6cfa42ae45bfee70bb24398e2e57d782bc))
+* **dev-loop:** four correctness fixes in the deploy stages ([6e1514f](https://github.com/mctlhq/mctl-agents/commit/6e1514f32a1edd8283008aadc8b7649524d5e5f8))
+* **dev-loop:** gate the shepherd before the claim, keep failures restartable ([ab8a1eb](https://github.com/mctlhq/mctl-agents/commit/ab8a1ebd9f6fb97d7f12a408c7eba2cad6411ac7))
+* **dev-loop:** keep the shepherd gate fail-open when the registry is down ([81262f0](https://github.com/mctlhq/mctl-agents/commit/81262f0714b0646eea99577d19ff9c94323f9621))
+* **dev-loop:** keep the timestamp helper total, log the real window ([975a6ba](https://github.com/mctlhq/mctl-agents/commit/975a6baecdcc1a66efd0c91f5dcdedac70bb01b0))
+* **dev-loop:** never let a timestamp compare wedge the workflow ([f4457d3](https://github.com/mctlhq/mctl-agents/commit/f4457d3b8b666359b56b45cec7cdd48ce62343c3))
+* **dev-loop:** open the incident window before the deploy observation ([d57007b](https://github.com/mctlhq/mctl-agents/commit/d57007b512e512c751d9bc0cd9581fe4233cee06))
+* **dev-loop:** refuse a deploy target that is not a safe path segment ([322e837](https://github.com/mctlhq/mctl-agents/commit/322e837677606b025b79d65c96a9050fc928361e))
+* **dev-loop:** report the real incident window, keep numeric ids ([c97f3f9](https://github.com/mctlhq/mctl-agents/commit/c97f3f9add062c397b241991e4f4255b98377bf4))
+* **dev-loop:** report truncated incident windows and odd id types ([377629a](https://github.com/mctlhq/mctl-agents/commit/377629af32bab30aeddef41eed2b6c790ebb7408))
+* **dev-loop:** run the in-loop shepherd tick concurrently ([ddae339](https://github.com/mctlhq/mctl-agents/commit/ddae339a391d3c2cbe2ef93c4ed603dfb7d20340))
+* **dev-loop:** tell a transient read from a bug in the deploy stages ([93dd0e3](https://github.com/mctlhq/mctl-agents/commit/93dd0e3bffb3c9942559ef212c1928d8d2a6a63a))
+* **release:** check out the tag, stop globbing across directories, add tests ([518ae9a](https://github.com/mctlhq/mctl-agents/commit/518ae9aa12c5565713e23ab5a07b9b461490b805))
+* **release:** drop the dead digest lookup, isolate per-agent failures ([254222c](https://github.com/mctlhq/mctl-agents/commit/254222c014432e3032b2d2e62d90804f608438f3))
+* **release:** give the registry step its own interpreter, unquote tree paths ([37f0db1](https://github.com/mctlhq/mctl-agents/commit/37f0db173685e962353e1c632b6706fb8e9e65f1))
+* **release:** make the digest unambiguous, isolate every failure kind ([3c64b73](https://github.com/mctlhq/mctl-agents/commit/3c64b738a280331a157ab122c708a833338170a0))
+
 ## [1.33.0](https://github.com/mctlhq/mctl-agents/compare/1.32.0...1.33.0) (2026-08-29)
 
 
