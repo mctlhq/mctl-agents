@@ -472,9 +472,21 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
         if status_path.exists():
             shutil.copymode(status_path, tmp_path)
         else:
-            umask = os.umask(0)
-            os.umask(umask)
-            os.chmod(tmp_path, 0o666 & ~umask)
+            # Discovered by creating a file and looking at it, NOT by
+            # os.umask(0) + restore. That idiom reads the umask by briefly
+            # setting it to zero, and the window is process-wide: anything
+            # else creating a file inside it gets 0666 (agy P2 on #247).
+            # This module is a single-shot CLI in the agent container and
+            # tests/test_worker_isolation.py keeps it out of the worker,
+            # so the window is not currently reachable — but a
+            # world-writable file is not the kind of thing to leave
+            # resting on an import-graph invariant.
+            probe = tmp_path.with_name(tmp_path.name + ".probe")
+            probe.touch(exist_ok=False)  # 0o666 & ~umask, applied by the OS
+            try:
+                shutil.copymode(probe, tmp_path)
+            finally:
+                probe.unlink(missing_ok=True)
         os.replace(tmp_path, status_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)

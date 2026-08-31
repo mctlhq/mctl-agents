@@ -995,9 +995,20 @@ def test_the_status_file_is_not_published_with_scratch_permissions(tmp_path, mon
     mode = stat.S_IMODE(status.stat().st_mode)
     assert mode != 0o600, "published with mkstemp's private mode"
     # What an ordinary open() would have produced.
-    umask = os.umask(0)
-    os.umask(umask)
-    assert mode == 0o666 & ~umask
+    probe = tmp_path / "probe"
+    probe.touch()
+    assert mode == stat.S_IMODE(probe.stat().st_mode)
+
+
+def test_the_status_write_never_touches_the_process_umask(tmp_path, monkeypatch):
+    """Reading the umask via os.umask(0) clears it process-wide for the
+    duration, and anything else creating a file in that window gets 0666
+    (agy P2 on #247)."""
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("write_status_yaml mutated the process umask")
+
+    monkeypatch.setattr(run_issue_investigator.os, "umask", _forbidden)
+    write_status_yaml(tmp_path / "proposals" / "issue-38-x", _issue(number=38))
 
 
 def test_an_approval_landing_mid_run_is_not_overwritten(tmp_path, monkeypatch):
