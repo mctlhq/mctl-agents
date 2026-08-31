@@ -55,8 +55,12 @@ _SERVICE_VALUES_RE = re.compile(
 # authenticated GET against an arbitrary internal endpoint, whose response
 # body this module would then quote back in an exception message — SSRF
 # plus exfiltration through the orchestrator's own token (agy P1 on #235).
-# One path segment, no separators, no traversal, no leading dot.
-_SAFE_SEGMENT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")
+# One path segment: no separators, and no leading dot, so ".." and any
+# path starting with a traversal are rejected. Interior dots ARE allowed —
+# ArgoCD application names and Kubernetes namespaces are DNS subdomains
+# and may legitimately contain them (agy P2); without a "/" they cannot
+# traverse anywhere.
+_SAFE_SEGMENT_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$")
 
 
 @dataclass(frozen=True)

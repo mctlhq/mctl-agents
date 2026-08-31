@@ -990,6 +990,33 @@ class TestGetDeployStatus:
         status = await env.run(get_deploy_status, "admins", "mctl-web")
         assert status.found is False
 
+    async def test_a_non_string_updated_at_is_dropped_at_the_boundary(self, env, monkeypatch):
+        """agy P1 (#236): an int epoch must never enter the dataclass.
+
+        This is where that gets decided. Downstream, `_at_or_after` would
+        call `.replace()` on it and raise AttributeError inside the
+        workflow loop — Temporal retries that forever on identical input,
+        wedging the state machine. It cannot get that far twice over:
+        Temporal's own converter refuses to decode a non-str into this
+        `str | None` field, and the activity drops it here first. Assert
+        the drop, so tightening this parse is never mistaken for dead code.
+        """
+        from orchestrator.temporal.activities.deploy_state import get_deploy_status
+
+        self._handler(
+            monkeypatch,
+            {
+                "argocd": {
+                    "health": "Healthy",
+                    "syncStatus": "Synced",
+                    "updatedAt": 1756512000,  # epoch, not ISO-8601
+                },
+                "service": {"imageTag": "7.4.0"},
+            },
+        )
+        status = await env.run(get_deploy_status, "admins", "mctl-web")
+        assert status.updated_at is None
+
 
 class TestDeployTargetPathSafety:
     """agy P1 on #235: the target ends up in an mctl-api URL path.
@@ -1043,3 +1070,127 @@ class TestDeployTargetPathSafety:
         )
         target = await env.run(resolve_deploy_target, "mctlhq/evil")
         assert target is not None and (target.team, target.app) == ("admins", "mctl-api")
+
+    async def test_dotted_names_are_allowed(self, env, monkeypatch):
+        """ArgoCD app names are DNS subdomains and may contain dots (agy P2)."""
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            "            -f team_name=admins \\\n            -f component_name=api.mctl.ai\n",
+        )
+        target = await env.run(resolve_deploy_target, "mctlhq/evil")
+        assert target is not None and target.app == "api.mctl.ai"
+
+    async def test_a_leading_dot_is_still_refused(self, env, monkeypatch):
+        """Allowing interior dots must not let ".." back in."""
+        from orchestrator.temporal.activities.deploy_state import resolve_deploy_target
+
+        self._handler(
+            monkeypatch,
+            "            -f team_name=admins \\\n            -f component_name=..evil\n",
+        )
+        assert await env.run(resolve_deploy_target, "mctlhq/evil") is None
+
+class TestListServiceIncidents:
+    """#216: scoped incident query — service + window, nothing stronger."""
+
+    def _handler(self, monkeypatch, payload, status=200, capture=None):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/incidents":
+                if capture is not None:
+                    capture.update(dict(request.url.params))
+                return httpx.Response(status, json=payload)
+            raise AssertionError(f"unexpected request: {request.url}")
+
+        monkeypatch.setenv("MCTL_TOKEN", "mctl-test-token")
+        _mock_async_client(monkeypatch, handler)
+
+    async def test_scopes_the_query_to_service_and_window(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        params: dict = {}
+        self._handler(monkeypatch, {"items": [], "count": 0}, capture=params)
+        await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert params["service"] == "mctl-web"
+        assert params["since"] == "2026-08-30T00:00:00Z"
+
+    async def test_maps_incident_fields(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch,
+            {
+                "items": [
+                    {
+                        "id": "alert-7",
+                        "title": "pods crashlooping",
+                        "severity": "critical",
+                        "status": "firing",
+                        "started_at": "2026-08-30T00:05:00Z",
+                    }
+                ],
+                "count": 1,
+            },
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert len(result.incidents) == 1
+        assert result.incidents[0].id == "alert-7"
+        assert result.incidents[0].severity == "critical"
+
+    async def test_falls_back_to_fingerprint_when_there_is_no_id(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch, {"items": [{"fingerprint": "fp-1", "title": "x"}], "count": 1}
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert [i.id for i in result.incidents] == ["fp-1"]
+
+    async def test_unexpected_items_shape_is_an_error_not_a_clean_window(
+        self, env, monkeypatch
+    ):
+        """Reporting "no incidents" for a changed payload would be a lie."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(monkeypatch, {"items": {"unexpected": True}})
+        with pytest.raises(Exception, match="incidents items"):
+            await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+
+    async def test_non_string_id_falls_through_to_fingerprint(self, env, monkeypatch):
+        """An int id must not shadow a usable fingerprint (claude P3 on #236)."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch,
+            {"items": [{"id": 12345, "fingerprint": "fp-2", "title": "x"}], "count": 1},
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert [i.id for i in result.incidents] == ["fp-2"]
+
+    async def test_truncation_is_reported(self, env, monkeypatch):
+        """A storm exceeding the cap must not read like a quiet window."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(
+            monkeypatch,
+            {"items": [{"id": "alert-1", "title": "x"}], "count": 400},
+        )
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert result.truncated is True
+
+    async def test_not_truncated_when_count_matches(self, env, monkeypatch):
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(monkeypatch, {"items": [{"id": "alert-1", "title": "x"}], "count": 1})
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert result.truncated is False
+
+    async def test_a_numeric_id_is_kept_not_dropped(self, env, monkeypatch):
+        """Dropping an alert because its id was an int would report a clean
+        window while it was firing — the one lie this stage must not tell."""
+        from orchestrator.temporal.activities.incidents import list_service_incidents
+
+        self._handler(monkeypatch, {"items": [{"id": 4242, "title": "x"}], "count": 1})
+        result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
+        assert [i.id for i in result.incidents] == ["4242"]

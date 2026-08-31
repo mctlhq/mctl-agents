@@ -107,12 +107,14 @@ select = [
 
 [tool.mypy]
 python_version = "3.12"
-# Matches what CI/local `mypy` (no args) checks — the same two dirs ruff and
-# pytest cover. `tests/` is deliberately out for now: fixtures and mocks lean
+# Matches what CI/local `mypy` (no args) checks — the same dirs ruff and
+# pytest cover. `tools/` is in: publish_agent_release.py runs unattended on
+# every release with a token that can write the agent registry, so it is the
+# last place that should be exempt from the checks (claude P2 on #238). `tests/` is deliberately out for now: fixtures and mocks lean
 # hard on duck typing (see tests/conftest.py's FakeMcpClient), so bringing it
 # under the same bar is a separate, bigger pass, not part of onboarding mypy
 # for the first time.
-files = ["orchestrator", "config"]
+files = ["orchestrator", "config", "tools"]
 
 # Soft mode: this is the first mypy pass over a previously-unchecked 5,800+
 # line codebase. Deliberately NOT enabling disallow_untyped_defs/strict here —

@@ -75,6 +75,15 @@ async def status(workflow_id: str) -> None:
                 print(f"    argocd:    {d.sync_status or '?'}/{d.health or '?'} tag={d.image_tag or '-'}")
             if d.detail:
                 print(f"    detail:    {d.detail}")
+        # Incident watch (stage 6.4, #216).
+        if result.incidents is not None and result.incidents.watched:
+            w = result.incidents
+            more = " (truncated — more than the query cap)" if w.truncated else ""
+            print(f"  incidents:   {len(w.incidents)} in {w.window_minutes}m after the rollout{more}")
+            for incident in w.incidents:
+                print(f"    - [{incident.severity or '?'}] {incident.id} {incident.title}")
+            if w.detail:
+                print(f"    detail:    {w.detail}")
 
 
 def main() -> None:

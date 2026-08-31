@@ -8,6 +8,8 @@ server binary (cached under ~/.cache after the first run).
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import uuid
 
 import anyio
@@ -20,10 +22,13 @@ from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
+from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
+from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
+    INCIDENT_WATCH_WINDOW,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
     DevLoopWorkflow,
@@ -78,6 +83,9 @@ def _fake_activities(
     deploy_status_bug: bool = False,
     unpinned: set[str] | None = None,
     resolve_unavailable: set[str] | None = None,
+    incidents: list[Incident] | None = None,
+    incident_reads_fail: bool = False,
+    incident_query: dict[str, str] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -161,6 +169,16 @@ def _fake_activities(
     ]
     deploy_index = {"i": 0}
 
+    @activity.defn(name="list_service_incidents")
+    async def fake_list_service_incidents(service: str, since: str) -> IncidentQueryResult:
+        if incident_query is not None:
+            incident_query.setdefault("since", since)
+        if incident_reads_fail:
+            from temporalio.exceptions import ApplicationError
+
+            raise ApplicationError("incident store down", non_retryable=True)
+        return IncidentQueryResult(incidents=list(incidents or []))
+
     @activity.defn(name="get_deploy_status")
     async def fake_get_deploy_status(team: str, app: str) -> DeployStatus:
         if deploy_status_bug:
@@ -208,6 +226,7 @@ def _fake_activities(
         fake_resolve_deploy_target,
         fake_get_release_after,
         fake_get_deploy_status,
+        fake_list_service_incidents,
     ]
     return activities, calls, investigate_ran
 
@@ -1407,11 +1426,82 @@ class TestDevLoopWorkflow:
 
         assert result.deploy is not None and result.deploy.outcome == "unverified"
 
-    async def test_unknown_argocd_application_stops_polling_immediately(self, env):
-        """A name that resolves to no app will not start existing."""
+    async def test_fractional_seconds_do_not_read_as_older(self, env):
+        """agy P2: ArgoCD emits fractional seconds, GitHub does not.
+
+        "…:00.500Z" sorts BEFORE "…:00Z" as a string, because "." < "Z",
+        so a lexicographic compare would call a sync that happened half a
+        second AFTER the release older than it — and never verify.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
+            deploy_statuses=[
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-30T00:00:00.500Z",
+                )
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 104)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
+    async def test_a_timestamp_without_an_offset_does_not_wedge_the_workflow(self, env):
+        """agy P1: naive vs aware datetimes raise TypeError.
+
+        Inside the workflow loop that is not a wrong answer, it is a
+        workflow task Temporal retries forever on identical input. An
+        offset-less timestamp must simply be read as UTC.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
+            deploy_statuses=[
+                DeployStatus(
+                    found=True,
+                    image_tag=None,
+                    health="Healthy",
+                    sync_status="Synced",
+                    updated_at="2026-08-30T00:00:01",  # no offset at all
+                )
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 106)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
+    async def test_a_new_argocd_application_is_waited_for(self, env):
+        """A release can introduce the app; ArgoCD registers it a bit later."""
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            deploy_statuses=[
+                DeployStatus(found=False),
+                DeployStatus(found=False),
+                DeployStatus(found=True, image_tag="9.9.9", health="Healthy", sync_status="Synced"),
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 105)
+
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
+    async def test_unknown_argocd_application_gives_up_after_the_grace(self, env):
+        """Past the grace polls, a name resolving to nothing is a wrong name."""
         activities, _calls, investigate_ran = _fake_activities(
             released=True, deploy_statuses=[DeployStatus(found=False)]
-        )
+        )  # repeated for every poll — the grace runs out and the watch gives up
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1419,6 +1509,98 @@ class TestDevLoopWorkflow:
 
         assert result.deploy is not None and result.deploy.outcome == "unverified"
         assert "no ArgoCD application" in (result.deploy.detail or "")
+
+    async def test_incident_watch_reports_a_clean_window(self, env):
+        """Stage 6.4 (#216): a healthy rollout with no incidents."""
+        activities, _calls, investigate_ran = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 97)
+
+        assert result.incidents is not None
+        assert result.incidents.watched is True
+        assert result.incidents.service == "mctl-telegram"
+        assert result.incidents.incidents == []
+
+    async def test_incident_window_opens_before_the_deploy_observation(self, env):
+        """agy P2: a bad rollout breaks things WHILE the deploy is watched.
+
+        _observe_deploy can block for over an hour. A window opened after
+        it would start past the incidents that rollout caused — exactly
+        the ones this stage exists to surface. The queried `since` must
+        therefore predate the deploy stage, not follow it.
+        """
+        query: dict[str, str] = {}
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            incident_query=query,
+            deploy_statuses=[
+                DeployStatus(found=True, image_tag="9.9.8", health="Progressing", sync_status="Synced"),
+                DeployStatus(found=True, image_tag="9.9.9", health="Healthy", sync_status="Synced"),
+            ],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 107)
+
+        assert result.incidents is not None
+        assert result.incidents.since == query["since"]
+        # The real assertion: the reported window spans MORE than
+        # INCIDENT_WATCH_WINDOW, which is only possible if `since` was
+        # taken before the deploy stage consumed its poll intervals.
+        # Comparing since to itself would hold no matter when it was
+        # captured — the earlier version of this test did exactly that
+        # and would not have caught a revert (claude P2).
+        flat_window = int(INCIDENT_WATCH_WINDOW.total_seconds() // 60)
+        assert result.incidents.window_minutes > flat_window
+
+    async def test_incident_watch_deduplicates_across_polls(self, env):
+        """An incident firing for the whole window is one finding, not six.
+
+        The fake returns the same incident on every poll — reporting it
+        once per poll would make a single alert look like a storm.
+        """
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True,
+            incidents=[Incident(id="alert-1", title="pods crashlooping", severity="critical")],
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 98)
+
+        assert result.incidents is not None
+        assert [i.id for i in result.incidents.incidents] == ["alert-1"]
+        # An incident is evidence for a human, never a workflow failure:
+        # implement, merge and rollout all already succeeded.
+        assert result.deploy is not None and result.deploy.outcome == "healthy"
+
+    async def test_incident_read_failure_does_not_end_the_watch(self, env):
+        """A failing incident store must not discard the stage's result."""
+        activities, _calls, investigate_ran = _fake_activities(
+            released=True, incident_reads_fail=True
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 99)
+
+        assert result.incidents is not None
+        assert result.incidents.watched is True
+        assert "incident read failed" in (result.incidents.detail or "")
+
+    async def test_no_incident_watch_when_nothing_was_released(self, env):
+        """no-release means nothing shipped — the window would be someone else's news."""
+        activities, _calls, investigate_ran = _fake_activities(released=True, release=None)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            result = await self._run_to_completion(env, activities, investigate_ran, 100)
+
+        assert result.deploy is not None and result.deploy.outcome == "no-release"
+        assert result.incidents is None
 
     async def test_failed_shepherd_tick_does_not_end_the_watch(self, env):
         """A failing shepherd tick is logged, not fatal — the watch keeps
@@ -1540,3 +1722,165 @@ class TestDevLoopWorkflow:
 
         assert result.pr is not None and result.pr.state == "MERGED"
         assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
+
+
+SERVICE = "mctl-telegram"
+SLUG = "issue-88-fake-title"
+
+
+@pytest.fixture
+def tick_logger(monkeypatch: pytest.MonkeyPatch) -> logging.Logger:
+    """A plain logger standing in for `workflow.logger` (#231).
+
+    temporalio's workflow logger is an adapter that asks the workflow
+    runtime whether it is replaying; called outside a workflow event loop
+    it raises _NotInWorkflowEventLoopError, so the tick helpers below —
+    which log on every branch they take — cannot be exercised directly
+    without this swap. Replacing the module attribute also makes the log
+    lines assertable via caplog, which is how these tests observe that a
+    finished tick's exception was actually retrieved.
+    """
+    logger = logging.getLogger("dev-loop-tick-unit")
+    monkeypatch.setattr(dev_loop.workflow, "logger", logger)
+    return logger
+
+
+class TestTickSettling:
+    """Direct unit tests for the in-loop tick helpers (#231).
+
+    Deliberately not run through the Temporal harness. The branch that
+    matters here — a shepherd tick STILL IN FLIGHT when the watch ends —
+    is unreachable under the time-skipping test server: an outstanding
+    activity stops it advancing timers, so a workflow-level test can never
+    get a poll to land past a running tick, and `_settle_tick` is always
+    reached with `tick_task.done()` already true. That is precisely how a
+    P1 (`except Exception` does not catch `asyncio.CancelledError`, which
+    is a BaseException) shipped through a green suite: the cancel-and-await
+    path never executed in CI. These call the methods on a bare
+    DevLoopWorkflow instance so that path executes for real.
+    """
+
+    async def test_settle_tick_cancels_an_in_flight_tick_without_raising(
+        self, tick_logger: logging.Logger
+    ) -> None:
+        """The P1 regression.
+
+        `_settle_tick` cancels the task and awaits it; `await` on a task
+        that has been cancelled re-raises CancelledError in the awaiter.
+        Since it inherits from BaseException, an `except Exception` there
+        does not catch it — it escapes `_settle_tick`, escapes `_watch_pr`'s
+        `finally`, and (because an exception raised in a `finally` replaces
+        the pending return) discards the MERGED state the watch was about
+        to return and fails a workflow whose implement and merge both
+        succeeded.
+        """
+        workflow_obj = DevLoopWorkflow()
+        running = asyncio.Event()
+
+        async def never_finishes() -> None:
+            running.set()
+            await asyncio.sleep(3600)
+
+        tick_task = asyncio.create_task(never_finishes())
+        # Await the task's own signal rather than sleeping: `_settle_tick`
+        # must be entered with the tick genuinely in flight, which is the
+        # whole point of the test. A task that had not started yet would
+        # take the same code path but prove less.
+        with anyio.fail_after(5):
+            await running.wait()
+        assert not tick_task.done()
+
+        await workflow_obj._settle_tick(tick_task, SERVICE, SLUG)
+
+        assert tick_task.cancelled()
+
+    async def test_settle_tick_survives_an_already_cancelled_tick(
+        self, tick_logger: logging.Logger
+    ) -> None:
+        """A task cancelled from elsewhere is `done()`, so `_settle_tick`
+        takes the drain branch — and `Task.exception()` on a cancelled task
+        raises CancelledError rather than returning it. `_drain_tick`'s
+        `cancelled()` guard is the only thing standing between that and the
+        same workflow failure the test above covers.
+        """
+        workflow_obj = DevLoopWorkflow()
+
+        async def never_finishes() -> None:
+            await asyncio.sleep(3600)
+
+        tick_task = asyncio.create_task(never_finishes())
+        await asyncio.sleep(0)
+        tick_task.cancel()
+        with anyio.fail_after(5):
+            with pytest.raises(asyncio.CancelledError):
+                await tick_task
+        assert tick_task.cancelled()
+
+        await workflow_obj._settle_tick(tick_task, SERVICE, SLUG)
+
+    async def test_settle_tick_retrieves_a_finished_ticks_exception(
+        self, tick_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A tick that finished by raising must have its exception read.
+
+        `_shepherd_tick` catches its own failures, so this should normally
+        find nothing — but if one ever escapes, the task holds it, the
+        watch loop drops the reference on the next boundary, and the only
+        trace is asyncio's "exception was never retrieved" warning at GC
+        time. The error log is the observable proof that `_drain_tick` ran.
+        """
+        workflow_obj = DevLoopWorkflow()
+
+        async def raises_immediately() -> None:
+            raise RuntimeError("tick blew up")
+
+        tick_task = asyncio.create_task(raises_immediately())
+        # asyncio.wait, specifically: it reports the task as done without
+        # reading its exception, so the retrieval under test below is still
+        # genuinely the first one. Awaiting the task itself would raise it
+        # here and destroy the thing being measured.
+        with anyio.fail_after(5):
+            await asyncio.wait({tick_task})
+
+        with caplog.at_level(logging.ERROR, logger=tick_logger.name):
+            await workflow_obj._settle_tick(tick_task, SERVICE, SLUG)
+
+        assert "unretrieved" in caplog.text
+        assert "RuntimeError" in caplog.text
+        assert SLUG in caplog.text
+        # Reading it here is what makes the assertion above meaningful: had
+        # _drain_tick not called .exception(), this would be the first read.
+        assert isinstance(tick_task.exception(), RuntimeError)
+
+    async def test_settle_tick_accepts_a_watch_that_never_ticked(
+        self, tick_logger: logging.Logger
+    ) -> None:
+        """Most watches end without a tick ever starting (the first
+        boundary is ~4 h in). `finally` still calls `_settle_tick`, with
+        None."""
+        await DevLoopWorkflow()._settle_tick(None, SERVICE, SLUG)
+
+    async def test_shepherd_tick_swallows_an_unexpected_error(
+        self,
+        tick_logger: logging.Logger,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`_shepherd_tick` runs as a task, so anything escaping it is
+        stored on that task instead of raised — and the next poll overwrites
+        the reference. It caught only ActivityError, which left every other
+        failure (a KeyError in the params, a bug in _record) silent. It must
+        log and return instead, at the one point that still has the
+        service/slug context.
+        """
+
+        async def resolve_explodes(agent: str) -> None:
+            raise RuntimeError("registry client is broken")
+
+        monkeypatch.setattr(dev_loop, "_resolve", resolve_explodes)
+
+        with caplog.at_level(logging.ERROR, logger=tick_logger.name):
+            await DevLoopWorkflow()._shepherd_tick(SERVICE, SLUG)
+
+        assert "unexpected RuntimeError" in caplog.text
+        assert SERVICE in caplog.text and SLUG in caplog.text

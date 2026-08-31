@@ -8,6 +8,10 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
+  # Mint the OIDC token the agent-registry refresh exchanges at Vault for
+  # a short-lived, read-only credential. No long-lived secret exists for
+  # this — see the "Refresh agent registry" step.
+  id-token: write
 
 concurrency:
   group: release-please-${{ github.ref }}
@@ -80,6 +84,69 @@ jobs:
             -f component_name=mctl-agents \
             -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml" \
             -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml"
+
+      # Refresh the agent registry so DevLoopWorkflow resolves THIS release
+      # rather than whatever was published last by hand. Nothing did this
+      # before, and the pins drifted: shepherd sat on 1.25.0 from
+      # 2026-08-07 while the repo released 1.33.0 — and once the in-loop
+      # shepherd tick started pinning the released image, that stale row
+      # became the image those ticks would run.
+      #
+      # The mctl-api token comes from Vault via GitHub OIDC, not from an
+      # Actions secret: a repo secret is readable by every workflow on the
+      # repo, whereas the Vault role `mctl-agents-release` is bound to
+      # this repository AND this workflow file, mints a 10-minute token,
+      # and its policy can read exactly one KV path. Same pattern as
+      # mctl-gitops' build-image.yaml.
+      # Only when a release was actually cut, and only after it was: the
+      # job otherwise has no repository on disk at all (release-please
+      # itself works entirely through the API). fetch-depth: 0 because the
+      # publish tool reads files out of the new tag's tree via `git show`,
+      # and a shallow clone has neither the tag nor the objects behind it.
+      - name: Check out the released commit
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+          fetch-depth: 0
+
+      # Own interpreter rather than the image's system python: a system-wide
+      # `pip install` on a PEP 668 image ("externally managed environment")
+      # fails outright, and this step is the release pipeline — it must not
+      # depend on whether the runner image happens to ship that marker, or
+      # on `python` being symlinked to `python3` (agy P1). setup-python puts
+      # a non-managed interpreter on PATH under both names.
+      - name: Set up Python
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Refresh agent registry
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        env:
+          VAULT_ADDR: https://secrets.mctl.ai
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+          JWT=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://github.com/mctlhq" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["value"])')
+
+          # Fail loudly rather than fall open: build-image.yaml silently
+          # skipped its Vault step for months because the login failed and
+          # nothing said so (see the F9 incident, 2026-08-15).
+          VAULT_TOKEN=$(curl -sf -X POST "$VAULT_ADDR/v1/auth/jwt/login" \
+            -d "{\"role\":\"mctl-agents-release\",\"jwt\":\"$JWT\"}" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["auth"]["client_token"])')
+
+          MCTL_TOKEN=$(curl -sf -H "X-Vault-Token: $VAULT_TOKEN" \
+            "$VAULT_ADDR/v1/secret/data/platform/mctl-agents" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["data"]["mctl-token"])')
+          echo "::add-mask::$MCTL_TOKEN"
+
+          python -m pip install --quiet httpx pyyaml
+          MCTL_TOKEN="$MCTL_TOKEN" python tools/publish_agent_release.py "$TAG"
 
       - name: Notify Telegram on release/deploy failure
         if: ${{ failure() && steps.release.outputs.release_created == 'true' }}
