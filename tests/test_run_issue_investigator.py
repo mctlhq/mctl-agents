@@ -2083,38 +2083,33 @@ def test_a_swap_that_wins_the_publish_window_is_caught_after_the_rename(
     assert (attacker / "loot.txt").read_text() == "elsewhere"
 
 
-def test_the_status_mode_is_read_once_and_not_re_resolved(tmp_path, monkeypatch):
-    """Checking with lstat and then calling copymode re-resolves the path,
-    and copymode follows symlinks — so a swap between the two still leaked
-    the target's mode (agy P3 on #247, twice)."""
-    elsewhere = tmp_path / "sensitive"
-    elsewhere.write_text("x")
-    os.chmod(elsewhere, stat.S_IRUSR)
+def test_a_mode_planted_by_the_agent_is_not_adopted(tmp_path):
+    """_status_mode used to inherit the mode of an existing .status.yaml,
+    on the reasoning that someone may have chosen it deliberately. At the
+    point it runs the directory is STAGING — the agent's own scratch — so
+    "someone" was the agent: a pre-created 0777 .status.yaml had that mode
+    copied onto the generated one and published, leaving the state
+    machine's own file writable by anyone sharing the volume (agy P2 on
+    #247).
 
+    This replaces a test for the lstat-vs-copymode double resolution inside
+    that branch. The branch is gone, so the test was passing without
+    exercising anything.
+    """
     proposal_dir = tmp_path / "proposals" / "issue-57-x"
     proposal_dir.mkdir(parents=True)
-    real_status = proposal_dir / ".status.yaml"
-    real_status.write_text("status: proposed\n")
-    os.chmod(real_status, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+    planted = proposal_dir / ".status.yaml"
+    planted.write_text("status: proposed\n")
+    os.chmod(planted, 0o777)  # noqa: S103 — the attack being refused
 
-    real_lstat = run_issue_investigator.os.lstat
-    swapped = []
-
-    def _swap_after_the_stat(path, *a, **kw):
-        result = real_lstat(path, *a, **kw)
-        if str(path).endswith(".status.yaml") and not swapped:
-            swapped.append(True)
-            real_status.unlink()
-            real_status.symlink_to(elsewhere)
-        return result
-
-    monkeypatch.setattr(run_issue_investigator.os, "lstat", _swap_after_the_stat)
     status_path = write_status_yaml(proposal_dir, _issue(number=57))
-    monkeypatch.setattr(run_issue_investigator.os, "lstat", real_lstat)
 
-    # The mode came from the stat already taken, not from a second lookup
-    # that would have followed the planted link.
-    assert stat.S_IMODE(status_path.stat().st_mode) != stat.S_IRUSR
+    mode = stat.S_IMODE(status_path.stat().st_mode)
+    assert mode != 0o777
+    assert not mode & stat.S_IWOTH
+    probe = tmp_path / "probe"
+    probe.touch()
+    assert mode == stat.S_IMODE(probe.stat().st_mode)
 
 
 def test_carry_forward_refuses_to_write_through_a_planted_symlink(tmp_path, monkeypatch):
@@ -2875,3 +2870,76 @@ def test_a_non_mapping_status_payload_is_rejected_not_raised(tmp_path, monkeypat
     assert "not a mapping" in result.error
     # And the landed directory was taken away, not left for the commit step.
     assert not result.proposal_dir.exists()
+
+
+def test_a_status_file_that_grows_while_it_is_read_is_refused(tmp_path):
+    """st_size is the length at one instant. Handing the stream to
+    safe_load let a writer keep appending while PyYAML read to EOF, so a
+    file small at the fstat still exhausted the worker's memory (agy P2 on
+    #247)."""
+    status = tmp_path / run_issue_investigator.STATUS_FILENAME
+    status.write_text("status: proposed\n")
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+
+    real_fstat = run_issue_investigator.os.fstat
+
+    def _report_it_small_then_grow(fd):
+        st = real_fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_size < 1024:
+            # The append lands after the size check, before the read.
+            with status.open("a") as f:
+                f.write("# " + "x" * (run_issue_investigator.MAX_STATUS_BYTES + 8))
+        return st
+
+    try:
+        run_issue_investigator.os.fstat = _report_it_small_then_grow
+        with pytest.raises(OSError, match="grew past"):
+            run_issue_investigator._read_published_status(dir_fd)
+    finally:
+        run_issue_investigator.os.fstat = real_fstat
+        os.close(dir_fd)
+
+
+def test_a_directory_planted_at_the_live_path_does_not_strand_the_proposal(
+    tmp_path, monkeypatch
+):
+    """The restore refused to remove a directory at the live path, on the
+    grounds that it might be a real proposal. This branch runs only when
+    `aside` holds the real one, so it never is — and leaving a planted
+    non-empty directory made os.replace fail with ENOTEMPTY, aborting the
+    restore and stranding the real proposal in scratch (agy P2 on #247)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=72,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("the previous proposal")
+
+    real_verify = run_issue_investigator._verify_aside
+
+    def _plant_a_directory_and_fail(aside, expected, fd):
+        real_verify(aside, expected, fd)
+        # The live path is vacant right now — the proposal is in `aside`.
+        first.proposal_dir.mkdir(parents=True, exist_ok=True)
+        (first.proposal_dir / "impostor.txt").write_text("not a proposal")
+        raise OSError(5, "transient, to reach the rollback")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_aside", _plant_a_directory_and_fail
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
+    assert not (first.proposal_dir / "impostor.txt").exists()

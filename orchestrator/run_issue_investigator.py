@@ -446,7 +446,18 @@ def _read_published_status(staging_fd: int) -> dict:
                 f"{MAX_STATUS_BYTES} limit"
             )
         with open(fd, encoding="utf-8", closefd=False) as f:  # via the verified fd
-            return yaml.safe_load(f) or {}
+            # Bound the READ, not merely the reported size. st_size is the
+            # length at one instant; handing the stream to safe_load lets a
+            # writer keep appending while PyYAML reads to EOF, so a file
+            # small at the fstat still exhausts the worker's memory (agy P2
+            # on #247).
+            content = f.read(MAX_STATUS_BYTES + 1)
+        if len(content) > MAX_STATUS_BYTES:
+            raise OSError(
+                f"{STATUS_FILENAME} grew past the {MAX_STATUS_BYTES} limit "
+                "while it was being read"
+            )
+        return yaml.safe_load(content) or {}
     finally:
         os.close(fd)
 
@@ -839,23 +850,26 @@ def _clone_repo(full_repo: str, slug: str) -> Path:
     return wrapper
 
 
-def _status_mode(status_path: Path, proposal_dir: Path) -> int:
+def _status_mode(proposal_dir: Path) -> int:
     """The mode a freshly written .status.yaml should carry.
 
-    An existing file keeps its own — someone may have chosen it — read
-    with lstat so a planted symlink contributes nothing. Otherwise what an
-    ordinary open() would produce, discovered by creating a file with
-    O_EXCL and reading its descriptor: NOT by os.umask(0) + restore, which
-    reads the umask by briefly zeroing it process-wide, and not by
-    stat'ing the probe by path afterwards, which resolves it a second
-    time.
+    What an ordinary open() would produce, and nothing else. This used to
+    inherit the mode of an existing .status.yaml, on the reasoning that
+    someone may have chosen it deliberately — but at the point it runs the
+    directory is STAGING, the agent's own scratch, so "someone" was the
+    agent: pre-creating a 0777 .status.yaml there had that mode copied onto
+    the generated one and published, leaving the state machine's own file
+    writable by anyone sharing the volume (agy P2 on #247).
+
+    A deliberately-chosen mode on a re-investigation survives anyway, and
+    from a source the agent does not control: _carry_forward copies the
+    aside copy's mode onto the file written here, after this runs.
+
+    Discovered by creating a file with O_EXCL and reading its descriptor:
+    NOT by os.umask(0) + restore, which reads the umask by briefly zeroing
+    it process-wide, and not by stat'ing the probe by path afterwards,
+    which resolves it a second time.
     """
-    try:
-        existing = os.lstat(status_path)
-        if stat.S_ISREG(existing.st_mode):
-            return stat.S_IMODE(existing.st_mode)
-    except OSError:
-        pass
     # A random name, not f".mode-probe-{os.getpid()}": pids are guessable
     # and there are only ~32k of them, so pre-creating the set made every
     # publish die on O_EXCL. Worth fixing even without an adversary — a
@@ -921,7 +935,7 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
             # the temp file, and both live in a directory the agent can
             # write, so the target could be a symlink by the time the call
             # lands. fchmod has no path to resolve.
-            os.fchmod(f.fileno(), _status_mode(status_path, proposal_dir))
+            os.fchmod(f.fileno(), _status_mode(proposal_dir))
         # mkstemp forces 0600, and os.replace carries that onto the real
         # file: the same scratch-permissions bug the published directory
         # had, one level down and just as invisible (agy P2 on #247).
@@ -1651,10 +1665,16 @@ def investigate(
                     # live. Neither shape can be a real proposal, so clear
                     # it; a directory is never removed here, because that
                     # could be one.
-                    if proposal_dir.is_symlink() or (
-                        proposal_dir.exists() and not proposal_dir.is_dir()
-                    ):
-                        proposal_dir.unlink()
+                    # Anything here, INCLUDING a directory. The comment
+                    # this replaces refused to remove one on the grounds
+                    # that it might be a real proposal — but this branch
+                    # runs only when `aside` holds the real one, so
+                    # whatever sits at the live path is not it. Leaving a
+                    # planted non-empty directory made os.replace fail with
+                    # ENOTEMPTY, which aborted the restore and stranded the
+                    # real proposal in scratch (agy P2 on #247).
+                    if proposal_dir.is_symlink() or proposal_dir.exists():
+                        _remove_rejected(proposal_dir)
                     os.replace(aside, proposal_dir)
                     aside = None
                 except BaseException as restore_error:  # noqa: BLE001 — see below
