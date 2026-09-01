@@ -7,8 +7,8 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 """
 from __future__ import annotations
 
-import os
 import json
+import os
 import pathlib
 import shutil
 import stat
