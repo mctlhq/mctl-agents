@@ -461,6 +461,19 @@ def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
     same kind as forging the approval, and one the status-only check let
     straight through (agy P1 on #247).
     """
+    # A mapping, before anything is asked of it. yaml.safe_load returns a
+    # top-level scalar or list unchanged, and `or {}` substitutes only for a
+    # falsy result, so `- a\n- b` reached .get and raised AttributeError —
+    # which neither except clause here catches. It escaped the post-publish
+    # check, so the rejection branch never ran, the already-landed directory
+    # was never taken away, and the cleanup left it in proposals/ for the
+    # CWFT to commit: an invalid proposal published despite the error
+    # (codex P2 on #247).
+    if not isinstance(published, dict):
+        return [
+            f"{STATUS_FILENAME} is not a mapping "
+            f"(parsed as {type(published).__name__})"
+        ]
     source = published.get("source") or {}
     control = published.get("control") or {}
     expected = [

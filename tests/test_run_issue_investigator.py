@@ -2855,3 +2855,23 @@ def test_an_oversized_status_file_is_refused_before_parsing(tmp_path, monkeypatc
 
     assert result.error is not None
     assert "over the" in result.error
+
+
+def test_a_non_mapping_status_payload_is_rejected_not_raised(tmp_path, monkeypatch):
+    """yaml.safe_load returns a top-level scalar or list unchanged, and
+    `or {}` substitutes only for a falsy result. `.get` on that raised
+    AttributeError, which neither except clause caught: it escaped the
+    post-publish check, the rejection branch never ran, the already-landed
+    directory was never taken away, and the cleanup left it in proposals/
+    for the CWFT to commit (codex P2 on #247)."""
+    def _write_a_list(dir_fd):
+        fd = os.open("staging/.status.yaml", os.O_WRONLY | os.O_TRUNC, dir_fd=dir_fd)
+        with os.fdopen(fd, "w") as f:
+            f.write("- a\n- b\n")
+
+    result = _tamper_with_the_published_status(monkeypatch, tmp_path, 71, _write_a_list)
+
+    assert result.error is not None
+    assert "not a mapping" in result.error
+    # And the landed directory was taken away, not left for the commit step.
+    assert not result.proposal_dir.exists()
