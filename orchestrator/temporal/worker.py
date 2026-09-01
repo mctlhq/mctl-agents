@@ -69,6 +69,15 @@ ISSUE_POLL_WORKFLOW_ID = "issue-poll-mctl-agents"
 INCIDENTS_SCHEDULE_ID = "incidents-mctl-agents-schedule"
 INCIDENTS_WORKFLOW_ID = "incidents-mctl-agents"
 
+# The three *_WORKFLOW_ID constants above are the id of the schedule's
+# ACTION, not the id the started workflow ends up with: Temporal appends the
+# action's nominal time when a schedule fires ("The Action's timestamp is
+# appended to the Workflow Id" — docs.temporal.io/schedule), so each tick
+# runs as e.g. `incidents-mctl-agents-2026-09-01T18:00:00Z`. Reading the
+# constant as the per-run id makes every scheduled tick look like the same
+# workflow, which is what led two reviewers to file the same finding against
+# the incident loop's execution record (#254).
+
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
 
