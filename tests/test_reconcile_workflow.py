@@ -246,7 +246,7 @@ class TestReconcileApplies:
         # way, so asserting only on it passes against the unguarded version.
         warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
         assert any("ended Failed" in m for m in warnings), warnings
-        assert any("not \nwritten" in m or "not written" in m for m in warnings), warnings
+        assert any("not written" in m for m in warnings), warnings
 
         assert len(received["submits"]) == 1
         assert result.applied is not None, "the Argo run must stay visible"
