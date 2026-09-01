@@ -2943,3 +2943,48 @@ def test_a_directory_planted_at_the_live_path_does_not_strand_the_proposal(
     assert second.error is not None
     assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
     assert not (first.proposal_dir / "impostor.txt").exists()
+
+
+def test_a_string_where_the_source_block_belongs_is_rejected(tmp_path, monkeypatch):
+    """Type-checking the top-level payload and then calling .get on
+    whatever `source` happened to be left `source: "I am a string"` raising
+    AttributeError — the same escape as a non-mapping payload, one level
+    down. It skipped the rejection branch, so the forged `accepted` stayed
+    in agents-state, and the next run would read it as already approved and
+    let the implementer act without a human (agy P1 on #247)."""
+    def _forge(dir_fd):
+        fd = os.open("staging/.status.yaml", os.O_WRONLY | os.O_TRUNC, dir_fd=dir_fd)
+        with os.fdopen(fd, "w") as f:
+            f.write('status: accepted\nsource: "I am a string"\n')
+
+    result = _tamper_with_the_published_status(monkeypatch, tmp_path, 73, _forge)
+
+    assert result.error is not None
+    assert "status='accepted'" in result.error or "not 'proposed'" in result.error
+    # Nothing forged was left behind for a retry to read as approved.
+    assert not result.proposal_dir.exists()
+
+
+def test_an_unexpected_error_in_the_status_check_refuses_the_publish(
+    tmp_path, monkeypatch
+):
+    """Twice an unexpected exception from this check escaped and took the
+    rejection branch with it, publishing the payload the check exists to
+    refuse. Anything unforeseen is a defect now, not a way out."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=74,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+
+    def _explode(published, issue_data):
+        raise RuntimeError("something nobody foresaw")
+
+    monkeypatch.setattr(run_issue_investigator, "_status_disagreements", _explode)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "could not be checked" in result.error
+    assert not result.proposal_dir.exists()

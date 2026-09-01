@@ -413,7 +413,19 @@ def _landed_triplet_defects(staging_fd: int | None, issue: IssueData) -> list[st
         except yaml.YAMLError as exc:
             defects.append(f"{STATUS_FILENAME} is not parseable: {exc}")
         else:
-            defects.extend(_status_disagreements(published, issue))
+            # Fail closed. Twice now an unexpected exception from this
+            # check has escaped and taken the rejection branch with it,
+            # publishing the very payload the check exists to refuse — so
+            # anything unforeseen here becomes a defect rather than a way
+            # out. A publish refused in error costs a re-run; a publish
+            # allowed in error is a forged approval in agents-state.
+            try:
+                defects.extend(_status_disagreements(published, issue))
+            except Exception as exc:  # noqa: BLE001 — deliberate, see above
+                defects.append(
+                    f"{STATUS_FILENAME} could not be checked: "
+                    f"{type(exc).__name__}: {exc}"
+                )
     return defects
 
 
@@ -485,8 +497,20 @@ def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
             f"{STATUS_FILENAME} is not a mapping "
             f"(parsed as {type(published).__name__})"
         ]
-    source = published.get("source") or {}
-    control = published.get("control") or {}
+    # The nested blocks too, not just the top level. Type-checking
+    # `published` and then calling .get on whatever `source` happened to be
+    # left `source: "I am a string"` raising AttributeError — the same
+    # escape as the non-mapping payload, one level down, with the same
+    # consequence: the exception skipped the rejection branch, the forged
+    # `accepted` stayed in agents-state, and the next run read it as
+    # already approved and let the implementer act without a human (agy P1
+    # on #247).
+    source = published.get("source")
+    control = published.get("control")
+    if not isinstance(source, dict):
+        source = {}
+    if not isinstance(control, dict):
+        control = {}
     expected = [
         ("status", published.get("status"), "proposed"),
         ("source.repo", source.get("repo"), issue.ref.full_repo),
