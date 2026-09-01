@@ -61,13 +61,15 @@ from pathlib import Path
 
 import anyio
 import yaml
-from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
+# The agent SDK and everything that pulls it in (auth, mcp_guard, options)
+# are imported inside _run_agent/main, not here: run_issue_poller reuses
+# this module's pure URL/slug helpers, and the poller runs as a Temporal
+# ACTIVITY inside the long-lived worker. A module-level import would drag
+# the whole agent stack into that process, which is exactly what #149
+# forbids — the agent itself only ever runs in an Argo sandbox.
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
-from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
-from orchestrator.mcp_guard import ensure_mctl_connected
-from orchestrator.options import build_issue_investigator_options
 from orchestrator.proc import run_capturing
 
 DEFAULT_STATE_DIR = Path(
@@ -1022,6 +1024,11 @@ def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 
 
+# What a stripped delimiter tag leaves behind. Carries no angle bracket of
+# its own, so it cannot become part of a tag itself.
+_STRIPPED_TAG = "[tag stripped]"
+
+
 def _neutralize_prompt_tags(text: str) -> str:
     """Strip forged <issue_title>/<issue_body> (and closing) tags from
     untrusted issue text so it cannot break out of — or fake — the
@@ -1031,10 +1038,24 @@ def _neutralize_prompt_tags(text: str) -> str:
     Targeted removal, not blanket angle-bracket escaping: issue bodies
     legitimately carry code with generics/HTML that must reach the agent
     intact."""
-    # \b[^>]*> (not \s*>): lenient LLM/XML parsers would honor a forged tag
-    # carrying attributes or junk before the `>` (e.g. `</issue_body x=y>`),
-    # which the whitespace-only form left intact (agy P1 round 3, PR #212).
-    return re.sub(r"(?i)</?\s*issue_(title|body)\b[^>]*>", "", text or "")
+    # Lenient LLM/XML parsers honor a forged tag carrying attributes or junk
+    # before the `>` (e.g. `</issue_body x=y>`), which a whitespace-only
+    # pattern left intact (agy P1 round 3, PR #212). They also honor a tag
+    # that never closes at all: `</issue_body` at end of line ends the block
+    # for the reader just as well, so the `>` is optional here (the same
+    # bypass agy found in run_shepherd._neutralize_findings_tags on #248).
+    # Junk stays bounded to the tag's own line — unbounded, an `<issue_body`
+    # inside quoted code would swallow everything up to the next `>`.
+    #
+    # The replacement is a marker, not "": `re.sub` is single-pass and never
+    # re-reads what it wrote, so deleting a tag lets the text on either side
+    # close up. `</is</issue_body>sue_body>` strips the inner tag and the
+    # halves fasten into an intact `</issue_body>` the pattern never sees
+    # again. A marker between them keeps the halves apart (agy P1, round 2
+    # on #248 — same fix in the sibling guard named above).
+    return re.sub(
+        r"(?i)<[\s/]*issue_(title|body)(?![-\w])[^>\n]*>?", _STRIPPED_TAG, text or ""
+    )
 
 
 def _build_prompt(issue: IssueData, service: str, slug: str) -> str:
@@ -1175,6 +1196,11 @@ class RateLimitExhaustedError(RuntimeError):
 
 
 async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
+    from claude_agent_sdk import ClaudeSDKClient, ResultMessage
+
+    from orchestrator.mcp_guard import ensure_mctl_connected
+    from orchestrator.options import build_issue_investigator_options
+
     options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
     mcp_configured = bool(options.mcp_servers)
     async with ClaudeSDKClient(options=options) as client:
@@ -1863,7 +1889,15 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    ensure_auth_for_sdk()
+    # Not in dry-run: it resolves the issue and the slug and stops before
+    # the agent, so requiring Claude credentials to do that would break the
+    # one mode whose whole point is to work without them — and the --dry-run
+    # help text already promises as much (agy P2 on #248). Same guard as
+    # run_shepherd.main().
+    if not args.dry_run:
+        from orchestrator.auth import ensure_auth_for_sdk  # deferred — see the import note at the top
+
+        ensure_auth_for_sdk()
 
     try:
         result = investigate(
