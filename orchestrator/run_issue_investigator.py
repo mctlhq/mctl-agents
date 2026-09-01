@@ -275,6 +275,24 @@ def _fd_still_linked(fd: int) -> bool:
         return False
 
 
+def _path_matches_fd(path: Path, fd: int | None) -> bool:
+    """Is ``path`` still the directory ``fd`` names?
+
+    The test both destructive cleanups ask before removing anything: a
+    wrapper renamed away and its name given to something else would
+    otherwise have that removed instead. (dev, ino) plus still-linked, for
+    the inode-reuse reason in _fd_still_linked.
+    """
+    if fd is None or not _fd_still_linked(fd):
+        return False
+    try:
+        st = os.lstat(path)
+        held = os.fstat(fd)
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (held.st_dev, held.st_ino)
+
+
 def _remove_rejected(path: Path) -> None:
     """Delete something the publish check refused, whatever shape it is."""
     try:
@@ -290,7 +308,17 @@ def _aside_is_ours(
     aside: Path, expected: tuple[int, int] | None, fd: int | None
 ) -> bool:
     """Is ``aside`` still the proposal directory we moved there?"""
-    if expected is None or fd is None or not _fd_still_linked(fd):
+    if expected is None:
+        return False
+    # A missing fd is NOT an answer of "no". The descriptor's job is to
+    # defeat inode reuse, and when we never got one — os.open raised EMFILE
+    # or a transient I/O error one line after the identity was read — the
+    # identity is still a real tuple and still worth comparing. Treating
+    # that as "not ours" discarded the previously-good proposal, which the
+    # `finally` then deleted, on a merely transient failure: the same
+    # data-loss class the surrounding commit closes, one line further along
+    # (claude P2 on #247).
+    if fd is not None and not _fd_still_linked(fd):
         return False
     try:
         return _dir_identity(aside) == expected and stat.S_ISDIR(
@@ -1176,6 +1204,7 @@ def investigate(
     aside: Path | None = None
     aside_id: tuple[int, int] | None = None
     aside_root: Path | None = None
+    aside_root_fd: int | None = None
     # Set only when the previous proposal could not be put back, in which
     # case the scratch copy is the ONLY one left and cleanup must not run.
     keep_aside = False
@@ -1320,6 +1349,16 @@ def investigate(
             # cleaned in the outer finally, so a failure here does not leak
             # the wrapper directory.
             aside_root = Path(tempfile.mkdtemp(dir=proposal_dir.parent.parent, prefix=".aside-"))
+            # A descriptor on the wrapper, opened before anything is moved
+            # into it, so every later chmod and the cleanup address the
+            # inode rather than the name. os.chmod follows symlinks: a
+            # wrapper renamed away with a link left behind under its name
+            # had the LINK'S TARGET's permissions changed to 0500 or 0700
+            # instead (agy P2 on #247). Opened here, where a failure is
+            # harmless because the proposal has not moved yet.
+            aside_root_fd = os.open(
+                aside_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
             moved = aside_root / "proposal"
             os.replace(proposal_dir, moved)
             # `aside` means "the proposal is at this path and nowhere else",
@@ -1360,7 +1399,7 @@ def investigate(
                 # adversary — same uid, it can chmod back — but the two
                 # wrappers should not differ for no reason, and both the
                 # restore and the cleanup re-open it explicitly.
-                os.chmod(aside.parent, stat.S_IRUSR | stat.S_IXUSR)
+                os.fchmod(aside_root_fd, stat.S_IRUSR | stat.S_IXUSR)  # type: ignore[arg-type]
 
                 # Only NOW re-read the status. The guard at the top of this
                 # function ran BEFORE an agent call that takes minutes, and
@@ -1494,9 +1533,9 @@ def investigate(
             # Reopen the aside wrapper: the restore renames an entry OUT of
             # it, which the dropped write bit forbids, and a human sent to
             # the surviving copy by the CRITICAL line below needs it too.
-            if aside_root is not None:
+            if aside_root_fd is not None:
                 with contextlib.suppress(OSError):
-                    os.chmod(aside_root, stat.S_IRWXU)
+                    os.fchmod(aside_root_fd, stat.S_IRWXU)
             if aside is not None:
                 if aside_id is None:
                     # The identity was never recorded, because the failure
@@ -1611,15 +1650,7 @@ def investigate(
             # this rmtree remove that instead (codex P2 on #247). Same
             # (dev, ino) plus still-linked test as the publish, for the
             # same reason: inode numbers are reused.
-            ours = wrapper_fd is not None and _fd_still_linked(wrapper_fd)
-            if ours:
-                try:
-                    st = os.lstat(staging_wrapper)
-                    held = os.fstat(wrapper_fd)  # type: ignore[arg-type]
-                    ours = (st.st_dev, st.st_ino) == (held.st_dev, held.st_ino)
-                except OSError:
-                    ours = False
-            if ours:
+            if _path_matches_fd(staging_wrapper, wrapper_fd):
                 # rmtree has to unlink an entry IN the wrapper, which the
                 # dropped write bit forbids — restore it or the scratch
                 # directory leaks on every run.
@@ -1637,13 +1668,22 @@ def investigate(
         if aside_root is not None:
             # rmtree unlinks an entry IN the wrapper, and keep_aside points
             # a human at it — either way the write bit has to come back.
-            with contextlib.suppress(OSError):
-                os.chmod(aside_root, stat.S_IRWXU)
-            if not keep_aside:
+            if aside_root_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.fchmod(aside_root_fd, stat.S_IRWXU)
+            # And, as with the staging wrapper, this path is only deleted
+            # if the descriptor says it is still the directory we made.
+            if not keep_aside and _path_matches_fd(aside_root, aside_root_fd):
                 shutil.rmtree(aside_root, ignore_errors=True)
+            elif not keep_aside:
+                print(
+                    f"warn: leaving {aside_root} alone — it is no longer the "
+                    "wrapper this run created",
+                    file=sys.stderr,
+                )
         # Only now: the cleanup above asks the descriptors whether the
         # paths it is about to delete are still the ones this run made.
-        for held_fd in (wrapper_fd, staging_fd, aside_fd):
+        for held_fd in (wrapper_fd, staging_fd, aside_fd, aside_root_fd):
             if held_fd is not None:
                 with contextlib.suppress(OSError):
                     os.close(held_fd)

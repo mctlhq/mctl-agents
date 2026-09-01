@@ -2609,3 +2609,92 @@ def test_the_status_file_is_not_published_as_a_symlink(tmp_path, monkeypatch):
     # from the regular-file loop.
     assert ".status.yaml is no longer a regular file" in result.error
     assert not (result.proposal_dir / ".status.yaml").is_symlink()
+
+
+def test_a_failed_aside_descriptor_open_still_restores_the_proposal(
+    tmp_path, monkeypatch
+):
+    """The sibling of the unrecorded-identity case: _dir_identity succeeds
+    and the very next line, os.open on the aside, raises (EMFILE, transient
+    I/O). aside_id is then a real tuple, so the rollback took the
+    _aside_is_ours path with fd=None — which returned False unconditionally
+    and let `finally` delete the previously-good proposal (claude P2 on
+    #247)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=66,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("the previous proposal")
+
+    real_open = run_issue_investigator.os.open
+
+    def _fail_opening_the_aside(path, *a, **kw):
+        if str(path).endswith("/proposal") and ".aside-" in str(path):
+            raise OSError(24, "EMFILE")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(run_issue_investigator.os, "open", _fail_opening_the_aside)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert first.proposal_dir.is_dir()
+    assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
+    assert (first.proposal_dir / "design.md").read_text() == "v1 design.md"
+
+
+def test_the_aside_wrapper_permissions_go_to_the_descriptor(tmp_path, monkeypatch):
+    """os.chmod follows symlinks. A wrapper renamed away with a link left
+    under its name had the LINK'S TARGET's permissions rewritten to 0500 or
+    0700 instead — and the cleanup would then delete through that name too
+    (agy P2 on #247)."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("not ours")
+    os.chmod(victim, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)  # noqa: S103
+    before = stat.S_IMODE(victim.stat().st_mode)
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=67,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    real_verify = run_issue_investigator._verify_aside
+
+    def _swap_the_wrapper_path(aside, expected, fd):
+        result = real_verify(aside, expected, fd)
+        root = aside.parent
+        if root.is_dir() and not root.is_symlink():
+            os.chmod(root, stat.S_IRWXU)
+            root.rename(tmp_path / f"moved-{root.name}")
+            root.symlink_to(victim)
+        return result
+
+    monkeypatch.setattr(run_issue_investigator, "_verify_aside", _swap_the_wrapper_path)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert stat.S_IMODE(victim.stat().st_mode) == before
+    assert (victim / "keep.txt").read_text() == "not ours"
