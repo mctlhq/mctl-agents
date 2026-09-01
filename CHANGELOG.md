@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.37.0](https://github.com/mctlhq/mctl-agents/compare/1.36.1...1.37.0) (2026-09-01)
+
+
+### Features
+
+* **reconcile:** submit the CWFT so found drift is actually written ([5af2082](https://github.com/mctlhq/mctl-agents/commit/5af2082db588b798d905bc39512c34062b273beb))
+
+
+### Bug Fixes
+
+* **reconcile:** a CWFT that ran and failed is not a written tick ([1f9bf93](https://github.com/mctlhq/mctl-agents/commit/1f9bf9361f5e1b3af41596bcc2e977a3293d3552))
+
 ## [1.36.1](https://github.com/mctlhq/mctl-agents/compare/1.36.0...1.36.1) (2026-09-01)
 
 
