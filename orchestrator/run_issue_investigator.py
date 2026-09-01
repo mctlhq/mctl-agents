@@ -943,14 +943,14 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
         # implementer, the approve CWFT, the reconcile sweep — and several
         # of them do not run as this user.
         #
-        # An existing file keeps its mode -- someone may have chosen it.
-        # Otherwise take what an ordinary open() would have produced: the
-        # process umask applied to 0666. NOT the containing directory's
-        # mode, which was the first attempt and is wrong for the case that
-        # matters: on a first investigation this function writes into
-        # STAGING, so the directory in question is the 0700 scratch dir
-        # whose permissions are exactly what we are trying not to inherit.
-        # Deriving from it reproduced 0600 and the test caught it.
+        # Take what an ordinary open() would have produced: the process
+        # umask applied to 0666. NOT the containing directory's mode, which
+        # was the first attempt and is wrong for the case that matters: on
+        # a first investigation this function writes into STAGING, so the
+        # directory in question is the 0700 scratch dir whose permissions
+        # are exactly what we are trying not to inherit. Deriving from it
+        # reproduced 0600 and the test caught it. And not an existing
+        # file's mode either, for the reason in _status_mode.
         os.replace(tmp_path, status_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
@@ -1657,22 +1657,20 @@ def investigate(
                     aside = None
             if aside is not None:
                 try:
-                    # A publish that landed something and was then rejected
-                    # leaves that something in the way, and os.replace
-                    # cannot put a directory over a symlink or a file
-                    # (ENOTDIR) — the restore failed and the proposal was
-                    # stranded in scratch while the attacker's entry stayed
-                    # live. Neither shape can be a real proposal, so clear
-                    # it; a directory is never removed here, because that
-                    # could be one.
-                    # Anything here, INCLUDING a directory. The comment
-                    # this replaces refused to remove one on the grounds
-                    # that it might be a real proposal — but this branch
-                    # runs only when `aside` holds the real one, so
-                    # whatever sits at the live path is not it. Leaving a
-                    # planted non-empty directory made os.replace fail with
-                    # ENOTEMPTY, which aborted the restore and stranded the
-                    # real proposal in scratch (agy P2 on #247).
+                    # A publish that landed something and was then
+                    # rejected leaves that something in the way, and
+                    # os.replace can put a directory neither over a symlink
+                    # or a file (ENOTDIR) nor over a non-empty directory
+                    # (ENOTEMPTY): either way the restore failed and the
+                    # proposal was stranded in scratch while the impostor
+                    # stayed live.
+                    #
+                    # So clear whatever is here, INCLUDING a directory.
+                    # This branch runs only when `aside` holds the real
+                    # proposal, so nothing at the live path can be one —
+                    # an earlier version excluded directories on the
+                    # grounds that they might be, which is what left the
+                    # planted-directory case broken (agy P2 on #247).
                     if proposal_dir.is_symlink() or proposal_dir.exists():
                         _remove_rejected(proposal_dir)
                     os.replace(aside, proposal_dir)
