@@ -885,7 +885,17 @@ def test_a_failed_aside_rename_leaks_no_scratch_directory(tmp_path, monkeypatch)
     second = investigate(issue.ref.url, state_dir=tmp_path)
     monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
 
+    # A soft error, NOT a crash: the rename sits outside the publish try,
+    # so the rollback is never reached and `aside` is still None. agy read
+    # this the other way round — a P1 claiming the rollback restores from a
+    # path that was never created, crashing the poller with
+    # ProposalRestoreFailed. It does not, and this is where that would show
+    # (the assertion below is on a RETURNED result; a BaseException would
+    # have propagated straight out of investigate()).
     assert second.error is not None
+    assert "device busy" in second.error
+    # ...and the proposal is exactly where it was, not stranded in scratch.
+    assert (first.proposal_dir / "design.md").read_text() == "v1 design.md"
     service_dir = tmp_path / "mctl-telegram"
     assert list(service_dir.glob(".aside-*")) == []
     assert list(service_dir.glob(".staging-*")) == []

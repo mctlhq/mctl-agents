@@ -900,8 +900,18 @@ def investigate(
             # cleaned in the outer finally, so a failure here does not leak
             # the wrapper directory.
             aside_root = Path(tempfile.mkdtemp(dir=proposal_dir.parent.parent, prefix=".aside-"))
-            aside = aside_root / "proposal"
-            os.replace(proposal_dir, aside)
+            moved = aside_root / "proposal"
+            os.replace(proposal_dir, moved)
+            # `aside` means "the proposal is at this path and nowhere else",
+            # so it is set only once that is true. This rename sits outside
+            # the publish try below, so a failure here returns a soft error
+            # with the proposal untouched at proposal_dir and never reaches
+            # the rollback — but that reading depends on where the `try`
+            # starts, and agy read it the other way (a false P1 on #247).
+            # Binding the name to the fact instead of to the line makes it
+            # checkable locally: with `aside` still None, the rollback has
+            # nothing to restore no matter who calls it.
+            aside = moved
 
             # Only NOW re-read the status. The guard at the top of this
             # function ran BEFORE an agent call that takes minutes, and
