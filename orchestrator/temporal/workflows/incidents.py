@@ -165,6 +165,18 @@ class IncidentLoopWorkflow:
         incidents on its own — wrote none, so the only trace was a log
         line in a pod that has since been recycled.
 
+        The workflow id is enough to tell one tick from the next, even
+        though `worker.py`'s INCIDENTS_WORKFLOW_ID is a constant: that
+        constant is the schedule ACTION's id, and Temporal appends the
+        action's nominal time when the schedule fires ("The Action's
+        timestamp is appended to the Workflow Id" —
+        docs.temporal.io/schedule). Each tick therefore records
+        `incidents-mctl-agents-<nominal-time>`, one id per Argo run, which
+        is what #149 asks for. Recording `run_id` alongside it would not
+        help today either: mctl-api's RecordAgentExecution decodes into a
+        fixed request struct with a plain json.Decoder, so an undeclared
+        field is dropped rather than persisted.
+
         Best-effort for the same reason it is in the dev loop: the CWFT
         being recorded has already finished, and letting an mctl-api blip
         fail the tick would turn a missing audit row into a missed
