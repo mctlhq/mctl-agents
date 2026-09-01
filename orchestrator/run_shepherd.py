@@ -1091,7 +1091,21 @@ def _neutralize_findings_tags(text: str) -> str:
     `>`, so the pattern allows for it (both lessons from the equivalent
     guard in run_issue_investigator._neutralize_prompt_tags).
     """
-    return re.sub(r"(?i)</?\s*findings\b[^>]*>", "", text or "")
+    # Three deliberate loosenings, each closing a bypass the stricter
+    # pattern left open (agy P1 on #248):
+    #   `<[\s/]*` — `< /findings>` still reads as a closer, so pinning the
+    #               slash to the front of the tag is not enough.
+    #   `>?`      — the `>` is optional. `</findings` at end of line reads
+    #               as the end of the block just as well, and requiring the
+    #               `>` put the whole guard one missing character away from
+    #               doing nothing at all.
+    #   `[^>\n]*` — junk is bounded to the tag's own line. Unbounded, a
+    #               `<findings` inside quoted code would swallow every
+    #               character up to the next `>` anywhere later in the text.
+    # `(?![-\w])` keeps a real `<findings-report>` in quoted code intact: it
+    # is not a fence terminator, so stripping it would lose content for
+    # nothing (claude P3 on #248).
+    return re.sub(r"(?i)<[\s/]*findings(?![-\w])[^>\n]*>?", "", text or "")
 
 
 async def _format_bundle_via_sdk(findings: list[CodexFinding]) -> dict:
@@ -2085,8 +2099,11 @@ def main() -> None:
             print("info: no implemented/review-fixing proposals with a PR found.")
         return
 
-    # Reconcile mode: GitHub projection, no budget or SDK. Dry-run executes the
-    # full decision pass but suppresses YAML writes and PR creation.
+    # Reconcile mode: GitHub projection, no budget or SDK. Dry-run suppresses
+    # YAML writes and PR creation here; in the sweep loop below it stops
+    # before process_one() entirely, so no dry-run path reaches the SDK.
+    # (The old wording claimed dry-run ran the full decision pass, which is
+    # what led agy to report a dry-run SDK call on #248 that cannot happen.)
     if args.reconcile:
         print(f"Reconcile pass: {len(refs)} proposal(s):")
         for r in refs:

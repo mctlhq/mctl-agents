@@ -1033,10 +1033,15 @@ def _neutralize_prompt_tags(text: str) -> str:
     Targeted removal, not blanket angle-bracket escaping: issue bodies
     legitimately carry code with generics/HTML that must reach the agent
     intact."""
-    # \b[^>]*> (not \s*>): lenient LLM/XML parsers would honor a forged tag
-    # carrying attributes or junk before the `>` (e.g. `</issue_body x=y>`),
-    # which the whitespace-only form left intact (agy P1 round 3, PR #212).
-    return re.sub(r"(?i)</?\s*issue_(title|body)\b[^>]*>", "", text or "")
+    # Lenient LLM/XML parsers honor a forged tag carrying attributes or junk
+    # before the `>` (e.g. `</issue_body x=y>`), which a whitespace-only
+    # pattern left intact (agy P1 round 3, PR #212). They also honor a tag
+    # that never closes at all: `</issue_body` at end of line ends the block
+    # for the reader just as well, so the `>` is optional here (the same
+    # bypass agy found in run_shepherd._neutralize_findings_tags on #248).
+    # Junk stays bounded to the tag's own line — unbounded, an `<issue_body`
+    # inside quoted code would swallow everything up to the next `>`.
+    return re.sub(r"(?i)<[\s/]*issue_(title|body)(?![-\w])[^>\n]*>?", "", text or "")
 
 
 def _build_prompt(issue: IssueData, service: str, slug: str) -> str:
