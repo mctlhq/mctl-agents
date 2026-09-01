@@ -1569,3 +1569,55 @@ class TestReconcileReadsGitHub:
         with pytest.raises(Exception) as excinfo:
             await env.run(discover_and_project, "")
         assert "403" in str(excinfo.value)
+
+    async def test_one_undecodable_blob_does_not_fail_the_whole_sweep(
+        self, env, monkeypatch
+    ):
+        """A corrupt blob is one proposal's defect, not the sweep's.
+
+        _read_blob wrapped the decode failure in ProposalListingError, which
+        the per-file skip does not catch — so a single unreadable
+        .status.yaml failed the whole tick, and kept failing it every 15
+        minutes, since the retry re-reads the same bad blob (agy P2).
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [
+                            ("mctl-web/proposals/issue-1-corrupt/.status.yaml", "sha-corrupt"),
+                            ("mctl-web/proposals/issue-66-good/.status.yaml", "sha-ok"),
+                        ]
+                    ),
+                )
+            if url.endswith("sha-corrupt"):
+                # Not valid base64: one character more than a multiple of 4.
+                return httpx.Response(200, json={"content": "abcde"})
+            if "/git/blobs/" in url:
+                import base64 as _b64
+
+                body = (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                return httpx.Response(200, json={"merged": True, "state": "closed"})
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        result = await env.run(discover_and_project, "")
+
+        assert [p.slug for p in result.projections] == ["issue-66-good"]
+        assert result.total_inspected == 1

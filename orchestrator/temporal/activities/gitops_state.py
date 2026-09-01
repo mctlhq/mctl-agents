@@ -182,7 +182,14 @@ async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> tuple[s
     try:
         text = base64.b64decode(payload.get("content", "")).decode("utf-8", "replace")
     except (ValueError, TypeError) as exc:
-        raise ProposalListingError(f"undecodable blob payload for {sha}") from exc
+        # ValueError, deliberately, not ProposalListingError: an undecodable
+        # blob is a defect in ONE proposal's file, the same class of problem
+        # as YAML that will not parse, and the caller skips those to keep
+        # scanning. Raising the retryable listing error here would let a
+        # single corrupt .status.yaml fail the whole sweep — and fail it
+        # every 15 minutes, since a retry re-reads the same bad blob
+        # (agy P2, round 2 on #271). binascii.Error is a ValueError.
+        raise ValueError(f"undecodable blob payload for {sha}") from exc
     parsed = _parse_status_yaml(text)
     _cache_put(sha, parsed)
     return parsed
