@@ -426,9 +426,14 @@ def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
 
 def gh_issue_view(url: str) -> IssueData:
     """Fetch issue title / body / state via `gh issue view --json`."""
+    # `--` before the URL: this function is called BEFORE parse_issue_url
+    # (which runs on the response, not the argument), so a value shaped
+    # like `--template=...` would reach gh as a flag rather than as the
+    # issue to view (agy P3 on #247).
     proc = _run([
-        "gh", "issue", "view", url,
+        "gh", "issue", "view",
         "--json", "number,title,body,state,url",
+        "--", url,
     ])
     data = json.loads(proc.stdout)
     ref = parse_issue_url(data["url"])
@@ -814,6 +819,26 @@ class InvestigateResult:
     rate_limited: bool = False
 
 
+# What the staging checks below are, and are not, for.
+#
+# The agent is prompt-injectable — the issue body is written by whoever
+# opened the issue — and it runs with Bash. It also runs as the SAME uid,
+# in the same container, in this very process tree: _run_agent is an
+# anyio.run call, not a sandbox. So every path this module can write, the
+# agent can already write directly, and redirecting one of our writes
+# through a symlink gains an attacker nothing it did not have.
+#
+# That is worth stating because two review rounds (and this author) argued
+# these checks as host protection. They are not. What they protect is the
+# PUBLISHED proposal: a staging directory swapped for a symlink would be
+# renamed into agents-state and committed, after which downstream jobs —
+# the implementer and shepherd, in other pods, with other credentials —
+# would follow it out of the tree. That is a boundary this process really
+# does sit on, and it is the reason to be strict here.
+#
+# Against a same-uid adversary with a background process, no path-based
+# scheme is airtight; each measure below raises the cost and none is
+# claimed to close the door.
 def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
@@ -866,6 +891,7 @@ def investigate(
     proposal_preexisted = proposal_dir.exists()
     clone = None
     staging = None
+    staging_wrapper: Path | None = None
     aside: Path | None = None
     aside_root: Path | None = None
     # Set only when the previous proposal could not be put back, in which
@@ -904,16 +930,26 @@ def investigate(
         #     land wherever it points. The second check before the publish
         #     would notice, far too late to matter (agy P1 on #247).
         #
-        #     mkdtemp picks the new name, so it is not derivable from
-        #     anything the agent saw; a process still holding the old path
-        #     cannot follow the rename. What remains is the two syscalls
-        #     between the check above and this rename, during which nothing
-        #     is written. Closing even that needs every write to go through
-        #     a dirfd opened O_NOFOLLOW, which shutil cannot do — so the
-        #     window is narrowed to nothing-happens rather than pretended
-        #     away.
-        secure = Path(tempfile.mkdtemp(dir=staging.parent, prefix=".staging-"))
+        #     Two things, neither of which is a name game. mkdtemp's name
+        #     is NOT a secret: the agent can poll the parent directory and
+        #     see a new .staging-* appear (agy P1 on #247, correcting the
+        #     previous commit's reasoning). What actually stops the swap is
+        #     the second step — creating a WRAPPER and dropping its write
+        #     bit, since renaming, creating or unlinking an entry needs
+        #     write permission on the containing directory, not on the
+        #     entry.
+        #
+        #     Stated honestly, because "categorically prevents" would be
+        #     wrong: the agent runs as the same uid and owns the wrapper,
+        #     so it can chmod it back. This raises the bar; it is not a
+        #     boundary. See the note above investigate() for why that is
+        #     acceptable — the agent shares this process's uid, so every
+        #     path this code can write it can write directly, and what
+        #     these checks protect is the PUBLISHED proposal, not the host.
+        staging_wrapper = Path(tempfile.mkdtemp(dir=staging.parent, prefix=".staging-"))
+        secure = staging_wrapper / "staging"
         os.replace(staging, secure)
+        os.chmod(staging_wrapper, stat.S_IRUSR | stat.S_IXUSR)
         staging = secure
         staging_id = _dir_identity(staging)
 
@@ -1042,9 +1078,13 @@ def investigate(
             else:
                 shutil.copymode(proposal_dir.parent, staging)
 
-            # Again, immediately before the rename that publishes it: the
-            # steps between here and the check above write through this
-            # path too, and this is the one that makes the result live.
+            # Renaming staging OUT of the wrapper needs the wrapper
+            # writable again, so it is reopened as late as possible and the
+            # identity check follows it rather than preceding it — checking
+            # first and then unlocking would put the window on the wrong
+            # side of the check.
+            if staging_wrapper is not None:
+                os.chmod(staging_wrapper, stat.S_IRWXU)
             _verify_staging(staging, staging_id)
             os.replace(staging, proposal_dir)
         except BaseException as publish_error:
@@ -1127,7 +1167,16 @@ def investigate(
         # Drop the staging directory. Whatever the agent left there is
         # this run's work and either landed in the swap or is being
         # abandoned; either way the live proposal was never touched.
-        if staging is not None:
+        if staging_wrapper is not None:
+            # rmtree has to unlink an entry IN the wrapper, which the
+            # dropped write bit forbids — restore it or the scratch
+            # directory leaks on every run.
+            try:
+                os.chmod(staging_wrapper, stat.S_IRWXU)
+            except OSError:
+                pass
+            shutil.rmtree(staging_wrapper, ignore_errors=True)
+        elif staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
         if aside_root is not None and not keep_aside:
             shutil.rmtree(aside_root, ignore_errors=True)

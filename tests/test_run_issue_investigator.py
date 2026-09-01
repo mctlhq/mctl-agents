@@ -8,6 +8,7 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 from __future__ import annotations
 
 import os
+import json
 import pathlib
 import shutil
 import stat
@@ -1833,3 +1834,75 @@ def test_the_status_mode_is_not_read_through_a_planted_symlink(tmp_path):
     probe = tmp_path / "probe"
     probe.touch()
     assert stat.S_IMODE(status_path.stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
+
+
+def test_the_staging_wrapper_is_not_writable_while_the_work_happens(
+    tmp_path, monkeypatch
+):
+    """Renaming, creating or unlinking an entry needs write permission on
+    the CONTAINING directory. Dropping the wrapper's write bit is what
+    actually stops a background swap — mkdtemp's name is not a secret, the
+    agent can poll the parent and watch it appear (agy P1 on #247)."""
+    observed: dict[str, int] = {}
+
+    real_write = run_issue_investigator.write_status_yaml
+
+    def _note_wrapper_mode(proposal_dir, issue_data):
+        # proposal_dir here IS staging; its parent is the wrapper.
+        observed["mode"] = stat.S_IMODE(proposal_dir.parent.stat().st_mode)
+        return real_write(proposal_dir, issue_data)
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=52,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    monkeypatch.setattr(run_issue_investigator, "write_status_yaml", _note_wrapper_mode)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is None
+    assert observed["mode"] & stat.S_IWUSR == 0, "the wrapper was writable during the work"
+
+
+def test_the_staging_wrapper_is_cleaned_up_despite_its_dropped_write_bit(
+    tmp_path, monkeypatch
+):
+    """rmtree has to unlink an entry IN the wrapper, which the dropped bit
+    forbids — without restoring it the scratch directory leaks every run."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=53,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is None
+    assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []
+
+
+def test_the_issue_url_cannot_be_read_as_a_gh_flag(tmp_path, monkeypatch):
+    """gh_issue_view runs BEFORE parse_issue_url (which validates the
+    response, not the argument), so a value shaped like a flag would reach
+    gh as one (agy P3 on #247)."""
+    captured: dict[str, list[str]] = {}
+
+    class _Proc:
+        stdout = json.dumps({
+            "number": 7, "title": "t", "body": "b", "state": "OPEN",
+            "url": "https://github.com/mctlhq/mctl-telegram/issues/7",
+        })
+
+    def _fake_run(cmd, cwd=None, check=True):
+        captured["cmd"] = cmd
+        return _Proc()
+
+    monkeypatch.setattr(run_issue_investigator, "_run", _fake_run)
+    gh_issue_view("--template=evil")
+
+    cmd = captured["cmd"]
+    assert "--" in cmd, "no argument separator before the URL"
+    assert cmd.index("--") < cmd.index("--template=evil")
