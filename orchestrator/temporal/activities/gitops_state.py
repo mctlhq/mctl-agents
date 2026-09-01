@@ -326,7 +326,16 @@ async def fetch_pr_snapshots(refs: list[ProposalStateRef]) -> dict[tuple[str, st
                     raise ProposalListingError(
                         f"reading {url} returned HTTP {response.status_code}: {response.text[:200]}"
                     )
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    # A 200 carrying a malformed body (a proxy page, a
+                    # truncated response) is a transport problem, not a
+                    # verdict about this PR. Wrapped like every other read
+                    # here so it reads as retryable rather than leaking a
+                    # bare ValueError, which in list_proposal_refs means
+                    # "skip this one file" (agy P3, round 3 on #271).
+                    raise ProposalListingError(f"non-JSON payload from {url}") from exc
             if not isinstance(data, dict):
                 raise ProposalListingError(f"unexpected payload type from {url}")
             merged = bool(data.get("merged"))

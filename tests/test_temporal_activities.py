@@ -1621,3 +1621,46 @@ class TestReconcileReadsGitHub:
 
         assert [p.slug for p in result.projections] == ["issue-66-good"]
         assert result.total_inspected == 1
+
+    async def test_a_malformed_pr_payload_is_retryable_not_a_bare_valueerror(
+        self, env, monkeypatch
+    ):
+        """A 200 with a broken body is transport noise, not a verdict.
+
+        Left bare, the ValueError would read like the per-file skip signal
+        list_proposal_refs uses for a corrupt status file (agy P3).
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+        from orchestrator.temporal.activities.proposals import ProposalListingError
+
+        self._clear_cache()
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [("mctl-web/proposals/issue-66-x/.status.yaml", "sha-j")]
+                    ),
+                )
+            if "/git/blobs/" in url:
+                import base64 as _b64
+
+                body = (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                return httpx.Response(200, text="<html>gateway hiccup</html>")
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(ProposalListingError):
+            await env.run(discover_and_project, "")
