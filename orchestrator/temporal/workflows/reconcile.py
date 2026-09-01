@@ -160,7 +160,7 @@ class ReconcileWorkflow:
             APPLY_OPERATION,
         )
         try:
-            return await workflow.execute_activity(
+            result: WorkflowResult = await workflow.execute_activity(
                 submit_and_wait,
                 SubmitAndWaitInput(
                     operation=APPLY_OPERATION,
@@ -188,3 +188,24 @@ class ReconcileWorkflow:
                 exc,
             )
             return None
+
+        if not result.succeeded:
+            # The other half of the same failure, and the quieter one:
+            # submit_and_wait RETURNS for every terminal phase, so a CWFT
+            # that ran and ended Failed/Error arrives here as an ordinary
+            # value. Without this branch a rejected staging guard or a lost
+            # push would read exactly like a successful write — the same
+            # indistinguishability this whole change exists to remove
+            # (claude P2 on #273). The result is still returned rather than
+            # dropped: it carries the Argo workflow name, which is what an
+            # operator needs to go read the failure.
+            workflow.logger.warning(
+                "reconcile: %s ran as %s and ended %s — %d projection(s) not "
+                "written, leaving them for the next tick",
+                APPLY_OPERATION,
+                result.workflow_name,
+                result.phase,
+                len(discovery.projections),
+            )
+
+        return result

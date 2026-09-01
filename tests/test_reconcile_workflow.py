@@ -8,6 +8,7 @@ environment with fake activities, same harness as test_dev_loop_workflow.py.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 
 import pytest
@@ -39,6 +40,7 @@ def _fake_activities(
     visibility_fails: bool = False,
     projections: list[ProposalProjection] | None = None,
     submit_fails: bool = False,
+    submit_phase: str = "Succeeded",
 ):
     received: dict = {}
     received["submits"] = []
@@ -52,7 +54,7 @@ def _fake_activities(
         received["submits"].append(input)
         if submit_fails:
             raise ApplicationError("argo unavailable", non_retryable=True)
-        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase=submit_phase)
 
     @activity.defn(name="list_active_dev_loop_ids")
     async def fake_list_active_dev_loop_ids() -> list[str]:
@@ -226,3 +228,28 @@ class TestReconcileApplies:
         assert result.orphans.skipped_reason is not None
         assert [i.operation for i in received["submits"]] == ["mctl-agents-reconcile"]
         assert result.applied is not None
+
+    async def test_a_cwft_that_ran_and_failed_is_not_read_as_written(self, env, caplog):
+        """submit_and_wait RETURNS for every terminal phase, including
+        Failed and Error — it only raises when submission or polling itself
+        blows up. A CWFT that ran and ended Failed (staging guard rejected
+        the write, push lost the race) therefore arrives as an ordinary
+        value, and without a check it reads exactly like a successful write
+        (claude P2). The tick still succeeds; the phase must survive on the
+        result so the failure is visible."""
+        acts, received = _fake_activities(projections=DRIFT, submit_phase="Failed")
+
+        with caplog.at_level(logging.WARNING, logger="temporalio.workflow"):
+            result = await _run(env, acts)
+
+        # The log line IS the fix: the returned value looks the same either
+        # way, so asserting only on it passes against the unguarded version.
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("ended Failed" in m for m in warnings), warnings
+        assert any("not \nwritten" in m or "not written" in m for m in warnings), warnings
+
+        assert len(received["submits"]) == 1
+        assert result.applied is not None, "the Argo run must stay visible"
+        assert result.applied.succeeded is False
+        assert result.applied.phase == "Failed"
+        assert result.discovery.projections, "the finding must survive the failed write"
