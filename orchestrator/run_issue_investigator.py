@@ -429,11 +429,30 @@ def _copy_file_exclusive(src: Path, dst: Path) -> None:
     # name a second time — so a source swapped for a symlink in between
     # would have its target read and copied in instead (agy P1 on #247).
     # O_NONBLOCK for the FIFO case, same reason as _copy_mode_nofollow.
+    #
+    # Every descriptor is handed to a file object on the line after it is
+    # opened, and the failure path closes it. The straightforward spelling
+    # -- both os.open calls, then one `with os.fdopen(a), os.fdopen(b)` --
+    # leaks the destination whenever opening the SOURCE raises, which is
+    # exactly what a swapped or unreadable source makes it do: the carry
+    # forward walks a whole proposal, so a directory of them exhausts the
+    # process's descriptors (codex P2 on #247).
     fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
-        src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "wb") as out, os.fdopen(src_fd, "rb") as f_in:
-            shutil.copyfileobj(f_in, out)
+        out = os.fdopen(fd, "wb")
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        with out:
+            src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                f_in = os.fdopen(src_fd, "rb")
+            except BaseException:
+                os.close(src_fd)
+                raise
+            with f_in:
+                shutil.copyfileobj(f_in, out)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(dst)
@@ -1523,21 +1542,35 @@ def investigate(
         # Drop the staging directory. Whatever the agent left there is
         # this run's work and either landed in the swap or is being
         # abandoned; either way the live proposal was never touched.
-        for held in (wrapper_fd, staging_fd, aside_fd):
-            if held is not None:
-                try:
-                    os.close(held)
-                except OSError:
-                    pass
         if staging_wrapper is not None:
-            # rmtree has to unlink an entry IN the wrapper, which the
-            # dropped write bit forbids — restore it or the scratch
-            # directory leaks on every run.
-            try:
-                os.chmod(staging_wrapper, stat.S_IRWXU)
-            except OSError:
-                pass
-            shutil.rmtree(staging_wrapper, ignore_errors=True)
+            # Ask the DESCRIPTOR whether this path is still the wrapper we
+            # made, before deleting anything through it. Cleanup is the one
+            # step here that destroys rather than reads, so a wrapper
+            # renamed away and its name given to something else would have
+            # this rmtree remove that instead (codex P2 on #247). Same
+            # (dev, ino) plus still-linked test as the publish, for the
+            # same reason: inode numbers are reused.
+            ours = wrapper_fd is not None and _fd_still_linked(wrapper_fd)
+            if ours:
+                try:
+                    st = os.lstat(staging_wrapper)
+                    held = os.fstat(wrapper_fd)  # type: ignore[arg-type]
+                    ours = (st.st_dev, st.st_ino) == (held.st_dev, held.st_ino)
+                except OSError:
+                    ours = False
+            if ours:
+                # rmtree has to unlink an entry IN the wrapper, which the
+                # dropped write bit forbids — restore it or the scratch
+                # directory leaks on every run.
+                with contextlib.suppress(OSError):
+                    os.fchmod(wrapper_fd, stat.S_IRWXU)  # type: ignore[arg-type]
+                shutil.rmtree(staging_wrapper, ignore_errors=True)
+            else:
+                print(
+                    f"warn: leaving {staging_wrapper} alone — it is no longer "
+                    "the staging wrapper this run created",
+                    file=sys.stderr,
+                )
         elif staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
         if aside_root is not None:
@@ -1547,6 +1580,12 @@ def investigate(
                 os.chmod(aside_root, stat.S_IRWXU)
             if not keep_aside:
                 shutil.rmtree(aside_root, ignore_errors=True)
+        # Only now: the cleanup above asks the descriptors whether the
+        # paths it is about to delete are still the ones this run made.
+        for held_fd in (wrapper_fd, staging_fd, aside_fd):
+            if held_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(held_fd)
         # Drop the throwaway /tmp clone — the wrapper _clone_repo returned,
         # which takes the checkout inside it with it.
         if clone is not None and clone.exists():

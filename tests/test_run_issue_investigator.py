@@ -2429,3 +2429,69 @@ def test_a_document_swapped_after_validation_is_not_published(tmp_path, monkeypa
     published = first.proposal_dir / "design.md"
     assert published.is_file() and not published.is_symlink()
     assert published.read_text() == "v1 design.md"
+
+
+def test_the_destination_is_closed_when_the_copy_source_will_not_open(tmp_path):
+    """The destination is created before the source is opened, so a source
+    that will not open must not leave it behind. _carry_forward walks a
+    whole proposal, so a directory of unreadable files would otherwise
+    exhaust the process's descriptors (codex P2 on #247)."""
+    target = tmp_path / "target"
+    target.write_text("x")
+    src = tmp_path / "src"
+    src.symlink_to(target)  # O_NOFOLLOW on the source rejects this (ELOOP)
+    dst = tmp_path / "dst"
+
+    def _open_count():
+        return len(os.listdir(f"/proc/{os.getpid()}/fd")) if os.path.isdir(
+            f"/proc/{os.getpid()}/fd"
+        ) else None
+
+    before = _open_count()
+    for _ in range(40):
+        with pytest.raises(OSError):
+            run_issue_investigator._copy_file_exclusive(src, dst)
+        assert not dst.exists()
+    after = _open_count()
+    if before is None or after is None:
+        pytest.skip("no /proc/self/fd on this platform")
+    # A leak here would be one descriptor per attempt.
+    assert after - before < 5
+
+
+def test_a_wrapper_swapped_before_cleanup_is_not_deleted(tmp_path, monkeypatch):
+    """Cleanup is the one step that destroys rather than reads, so it asks
+    the descriptor whether the path is still ours before removing it
+    (codex P2 on #247)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=62,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _rename_the_wrapper_away(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        wrappers = [
+            w for w in (tmp_path / "mctl-telegram").glob(".staging-*") if w.is_dir()
+        ]
+        assert wrappers, "no wrapper to attack"
+        w = wrappers[0]
+        os.chmod(w, stat.S_IRWXU)
+        w.rename(tmp_path / "moved-away")
+        # And give the vacated name to a real directory that must survive.
+        # A symlink would be safe by accident -- rmtree refuses to follow
+        # one -- so the impostor here is a directory, which rmtree deletes.
+        global _BYSTANDER
+        _BYSTANDER = tmp_path / "mctl-telegram" / w.name
+        _BYSTANDER.mkdir()
+        (_BYSTANDER / "keep.txt").write_text("not ours")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _rename_the_wrapper_away
+    )
+    investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert (_BYSTANDER / "keep.txt").read_text() == "not ours"
