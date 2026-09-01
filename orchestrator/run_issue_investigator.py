@@ -851,12 +851,24 @@ def investigate(
         # 4. Verify the agent produced the triplet. Staging is empty at the
         #    start of every run, so existence here proves THIS run wrote it
         #    — no comparison against the previous run needed.
-        missing = [name for name in TRIPLET if not (staging / name).is_file()]
+        #
+        #    _is_plain_file, not is_file(): is_file() FOLLOWS symlinks, so an
+        #    agent with Bash that answered `design.md` with a link to some
+        #    file it found passed validation, and the swap published the
+        #    link. Git stores only the target, so every checkout but the one
+        #    that made it gets a broken or host-dependent document where the
+        #    generated Markdown should be — and the proposal still looks
+        #    complete (codex P2 on #247). A directory of the right name is
+        #    refused for the same reason.
+        missing = [name for name in TRIPLET if not _is_plain_file(staging / name)]
         if missing:
-            return InvestigateResult(
-                service, slug, proposal_dir,
-                error=f"agent did not write: {', '.join(missing)}",
-            )
+            wrong_type = [name for name in missing if (staging / name).exists()]
+            detail = f"agent did not write: {', '.join(missing)}"
+            if wrong_type:
+                detail += (
+                    f" (present but not a regular file: {', '.join(wrong_type)})"
+                )
+            return InvestigateResult(service, slug, proposal_dir, error=detail)
 
         # 5. Write .status.yaml into STAGING as well, so a failure there
         #    publishes nothing at all rather than leaving the new

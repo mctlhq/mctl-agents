@@ -1576,3 +1576,61 @@ def test_a_regenerated_file_keeps_the_mode_of_the_one_it_replaces(tmp_path, monk
     assert second.error is None
     assert design.read_text() == "v2 design.md"
     assert stat.S_IMODE(design.stat().st_mode) == chosen
+
+
+def test_a_triplet_document_written_as_a_symlink_is_refused(tmp_path, monkeypatch):
+    """is_file() follows symlinks, so the check passed and the swap published
+    the link. Git stores only the target, leaving every other checkout with a
+    broken or host-dependent document where the generated Markdown should be —
+    while the proposal still looks complete (codex P2 on #247)."""
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("someone else's file")
+
+    def _agent_symlinks_design(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+        (proposal_dir / "design.md").symlink_to(elsewhere)
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=43, agent=_agent_symlinks_design
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "design.md" in result.error
+    assert "not a regular file" in result.error
+    # Nothing was published — a partial proposal is worse than none.
+    assert not result.proposal_dir.exists()
+
+
+def test_a_triplet_document_written_as_a_directory_is_refused(tmp_path, monkeypatch):
+    """Same check, the other way it can be satisfied by something that is not
+    a document."""
+    def _agent_makes_a_directory(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+        (proposal_dir / "design.md").mkdir()
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=44, agent=_agent_makes_a_directory
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "not a regular file" in result.error
+
+
+def test_a_genuinely_absent_document_still_reads_as_absent(tmp_path, monkeypatch):
+    """The wrong-type detail must not swallow the ordinary case."""
+    def _agent_skips_one(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=45, agent=_agent_skips_one
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "agent did not write: design.md" in result.error
+    assert "not a regular file" not in result.error
