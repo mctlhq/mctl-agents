@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.36.1](https://github.com/mctlhq/mctl-agents/compare/1.36.0...1.36.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **reconcile:** let every concurrent read finish before raising ([292772b](https://github.com/mctlhq/mctl-agents/commit/292772b52e21832d04690fa420c36d46a45b8401))
+* **reconcile:** read agents-state from GitHub, not from a checkout the worker lacks ([ec9acea](https://github.com/mctlhq/mctl-agents/commit/ec9acea6adc0f0bb5a04be1927bc07312c218445)), closes [#270](https://github.com/mctlhq/mctl-agents/issues/270)
+* **reconcile:** skip one corrupt blob instead of failing the sweep ([a041735](https://github.com/mctlhq/mctl-agents/commit/a041735f390d030ea0cc1bcfce5da77d73ae4ac3))
+* **reconcile:** wrap a malformed PR payload as a retryable read failure ([8cab345](https://github.com/mctlhq/mctl-agents/commit/8cab345cc8331fb1c8e12ae170ce5ed9df50ecb8))
+
 ## [1.36.0](https://github.com/mctlhq/mctl-agents/compare/1.35.0...1.36.0) (2026-09-01)
 
 
