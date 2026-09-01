@@ -247,6 +247,30 @@ def _entry_identity(dir_fd: int, name: str) -> tuple[int, int]:
     return (st.st_dev, st.st_ino)
 
 
+def _fd_still_linked(fd: int) -> bool:
+    """Does the inode behind ``fd`` still have a name in the filesystem?
+
+    (device, inode) alone does NOT identify a directory across a delete.
+    Inode numbers are a reusable resource: ext4 hands the number of a
+    just-freed inode straight back to the next create in the same group,
+    so `rm -rf staging && ln -s /elsewhere staging` can land a symlink
+    carrying the very (dev, ino) the check was told to expect, and the
+    swap passes. APFS never reuses within a mount's lifetime, which is
+    why every one of these checks looked sound on a macOS laptop and only
+    the Linux CI — the same kernel and filesystem the agent container
+    runs on — showed the hole.
+
+    A held descriptor closes it: reuse is possible only once our inode is
+    unlinked, and an unlinked inode has st_nlink == 0. So identity is
+    "(dev, ino) match AND our fd is still linked", and the two together
+    cannot both be true of an impostor.
+    """
+    try:
+        return os.fstat(fd).st_nlink > 0
+    except OSError:
+        return False
+
+
 def _remove_rejected(path: Path) -> None:
     """Delete something the publish check refused, whatever shape it is."""
     try:
@@ -258,9 +282,11 @@ def _remove_rejected(path: Path) -> None:
         pass
 
 
-def _aside_is_ours(aside: Path, expected: tuple[int, int] | None) -> bool:
+def _aside_is_ours(
+    aside: Path, expected: tuple[int, int] | None, fd: int | None
+) -> bool:
     """Is ``aside`` still the proposal directory we moved there?"""
-    if expected is None:
+    if expected is None or fd is None or not _fd_still_linked(fd):
         return False
     try:
         return _dir_identity(aside) == expected and stat.S_ISDIR(
@@ -270,10 +296,17 @@ def _aside_is_ours(aside: Path, expected: tuple[int, int] | None) -> bool:
         return False
 
 
-def _verify_aside(aside: Path, expected: tuple[int, int] | None) -> None:
+def _verify_aside(
+    aside: Path, expected: tuple[int, int] | None, fd: int | None
+) -> None:
     """Raise unless ``aside`` is still the proposal directory we moved."""
     if expected is None:
         return
+    if fd is None or not _fd_still_linked(fd):
+        raise _StagingReplaced(
+            "the moved-aside proposal was deleted — whatever holds its path "
+            "now is not it, however its inode number reads"
+        )
     try:
         actual = _dir_identity(aside)
     except OSError as exc:
@@ -283,6 +316,26 @@ def _verify_aside(aside: Path, expected: tuple[int, int] | None) -> None:
             "the moved-aside proposal was replaced — refusing to carry "
             "whatever is there now into the new one"
         )
+
+
+def _verify_landed(
+    proposal_dir: Path, staging_fd: int | None, expected: tuple[int, int]
+) -> bool:
+    """Is what now sits at the proposal path the staging we verified?
+
+    Asked AFTER the rename, which is the check that actually decides, and
+    it must survive inode-number reuse: the staging fd is held open from
+    before the publish, so an attacker who deleted our directory to free
+    its number leaves that fd unlinked and is caught even when the number
+    matches (see _fd_still_linked).
+    """
+    if staging_fd is not None and not _fd_still_linked(staging_fd):
+        return False
+    try:
+        landed = os.lstat(proposal_dir)
+    except OSError:
+        return False
+    return stat.S_ISDIR(landed.st_mode) and (landed.st_dev, landed.st_ino) == expected
 
 
 def _verify_staging_fd(dir_fd: int, expected: tuple[int, int]) -> None:
@@ -1035,6 +1088,8 @@ def investigate(
     staging = None
     staging_wrapper: Path | None = None
     wrapper_fd: int | None = None
+    staging_fd: int | None = None
+    aside_fd: int | None = None
     aside: Path | None = None
     aside_id: tuple[int, int] | None = None
     aside_root: Path | None = None
@@ -1121,6 +1176,14 @@ def investigate(
             staging_wrapper, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         )
         staging_id = _entry_identity(wrapper_fd, STAGING_ENTRY)
+        #     And a descriptor on staging ITSELF, held until the publish is
+        #     decided. It is what makes the identity check survive inode
+        #     reuse — see _fd_still_linked.
+        staging_fd = os.open(
+            STAGING_ENTRY,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=wrapper_fd,
+        )
 
         # 4. Verify the agent produced the triplet. Staging is empty at the
         #    start of every run, so existence here proves THIS run wrote it
@@ -1191,6 +1254,9 @@ def investigate(
             # enumerated and its files copied into the proposal we are
             # about to publish (agy P1 on #247).
             aside_id = _dir_identity(aside)
+            aside_fd = os.open(
+                aside, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
 
             # Only NOW re-read the status. The guard at the top of this
             # function ran BEFORE an agent call that takes minutes, and
@@ -1225,7 +1291,7 @@ def investigate(
                 # Anything the agent did not rewrite is carried into
                 # staging, so the swap does not silently drop files a
                 # previous investigation left behind.
-                _verify_aside(aside, aside_id)
+                _verify_aside(aside, aside_id, aside_fd)
                 _carry_forward(aside, staging)
 
                 # mkdtemp made staging 0700. Publishing it as-is would
@@ -1277,7 +1343,7 @@ def investigate(
                 #
                 # Raised inside the publish try on purpose — the rollback
                 # below then puts the previous proposal back over it.
-                if _dir_identity(proposal_dir) != staging_id:
+                if not _verify_landed(proposal_dir, staging_fd, staging_id):
                     # Take it away before raising. The rollback can only
                     # unlink a symlink or a plain file, so a non-empty
                     # DIRECTORY swapped in would make os.replace(aside,
@@ -1308,7 +1374,7 @@ def investigate(
             # nothing worth keeping: preserving the impostor and calling it
             # "the previous proposal" would be a false claim in a CRITICAL
             # log line.
-            if aside is not None and not _aside_is_ours(aside, aside_id):
+            if aside is not None and not _aside_is_ours(aside, aside_id, aside_fd):
                 aside = None
             if aside is not None:
                 try:
@@ -1401,11 +1467,12 @@ def investigate(
         # Drop the staging directory. Whatever the agent left there is
         # this run's work and either landed in the swap or is being
         # abandoned; either way the live proposal was never touched.
-        if wrapper_fd is not None:
-            try:
-                os.close(wrapper_fd)
-            except OSError:
-                pass
+        for held in (wrapper_fd, staging_fd, aside_fd):
+            if held is not None:
+                try:
+                    os.close(held)
+                except OSError:
+                    pass
         if staging_wrapper is not None:
             # rmtree has to unlink an entry IN the wrapper, which the
             # dropped write bit forbids — restore it or the scratch

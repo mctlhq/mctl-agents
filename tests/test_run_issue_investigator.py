@@ -2207,13 +2207,13 @@ def test_an_aside_swapped_for_a_symlink_is_not_carried_forward(tmp_path, monkeyp
 
     real_verify = run_issue_investigator._verify_aside
 
-    def _swap_the_aside(aside, expected):
+    def _swap_the_aside(aside, expected, fd):
         asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
         for a in asides:
             if a.is_dir() and not a.is_symlink():
                 shutil.rmtree(a)
                 a.symlink_to(outside)
-        return real_verify(aside, expected)
+        return real_verify(aside, expected, fd)
 
     monkeypatch.setattr(run_issue_investigator, "_verify_aside", _swap_the_aside)
     monkeypatch.setattr(
@@ -2316,3 +2316,63 @@ def test_carry_forward_does_not_read_through_a_swapped_source(tmp_path, monkeypa
     assert not (staging / "notes.md").exists() or (
         staging / "notes.md"
     ).read_text() != "not the proposal's content"
+
+
+def test_a_reused_inode_number_does_not_pass_as_the_staging_we_verified(
+    tmp_path, monkeypatch
+):
+    """(dev, ino) does not identify a directory across a delete.
+
+    Inode numbers are reusable: ext4 hands a just-freed number straight
+    back to the next create in the same group, so `rm -rf staging && ln -s
+    /elsewhere staging` can land an impostor carrying the very identity
+    the check was told to expect. APFS never reuses within a mount's
+    lifetime, which is why both post-rename tests passed on a macOS laptop
+    and failed on the Linux CI — the same kernel and filesystem the agent
+    container runs on. The held descriptor is what separates them: reuse
+    is possible only once our inode is unlinked, and an unlinked inode has
+    st_nlink == 0.
+
+    The reuse is forced here rather than waited for, so the guard is
+    exercised on either filesystem.
+    """
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+    st = os.lstat(staging)
+    expected = (st.st_dev, st.st_ino)
+    try:
+        shutil.rmtree(staging)
+        if run_issue_investigator._fd_still_linked(fd):
+            # APFS keeps st_nlink at 2 for a directory whose last name is
+            # gone, so the guard has nothing to read and this test would
+            # assert a property the platform does not provide. It is inert
+            # there rather than broken: APFS also never reuses an inode
+            # number, so the identity comparison alone already separates
+            # the impostor. Linux — the platform the agent container runs
+            # on, where reuse is real — reports 0 and is covered below.
+            pytest.skip("this filesystem does not report unlinked directories")
+
+        landed = tmp_path / "landed"
+        landed.mkdir()
+        real_lstat = run_issue_investigator.os.lstat
+
+        def _as_if_the_number_were_reused(path, *a, **kw):
+            result = real_lstat(path, *a, **kw)
+            if Path(path) == landed:
+                return os.stat_result(
+                    [result.st_mode, expected[1], expected[0], *tuple(result)[3:]]
+                )
+            return result
+
+        monkeypatch.setattr(
+            run_issue_investigator.os, "lstat", _as_if_the_number_were_reused
+        )
+        # Identity alone now says yes. The publish must still say no.
+        assert (
+            run_issue_investigator.os.lstat(landed).st_dev,
+            run_issue_investigator.os.lstat(landed).st_ino,
+        ) == expected
+        assert not run_issue_investigator._verify_landed(landed, fd, expected)
+    finally:
+        os.close(fd)
