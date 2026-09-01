@@ -247,6 +247,44 @@ def _entry_identity(dir_fd: int, name: str) -> tuple[int, int]:
     return (st.st_dev, st.st_ino)
 
 
+def _remove_rejected(path: Path) -> None:
+    """Delete something the publish check refused, whatever shape it is."""
+    try:
+        if path.is_symlink() or not path.is_dir():
+            path.unlink()
+        else:
+            shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _aside_is_ours(aside: Path, expected: tuple[int, int] | None) -> bool:
+    """Is ``aside`` still the proposal directory we moved there?"""
+    if expected is None:
+        return False
+    try:
+        return _dir_identity(aside) == expected and stat.S_ISDIR(
+            os.lstat(aside).st_mode
+        )
+    except OSError:
+        return False
+
+
+def _verify_aside(aside: Path, expected: tuple[int, int] | None) -> None:
+    """Raise unless ``aside`` is still the proposal directory we moved."""
+    if expected is None:
+        return
+    try:
+        actual = _dir_identity(aside)
+    except OSError as exc:
+        raise _StagingReplaced(f"the moved-aside proposal is gone: {exc}") from exc
+    if actual != expected or not stat.S_ISDIR(os.lstat(aside).st_mode):
+        raise _StagingReplaced(
+            "the moved-aside proposal was replaced — refusing to carry "
+            "whatever is there now into the new one"
+        )
+
+
 def _verify_staging_fd(dir_fd: int, expected: tuple[int, int]) -> None:
     """Raise unless the staging entry is still the directory we created."""
     try:
@@ -289,8 +327,13 @@ def _copy_mode_nofollow(src: Path, dst: Path) -> None:
     applied to the link's target instead. O_NOFOLLOW + fchmod removes the
     second resolution rather than narrowing the gap between them.
     """
+    # O_NONBLOCK as well: opening a FIFO O_RDONLY blocks until a writer
+    # appears, so a file replaced by a pipe between the copy and this call
+    # would hang the investigator for good. That is the same hang
+    # _carry_forward already refuses special files to avoid — reintroduced
+    # here through a different door, and caught in review (agy P2 on #247).
     try:
-        fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return
     try:
@@ -987,6 +1030,7 @@ def investigate(
     staging_wrapper: Path | None = None
     wrapper_fd: int | None = None
     aside: Path | None = None
+    aside_id: tuple[int, int] | None = None
     aside_root: Path | None = None
     # Set only when the previous proposal could not be put back, in which
     # case the scratch copy is the ONLY one left and cleanup must not run.
@@ -1136,6 +1180,11 @@ def investigate(
             # checkable locally: with `aside` still None, the rollback has
             # nothing to restore no matter who calls it.
             aside = moved
+            # Its identity too. _carry_forward reads THROUGH this path, so
+            # an aside swapped for a symlink would have the link's target
+            # enumerated and its files copied into the proposal we are
+            # about to publish (agy P1 on #247).
+            aside_id = _dir_identity(aside)
 
             # Only NOW re-read the status. The guard at the top of this
             # function ran BEFORE an agent call that takes minutes, and
@@ -1170,6 +1219,7 @@ def investigate(
                 # Anything the agent did not rewrite is carried into
                 # staging, so the swap does not silently drop files a
                 # previous investigation left behind.
+                _verify_aside(aside, aside_id)
                 _carry_forward(aside, staging)
 
                 # mkdtemp made staging 0700. Publishing it as-is would
@@ -1222,6 +1272,16 @@ def investigate(
                 # Raised inside the publish try on purpose — the rollback
                 # below then puts the previous proposal back over it.
                 if _dir_identity(proposal_dir) != staging_id:
+                    # Take it away before raising. The rollback can only
+                    # unlink a symlink or a plain file, so a non-empty
+                    # DIRECTORY swapped in would make os.replace(aside,
+                    # proposal_dir) fail on a non-empty target: the restore
+                    # would then fail, the previous proposal would be
+                    # stranded in scratch, and the attacker's directory
+                    # would stay live (agy P2 on #247). Whatever is here is
+                    # not what we verified and cannot be a real proposal —
+                    # the real one is in `aside`.
+                    _remove_rejected(proposal_dir)
                     raise _StagingReplaced(
                         "staging was replaced during the publish — the "
                         "proposal path does not hold what was verified"
@@ -1230,6 +1290,20 @@ def investigate(
                 _verify_staging(staging, staging_id)
                 os.replace(staging, proposal_dir)
         except BaseException as publish_error:
+            # Restore only what we actually moved. This rollback runs on
+            # every publish failure, including the one raised BECAUSE aside
+            # was swapped — and restoring blindly then put the attacker's
+            # symlink at the proposal path, which is precisely the outcome
+            # the check exists to prevent. Found by the test written for
+            # that check, not by the review that asked for it.
+            #
+            # A swapped aside also means the real proposal was destroyed
+            # before we got here, so there is nothing to put back and
+            # nothing worth keeping: preserving the impostor and calling it
+            # "the previous proposal" would be a false claim in a CRITICAL
+            # log line.
+            if aside is not None and not _aside_is_ours(aside, aside_id):
+                aside = None
             if aside is not None:
                 try:
                     # A publish that landed something and was then rejected

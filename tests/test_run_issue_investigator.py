@@ -2161,3 +2161,121 @@ def test_the_status_mode_is_applied_to_the_descriptor(tmp_path, monkeypatch):
     assert stat.S_IMODE(status_path.stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
     # And no probe file is left behind in the proposal.
     assert [q.name for q in proposal_dir.iterdir()] == [".status.yaml"]
+
+
+def test_a_fifo_planted_after_the_copy_does_not_hang_the_mode_transfer(tmp_path):
+    """Opening a FIFO O_RDONLY blocks until a writer appears. This is the
+    same hang carry-forward already refuses special files to avoid,
+    reintroduced through _copy_mode_nofollow's own open (agy P2 on #247)."""
+    source = tmp_path / "source.md"
+    source.write_text("x")
+
+    pipe = tmp_path / "pipe"
+    os.mkfifo(pipe)
+
+    import threading
+
+    done = threading.Event()
+
+    def _go():
+        run_issue_investigator._copy_mode_nofollow(source, pipe)
+        done.set()
+
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    t.join(10)
+    assert done.is_set(), "_copy_mode_nofollow blocked on a FIFO"
+
+
+def test_an_aside_swapped_for_a_symlink_is_not_carried_forward(tmp_path, monkeypatch):
+    """_carry_forward reads THROUGH the aside path, so a swap there would
+    enumerate the link's target and copy its files into the proposal about
+    to be published (agy P1 on #247)."""
+    outside = tmp_path / "outside-secrets"
+    outside.mkdir()
+    (outside / "passwd").write_text("root:x:0:0")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=59,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    real_verify = run_issue_investigator._verify_aside
+
+    def _swap_the_aside(aside, expected):
+        asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
+        for a in asides:
+            if a.is_dir() and not a.is_symlink():
+                shutil.rmtree(a)
+                a.symlink_to(outside)
+        return real_verify(aside, expected)
+
+    monkeypatch.setattr(run_issue_investigator, "_verify_aside", _swap_the_aside)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert "moved-aside" in second.error
+    assert not (first.proposal_dir / "passwd").exists()
+
+
+def test_a_directory_swapped_in_during_publish_is_removed_not_stranded(
+    tmp_path, monkeypatch
+):
+    """The rollback can only unlink a symlink or a plain file, so a non-empty
+    DIRECTORY swapped in made os.replace(aside, proposal_dir) fail on a
+    non-empty target: the restore failed and the previous proposal was
+    stranded in scratch (agy P2 on #247)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=60,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("the previous proposal")
+
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _swap_for_a_non_empty_directory(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        wrappers = [
+            w for w in (tmp_path / "mctl-telegram").glob(".staging-*") if w.is_dir()
+        ]
+        entry = wrappers[0] / "staging"
+        shutil.rmtree(entry)
+        entry.mkdir()
+        (entry / "attacker.txt").write_text("not the verified directory")
+        return None
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _swap_for_a_non_empty_directory
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    # The previous proposal is back where it belongs, not stranded.
+    assert first.proposal_dir.is_dir()
+    assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
+    assert not (first.proposal_dir / "attacker.txt").exists()
+    assert list((tmp_path / "mctl-telegram").glob(".aside-*")) == []
