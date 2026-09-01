@@ -1990,3 +1990,91 @@ def test_a_failed_move_into_the_wrapper_leaks_nothing(tmp_path, monkeypatch):
     assert result.error is not None
     # Neither the empty wrapper nor the real staging directory survives.
     assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []
+
+
+def test_a_swap_that_wins_the_publish_window_is_caught_after_the_rename(
+    tmp_path, monkeypatch
+):
+    """Unlocking the wrapper reopens it for the two syscalls before the move,
+    so a check beforehand can only say "it was fine a moment ago". Asking
+    what LANDED cannot be raced (agy P2 on #247)."""
+    attacker = tmp_path / "attacker-target"
+    attacker.mkdir()
+    (attacker / "loot.txt").write_text("elsewhere")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=56,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("the previous proposal")
+
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _win_the_window_portable(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        wrappers = [
+            w for w in (tmp_path / "mctl-telegram").glob(".staging-*") if w.is_dir()
+        ]
+        assert wrappers, "no wrapper to attack"
+        entry = wrappers[0] / "staging"
+        shutil.rmtree(entry)
+        entry.symlink_to(attacker)
+        return None
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _win_the_window_portable
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert "replaced during the publish" in second.error
+    # The rollback put the previous proposal back over the attacker's entry.
+    assert first.proposal_dir.is_dir() and not first.proposal_dir.is_symlink()
+    assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
+    assert (attacker / "loot.txt").read_text() == "elsewhere"
+
+
+def test_the_status_mode_is_read_once_and_not_re_resolved(tmp_path, monkeypatch):
+    """Checking with lstat and then calling copymode re-resolves the path,
+    and copymode follows symlinks — so a swap between the two still leaked
+    the target's mode (agy P3 on #247, twice)."""
+    elsewhere = tmp_path / "sensitive"
+    elsewhere.write_text("x")
+    os.chmod(elsewhere, stat.S_IRUSR)
+
+    proposal_dir = tmp_path / "proposals" / "issue-57-x"
+    proposal_dir.mkdir(parents=True)
+    real_status = proposal_dir / ".status.yaml"
+    real_status.write_text("status: proposed\n")
+    os.chmod(real_status, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+
+    real_lstat = run_issue_investigator.os.lstat
+    swapped = []
+
+    def _swap_after_the_stat(path, *a, **kw):
+        result = real_lstat(path, *a, **kw)
+        if str(path).endswith(".status.yaml") and not swapped:
+            swapped.append(True)
+            real_status.unlink()
+            real_status.symlink_to(elsewhere)
+        return result
+
+    monkeypatch.setattr(run_issue_investigator.os, "lstat", _swap_after_the_stat)
+    status_path = write_status_yaml(proposal_dir, _issue(number=57))
+    monkeypatch.setattr(run_issue_investigator.os, "lstat", real_lstat)
+
+    # The mode came from the stat already taken, not from a second lookup
+    # that would have followed the planted link.
+    assert stat.S_IMODE(status_path.stat().st_mode) != stat.S_IRUSR

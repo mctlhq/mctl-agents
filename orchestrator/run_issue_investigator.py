@@ -583,13 +583,19 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
         # STAGING, so the directory in question is the 0700 scratch dir
         # whose permissions are exactly what we are trying not to inherit.
         # Deriving from it reproduced 0600 and the test caught it.
-        # _is_plain_file, not exists(): exists() follows symlinks, so a
-        # .status.yaml planted as a link to /etc/shadow would have THAT
-        # file's mode copied onto the published status file and committed
-        # to gitops — a small but free disclosure of a system file's
-        # permissions (agy P3 on #247).
-        if _is_plain_file(status_path):
-            shutil.copymode(status_path, tmp_path)
+        # ONE lstat, and the mode comes from that same result. Checking
+        # with lstat and then calling shutil.copymode re-resolved the path,
+        # and copymode follows symlinks — so a .status.yaml swapped for a
+        # link to /etc/shadow between the two calls still had that file's
+        # mode copied onto the published status file and committed to
+        # gitops. Not a narrower window: no window, because nothing is
+        # resolved twice (agy P3 on #247, twice).
+        try:
+            existing = os.lstat(status_path)
+        except OSError:
+            existing = None
+        if existing is not None and stat.S_ISREG(existing.st_mode):
+            os.chmod(tmp_path, stat.S_IMODE(existing.st_mode))
         else:
             # Discovered by creating a file and looking at it, NOT by
             # os.umask(0) + restore. That idiom reads the umask by briefly
@@ -1163,12 +1169,39 @@ def investigate(
                 os.fchmod(wrapper_fd, stat.S_IRWXU)
                 _verify_staging_fd(wrapper_fd, staging_id)
                 os.replace(STAGING_ENTRY, proposal_dir, src_dir_fd=wrapper_fd)
+                # And again AFTER the rename, which is the check that
+                # actually decides. Unlocking the wrapper reopens it to a
+                # background process for the two syscalls before the move,
+                # so a check beforehand can only ever say "it was fine a
+                # moment ago". Asking what LANDED cannot be raced: if a
+                # swap won that window, proposal_dir is now the attacker's
+                # entry and its identity says so (agy P2 on #247).
+                #
+                # Raised inside the publish try on purpose — the rollback
+                # below then puts the previous proposal back over it.
+                if _dir_identity(proposal_dir) != staging_id:
+                    raise _StagingReplaced(
+                        "staging was replaced during the publish — the "
+                        "proposal path does not hold what was verified"
+                    )
             else:
                 _verify_staging(staging, staging_id)
                 os.replace(staging, proposal_dir)
         except BaseException as publish_error:
             if aside is not None:
                 try:
+                    # A publish that landed something and was then rejected
+                    # leaves that something in the way, and os.replace
+                    # cannot put a directory over a symlink or a file
+                    # (ENOTDIR) — the restore failed and the proposal was
+                    # stranded in scratch while the attacker's entry stayed
+                    # live. Neither shape can be a real proposal, so clear
+                    # it; a directory is never removed here, because that
+                    # could be one.
+                    if proposal_dir.is_symlink() or (
+                        proposal_dir.exists() and not proposal_dir.is_dir()
+                    ):
+                        proposal_dir.unlink()
                     os.replace(aside, proposal_dir)
                     aside = None
                 except BaseException as restore_error:  # noqa: BLE001 — see below
