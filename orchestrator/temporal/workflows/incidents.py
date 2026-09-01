@@ -103,12 +103,27 @@ class IncidentLoopWorkflow:
             # it as the container image, so this needs no change in the
             # sibling repos — checked, rather than assumed, before
             # writing it.
-            release = await workflow.execute_activity(
-                resolve_agent_release,
-                args=[RESPONDER_AGENT, ENVIRONMENT],
-                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
-            )
+            try:
+                release = await workflow.execute_activity(
+                    resolve_agent_release,
+                    args=[RESPONDER_AGENT, ENVIRONMENT],
+                    start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                    retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+                )
+            except ActivityError:
+                # An mctl-api outage is a lookup failure, not an incident
+                # response failure. Letting it propagate would abandon the
+                # tick before submit_and_wait — the exact fail-closed
+                # behaviour the branch below exists to avoid, arrived at
+                # through the registry being down rather than empty
+                # (codex P2 + agy P2 on #254).
+                workflow.logger.warning(
+                    "registry lookup for %s failed after retries — falling back to the "
+                    "CWFT's baked-in default image for this tick",
+                    RESPONDER_AGENT,
+                )
+                release = None
+
             if release and release.image_ref:
                 params["agent_image"] = release.image_ref
                 params["agent_version"] = f"{RESPONDER_AGENT}@{release.version}"

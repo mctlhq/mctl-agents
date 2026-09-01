@@ -59,6 +59,18 @@ def _capturing_resolve(release: ResolvedRelease | None):
     return fake_resolve, seen
 
 
+def _failing_resolve():
+    """Stand in for the registry being DOWN, as opposed to empty."""
+    attempts: list[tuple[str, str]] = []
+
+    @activity.defn(name="resolve_agent_release")
+    async def fake_resolve(agent: str, environment: str) -> ResolvedRelease | None:
+        attempts.append((agent, environment))
+        raise RuntimeError("mctl-api is down")
+
+    return fake_resolve, attempts
+
+
 def _capturing_record(fail: bool = False):
     seen: list[ExecutionRecord] = []
 
@@ -160,6 +172,27 @@ class TestIncidentLoopWorkflow:
         assert "agent_image" not in seen[0].params
         assert recorded[0].version == ""
         assert recorded[0].image_ref == ""
+
+    async def test_a_registry_outage_does_not_skip_the_tick(self, env):
+        """The registry being DOWN must fail open, like it being empty.
+
+        Without the guard the resolve activity's ActivityError propagates
+        out of the workflow and the tick ends before submit_and_wait ever
+        runs — an mctl-api blip silently costing an hour of incident
+        response, which is the exact trade the unpinned branch above was
+        written to avoid (codex P2 + agy P2 on #254).
+        """
+        fake_submit, seen = _capturing_submit()
+        fake_resolve, attempts = _failing_resolve()
+        fake_record, recorded = _capturing_record()
+
+        result = await _run(env, fake_submit, fake_resolve, fake_record)
+
+        assert len(attempts) > 1, "the lookup should be retried before giving up"
+        assert result.responder_result.succeeded is True
+        assert "agent_image" not in seen[0].params
+        # The tick still leaves a trace, with the missing pin visible on it.
+        assert [r.version for r in recorded] == [""]
 
     async def test_the_run_is_traceable_to_its_argo_workflow(self, env):
         """#149's acceptance criterion: Temporal workflow ID -> Argo name.
