@@ -49,6 +49,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -209,6 +210,41 @@ def _staging_dir(proposal_dir: Path) -> Path:
     service_dir = proposal_dir.parent.parent
     service_dir.mkdir(parents=True, exist_ok=True)
     return Path(tempfile.mkdtemp(dir=service_dir, prefix=".staging-"))
+
+
+def _dir_identity(path: Path) -> tuple[int, int]:
+    """(device, inode) of ``path`` itself — lstat, so a symlink is not followed.
+
+    Identity rather than existence: the agent runs with Bash and writes
+    into staging, so it can `rm -rf` the directory and put a symlink to
+    somewhere else in its place. Every later check that looks INSIDE
+    staging still passes — `staging / "design.md"` is a perfectly ordinary
+    regular file, just not where staging was — and the publish then
+    renames the LINK into the proposal path, so the live proposal points
+    outside agents-state and everything downstream reads and rewrites
+    unrelated files (codex P1 on #247).
+    """
+    st = os.lstat(path)
+    return (st.st_dev, st.st_ino)
+
+
+def _verify_staging(staging: Path, expected: tuple[int, int]) -> None:
+    """Raise unless ``staging`` is still the directory we created."""
+    try:
+        actual = _dir_identity(staging)
+    except OSError as exc:
+        raise _StagingReplaced(f"staging directory is gone: {exc}") from exc
+    if actual != expected:
+        raise _StagingReplaced(
+            "staging directory was replaced while the agent was running — "
+            "refusing to publish whatever is there now"
+        )
+    if not stat.S_ISDIR(os.lstat(staging).st_mode):
+        raise _StagingReplaced("staging path is no longer a directory")
+
+
+class _StagingReplaced(RuntimeError):
+    """The agent replaced its own output directory. Never publish that."""
 
 
 def _is_plain_file(path: Path) -> bool:
@@ -843,10 +879,17 @@ def investigate(
         #    off disk first and put them back on failure; every round of
         #    review found another way for that inverse to be wrong.
         staging = _staging_dir(proposal_dir)
+        # Remembered before the agent can touch it; checked after.
+        staging_id = _dir_identity(staging)
 
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.
         prompt = _build_prompt(issue, service, slug)
         anyio.run(_run_agent, clone / "repo", prompt, staging.resolve())
+
+        # 4a. Before looking INSIDE staging, check staging itself is still
+        #     the directory we made. Every check below reads through the
+        #     path, so a swapped-in symlink satisfies all of them.
+        _verify_staging(staging, staging_id)
 
         # 4. Verify the agent produced the triplet. Staging is empty at the
         #    start of every run, so existence here proves THIS run wrote it
@@ -961,10 +1004,22 @@ def investigate(
                 # per filename, which is what the special case for
                 # .status.yaml turned into as soon as codex pointed out
                 # that requirements/design/tasks have the same problem.
+                # Mode only, not owner or group. copymode is not an
+                # oversight here: chown needs CAP_CHOWN or a matching uid,
+                # and this runs unprivileged as uid 1000 in a pod whose
+                # gitops checkout is entirely owned by that user — so the
+                # call would fail on the case it is supposed to fix and do
+                # nothing on every other one. If the checkout ever becomes
+                # group-shared, the fix belongs in the CWFT that creates
+                # it, not in a chown attempt here (codex P2 on #247).
                 shutil.copymode(aside, staging)
             else:
                 shutil.copymode(proposal_dir.parent, staging)
 
+            # Again, immediately before the rename that publishes it: the
+            # steps between here and the check above write through this
+            # path too, and this is the one that makes the result live.
+            _verify_staging(staging, staging_id)
             os.replace(staging, proposal_dir)
         except BaseException as publish_error:
             if aside is not None:
@@ -1018,6 +1073,8 @@ def investigate(
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         return InvestigateResult(service, slug, proposal_dir, error=msg)
+    except _StagingReplaced as e:
+        return InvestigateResult(service, slug, proposal_dir, error=str(e))
     except _ProposalAdvanced as e:
         # The rollback already put the proposal back; this is an ordinary
         # refusal, not a crash.

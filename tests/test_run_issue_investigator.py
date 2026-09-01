@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import stat
 import subprocess
 import types
@@ -1644,3 +1645,121 @@ def test_a_genuinely_absent_document_still_reads_as_absent(tmp_path, monkeypatch
     assert result.error is not None
     assert "agent did not write: design.md" in result.error
     assert "not a regular file" not in result.error
+
+
+def test_an_agent_that_replaces_its_staging_directory_publishes_nothing(
+    tmp_path, monkeypatch
+):
+    """The agent has Bash and writes into staging, so it can remove the
+    directory and put a symlink to somewhere else in its place. Every check
+    that looks INSIDE staging still passes — the triplet members are
+    perfectly ordinary regular files, just not where staging was — and the
+    publish then renames the LINK into the proposal path, leaving the live
+    proposal pointing outside agents-state (codex P1 on #247)."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("not part of any proposal")
+
+    def _agent_swaps_its_own_directory(repo_dir, prompt, staging):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (outside / name).write_text(f"v1 {name}")
+        shutil.rmtree(staging)
+        staging.symlink_to(outside)
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=46, agent=_agent_swaps_its_own_directory
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "staging" in result.error
+    # Nothing was published, and the directory it pointed at is untouched.
+    assert not result.proposal_dir.exists()
+    # And nothing was WRITTEN through the link either. This is what the
+    # early check uniquely buys: without it write_status_yaml runs before
+    # publication and drops a .status.yaml into the attacker's directory,
+    # which the pre-publish check is too late to prevent.
+    assert sorted(q.name for q in outside.iterdir()) == [
+        "design.md", "requirements.md", "secret.txt", "tasks.md",
+    ]
+
+
+def test_a_staging_directory_deleted_by_the_agent_publishes_nothing(
+    tmp_path, monkeypatch
+):
+    """The same check has to survive the simpler sabotage."""
+    def _agent_deletes_its_own_directory(repo_dir, prompt, staging):
+        shutil.rmtree(staging)
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=47, agent=_agent_deletes_its_own_directory
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert not result.proposal_dir.exists()
+
+
+def test_a_live_proposal_survives_an_agent_that_swaps_staging(tmp_path, monkeypatch):
+    """The refusal must not cost the proposal that was already there."""
+    outside = tmp_path / "outside2"
+    outside.mkdir()
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (outside / name).write_text(f"attacker {name}")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=48,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    def _agent_swaps(repo_dir, prompt, staging):
+        shutil.rmtree(staging)
+        staging.symlink_to(outside)
+
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", _agent_swaps)
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert (first.proposal_dir / "design.md").read_text() == "v1 design.md"
+
+
+def test_staging_swapped_after_validation_is_still_refused(tmp_path, monkeypatch):
+    """The agent can leave something running, so passing validation is not
+    a promise that staging is still staging when the rename happens. This
+    isolates the pre-publish check: the swap lands after the triplet has
+    already been verified."""
+    outside = tmp_path / "outside3"
+    outside.mkdir()
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (outside / name).write_text(f"attacker {name}")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=49,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+
+    real_write = run_issue_investigator.write_status_yaml
+
+    def _swap_during_status_write(proposal_dir, issue_data):
+        out = real_write(proposal_dir, issue_data)
+        # Runs after validation, before the swap.
+        shutil.rmtree(proposal_dir)
+        proposal_dir.symlink_to(outside)
+        return out
+
+    monkeypatch.setattr(
+        run_issue_investigator, "write_status_yaml", _swap_during_status_write
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "staging" in result.error
+    assert not result.proposal_dir.exists()
