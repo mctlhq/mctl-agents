@@ -228,8 +228,41 @@ def _dir_identity(path: Path) -> tuple[int, int]:
     return (st.st_dev, st.st_ino)
 
 
+# The name staging holds inside its wrapper. Constant, because it is
+# resolved relative to a directory fd and never joined into a path.
+STAGING_ENTRY = "staging"
+
+
+def _entry_identity(dir_fd: int, name: str) -> tuple[int, int]:
+    """(device, inode) of ``name`` INSIDE ``dir_fd``, not following links.
+
+    fstatat, so nothing about the wrapper's own path is consulted: the fd
+    names an inode, and an attacker who replaces the wrapper's path with a
+    symlink changes nothing about what this reads.
+    """
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        raise _StagingReplaced(f"{name} is no longer a directory")
+    return (st.st_dev, st.st_ino)
+
+
+def _verify_staging_fd(dir_fd: int, expected: tuple[int, int]) -> None:
+    """Raise unless the staging entry is still the directory we created."""
+    try:
+        actual = _entry_identity(dir_fd, STAGING_ENTRY)
+    except FileNotFoundError as exc:
+        raise _StagingReplaced("staging directory is gone") from exc
+    except OSError as exc:
+        raise _StagingReplaced(f"staging directory is unreadable: {exc}") from exc
+    if actual != expected:
+        raise _StagingReplaced(
+            "staging directory was replaced while the agent was running — "
+            "refusing to publish whatever is there now"
+        )
+
+
 def _verify_staging(staging: Path, expected: tuple[int, int]) -> None:
-    """Raise unless ``staging`` is still the directory we created."""
+    """Path-based identity check, for the window before the wrapper exists."""
     try:
         actual = _dir_identity(staging)
     except OSError as exc:
@@ -892,6 +925,7 @@ def investigate(
     clone = None
     staging = None
     staging_wrapper: Path | None = None
+    wrapper_fd: int | None = None
     aside: Path | None = None
     aside_root: Path | None = None
     # Set only when the previous proposal could not be put back, in which
@@ -951,7 +985,19 @@ def investigate(
         os.replace(staging, secure)
         os.chmod(staging_wrapper, stat.S_IRUSR | stat.S_IXUSR)
         staging = secure
-        staging_id = _dir_identity(staging)
+
+        #     And hold a DESCRIPTOR on the wrapper, opened O_NOFOLLOW. From
+        #     here on the wrapper is addressed by that fd rather than by its
+        #     path, so swapping the .staging-* path for a symlink no longer
+        #     changes what we operate on — the fd names the inode. Both the
+        #     identity check and the publishing rename go through it
+        #     (fstatat and renameat), which takes path resolution out of the
+        #     attacker's reach entirely rather than re-checking after it
+        #     (codex P1 on #247, twice).
+        wrapper_fd = os.open(
+            staging_wrapper, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        staging_id = _entry_identity(wrapper_fd, STAGING_ENTRY)
 
         # 4. Verify the agent produced the triplet. Staging is empty at the
         #    start of every run, so existence here proves THIS run wrote it
@@ -1083,10 +1129,18 @@ def investigate(
             # identity check follows it rather than preceding it — checking
             # first and then unlocking would put the window on the wrong
             # side of the check.
-            if staging_wrapper is not None:
-                os.chmod(staging_wrapper, stat.S_IRWXU)
-            _verify_staging(staging, staging_id)
-            os.replace(staging, proposal_dir)
+            # Renaming the entry OUT of the wrapper needs the wrapper
+            # writable again, so it is reopened as late as possible and the
+            # check follows the unlock rather than preceding it. Both the
+            # check and the rename address the entry through wrapper_fd, so
+            # neither resolves the wrapper's path.
+            if wrapper_fd is not None:
+                os.fchmod(wrapper_fd, stat.S_IRWXU)
+                _verify_staging_fd(wrapper_fd, staging_id)
+                os.replace(STAGING_ENTRY, proposal_dir, src_dir_fd=wrapper_fd)
+            else:
+                _verify_staging(staging, staging_id)
+                os.replace(staging, proposal_dir)
         except BaseException as publish_error:
             if aside is not None:
                 try:
@@ -1167,6 +1221,11 @@ def investigate(
         # Drop the staging directory. Whatever the agent left there is
         # this run's work and either landed in the swap or is being
         # abandoned; either way the live proposal was never touched.
+        if wrapper_fd is not None:
+            try:
+                os.close(wrapper_fd)
+            except OSError:
+                pass
         if staging_wrapper is not None:
             # rmtree has to unlink an entry IN the wrapper, which the
             # dropped write bit forbids — restore it or the scratch

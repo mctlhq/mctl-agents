@@ -813,11 +813,11 @@ def test_a_failed_publish_puts_the_original_proposal_back(tmp_path, monkeypatch)
     # test nothing.
     failed = []
 
-    def failing_second_rename(src, dst):
+    def failing_second_rename(src, dst, **kw):
         if Path(dst) == first.proposal_dir and not failed:
             failed.append(True)
             raise OSError("disk full")
-        return real_replace(src, dst)
+        return real_replace(src, dst, **kw)
 
     monkeypatch.setattr(run_issue_investigator.os, "replace", failing_second_rename)
     second = investigate(issue.ref.url, state_dir=tmp_path)
@@ -878,10 +878,10 @@ def test_a_failed_aside_rename_leaks_no_scratch_directory(tmp_path, monkeypatch)
 
     real_replace = run_issue_investigator.os.replace
 
-    def failing_aside(src, dst):
+    def failing_aside(src, dst, **kw):
         if Path(src) == first.proposal_dir:
             raise OSError("device busy")
-        return real_replace(src, dst)
+        return real_replace(src, dst, **kw)
 
     monkeypatch.setattr(run_issue_investigator.os, "replace", failing_aside)
     second = investigate(issue.ref.url, state_dir=tmp_path)
@@ -932,11 +932,11 @@ def test_a_failed_restore_is_not_swallowed_as_an_ordinary_result(tmp_path, monke
     real_replace = run_issue_investigator.os.replace
     calls = []
 
-    def both_renames_fail(src, dst):
+    def both_renames_fail(src, dst, **kw):
         if Path(dst) == first.proposal_dir:
             calls.append(dst)
             raise OSError("publish failed" if len(calls) == 1 else "read-only fs")
-        return real_replace(src, dst)
+        return real_replace(src, dst, **kw)
 
     monkeypatch.setattr(run_issue_investigator.os, "replace", both_renames_fail)
     with pytest.raises(run_issue_investigator.ProposalRestoreFailed) as caught:
@@ -979,11 +979,11 @@ def test_a_failed_restore_survives_a_base_exception_too(tmp_path, monkeypatch):
     real_replace = run_issue_investigator.os.replace
     calls = []
 
-    def both_renames_fail(src, dst):
+    def both_renames_fail(src, dst, **kw):
         if Path(dst) == first.proposal_dir:
             calls.append(dst)
             raise KeyboardInterrupt() if len(calls) == 1 else OSError("read-only fs")
-        return real_replace(src, dst)
+        return real_replace(src, dst, **kw)
 
     monkeypatch.setattr(run_issue_investigator.os, "replace", both_renames_fail)
     with pytest.raises(run_issue_investigator.ProposalRestoreFailed):
@@ -1268,9 +1268,9 @@ def test_the_approval_check_reads_the_proposal_after_it_is_renamed_aside(
     real_replace = run_issue_investigator.os.replace
     real_load = run_issue_investigator._load_status
 
-    def _spy_replace(src, dst):
+    def _spy_replace(src, dst, **kw):
         events.append(f"rename:{pathlib.Path(src).name}")
-        return real_replace(src, dst)
+        return real_replace(src, dst, **kw)
 
     def _spy_load(path):
         if pathlib.Path(path).name == ".status.yaml":
@@ -1906,3 +1906,50 @@ def test_the_issue_url_cannot_be_read_as_a_gh_flag(tmp_path, monkeypatch):
     cmd = captured["cmd"]
     assert "--" in cmd, "no argument separator before the URL"
     assert cmd.index("--") < cmd.index("--template=evil")
+
+
+def test_swapping_the_wrapper_path_cannot_redirect_the_publish(tmp_path, monkeypatch):
+    """The publish addresses the entry through a directory descriptor.
+
+    An attacker who replaces the wrapper's PATH with a symlink changes
+    nothing: the fd names the inode, so fstatat and renameat operate on the
+    real wrapper regardless of what the path now resolves to. Checking and
+    then renaming by path could never be atomic — this takes path
+    resolution out of the race instead of re-checking after it (codex P1 on
+    #247, twice).
+    """
+    victim = tmp_path / "victim-wrapper"
+    victim.mkdir()
+    (victim / "staging").mkdir()
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (victim / "staging" / name).write_text(f"attacker {name}")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=54,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _swap_the_wrapper_path(dir_fd, expected):
+        result = real_verify(dir_fd, expected)
+        # The last instant before the rename: replace the wrapper's path.
+        wrappers = list((tmp_path / "mctl-telegram").glob(".staging-*"))
+        for w in wrappers:
+            if w.is_dir() and not w.is_symlink():
+                os.rename(w, w.with_name(w.name + "-moved"))
+                w.symlink_to(victim)
+        return result
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _swap_the_wrapper_path
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is None
+    # The agent's own output was published, not the attacker's.
+    assert (result.proposal_dir / "design.md").read_text() == "v1 design.md"
+    assert (victim / "staging").is_dir(), "the decoy was consumed"
