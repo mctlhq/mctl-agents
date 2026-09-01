@@ -49,6 +49,7 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -193,6 +194,9 @@ def build_slug(issue_number: int, title: str) -> str:
 
 
 TRIPLET = ("requirements.md", "design.md", "tasks.md")
+
+# The file every other component reads to decide what to do with a proposal.
+STATUS_FILENAME = ".status.yaml"
 
 
 def _staging_dir(proposal_dir: Path) -> Path:
@@ -348,7 +352,11 @@ def _landed_triplet_defects(staging_fd: int | None) -> list[str]:
     if staging_fd is None:
         return []
     defects = []
-    for name in TRIPLET:
+    # .status.yaml as well as the documents. It was left out of the first
+    # version of this check, and it is the file with the most authority in
+    # the directory: every other component reads it, so a link published in
+    # its place is followed by all of them (agy P1 on #247).
+    for name in (*TRIPLET, STATUS_FILENAME):
         try:
             st = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
         except OSError:
@@ -356,6 +364,31 @@ def _landed_triplet_defects(staging_fd: int | None) -> list[str]:
             continue
         if not stat.S_ISREG(st.st_mode):
             defects.append(f"{name} is no longer a regular file")
+    if not defects:
+        # And its CONTENT, not merely its type. The orchestrator writes
+        # `proposed` into staging and then spends the carry-forward walk
+        # and two renames not looking at it, while the agent's uid can
+        # still write there: overwriting it with `accepted` hands the agent
+        # the human approval this whole state machine exists to require,
+        # and the implementer — another pod, other credentials — acts on
+        # it. That crosses the boundary, unlike the redirect-our-own-writes
+        # findings this file is full of, so it is checked on the published
+        # copy through the same descriptor (agy P1 on #247).
+        try:
+            with open(  # the path is resolved by the verified dir_fd
+                os.open(STATUS_FILENAME, os.O_RDONLY | os.O_NOFOLLOW,
+                        dir_fd=staging_fd),
+                encoding="utf-8",
+            ) as f:
+                published = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            defects.append(f"{STATUS_FILENAME} could not be read back: {exc}")
+        else:
+            if published.get("status") != "proposed":
+                defects.append(
+                    f"{STATUS_FILENAME} says status="
+                    f"{published.get('status')!r}, not 'proposed'"
+                )
     return defects
 
 
@@ -725,7 +758,17 @@ def _status_mode(status_path: Path, proposal_dir: Path) -> int:
             return stat.S_IMODE(existing.st_mode)
     except OSError:
         pass
-    probe = proposal_dir / f".mode-probe-{os.getpid()}"
+    # A random name, not f".mode-probe-{os.getpid()}": pids are guessable
+    # and there are only ~32k of them, so pre-creating the set made every
+    # publish die on O_EXCL. Worth fixing even without an adversary — a
+    # probe left behind by a crashed run whose pid comes round again does
+    # the same thing (agy P3 on #247).
+    #
+    # NOT tempfile.mkstemp, which is what the finding proposed: it creates
+    # at 0600, and this probe exists precisely to observe the mode an
+    # ordinary open() produces. Using it published .status.yaml private,
+    # which the test for that caught.
+    probe = proposal_dir / f".mode-probe-{secrets.token_hex(8)}"
     fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
         return stat.S_IMODE(os.fstat(fd).st_mode)
@@ -1289,48 +1332,53 @@ def investigate(
             # checkable locally: with `aside` still None, the rollback has
             # nothing to restore no matter who calls it.
             aside = moved
-            # Its identity too. _carry_forward reads THROUGH this path, so
-            # an aside swapped for a symlink would have the link's target
-            # enumerated and its files copied into the proposal we are
-            # about to publish (agy P1 on #247).
-            aside_id = _dir_identity(aside)
-            aside_fd = os.open(
-                aside, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            )
-            # Drop the write bit on the wrapper, the same lock staging's
-            # wrapper carries: renaming `proposal` out of it now needs a
-            # chmod first, so a swap is no longer a single rename (agy P2
-            # on #247). Not a barrier against this adversary — same uid,
-            # it can chmod back — but the two wrappers should not differ
-            # for no reason, and the restore below re-opens it explicitly.
-            os.chmod(aside_root, stat.S_IRUSR | stat.S_IXUSR)
-
-            # Only NOW re-read the status. The guard at the top of this
-            # function ran BEFORE an agent call that takes minutes, and
-            # approval is a human action that can land inside that window:
-            # the flip to `accepted` is exactly what someone does while
-            # reading the proposal. Swapping a freshly-generated `proposed`
-            # over it would silently revoke a human approval and strand the
-            # implementer, which no later step could detect.
-            #
-            # Reading it before the rename only narrowed that window, it did
-            # not close it — the carry-forward walk sits between the check
-            # and the swap, and an approval landing there was still lost
-            # (agy P2 on #247, second round). Checking the renamed-aside
-            # copy makes the answer authoritative instead of merely fresh:
-            # the proposal is no longer at the path an approver writes to,
-            # so nothing can change it between this read and the swap.
-        # EVERYTHING after that first rename runs under the rollback, not
-        # just the swap. The status read and the carry-forward walk can
-        # both fail — an unreadable supplemental file, a full filesystem —
-        # and while they sat outside this block the exception went
-        # straight to `finally`, which deleted aside_root because
-        # keep_aside was still false: the previous proposal destroyed and
-        # its live path left empty (codex P2 on #247). The rule is the
-        # rename, not the swap: once the proposal is aside, no path out of
-        # here may leave it there.
+        # EVERYTHING after that rename runs under the rollback — including
+        # reading the aside's identity, opening its descriptor and locking
+        # its wrapper. Those three sat outside this block while the comment
+        # below already claimed otherwise, so a transient OSError on any of
+        # them skipped the restore and went straight to `finally`, which
+        # deleted aside_root because keep_aside was still false: the
+        # previously-good proposal destroyed and its live path left empty.
+        # Raised as P2 by codex on cf88c9c and by claude twice; the earlier
+        # rounds moved the status read and the carry-forward in and left
+        # these three behind. The rule is the rename, not the swap: once
+        # the proposal is aside, no path out of here may leave it there.
         try:
             if aside is not None:
+                # Its identity. _carry_forward reads THROUGH this path, so
+                # an aside swapped for a symlink would have the link's
+                # target enumerated and its files copied into the proposal
+                # we are about to publish (agy P1 on #247).
+                aside_id = _dir_identity(aside)
+                aside_fd = os.open(
+                    aside, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+                # Drop the write bit on the wrapper, the same lock
+                # staging's wrapper carries: renaming `proposal` out of it
+                # now needs a chmod first, so a swap is no longer a single
+                # rename (agy P2 on #247). Not a barrier against this
+                # adversary — same uid, it can chmod back — but the two
+                # wrappers should not differ for no reason, and both the
+                # restore and the cleanup re-open it explicitly.
+                os.chmod(aside.parent, stat.S_IRUSR | stat.S_IXUSR)
+
+                # Only NOW re-read the status. The guard at the top of this
+                # function ran BEFORE an agent call that takes minutes, and
+                # approval is a human action that can land inside that
+                # window: the flip to `accepted` is exactly what someone
+                # does while reading the proposal. Swapping a
+                # freshly-generated `proposed` over it would silently
+                # revoke a human approval and strand the implementer,
+                # which no later step could detect.
+                #
+                # Reading it before the rename only narrowed that window,
+                # it did not close it — the carry-forward walk sits between
+                # the check and the swap, and an approval landing there was
+                # still lost (agy P2 on #247, second round). Checking the
+                # renamed-aside copy makes the answer authoritative instead
+                # of merely fresh: the proposal is no longer at the path an
+                # approver writes to, so nothing can change it between this
+                # read and the swap.
                 live_status = _load_status(aside / ".status.yaml").get("status")
                 if live_status and live_status not in _OVERWRITABLE_STATUSES:
                     raise _ProposalAdvanced(live_status)
@@ -1449,8 +1497,21 @@ def investigate(
             if aside_root is not None:
                 with contextlib.suppress(OSError):
                     os.chmod(aside_root, stat.S_IRWXU)
-            if aside is not None and not _aside_is_ours(aside, aside_id, aside_fd):
-                aside = None
+            if aside is not None:
+                if aside_id is None:
+                    # The identity was never recorded, because the failure
+                    # landed between the rename and the read. Refusing to
+                    # restore here destroys the proposal with certainty,
+                    # while the swap it guards against would have to be won
+                    # inside those few instructions — so the shape is
+                    # checked instead of the identity, and the restore goes
+                    # ahead. Treating "unproven" as "not ours" is what left
+                    # the live path empty in the test written for this.
+                    ours = aside.is_dir() and not aside.is_symlink()
+                else:
+                    ours = _aside_is_ours(aside, aside_id, aside_fd)
+                if not ours:
+                    aside = None
             if aside is not None:
                 try:
                     # A publish that landed something and was then rejected

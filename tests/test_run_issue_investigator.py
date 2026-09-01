@@ -2495,3 +2495,117 @@ def test_a_wrapper_swapped_before_cleanup_is_not_deleted(tmp_path, monkeypatch):
     investigate(issue.ref.url, state_dir=tmp_path)
 
     assert (_BYSTANDER / "keep.txt").read_text() == "not ours"
+
+
+def test_a_failure_right_after_the_rename_aside_restores_the_proposal(
+    tmp_path, monkeypatch
+):
+    """Reading the aside's identity, opening its descriptor and locking its
+    wrapper all sit after the proposal has been moved out of its live path.
+    A transient OSError on any of them once skipped the restore and reached
+    `finally`, which deleted the wrapper: the previously-good proposal
+    destroyed and its live path left empty (codex P2 on cf88c9c, claude
+    twice)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=63,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+    (first.proposal_dir / "notes.md").write_text("the previous proposal")
+
+    real_identity = run_issue_investigator._dir_identity
+
+    def _fail_on_the_aside(path):
+        if path.parent.name.startswith(".aside-"):
+            raise OSError(5, "transient")
+        return real_identity(path)
+
+    monkeypatch.setattr(run_issue_investigator, "_dir_identity", _fail_on_the_aside)
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    # The proposal is back where it belongs, with its content intact.
+    assert first.proposal_dir.is_dir()
+    assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
+    assert (first.proposal_dir / "design.md").read_text() == "v1 design.md"
+
+
+def test_an_agent_cannot_approve_its_own_proposal_before_the_publish(
+    tmp_path, monkeypatch
+):
+    """The orchestrator writes `proposed` into staging and then spends the
+    carry-forward walk and two renames not looking at it, while the agent's
+    uid can still write there. Overwriting it with `accepted` hands the
+    agent the approval the state machine exists to require, and the
+    implementer — another pod, other credentials — acts on it. Unlike the
+    redirect-our-own-writes findings, this one crosses the boundary (agy P1
+    on #247)."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=64,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _self_approve(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        fd = os.open("staging/.status.yaml", os.O_WRONLY | os.O_TRUNC, dir_fd=dir_fd)
+        with os.fdopen(fd, "w") as f:
+            f.write("status: accepted\n")
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _self_approve
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "not 'proposed'" in result.error
+    # And nothing was published under that claim.
+    assert not (result.proposal_dir / ".status.yaml").exists()
+
+
+def test_the_status_file_is_not_published_as_a_symlink(tmp_path, monkeypatch):
+    """.status.yaml has the most authority in the directory — every other
+    component reads it — and it was left out of the post-publish
+    regular-file check (agy P1 on #247)."""
+    elsewhere = tmp_path / "elsewhere.yaml"
+    elsewhere.write_text("status: accepted\n")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=65,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _swap_the_status(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        os.unlink("staging/.status.yaml", dir_fd=dir_fd)
+        os.symlink(str(elsewhere), "staging/.status.yaml", dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _swap_the_status
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    # The type check names it, before the content read gets a chance to
+    # fail on O_NOFOLLOW — so this test dies if .status.yaml is dropped
+    # from the regular-file loop.
+    assert ".status.yaml is no longer a regular file" in result.error
+    assert not (result.proposal_dir / ".status.yaml").is_symlink()
