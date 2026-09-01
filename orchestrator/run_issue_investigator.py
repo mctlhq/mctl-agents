@@ -198,6 +198,10 @@ TRIPLET = ("requirements.md", "design.md", "tasks.md")
 # The file every other component reads to decide what to do with a proposal.
 STATUS_FILENAME = ".status.yaml"
 
+# A status file is a handful of lines. Anything near this is not one, and
+# yaml.safe_load would read all of it into the worker's memory.
+MAX_STATUS_BYTES = 1 << 20
+
 
 def _staging_dir(proposal_dir: Path) -> Path:
     """A scratch directory for the agent's output, beside the live proposal.
@@ -370,7 +374,7 @@ def _verify_landed(
     return stat.S_ISDIR(landed.st_mode) and (landed.st_dev, landed.st_ino) == expected
 
 
-def _landed_triplet_defects(staging_fd: int | None) -> list[str]:
+def _landed_triplet_defects(staging_fd: int | None, issue: IssueData) -> list[str]:
     """Which of the triplet are not regular files, asked through ``staging_fd``.
 
     fstatat against the descriptor of the directory that was just renamed
@@ -403,21 +407,74 @@ def _landed_triplet_defects(staging_fd: int | None) -> list[str]:
         # findings this file is full of, so it is checked on the published
         # copy through the same descriptor (agy P1 on #247).
         try:
-            with open(  # the path is resolved by the verified dir_fd
-                os.open(STATUS_FILENAME, os.O_RDONLY | os.O_NOFOLLOW,
-                        dir_fd=staging_fd),
-                encoding="utf-8",
-            ) as f:
-                published = yaml.safe_load(f) or {}
-        except (OSError, yaml.YAMLError) as exc:
+            published = _read_published_status(staging_fd)
+        except OSError as exc:
             defects.append(f"{STATUS_FILENAME} could not be read back: {exc}")
+        except yaml.YAMLError as exc:
+            defects.append(f"{STATUS_FILENAME} is not parseable: {exc}")
         else:
-            if published.get("status") != "proposed":
-                defects.append(
-                    f"{STATUS_FILENAME} says status="
-                    f"{published.get('status')!r}, not 'proposed'"
-                )
+            defects.extend(_status_disagreements(published, issue))
     return defects
+
+
+def _read_published_status(staging_fd: int) -> dict:
+    """Parse the published .status.yaml through ``staging_fd``.
+
+    O_NONBLOCK, because the stat above says "regular file" about a moment
+    that has already passed: the directory is live in agents-state by now,
+    and an agent watching it can put a FIFO there before this open, which
+    without the flag blocks forever waiting for a writer and hangs the
+    worker for good. The same hang _carry_forward refuses special files to
+    avoid, reintroduced through a third door -- so the descriptor is also
+    re-checked with fstat, which cannot be raced at all (agy P2 on #247).
+
+    And a size ceiling before parsing: safe_load reads the whole file into
+    memory, and nothing stops the agent writing a multi-gigabyte one.
+    """
+    fd = os.open(
+        STATUS_FILENAME,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=staging_fd,
+    )
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(f"{STATUS_FILENAME} is not a regular file")
+        if st.st_size > MAX_STATUS_BYTES:
+            raise OSError(
+                f"{STATUS_FILENAME} is {st.st_size} bytes, over the "
+                f"{MAX_STATUS_BYTES} limit"
+            )
+        with open(fd, encoding="utf-8", closefd=False) as f:  # via the verified fd
+            return yaml.safe_load(f) or {}
+    finally:
+        os.close(fd)
+
+
+def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
+    """Ways the published status file differs from what we wrote.
+
+    Not just `status`. The `source` block names the issue the implementer
+    writes `Closes <repo>#<N>` for, so an agent that rewrote it to another
+    repository would have the merge of ITS proposal silently close
+    unrelated issues elsewhere in the org -- a boundary crossing of the
+    same kind as forging the approval, and one the status-only check let
+    straight through (agy P1 on #247).
+    """
+    source = published.get("source") or {}
+    control = published.get("control") or {}
+    expected = [
+        ("status", published.get("status"), "proposed"),
+        ("source.repo", source.get("repo"), issue.ref.full_repo),
+        ("source.issue", source.get("issue"), issue.ref.number),
+        ("source.url", source.get("url"), issue.ref.url),
+        ("control.requires_human_approval", control.get("requires_human_approval"), True),
+    ]
+    return [
+        f"{STATUS_FILENAME} says {field}={actual!r}, not {wanted!r}"
+        for field, actual, wanted in expected
+        if actual != wanted
+    ]
 
 
 def _verify_staging_fd(dir_fd: int, expected: tuple[int, int]) -> None:
@@ -1287,7 +1344,16 @@ def investigate(
         wrapper_fd = os.open(
             staging_wrapper, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         )
-        staging_id = _entry_identity(wrapper_fd, STAGING_ENTRY)
+        #     ASSERT the identity here, do not re-read it. Assigning
+        #     staging_id from what is inside the wrapper threw away the
+        #     value verified before the move and adopted whatever the
+        #     rename had actually carried: a directory swapped in between
+        #     _verify_staging and os.replace — another proposal from
+        #     agents-state, say — was moved in and then trusted, and every
+        #     later check compared it against itself (agy P2 on #247). A
+        #     rename preserves the inode, so the original value is exactly
+        #     what must still be here.
+        _verify_staging_fd(wrapper_fd, staging_id)
         #     And a descriptor on staging ITSELF, held until the publish is
         #     decided. It is what makes the identity check survive inode
         #     reuse — see _fd_still_linked.
@@ -1356,9 +1422,20 @@ def investigate(
             # had the LINK'S TARGET's permissions changed to 0500 or 0700
             # instead (agy P2 on #247). Opened here, where a failure is
             # harmless because the proposal has not moved yet.
-            aside_root_fd = os.open(
-                aside_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-            )
+            try:
+                aside_root_fd = os.open(
+                    aside_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+            except BaseException:
+                # Without this the wrapper is left set with no descriptor,
+                # and the cleanup — which now refuses to delete a path no
+                # descriptor vouches for — would leak an empty scratch
+                # directory into agents-state on every such failure
+                # (claude P2 on #247). Nothing has been moved in yet, so
+                # removing it here is free.
+                shutil.rmtree(aside_root, ignore_errors=True)
+                aside_root = None
+                raise
             moved = aside_root / "proposal"
             os.replace(proposal_dir, moved)
             # `aside` means "the proposal is at this path and nowhere else",
@@ -1507,7 +1584,7 @@ def investigate(
                 # spoken after the rename rather than before it, through
                 # the fd we already hold — which names the published
                 # directory itself, no path to re-resolve.
-                bad = _landed_triplet_defects(staging_fd)
+                bad = _landed_triplet_defects(staging_fd, issue)
                 if bad:
                     _remove_rejected(proposal_dir)
                     raise _StagingReplaced(

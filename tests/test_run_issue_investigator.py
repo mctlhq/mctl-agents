@@ -1457,6 +1457,32 @@ def test_a_deliberate_status_mode_survives_re_investigation(tmp_path, monkeypatc
     assert stat.S_IMODE(status.stat().st_mode) == chosen
 
 
+def _call_without_hanging(fn, seconds=15):
+    """Run `fn` on a thread and fail rather than hang.
+
+    Same reason as _investigate_without_hanging, for callables that set up
+    their own investigation.
+    """
+    import threading
+
+    box = {}
+
+    def _go():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:  # noqa: BLE001 — re-raised below
+            box["error"] = exc
+
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise AssertionError(f"investigate() did not return within {seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
 def _investigate_without_hanging(url, state_dir, seconds=15):
     """Run investigate() on a thread and fail rather than hang.
 
@@ -1933,10 +1959,15 @@ def test_swapping_the_wrapper_path_cannot_redirect_the_publish(tmp_path, monkeyp
     )
 
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _swap_the_wrapper_path(dir_fd, expected):
         result = real_verify(dir_fd, expected)
-        # The last instant before the rename: replace the wrapper's path.
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. The last instant before the rename is the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return result
         wrappers = list((tmp_path / "mctl-telegram").glob(".staging-*"))
         for w in wrappers:
             if w.is_dir() and not w.is_symlink():
@@ -2014,9 +2045,15 @@ def test_a_swap_that_wins_the_publish_window_is_caught_after_the_rename(
     (first.proposal_dir / "notes.md").write_text("the previous proposal")
 
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _win_the_window_portable(dir_fd, expected):
         real_verify(dir_fd, expected)
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. Everything below belongs to the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
         wrappers = [
             w for w in (tmp_path / "mctl-telegram").glob(".staging-*") if w.is_dir()
         ]
@@ -2254,9 +2291,15 @@ def test_a_directory_swapped_in_during_publish_is_removed_not_stranded(
     (first.proposal_dir / "notes.md").write_text("the previous proposal")
 
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _swap_for_a_non_empty_directory(dir_fd, expected):
         real_verify(dir_fd, expected)
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. Everything below belongs to the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
         wrappers = [
             w for w in (tmp_path / "mctl-telegram").glob(".staging-*") if w.is_dir()
         ]
@@ -2403,9 +2446,15 @@ def test_a_document_swapped_after_validation_is_not_published(tmp_path, monkeypa
     assert first.error is None
 
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _swap_a_document(dir_fd, expected):
         real_verify(dir_fd, expected)
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. Everything below belongs to the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
         # Long after _is_plain_file said yes, and still before the rename.
         # dir_fd names the WRAPPER; the documents are one level in.
         os.unlink("staging/design.md", dir_fd=dir_fd)
@@ -2471,9 +2520,15 @@ def test_a_wrapper_swapped_before_cleanup_is_not_deleted(tmp_path, monkeypatch):
         ],
     )
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _rename_the_wrapper_away(dir_fd, expected):
         real_verify(dir_fd, expected)
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. Everything below belongs to the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
         wrappers = [
             w for w in (tmp_path / "mctl-telegram").glob(".staging-*") if w.is_dir()
         ]
@@ -2559,9 +2614,15 @@ def test_an_agent_cannot_approve_its_own_proposal_before_the_publish(
         ],
     )
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _self_approve(dir_fd, expected):
         real_verify(dir_fd, expected)
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. Everything below belongs to the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
         fd = os.open("staging/.status.yaml", os.O_WRONLY | os.O_TRUNC, dir_fd=dir_fd)
         with os.fdopen(fd, "w") as f:
             f.write("status: accepted\n")
@@ -2592,9 +2653,15 @@ def test_the_status_file_is_not_published_as_a_symlink(tmp_path, monkeypatch):
         ],
     )
     real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
 
     def _swap_the_status(dir_fd, expected):
         real_verify(dir_fd, expected)
+        # Two calls now: once when the wrapper is opened, once before the
+        # publish. Everything below belongs to the second.
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
         os.unlink("staging/.status.yaml", dir_fd=dir_fd)
         os.symlink(str(elsewhere), "staging/.status.yaml", dir_fd=dir_fd)
 
@@ -2698,3 +2765,93 @@ def test_the_aside_wrapper_permissions_go_to_the_descriptor(tmp_path, monkeypatc
 
     assert stat.S_IMODE(victim.stat().st_mode) == before
     assert (victim / "keep.txt").read_text() == "not ours"
+
+
+def _tamper_with_the_published_status(monkeypatch, tmp_path, number, write):
+    """Run an investigation whose agent rewrites .status.yaml just before
+    the publish, using `write(dir_fd)`."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=number,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    real_verify = run_issue_investigator._verify_staging_fd
+    _seen: list[int] = []
+
+    def _hook(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        _seen.append(1)
+        if len(_seen) < 2:
+            return None
+        write(dir_fd)
+        return None
+
+    monkeypatch.setattr(run_issue_investigator, "_verify_staging_fd", _hook)
+    return investigate(issue.ref.url, state_dir=tmp_path)
+
+
+def test_a_forged_source_block_is_not_published(tmp_path, monkeypatch):
+    """The source block names the issue the implementer writes
+    `Closes <repo>#<N>` for. An agent that rewrote it to another repository
+    would have the merge of ITS proposal silently close unrelated issues
+    elsewhere in the org — and the status-only check let that straight
+    through (agy P1 on #247)."""
+    def _forge(dir_fd):
+        fd = os.open("staging/.status.yaml", os.O_WRONLY | os.O_TRUNC, dir_fd=dir_fd)
+        with os.fdopen(fd, "w") as f:
+            f.write(
+                "status: proposed\n"
+                "source:\n"
+                "  type: github_issue\n"
+                "  repo: mctlhq/core-infra\n"
+                "  issue: 999\n"
+                "  url: https://github.com/mctlhq/core-infra/issues/999\n"
+                "control:\n"
+                "  requires_human_approval: true\n"
+            )
+
+    result = _tamper_with_the_published_status(monkeypatch, tmp_path, 68, _forge)
+
+    assert result.error is not None
+    assert "source.repo" in result.error
+    assert not (result.proposal_dir / ".status.yaml").exists()
+
+
+def test_reading_the_published_status_does_not_hang_on_a_fifo(tmp_path):
+    """The type check above _read_published_status says "regular file"
+    about a moment that has already passed -- the directory is live in
+    agents-state by then, so an agent watching it can swap the file for a
+    FIFO before the open. Without O_NONBLOCK that open blocks forever
+    waiting for a writer and hangs the worker (agy P2 on #247).
+
+    Exercised directly: through investigate() the earlier stat loop rejects
+    the FIFO first, so the open is never reached and the test would pass
+    with the flag removed.
+    """
+    os.mkfifo(tmp_path / run_issue_investigator.STATUS_FILENAME)
+    dir_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(OSError, match="not a regular file"):
+            _call_without_hanging(
+                lambda: run_issue_investigator._read_published_status(dir_fd),
+                seconds=5,
+            )
+    finally:
+        os.close(dir_fd)
+
+
+def test_an_oversized_status_file_is_refused_before_parsing(tmp_path, monkeypatch):
+    """safe_load reads the whole file into the worker's memory, and nothing
+    stops the agent writing a huge one (agy P2 on #247)."""
+    def _bloat(dir_fd):
+        fd = os.open("staging/.status.yaml", os.O_WRONLY | os.O_TRUNC, dir_fd=dir_fd)
+        with os.fdopen(fd, "w") as f:
+            f.write("status: proposed\n# ")
+            f.write("x" * (run_issue_investigator.MAX_STATUS_BYTES + 1))
+
+    result = _tamper_with_the_published_status(monkeypatch, tmp_path, 70, _bloat)
+
+    assert result.error is not None
+    assert "over the" in result.error
