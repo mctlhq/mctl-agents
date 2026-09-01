@@ -1024,6 +1024,11 @@ def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 
 
+# What a stripped delimiter tag leaves behind. Carries no angle bracket of
+# its own, so it cannot become part of a tag itself.
+_STRIPPED_TAG = "[tag stripped]"
+
+
 def _neutralize_prompt_tags(text: str) -> str:
     """Strip forged <issue_title>/<issue_body> (and closing) tags from
     untrusted issue text so it cannot break out of — or fake — the
@@ -1041,7 +1046,16 @@ def _neutralize_prompt_tags(text: str) -> str:
     # bypass agy found in run_shepherd._neutralize_findings_tags on #248).
     # Junk stays bounded to the tag's own line — unbounded, an `<issue_body`
     # inside quoted code would swallow everything up to the next `>`.
-    return re.sub(r"(?i)<[\s/]*issue_(title|body)(?![-\w])[^>\n]*>?", "", text or "")
+    #
+    # The replacement is a marker, not "": `re.sub` is single-pass and never
+    # re-reads what it wrote, so deleting a tag lets the text on either side
+    # close up. `</is</issue_body>sue_body>` strips the inner tag and the
+    # halves fasten into an intact `</issue_body>` the pattern never sees
+    # again. A marker between them keeps the halves apart (agy P1, round 2
+    # on #248 — same fix in the sibling guard named above).
+    return re.sub(
+        r"(?i)<[\s/]*issue_(title|body)(?![-\w])[^>\n]*>?", _STRIPPED_TAG, text or ""
+    )
 
 
 def _build_prompt(issue: IssueData, service: str, slug: str) -> str:

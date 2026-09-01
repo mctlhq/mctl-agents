@@ -1080,6 +1080,11 @@ def decide(
 # ---------------------------------------------------------------------------
 # Sub-agent invocation — let shepherd.md format the bundle into JSON.
 # ---------------------------------------------------------------------------
+# What a stripped fence tag leaves behind. Carries no angle bracket of its
+# own, so it cannot become part of a tag itself.
+_STRIPPED_TAG = "[tag stripped]"
+
+
 def _neutralize_findings_tags(text: str) -> str:
     """Strip forged <findings> tags so review text cannot close its own fence.
 
@@ -1105,7 +1110,15 @@ def _neutralize_findings_tags(text: str) -> str:
     # `(?![-\w])` keeps a real `<findings-report>` in quoted code intact: it
     # is not a fence terminator, so stripping it would lose content for
     # nothing (claude P3 on #248).
-    return re.sub(r"(?i)<[\s/]*findings(?![-\w])[^>\n]*>?", "", text or "")
+    #
+    # The replacement is a marker, not "": `re.sub` is single-pass and never
+    # re-reads what it wrote, so deleting a tag lets the text on either side
+    # of it close up. `</fin</findings>dings>` strips the inner tag and the
+    # halves fasten into an intact `</findings>` that no longer faces the
+    # pattern — the fence is open again. A marker between them keeps the
+    # halves apart, and says in the prompt what was taken out rather than
+    # silently editing a reviewer's words (agy P1, round 2 on #248).
+    return re.sub(r"(?i)<[\s/]*findings(?![-\w])[^>\n]*>?", _STRIPPED_TAG, text or "")
 
 
 async def _format_bundle_via_sdk(findings: list[CodexFinding]) -> dict:
