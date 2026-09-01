@@ -1953,3 +1953,40 @@ def test_swapping_the_wrapper_path_cannot_redirect_the_publish(tmp_path, monkeyp
     # The agent's own output was published, not the attacker's.
     assert (result.proposal_dir / "design.md").read_text() == "v1 design.md"
     assert (victim / "staging").is_dir(), "the decoy was consumed"
+
+
+def test_a_failed_move_into_the_wrapper_leaks_nothing(tmp_path, monkeypatch):
+    """Naming the wrapper before the move made cleanup pick the wrong one.
+
+    With `staging_wrapper` already bound, a failed rename left `staging`
+    pointing at the original and cleanup took the wrapper branch: it
+    removed an empty directory and leaked the one holding the agent's
+    actual output, permanently, under agents-state/<service>/ (claude P2
+    on #247).
+    """
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=55,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+
+    real_replace = run_issue_investigator.os.replace
+
+    def _fail_the_move_into_the_wrapper(src, dst, **kw):
+        # Only the staging -> wrapper/staging move, identified by its
+        # destination name, so the publish rename is untouched.
+        if not kw and Path(dst).name == "staging":
+            raise OSError("cross-device link")
+        return real_replace(src, dst, **kw)
+
+    monkeypatch.setattr(
+        run_issue_investigator.os, "replace", _fail_the_move_into_the_wrapper
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    monkeypatch.setattr(run_issue_investigator.os, "replace", real_replace)
+
+    assert result.error is not None
+    # Neither the empty wrapper nor the real staging directory survives.
+    assert list((tmp_path / "mctl-telegram").glob(".staging-*")) == []

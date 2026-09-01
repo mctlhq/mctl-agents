@@ -872,6 +872,18 @@ class InvestigateResult:
 # Against a same-uid adversary with a background process, no path-based
 # scheme is airtight; each measure below raises the cost and none is
 # claimed to close the door.
+#
+# One consequence worth stating, because review keeps arriving at it: a
+# backgrounded process that kept a descriptor on the staging directory can
+# still change what is INSIDE it, and neither the rename nor the parent's
+# dropped write bit touches that (codex P1, 03:06). True, and not a hole in
+# the boundary that matters: the contents of a proposal are what the agent
+# authors anyway, so an attacker gains nothing by writing them twice. What
+# it cannot do with that descriptor is turn staging into a symlink —
+# unlinking the entry and creating a link both need write on the wrapper —
+# so the published path still cannot leave agents-state. Making even the
+# contents trustworthy means not running the agent as this uid, which is
+# #149's territory.
 def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
@@ -980,9 +992,22 @@ def investigate(
         #     acceptable — the agent shares this process's uid, so every
         #     path this code can write it can write directly, and what
         #     these checks protect is the PUBLISHED proposal, not the host.
-        staging_wrapper = Path(tempfile.mkdtemp(dir=staging.parent, prefix=".staging-"))
-        secure = staging_wrapper / "staging"
-        os.replace(staging, secure)
+        wrapper = Path(tempfile.mkdtemp(dir=staging.parent, prefix=".staging-"))
+        secure = wrapper / "staging"
+        try:
+            os.replace(staging, secure)
+        except BaseException:
+            # Bind the outer names only once the move has happened. Assigning
+            # staging_wrapper first meant a failed rename left `staging`
+            # pointing at the original AND `staging_wrapper` set, so the
+            # cleanup took the wrapper branch, removed an empty directory and
+            # leaked the one holding the agent's actual output (claude P2 on
+            # #247). Third time this file has been bitten by naming a thing
+            # before the thing is true — the same lesson as `aside` two
+            # commits ago and as _clone_repo's wrapper before that.
+            shutil.rmtree(wrapper, ignore_errors=True)
+            raise
+        staging_wrapper = wrapper
         os.chmod(staging_wrapper, stat.S_IRUSR | stat.S_IXUSR)
         staging = secure
 
