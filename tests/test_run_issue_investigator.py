@@ -2211,6 +2211,11 @@ def test_an_aside_swapped_for_a_symlink_is_not_carried_forward(tmp_path, monkeyp
         asides = list((tmp_path / "mctl-telegram").glob(".aside-*/proposal"))
         for a in asides:
             if a.is_dir() and not a.is_symlink():
+                # Take the wrapper's write bit back first. The lock the
+                # publish drops is not a barrier against this adversary —
+                # same uid owns the directory — and the attack has to say
+                # so out loud rather than be stopped by it and pass.
+                os.chmod(a.parent, stat.S_IRWXU)
                 shutil.rmtree(a)
                 a.symlink_to(outside)
         return real_verify(aside, expected, fd)
@@ -2376,3 +2381,51 @@ def test_a_reused_inode_number_does_not_pass_as_the_staging_we_verified(
         assert not run_issue_investigator._verify_landed(landed, fd, expected)
     finally:
         os.close(fd)
+
+
+def test_a_document_swapped_after_validation_is_not_published(tmp_path, monkeypatch):
+    """Step 4 validates the triplet minutes and several writes before the
+    rename, and nothing holds the files still in between. A background
+    process with an fd on staging can swap a validated design.md for a
+    symlink right up to the publish, and what LANDS is what the implementer
+    and the shepherd read in other pods (agy P2 on #247)."""
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("not the agent's work")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=61,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    first = investigate(issue.ref.url, state_dir=tmp_path)
+    assert first.error is None
+
+    real_verify = run_issue_investigator._verify_staging_fd
+
+    def _swap_a_document(dir_fd, expected):
+        real_verify(dir_fd, expected)
+        # Long after _is_plain_file said yes, and still before the rename.
+        # dir_fd names the WRAPPER; the documents are one level in.
+        os.unlink("staging/design.md", dir_fd=dir_fd)
+        os.symlink(str(elsewhere), "staging/design.md", dir_fd=dir_fd)
+
+    monkeypatch.setattr(
+        run_issue_investigator, "_verify_staging_fd", _swap_a_document
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "_run_agent",
+        lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v2 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    second = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert second.error is not None
+    assert "replaced during the publish" in second.error
+    # The previous proposal is back, and no link was published.
+    published = first.proposal_dir / "design.md"
+    assert published.is_file() and not published.is_symlink()
+    assert published.read_text() == "v1 design.md"

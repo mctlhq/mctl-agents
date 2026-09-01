@@ -338,6 +338,27 @@ def _verify_landed(
     return stat.S_ISDIR(landed.st_mode) and (landed.st_dev, landed.st_ino) == expected
 
 
+def _landed_triplet_defects(staging_fd: int | None) -> list[str]:
+    """Which of the triplet are not regular files, asked through ``staging_fd``.
+
+    fstatat against the descriptor of the directory that was just renamed
+    into place, so the answer is about what was published, not about what
+    some path resolves to now.
+    """
+    if staging_fd is None:
+        return []
+    defects = []
+    for name in TRIPLET:
+        try:
+            st = os.stat(name, dir_fd=staging_fd, follow_symlinks=False)
+        except OSError:
+            defects.append(f"{name} is gone")
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            defects.append(f"{name} is no longer a regular file")
+    return defects
+
+
 def _verify_staging_fd(dir_fd: int, expected: tuple[int, int]) -> None:
     """Raise unless the staging entry is still the directory we created."""
     try:
@@ -1257,6 +1278,13 @@ def investigate(
             aside_fd = os.open(
                 aside, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
             )
+            # Drop the write bit on the wrapper, the same lock staging's
+            # wrapper carries: renaming `proposal` out of it now needs a
+            # chmod first, so a swap is no longer a single rename (agy P2
+            # on #247). Not a barrier against this adversary — same uid,
+            # it can chmod back — but the two wrappers should not differ
+            # for no reason, and the restore below re-opens it explicitly.
+            os.chmod(aside_root, stat.S_IRUSR | stat.S_IXUSR)
 
             # Only NOW re-read the status. The guard at the top of this
             # function ran BEFORE an agent call that takes minutes, and
@@ -1358,6 +1386,28 @@ def investigate(
                         "staging was replaced during the publish — the "
                         "proposal path does not hold what was verified"
                     )
+                # The documents, re-checked at the same moment. Step 4
+                # validated them minutes and several writes earlier, and
+                # nothing held them still in between: a background process
+                # with an fd on staging can unlinkat + symlinkat a
+                # validated design.md right up to the rename, and the
+                # publish would then commit the link (agy P2 on #247).
+                #
+                # This is the one window in this function that crosses a
+                # boundary. Everything the agent redirects inside its own
+                # process it could write directly; what LANDS here is read
+                # by the implementer and the shepherd, in other pods with
+                # other credentials. So the last word about the triplet is
+                # spoken after the rename rather than before it, through
+                # the fd we already hold — which names the published
+                # directory itself, no path to re-resolve.
+                bad = _landed_triplet_defects(staging_fd)
+                if bad:
+                    _remove_rejected(proposal_dir)
+                    raise _StagingReplaced(
+                        "the proposal documents were replaced during the "
+                        f"publish: {', '.join(bad)}"
+                    )
             else:
                 _verify_staging(staging, staging_id)
                 os.replace(staging, proposal_dir)
@@ -1374,6 +1424,12 @@ def investigate(
             # nothing worth keeping: preserving the impostor and calling it
             # "the previous proposal" would be a false claim in a CRITICAL
             # log line.
+            # Reopen the aside wrapper: the restore renames an entry OUT of
+            # it, which the dropped write bit forbids, and a human sent to
+            # the surviving copy by the CRITICAL line below needs it too.
+            if aside_root is not None:
+                with contextlib.suppress(OSError):
+                    os.chmod(aside_root, stat.S_IRWXU)
             if aside is not None and not _aside_is_ours(aside, aside_id, aside_fd):
                 aside = None
             if aside is not None:
@@ -1484,8 +1540,13 @@ def investigate(
             shutil.rmtree(staging_wrapper, ignore_errors=True)
         elif staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
-        if aside_root is not None and not keep_aside:
-            shutil.rmtree(aside_root, ignore_errors=True)
+        if aside_root is not None:
+            # rmtree unlinks an entry IN the wrapper, and keep_aside points
+            # a human at it — either way the write bit has to come back.
+            with contextlib.suppress(OSError):
+                os.chmod(aside_root, stat.S_IRWXU)
+            if not keep_aside:
+                shutil.rmtree(aside_root, ignore_errors=True)
         # Drop the throwaway /tmp clone — the wrapper _clone_repo returned,
         # which takes the checkout inside it with it.
         if clone is not None and clone.exists():
