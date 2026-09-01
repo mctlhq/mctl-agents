@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.36.0](https://github.com/mctlhq/mctl-agents/compare/1.35.0...1.36.0) (2026-09-01)
+
+
+### Features
+
+* **incidents:** pin the responder image and record the run ([85e2c95](https://github.com/mctlhq/mctl-agents/commit/85e2c95586027adf6b1cd95b1c53560113544039))
+
+
+### Bug Fixes
+
+* **incidents:** fail open when the registry lookup itself fails ([c545272](https://github.com/mctlhq/mctl-agents/commit/c54527218cf2816312622cdcf8cb8cc46acc8505))
+
 ## [1.35.0](https://github.com/mctlhq/mctl-agents/compare/1.34.0...1.35.0) (2026-09-01)
 
 
