@@ -545,7 +545,12 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
         # STAGING, so the directory in question is the 0700 scratch dir
         # whose permissions are exactly what we are trying not to inherit.
         # Deriving from it reproduced 0600 and the test caught it.
-        if status_path.exists():
+        # _is_plain_file, not exists(): exists() follows symlinks, so a
+        # .status.yaml planted as a link to /etc/shadow would have THAT
+        # file's mode copied onto the published status file and committed
+        # to gitops — a small but free disclosure of a system file's
+        # permissions (agy P3 on #247).
+        if _is_plain_file(status_path):
             shutil.copymode(status_path, tmp_path)
         else:
             # Discovered by creating a file and looking at it, NOT by
@@ -890,6 +895,27 @@ def investigate(
         #     the directory we made. Every check below reads through the
         #     path, so a swapped-in symlink satisfies all of them.
         _verify_staging(staging, staging_id)
+
+        # 4b. Then take it out of reach. The agent runs with Bash and can
+        #     leave something running: verifying once and then writing for
+        #     several more steps leaves a window where a background process
+        #     swaps staging for a symlink AFTER the check, and the writes
+        #     that follow — write_status_yaml, _carry_forward, copymode —
+        #     land wherever it points. The second check before the publish
+        #     would notice, far too late to matter (agy P1 on #247).
+        #
+        #     mkdtemp picks the new name, so it is not derivable from
+        #     anything the agent saw; a process still holding the old path
+        #     cannot follow the rename. What remains is the two syscalls
+        #     between the check above and this rename, during which nothing
+        #     is written. Closing even that needs every write to go through
+        #     a dirfd opened O_NOFOLLOW, which shutil cannot do — so the
+        #     window is narrowed to nothing-happens rather than pretended
+        #     away.
+        secure = Path(tempfile.mkdtemp(dir=staging.parent, prefix=".staging-"))
+        os.replace(staging, secure)
+        staging = secure
+        staging_id = _dir_identity(staging)
 
         # 4. Verify the agent produced the triplet. Staging is empty at the
         #    start of every run, so existence here proves THIS run wrote it

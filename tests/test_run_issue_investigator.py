@@ -1763,3 +1763,73 @@ def test_staging_swapped_after_validation_is_still_refused(tmp_path, monkeypatch
     assert result.error is not None
     assert "staging" in result.error
     assert not result.proposal_dir.exists()
+
+
+def test_a_background_swap_after_the_agent_returns_cannot_redirect_writes(
+    tmp_path, monkeypatch
+):
+    """Verifying once and then writing for several more steps is not enough.
+
+    The agent runs with Bash and can leave something running. A process
+    that swaps staging for a symlink AFTER the check would have every
+    later write — write_status_yaml, _carry_forward, copymode — land
+    wherever it points. Moving staging to a name mkdtemp picked, before
+    anything is written into it, means a process holding the old path
+    cannot follow (agy P1 on #247).
+    """
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("untouched")
+
+    seen: dict[str, Path] = {}
+
+    def _agent_notes_its_directory(repo_dir, prompt, proposal_dir):
+        seen["staging"] = proposal_dir
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _investigate_harness(
+        tmp_path, monkeypatch, number=50, agent=_agent_notes_its_directory
+    )
+
+    real_write = run_issue_investigator.write_status_yaml
+
+    def _swap_the_path_the_agent_saw(proposal_dir, issue_data):
+        # Stands in for a leftover background process: it can only act on
+        # the path it observed, which is no longer where the work is.
+        old = seen["staging"]
+        if old.exists() or old.is_symlink():
+            shutil.rmtree(old, ignore_errors=True)
+            old.symlink_to(victim)
+        return real_write(proposal_dir, issue_data)
+
+    monkeypatch.setattr(
+        run_issue_investigator, "write_status_yaml", _swap_the_path_the_agent_saw
+    )
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    # The run completes normally — the swap targeted a stale path.
+    assert result.error is None
+    assert (result.proposal_dir / "design.md").read_text() == "v1 design.md"
+    # And nothing was written through the link.
+    assert sorted(q.name for q in victim.iterdir()) == ["keep.txt"]
+
+
+def test_the_status_mode_is_not_read_through_a_planted_symlink(tmp_path):
+    """exists() follows symlinks, so a .status.yaml planted as a link to a
+    system file had THAT file's mode copied onto the published status file
+    and committed to gitops (agy P3 on #247)."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text("some other file")
+    os.chmod(elsewhere, stat.S_IRUSR)  # a mode nothing here would produce
+
+    proposal_dir = tmp_path / "proposals" / "issue-51-x"
+    proposal_dir.mkdir(parents=True)
+    (proposal_dir / ".status.yaml").symlink_to(elsewhere)
+
+    status_path = write_status_yaml(proposal_dir, _issue(number=51))
+
+    assert stat.S_IMODE(status_path.stat().st_mode) != stat.S_IRUSR
+    probe = tmp_path / "probe"
+    probe.touch()
+    assert stat.S_IMODE(status_path.stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
