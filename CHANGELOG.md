@@ -1,5 +1,64 @@
 # Changelog
 
+## [1.35.0](https://github.com/mctlhq/mctl-agents/compare/1.34.0...1.35.0) (2026-09-01)
+
+
+### Features
+
+* **worker:** add role selection and slot limits for the queue split ([bc5f11d](https://github.com/mctlhq/mctl-agents/commit/bc5f11d7c977ca7d5b2d9d82ec182d743e073f86))
+* **worker:** drain every worker on SIGTERM instead of dying mid-flight ([34ab05a](https://github.com/mctlhq/mctl-agents/commit/34ab05ae1b466d33705945632c660b473b60899c))
+
+
+### Bug Fixes
+
+* **investigator:** a lost proposal must crash, not return an error string ([f87613f](https://github.com/mctlhq/mctl-agents/commit/f87613f247f1d59cbb4f10c2acbb059a2fb7fe20))
+* **investigator:** a missing descriptor is not an answer of "not ours" ([8e62497](https://github.com/mctlhq/mctl-agents/commit/8e62497d7cfe902ba85ce9602c80f8c54db5a364)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** a triplet document must be a real file ([00bf5ab](https://github.com/mctlhq/mctl-agents/commit/00bf5ab3966df7a7fd9051394f88269614368872))
+* **investigator:** bind the staging wrapper only after the move succeeds ([62694d4](https://github.com/mctlhq/mctl-agents/commit/62694d45c587071250f60c85b7adc8ac1cdaa09d))
+* **investigator:** carry subdirectories into staging, not just files ([985a811](https://github.com/mctlhq/mctl-agents/commit/985a8118d87dc68697961a4a3fd3677cec440f39))
+* **investigator:** carry the status file's mode across the swap too ([e35c51b](https://github.com/mctlhq/mctl-agents/commit/e35c51b8ebe3906b94c43fbe7441cf5fa6bf7f81))
+* **investigator:** check what landed, not what was there a moment ago ([e39e1a5](https://github.com/mctlhq/mctl-agents/commit/e39e1a56b8289d14356cbe9381cf7061cd8e671f))
+* **investigator:** clean up the clone wrapper on failure, mark success later ([1269861](https://github.com/mctlhq/mctl-agents/commit/1269861e141154000b1f8007d09c4e60d969e742))
+* **investigator:** clear the triplet before the run and restore it on failure ([fa7485e](https://github.com/mctlhq/mctl-agents/commit/fa7485ede57d98f479149d87debae6d64a3f4c4a))
+* **investigator:** close staging's parent, and say what these checks defend ([38453a9](https://github.com/mctlhq/mctl-agents/commit/38453a989a874e96418a4fc34b154a74fa5f0a9e))
+* **investigator:** close the copy destination on a failed source open ([3bd23c4](https://github.com/mctlhq/mctl-agents/commit/3bd23c4535e47ef1451bb8d4ce4667022de1c66d)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** decide the triplet after the publish, not before it ([9be80b6](https://github.com/mctlhq/mctl-agents/commit/9be80b65d4851dade744fa5905a59a1ff0a7e2b1)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** discover the default file mode without clearing the umask ([1d1a8d4](https://github.com/mctlhq/mctl-agents/commit/1d1a8d4ec009aa2b368ef6b2283a5511d71e91b0))
+* **investigator:** identify staging by a held fd, not by inode number alone ([0d2b045](https://github.com/mctlhq/mctl-agents/commit/0d2b0459108f45c2c6bd86e15067f3f58df159c8)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** key the proposal directory on the issue number ([2bbf540](https://github.com/mctlhq/mctl-agents/commit/2bbf54026d17570666061de5d5aa98ce27f70d03))
+* **investigator:** make the triplet rollback an exact inverse ([7f4e24e](https://github.com/mctlhq/mctl-agents/commit/7f4e24e972d4865efea34045535e87c7d4f072db))
+* **investigator:** merge carried-forward folders leaf by leaf ([f364a4d](https://github.com/mctlhq/mctl-agents/commit/f364a4dba33b1d19d17d0bf374af008e23c30e3a))
+* **investigator:** move staging out of the agent's reach before writing ([e7a0fd0](https://github.com/mctlhq/mctl-agents/commit/e7a0fd0686f66c810b62c5f6a1e52da9f83a74a7))
+* **investigator:** never follow a symlink while carrying a proposal forward ([7a8e98d](https://github.com/mctlhq/mctl-agents/commit/7a8e98d05e5f597093a43ff0d181c4497ad50fb0))
+* **investigator:** never open a special file, and carry modes by rule ([3473691](https://github.com/mctlhq/mctl-agents/commit/347369160663aaf9abedb9efde3a6f1dcabf01a9))
+* **investigator:** open the copy source without following it either ([c22ed3b](https://github.com/mctlhq/mctl-agents/commit/c22ed3bca92a4eb947125de754301fb29ed33a5c))
+* **investigator:** preserve the original failure and never leak the aside copy ([92aa277](https://github.com/mctlhq/mctl-agents/commit/92aa277dce59b81e98e4ad15c7546de4b6b83501))
+* **investigator:** publish by swapping directories, not file by file ([bda470e](https://github.com/mctlhq/mctl-agents/commit/bda470e7380ae54fa1aed04ac81547563b1d628f))
+* **investigator:** publish through a directory descriptor, not a path ([db49ca1](https://github.com/mctlhq/mctl-agents/commit/db49ca14b96086b992df530fdec5f27ff7bd3e22))
+* **investigator:** re-check the proposal status immediately before publishing ([f951a6c](https://github.com/mctlhq/mctl-agents/commit/f951a6ce23d25b7a17ec324d8112546729b8c19f))
+* **investigator:** refuse a proposal that approved itself ([9eb3bbb](https://github.com/mctlhq/mctl-agents/commit/9eb3bbb3a4805f84627b74e8fa2c6653a85ca38a)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** refuse to publish a staging directory that was replaced ([be9e6d4](https://github.com/mctlhq/mctl-agents/commit/be9e6d414ac65eaa4f7c3d9da2e45dd6dcd48234))
+* **investigator:** reject a status payload that is not a mapping ([c7756b7](https://github.com/mctlhq/mctl-agents/commit/c7756b7cc1144593f81d485142ff5e4b3e2827db)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** roll back from the rename, not from the swap ([2d8be81](https://github.com/mctlhq/mctl-agents/commit/2d8be81d98c381727fd6e2400dd0a7bf8acd1435))
+* **investigator:** stop resolving paths twice inside a writable directory ([d16a882](https://github.com/mctlhq/mctl-agents/commit/d16a88261ebc346f10236c83596aec5119ae77af))
+* **investigator:** stop taking the status file's mode from the agent ([3422ce0](https://github.com/mctlhq/mctl-agents/commit/3422ce0da73e4328ad08bfe143a2b7c4ba764a3f)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** stop the rollback deleting documents it never observed ([d694c53](https://github.com/mctlhq/mctl-agents/commit/d694c5352c99a780ca8c1b40e8ff735b589b9478))
+* **investigator:** type-check the nested status blocks, and fail closed ([4fc64cc](https://github.com/mctlhq/mctl-agents/commit/4fc64cc4442a2b3b2c5aa799f51b168f2ae282a7)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** verify the aside copy, and recover from a rejected publish ([cf88c9c](https://github.com/mctlhq/mctl-agents/commit/cf88c9c5ec97eca472b796dd32f460e26d7d1132))
+* **investigator:** verify the whole published status, not just its status ([f3108d7](https://github.com/mctlhq/mctl-agents/commit/f3108d7bc159b8ff0dc986e73e9735b80e173109)), closes [#247](https://github.com/mctlhq/mctl-agents/issues/247)
+* **investigator:** verify this run wrote the triplet, not that files exist ([de8f86f](https://github.com/mctlhq/mctl-agents/commit/de8f86f7cd17f195073b227fa54fc41be22072b3))
+* **investigator:** write .status.yaml atomically, read the triplet before removing it ([c7575f5](https://github.com/mctlhq/mctl-agents/commit/c7575f5a31c507f9231395e55872ed5b8843d01b))
+* **shepherd:** fence review findings as data; skip SDK auth on dry-run ([89afc8c](https://github.com/mctlhq/mctl-agents/commit/89afc8c0a9bc2480f3c62f7e21e393281b95d92e))
+* **shepherd:** leave a marker where a fence tag was, not a gap ([4236f6d](https://github.com/mctlhq/mctl-agents/commit/4236f6d1fd905d46b29de391a9e1a8b4a5ddd169))
+* **shepherd:** strip a fence tag that never closes, in both guards ([b5c0e23](https://github.com/mctlhq/mctl-agents/commit/b5c0e23bafbdedb9a6668d83a910bbf5496bed59))
+* **worker:** cap the drain when a worker died rather than was signalled ([644a8b6](https://github.com/mctlhq/mctl-agents/commit/644a8b6ae636033586204d69dd404387cc4a841a))
+* **worker:** crash when a worker dies alone, not just on SIGTERM ([a10cb67](https://github.com/mctlhq/mctl-agents/commit/a10cb673ba1e946c4939611847bbfea8c3e7fcfa))
+* **worker:** keep the control limit at the SDK default until the flip ([fc1363e](https://github.com/mctlhq/mctl-agents/commit/fc1363e917517ac853e0479c759b16ed7fc1a273))
+* **worker:** leave the control workflow-task ceiling unset until the flip ([e65a2d9](https://github.com/mctlhq/mctl-agents/commit/e65a2d904bf256f39fd720cbca318ce5d8f21d06))
+* **worker:** make `all` poll both queues; correct the metrics claim ([65be8d5](https://github.com/mctlhq/mctl-agents/commit/65be8d57cea3c60e37a4c46035c69aa12ee5ba2f))
+* **worker:** make a failed schedule registration loud, not fatal ([f9c0b48](https://github.com/mctlhq/mctl-agents/commit/f9c0b48d55ac271a05288b369a6952d3d0d2e5db))
+* **worker:** one deadline over the drain, and report what would not stop ([6c86658](https://github.com/mctlhq/mctl-agents/commit/6c866584f59f7d719172594d689ca087b79eb64c))
+
 ## [1.34.0](https://github.com/mctlhq/mctl-agents/compare/1.33.0...1.34.0) (2026-08-31)
 
 
