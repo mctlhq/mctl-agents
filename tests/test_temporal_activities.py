@@ -8,6 +8,7 @@ mctl-api's actual request/response shapes are asserted against directly
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -1194,3 +1195,472 @@ class TestListServiceIncidents:
         self._handler(monkeypatch, {"items": [{"id": 4242, "title": "x"}], "count": 1})
         result = await env.run(list_service_incidents, "mctl-web", "2026-08-30T00:00:00Z")
         assert [i.id for i in result.incidents] == ["4242"]
+
+
+class TestReconcileReadsGitHub:
+    """The reconcile sweep with no state_dir_path (#270).
+
+    Until this landed, both activities resolved their default to
+    /workdir/mctl-gitops/... — a path the worker never has — took the
+    `not is_dir()` branch and returned empty on every tick since
+    2026-08-06. These tests pin the GitHub-backed path that replaced it,
+    and the refusal to report an empty sweep as a clean one.
+    """
+
+    STATUS_SHA = "sha-implemented"
+
+    def _tree(self, paths, truncated=False):
+        return {
+            "truncated": truncated,
+            "tree": [
+                {"type": "blob", "path": p, "sha": s} for p, s in paths
+            ],
+        }
+
+    def _handler(self, monkeypatch, *, tree, blobs, pulls, seen=None):
+        import base64 as _b64
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(200, json=tree)
+            if "/git/blobs/" in url:
+                sha = url.rsplit("/", 1)[-1]
+                if seen is not None:
+                    seen.append(sha)
+                body = blobs[sha]
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                key = url.split("/repos/")[1]
+                if key not in pulls:
+                    return httpx.Response(404, json={})
+                return httpx.Response(200, json=pulls[key])
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+    def _clear_cache(self):
+        from orchestrator.temporal.activities import gitops_state
+
+        gitops_state._blob_cache.clear()
+
+    async def test_a_merged_pr_is_projected_onto_an_implemented_proposal(
+        self, env, monkeypatch
+    ):
+        """The drift #270 found in production: eight proposals sat at
+        `implemented` while their PR was long merged."""
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", self.STATUS_SHA)]
+            ),
+            blobs={
+                self.STATUS_SHA: (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+            },
+            pulls={"mctlhq/mctl-web/pulls/76": {"merged": True, "state": "closed"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.total_inspected == 1
+        assert [p.projected_status for p in result.projections] == ["merged"]
+        assert result.projections[0].service == "mctl-web"
+        assert result.projections[0].current_status == "implemented"
+
+    async def test_a_pr_closed_unmerged_projects_rejected(self, env, monkeypatch):
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-academy/proposals/issue-14-smoke/.status.yaml", "sha-closed")]
+            ),
+            blobs={
+                "sha-closed": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-academy/pull/23\n"
+                )
+            },
+            pulls={"mctlhq/mctl-academy/pulls/23": {"merged": False, "state": "closed"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [p.projected_status for p in result.projections] == ["rejected"]
+
+    async def test_an_open_pr_projects_nothing(self, env, monkeypatch):
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-open")]
+            ),
+            blobs={
+                "sha-open": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+            },
+            pulls={"mctlhq/mctl-web/pulls/76": {"merged": False, "state": "open"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.total_inspected == 1
+        assert result.projections == []
+
+    async def test_a_truncated_tree_is_refused_not_reported_clean(self, env, monkeypatch):
+        """A partial sweep reported as complete is the failure mode this
+        whole change exists to remove."""
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-x/.status.yaml", "sha-x")], truncated=True
+            ),
+            blobs={"sha-x": "status: implemented\n"},
+            pulls={},
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(discover_and_project, "")
+        assert "truncated" in str(excinfo.value).lower()
+
+    async def test_a_missing_token_refuses_instead_of_sweeping_empty(
+        self, env, monkeypatch
+    ):
+        """Unauthenticated reads of a private repo 404, which would look
+        exactly like 'no proposals anywhere'."""
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(discover_and_project, "")
+        assert "token" in str(excinfo.value).lower()
+
+    async def test_blob_contents_are_cached_by_sha_across_sweeps(self, env, monkeypatch):
+        """A .status.yaml cannot change without its blob SHA changing, so a
+        steady-state tick must not re-read all 200+ proposals."""
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        seen: list[str] = []
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-stable")]
+            ),
+            blobs={
+                "sha-stable": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+            },
+            pulls={"mctlhq/mctl-web/pulls/76": {"merged": False, "state": "open"}},
+            seen=seen,
+        )
+
+        await env.run(discover_and_project, "")
+        await env.run(discover_and_project, "")
+
+        assert seen == ["sha-stable"], "the second sweep re-read an unchanged blob"
+
+    async def test_a_pr_in_another_repo_is_not_tracked(self, env, monkeypatch):
+        """A stale or hand-edited pr: must not complete a proposal with an
+        unrelated repository's PR."""
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-foreign")]
+            ),
+            blobs={
+                "sha-foreign": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-telegram/pull/415\n"
+                )
+            },
+            pulls={"mctlhq/mctl-telegram/pulls/415": {"merged": True, "state": "closed"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.projections == []
+
+    async def test_one_unreadable_status_file_does_not_blind_the_sweep(
+        self, env, monkeypatch
+    ):
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [
+                    ("mctl-web/proposals/issue-1-bad/.status.yaml", "sha-bad"),
+                    ("mctl-web/proposals/issue-66-good/.status.yaml", "sha-good"),
+                ]
+            ),
+            blobs={
+                "sha-bad": "status: [unclosed\n",
+                "sha-good": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                ),
+            },
+            pulls={"mctlhq/mctl-web/pulls/76": {"merged": True, "state": "closed"}},
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [p.slug for p in result.projections] == ["issue-66-good"]
+
+    async def test_orphans_are_detected_from_github_too(self, env, monkeypatch):
+        """detect_orphans returned empty SILENTLY — no warning at all — so
+        nothing in the logs distinguished 'no orphans' from 'never ran'."""
+        from orchestrator.temporal.activities.orphans import detect_orphans
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-orphan")]
+            ),
+            blobs={
+                "sha-orphan": (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+            },
+            pulls={"mctlhq/mctl-web/pulls/76": {"merged": False, "state": "open"}},
+        )
+
+        orphaned = await env.run(detect_orphans, "", [])
+        assert [o.slug for o in orphaned.orphans] == ["issue-66-turnstile"]
+        assert orphaned.total_actionable == 1
+
+        self._clear_cache()
+        adopted = await env.run(detect_orphans, "", ["dev-loop-mctlhq-mctl-web-66"])
+        assert adopted.orphans == []
+
+    async def test_a_named_state_dir_that_is_missing_raises(self, env, tmp_path):
+        """The old default silently swallowed exactly this."""
+        from orchestrator.temporal.activities.orphans import detect_orphans
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(detect_orphans, str(tmp_path / "nope"), [])
+        assert "does not exist" in str(excinfo.value)
+
+    async def test_a_failed_read_lets_its_siblings_finish_first(self, env, monkeypatch):
+        """gather must not strand in-flight reads on the first failure.
+
+        Plain gather raises immediately without cancelling siblings, so the
+        enclosing `async with httpx.AsyncClient` closed the pool under reads
+        that were still running — each then failed into nobody's hands
+        (claude P3 + agy P2 on #271). Here the second blob 500s; the first
+        must still have completed against a live client.
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        finished: list[str] = []
+
+        # The slow read is the point: it must still be in flight when the
+        # fast one fails. Without the wait both reads complete before the
+        # exception propagates and a broken gather looks identical to a
+        # fixed one — this test passed against plain gather until the
+        # delay was added.
+        async def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [
+                            ("mctl-web/proposals/issue-1-a/.status.yaml", "sha-a"),
+                            ("mctl-web/proposals/issue-2-b/.status.yaml", "sha-boom"),
+                        ]
+                    ),
+                )
+            if url.endswith("sha-boom"):
+                return httpx.Response(500, text="boom")
+            if "/git/blobs/" in url:
+                await asyncio.sleep(0.1)
+                finished.append(url.rsplit("/", 1)[-1])
+                import base64 as _b64
+
+                body = "status: implemented\n"
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(discover_and_project, "")
+
+        # The failure surfaces with its own type, so Temporal still retries…
+        assert "500" in str(excinfo.value)
+        # …and the sibling read completed rather than being stranded.
+        assert finished == ["sha-a"]
+
+    async def test_a_rate_limited_pr_read_raises_instead_of_reading_clean(
+        self, env, monkeypatch
+    ):
+        """A 403 from the pulls API is not 'this PR is still open'.
+
+        Swallowing it would silently drop the proposal from the sweep —
+        the same shape of false-clean this whole change removes.
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [("mctl-web/proposals/issue-66-x/.status.yaml", "sha-rl")]
+                    ),
+                )
+            if "/git/blobs/" in url:
+                import base64 as _b64
+
+                body = (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                return httpx.Response(403, text="API rate limit exceeded")
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(discover_and_project, "")
+        assert "403" in str(excinfo.value)
+
+    async def test_one_undecodable_blob_does_not_fail_the_whole_sweep(
+        self, env, monkeypatch
+    ):
+        """A corrupt blob is one proposal's defect, not the sweep's.
+
+        _read_blob wrapped the decode failure in ProposalListingError, which
+        the per-file skip does not catch — so a single unreadable
+        .status.yaml failed the whole tick, and kept failing it every 15
+        minutes, since the retry re-reads the same bad blob (agy P2).
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [
+                            ("mctl-web/proposals/issue-1-corrupt/.status.yaml", "sha-corrupt"),
+                            ("mctl-web/proposals/issue-66-good/.status.yaml", "sha-ok"),
+                        ]
+                    ),
+                )
+            if url.endswith("sha-corrupt"):
+                # Not valid base64: one character more than a multiple of 4.
+                return httpx.Response(200, json={"content": "abcde"})
+            if "/git/blobs/" in url:
+                import base64 as _b64
+
+                body = (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                return httpx.Response(200, json={"merged": True, "state": "closed"})
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        result = await env.run(discover_and_project, "")
+
+        assert [p.slug for p in result.projections] == ["issue-66-good"]
+        assert result.total_inspected == 1
+
+    async def test_a_malformed_pr_payload_is_retryable_not_a_bare_valueerror(
+        self, env, monkeypatch
+    ):
+        """A 200 with a broken body is transport noise, not a verdict.
+
+        Left bare, the ValueError would read like the per-file skip signal
+        list_proposal_refs uses for a corrupt status file (agy P3).
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+        from orchestrator.temporal.activities.proposals import ProposalListingError
+
+        self._clear_cache()
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [("mctl-web/proposals/issue-66-x/.status.yaml", "sha-j")]
+                    ),
+                )
+            if "/git/blobs/" in url:
+                import base64 as _b64
+
+                body = (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                return httpx.Response(200, text="<html>gateway hiccup</html>")
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(ProposalListingError):
+            await env.run(discover_and_project, "")

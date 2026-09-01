@@ -42,6 +42,17 @@ replicates the existing read-only semantics:
 1. Discover every non-terminal `.status.yaml` across
    `agents-state/<svc>/proposals/<slug>/`.
 2. Group proposals by service, preserving on-disk order.
+
+   > **Amended 2026-09-01 (#270).** "Across `agents-state/...`" was
+   > implemented as a filesystem walk of the Argo pod's gitops clone, which
+   > the Temporal worker deliberately does not have. Both activities took
+   > their `not state_dir.is_dir()` branch and returned empty on every tick
+   > from 2026-08-06 — when the Argo reconcile cron was deleted as
+   > "migrated" — onwards. Discovery now reads gitops over the GitHub API
+   > (git-trees for the listing, blobs cached by SHA), the same rule
+   > `find_proposal_slug` and `get_pr_state` already follow. A named
+   > `state_dir_path` still reads a local checkout, for Argo and the tests.
+
 3. For each proposal in an actionable status: read its canonical PR state
    from GitHub and project that onto local status.
 4. Detect **orphans** — proposals whose status says they should be in flight
