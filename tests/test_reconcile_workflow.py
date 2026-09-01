@@ -17,7 +17,8 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
-from orchestrator.temporal.activities.discovery import ReconcileDiscoveryResult
+from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.discovery import ProposalProjection, ReconcileDiscoveryResult
 from orchestrator.temporal.activities.orphans import OrphanDetectionResult, OrphanSignal
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
 
@@ -32,12 +33,26 @@ async def env():
         yield env
 
 
-def _fake_activities(*, active_ids: list[str] | None = None, visibility_fails: bool = False):
+def _fake_activities(
+    *,
+    active_ids: list[str] | None = None,
+    visibility_fails: bool = False,
+    projections: list[ProposalProjection] | None = None,
+    submit_fails: bool = False,
+):
     received: dict = {}
+    received["submits"] = []
 
     @activity.defn(name="discover_and_project")
     async def fake_discover_and_project(state_dir_path: str) -> ReconcileDiscoveryResult:
-        return ReconcileDiscoveryResult(total_inspected=1, projections=[])
+        return ReconcileDiscoveryResult(total_inspected=1, projections=projections or [])
+
+    @activity.defn(name="submit_and_wait")
+    async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+        received["submits"].append(input)
+        if submit_fails:
+            raise ApplicationError("argo unavailable", non_retryable=True)
+        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
 
     @activity.defn(name="list_active_dev_loop_ids")
     async def fake_list_active_dev_loop_ids() -> list[str]:
@@ -63,7 +78,30 @@ def _fake_activities(*, active_ids: list[str] | None = None, visibility_fails: b
             ],
         )
 
-    return [fake_discover_and_project, fake_list_active_dev_loop_ids, fake_detect_orphans], received
+    return [
+        fake_discover_and_project,
+        fake_list_active_dev_loop_ids,
+        fake_detect_orphans,
+        fake_submit_and_wait,
+    ], received
+
+
+async def _run(env, activities):
+    """Run one tick against fake activities. Mirrors the inline setup the
+    older tests use; the newer ones share it rather than repeat it."""
+    async with Worker(
+        env.client,
+        task_queue=TASK_QUEUE,
+        workflows=[ReconcileWorkflow],
+        activities=activities,
+    ):
+        return await env.client.execute_workflow(
+            ReconcileWorkflow.run,
+            ReconcileWorkflowInput(state_dir_path="/tmp/state"),
+            id=f"reconcile-test-{uuid.uuid4()}",
+            task_queue=TASK_QUEUE,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
 
 
 class TestReconcileWorkflow:
@@ -116,3 +154,75 @@ class TestReconcileWorkflow:
         assert "visibility" in result.orphans.skipped_reason
         # Discovery still ran and is reported.
         assert result.discovery.total_inspected == 1
+
+
+DRIFT = [
+    ProposalProjection(
+        service="mctl-telegram",
+        slug="issue-412-read-only-mcp-jwt",
+        current_status="implemented",
+        projected_status="merged",
+        pr_url="https://github.com/mctlhq/mctl-telegram/pull/414",
+        notes="PR mctlhq/mctl-telegram#414 merged on GitHub",
+    )
+]
+
+
+class TestReconcileApplies:
+    """The write half (#270): discovery found drift, something has to write it.
+
+    Discovery is read-only and the worker has no gitops checkout, so the
+    only way a projection becomes a commit is the mctl-agents-reconcile
+    CWFT. Before this, ReconcileWorkflow logged the drift and dropped it.
+    """
+
+    async def test_drift_is_submitted_to_the_reconcile_cwft(self, env):
+        acts, received = _fake_activities(projections=DRIFT)
+
+        result = await _run(env, acts)
+
+        assert [i.operation for i in received["submits"]] == ["mctl-agents-reconcile"]
+        assert result.applied is not None
+        assert result.applied.workflow_name == "mctl-agents-reconcile-fake"
+
+    async def test_the_submit_is_never_a_dry_run(self, env):
+        """A dry run would read everything, report success and write nothing
+        — #270 exactly, and invisible from this side."""
+        acts, received = _fake_activities(projections=DRIFT)
+
+        await _run(env, acts)
+
+        assert received["submits"][0].params["dry_run"] == "false"
+
+    async def test_a_clean_tick_submits_nothing(self, env):
+        """No drift means no clone, no ~200 GitHub reads, and no turn at the
+        shared write mutex — every 15 minutes, to write nothing."""
+        acts, received = _fake_activities(projections=[])
+
+        result = await _run(env, acts)
+
+        assert received["submits"] == []
+        assert result.applied is None
+
+    async def test_a_failed_submit_does_not_fail_the_tick(self, env):
+        """The drift is still there and the next tick re-derives it; failing
+        here would turn a busy mutex into a red schedule."""
+        acts, received = _fake_activities(projections=DRIFT, submit_fails=True)
+
+        result = await _run(env, acts)
+
+        assert result.applied is None
+        assert result.discovery.projections, "the finding must survive the failed write"
+        assert len(received["submits"]) >= 1
+
+    async def test_a_visibility_failure_still_writes_the_drift(self, env):
+        """Orphan detection needs the active DevLoop set; projecting merged
+        PRs onto .status.yaml does not. Dropping the write here would let a
+        Temporal blip silently cost a tick of drift correction."""
+        acts, received = _fake_activities(projections=DRIFT, visibility_fails=True)
+
+        result = await _run(env, acts)
+
+        assert result.orphans.skipped_reason is not None
+        assert [i.operation for i in received["submits"]] == ["mctl-agents-reconcile"]
+        assert result.applied is not None
