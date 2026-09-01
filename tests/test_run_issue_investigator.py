@@ -2279,3 +2279,40 @@ def test_a_directory_swapped_in_during_publish_is_removed_not_stranded(
     assert (first.proposal_dir / "notes.md").read_text() == "the previous proposal"
     assert not (first.proposal_dir / "attacker.txt").exists()
     assert list((tmp_path / "mctl-telegram").glob(".aside-*")) == []
+
+
+def test_carry_forward_does_not_read_through_a_swapped_source(tmp_path, monkeypatch):
+    """_carry_forward decided `kept` was a regular file by lstat; a plain
+    open() resolves the name a second time, so a source swapped for a
+    symlink in between had its target read and copied in (agy P1 on #247)."""
+    secret = tmp_path / "secret"
+    secret.write_text("not the proposal's content")
+
+    live = tmp_path / "live"
+    live.mkdir()
+    source = live / "notes.md"
+    source.write_text("carried")
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    real_open = run_issue_investigator.os.open
+    swapped = []
+
+    def _swap_the_source(path, flags, *a, **kw):
+        # Fires on the destination create, i.e. after `kept` was inspected
+        # and just before it is opened.
+        if str(path).endswith("staging/notes.md") and not swapped:
+            swapped.append(True)
+            source.unlink()
+            source.symlink_to(secret)
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(run_issue_investigator.os, "open", _swap_the_source)
+    with pytest.raises(OSError):
+        run_issue_investigator._carry_forward(live, staging)
+    monkeypatch.setattr(run_issue_investigator.os, "open", real_open)
+
+    assert not (staging / "notes.md").exists() or (
+        staging / "notes.md"
+    ).read_text() != "not the proposal's content"

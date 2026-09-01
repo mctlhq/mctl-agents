@@ -350,9 +350,15 @@ def _copy_file_exclusive(src: Path, dst: Path) -> None:
     O_EXCL, so a symlink planted at dst between the caller's existence
     check and this call makes the create fail instead of following it.
     """
+    # The SOURCE is opened O_NOFOLLOW too. _carry_forward decided `kept`
+    # was a regular file by lstat, and a plain open() would resolve the
+    # name a second time — so a source swapped for a symlink in between
+    # would have its target read and copied in instead (agy P1 on #247).
+    # O_NONBLOCK for the FIFO case, same reason as _copy_mode_nofollow.
     fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
     try:
-        with os.fdopen(fd, "wb") as out, open(src, "rb") as f_in:
+        src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "wb") as out, os.fdopen(src_fd, "rb") as f_in:
             shutil.copyfileobj(f_in, out)
     except BaseException:
         with contextlib.suppress(OSError):
