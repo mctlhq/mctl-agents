@@ -8,6 +8,7 @@ mctl-api's actual request/response shapes are asserted against directly
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -1469,3 +1470,102 @@ class TestReconcileReadsGitHub:
         with pytest.raises(Exception) as excinfo:
             await env.run(detect_orphans, str(tmp_path / "nope"), [])
         assert "does not exist" in str(excinfo.value)
+
+    async def test_a_failed_read_lets_its_siblings_finish_first(self, env, monkeypatch):
+        """gather must not strand in-flight reads on the first failure.
+
+        Plain gather raises immediately without cancelling siblings, so the
+        enclosing `async with httpx.AsyncClient` closed the pool under reads
+        that were still running — each then failed into nobody's hands
+        (claude P3 + agy P2 on #271). Here the second blob 500s; the first
+        must still have completed against a live client.
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        finished: list[str] = []
+
+        # The slow read is the point: it must still be in flight when the
+        # fast one fails. Without the wait both reads complete before the
+        # exception propagates and a broken gather looks identical to a
+        # fixed one — this test passed against plain gather until the
+        # delay was added.
+        async def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [
+                            ("mctl-web/proposals/issue-1-a/.status.yaml", "sha-a"),
+                            ("mctl-web/proposals/issue-2-b/.status.yaml", "sha-boom"),
+                        ]
+                    ),
+                )
+            if url.endswith("sha-boom"):
+                return httpx.Response(500, text="boom")
+            if "/git/blobs/" in url:
+                await asyncio.sleep(0.1)
+                finished.append(url.rsplit("/", 1)[-1])
+                import base64 as _b64
+
+                body = "status: implemented\n"
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(discover_and_project, "")
+
+        # The failure surfaces with its own type, so Temporal still retries…
+        assert "500" in str(excinfo.value)
+        # …and the sibling read completed rather than being stranded.
+        assert finished == ["sha-a"]
+
+    async def test_a_rate_limited_pr_read_raises_instead_of_reading_clean(
+        self, env, monkeypatch
+    ):
+        """A 403 from the pulls API is not 'this PR is still open'.
+
+        Swallowing it would silently drop the proposal from the sweep —
+        the same shape of false-clean this whole change removes.
+        """
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+
+        def handler(request):
+            url = str(request.url)
+            if "/git/trees/" in url:
+                return httpx.Response(
+                    200,
+                    json=self._tree(
+                        [("mctl-web/proposals/issue-66-x/.status.yaml", "sha-rl")]
+                    ),
+                )
+            if "/git/blobs/" in url:
+                import base64 as _b64
+
+                body = (
+                    "status: implemented\n"
+                    "pr: https://github.com/mctlhq/mctl-web/pull/76\n"
+                )
+                return httpx.Response(
+                    200, json={"content": _b64.b64encode(body.encode()).decode()}
+                )
+            if "/pulls/" in url:
+                return httpx.Response(403, text="API rate limit exceeded")
+            raise AssertionError(f"unexpected request {url}")
+
+        _mock_async_client(monkeypatch, handler)
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(Exception) as excinfo:
+            await env.run(discover_and_project, "")
+        assert "403" in str(excinfo.value)

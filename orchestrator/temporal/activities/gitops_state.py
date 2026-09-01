@@ -84,6 +84,28 @@ class PRSnapshot:
     closed_unmerged: bool
 
 
+async def _gather_or_raise(coros: list) -> list:
+    """asyncio.gather that lets every read finish before it raises.
+
+    Plain `gather` propagates the first exception immediately but does NOT
+    cancel its siblings. Here the caller's `async with httpx.AsyncClient`
+    then closes the pool out from under those still-running reads, which
+    fail into nobody's hands — "Task exception was never retrieved" once
+    per stranded read, every 15 minutes, on any transient GitHub hiccup
+    (claude P3 + agy P2 on #271).
+
+    `return_exceptions=True` makes gather wait for all of them, so the
+    client outlives every read that uses it; the first failure is then
+    re-raised with its own type intact, which is what decides whether
+    Temporal retries the activity.
+    """
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
 def _headers(token: str) -> dict[str, str]:
     return {
         "Accept": "application/vnd.github+json",
@@ -235,7 +257,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                     return None
             return ProposalStateRef(service=service, slug=slug, status=status, pr_url=pr_url)
 
-        results = await asyncio.gather(*(one(s, g, sha) for s, g, sha in paths))
+        results = await _gather_or_raise([one(s, g, sha) for s, g, sha in paths])
 
     refs = [r for r in results if r is not None]
     activity.logger.info(
@@ -309,6 +331,6 @@ async def fetch_pr_snapshots(refs: list[ProposalStateRef]) -> dict[tuple[str, st
                 closed_unmerged=closed and not merged,
             )
 
-        await asyncio.gather(*(one(ref, repo, number) for ref, repo, number in wanted))
+        await _gather_or_raise([one(ref, repo, number) for ref, repo, number in wanted])
 
     return snapshots
