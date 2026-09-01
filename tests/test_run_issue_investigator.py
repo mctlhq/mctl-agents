@@ -2078,3 +2078,86 @@ def test_the_status_mode_is_read_once_and_not_re_resolved(tmp_path, monkeypatch)
     # The mode came from the stat already taken, not from a second lookup
     # that would have followed the planted link.
     assert stat.S_IMODE(status_path.stat().st_mode) != stat.S_IRUSR
+
+
+def test_carry_forward_refuses_to_write_through_a_planted_symlink(tmp_path, monkeypatch):
+    """A symlink planted at the destination between the existence check and
+    the copy would have been followed. O_EXCL makes the create fail instead
+    (agy P1 on #247)."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("original")
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "notes.md").write_text("carried")
+
+    real_open = run_issue_investigator.os.open
+    planted = []
+
+    def _plant_between_check_and_create(path, flags, *a, **kw):
+        # Stands in for the background process: the symlink appears after
+        # _carry_forward decided the target was absent.
+        if str(path).endswith("notes.md") and not planted:
+            planted.append(True)
+            pathlib.Path(path).symlink_to(victim)
+        return real_open(path, flags, *a, **kw)
+
+    monkeypatch.setattr(run_issue_investigator.os, "open", _plant_between_check_and_create)
+    with pytest.raises(OSError):
+        run_issue_investigator._carry_forward(live, staging)
+    monkeypatch.setattr(run_issue_investigator.os, "open", real_open)
+
+    assert victim.read_text() == "original", "wrote through the planted link"
+
+
+def test_carry_forward_does_not_chmod_through_a_planted_symlink(tmp_path, monkeypatch):
+    """The swap lands between _is_plain_file saying yes and the mode being
+    applied. copymode re-resolves the path and follows the link; opening
+    O_NOFOLLOW and using fchmod has no second resolution (agy P1 on #247)."""
+    victim = tmp_path / "victim.txt"
+    victim.write_text("x")
+    os.chmod(victim, stat.S_IRUSR | stat.S_IWUSR)
+    before = stat.S_IMODE(victim.stat().st_mode)
+
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "notes.md").write_text("carried")
+    loud = stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP
+    os.chmod(live / "notes.md", loud)
+
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    target = staging / "notes.md"
+    target.write_text("this run's version")
+
+    real_check = run_issue_investigator._is_plain_file
+    swapped = []
+
+    def _swap_right_after_the_check(path):
+        result = real_check(path)
+        if path == target and result and not swapped:
+            swapped.append(True)
+            target.unlink()
+            target.symlink_to(victim)
+        return result
+
+    monkeypatch.setattr(run_issue_investigator, "_is_plain_file", _swap_right_after_the_check)
+    run_issue_investigator._carry_forward(live, staging)
+    monkeypatch.setattr(run_issue_investigator, "_is_plain_file", real_check)
+
+    assert stat.S_IMODE(victim.stat().st_mode) == before, "chmod followed the link"
+
+
+def test_the_status_mode_is_applied_to_the_descriptor(tmp_path, monkeypatch):
+    """Every path-based alternative re-resolves a name inside a directory the
+    agent can write. fchmod has no path to resolve (agy P1 on #247)."""
+    proposal_dir = tmp_path / "proposals" / "issue-58-x"
+    status_path = write_status_yaml(proposal_dir, _issue(number=58))
+
+    probe = tmp_path / "probe"
+    probe.touch()
+    assert stat.S_IMODE(status_path.stat().st_mode) == stat.S_IMODE(probe.stat().st_mode)
+    # And no probe file is left behind in the proposal.
+    assert [q.name for q in proposal_dir.iterdir()] == [".status.yaml"]

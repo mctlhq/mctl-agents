@@ -45,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -280,6 +281,43 @@ class _StagingReplaced(RuntimeError):
     """The agent replaced its own output directory. Never publish that."""
 
 
+def _copy_mode_nofollow(src: Path, dst: Path) -> None:
+    """Apply src's mode to dst without either path being resolved twice.
+
+    shutil.copymode re-resolves both and follows links, so a dst swapped
+    for a symlink between the caller's check and the call had the mode
+    applied to the link's target instead. O_NOFOLLOW + fchmod removes the
+    second resolution rather than narrowing the gap between them.
+    """
+    try:
+        fd = os.open(dst, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        os.fchmod(fd, stat.S_IMODE(os.lstat(src).st_mode))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _copy_file_exclusive(src: Path, dst: Path) -> None:
+    """Copy src to dst, refusing to write through anything already there.
+
+    O_EXCL, so a symlink planted at dst between the caller's existence
+    check and this call makes the create fail instead of following it.
+    """
+    fd = os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    try:
+        with os.fdopen(fd, "wb") as out, open(src, "rb") as f_in:
+            shutil.copyfileobj(f_in, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(dst)
+        raise
+    _copy_mode_nofollow(src, dst)
+
+
 def _is_plain_file(path: Path) -> bool:
     """A regular file, and not a symlink to one."""
     return path.is_file() and not path.is_symlink()
@@ -354,13 +392,13 @@ def _carry_forward(live: Path, staging: Path) -> None:
             # P2 on #247). Same rule as the directory and .status.yaml,
             # applied once here instead of case by case.
             if _is_plain_file(kept) and _is_plain_file(target):
-                shutil.copymode(kept, target)
+                _copy_mode_nofollow(kept, target)
         elif kept.is_symlink():
             os.symlink(os.readlink(kept), target)
         elif kept.is_dir():
             shutil.copytree(kept, target, symlinks=True, ignore=_ignore_special)
         elif kept.is_file():
-            shutil.copy2(kept, target)
+            _copy_file_exclusive(kept, target)
         else:
             # A FIFO, socket or device node. shutil.copy2 would OPEN it,
             # and opening a FIFO for reading blocks until a writer appears
@@ -528,6 +566,33 @@ def _clone_repo(full_repo: str, slug: str) -> Path:
     return wrapper
 
 
+def _status_mode(status_path: Path, proposal_dir: Path) -> int:
+    """The mode a freshly written .status.yaml should carry.
+
+    An existing file keeps its own — someone may have chosen it — read
+    with lstat so a planted symlink contributes nothing. Otherwise what an
+    ordinary open() would produce, discovered by creating a file with
+    O_EXCL and reading its descriptor: NOT by os.umask(0) + restore, which
+    reads the umask by briefly zeroing it process-wide, and not by
+    stat'ing the probe by path afterwards, which resolves it a second
+    time.
+    """
+    try:
+        existing = os.lstat(status_path)
+        if stat.S_ISREG(existing.st_mode):
+            return stat.S_IMODE(existing.st_mode)
+    except OSError:
+        pass
+    probe = proposal_dir / f".mode-probe-{os.getpid()}"
+    fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666)
+    try:
+        return stat.S_IMODE(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(probe)
+
+
 def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
     """Write the initial .status.yaml for an issue-driven proposal.
 
@@ -568,6 +633,12 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
             yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=True)
             f.flush()
             os.fsync(f.fileno())
+            # The mode goes onto the DESCRIPTOR, while it is still open.
+            # Every path-based alternative here re-resolves .status.yaml or
+            # the temp file, and both live in a directory the agent can
+            # write, so the target could be a symlink by the time the call
+            # lands. fchmod has no path to resolve.
+            os.fchmod(f.fileno(), _status_mode(status_path, proposal_dir))
         # mkstemp forces 0600, and os.replace carries that onto the real
         # file: the same scratch-permissions bug the published directory
         # had, one level down and just as invisible (agy P2 on #247).
@@ -583,35 +654,6 @@ def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
         # STAGING, so the directory in question is the 0700 scratch dir
         # whose permissions are exactly what we are trying not to inherit.
         # Deriving from it reproduced 0600 and the test caught it.
-        # ONE lstat, and the mode comes from that same result. Checking
-        # with lstat and then calling shutil.copymode re-resolved the path,
-        # and copymode follows symlinks — so a .status.yaml swapped for a
-        # link to /etc/shadow between the two calls still had that file's
-        # mode copied onto the published status file and committed to
-        # gitops. Not a narrower window: no window, because nothing is
-        # resolved twice (agy P3 on #247, twice).
-        try:
-            existing = os.lstat(status_path)
-        except OSError:
-            existing = None
-        if existing is not None and stat.S_ISREG(existing.st_mode):
-            os.chmod(tmp_path, stat.S_IMODE(existing.st_mode))
-        else:
-            # Discovered by creating a file and looking at it, NOT by
-            # os.umask(0) + restore. That idiom reads the umask by briefly
-            # setting it to zero, and the window is process-wide: anything
-            # else creating a file inside it gets 0666 (agy P2 on #247).
-            # This module is a single-shot CLI in the agent container and
-            # tests/test_worker_isolation.py keeps it out of the worker,
-            # so the window is not currently reachable — but a
-            # world-writable file is not the kind of thing to leave
-            # resting on an import-graph invariant.
-            probe = tmp_path.with_name(tmp_path.name + ".probe")
-            probe.touch(exist_ok=False)  # 0o666 & ~umask, applied by the OS
-            try:
-                shutil.copymode(probe, tmp_path)
-            finally:
-                probe.unlink(missing_ok=True)
         os.replace(tmp_path, status_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
