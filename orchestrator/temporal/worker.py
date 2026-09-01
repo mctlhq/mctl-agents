@@ -9,10 +9,15 @@ Deployed as its own service (mctl-agents-worker, ingress disabled).
 """
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
+import signal
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from temporalio.client import (
     Client,
@@ -42,7 +47,13 @@ from orchestrator.temporal.activities.proposals import find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
 from orchestrator.temporal.activities.visibility import VisibilityActivities
-from orchestrator.temporal.constants import TASK_QUEUE
+from orchestrator.temporal.constants import (
+    CONTROL_MAX_CONCURRENT_ACTIVITIES,
+    CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
+    EXECUTION_MAX_CONCURRENT_ACTIVITIES,
+    EXECUTION_TASK_QUEUE,
+    TASK_QUEUE,
+)
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.docs_delta import DocsDeltaWorkflow
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
@@ -60,6 +71,13 @@ INCIDENTS_WORKFLOW_ID = "incidents-mctl-agents"
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
+
+# How long to let the surviving workers drain when a worker died on its own
+# rather than on a signal. Short on purpose: on that path the drain is a
+# courtesy and the restart is the fix, so the cap only has to be long enough
+# for cancelled activities to unwind. A signalled shutdown is not capped —
+# there Kubernetes already holds the stopwatch.
+CRASH_DRAIN_TIMEOUT_SECONDS = 20.0
 
 
 async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, label: str) -> None:
@@ -81,7 +99,17 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
     except ScheduleAlreadyRunningError:
         pass
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not register Temporal schedule %s: %s", schedule_id, exc)
+        # Deliberately not fatal — see the test in test_worker_schedules.py.
+        # ERROR, not WARNING: the concern this swallow trades away is a
+        # worker that comes up healthy and never registers reconcile or
+        # intake for its whole lifetime (agy P2 on #249). Riding out a blip
+        # is worth it; doing so quietly is not.
+        logger.error(
+            "Temporal schedule %s NOT registered (%s) — this worker is "
+            "serving its task queue but its schedules are not current",
+            schedule_id,
+            exc,
+        )
         return
 
     converged = False
@@ -111,7 +139,12 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         else:
             logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not converge Temporal schedule %s: %s", schedule_id, exc)
+        logger.error(
+            "Temporal schedule %s NOT converged (%s) — its live spec may "
+            "differ from the one declared here",
+            schedule_id,
+            exc,
+        )
 
 
 async def setup_schedules(client: Client) -> None:
@@ -163,40 +196,279 @@ async def setup_schedules(client: Client) -> None:
     await _ensure_schedule(client, INCIDENTS_SCHEDULE_ID, incidents_schedule, "IncidentLoopWorkflow")
 
 
+ROLES = ("all", "control", "execution")
+
+
+@dataclass(frozen=True)
+class WorkerPlan:
+    """What one role registers, and where. See ADR-008.
+
+    A plain description rather than a Worker, so the routing decision — the
+    part with the actual consequences — is a pure function that can be
+    asserted on without a live Temporal connection (Worker() insists on a
+    real bridge client and dials on construction).
+    """
+
+    task_queue: str
+    workflows: list[type]
+    activities: list[Callable[..., Any]]
+    max_concurrent_activities: int | None = None
+    max_concurrent_workflow_tasks: int | None = None
+
+    @property
+    def activity_names(self) -> set[str]:
+        return {getattr(a, "__temporal_activity_definition").name for a in self.activities}
+
+
+def owns_schedules(role: str) -> bool:
+    """Does this role create and converge the Temporal schedules?
+
+    Only a role that runs the workflows may assert their specs. An
+    execution worker declaring a cadence for workflows it does not run is
+    a lie waiting to drift — and since _ensure_schedule converges an
+    existing spec in place, that lie would actively overwrite the truth.
+
+    A named function rather than an inline check in main(), for the same
+    reason worker_plans exists: main() needs a live Temporal client, so
+    anything decided inside it is untestable (claude P3 on #249).
+    """
+    return role in ("all", "control")
+
+
+def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan]:
+    """The queue/registration layout for one role — one plan per queue.
+
+    A list, because `all` must poll BOTH queues. It is the documented
+    rollback target, and after the routing flip patched histories schedule
+    submit_and_wait onto the execution queue: an `all` process listening
+    only on the control queue would leave those activities with no poller
+    until they time out, so collapsing the split deployments back would
+    not be a rollback at all (codex P1 on #249).
+
+    `all` is the default and is byte-for-byte the single-queue worker this
+    repo has always run — same queue, same activities, no slot limits — so
+    this change is releasable on its own and a rollback is a values edit
+    rather than a code revert.
+
+    Workflows go on the control queue only. The execution worker never
+    needs them: it services activities scheduled BY those workflows, and a
+    workflow task is short by construction, so putting them on the
+    long-holding queue would reintroduce the starvation the split removes.
+    """
+    if role not in ROLES:
+        raise SystemExit(f"--role must be one of {', '.join(ROLES)}, got {role!r}")
+
+    short_activities: list[Callable[..., Any]] = [
+        resolve_agent_release,
+        record_execution,
+        find_proposal_slug,
+        get_pr_state,
+        resolve_deploy_target,
+        get_release_after,
+        get_deploy_status,
+        list_service_incidents,
+        discover_and_project,
+        detect_orphans,
+        visibility.list_active_dev_loop_ids,
+        poll_issues_activity,
+        process_docs_delta_activity,
+    ]
+    workflows: list[type] = [
+        DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow
+    ]
+
+    execution_plan = WorkerPlan(
+        task_queue=EXECUTION_TASK_QUEUE,
+        workflows=[],
+        activities=[submit_and_wait],
+        max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
+    )
+
+    if role == "execution":
+        return [execution_plan]
+    if role == "control":
+        return [WorkerPlan(
+            task_queue=TASK_QUEUE,
+            workflows=workflows,
+            # submit_and_wait stays registered here too: nothing routes to
+            # the execution queue until the patched flip lands, so removing
+            # it now would strand every Argo submit in the gap between the
+            # two PRs.
+            activities=[*short_activities, submit_and_wait],
+            max_concurrent_activities=CONTROL_MAX_CONCURRENT_ACTIVITIES,
+            max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
+        )]
+    # `all`: one process, both queues, no limits — the pre-split shape plus
+    # a poller for the queue the routing flip starts using.
+    return [
+        WorkerPlan(
+            task_queue=TASK_QUEUE,
+            workflows=workflows,
+            activities=[*short_activities, submit_and_wait],
+        ),
+        execution_plan,
+    ]
+
+
+def build_worker(client: Client, plan: WorkerPlan) -> Worker:
+    """Turn a plan into a Worker. Kept trivial on purpose — everything
+    worth testing lives in worker_plans()."""
+    kwargs: dict[str, Any] = {}
+    if plan.max_concurrent_activities is not None:
+        kwargs["max_concurrent_activities"] = plan.max_concurrent_activities
+    if plan.max_concurrent_workflow_tasks is not None:
+        kwargs["max_concurrent_workflow_tasks"] = plan.max_concurrent_workflow_tasks
+    return Worker(
+        client,
+        task_queue=plan.task_queue,
+        workflows=plan.workflows,
+        activities=plan.activities,
+        **kwargs,
+    )
+
+
 async def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--role",
+        default=os.environ.get("WORKER_ROLE", "all"),
+        choices=ROLES,
+        help=(
+            "which half of the split this process serves (ADR-008). "
+            "'all' — one process, one queue, as before (default)."
+        ),
+    )
+    args = parser.parse_args()
+
     address = os.environ.get("TEMPORAL_ADDRESS", "temporal-frontend.temporal.svc.cluster.local:7233")
     namespace = os.environ.get("TEMPORAL_NAMESPACE", "mctl-agents")
 
     logger.info("connecting to Temporal at %s (namespace=%s)", address, namespace)
     client = await Client.connect(address, namespace=namespace)
 
-    await setup_schedules(client)
+    if owns_schedules(args.role):
+        await setup_schedules(client)
 
     visibility = VisibilityActivities(client)
+    plans = worker_plans(args.role, visibility)
+    workers = [build_worker(client, plan) for plan in plans]
 
-    worker = Worker(
-        client,
-        task_queue=TASK_QUEUE,
-        workflows=[DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow],
-        activities=[
-            resolve_agent_release,
-            submit_and_wait,
-            record_execution,
-            find_proposal_slug,
-            get_pr_state,
-            resolve_deploy_target,
-            get_release_after,
-            get_deploy_status,
-            list_service_incidents,
-            discover_and_project,
-            detect_orphans,
-            visibility.list_active_dev_loop_ids,
-            poll_issues_activity,
-            process_docs_delta_activity,
-        ],
+    logger.info(
+        "worker starting: role=%s task_queues=%s",
+        args.role,
+        ", ".join(plan.task_queue for plan in plans),
     )
-    logger.info("worker starting on task queue %s", TASK_QUEUE)
-    await worker.run()
+    await run_until_signalled(workers)
+
+
+async def run_until_signalled(workers: list[Worker]) -> None:
+    """Run every worker until SIGTERM/SIGINT or a worker dies, then drain.
+
+    The Python SDK installs no signal handlers (unlike some of the other
+    Temporal SDKs — `add_signal_handler` appears nowhere in temporalio),
+    so SIGTERM used to hit Python's default and end the process outright:
+    no drain, in-flight activities cut mid-flight. That was already true
+    of the single worker; a queue split whose whole purpose is rollouts
+    should not leave rollouts ungraceful.
+
+    A worker that dies on its own must still take the process down. The
+    pre-split code got that for free from a bare `await worker.run()`. Two
+    workers make it something that has to be arranged: if only the control
+    worker's poll loop dies — a dropped connection, an auth failure — the
+    execution worker keeps the process alive and looking healthy while
+    reconcile, intake and every DevLoop go dark, with nothing to restart
+    because nothing crashed. So the shutdown signal is RACED against the
+    run tasks and a worker's failure is re-raised (claude P1 / codex P1 on
+    #249).
+
+    Explicit tasks rather than `async with`: the SDK's context manager
+    does propagate a fatal error, but by cancelling whichever task entered
+    it, which is subtle enough under AsyncExitStack that a reader cannot
+    check it locally. `run()` plus `shutdown()` is the SDK's own
+    documented pair and says what it does.
+    """
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except NotImplementedError:  # pragma: no cover — non-POSIX only
+            pass
+
+    run_tasks = [asyncio.create_task(worker.run()) for worker in workers]
+    signal_task = asyncio.create_task(shutdown.wait())
+    try:
+        done, _ = await asyncio.wait(
+            [*run_tasks, signal_task], return_when=asyncio.FIRST_COMPLETED
+        )
+    finally:
+        signal_task.cancel()
+
+    crashed = signal_task not in done
+    if crashed:
+        # Nobody asked for this shutdown, so nothing is holding a stopwatch
+        # over it: there was no SIGTERM, so there is no SIGKILL coming 30 s
+        # later either. An unbounded drain here can only end one way — the
+        # pod stays Running with a queue nobody polls, which is the exact
+        # state the race above exists to escape. Every activity is async
+        # today and dies on the first await after cancellation, so the
+        # drain is quick; that is a property of the current activity set,
+        # not of this function, and one sync activity would silently make
+        # it untrue (agy P1 on #249, whose reasoning assumed the drain
+        # already blocks for hours — it does not, but nothing stops it
+        # from starting to).
+        logger.error(
+            "a worker stopped on its own; draining with a %ss cap, then crashing",
+            CRASH_DRAIN_TIMEOUT_SECONDS,
+        )
+    else:
+        logger.info("draining %d worker(s)", len(workers))
+
+    # shutdown() is safe to call repeatedly and on a worker that already
+    # stopped, so this needs no bookkeeping about which one finished first.
+    #
+    # ONE deadline over the shutdowns AND the run tasks, rather than a
+    # bounded wait on each. Two sequential waits let a slow drain spend
+    # the cap twice — 40 s under a 20 s policy — and, worse, the second
+    # one was `asyncio.wait`, which does not raise on timeout: it returns
+    # (done, pending) quietly, so the `except TimeoutError` that was
+    # supposed to log why the pod is about to die could never fire (agy P3
+    # on #249). The pending set is the signal; ask it directly.
+    timeout = CRASH_DRAIN_TIMEOUT_SECONDS if crashed else None
+    shutdowns = [asyncio.ensure_future(worker.shutdown()) for worker in workers]
+    _, pending = await asyncio.wait([*shutdowns, *run_tasks], timeout=timeout)
+    if pending:
+        logger.error(
+            "%d task(s) still running %ss after shutdown was requested; "
+            "crashing without them",
+            len(pending),
+            timeout,
+        )
+        for task in pending:
+            task.cancel()
+
+    # A shutdown() that raised is not itself fatal — the worker failure
+    # below is the real story — but its exception has to be retrieved, or
+    # asyncio logs it as never-retrieved noise right as the pod dies.
+    for task in shutdowns:
+        if task.done() and not task.cancelled():
+            task.exception()
+
+    for task in run_tasks:
+        if not task.done() or task.cancelled():
+            continue
+        exc = task.exception()
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            raise exc
+
+    if crashed:
+        # run() returning cleanly without a signal is still fatal: that
+        # queue has stopped being polled and only a restart resumes it.
+        raise RuntimeError(
+            "a worker stopped polling without raising and without a shutdown "
+            "signal — crashing so the pod restarts"
+        )
+
 
 
 if __name__ == "__main__":
