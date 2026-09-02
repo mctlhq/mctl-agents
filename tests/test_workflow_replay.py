@@ -44,6 +44,14 @@ and nothing else routed. Neither half alone is enough — the marker without
 the queue would pass if `patched()` were called and its result ignored, and
 the queue without the marker would pass on an unguarded change.
 
+A `*.patched.json` describes a workflow that started AFTER the flip, and
+only that. It is not a picture of what a running dev loop does: `patched()`
+memoizes, so an execution that predates the marker keeps taking the
+unpatched branch for the rest of its life and never appears in a fixture of
+this shape at all. That half is pinned by
+`tests/test_patch_memoization.py`, and it is the half that decides how to
+read the queue metrics during the soak.
+
 ## Why this file asserts on fixture CONTENT, not just on replay
 
 A `*.prepatch.json` is evidence about what an older version scheduled, and it
