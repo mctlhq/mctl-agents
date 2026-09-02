@@ -703,14 +703,22 @@ def test_reconcile_never_reads_github_for_a_proposal_without_a_source_block(
     gh.assert_not_called()
 
 
-def test_reconcile_falls_back_to_missing_pr_when_github_cannot_be_read(
+def test_an_unreadable_source_issue_leaves_the_missing_pr_diagnosis_alone(
     tmp_path,
 ) -> None:
-    """Fail-open: an unreadable GitHub is not evidence about the proposal.
+    """Fail-open: an unreadable source issue is not evidence about the PR.
 
     Same reasoning as the `discovered_url` guard — a transient read failure
-    must never move a durable status, and must never escape as an exception
-    that aborts the whole reconcile sweep partway through.
+    must never invent a status, and must never escape as an exception that
+    aborts the whole reconcile sweep partway through.
+
+    Scoped deliberately, and renamed after agy read the old name
+    ("...when_github_cannot_be_read") as a claim that an outage may
+    overwrite an `implemented` proposal. It does not say that: the absence
+    of a PR is STIPULATED here by the two mocks, and the only failing read
+    is the source issue. Whether a transient failure in PR *discovery*
+    should be allowed to write `missing-pr` at all is a real, separate and
+    pre-existing question — mctl-agents#281.
     """
     ref = make_ref(
         tmp_path, service="mctl-academy", slug="gh-down",
