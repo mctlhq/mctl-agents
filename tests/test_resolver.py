@@ -448,3 +448,43 @@ def test_an_absent_fixture_tree_is_named_not_reported_as_a_missing_profile(monke
     assert "no fixtures to resolve against" in message
     # The old, misleading message must not be what surfaces.
     assert "missing execution profile" not in message
+
+
+def test_the_recorded_hash_describes_the_bytes_that_were_parsed(tmp_path, monkeypatch):
+    """Parse and hash must come from ONE read of the file.
+
+    Reading twice — once for `yaml.safe_load`, once for the hash — lets the
+    two disagree if the file changes in between, and the plan then pins a
+    `content_hash` describing bytes it was not built from. That pin is the
+    whole provenance claim, so a pin that can describe different content is
+    not a weaker guarantee but the absence of one (claude P3 on #234).
+
+    Simulated by making the file's content change between reads: `read_bytes`
+    is stubbed to return different content on each call. With a single read
+    the definition simply reflects whichever bytes it got; with two, the
+    parsed name and the recorded hash come from different documents.
+    """
+    built = _build_fixture_set(tmp_path, monkeypatch)
+    definition_path = built["definition_path"]
+    original = definition_path.read_bytes()
+    mutated = original.replace(b"name: " + _AGENT.encode(), b"name: " + _AGENT.encode() + b"-changed")
+    assert mutated != original  # the premise: the swap really is a different document
+
+    real_read_bytes = Path.read_bytes
+    calls = {"n": 0}
+
+    def flip_flopping_read(self, *args, **kwargs):
+        if self == definition_path:
+            calls["n"] += 1
+            return original if calls["n"] == 1 else mutated
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", flip_flopping_read)
+
+    definition = resolver.load_definition(_AGENT)
+
+    # Exactly one read of this file, so the hash cannot describe the other
+    # document — and it matches a hash computed over the bytes that produced
+    # the parsed name.
+    assert calls["n"] == 1
+    assert definition.content_hash == "sha256:" + hashlib.sha256(original).hexdigest()

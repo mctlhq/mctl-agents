@@ -101,6 +101,9 @@ class AgentDefinition:
     execution_profile_name: str
     execution_profile_compatibility: str
     path: Path
+    # Hashed from the same bytes that were parsed, not re-read later — see
+    # _read_yaml_and_hash. This is the value the release binding pins.
+    content_hash: str
 
 
 @dataclass(frozen=True)
@@ -203,20 +206,49 @@ class ExecutionPlan:
         print(f"[resolver] execution_plan={json.dumps(self.to_log_dict(), sort_keys=True)}")
 
 
-def _content_hash(path: Path) -> str:
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _read_yaml(path: Path) -> dict[str, Any]:
+def _read_bytes(path: Path) -> bytes:
     try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return path.read_bytes()
     except OSError as exc:
         raise ResolverError(f"could not read {path}: {exc}") from exc
+
+
+def _hash_bytes(raw: bytes) -> str:
+    return "sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def _content_hash(path: Path) -> str:
+    return _hash_bytes(_read_bytes(path))
+
+
+def _read_yaml_and_hash(path: Path) -> tuple[dict[str, Any], str]:
+    """Parse `path` and hash it from the SAME bytes.
+
+    Reading twice — once for `yaml.safe_load`, once for the hash — lets the
+    two disagree if the file changes in between, and what the resolver would
+    then record is a `content_hash` describing bytes it did not parse. That
+    hash is the entire provenance claim: a plan pins it, and `execute()`
+    fails closed when a file drifts out from under its release binding. A
+    pin that can describe different content than the plan was built from is
+    not a weaker guarantee, it is the absence of one (claude P3 on #234).
+
+    Narrow window and checked-in files, so this is cheap insurance rather
+    than a live bug — but the fix is one read instead of two.
+    """
+    raw = _read_bytes(path)
+    try:
+        document = yaml.safe_load(raw.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ResolverError(f"{path}: not valid UTF-8: {exc}") from exc
     except yaml.YAMLError as exc:
         raise ResolverError(f"{path}: invalid YAML: {exc}") from exc
     if not isinstance(document, dict):
         raise ResolverError(f"{path}: root must be a mapping")
-    return document
+    return document, _hash_bytes(raw)
+
+
+def _read_yaml(path: Path) -> dict[str, Any]:
+    return _read_yaml_and_hash(path)[0]
 
 
 def _require_mapping(value: Any, *, path: Path, field_path: str) -> dict[str, Any]:
@@ -247,7 +279,7 @@ def load_definition(agent: str) -> AgentDefinition:
     path = DEFINITIONS_DIR / agent / "agent.yaml"
     if not path.is_file():
         raise ResolverError(f"unknown agent {agent!r}: no manifest at {path}")
-    document = _read_yaml(path)
+    document, content_hash = _read_yaml_and_hash(path)
     api_version = document.get("apiVersion")
     if api_version != SUPPORTED_DEFINITION_API_VERSION:
         raise ResolverError(
@@ -290,6 +322,7 @@ def load_definition(agent: str) -> AgentDefinition:
         execution_profile_name=profile_name,
         execution_profile_compatibility=compatibility,
         path=path,
+        content_hash=content_hash,
     )
 
 
@@ -301,7 +334,7 @@ def load_profile(name: str) -> ExecutionProfile:
     path = PROFILES_FIXTURE_DIR / f"{name}.yaml"
     if not path.is_file():
         raise ResolverError(f"missing execution profile {name!r}: no fixture at {path}")
-    document = _read_yaml(path)
+    document, content_hash = _read_yaml_and_hash(path)
     if document.get("apiVersion") != SUPPORTED_PROFILE_API_VERSION:
         raise ResolverError(f"{path}: unsupported profile apiVersion {document.get('apiVersion')!r}")
     if document.get("kind") != "ExecutionProfile":
@@ -383,7 +416,7 @@ def load_profile(name: str) -> ExecutionProfile:
         approval=approval,
         evidence=tuple(evidence),
         path=path,
-        content_hash=_content_hash(path),
+        content_hash=content_hash,
     )
 
 
@@ -444,9 +477,9 @@ def _model_policy_version() -> str:
     the declared schema `version:` plus a content hash, so a policy edit
     that changes model routing without bumping `version:` still changes the
     identifier a plan pins."""
-    document = _read_yaml(DEFAULT_POLICY_PATH)
+    document, content_hash = _read_yaml_and_hash(DEFAULT_POLICY_PATH)
     schema_version = document.get("version")
-    return f"v{schema_version}+{_content_hash(DEFAULT_POLICY_PATH)}"
+    return f"v{schema_version}+{content_hash}"
 
 
 def _under_repo_root(value: str) -> Path:
@@ -558,7 +591,7 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
             f"unknown reference: release binding definition.name {binding.definition_name!r} does "
             f"not match resolved definition {definition.name!r}"
         )
-    definition_content_hash = _content_hash(definition.path)
+    definition_content_hash = definition.content_hash
     if binding.definition_version != definition_content_hash:
         raise ResolverError(
             f"ambiguous version: release binding definition.version {binding.definition_version!r} "
