@@ -672,8 +672,33 @@ SOURCE_RECHECKED_FAILURE_CODES = frozenset(
 )
 
 
-def _source_issue_failure(status_data: dict[str, Any]) -> dict[str, str] | None:
-    """Failure block for a PR-less proposal whose source issue is closed.
+@dataclass(frozen=True)
+class SourceIssueVerdict:
+    """What the source issue says about a PR-less proposal.
+
+    `known` and `failure` are deliberately two fields rather than one
+    nullable one.  Collapsing them loses the distinction between "GitHub
+    answered: the issue is open" and "GitHub did not answer", and those want
+    opposite handling: the first may rewrite a stale `source-resolved` back
+    to `missing-pr`, the second must not touch the status at all.
+
+    Folding them together is not hypothetical — it was the first version of
+    this code, and agy's P1 on PR #279 caught it: a 502 during a sweep would
+    have flapped every parked `source-resolved` proposal to `missing-pr`,
+    two GitOps commits per proposal per blip, erasing the very signal an
+    operator was reading.
+    """
+
+    known: bool
+    failure: dict[str, str] | None = None
+
+
+_SOURCE_UNKNOWN = SourceIssueVerdict(known=False)
+_SOURCE_ISSUE_OPEN = SourceIssueVerdict(known=True, failure=None)
+
+
+def _source_issue_state(status_data: dict[str, Any]) -> SourceIssueVerdict:
+    """Read the proposal's source issue and say what it implies.
 
     `missing-pr` conflates two situations that want opposite responses: a PR
     that should exist and does not (a real failure worth a human), and a
@@ -682,26 +707,31 @@ def _source_issue_failure(status_data: dict[str, Any]) -> dict[str, str] | None:
     accumulates silently — every issue the platform investigates but a human
     then resolves directly produces one (#276).
 
-    Returns None whenever the answer is "keep doing what you were doing":
-    the issue is open, the proposal predates `source:`, or GitHub could not
-    be read.  **Fail-open on purpose** — the same reasoning as the
-    `discovered_url` guard in `reconcile_one`: an unreadable GitHub is not
-    evidence about the proposal, and a durable status must not move on it.
+    Returns `_SOURCE_UNKNOWN` when the question cannot be answered at all:
+    the proposal predates `source:`, the block is partial, or GitHub could
+    not be read.  Callers must treat that as "change nothing", the same
+    reasoning as the `discovered_url` guard in `reconcile_one` — an
+    unreadable GitHub is not evidence about the proposal.
     """
     source = status_data.get("source")
     if not isinstance(source, dict):
-        return None
+        return _SOURCE_UNKNOWN
     repo = source.get("repo")
     number = source.get("issue")
     if not repo or not number:
-        return None
+        return _SOURCE_UNKNOWN
     try:
         issue = _gh_api_json([f"repos/{repo}/issues/{number}"])
-    except Exception as exc:  # noqa: BLE001 — any gh/JSON failure is fail-open
+    except Exception as exc:  # noqa: BLE001 — any gh/JSON failure is unknown
         print(f"warn: could not read source issue {repo}#{number}: {exc}")
-        return None
-    if not isinstance(issue, dict) or issue.get("state") != "closed":
-        return None
+        return _SOURCE_UNKNOWN
+    if not isinstance(issue, dict) or "state" not in issue:
+        # A response we cannot interpret is not an answer.  Reading it as
+        # "open" would be a guess dressed up as a fact.
+        print(f"warn: unreadable source issue payload for {repo}#{number}")
+        return _SOURCE_UNKNOWN
+    if issue["state"] != "closed":
+        return _SOURCE_ISSUE_OPEN
     # state_reason is null on issues closed before GitHub introduced it, and
     # on some API paths.  Treat "closed, reason unknown" as completed: the
     # actionable half of the message ("no PR ever existed for this slug, the
@@ -709,17 +739,20 @@ def _source_issue_failure(status_data: dict[str, Any]) -> dict[str, str] | None:
     not_planned = issue.get("state_reason") == "not_planned"
     code = "source-not-planned" if not_planned else "source-resolved"
     reason = "not planned" if not_planned else "completed"
-    return {
-        "code": code,
-        "stage": "reconcile",
-        "message": (
-            f"No canonical PR exists for the deterministic result branch, and "
-            f"the source issue {repo}#{number} is closed as {reason}. The "
-            f"branch is missing because this proposal was abandoned, not "
-            f"because a PR was lost. Retire it with a terminal status "
-            f"(agents-state/OPERATOR.md) or reopen the issue."
-        ),
-    }
+    return SourceIssueVerdict(
+        known=True,
+        failure={
+            "code": code,
+            "stage": "reconcile",
+            "message": (
+                f"No canonical PR exists for the deterministic result branch, "
+                f"and the source issue {repo}#{number} is closed as {reason}. "
+                f"The branch is missing because this proposal was abandoned, "
+                f"not because a PR was lost. Retire it with a terminal status "
+                f"(agents-state/OPERATOR.md) or reopen the issue."
+            ),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1948,16 +1981,27 @@ def reconcile_one(
                 decision="wait",
                 notes="active implementation lease has not expired",
             )
-        # Read the source issue here rather than at the top of the block: by
-        # this point every path that does not write has already returned, so
-        # the extra GitHub read is spent only on proposals whose status is
-        # actually about to be decided.
-        #
-        # Falling through with the SAME missing-pr block when the issue is
-        # open is what keeps that case byte-identical: _update_status_if_changed
-        # compares field by field and does not write when nothing moved, so
-        # this is not a new GitOps commit every cycle.
-        source_failure = _source_issue_failure(status_data)
+        # Read the source issue only once every non-writing path above has
+        # returned, so the extra GitHub call is spent on proposals whose
+        # status is actually about to be decided and on nothing else.
+        source = _source_issue_state(status_data)
+        # An unanswerable source issue must leave an existing PR-less
+        # diagnosis exactly as it is.  This is the other half of letting
+        # source-resolved be re-checked: without it a single 502 mid-sweep
+        # would flap every parked source-resolved proposal back to
+        # missing-pr, two GitOps commits per proposal per blip, erasing the
+        # signal an operator was reading (agy P1 on PR #279).
+        if ref.status == "needs-triage" and existing_failure and not source.known:
+            return ShepherdResult(
+                ref=ref,
+                decision="needs-triage",
+                notes=f"preserving existing failure: {failure_code or 'unknown'}",
+            )
+        # Writing the SAME missing-pr block when the issue is open is what
+        # keeps that case quiet: _update_status_if_changed compares field by
+        # field and does not write when nothing moved, so a live issue does
+        # not produce a GitOps commit every cycle.
+        source_failure = source.failure
         _update_status_if_changed(
             ref,
             "needs-triage",
