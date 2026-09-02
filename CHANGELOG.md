@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.38.0](https://github.com/mctlhq/mctl-agents/compare/1.37.0...1.38.0) (2026-09-02)
+
+
+### Features
+
+* **worker:** export Temporal SDK metrics on the port the pod declares ([f864dbe](https://github.com/mctlhq/mctl-agents/commit/f864dbee77f2c619555b089e180c7ebc33952158)), closes [#252](https://github.com/mctlhq/mctl-agents/issues/252)
+
 ## [1.37.0](https://github.com/mctlhq/mctl-agents/compare/1.36.1...1.37.0) (2026-09-01)
 
 
