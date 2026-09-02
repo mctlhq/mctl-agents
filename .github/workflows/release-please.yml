@@ -119,7 +119,7 @@ jobs:
       # and a shallow clone has neither the tag nor the objects behind it.
       - name: Check out the released commit
         if: ${{ steps.release.outputs.release_created == 'true' }}
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.release.outputs.tag_name }}
           fetch-depth: 0
