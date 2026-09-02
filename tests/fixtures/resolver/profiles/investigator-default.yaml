@@ -1,0 +1,74 @@
+# ExecutionProfile compatibility fixture — issue-227 declarative resolver
+# pilot (orchestrator/resolver.py). Mirrors the #950 GitOps catalog schema
+# (ADR 007) so the pilot's shape is a straight port once that catalog lands.
+#
+# NOT a second catalog: this file lives under tests/fixtures/, is loaded only
+# by orchestrator/resolver.py (and, through it, orchestrator/manifest.py's
+# v1alpha2 branch) and is marked explicitly non-promotable below. It must
+# never be read as registry or production-activation state — production
+# activation is blocked on mctlhq/mctl-gitops#950's real catalog/release API.
+#
+# Every field here is a checked claim, same discipline as
+# agents/_manifests/*/agent.yaml: orchestrator/resolver.py's load_profile()
+# validates required/bounded fields, and orchestrator/manifest.py resolves
+# this file to populate the same toolPolicy/execution shape
+# orchestrator/validate_manifest.py already checks against the real
+# orchestrator/options.py builder — this fixture does not get a free pass on
+# that "checked claim, not a second implementation" contract.
+apiVersion: agents.mctl.ai/v1alpha2
+kind: ExecutionProfile
+metadata:
+  name: investigator-default
+  # Explicit false: a pilot fixture must never be interpretable as a
+  # promotable registry version (see mctlhq/mctl-agents#227 requirements).
+  promotable: false
+spec:
+  modelPolicyRef:
+    # Same task issue-investigator's legacy v1alpha1 manifest declares
+    # (spec.modelPolicy.task) — config/model-policy.yaml's "service_agent".
+    task: service_agent
+    # INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
+    # in orchestrator/run_issue_investigator.py — highest-priority override
+    # before the service_agent task's own model-policy.yaml resolution.
+    legacyEnvOverride: ISSUE_INVESTIGATOR_MODEL
+  # issue-investigator uses no versioned platform skill today.
+  skills: []
+  # Must equal build_issue_investigator_options()'s actual allowed_tools
+  # exactly — orchestrator/manifest.py's v1alpha2 branch surfaces this as
+  # AgentManifest.tool_allow, which orchestrator/validate_manifest.py diffs
+  # against the real builder output, same as every v1alpha1 manifest.
+  tools:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - WebSearch
+    - WebFetch
+    - Bash
+    - "mcp__mctl__*"
+  policyRef: issue-investigator-default
+  # Tools alone are not authorization (ADR 007 sec. 2) — these are the
+  # reviewed least-privilege scopes a provider enforces server-side.
+  permissions:
+    targetRepository: read-only
+    gitopsWrite: proposal-path-only
+    issueComment: allowed
+    productionMutation: forbidden
+  budgetUsd: 3.00        # ISSUE_INVESTIGATOR_BUDGET_USD default
+  timeoutSeconds: 7200    # mctl-agents-investigate CWFT activeDeadlineSeconds
+  runtime:
+    type: claude-agent-sdk
+    entrypoint: orchestrator.run_issue_investigator:investigate
+    optionsBuilder: orchestrator.options:build_issue_investigator_options
+    sandbox:
+      backend: argo
+      clusterWorkflowTemplate: mctl-agents-investigate
+      approved: true
+  approval:
+    required: false
+    reason: investigation only writes a status:proposed proposal; no mutation.
+  evidence:
+    - proposal_triplet
+    - status_yaml
+    - issue_comment

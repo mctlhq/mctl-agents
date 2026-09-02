@@ -3051,3 +3051,118 @@ def test_an_unexpected_error_in_the_status_check_refuses_the_publish(
     assert result.error is not None
     assert "could not be checked" in result.error
     assert not result.proposal_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# _run_agent — ISSUE_INVESTIGATOR_RESOLVER_MODE wiring (mctlhq/mctl-agents#227)
+# ---------------------------------------------------------------------------
+def _stub_client_no_messages(monkeypatch):
+    # Patched at the SDK, not as a module attribute of
+    # run_issue_investigator: _run_agent imports ClaudeSDKClient lazily
+    # inside the function (so the long-lived Temporal worker never drags the
+    # agent stack in — see the import note at the top of that module), so
+    # there is no module-level name to replace. This matches how every other
+    # _run_agent test here stubs it.
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient",
+        _fake_client_factory([]),
+    )
+
+
+def test_run_agent_default_mode_is_legacy_and_never_touches_resolver(tmp_path, monkeypatch, capsys):
+    """No ISSUE_INVESTIGATOR_RESOLVER_MODE set at all — the default must stay
+    'legacy' and must not import/call orchestrator.resolver.execute."""
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", raising=False)
+    _stub_client_no_messages(monkeypatch)
+    _stub_build_options(monkeypatch, mcp_servers={})
+    monkeypatch.setattr(
+        "orchestrator.resolver.execute",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("resolver.execute must not be called in legacy mode")),
+    )
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+    assert "resolver_mode='legacy'" in capsys.readouterr().out
+
+
+def test_run_agent_explicit_legacy_is_observable(tmp_path, monkeypatch, capsys):
+    """Explicit rollback drill: ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy must
+    behave exactly like the default and must log that it did — the
+    'available only when explicit ... and is observable' acceptance
+    criterion."""
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "legacy")
+    _stub_client_no_messages(monkeypatch)
+    _stub_build_options(monkeypatch, mcp_servers={})
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+    assert "resolver_mode='legacy'" in capsys.readouterr().out
+
+
+def test_run_agent_declarative_mode_resolves_a_plan_and_uses_plan_builder(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    _stub_client_no_messages(monkeypatch)
+
+    captured_plan_calls = []
+
+    def _fake_build_from_plan(plan, repo_dir, proposal_dir):
+        captured_plan_calls.append(plan)
+        return types.SimpleNamespace(mcp_servers={})
+
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options_from_plan",
+        _fake_build_from_plan,
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("legacy builder must not be called in declarative mode")
+        ),
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    out = capsys.readouterr().out
+    assert "resolver_mode='declarative'" in out
+    assert '"agent": "issue-investigator"' in out  # plan.log()'s structured snapshot
+    assert len(captured_plan_calls) == 1
+    assert captured_plan_calls[0].agent == "issue-investigator"
+    assert captured_plan_calls[0].target_repository_sha == "f" * 40
+
+
+def test_run_agent_invalid_resolver_mode_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "bogus")
+    with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_RESOLVER_MODE"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_target_repository_sha_reads_git_head(tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("hi")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+
+    sha = run_issue_investigator._target_repository_sha(tmp_path)
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True, text=True, capture_output=True,
+    ).stdout.strip()
+    assert sha == expected
+    assert len(sha) == 40
+
+
+def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
+    """A clone with no commits has no HEAD to pin.
+
+    `gh repo clone` of an empty repository produces exactly this, and
+    `git rev-parse HEAD` exits 128 there. Failing closed is right — a plan
+    that pinned nothing would still claim reproducibility — but the reason
+    has to reach the reader, not arrive as a bare CommandFailed out of
+    `_run_agent` (claude P3 on #234).
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+
+    with pytest.raises(RuntimeError, match="cannot pin target_repository_sha"):
+        run_issue_investigator._target_repository_sha(tmp_path)

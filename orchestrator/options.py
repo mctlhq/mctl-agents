@@ -7,6 +7,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
 from config.settings import MCTL_MCP_URL
+from orchestrator.resolver import ExecutionPlan
 
 
 def mctl_mcp_config(*, always_load: bool = False) -> dict:
@@ -307,6 +308,60 @@ def build_issue_investigator_options(
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
+        add_dirs=[str(proposal_dir)],
+        env=env,
+        hooks=_command_audit_hooks(),
+    )
+
+
+def build_issue_investigator_options_from_plan(
+    plan: ExecutionPlan,
+    repo_dir: Path,
+    proposal_dir: Path,
+) -> ClaudeAgentOptions:
+    """Options for issue-investigator's `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`
+    path (orchestrator/run_issue_investigator.py): built from a resolved
+    `orchestrator.resolver.ExecutionPlan` instead of the module-level
+    ``ISSUE_INVESTIGATOR_MODEL``/``ISSUE_INVESTIGATOR_BUDGET_USD`` constants
+    ``build_issue_investigator_options`` above uses.
+
+    Only the fields the plan actually owns (model, tools, budget) come from
+    it — every structural field the plan does NOT declare (cwd, mcp_servers,
+    permission_mode, add_dirs, env, hooks) matches
+    ``build_issue_investigator_options`` exactly, by construction, so the two
+    builders resolve identical `ClaudeAgentOptions` for the same repo/model/
+    tools/budget input (the equivalence tests in tests/test_options.py
+    assert this directly).
+
+    `mcp__mctl__*` is the one tool whose presence is a conjunction of two
+    facts, and BOTH have to hold:
+
+    1. the profile grants it — `plan.tools` is the authoritative allow-list
+       under ADR 007, and a future `ExecutionProfile` may narrow it;
+    2. mctl MCP is actually configured — `_mctl_tool_globs()` gates the
+       legacy builder the same way, so an unset `MCTL_TOKEN` must not leave
+       the declarative path holding a dead allow-list entry the legacy path
+       omits.
+
+    Treating only (2) as the condition is a privilege escalation, not a
+    divergence: a profile that deliberately withholds the mctl tools would
+    have them handed back whenever `MCTL_TOKEN` happened to be set. That is
+    dormant today only because the single checked-in fixture always lists
+    `mcp__mctl__*` — an accident of the fixture, not a property of the
+    design (claude P2 on #234, third round; earlier rounds fixed (2) alone).
+    """
+    env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
+    allowed_tools = [t for t in plan.tools if t != "mcp__mctl__*"]
+    if "mcp__mctl__*" in plan.tools:
+        allowed_tools += _mctl_tool_globs()
+    return ClaudeAgentOptions(
+        cwd=str(repo_dir),
+        setting_sources=["project"],
+        model=plan.model,
+        allowed_tools=allowed_tools,
+        mcp_servers=mctl_mcp_config(always_load=True),
+        permission_mode="acceptEdits",
+        max_budget_usd=plan.budget_usd,
         add_dirs=[str(proposal_dir)],
         env=env,
         hooks=_command_audit_hooks(),
