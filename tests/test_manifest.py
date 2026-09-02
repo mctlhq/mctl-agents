@@ -66,6 +66,35 @@ def test_catalog_profiles_match_builders() -> None:
     assert not errors, errors
 
 
+def test_catalog_check_does_not_leave_options_reloaded(monkeypatch) -> None:
+    """The catalog check must not pin orchestrator.options to cleared env.
+
+    Its sibling `_check_tool_policy_and_budget_match_options_py` reloads
+    orchestrator.options against a cleared environment and restores it in a
+    `finally`; a caller that borrows that helper and forgets the restore
+    leaves the module pinned to coded defaults for the rest of the process,
+    silently changing what every later reader sees (claude P2 on #284).
+
+    This check sidesteps it entirely — allowed_tools depends on none of the
+    cleared vars — and that is asserted here rather than argued in a comment,
+    since "we don't need the helper" is exactly the kind of claim that stops
+    being true when someone adds a budget comparison later.
+    """
+    if not GITOPS_CATALOG_PROFILES_DIR.is_dir():
+        pytest.skip("mctl-gitops catalog not checked out")
+    monkeypatch.setenv("IMPLEMENTER_BUDGET_USD", "42.00")
+    import orchestrator.options as options_module
+
+    importlib.reload(options_module)
+    assert options_module.IMPLEMENTER_BUDGET_USD == 42.00
+
+    assert check_catalog_profiles_match_builders(MANIFESTS) == []
+
+    assert options_module.IMPLEMENTER_BUDGET_USD == 42.00, (
+        "orchestrator.options was left reloaded against a cleared environment"
+    )
+
+
 def test_an_unmapped_catalog_profile_is_an_error_not_a_skip(tmp_path, monkeypatch) -> None:
     """A profile nobody mapped must fail, not pass unchecked.
 

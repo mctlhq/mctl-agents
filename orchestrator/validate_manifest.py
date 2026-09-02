@@ -503,8 +503,16 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
             )
             continue
 
+        # Deliberately NOT _resolve_builder_module_with_clean_env: every var
+        # it clears is a budget or a timeout, and this check compares only
+        # allowed_tools, which none of them affect. Using it would mean
+        # inheriting its contract — it reloads orchestrator.options against a
+        # cleared env and leaves restoring the module to the CALLER — for no
+        # benefit, and three profiles' worth of chances to forget (claude P2
+        # on #284). The one env var that does reach allowed_tools is
+        # MCTL_TOKEN, forced below.
         try:
-            builder, _ = _resolve_builder_module_with_clean_env(manifest)
+            builder = manifest.resolve_options_builder()
         except ManifestError as exc:
             errors.append(f"{profile_name}: {exc}")
             continue
