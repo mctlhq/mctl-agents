@@ -629,15 +629,24 @@ def test_reconcile_relabels_an_ALREADY_stuck_missing_pr_proposal(tmp_path) -> No
     assert read_status(ref)["failure"]["code"] == "source-resolved"
 
 
-def test_reconcile_can_relabel_back_when_the_issue_is_reopened(tmp_path) -> None:
-    """source-resolved is not a one-way door written by a machine."""
+@pytest.mark.parametrize("parked_code", ["source-resolved", "source-not-planned"])
+def test_reconcile_can_relabel_back_when_the_issue_is_reopened(
+    tmp_path, parked_code
+) -> None:
+    """Neither source-* code is a one-way door written by a machine.
+
+    Parametrized over both because the frozenset is the only thing making
+    them symmetric, and an asymmetric membership is a plausible edit: with
+    only source-resolved covered, dropping source-not-planned from
+    SOURCE_RECHECKED_FAILURE_CODES left the whole suite green (claude P3).
+    """
     ref = make_ref(
         tmp_path, service="mctl-academy", slug="reopened",
         status="needs-triage", pr_url=None,
     )
     _with_source(ref)
     status = read_status(ref)
-    status["failure"] = {"code": "source-resolved", "stage": "reconcile", "message": "..."}
+    status["failure"] = {"code": parked_code, "stage": "reconcile", "message": "..."}
     ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
 
     result, _ = _pr_less_reconcile(ref, issue_payload={"state": "open", "state_reason": None})
