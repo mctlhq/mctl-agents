@@ -204,7 +204,29 @@ jobs:
         # exits 0 on the stale lock while --locked exits 1.
         run: uv sync --locked
 
+      # The catalog and clusterWorkflowTemplate checks compare this repo's
+      # builders against mctl-gitops. Without the checkout they returned []
+      # here — a check reporting success in the one environment that gates
+      # the merge, which is how _check_cluster_workflow_template stayed a
+      # silent no-op for its whole life (mctl-agents#277).
+      #
+      # No token: mctl-gitops is public, so the default GITHUB_TOKEN suffices
+      # and this also works on dependabot PRs, which get no Actions secrets
+      # at all. A gated checkout would have turned every dependabot run red.
+      #
+      # Checked out INSIDE the workspace because actions/checkout refuses to
+      # write outside it, so the sibling layout a developer has is not
+      # reproducible here — MCTL_GITOPS_ROOT points the validator at it.
+      - name: Check out mctl-gitops for the cross-repo checks
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mctlhq/mctl-gitops
+          path: _gitops
+          persist-credentials: false
+
       - name: Run tests
+        env:
+          MCTL_GITOPS_ROOT: ${{ github.workspace }}/_gitops/platform-gitops
         run: uv run --locked pytest -q
 
   lint:

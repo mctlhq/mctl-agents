@@ -18,10 +18,13 @@ from pathlib import Path
 import pytest
 import yaml
 
+from orchestrator import validate_manifest as validate_manifest_module
 from orchestrator.manifest import AgentManifest, ManifestError, load, load_all
 from orchestrator.validate_manifest import (
+    GITOPS_CATALOG_PROFILES_DIR,
     _check_legacy_env_override,
     _check_prompt_sources,
+    check_catalog_profiles_match_builders,
     check_manifests_match_inventory,
     validate,
 )
@@ -45,6 +48,71 @@ def test_manifest_is_valid(manifest: AgentManifest) -> None:
 def test_manifests_match_inventory() -> None:
     errors = check_manifests_match_inventory(MANIFESTS)
     assert not errors, errors
+
+
+def test_catalog_profiles_match_builders() -> None:
+    """The mctl-gitops ExecutionProfile catalog must state real tool grants.
+
+    Skips with a reason rather than passing when the sibling checkout is
+    absent: a green test that never ran is worse than a visibly skipped one,
+    and that is exactly how `_check_cluster_workflow_template` stayed a
+    silent no-op in CI for its whole life (#277). pr-validation.yml now
+    checks mctl-gitops out, so this runs there; `_gitops_missing` turns
+    absence into an error under CI so it cannot regress to a skip.
+    """
+    if not GITOPS_CATALOG_PROFILES_DIR.is_dir():
+        pytest.skip(f"mctl-gitops catalog not checked out at {GITOPS_CATALOG_PROFILES_DIR}")
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert not errors, errors
+
+
+def test_an_unmapped_catalog_profile_is_an_error_not_a_skip(tmp_path, monkeypatch) -> None:
+    """A profile nobody mapped must fail, not pass unchecked.
+
+    This is the failure mode the check is most likely to die of: someone adds
+    a fourth profile, `_AGENT_BY_CATALOG_PROFILE.get()` returns None, and a
+    lenient lookup waves it through forever. Asserting on the behaviour
+    rather than on the table's contents, so the test survives the table
+    growing legitimately.
+    """
+    profiles = tmp_path / "execution-profiles" / "brand-new-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec": {
+                    "tools": ["Read"],
+                    "runtime": {"optionsBuilder": "orchestrator.options:build_shepherd_options"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent
+    )
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert any("brand-new-default" in e and "_AGENT_BY_CATALOG_PROFILE" in e for e in errors), errors
+
+
+def test_a_missing_gitops_checkout_fails_under_ci(tmp_path, monkeypatch) -> None:
+    """Absence must be an error where the check is the only thing looking.
+
+    Locally it degrades to a warning so a developer without the sibling
+    checkout still gets a usable run; under CI it must fail, because a check
+    that silently returns [] reports success for precisely the environment
+    that gates the merge.
+    """
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", tmp_path / "absent"
+    )
+
+    monkeypatch.delenv("CI", raising=False)
+    assert check_catalog_profiles_match_builders(MANIFESTS) == []
+
+    monkeypatch.setenv("CI", "true")
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert errors and "absent" in errors[0]
 
 
 def test_no_duplicate_manifest_names() -> None:
