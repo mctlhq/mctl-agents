@@ -30,9 +30,15 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
+    METRICS_PORT,
     TASK_QUEUE,
 )
-from orchestrator.temporal.worker import owns_schedules, run_until_signalled, worker_plans
+from orchestrator.temporal.worker import (
+    owns_schedules,
+    run_until_signalled,
+    telemetry_config,
+    worker_plans,
+)
 
 
 @pytest.fixture
@@ -109,6 +115,71 @@ def test_slot_limits_are_set_for_the_split_roles(visibility):
     # The execution worker runs no workflows, so a workflow-task limit there
     # would be a number with nothing to bound.
     assert execution.max_concurrent_workflow_tasks is None
+
+
+def test_metrics_are_published_where_the_deployment_can_be_scraped():
+    """ADR-008 D5 / #252 — the exporter has to land on the port the pod
+    already declares, on an address a vmagent in another pod can reach.
+
+    mctl-gitops's base-service chart renders containerPort `http` and
+    Service port `http` from .Values.service.port unconditionally; the
+    separate `metrics` port only exists under `metrics.enabled`, which also
+    renders a monitoring.coreos.com ServiceMonitor that this cluster's
+    VictoriaMetrics operator auto-converts and orphans. So the VMServiceScrape
+    on the gitops side targets `port: http` — a bind on any other port, or on
+    loopback, is a scrape pool that stays empty while looking configured.
+    """
+    metrics = telemetry_config().metrics
+
+    assert metrics is not None
+    assert metrics.bind_address == f"0.0.0.0:{METRICS_PORT}"
+    # Spelled out rather than derived from the constant: 8080 is not a free
+    # choice, it is base-service's `service.port` default over in
+    # mctl-gitops. Asserting it against itself would pass for any value and
+    # catch exactly the change that breaks the scrape.
+    assert METRICS_PORT == 8080
+
+
+def test_latencies_are_reported_in_seconds():
+    """The one number the split exists to expose is schedule-to-start, and
+    the SDK's default is integer milliseconds — which quantises the
+    sub-second range a healthy control queue sits in into a handful of
+    buckets, and reads as a different unit than every other histogram the
+    VMRules are written against."""
+    metrics = telemetry_config().metrics
+
+    assert metrics is not None
+    assert metrics.durations_as_seconds is True
+
+
+@pytest.mark.anyio
+async def test_the_client_is_built_on_the_runtime_that_exports():
+    """A client keeps the runtime it was created with.
+
+    Constructing the Runtime but connecting without it is the silent
+    failure this guards: the port binds, /metrics answers, and every
+    `temporal_*` series stays on the default runtime that publishes
+    nothing — an exporter that looks wired from the outside and reports an
+    empty queue forever.
+    """
+    connected = {}
+
+    async def fake_connect(address, **kwargs):
+        connected.update(kwargs)
+        return MagicMock()
+
+    with (
+        mock.patch.object(worker_module.Client, "connect", side_effect=fake_connect),
+        mock.patch.object(worker_module, "setup_schedules", new=mock.AsyncMock()),
+        mock.patch.object(worker_module, "build_worker", return_value=MagicMock()),
+        mock.patch.object(worker_module, "run_until_signalled", new=mock.AsyncMock()),
+        mock.patch.object(worker_module, "Runtime") as runtime_cls,
+        mock.patch("sys.argv", ["worker", "--role", "control"]),
+    ):
+        await worker_module.main()
+
+    runtime_cls.assert_called_once_with(telemetry=mock.ANY)
+    assert connected.get("runtime") is runtime_cls.return_value
 
 
 def test_an_unknown_role_is_refused(visibility):

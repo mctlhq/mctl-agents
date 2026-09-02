@@ -41,3 +41,24 @@ CONTROL_MAX_CONCURRENT_ACTIVITIES = 100
 CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS: int | None = None
 
 EXECUTION_MAX_CONCURRENT_ACTIVITIES = 40
+
+# Where the Temporal SDK's Prometheus exporter binds (ADR-008 D5, #252).
+#
+# The starvation this split addresses was invisible: a full slot pool looks
+# exactly like "nothing is happening". The number that names it is
+# schedule-to-start latency per queue, and the SDK already records it — it
+# just had nowhere to publish it, because Client.connect ran on the default
+# runtime with no TelemetryConfig.
+#
+# 8080 rather than a dedicated 9090 because it is the port the deployment
+# ALREADY declares and nothing listens on. mctl-gitops's base-service chart
+# renders containerPort `http` and Service port `http` from
+# .Values.service.port (default 8080) unconditionally; the metrics port is
+# rendered only under `metrics.enabled`, which ALSO renders a
+# monitoring.coreos.com/v1 ServiceMonitor. This cluster runs VictoriaMetrics,
+# whose operator auto-converts such an object and leaves the original
+# orphaned — an ArgoCD drift already paid for twice (mctl-gitops incidents
+# 43d9e608 and 992434e2, recorded in services/labs/openclaw/values.yaml).
+# Binding here makes the declared port real and lets a native VMServiceScrape
+# target `port: http` with no chart change at all.
+METRICS_PORT = 8080
