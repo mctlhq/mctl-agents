@@ -16,12 +16,12 @@ from temporalio import activity
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.discovery import ProposalProjection, ReconcileDiscoveryResult
 from orchestrator.temporal.activities.orphans import OrphanDetectionResult, OrphanSignal
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
+from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
 pytestmark = pytest.mark.anyio
 

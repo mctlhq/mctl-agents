@@ -18,7 +18,6 @@ from temporalio import activity
 from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
-from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
@@ -34,6 +33,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     DevLoopWorkflow,
     IssueRef,
 )
+from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
 _SENTINEL_TARGET = DeployTarget(team="admins", app="mctl-telegram")
 _DEFAULT_RELEASE = ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z")

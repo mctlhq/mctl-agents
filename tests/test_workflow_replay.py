@@ -30,12 +30,27 @@ Measured against these fixtures, on temporalio 1.31.0:
 
 Two consequences, both load-bearing:
 
-- This file is real coverage for the nine existing markers, which all guard
+- Replay is real coverage for the nine existing markers, which all guard
   added or reordered commands.
-- It CANNOT verify the #251 queue flip. An unguarded `task_queue=` change
-  replays clean. Routing is only visible in recorded history content, which
-  is what `test_prepatch_histories_predate_the_exec_queue_flip` reads — a
-  green replay run is not evidence that the flip was guarded.
+- Replay CANNOT verify the #251 queue flip. An unguarded `task_queue=` change
+  replays clean — measured, not inferred.
+
+So routing is verified from recorded history CONTENT instead, which is the
+only place a task queue is visible at all. Two fixtures per scenario:
+`*.prepatch.json`, recorded before the flip, must contain no `exec-queue`
+marker and no routed activity; `*.patched.json`, recorded after it, must
+contain both the marker and every `submit_and_wait` on the execution queue,
+and nothing else routed. Neither half alone is enough — the marker without
+the queue would pass if `patched()` were called and its result ignored, and
+the queue without the marker would pass on an unguarded change.
+
+A `*.patched.json` describes a workflow that started AFTER the flip, and
+only that. It is not a picture of what a running dev loop does: `patched()`
+memoizes, so an execution that predates the marker keeps taking the
+unpatched branch for the rest of its life and never appears in a fixture of
+this shape at all. That half is pinned by
+`tests/test_patch_memoization.py`, and it is the half that decides how to
+read the queue metrics during the soak.
 
 ## Why this file asserts on fixture CONTENT, not just on replay
 
@@ -57,16 +72,21 @@ from pathlib import Path
 
 import pytest
 from temporalio.client import WorkflowHistory
+from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 
-from tests.replay_scenarios import SCENARIOS, Scenario
+from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
+from tests.replay_scenarios import SCENARIOS, Scenario, record, scenario_by_name
 
 pytestmark = pytest.mark.anyio
 
 
+def _events_at(path: Path) -> list[dict]:
+    return json.loads(path.read_text(encoding="utf-8"))["events"]
+
+
 def _events(scenario: Scenario) -> list[dict]:
-    payload = json.loads(scenario.path.read_text(encoding="utf-8"))
-    return payload["events"]
+    return _events_at(scenario.path)
 
 
 def _patch_ids(events: list[dict]) -> set[str]:
@@ -159,6 +179,93 @@ def test_prepatch_histories_predate_the_exec_queue_flip(scenario: Scenario) -> N
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
+async def test_patched_history_replays_against_current_definitions(
+    scenario: Scenario,
+) -> None:
+    """The post-flip history must replay too, not just the pre-flip one."""
+    history = WorkflowHistory.from_json(
+        f"replay-{scenario.name}-patched",
+        scenario.patched_path.read_text(encoding="utf-8"),
+    )
+    await Replayer(workflows=scenario.workflows).replay_workflow(history)
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
+def test_patched_histories_show_submit_and_wait_on_the_execution_queue(
+    scenario: Scenario,
+) -> None:
+    """The actual acceptance criterion for the #251 flip.
+
+    Replay cannot verify routing — it compares command shape and is blind to
+    `task_queue`, measured above. So the flip is verified the only way it
+    can be: by reading a history recorded after it and checking where the
+    activity was scheduled.
+
+    Both halves are asserted. The marker alone would pass if `patched()`
+    were called and its result ignored; the queue alone would pass if the
+    routing were unguarded. Neither is the change #251 asks for.
+    """
+    events = _events_at(scenario.patched_path)
+    assert "exec-queue" in _patch_ids(events), (
+        f"{scenario.patched_path.name} has no exec-queue marker: the routing "
+        "change is unguarded, so a rollback could not be replayed."
+    )
+    workflow_queue = _workflow_task_queue(events)
+    scheduled = _scheduled_activities(events)
+    submits = [(name, queue) for name, queue in scheduled if name == "submit_and_wait"]
+    assert submits, f"{scenario.patched_path.name} records no submit_and_wait"
+    assert all(queue == EXECUTION_TASK_QUEUE for _, queue in submits), (
+        f"{scenario.patched_path.name} still schedules {submits} on the "
+        "control queue"
+    )
+    # Nothing ELSE may move. The short activities are what the control
+    # worker exists to keep responsive; routing one of them to exec would
+    # put it behind the long Argo polls, which is the starvation ADR-008
+    # removes, reintroduced from the other side.
+    strays = [
+        (name, queue)
+        for name, queue in scheduled
+        if name != "submit_and_wait" and queue != workflow_queue
+    ]
+    assert not strays, f"{scenario.patched_path.name} also routed {strays}"
+
+
+async def test_todays_code_still_routes_and_still_guards() -> None:
+    """Ties the routing assertions to the CODE, not to a committed snapshot.
+
+    `*.patched.json` is a recording. It keeps saying the guard was there and
+    the activity was routed no matter what the workflows do afterwards, so on
+    its own it cannot catch someone later dropping `workflow.patched(...)` or
+    the `task_queue=` argument. This runs the workflow for real against
+    today's definitions and reads the history it actually produces.
+
+    One scenario, deliberately: incident_loop is the cheapest (27 events, no
+    timers) and the routing decision it exercises is the same
+    `patched("exec-queue")` the other two make.
+    """
+    scenario = scenario_by_name("incident_loop")
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        handle = await record(env.client, scenario)
+        history = await handle.fetch_history()
+
+    events = history.to_json_dict()["events"]
+    assert "exec-queue" in _patch_ids(events), (
+        "the routing change is no longer guarded by workflow.patched(): "
+        "in-flight executions would have no marker recording which queue "
+        "they used, and a rollback could not be replayed."
+    )
+    submits = [
+        (name, queue)
+        for name, queue in _scheduled_activities(events)
+        if name == "submit_and_wait"
+    ]
+    assert submits and all(queue == EXECUTION_TASK_QUEUE for _, queue in submits), (
+        f"today's code schedules {submits}; submit_and_wait must go to "
+        f"{EXECUTION_TASK_QUEUE}"
+    )
+
+
+@pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
 def test_every_history_actually_reaches_submit_and_wait(scenario: Scenario) -> None:
     """Guards against a vacuous fixture.
 
@@ -183,5 +290,5 @@ def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     from tests.replay_scenarios import HISTORY_DIR
 
     on_disk = {p.name for p in Path(HISTORY_DIR).glob("*.json")}
-    expected = {s.path.name for s in SCENARIOS}
+    expected = {s.path.name for s in SCENARIOS} | {s.patched_path.name for s in SCENARIOS}
     assert on_disk == expected

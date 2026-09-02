@@ -36,6 +36,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
+    from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
 
 # mctl-api operation name; maps 1:1 to the `mctl-agents-run` CWFT with
 # mode=incident-responder (see mctl-api internal/operations/registry.go).
@@ -142,13 +143,27 @@ class IncidentLoopWorkflow:
                     ENVIRONMENT,
                 )
 
-        responder_result: WorkflowResult = await workflow.execute_activity(
-            submit_and_wait,
-            SubmitAndWaitInput(operation=INCIDENTS_OPERATION, params=params),
-            start_to_close_timeout=SDK_STEP_TIMEOUT,
-            heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
-            retry_policy=SDK_STEP_RETRY_POLICY,
-        )
+        # ADR-008 step 4, same marker as the dev loop's funnel: one patch id
+        # covers the whole routing change, so an execution either routes all
+        # of its submits to exec or none of them.  Checked before the call,
+        # with the old branch kept verbatim below.
+        if workflow.patched("exec-queue"):
+            responder_result: WorkflowResult = await workflow.execute_activity(
+                submit_and_wait,
+                SubmitAndWaitInput(operation=INCIDENTS_OPERATION, params=params),
+                task_queue=EXECUTION_TASK_QUEUE,
+                start_to_close_timeout=SDK_STEP_TIMEOUT,
+                heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
+                retry_policy=SDK_STEP_RETRY_POLICY,
+            )
+        else:
+            responder_result = await workflow.execute_activity(
+                submit_and_wait,
+                SubmitAndWaitInput(operation=INCIDENTS_OPERATION, params=params),
+                start_to_close_timeout=SDK_STEP_TIMEOUT,
+                heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
+                retry_policy=SDK_STEP_RETRY_POLICY,
+            )
 
         if workflow.patched("incident-registry-and-record"):
             await self._record(release, responder_result)
