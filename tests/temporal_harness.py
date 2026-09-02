@@ -76,7 +76,18 @@ class Worker:
     async def __aenter__(self) -> Worker:
         await self._control.__aenter__()
         if self._execution is not None:
-            await self._execution.__aenter__()
+            # Tear the control worker down if the second one fails to start.
+            # `async with` never binds the target on a raising __aenter__, so
+            # __aexit__ would never run and the control worker would keep
+            # polling for the rest of the process — which in this suite shows
+            # up as an unrelated test hanging on a task some ghost worker
+            # already took. Cheap insurance against an expensive symptom
+            # (claude P3 on #282).
+            try:
+                await self._execution.__aenter__()
+            except BaseException:
+                await self._control.__aexit__(None, None, None)
+                raise
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
