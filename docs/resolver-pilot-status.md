@@ -40,19 +40,18 @@ catalog schema, registry-backed compatibility validation, and atomic
   `ISSUE_INVESTIGATOR_RESOLVER_MODE` flag, is explicitly out of scope for
   this pilot (mctlhq/mctl-agents#227's requirements.md "Out of scope").
 
-### Declarative mode is usable from a source checkout only
+### Where the fixtures live at runtime
 
-Worth stating plainly, because the flag looks like it would work anywhere:
-the fixtures live under `tests/`, and the Dockerfile copies only
-`orchestrator/`, `config/` and `agents/` into the image. `entrypoint.sh`
-does not restore them either. So on the deployed container — the only place
-`run_issue_investigator` normally runs — setting
-`ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` cannot succeed, by
-construction rather than by accident.
+The fixtures are under `tests/`, which is otherwise not shipped. The
+Dockerfile therefore copies exactly `tests/fixtures/resolver/` and nothing
+else from that tree, so `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`
+works on a deployed container as well as in a checkout.
 
-`execute()` checks for the fixture root up front and says exactly that,
-rather than reporting "missing execution profile", which reads like a
-catalog typo and sends the reader looking for a file to add.
+Their absence is consequently not a normal condition in either place, and
+`execute()` checks for the tree up front and says so — otherwise the
+failure surfaces as "missing execution profile", which reads like a catalog
+typo and sends the reader looking for a file to add when nothing is there
+at all.
 
 **#950 has since landed**, and the catalog now exists at
 `platform-gitops/agent-platform/` — but it is itself marked
@@ -62,7 +61,7 @@ production activation either. It also diverges from the fixtures here
 `modelPolicyRef.task` `issue_investigator` vs `service_agent`, and a
 different tool list). Converging the two — and settling which of them is
 right about the investigator's real tool allow-list — is deliberately not
-part of this pilot; it is tracked separately.
+part of this pilot; it is tracked in mctlhq/mctl-agents#277.
 
 ## Rollback
 

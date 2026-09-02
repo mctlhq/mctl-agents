@@ -333,16 +333,27 @@ def build_issue_investigator_options_from_plan(
     tools/budget input (the equivalence tests in tests/test_options.py
     assert this directly).
 
-    The profile fixture's `spec.tools` hardcodes `mcp__mctl__*` unconditionally
-    (it is meant to equal the legacy builder's tools when mctl MCP is
-    configured), so plan.tools is filtered the same way
-    ``_mctl_tool_globs()`` gates the legacy builder: drop `mcp__mctl__*`
-    unless `MCTL_TOKEN` is actually set. Without this, an unset MCTL_TOKEN
-    would make the two builders diverge (declarative keeps a dead
-    allow-list entry the legacy path omits).
+    `mcp__mctl__*` is the one tool whose presence is a conjunction of two
+    facts, and BOTH have to hold:
+
+    1. the profile grants it — `plan.tools` is the authoritative allow-list
+       under ADR 007, and a future `ExecutionProfile` may narrow it;
+    2. mctl MCP is actually configured — `_mctl_tool_globs()` gates the
+       legacy builder the same way, so an unset `MCTL_TOKEN` must not leave
+       the declarative path holding a dead allow-list entry the legacy path
+       omits.
+
+    Treating only (2) as the condition is a privilege escalation, not a
+    divergence: a profile that deliberately withholds the mctl tools would
+    have them handed back whenever `MCTL_TOKEN` happened to be set. That is
+    dormant today only because the single checked-in fixture always lists
+    `mcp__mctl__*` — an accident of the fixture, not a property of the
+    design (claude P2 on #234, third round; earlier rounds fixed (2) alone).
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
-    allowed_tools = [t for t in plan.tools if t != "mcp__mctl__*"] + _mctl_tool_globs()
+    allowed_tools = [t for t in plan.tools if t != "mcp__mctl__*"]
+    if "mcp__mctl__*" in plan.tools:
+        allowed_tools += _mctl_tool_globs()
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],

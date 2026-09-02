@@ -190,3 +190,46 @@ def test_build_issue_investigator_options_from_plan_uses_the_plans_model_and_bud
     built = options.build_issue_investigator_options_from_plan(fake_plan, repo_dir, proposal_dir)
     assert built.model == "a-completely-different-model"
     assert built.max_budget_usd == 42.0
+
+
+def test_a_profile_that_withholds_the_mctl_tools_does_not_get_them_back(tmp_path, monkeypatch):
+    """`plan.tools` is the authoritative allow-list under ADR 007, and a
+    profile may narrow it.
+
+    Gating the mctl glob on `MCTL_TOKEN` alone re-grants the tools to a
+    profile that deliberately omitted them, whenever the token happens to
+    be set — a privilege escalation, not a divergence. Dormant today only
+    because the single checked-in fixture always lists `mcp__mctl__*`,
+    which is an accident of the fixture rather than a property of the
+    design (claude P2 on #234, raised three rounds running).
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "set-and-therefore-tempting")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    restricted = dataclasses.replace(
+        plan, tools=tuple(t for t in plan.tools if t != "mcp__mctl__*")
+    )
+
+    built = options.build_issue_investigator_options_from_plan(restricted, repo_dir, proposal_dir)
+
+    assert not [t for t in built.allowed_tools if t.startswith("mcp__mctl__")]
+
+
+def test_a_profile_that_grants_the_mctl_tools_still_gets_them(tmp_path, monkeypatch):
+    """The other half of the conjunction — narrowing must not become a
+    blanket drop. A profile that lists `mcp__mctl__*` with MCP configured
+    keeps it, exactly as the legacy builder does."""
+    monkeypatch.setenv("MCTL_TOKEN", "set")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="f" * 40))
+    assert "mcp__mctl__*" in plan.tools  # guards the premise of the test above
+
+    built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+
+    assert "mcp__mctl__*" in built.allowed_tools

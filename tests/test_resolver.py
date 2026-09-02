@@ -429,14 +429,15 @@ def test_a_file_prompt_source_cannot_reach_outside_the_repository(value):
         resolver._hash_prompt_source(PromptSource(kind="file", value=value))
 
 
-def test_declarative_mode_names_itself_test_only_when_the_fixtures_are_absent(monkeypatch):
-    """The production image ships no tests/, so declarative mode cannot run
-    there at all.
+def test_an_absent_fixture_tree_is_named_not_reported_as_a_missing_profile(monkeypatch):
+    """The Dockerfile ships `tests/fixtures/resolver/` explicitly, so the
+    tree is present in the image as well as in a checkout — its absence is
+    not a normal condition in either.
 
-    Before this guard the operator saw "missing execution profile
-    issue-investigator-default" — which reads like a catalog typo and sends
-    them hunting for a file to add, rather than telling them the mode is
-    test-only until the real catalog lands (claude P2 on #234).
+    That is exactly why the message matters: the failure would otherwise
+    surface as "missing execution profile issue-investigator-default",
+    which reads like a catalog typo and sends the operator looking for one
+    file to add, when in fact nothing is there at all (claude P2 on #234).
     """
     monkeypatch.setattr(resolver, "FIXTURES_DIR", resolver.REPO_ROOT / "no-such-dir")
 
@@ -444,7 +445,6 @@ def test_declarative_mode_names_itself_test_only_when_the_fixtures_are_absent(mo
         resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
 
     message = str(excinfo.value)
-    assert "not available here" in message
-    assert "production image does not ship" in message
+    assert "no fixtures to resolve against" in message
     # The old, misleading message must not be what surfaces.
     assert "missing execution profile" not in message

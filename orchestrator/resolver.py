@@ -502,20 +502,20 @@ def _hash_prompt_source(source: PromptSource) -> str:
 
 
 def _require_fixtures_present() -> None:
-    """Say the real thing when declarative mode is selected where it cannot run.
+    """Say the real thing when the fixture tree is not where it should be.
 
-    `FIXTURES_DIR` is under `tests/`, and the Dockerfile copies only
-    `orchestrator/`, `config/` and `agents/` into the image — `entrypoint.sh`
-    does not restore it either. So on the actual deployed container, which is
-    the only place `run_issue_investigator` normally runs,
-    `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` cannot work at all.
+    `FIXTURES_DIR` lives under `tests/`, which is otherwise not shipped —
+    the Dockerfile copies exactly `tests/fixtures/resolver/` and nothing
+    else from that tree, deliberately. So its absence is not a normal
+    condition anywhere: not in a source checkout, and not in the image.
+    It means the build lost that COPY, or the resolver is running somewhere
+    nobody designed for.
 
-    Without this guard the operator gets "missing execution profile
-    issue-investigator-default", which reads like a catalog typo and sends
-    them looking for a file to add. The condition is not a missing profile,
-    it is a mode that is test-only until the real catalog lands
-    (mctlhq/mctl-gitops#950's `platform-gitops/agent-platform/`); this names
-    that instead (claude P2 on #234).
+    Defence in depth, then, rather than an expected path — but it earns its
+    keep by what the alternative reports. Without it the failure surfaces as
+    "missing execution profile issue-investigator-default", which reads like
+    a catalog typo and sends the operator looking for a file to add, when
+    the actual problem is that no fixtures exist at all.
     """
     # Deliberately the fixture ROOT, not the two directories execute()
     # actually reads. Their absence is a real and different failure — a
@@ -526,12 +526,11 @@ def _require_fixtures_present() -> None:
     if FIXTURES_DIR.is_dir():
         return
     raise ResolverError(
-        f"declarative resolver mode is not available here: {FIXTURES_DIR} does not exist. "
-        "The pilot resolves against compatibility fixtures under tests/, which the "
-        "production image does not ship (the Dockerfile copies only orchestrator/, "
-        "config/ and agents/). Declarative mode is usable from a source checkout only; "
-        "in the image, leave ISSUE_INVESTIGATOR_RESOLVER_MODE unset or 'legacy'. "
-        "Production activation is mctlhq/mctl-agents#227's follow-up, not this flag."
+        f"declarative resolver mode has no fixtures to resolve against: {FIXTURES_DIR} "
+        "does not exist. This is not a missing profile — the whole compatibility-fixture "
+        "tree is absent. In the image that means the Dockerfile's "
+        "`COPY tests/fixtures/resolver/` was lost; in a checkout it means the tree was "
+        "deleted. Set ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy to fall back explicitly."
     )
 
 
