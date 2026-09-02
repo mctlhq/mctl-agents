@@ -18,10 +18,13 @@ from pathlib import Path
 import pytest
 import yaml
 
+from orchestrator import validate_manifest as validate_manifest_module
 from orchestrator.manifest import AgentManifest, ManifestError, load, load_all
 from orchestrator.validate_manifest import (
+    GITOPS_CATALOG_PROFILES_DIR,
     _check_legacy_env_override,
     _check_prompt_sources,
+    check_catalog_profiles_match_builders,
     check_manifests_match_inventory,
     validate,
 )
@@ -45,6 +48,162 @@ def test_manifest_is_valid(manifest: AgentManifest) -> None:
 def test_manifests_match_inventory() -> None:
     errors = check_manifests_match_inventory(MANIFESTS)
     assert not errors, errors
+
+
+def test_catalog_profiles_match_builders() -> None:
+    """The mctl-gitops ExecutionProfile catalog must state real tool grants.
+
+    **The skip is conditional on NOT being under CI**, and getting that
+    wrong once already is why it is spelled out here. An unconditional
+    `pytest.skip` when the checkout is absent intercepts execution before
+    `_gitops_missing` can turn absence into an error — so a failed checkout
+    in CI would produce a green build from a test that never ran, which is
+    the precise failure this PR exists to remove, reproduced inside its own
+    test (agy P2 on #284).
+
+    Locally the skip is right: a developer without the sibling checkout
+    should see a visible skip rather than a failure about someone else's
+    repository.
+    """
+    if not GITOPS_CATALOG_PROFILES_DIR.is_dir() and not os.environ.get("CI"):
+        pytest.skip(f"mctl-gitops catalog not checked out at {GITOPS_CATALOG_PROFILES_DIR}")
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert not errors, errors
+
+
+def test_catalog_check_does_not_leave_options_reloaded(monkeypatch) -> None:
+    """The catalog check must not pin orchestrator.options to cleared env.
+
+    Its sibling `_check_tool_policy_and_budget_match_options_py` reloads
+    orchestrator.options against a cleared environment and restores it in a
+    `finally`; a caller that borrows that helper and forgets the restore
+    leaves the module pinned to coded defaults for the rest of the process,
+    silently changing what every later reader sees (claude P2 on #284).
+
+    This check sidesteps it entirely — allowed_tools depends on none of the
+    cleared vars — and that is asserted here rather than argued in a comment,
+    since "we don't need the helper" is exactly the kind of claim that stops
+    being true when someone adds a budget comparison later.
+    """
+    if not GITOPS_CATALOG_PROFILES_DIR.is_dir() and not os.environ.get("CI"):
+        pytest.skip("mctl-gitops catalog not checked out")
+    monkeypatch.setenv("IMPLEMENTER_BUDGET_USD", "42.00")
+    import orchestrator.options as options_module
+
+    try:
+        importlib.reload(options_module)
+        assert options_module.IMPLEMENTER_BUDGET_USD == 42.00
+
+        assert check_catalog_profiles_match_builders(MANIFESTS) == []
+
+        assert options_module.IMPLEMENTER_BUDGET_USD == 42.00, (
+            "orchestrator.options was left reloaded against a cleared environment"
+        )
+    finally:
+        # monkeypatch restores os.environ but NOT sys.modules, so without
+        # this the module stays at 42.00 for every later test in the session
+        # — this test would leak exactly the state it exists to detect (agy
+        # P3 on #284). The env var is already gone by the time the reload
+        # runs at teardown order, so pop it explicitly first.
+        os.environ.pop("IMPLEMENTER_BUDGET_USD", None)
+        importlib.reload(options_module)
+
+
+def test_an_unmapped_catalog_profile_is_an_error_not_a_skip(tmp_path, monkeypatch) -> None:
+    """A profile nobody mapped must fail, not pass unchecked.
+
+    This is the failure mode the check is most likely to die of: someone adds
+    a fourth profile, `_AGENT_BY_CATALOG_PROFILE.get()` returns None, and a
+    lenient lookup waves it through forever. Asserting on the behaviour
+    rather than on the table's contents, so the test survives the table
+    growing legitimately.
+    """
+    profiles = tmp_path / "execution-profiles" / "brand-new-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec": {
+                    "tools": ["Read"],
+                    "runtime": {"optionsBuilder": "orchestrator.options:build_shepherd_options"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent
+    )
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert any("brand-new-default" in e and "_AGENT_BY_CATALOG_PROFILE" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [None, "a string", [], {"tools": "Read"}],
+    ids=["empty-spec", "string-spec", "list-spec", "tools-not-a-list"],
+)
+def test_a_malformed_profile_is_reported_not_crashed(tmp_path, monkeypatch, spec) -> None:
+    """One bad file in ANOTHER repo must not abort the whole validation run.
+
+    `spec:` with nothing under it parses as None, and `tools:` can be any
+    YAML node — so reading them outside the guard raises AttributeError or
+    TypeError, kills the run and hides every other profile's result behind a
+    file this repo does not own (agy P2 on #284).
+
+    Same shape claude flagged on the mctl-gitops side of this work, which is
+    why it is parametrized over four malformations rather than fixed for the
+    one that was reported: the defect is "risky reads outside the guard", not
+    "empty spec".
+    """
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(yaml.safe_dump({"spec": spec}), encoding="utf-8")
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent
+    )
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert errors, "a malformed profile produced no error at all"
+    assert all("profile.yaml" in e for e in errors), errors
+
+
+def test_an_empty_catalog_directory_is_an_error(tmp_path, monkeypatch) -> None:
+    """A directory that exists but holds no profiles checked nothing.
+
+    Same silent-no-op shape as the missing checkout, reached differently: a
+    rename or restructure in mctl-gitops leaves the path valid and the glob
+    empty, and the loop would return [] having validated zero profiles (agy
+    P3 on #284).
+    """
+    empty = tmp_path / "execution-profiles"
+    empty.mkdir()
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", empty)
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert errors and "no */profile.yaml" in errors[0], errors
+
+
+def test_a_missing_gitops_checkout_fails_under_ci(tmp_path, monkeypatch) -> None:
+    """Absence must be an error where the check is the only thing looking.
+
+    Locally it degrades to a warning so a developer without the sibling
+    checkout still gets a usable run; under CI it must fail, because a check
+    that silently returns [] reports success for precisely the environment
+    that gates the merge.
+    """
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", tmp_path / "absent"
+    )
+
+    monkeypatch.delenv("CI", raising=False)
+    assert check_catalog_profiles_match_builders(MANIFESTS) == []
+
+    monkeypatch.setenv("CI", "true")
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert errors and "absent" in errors[0]
 
 
 def test_no_duplicate_manifest_names() -> None:

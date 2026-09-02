@@ -37,16 +37,52 @@ from orchestrator.manifest import (
 MODEL_POLICY = REPO_ROOT / "config" / "model-policy.yaml"
 INVENTORY = REPO_ROOT / "docs" / "agent-inventory.yaml"
 
-# mctl-gitops lives beside this repo in the developer workspace but is absent
-# in CI, which checks out this repo alone — same skip pattern as
-# tests/test_agent_inventory.py's test_cluster_workflow_template_exists.
-GITOPS_CWFT_DIR = (
-    REPO_ROOT.parent
-    / "mctl-gitops"
-    / "platform-gitops"
-    / "argo-workflows"
-    / "cluster-templates"
+# mctl-gitops lives beside this repo in the developer workspace, and is now
+# checked out in CI too (pr-validation.yml) so the two cross-repo checks
+# below actually run there.
+#
+# It used to be absent in CI and both checks returned [] when the directory
+# was missing. That is a check which reports success for the one environment
+# where it is the only thing looking — `_check_cluster_workflow_template` was
+# a silent no-op in CI for its entire life. Absence is now an ERROR under CI
+# and a printed warning locally: a developer without the sibling checkout
+# still gets a usable run, and nothing green is ever produced by a check that
+# did not execute (mctl-agents#277).
+# MCTL_GITOPS_ROOT exists because actions/checkout refuses to write outside
+# $GITHUB_WORKSPACE, so CI cannot reproduce the sibling-directory layout a
+# developer workspace has. The default is that layout; CI checks the repo out
+# into the workspace and points this at it.
+GITOPS_ROOT = Path(
+    os.environ.get("MCTL_GITOPS_ROOT")
+    or REPO_ROOT.parent / "mctl-gitops" / "platform-gitops"
 )
+GITOPS_CWFT_DIR = GITOPS_ROOT / "argo-workflows" / "cluster-templates"
+GITOPS_CATALOG_PROFILES_DIR = GITOPS_ROOT / "agent-platform" / "execution-profiles"
+
+
+def _gitops_missing(directory: Path, what: str) -> list[str]:
+    """Error under CI, warn locally, for an absent sibling checkout."""
+    message = (
+        f"{directory} not found; cannot check {what}. In CI this is a "
+        "failure — pr-validation.yml checks mctl-gitops out for exactly this."
+    )
+    if os.environ.get("CI"):
+        return [message]
+    print(f"warn: {message} (skipping: not running under CI)")
+    return []
+
+
+# Which agent's builder each catalog ExecutionProfile has to agree with.
+#
+# An explicit table, and a MISSING entry is an error rather than a skip: a
+# fourth profile added to the catalog must either be mapped here or fail. A
+# lookup that silently passes unknown profiles is how this check would stop
+# working without ever going red — the same shape as the CI skip above.
+_AGENT_BY_CATALOG_PROFILE = {
+    "issue-investigator-default": "issue-investigator",
+    "implementer-default": "implementer",
+    "shepherd-default": "shepherd",
+}
 
 # Every build_*_options() builder consults mctl_mcp_config()/_mctl_tool_globs(),
 # which only includes "mcp__mctl__*" in allowed_tools when MCTL_TOKEN is set.
@@ -218,7 +254,7 @@ def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
 
 def _check_cluster_workflow_template(manifest: AgentManifest) -> list[str]:
     if not GITOPS_CWFT_DIR.is_dir():
-        return []  # mctl-gitops checkout not present; expected in CI
+        return _gitops_missing(GITOPS_CWFT_DIR, "clusterWorkflowTemplate references")
     names = {
         yaml.safe_load(p.read_text(encoding="utf-8"))["metadata"]["name"]
         for p in GITOPS_CWFT_DIR.glob("cwft-*.yaml")
@@ -408,6 +444,129 @@ def check_manifests_match_inventory(manifests: dict[str, AgentManifest]) -> list
     return errors
 
 
+def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -> list[str]:
+    """The mctl-gitops ExecutionProfile catalog must state the tools that
+    `orchestrator/options.py` actually grants.
+
+    Why this lives here and not in mctl-gitops: the comparison has to call
+    the real builders, which only exist in this repo. The other half of the
+    contract — budgetUsd/timeoutSeconds against the CWFT that enforces them —
+    is entirely inside mctl-gitops and lives in its
+    `scripts/validate-agent-platform.py`.
+
+    Why it is needed at all: until 2026-09-02 nothing compared the catalog to
+    the code, and it had drifted in BOTH directions at once (#277). The
+    investigator profile omitted Write/Edit/Bash, understating what the agent
+    can do — a security claim the platform does not enforce. The shepherd
+    profile listed Bash/Grep/Glob/WebFetch while `build_shepherd_options`
+    grants exactly ["Read"], overstating it — in a catalog meant to become
+    authoritative, a claim that would have WIDENED the agent's permissions
+    the day something started reading it. The implementer profile named
+    `build_implementer_options`, which does not exist.
+
+    Only `spec.tools` is compared. Budgets are deliberately NOT: the catalog
+    records EFFECTIVE values, which come from the CWFT's env, not from this
+    module's defaults — implementer-default correctly says $20.00 where
+    options.py defaults to $3.00. Comparing them here would fire immediately
+    and be wrong.
+    """
+    if not GITOPS_CATALOG_PROFILES_DIR.is_dir():
+        return _gitops_missing(GITOPS_CATALOG_PROFILES_DIR, "the agent-platform catalog")
+
+    errors: list[str] = []
+    profile_paths = sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml"))
+    # A directory that exists but holds no profiles validates nothing, and
+    # would report success for doing so — the same silent-no-op shape as the
+    # missing-checkout case above, reached by a rename or a restructure in
+    # mctl-agents rather than by an absent clone (agy P3 on #284).
+    if not profile_paths:
+        return [
+            f"{GITOPS_CATALOG_PROFILES_DIR} contains no */profile.yaml; the "
+            "catalog moved or was emptied, and nothing was checked."
+        ]
+    for profile_path in profile_paths:
+        try:
+            document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
+                raise ManifestError("missing or non-mapping 'spec'")
+            spec = document["spec"]
+            # Read and shape-check inside the guard, not after it. `spec:` with
+            # nothing under it parses as None, and `tools:` can be any YAML
+            # node — so `spec.get(...)` or `set(spec.get("tools"))` outside
+            # this block raises AttributeError/TypeError and aborts the whole
+            # run, hiding every other profile's result behind one malformed
+            # file in a DIFFERENT repository (agy P2 on #284).
+            declared_builder = (spec.get("runtime") or {}).get("optionsBuilder")
+            tools = spec.get("tools") or []
+            # Explicitly a list. `set("Read")` on a scalar `tools: Read` is
+            # not an error — it silently yields {'R','e','a','d'}, and the
+            # mismatch that follows names four letters instead of the real
+            # problem.
+            if not isinstance(tools, list):
+                raise ManifestError(f"spec.tools must be a list, got {type(tools).__name__}")
+            declared_tools = set(tools)
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            errors.append(f"{profile_path}: {exc}")
+            continue
+
+        profile_name = profile_path.parent.name
+        agent_name = _AGENT_BY_CATALOG_PROFILE.get(profile_name)
+        if agent_name is None:
+            errors.append(
+                f"{profile_name}: no entry in _AGENT_BY_CATALOG_PROFILE, so its "
+                "tools are checked against nothing. Map it to the agent whose "
+                "builder it describes, or remove the profile."
+            )
+            continue
+        manifest = manifests.get(agent_name)
+        if manifest is None:
+            errors.append(f"{profile_name}: maps to unknown agent {agent_name!r}")
+            continue
+
+        if declared_builder != manifest.options_builder:
+            errors.append(
+                f"{profile_name}: runtime.optionsBuilder {declared_builder!r} does "
+                f"not match {agent_name}'s manifest {manifest.options_builder!r}"
+            )
+            continue
+
+        # Deliberately NOT _resolve_builder_module_with_clean_env: every var
+        # it clears is a budget or a timeout, and this check compares only
+        # allowed_tools, which none of them affect. Using it would mean
+        # inheriting its contract — it reloads orchestrator.options against a
+        # cleared env and leaves restoring the module to the CALLER — for no
+        # benefit, and three profiles' worth of chances to forget (claude P2
+        # on #284). The one env var that does reach allowed_tools is
+        # MCTL_TOKEN, forced below.
+        try:
+            builder = manifest.resolve_options_builder()
+        except ManifestError as exc:
+            errors.append(f"{profile_name}: {exc}")
+            continue
+
+        args, kwargs = _builder_call_args(manifest.options_builder.rpartition(":")[2])
+        previous_token = os.environ.get("MCTL_TOKEN")
+        os.environ["MCTL_TOKEN"] = _DUMMY_MCTL_TOKEN
+        try:
+            options = builder(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - report as a validation failure
+            errors.append(f"{profile_name}: {manifest.options_builder} raised: {exc}")
+            continue
+        finally:
+            if previous_token is None:
+                os.environ.pop("MCTL_TOKEN", None)
+            else:
+                os.environ["MCTL_TOKEN"] = previous_token
+
+        actual = set(options.allowed_tools or [])
+        if actual != declared_tools:
+            errors.append(
+                f"{profile_name}: spec.tools {sorted(declared_tools)} does not match "
+                f"{manifest.options_builder}'s actual allowed_tools {sorted(actual)}"
+            )
+    return errors
+
+
 def validate(manifest: AgentManifest) -> list[str]:
     """Return human-readable errors for one manifest; empty means valid."""
     errors: list[str] = []
@@ -439,11 +598,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no manifests found under {MANIFESTS_DIR}", file=sys.stderr)
         return 1
 
-    if not GITOPS_CWFT_DIR.is_dir():
+    if not GITOPS_ROOT.is_dir():
         # Otherwise every "OK" line below is indistinguishable from one where
-        # clusterWorkflowTemplate was actually cross-checked against
-        # mctl-gitops, which in CI it never is (that checkout isn't present).
-        print(f"NOTE mctl-gitops not found at {GITOPS_CWFT_DIR} — clusterWorkflowTemplate checks are skipped below")
+        # the cross-repo checks actually ran.
+        note = (
+            "reported as FAILURES below (CI is set)"
+            if os.environ.get("CI")
+            else "skipped below"
+        )
+        print(f"NOTE mctl-gitops not found at {GITOPS_ROOT} — cross-repo checks are {note}")
 
     manifests: dict[str, AgentManifest] = {}
     exit_code = 0
@@ -491,6 +654,13 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             print("FAIL docs/agent-inventory.yaml <-> agents/_manifests/ consistency:")
             for error in inventory_errors:
+                print(f"  - {error}")
+
+        catalog_errors = check_catalog_profiles_match_builders(manifests)
+        if catalog_errors:
+            exit_code = 1
+            print("FAIL mctl-gitops agent-platform catalog <-> orchestrator/options.py:")
+            for error in catalog_errors:
                 print(f"  - {error}")
 
     return exit_code

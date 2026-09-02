@@ -50,6 +50,17 @@ dev = [
     "types-pyyaml~=6.0",  # stub package — PyYAML ships no inline types
 ]
 
+[tool.pytest.ini_options]
+# Only this repo's tests. CI now checks mctl-gitops out into ./_gitops for
+# the cross-repo catalog checks (mctl-agents#277), and a bare `pytest` was
+# happily collecting THAT repo's test suite too — which fails at import,
+# because its tests read paths relative to their own repo root. Collection
+# aborted before a single test of ours ran.
+#
+# testpaths only applies when no path argument is given, so `pytest
+# tests/test_manifest.py` and `pytest _gitops/...` still work as before.
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
