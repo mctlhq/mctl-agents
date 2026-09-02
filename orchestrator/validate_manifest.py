@@ -474,7 +474,17 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
         return _gitops_missing(GITOPS_CATALOG_PROFILES_DIR, "the agent-platform catalog")
 
     errors: list[str] = []
-    for profile_path in sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml")):
+    profile_paths = sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml"))
+    # A directory that exists but holds no profiles validates nothing, and
+    # would report success for doing so — the same silent-no-op shape as the
+    # missing-checkout case above, reached by a rename or a restructure in
+    # mctl-agents rather than by an absent clone (agy P3 on #284).
+    if not profile_paths:
+        return [
+            f"{GITOPS_CATALOG_PROFILES_DIR} contains no */profile.yaml; the "
+            "catalog moved or was emptied, and nothing was checked."
+        ]
+    for profile_path in profile_paths:
         try:
             document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
             if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
