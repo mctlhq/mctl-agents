@@ -113,9 +113,19 @@ class ReconcileWorkflow:
             )
         else:
             # Unpatched replay branch: schedule detect_orphans with exactly
-            # the one argument the old history recorded — a second (even
-            # None) argument here would be a payload mismatch on replay
-            # (agy P1 on this PR).
+            # the one argument the old history recorded.
+            #
+            # The original reason given here (agy P1 on that PR) was that a
+            # second argument "would be a payload mismatch on replay". That
+            # is not true, and tests/test_workflow_replay.py now measures it:
+            # Replayer compares the shape of the command stream, never a
+            # command's payload against the event it matched. An extra
+            # argument replays clean.
+            #
+            # Keeping the branch anyway, for the reason that does hold: this
+            # activity is re-executed for real when a resumed execution
+            # reaches it, and detect_orphans' signature is what bounds what
+            # may be passed. Same code, honest justification.
             orphans_result = await workflow.execute_activity(
                 detect_orphans,
                 args=[state_dir_path],

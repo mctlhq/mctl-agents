@@ -124,3 +124,17 @@ files = ["orchestrator", "config", "tools"]
 # `# type: ignore` or cast rather than restricting what's allowed today.
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+# `files` above deliberately excludes tests/, but mypy still FOLLOWS imports
+# into it: tools/record_workflow_history.py imports tests.replay_scenarios,
+# which imports the workflow test modules for their fake activities (#251 —
+# sharing one definition between the recorder and the replay tests is what
+# stops the recorded histories drifting from what the tests exercise).
+#
+# Without this, adding that one import re-imports every duck-typed fixture in
+# tests/ into the checked set and fails CI on pre-existing code the config
+# says is out of scope. Errors are silenced rather than the import ignored,
+# so tools/ still type-checks against the real signatures.
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
