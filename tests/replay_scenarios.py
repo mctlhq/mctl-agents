@@ -59,11 +59,11 @@ from pathlib import Path
 from typing import Any
 
 from temporalio.client import Client, WorkflowHandle
-from temporalio.worker import Worker
 
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
+from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
 HISTORY_DIR = Path(__file__).resolve().parent / "fixtures" / "histories"
 
@@ -91,7 +91,22 @@ class Scenario:
 
     @property
     def path(self) -> Path:
+        """History recorded BEFORE the exec-queue flip. Never re-record."""
         return HISTORY_DIR / f"{self.name}.prepatch.json"
+
+    @property
+    def patched_path(self) -> Path:
+        """History recorded AFTER the flip.
+
+        This is the only artifact that can show the flip actually routed:
+        replay compares command shape and is blind to `task_queue`, so a
+        green replay run says nothing about routing either way. The queue
+        name is visible in recorded history and nowhere else.
+        """
+        return HISTORY_DIR / f"{self.name}.patched.json"
+
+    def path_for(self, kind: str) -> Path:
+        return self.path if kind == "prepatch" else self.patched_path
 
 
 async def record(client: Client, scenario: Scenario) -> WorkflowHandle:

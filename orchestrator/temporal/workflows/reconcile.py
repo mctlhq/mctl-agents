@@ -19,6 +19,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.discovery import ReconcileDiscoveryResult, discover_and_project
     from orchestrator.temporal.activities.orphans import OrphanDetectionResult, detect_orphans
+    from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
 
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
@@ -169,21 +170,42 @@ class ReconcileWorkflow:
             len(discovery.projections),
             APPLY_OPERATION,
         )
+        # Explicit rather than relying on the operation's default: a dry run
+        # here would read everything, report success and write nothing — the
+        # exact shape of #270, and invisible from this side.
+        apply_input = SubmitAndWaitInput(
+            operation=APPLY_OPERATION, params={"dry_run": "false"}
+        )
+        # ADR-008 step 4. #251 names only DevLoopWorkflow and
+        # IncidentLoopWorkflow, but this is the third submit_and_wait and it
+        # belongs on the execution queue for the same reason as the other
+        # two: a 35-minute Argo poll waiting on the shared gitops write mutex
+        # is precisely the long-held slot the split exists to move off the
+        # control queue. Leaving it here would keep the workload the split
+        # was built to remove.
+        #
+        # A separate check from the reconcile-apply marker three lines up in
+        # the caller, not nested inside it: the two decisions are
+        # independent, and an execution may have recorded one and not the
+        # other.
         try:
-            result: WorkflowResult = await workflow.execute_activity(
-                submit_and_wait,
-                SubmitAndWaitInput(
-                    operation=APPLY_OPERATION,
-                    # Explicit rather than relying on the operation's default:
-                    # a dry run here would read everything, report success and
-                    # write nothing — the exact shape of #270, and invisible
-                    # from this side.
-                    params={"dry_run": "false"},
-                ),
-                start_to_close_timeout=APPLY_STEP_TIMEOUT,
-                heartbeat_timeout=APPLY_STEP_HEARTBEAT_TIMEOUT,
-                retry_policy=APPLY_STEP_RETRY_POLICY,
-            )
+            if workflow.patched("exec-queue"):
+                result: WorkflowResult = await workflow.execute_activity(
+                    submit_and_wait,
+                    apply_input,
+                    task_queue=EXECUTION_TASK_QUEUE,
+                    start_to_close_timeout=APPLY_STEP_TIMEOUT,
+                    heartbeat_timeout=APPLY_STEP_HEARTBEAT_TIMEOUT,
+                    retry_policy=APPLY_STEP_RETRY_POLICY,
+                )
+            else:
+                result = await workflow.execute_activity(
+                    submit_and_wait,
+                    apply_input,
+                    start_to_close_timeout=APPLY_STEP_TIMEOUT,
+                    heartbeat_timeout=APPLY_STEP_HEARTBEAT_TIMEOUT,
+                    retry_policy=APPLY_STEP_RETRY_POLICY,
+                )
         except ActivityError as exc:
             # A failed write is not a failed tick. The drift is still there,
             # discovery still reported it, and the next tick in 15 minutes

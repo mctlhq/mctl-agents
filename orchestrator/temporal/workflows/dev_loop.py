@@ -63,6 +63,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
+    from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
     from orchestrator.temporal.issue_ref import parse_issue_url
 
 ENVIRONMENT = "production"
@@ -265,6 +266,29 @@ async def _resolve(agent: str) -> ResolvedRelease | None:
 async def _run_cwft(
     operation: str, params: dict[str, str], *, step_timeout: timedelta = SDK_STEP_TIMEOUT
 ) -> WorkflowResult:
+    # ADR-008 step 4: every CWFT submit moves to the execution queue. This
+    # one funnel covers all four dev-loop submits (investigate, approve,
+    # implement, the in-loop shepherd tick), so the check sits here and is
+    # evaluated once per call, before the command is scheduled — never
+    # inside a branch that has already scheduled one (#223).
+    #
+    # patched() returns False only while replaying history that lacks the
+    # marker, so a 14-day merge watch started before this deploy keeps
+    # replaying its earlier submits on the control queue and routes only
+    # its NEW ticks to exec. The transition is spread across the watch
+    # window rather than happening at once.
+    if workflow.patched("exec-queue"):
+        return await workflow.execute_activity(
+            submit_and_wait,
+            SubmitAndWaitInput(operation=operation, params=params),
+            task_queue=EXECUTION_TASK_QUEUE,
+            start_to_close_timeout=step_timeout,
+            heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
+            retry_policy=SDK_STEP_RETRY_POLICY,
+        )
+    # Unpatched replay branch, kept verbatim: no task_queue argument at all,
+    # which schedules onto the workflow's own queue exactly as the recorded
+    # history did.
     return await workflow.execute_activity(
         submit_and_wait,
         SubmitAndWaitInput(operation=operation, params=params),

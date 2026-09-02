@@ -87,11 +87,43 @@ the workload has moved off the control queue, and the exporter is running
 so the effect is visible.
 
 **D4 — The routing flip is guarded by `workflow.patched("exec-queue")`.**
-`execute_activity(task_queue=...)` changes the scheduled command, and
-in-flight histories replay command-for-command. With 14-day watches
-running right now, an unguarded change would wedge every active loop —
-the same failure the `slug-scoped-implement` and `atomic-approve` markers
-exist to prevent.
+
+> **Amended 2026-09-02 (#251).** The reason originally given here was
+> wrong, and the replay infrastructure built for this step is what
+> disproved it. It said `execute_activity(task_queue=...)` "changes the
+> scheduled command, and in-flight histories replay command-for-command",
+> so an unguarded change "would wedge every active loop".
+>
+> It would not. `Replayer` compares the *shape* of the command stream —
+> how many commands, of what kind, in what order. sdk-core's
+> `handle_command_event` pops the next command off the queue and feeds it
+> the event; it never compares the command's attributes to the event's,
+> and the activity state machine has no `matches_event` at all. Measured
+> on temporalio 1.31.0 against real recorded histories: an added, removed
+> or reordered activity raises `NondeterminismError`; a changed
+> `task_queue`, a changed timeout and an extra argument are all invisible.
+> The table and the mutations are in `tests/test_workflow_replay.py`.
+>
+> The marker is still the right call, for reasons that survive:
+> history records which executions used which queue, and a rollback of
+> the flip is replayable rather than a second unguarded edit. But the
+> flip was never the hazard this paragraph claimed, and two other places
+> inherited the same false premise — `reconcile.py`'s unpatched branch
+> (an accepted agy P1 about "payload mismatch on replay") and this ADR.
+> Both corrected.
+>
+> The practical consequence for the rollout: **a green replay run is not
+> evidence that the flip was guarded or that it routes.** Routing is
+> verified from recorded history content, which is the only place a task
+> queue is visible — see the `*.patched.json` fixtures and
+> `test_todays_code_still_routes_and_still_guards`.
+
+`patched()` returns False only while replaying history that lacks the
+marker, so a 14-day merge watch started before the deploy keeps replaying
+its earlier submits on the control queue and routes only its NEW ticks to
+exec. The transition is spread across the watch window rather than
+happening at once, which is also why `MERGE_WATCH_DEADLINE` governs when
+the marker may be removed rather than whether the flip is safe.
 
 **D5 — Metrics before tuning, and the exporter is a prerequisite rather
 than a given.** The SDK *can* produce
@@ -152,14 +184,33 @@ there until timeout.
    flip so the flip has a baseline to be read against rather than being
    the first thing the new dashboards ever see.
 4. **mctl-agents:** flip `submit_and_wait` onto the exec queue behind
-   `workflow.patched("exec-queue")`. Limits unchanged here — this step is
-   one-way, and pairing it with a capacity change would make a bad
-   number indistinguishable from a bad flip.
+   `workflow.patched("exec-queue")` — *done, #251*. Limits unchanged
+   here — pairing the flip with a capacity change would make a bad number
+   indistinguishable from a bad flip.
+
+   Three call sites, not the two #251 names: `dev_loop._run_cwft` (the
+   funnel feeding investigate, approve, implement and the in-loop
+   shepherd tick), `incidents.py`, and `reconcile.py`'s `_apply`. The
+   third was included deliberately — a 35-minute Argo poll waiting on the
+   shared gitops write mutex is exactly the long-held slot this split
+   exists to move, and leaving it would keep the workload the split was
+   built to remove.
+
+   Preceded by replay infrastructure (#251 step A, PR #280), which did
+   not exist despite the issue's verification section assuming it did.
 5. Soak one full dev-loop, then tighten the control limits (D3) from real
    numbers.
 
 Steps 1–3 are individually reversible. Step 4 is one-way for histories
 that record the patch, which is why it is alone.
+
+> **Note on step 4's blast radius**, given D4's amendment above: because
+> `patched()` only returns False while replaying history without the
+> marker, in-flight executions do not stay on the control queue — they
+> replay their earlier submits there and route their next ones to exec.
+> The changeover is gradual across the merge-watch window, not a cutover.
+> The exec worker has been polling since 09-01, so there was never a
+> window where a routed activity had nobody to pick it up.
 
 ## Consequences
 
