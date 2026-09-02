@@ -118,12 +118,35 @@ so the effect is visible.
 > queue is visible — see the `*.patched.json` fixtures and
 > `test_todays_code_still_routes_and_still_guards`.
 
-`patched()` returns False only while replaying history that lacks the
-marker, so a 14-day merge watch started before the deploy keeps replaying
-its earlier submits on the control queue and routes only its NEW ticks to
-exec. The transition is spread across the watch window rather than
-happening at once, which is also why `MERGE_WATCH_DEADLINE` governs when
-the marker may be removed rather than whether the flip is safe.
+**Migration is by attrition, and that was got wrong too.** An earlier
+version of this paragraph said an in-flight execution "replays its earlier
+submits on the control queue and routes only its NEW ticks to exec". It
+does not. `workflow_patch` memoizes per patch id
+(`temporalio/worker/_workflow_instance.py`): an execution whose history
+lacks the marker replays that call, gets False, memoizes False, and
+returns False for the rest of its life — long after replay has finished.
+
+So a dev loop that was already running when the flip deployed keeps
+sending **every** Argo poll to the control queue until it ends, up to
+`MERGE_WATCH_DEADLINE`. Only executions started after the deploy route to
+exec. Verified end to end rather than read off the source, in
+`tests/test_patch_memoization.py` — reasoning from source is exactly how
+the wrong version got written.
+
+Two operational consequences:
+
+- A control queue still carrying long polls a week after the flip is
+  attrition, not a broken flip. `temporal_worker_task_slots_used` on
+  `mctl-dev-loop` decaying toward zero as old loops finish is the signal
+  that it worked.
+- The relief is therefore gradual. The alternative — dropping the marker
+  and routing unconditionally — would move every in-flight execution
+  immediately, and is genuinely available now that replay is known to
+  ignore `task_queue` (agy proposed exactly that on #251). It is not taken
+  because history would then contain no record of which queue an execution
+  used, a rollback would be a second unguarded edit with the same gap, and
+  a loop that switched queues mid-life would split its schedule-to-start
+  across both — muddying the one measurement D5 exists to produce.
 
 **D5 — Metrics before tuning, and the exporter is a prerequisite rather
 than a given.** The SDK *can* produce
@@ -204,13 +227,14 @@ there until timeout.
 Steps 1–3 are individually reversible. Step 4 is one-way for histories
 that record the patch, which is why it is alone.
 
-> **Note on step 4's blast radius**, given D4's amendment above: because
-> `patched()` only returns False while replaying history without the
-> marker, in-flight executions do not stay on the control queue — they
-> replay their earlier submits there and route their next ones to exec.
-> The changeover is gradual across the merge-watch window, not a cutover.
-> The exec worker has been polling since 09-01, so there was never a
-> window where a routed activity had nobody to pick it up.
+> **Note on step 4's blast radius**, given D4's amendment above:
+> in-flight executions **stay** on the control queue for the rest of their
+> lives — `patched()` memoizes, so an execution that predates the marker
+> never adopts it. Only new executions route to exec. The changeover is
+> attrition across the merge-watch window, not a cutover and not a
+> mid-life migration. The exec worker has been polling since 09-01, so
+> there was never a window where a routed activity had nobody to pick it
+> up.
 
 ## Consequences
 

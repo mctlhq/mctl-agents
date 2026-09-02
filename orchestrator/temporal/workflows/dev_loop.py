@@ -272,11 +272,13 @@ async def _run_cwft(
     # evaluated once per call, before the command is scheduled — never
     # inside a branch that has already scheduled one (#223).
     #
-    # patched() returns False only while replaying history that lacks the
-    # marker, so a 14-day merge watch started before this deploy keeps
-    # replaying its earlier submits on the control queue and routes only
-    # its NEW ticks to exec. The transition is spread across the watch
-    # window rather than happening at once.
+    # Migration is by ATTRITION, not mid-life. patched() memoizes per id
+    # (temporalio/worker/_workflow_instance.py), so a loop whose history
+    # lacks the marker returns False here for the rest of its life — every
+    # one of its Argo polls stays on the control queue until it ends, up to
+    # MERGE_WATCH_DEADLINE. Only executions started after this deploy route
+    # to exec. Pinned by tests/test_patch_memoization.py; the opposite was
+    # asserted in ADR-008 until agy caught it on #282.
     if workflow.patched("exec-queue"):
         return await workflow.execute_activity(
             submit_and_wait,
