@@ -148,10 +148,9 @@ there until timeout.
    poll; nothing yet schedules to the exec queue.
 3. **mctl-agents:** wire the metrics exporter (D5) — *done, #252*, with
    the scrape, alert rule and dashboard following in mctl-gitops.
-   Independent of the
-   split and safe on its own, and it goes BEFORE the flip so the flip has
-   a baseline to be read against rather than being the first thing the
-   new dashboards ever see.
+   Independent of the split and safe on its own, and it goes BEFORE the
+   flip so the flip has a baseline to be read against rather than being
+   the first thing the new dashboards ever see.
 4. **mctl-agents:** flip `submit_and_wait` onto the exec queue behind
    `workflow.patched("exec-queue")`. Limits unchanged here — this step is
    one-way, and pairing it with a capacity change would make a bad
