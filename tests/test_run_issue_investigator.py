@@ -3149,3 +3149,20 @@ def test_target_repository_sha_reads_git_head(tmp_path):
     ).stdout.strip()
     assert sha == expected
     assert len(sha) == 40
+
+
+def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
+    """A clone with no commits has no HEAD to pin.
+
+    `gh repo clone` of an empty repository produces exactly this, and
+    `git rev-parse HEAD` exits 128 there. Failing closed is right — a plan
+    that pinned nothing would still claim reproducibility — but the reason
+    has to reach the reader, not arrive as a bare CommandFailed out of
+    `_run_agent` (claude P3 on #234).
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+
+    with pytest.raises(RuntimeError, match="cannot pin target_repository_sha"):
+        run_issue_investigator._target_repository_sha(tmp_path)

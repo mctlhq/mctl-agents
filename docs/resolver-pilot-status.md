@@ -40,6 +40,30 @@ catalog schema, registry-backed compatibility validation, and atomic
   `ISSUE_INVESTIGATOR_RESOLVER_MODE` flag, is explicitly out of scope for
   this pilot (mctlhq/mctl-agents#227's requirements.md "Out of scope").
 
+### Declarative mode is usable from a source checkout only
+
+Worth stating plainly, because the flag looks like it would work anywhere:
+the fixtures live under `tests/`, and the Dockerfile copies only
+`orchestrator/`, `config/` and `agents/` into the image. `entrypoint.sh`
+does not restore them either. So on the deployed container — the only place
+`run_issue_investigator` normally runs — setting
+`ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` cannot succeed, by
+construction rather than by accident.
+
+`execute()` checks for the fixture root up front and says exactly that,
+rather than reporting "missing execution profile", which reads like a
+catalog typo and sends the reader looking for a file to add.
+
+**#950 has since landed**, and the catalog now exists at
+`platform-gitops/agent-platform/` — but it is itself marked
+`bindingSource: compatibility-fixture` / `promotable: false`, so it is not
+production activation either. It also diverges from the fixtures here
+(profile named `issue-investigator-default` vs `investigator-default`,
+`modelPolicyRef.task` `issue_investigator` vs `service_agent`, and a
+different tool list). Converging the two — and settling which of them is
+right about the investigator's real tool allow-list — is deliberately not
+part of this pilot; it is tracked separately.
+
 ## Rollback
 
 Set `ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy` (already the default) —

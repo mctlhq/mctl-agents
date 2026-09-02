@@ -449,6 +449,24 @@ def _model_policy_version() -> str:
     return f"v{schema_version}+{_content_hash(DEFAULT_POLICY_PATH)}"
 
 
+def _under_repo_root(value: str) -> Path:
+    """Resolve `value` beneath REPO_ROOT, refusing anything that escapes it.
+
+    `Path(REPO_ROOT) / "/etc/shadow"` is `/etc/shadow` — pathlib lets an
+    absolute right-hand operand discard the left entirely — and a relative
+    `../..` walks out just as well. In practice `value` comes from a
+    reviewed, committed agent.yaml/profile, the same trust boundary as the
+    rest of this module, and the result is only ever a sha256. That makes
+    this cheap rather than unnecessary: the check costs two lines, and
+    "it can only leak a hash of the file" is a sentence worth not having
+    to write again (claude P3 on #234).
+    """
+    candidate = (REPO_ROOT / value).resolve()
+    if candidate != REPO_ROOT and REPO_ROOT not in candidate.parents:
+        raise ResolverError(f"prompt source escapes the repository root: {value}")
+    return candidate
+
+
 def _hash_prompt_source(source: PromptSource) -> str:
     """Deterministic content hash for one PromptSource, mirroring
     docs/agent-inventory.yaml's promptSources contract: `file`/`glob` hash
@@ -456,20 +474,20 @@ def _hash_prompt_source(source: PromptSource) -> str:
     text (so an edit to the prompt template changes the hash even though no
     file path changed)."""
     if source.kind == "file":
-        target = REPO_ROOT / source.value.split("#")[0].strip()
+        target = _under_repo_root(source.value.split("#")[0].strip())
         if not target.is_file():
             raise ResolverError(f"prompt source file does not exist: {source.value}")
         return _content_hash(target)
     if source.kind == "glob":
         matches = sorted(
             m for m in globmod.glob(source.value, root_dir=REPO_ROOT, recursive=True)
-            if (REPO_ROOT / m).is_file()
+            if _under_repo_root(m).is_file()
         )
         if not matches:
             raise ResolverError(f"prompt source glob matches no files: {source.value}")
         digest = hashlib.sha256()
         for match in matches:
-            digest.update((REPO_ROOT / match).read_bytes())
+            digest.update(_under_repo_root(match).read_bytes())
         return "sha256:" + digest.hexdigest()
     if source.kind == "inline":
         module_name, _, symbol = source.value.partition(":")
@@ -483,12 +501,48 @@ def _hash_prompt_source(source: PromptSource) -> str:
     raise ResolverError(f"unknown prompt source kind {source.kind!r}")
 
 
+def _require_fixtures_present() -> None:
+    """Say the real thing when declarative mode is selected where it cannot run.
+
+    `FIXTURES_DIR` is under `tests/`, and the Dockerfile copies only
+    `orchestrator/`, `config/` and `agents/` into the image — `entrypoint.sh`
+    does not restore it either. So on the actual deployed container, which is
+    the only place `run_issue_investigator` normally runs,
+    `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` cannot work at all.
+
+    Without this guard the operator gets "missing execution profile
+    issue-investigator-default", which reads like a catalog typo and sends
+    them looking for a file to add. The condition is not a missing profile,
+    it is a mode that is test-only until the real catalog lands
+    (mctlhq/mctl-gitops#950's `platform-gitops/agent-platform/`); this names
+    that instead (claude P2 on #234).
+    """
+    # Deliberately the fixture ROOT, not the two directories execute()
+    # actually reads. Their absence is a real and different failure — a
+    # missing profile or an unwritten release binding — which must keep
+    # reporting itself as such; tests redirect those two paths and this
+    # guard must not fire for them. What the root's absence uniquely means
+    # is "tests/ was never shipped here", i.e. the image.
+    if FIXTURES_DIR.is_dir():
+        return
+    raise ResolverError(
+        f"declarative resolver mode is not available here: {FIXTURES_DIR} does not exist. "
+        "The pilot resolves against compatibility fixtures under tests/, which the "
+        "production image does not ship (the Dockerfile copies only orchestrator/, "
+        "config/ and agents/). Declarative mode is usable from a source checkout only; "
+        "in the image, leave ISSUE_INVESTIGATOR_RESOLVER_MODE unset or 'legacy'. "
+        "Production activation is mctlhq/mctl-agents#227's follow-up, not this flag."
+    )
+
+
 def execute(agent: str, task: Task) -> ExecutionPlan:
     """Resolve one immutable `ExecutionPlan` for `agent`, entirely from
     checked-in v1alpha2 fixtures. Raises `ResolverError` — never falls back —
     for every missing/ambiguous/disabled/incompatible/unbounded/unapproved
     condition ADR 007 and mctlhq/mctl-agents#227's acceptance criteria name.
     """
+    _require_fixtures_present()
+
     if not task.target_repository_sha or not task.target_repository_sha.strip():
         raise ResolverError("task.target_repository_sha is required and must be non-empty")
 

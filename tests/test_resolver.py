@@ -408,3 +408,43 @@ def test_hash_prompt_source_fails_closed_on_unretrievable_source():
     outside the import/getattr error set — must still raise `ResolverError`."""
     with pytest.raises(resolver.ResolverError):
         resolver._hash_prompt_source(PromptSource(kind="inline", value="builtins:len"))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/etc/hosts",            # absolute: pathlib discards REPO_ROOT entirely
+        "../../../../etc/hosts",  # relative walk-out
+    ],
+)
+def test_a_file_prompt_source_cannot_reach_outside_the_repository(value):
+    """`REPO_ROOT / "/etc/hosts"` is `/etc/hosts` — an absolute right-hand
+    operand overrides the left in pathlib, and `../` walks out just as well.
+
+    Both must be refused as escapes rather than silently hashed. Uses a path
+    that really exists on the host, so a passing test means the guard fired
+    and not merely that the file was missing (claude P3 on #234).
+    """
+    with pytest.raises(resolver.ResolverError, match="escapes the repository root"):
+        resolver._hash_prompt_source(PromptSource(kind="file", value=value))
+
+
+def test_declarative_mode_names_itself_test_only_when_the_fixtures_are_absent(monkeypatch):
+    """The production image ships no tests/, so declarative mode cannot run
+    there at all.
+
+    Before this guard the operator saw "missing execution profile
+    issue-investigator-default" — which reads like a catalog typo and sends
+    them hunting for a file to add, rather than telling them the mode is
+    test-only until the real catalog lands (claude P2 on #234).
+    """
+    monkeypatch.setattr(resolver, "FIXTURES_DIR", resolver.REPO_ROOT / "no-such-dir")
+
+    with pytest.raises(resolver.ResolverError) as excinfo:
+        resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
+
+    message = str(excinfo.value)
+    assert "not available here" in message
+    assert "production image does not ship" in message
+    # The old, misleading message must not be what surfaces.
+    assert "missing execution profile" not in message

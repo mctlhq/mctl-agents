@@ -70,7 +70,7 @@ import yaml
 # forbids — the agent itself only ever runs in an Argo sandbox.
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.github_token import refresh_github_token
-from orchestrator.proc import run_capturing
+from orchestrator.proc import CommandFailed, run_capturing
 
 DEFAULT_STATE_DIR = Path(
     os.getenv(
@@ -106,9 +106,27 @@ def _target_repository_sha(repo_dir: Path) -> str:
     """HEAD SHA of the read-only target-repo clone `_clone_repo` produced —
     pins the declarative ExecutionPlan's `target_repository_sha` (see
     docs/agent-inventory.yaml's runtimeContextInputs note: an agent version
-    is reproducible only against a fixed target SHA)."""
-    proc = run_capturing(["git", "rev-parse", "HEAD"], cwd=repo_dir)
-    return proc.stdout.strip()
+    is reproducible only against a fixed target SHA).
+
+    Fails closed, and says why. `git rev-parse HEAD` exits 128 on a clone
+    with no commits — an empty target repository is rare but perfectly
+    legal, and `_clone_repo`'s shallow `gh repo clone` produces one happily.
+    Left to `run_capturing`'s default `check=True` that surfaced as a bare
+    CommandFailed out of `_run_agent`; the resolver would rather name the
+    condition than let a plan claim a pinned SHA it does not have (claude P3
+    on #234).
+    """
+    try:
+        proc = run_capturing(["git", "rev-parse", "HEAD"], cwd=repo_dir)
+    except CommandFailed as exc:
+        raise RuntimeError(
+            f"cannot pin target_repository_sha: no HEAD in {repo_dir} "
+            f"(an empty repository has no commit to resolve) — {exc}"
+        ) from exc
+    sha = proc.stdout.strip()
+    if not sha:
+        raise RuntimeError(f"cannot pin target_repository_sha: empty HEAD in {repo_dir}")
+    return sha
 
 # A proposal whose .status.yaml is missing or still `proposed` can be
 # (re-)investigated. Anything past that means the implementer/shepherd has
