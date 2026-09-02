@@ -479,6 +479,347 @@ def test_reconcile_preserves_existing_triage_failure_without_pr(tmp_path) -> Non
     assert read_status(ref)["failure"]["code"] == "no-commits"
 
 
+# ---------------------------------------------------------------------------
+# #276: a PR-less proposal whose source issue is already resolved
+#
+# `missing-pr` conflates "a PR should exist and does not" with "this
+# proposal's reason for existing is gone".  Only the second is knowable from
+# the source issue, and only the second accumulates silently — the report is
+# accurate and useless, so nobody acts on it.
+# ---------------------------------------------------------------------------
+def _with_source(ref: ProposalRef, *, repo: str = "mctlhq/mctl-academy", issue: int = 21) -> None:
+    """Add the `source:` block the investigator writes, in place."""
+    status = read_status(ref)
+    status["source"] = {
+        "type": "github_issue",
+        "repo": repo,
+        "issue": issue,
+        "url": f"https://github.com/{repo}/issues/{issue}",
+    }
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False), encoding="utf-8"
+    )
+
+
+def _pr_less_reconcile(ref: ProposalRef, *, issue_payload, gh_side_effect=None):
+    """Drive reconcile_one down the no-PR path with a stubbed source issue."""
+    gh = patch.object(
+        run_shepherd,
+        "_gh_api_json",
+        side_effect=gh_side_effect,
+        **({} if gh_side_effect else {"return_value": issue_payload}),
+    )
+    with patch.object(run_shepherd, "_find_pr_url_by_branch", return_value=None), \
+         patch.object(run_shepherd, "find_pr_for_proposal", return_value=None), \
+         patch.object(
+             run_implementer,
+             "_preflight_existing_result",
+             return_value=run_implementer.ExistingResult(action="none"),
+         ), gh as gh_mock:
+        return run_shepherd.reconcile_one(ref), gh_mock
+
+
+def test_reconcile_keeps_missing_pr_while_the_source_issue_is_open(tmp_path) -> None:
+    """An open issue means missing-pr is still the right answer, and it settles.
+
+    Asserted over TWO cycles rather than one, because one cycle cannot tell
+    the two outcomes apart.  A stuck proposal that never carried `notes` does
+    get one catch-up write when this lands — that is a one-time settle.  What
+    would be a defect is a write on EVERY cycle: reconcile runs every 15
+    minutes against a GitOps repo, so a per-cycle diff is a commit per stuck
+    proposal per cycle, forever.  Only the second run can distinguish them.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="open-issue",
+        status="needs-triage", pr_url=None,
+    )
+    _with_source(ref)
+    status = read_status(ref)
+    status["failure"] = {
+        "code": "missing-pr",
+        "stage": "reconcile",
+        "message": "No canonical PR exists for the deterministic result branch.",
+    }
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+
+    result, _ = _pr_less_reconcile(ref, issue_payload={"state": "open", "state_reason": None})
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "missing-pr"
+
+    settled = ref.status_path.read_text(encoding="utf-8")
+    _pr_less_reconcile(ref, issue_payload={"state": "open", "state_reason": None})
+    assert ref.status_path.read_text(encoding="utf-8") == settled
+
+
+def test_reconcile_relabels_a_proposal_whose_issue_closed_completed(tmp_path) -> None:
+    """The status stays needs-triage; only the reason becomes legible.
+
+    Deliberately NOT a terminal write.  Retiring a proposal is an operator
+    decision, and `rejected` is durable — a state machine that writes it has
+    made that decision on the operator's behalf and left no way back.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="done-elsewhere",
+        status="implemented", pr_url=None,
+    )
+    _with_source(ref)
+
+    result, _ = _pr_less_reconcile(
+        ref, issue_payload={"state": "closed", "state_reason": "completed"}
+    )
+
+    final = read_status(ref)
+    assert result.decision == "needs-triage"
+    assert final["status"] == "needs-triage"
+    assert final["failure"]["code"] == "source-resolved"
+    assert "mctlhq/mctl-academy#21" in final["failure"]["message"]
+
+    # The re-label must settle too, for the same reason the missing-pr case
+    # must: a closed issue stays closed, so a second cycle has nothing new to
+    # say and must not produce a second GitOps commit.
+    settled = ref.status_path.read_text(encoding="utf-8")
+    _pr_less_reconcile(ref, issue_payload={"state": "closed", "state_reason": "completed"})
+    assert ref.status_path.read_text(encoding="utf-8") == settled
+
+
+def test_reconcile_distinguishes_not_planned_from_completed(tmp_path) -> None:
+    """Two different reasons a proposal is obsolete, told apart in the file."""
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="dropped",
+        status="implemented", pr_url=None,
+    )
+    _with_source(ref)
+
+    result, _ = _pr_less_reconcile(
+        ref, issue_payload={"state": "closed", "state_reason": "not_planned"}
+    )
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "source-not-planned"
+
+
+def test_reconcile_relabels_an_ALREADY_stuck_missing_pr_proposal(tmp_path) -> None:
+    """The regression this whole change exists for.
+
+    A proposal already sitting at needs-triage/missing-pr returns from the
+    "preserving existing failure" branch, which sits BEFORE the write.  A
+    source-issue check placed at the write site would therefore never run for
+    it — it would fix proposals that get stuck in the future and leave every
+    currently stuck one exactly where it is.  Those are the ones #276 is
+    about, so this asserts the re-label happens from the stuck state.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="stuck-for-weeks",
+        status="needs-triage", pr_url=None,
+    )
+    _with_source(ref)
+    status = read_status(ref)
+    status["failure"] = {
+        "code": "missing-pr",
+        "stage": "reconcile",
+        "message": "No canonical PR exists for the deterministic result branch.",
+    }
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+
+    result, _ = _pr_less_reconcile(
+        ref, issue_payload={"state": "closed", "state_reason": "completed"}
+    )
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "source-resolved"
+
+
+@pytest.mark.parametrize("parked_code", ["source-resolved", "source-not-planned"])
+def test_reconcile_can_relabel_back_when_the_issue_is_reopened(
+    tmp_path, parked_code
+) -> None:
+    """Neither source-* code is a one-way door written by a machine.
+
+    Parametrized over both because the frozenset is the only thing making
+    them symmetric, and an asymmetric membership is a plausible edit: with
+    only source-resolved covered, dropping source-not-planned from
+    SOURCE_RECHECKED_FAILURE_CODES left the whole suite green (claude P3).
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="reopened",
+        status="needs-triage", pr_url=None,
+    )
+    _with_source(ref)
+    status = read_status(ref)
+    status["failure"] = {"code": parked_code, "stage": "reconcile", "message": "..."}
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+
+    result, _ = _pr_less_reconcile(ref, issue_payload={"state": "open", "state_reason": None})
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "missing-pr"
+
+
+def test_reconcile_does_not_let_the_source_issue_touch_other_failures(tmp_path) -> None:
+    """A closed issue says nothing about no-commits, and must not overwrite it.
+
+    no-commits describes what the implementer did; the source issue describes
+    why the work was wanted.  Widening the re-label to every failure code
+    would erase implementer diagnostics the moment someone tidies up GitHub.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="no-commits-and-closed",
+        status="needs-triage", pr_url=None,
+    )
+    _with_source(ref)
+    status = read_status(ref)
+    status["failure"] = {
+        "code": "no-commits",
+        "stage": "agent",
+        "message": "implementer produced no commits",
+    }
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+    before = ref.status_path.read_text(encoding="utf-8")
+
+    result, gh = _pr_less_reconcile(
+        ref, issue_payload={"state": "closed", "state_reason": "completed"}
+    )
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "no-commits"
+    assert ref.status_path.read_text(encoding="utf-8") == before
+    # ...and GitHub was never asked: the answer could not have changed
+    # anything, so it must not cost a request per proposal per cycle.
+    gh.assert_not_called()
+
+
+def test_reconcile_never_reads_github_for_a_proposal_without_a_source_block(
+    tmp_path,
+) -> None:
+    """Proposals predating `source:` keep working, offline."""
+    ref = make_ref(
+        tmp_path, service="mctl-design", slug="legacy", status="implemented", pr_url=None,
+    )
+
+    result, gh = _pr_less_reconcile(ref, issue_payload=None)
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "missing-pr"
+    gh.assert_not_called()
+
+
+def test_an_unreadable_source_issue_leaves_the_missing_pr_diagnosis_alone(
+    tmp_path,
+) -> None:
+    """Fail-open: an unreadable source issue is not evidence about the PR.
+
+    Same reasoning as the `discovered_url` guard — a transient read failure
+    must never invent a status, and must never escape as an exception that
+    aborts the whole reconcile sweep partway through.
+
+    Scoped deliberately, and renamed after agy read the old name
+    ("...when_github_cannot_be_read") as a claim that an outage may
+    overwrite an `implemented` proposal. It does not say that: the absence
+    of a PR is STIPULATED here by the two mocks, and the only failing read
+    is the source issue. Whether a transient failure in PR *discovery*
+    should be allowed to write `missing-pr` at all is a real, separate and
+    pre-existing question — mctl-agents#281.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="gh-down",
+        status="implemented", pr_url=None,
+    )
+    _with_source(ref)
+
+    result, _ = _pr_less_reconcile(
+        ref, issue_payload=None, gh_side_effect=RuntimeError("gh: 502 Bad Gateway")
+    )
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "missing-pr"
+
+
+def test_a_github_blip_does_not_flap_a_parked_source_resolved_proposal(
+    tmp_path,
+) -> None:
+    """agy P1 on PR #279, and the price of making source-resolved re-checkable.
+
+    Re-checking is right — a reopened issue must be able to go back to
+    missing-pr — but it also means source-resolved no longer returns from the
+    preservation branch. If an unreadable issue were then read as "not
+    closed", one 502 mid-sweep would rewrite every parked proposal to
+    missing-pr and the next tick would rewrite them back: two GitOps commits
+    per proposal per blip, and the operator's signal gone in between.
+
+    So the status must be untouched, byte for byte, when GitHub cannot
+    answer — as distinct from GitHub answering "open", which is asserted
+    separately in test_reconcile_can_relabel_back_when_the_issue_is_reopened.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="parked",
+        status="needs-triage", pr_url=None,
+    )
+    _with_source(ref)
+    status = read_status(ref)
+    status["failure"] = {
+        "code": "source-resolved",
+        "stage": "reconcile",
+        "message": "source issue closed as completed",
+    }
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+    before = ref.status_path.read_text(encoding="utf-8")
+
+    result, _ = _pr_less_reconcile(
+        ref, issue_payload=None, gh_side_effect=RuntimeError("gh: 502 Bad Gateway")
+    )
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "source-resolved"
+    assert ref.status_path.read_text(encoding="utf-8") == before
+
+
+def test_an_uninterpretable_issue_payload_is_not_read_as_open(tmp_path) -> None:
+    """A 200 with an unexpected body is not an answer either.
+
+    Same failure as the 502 above, reached a different way: if a response
+    without a `state` fell through to "the issue is open", a schema change or
+    a proxy's error page would silently un-park proposals.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="weird-payload",
+        status="needs-triage", pr_url=None,
+    )
+    _with_source(ref)
+    status = read_status(ref)
+    status["failure"] = {"code": "source-resolved", "stage": "reconcile", "message": "..."}
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+    before = ref.status_path.read_text(encoding="utf-8")
+
+    result, _ = _pr_less_reconcile(ref, issue_payload={"message": "Not Found"})
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "source-resolved"
+    assert ref.status_path.read_text(encoding="utf-8") == before
+
+
+def test_a_partial_source_block_costs_no_github_request(tmp_path) -> None:
+    """claude P3 on PR #279: `source:` present but missing repo/issue.
+
+    Distinct from the block being absent entirely — that path is covered by
+    test_reconcile_never_reads_github_for_a_proposal_without_a_source_block.
+    A half-written block would be enough to attempt a request against
+    `repos/None/issues/None` if the guard were only `"source" in status`.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="half-written",
+        status="implemented", pr_url=None,
+    )
+    status = read_status(ref)
+    status["source"] = {"type": "github_issue"}
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+
+    result, gh = _pr_less_reconcile(ref, issue_payload=None)
+
+    assert result.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "missing-pr"
+    gh.assert_not_called()
+
+
 def test_reconcile_never_adopts_recorded_branch_collision(tmp_path) -> None:
     """A non-canonical colliding PR cannot enter the shepherd merge loop."""
     ref = make_ref(
