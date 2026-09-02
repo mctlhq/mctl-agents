@@ -657,6 +657,71 @@ def _parse_pr_url(pr_url: str) -> tuple[str, str, int]:
         raise ValueError(f"Cannot parse PR URL: {pr_url!r}") from e
 
 
+# Failure codes that describe "there is no PR", and are therefore the only
+# ones a fresh look at the source issue is allowed to overwrite.  Every other
+# code (no-commits, existing-result-invalid, ...) records something a human
+# put there or something reconcile learned from a branch, and the source
+# issue says nothing about those.
+#
+# missing-pr is in this set because it is the code the source check exists to
+# refine.  Its own two successors are in it as well so a proposal that was
+# already re-labelled can be re-labelled BACK when the issue is reopened —
+# without that, source-resolved would be a one-way door written by a machine.
+SOURCE_RECHECKED_FAILURE_CODES = frozenset(
+    {"missing-pr", "source-resolved", "source-not-planned"}
+)
+
+
+def _source_issue_failure(status_data: dict[str, Any]) -> dict[str, str] | None:
+    """Failure block for a PR-less proposal whose source issue is closed.
+
+    `missing-pr` conflates two situations that want opposite responses: a PR
+    that should exist and does not (a real failure worth a human), and a
+    proposal whose reason for existing is gone (not a failure at all).  Only
+    the second is knowable from the source issue, and it is the one that
+    accumulates silently — every issue the platform investigates but a human
+    then resolves directly produces one (#276).
+
+    Returns None whenever the answer is "keep doing what you were doing":
+    the issue is open, the proposal predates `source:`, or GitHub could not
+    be read.  **Fail-open on purpose** — the same reasoning as the
+    `discovered_url` guard in `reconcile_one`: an unreadable GitHub is not
+    evidence about the proposal, and a durable status must not move on it.
+    """
+    source = status_data.get("source")
+    if not isinstance(source, dict):
+        return None
+    repo = source.get("repo")
+    number = source.get("issue")
+    if not repo or not number:
+        return None
+    try:
+        issue = _gh_api_json([f"repos/{repo}/issues/{number}"])
+    except Exception as exc:  # noqa: BLE001 — any gh/JSON failure is fail-open
+        print(f"warn: could not read source issue {repo}#{number}: {exc}")
+        return None
+    if not isinstance(issue, dict) or issue.get("state") != "closed":
+        return None
+    # state_reason is null on issues closed before GitHub introduced it, and
+    # on some API paths.  Treat "closed, reason unknown" as completed: the
+    # actionable half of the message ("no PR ever existed for this slug, the
+    # issue is closed") is true either way, and the operator confirms.
+    not_planned = issue.get("state_reason") == "not_planned"
+    code = "source-not-planned" if not_planned else "source-resolved"
+    reason = "not planned" if not_planned else "completed"
+    return {
+        "code": code,
+        "stage": "reconcile",
+        "message": (
+            f"No canonical PR exists for the deterministic result branch, and "
+            f"the source issue {repo}#{number} is closed as {reason}. The "
+            f"branch is missing because this proposal was abandoned, not "
+            f"because a PR was lost. Retire it with a terminal status "
+            f"(agents-state/OPERATOR.md) or reopen the issue."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # PR + review readers
 # ---------------------------------------------------------------------------
@@ -1859,7 +1924,19 @@ def reconcile_one(
     if pr is None:
         if ref.status == "accepted":
             return ShepherdResult(ref=ref, decision="wait")
-        if ref.status == "needs-triage" and existing_failure:
+        # The PR-less failure codes fall THROUGH this branch rather than
+        # returning from it, so that the source-issue check further down is
+        # reached at all.  A check placed only at the write site would never
+        # run for a proposal that is already needs-triage/missing-pr — it
+        # returns here — so it would fix proposals that get stuck in the
+        # future and leave every currently stuck one exactly where it is.
+        # Those are the ones #276 is about.  Every other code still returns
+        # here untouched: the source issue says nothing about them.
+        if (
+            ref.status == "needs-triage"
+            and existing_failure
+            and failure_code not in SOURCE_RECHECKED_FAILURE_CODES
+        ):
             return ShepherdResult(
                 ref=ref,
                 decision="needs-triage",
@@ -1871,19 +1948,41 @@ def reconcile_one(
                 decision="wait",
                 notes="active implementation lease has not expired",
             )
+        # Read the source issue here rather than at the top of the block: by
+        # this point every path that does not write has already returned, so
+        # the extra GitHub read is spent only on proposals whose status is
+        # actually about to be decided.
+        #
+        # Falling through with the SAME missing-pr block when the issue is
+        # open is what keeps that case byte-identical: _update_status_if_changed
+        # compares field by field and does not write when nothing moved, so
+        # this is not a new GitOps commit every cycle.
+        source_failure = _source_issue_failure(status_data)
         _update_status_if_changed(
             ref,
             "needs-triage",
             dry_run=dry_run,
-            failure={
+            failure=source_failure
+            or {
                 "code": "missing-pr",
                 "stage": "reconcile",
                 "message": "No canonical PR exists for the deterministic result branch.",
             },
-            notes="reconcile: no canonical GitHub PR found",
+            notes=(
+                f"reconcile: no canonical GitHub PR found, source issue closed "
+                f"({source_failure['code']})"
+                if source_failure
+                else "reconcile: no canonical GitHub PR found"
+            ),
         )
         return ShepherdResult(
-            ref=ref, decision="needs-triage", notes="missing canonical PR"
+            ref=ref,
+            decision="needs-triage",
+            notes=(
+                f"missing canonical PR, {source_failure['code']}"
+                if source_failure
+                else "missing canonical PR"
+            ),
         )
     pr_url = discovered_url or f"https://github.com/{pr.repo}/pull/{pr.number}"
     github_state = "merged" if pr.merged else ("closed" if pr.closed_unmerged else "open")

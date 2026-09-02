@@ -76,10 +76,35 @@ proposed → accepted → implemented → review-fixing → merged
                                                 ↘ error
 ```
 
-`merged`, `rejected`, `review-stuck`, `needs-triage`, `error` are
-**terminal** — reconcile never mutates a proposal already in one of these.
+Only `merged` and `rejected` are genuinely **terminal**: `reconcile_one`
+has an explicit branch preserving those two when no PR can be found, and
+nothing else. `review-stuck`, `needs-triage` and `error` were described as
+terminal here and are not — reconcile re-opens all three to `implemented`
+when a live PR turns up (`run_shepherd.py`, the open-PR repair block). That
+is the intended behaviour; this paragraph was the thing that was wrong.
 `accepted`, `in-progress`, `implemented`, `review-fixing` are
-**actionable** — these are the only statuses reconcile inspects.
+**actionable** — reconcile inspects those too.
+
+Practical consequence, and the reason it is worth stating precisely:
+`rejected` is what an operator writes to retire a proposal by hand, and it
+is the only non-merged status that survives a reconcile cycle without a PR.
+Writing `needs-triage` instead leaves the proposal in the queue forever.
+
+#### `failure.code` when there is no PR
+
+`missing-pr` conflates two situations that want opposite responses — a PR
+that should exist and does not, versus a proposal whose reason for existing
+is gone. Reconcile therefore reads the proposal's `source:` issue when no PR
+is found (#276) and narrows the code:
+
+| source issue | `failure.code` | meaning |
+|---|---|---|
+| open, or absent, or unreadable | `missing-pr` | a PR should exist and does not |
+| closed as completed | `source-resolved` | the work landed outside this proposal |
+| closed as not planned | `source-not-planned` | the ask was dropped |
+
+All three keep `status: needs-triage`. Retiring a proposal stays an operator
+decision: the loop makes the reason legible, it does not write the terminal.
 
 ### Projection rules (read-only, GitHub-first)
 
