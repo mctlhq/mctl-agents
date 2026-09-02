@@ -29,6 +29,7 @@ from temporalio.client import (
     ScheduleUpdate,
     ScheduleUpdateInput,
 )
+from temporalio.runtime import PrometheusConfig, Runtime, TelemetryConfig
 from temporalio.worker import Worker
 
 from orchestrator.temporal.activities.argo import submit_and_wait
@@ -52,6 +53,7 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
+    METRICS_PORT,
     TASK_QUEUE,
 )
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
@@ -244,6 +246,41 @@ def owns_schedules(role: str) -> bool:
     return role in ("all", "control")
 
 
+def telemetry_config() -> TelemetryConfig:
+    """The SDK telemetry the process publishes — ADR-008 D5, #252.
+
+    Split out of main() and returning the config rather than the Runtime for
+    the same reason worker_plans exists: constructing a Runtime spins up a
+    thread pool AND binds the port, so a test that asserted on one would be
+    a test that races the real listener. The config is a value; the decision
+    it encodes can be asserted without a bridge.
+
+    Role-independent on purpose. Both halves of the split need the same
+    numbers or the comparison the split exists to make — is the control pool
+    saturated while the execution pool idles? — has only one side. The
+    queue is a metric LABEL (task_queue), not a deployment difference.
+
+    durations_as_seconds: the SDK otherwise reports latencies as integer
+    milliseconds, which quantises the sub-second range the control queue
+    should normally sit in down to a handful of buckets and reads as a
+    different unit than every other histogram in this cluster. Verified
+    against a real worker: buckets come out as `le="0.1"`, not `le="100"`.
+
+    counters_total_suffix is deliberately NOT set. Its docstring promises
+    the OpenMetrics `_total` suffix, but on temporalio 1.31.0 a live worker
+    emits `temporal_activity_task_received` and `temporal_workflow_completed`
+    with and without the flag alike — it changes nothing here. Setting it
+    would put an unverified claim in the config and, worse, invite the
+    VMRules to be written against `_total` names that do not exist.
+    """
+    return TelemetryConfig(
+        metrics=PrometheusConfig(
+            bind_address=f"0.0.0.0:{METRICS_PORT}",
+            durations_as_seconds=True,
+        )
+    )
+
+
 def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan]:
     """The queue/registration layout for one role — one plan per queue.
 
@@ -352,8 +389,16 @@ async def main() -> None:
     address = os.environ.get("TEMPORAL_ADDRESS", "temporal-frontend.temporal.svc.cluster.local:7233")
     namespace = os.environ.get("TEMPORAL_NAMESPACE", "mctl-agents")
 
+    # One Runtime for the process, built BEFORE the client: a client keeps
+    # the runtime it was created with, so a later one would leave this
+    # process's metrics on the default runtime that exports nothing. For
+    # `--role all` both workers share this client and therefore this
+    # exporter, and separate by the task_queue label rather than by port.
+    runtime = Runtime(telemetry=telemetry_config())
+    logger.info("serving metrics on :%d/metrics", METRICS_PORT)
+
     logger.info("connecting to Temporal at %s (namespace=%s)", address, namespace)
-    client = await Client.connect(address, namespace=namespace)
+    client = await Client.connect(address, namespace=namespace, runtime=runtime)
 
     if owns_schedules(args.role):
         await setup_schedules(client)

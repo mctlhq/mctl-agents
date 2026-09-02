@@ -105,6 +105,27 @@ number in D3 can be tuned against reality. The signal to alert on is
 sustained schedule-to-start on the control queue: that is starvation in
 one number, and it is what was previously unobservable.
 
+*Resolved (#252).* `main()` now builds one `Runtime` with a
+`PrometheusConfig` before the client and passes it to `Client.connect`;
+the exporter binds `0.0.0.0:8080`, which is the port base-service already
+declares as `http` and nothing was listening on. Verified against a live
+worker rather than assumed — the names the rules and dashboards may use
+are:
+
+| metric | labels |
+| --- | --- |
+| `temporal_activity_schedule_to_start_latency_{bucket,count,sum}` | `namespace`, `service_name`, `task_queue` |
+| `temporal_workflow_task_schedule_to_start_latency_{bucket,count,sum}` | same |
+| `temporal_worker_task_slots_available` / `_used` | + `worker_type` (`ActivityWorker`, `WorkflowWorker`, `LocalActivityWorker`) |
+| `temporal_num_pollers` | + `poller_type` |
+
+`durations_as_seconds=True`, so buckets are `le="0.1"`, not `le="100"`.
+Two facts worth writing down because they are not guessable: the roles
+are **not** distinguishable by `service_name` (both report
+`temporal-core-sdk`) — `task_queue` is what separates them; and
+`counters_total_suffix` does nothing on temporalio 1.31.0, so no counter
+carries a `_total` suffix regardless of the flag.
+
 **D6 — No HPA in this slice.** Replica count stays fixed per role. Both
 roles are I/O-bound waiters, so CPU-based autoscaling would measure the
 wrong thing entirely; the right signal is slot availability, which needs
@@ -125,7 +146,9 @@ there until timeout.
 2. **mctl-gitops:** second deployment `mctl-agents-worker-exec` with
    `--role execution`, and `--role control` on the existing one. Both
    poll; nothing yet schedules to the exec queue.
-3. **mctl-agents:** wire the metrics exporter (D5). Independent of the
+3. **mctl-agents:** wire the metrics exporter (D5) — *done, #252*, with
+   the scrape, alert rule and dashboard following in mctl-gitops.
+   Independent of the
    split and safe on its own, and it goes BEFORE the flip so the flip has
    a baseline to be read against rather than being the first thing the
    new dashboards ever see.
