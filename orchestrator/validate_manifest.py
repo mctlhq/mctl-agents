@@ -476,7 +476,25 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
     errors: list[str] = []
     for profile_path in sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml")):
         try:
-            spec = yaml.safe_load(profile_path.read_text(encoding="utf-8"))["spec"]
+            document = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
+                raise ManifestError("missing or non-mapping 'spec'")
+            spec = document["spec"]
+            # Read and shape-check inside the guard, not after it. `spec:` with
+            # nothing under it parses as None, and `tools:` can be any YAML
+            # node — so `spec.get(...)` or `set(spec.get("tools"))` outside
+            # this block raises AttributeError/TypeError and aborts the whole
+            # run, hiding every other profile's result behind one malformed
+            # file in a DIFFERENT repository (agy P2 on #284).
+            declared_builder = (spec.get("runtime") or {}).get("optionsBuilder")
+            tools = spec.get("tools") or []
+            # Explicitly a list. `set("Read")` on a scalar `tools: Read` is
+            # not an error — it silently yields {'R','e','a','d'}, and the
+            # mismatch that follows names four letters instead of the real
+            # problem.
+            if not isinstance(tools, list):
+                raise ManifestError(f"spec.tools must be a list, got {type(tools).__name__}")
+            declared_tools = set(tools)
         except Exception as exc:  # noqa: BLE001 - report and continue
             errors.append(f"{profile_path}: {exc}")
             continue
@@ -495,7 +513,6 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
             errors.append(f"{profile_name}: maps to unknown agent {agent_name!r}")
             continue
 
-        declared_builder = (spec.get("runtime") or {}).get("optionsBuilder")
         if declared_builder != manifest.options_builder:
             errors.append(
                 f"{profile_name}: runtime.optionsBuilder {declared_builder!r} does "
@@ -532,10 +549,9 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
                 os.environ["MCTL_TOKEN"] = previous_token
 
         actual = set(options.allowed_tools or [])
-        declared = set(spec.get("tools") or [])
-        if actual != declared:
+        if actual != declared_tools:
             errors.append(
-                f"{profile_name}: spec.tools {sorted(declared)} does not match "
+                f"{profile_name}: spec.tools {sorted(declared_tools)} does not match "
                 f"{manifest.options_builder}'s actual allowed_tools {sorted(actual)}"
             )
     return errors

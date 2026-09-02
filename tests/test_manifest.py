@@ -124,6 +124,37 @@ def test_an_unmapped_catalog_profile_is_an_error_not_a_skip(tmp_path, monkeypatc
     assert any("brand-new-default" in e and "_AGENT_BY_CATALOG_PROFILE" in e for e in errors), errors
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [None, "a string", [], {"tools": "Read"}],
+    ids=["empty-spec", "string-spec", "list-spec", "tools-not-a-list"],
+)
+def test_a_malformed_profile_is_reported_not_crashed(tmp_path, monkeypatch, spec) -> None:
+    """One bad file in ANOTHER repo must not abort the whole validation run.
+
+    `spec:` with nothing under it parses as None, and `tools:` can be any
+    YAML node — so reading them outside the guard raises AttributeError or
+    TypeError, kills the run and hides every other profile's result behind a
+    file this repo does not own (agy P2 on #284).
+
+    Same shape claude flagged on the mctl-gitops side of this work, which is
+    why it is parametrized over four malformations rather than fixed for the
+    one that was reported: the defect is "risky reads outside the guard", not
+    "empty spec".
+    """
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(yaml.safe_dump({"spec": spec}), encoding="utf-8")
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent
+    )
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert errors, "a malformed profile produced no error at all"
+    assert all("profile.yaml" in e for e in errors), errors
+
+
 def test_a_missing_gitops_checkout_fails_under_ci(tmp_path, monkeypatch) -> None:
     """Absence must be an error where the check is the only thing looking.
 
