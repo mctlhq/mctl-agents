@@ -92,7 +92,7 @@ jobs:
           # headless inside Actions (first main run, #5, failed on it).
           ARCHIFY_CHROME: /usr/bin/google-chrome
         run: |
-          "$ARCHIFY_CHROME" --version
+          "$ARCHIFY_CHROME" --version || true
           python3 tools/check_diagrams.py --archify _archify/archify/bin/archify.mjs \
             --deliver --out rendered docs/diagrams/archify
 
@@ -115,17 +115,21 @@ jobs:
           for f in sorted(out.glob("*.html")):
               if ".visual-check." in f.name:
                   continue
-              name, kind = f.stem.rsplit(".", 1)
+              parts = f.stem.rsplit(".", 1)
+              kind = parts[1] if len(parts) > 1 else "diagram"
               src = pathlib.Path("docs/diagrams/archify") / (f.stem + ".json")
-              title = json.loads(src.read_text())["meta"]["title"] if src.exists() else f.stem
+              meta = json.loads(src.read_text()).get("meta", {}) if src.exists() else {}
+              title = meta.get("title", f.stem)
               png = f"{f.stem}.visual-check.1440x900.dark.png"
+              has_png = (out / png).exists()
               # File names come from a merged PR, i.e. from a reviewed diff —
               # escape them anyway; an index page is not the place to trust input.
               h = lambda v: html.escape(str(v), quote=True)
               u = lambda v: html.escape(quote(str(v), safe="/"), quote=True)
+              preview = f'<a href="{u(png)}">preview</a> · ' if has_png else ""
               rows.append(
                   f'<li><a href="{u(f.name)}">{h(title)}</a> '
-                  f'<span class="k">{h(kind)}</span> · <a href="{u(png)}">preview</a> · '
+                  f'<span class="k">{h(kind)}</span> · {preview}'
                   f'<a href="https://github.com/${{ github.repository }}/blob/main/docs/diagrams/archify/{u(f.stem)}.json">source</a></li>'
               )
           sha = "${{ github.sha }}"[:12]
