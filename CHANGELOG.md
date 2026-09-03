@@ -1,5 +1,36 @@
 # Changelog
 
+## [1.39.0](https://github.com/mctlhq/mctl-agents/compare/1.38.0...1.39.0) (2026-09-03)
+
+
+### Features
+
+* **resolver:** resolve against the real mctl-gitops catalog ([09b8f2c](https://github.com/mctlhq/mctl-agents/commit/09b8f2c8b84e19b82bc970d08a90be549d60f966)), closes [#277](https://github.com/mctlhq/mctl-agents/issues/277)
+* **temporal:** route submit_and_wait to the execution queue ([5e446ab](https://github.com/mctlhq/mctl-agents/commit/5e446aba96a4fde6f29bba3dcaa6867acc0ccb8a)), closes [#251](https://github.com/mctlhq/mctl-agents/issues/251)
+* **tools:** add diagram drift detector and archify showcase validator ([4166c52](https://github.com/mctlhq/mctl-agents/commit/4166c52d54194be0bd1d671c3185398d0022927e))
+
+
+### Bug Fixes
+
+* **ci:** collect only this repo's tests ([b0a5f30](https://github.com/mctlhq/mctl-agents/commit/b0a5f30fc4f5cfede979266676ba115ee54faa23))
+* **ci:** harden diagrams Pages index against agy review findings ([82d20ff](https://github.com/mctlhq/mctl-agents/commit/82d20ffc3cdb97b22ef7868c541cb645ffceb2a3))
+* **reconcile:** do not move a status when the source issue is unreadable ([4986ec6](https://github.com/mctlhq/mctl-agents/commit/4986ec619070cf4375edd661065af24dfac93237))
+* **reconcile:** read the source issue when a proposal has no PR ([edf2440](https://github.com/mctlhq/mctl-agents/commit/edf2440742e98fcede186daebd9146263f6828e4)), closes [#276](https://github.com/mctlhq/mctl-agents/issues/276)
+* **resolver:** restore the definition pin, and reject partial constraints ([f0c5ab8](https://github.com/mctlhq/mctl-agents/commit/f0c5ab86df9572ca2d6afa9b49b090751ab2ae08)), closes [#277](https://github.com/mctlhq/mctl-agents/issues/277)
+* **temporal:** correct what patched() does to an in-flight execution ([c16ec6e](https://github.com/mctlhq/mctl-agents/commit/c16ec6e5574a895f74ff94c2c950c5375c6be048))
+* **tests:** the catalog-task test must fail, not no-op, under CI ([fafc8e5](https://github.com/mctlhq/mctl-agents/commit/fafc8e5cd79c0595c352e5da6c829932bbdf0d47)), closes [#277](https://github.com/mctlhq/mctl-agents/issues/277)
+* **test:** the catalog test must fail, not skip, under CI ([234936b](https://github.com/mctlhq/mctl-agents/commit/234936b91a16c1defc37d834194cbfa5a750e96f))
+* **tools:** address review on the diagram refresh loop ([e96abb1](https://github.com/mctlhq/mctl-agents/commit/e96abb1529027a7258cbf70764d466cdb4e45a0a))
+* **tools:** keep release prose away from the refresh agent ([0ded0bb](https://github.com/mctlhq/mctl-agents/commit/0ded0bb9ef7ca40488f8794843553d17af293d04))
+* **tools:** use the runner's Google Chrome for the diagram browser check ([5387ae7](https://github.com/mctlhq/mctl-agents/commit/5387ae7f5dec62c5290df5fff5c681b259d85572))
+* **tools:** use the runner's Google Chrome for the diagram browser check ([7a9ff2c](https://github.com/mctlhq/mctl-agents/commit/7a9ff2cdb319be8df86b20d086c5a1e4c4f37fff))
+* **validate:** an unresolvable agent is an error, and path handling is guarded ([55e25d8](https://github.com/mctlhq/mctl-agents/commit/55e25d85a9e3f82fba9a401c732dad68e1d6f600)), closes [#293](https://github.com/mctlhq/mctl-agents/issues/293)
+* **validate:** check the catalog's model-policy task against this repo ([6d6fc78](https://github.com/mctlhq/mctl-agents/commit/6d6fc7873b5641c99cdfddfbd7e092ba2626ee45))
+* **validate:** check the gitops catalog against the real builders ([c58a543](https://github.com/mctlhq/mctl-agents/commit/c58a5430adf311214d744e514cd8a24d2d9ad9ac)), closes [#277](https://github.com/mctlhq/mctl-agents/issues/277)
+* **validate:** do not borrow the clean-env reload for the catalog check ([6683dfe](https://github.com/mctlhq/mctl-agents/commit/6683dfe3644f4263cd5de6bbbf6fe68505487189))
+* **validate:** report a malformed catalog profile instead of crashing ([acfef53](https://github.com/mctlhq/mctl-agents/commit/acfef53195130142e73708a2bac37903dd57bcd0))
+* **validate:** verify every binding's definition pin, not just the resolved one ([ea149f0](https://github.com/mctlhq/mctl-agents/commit/ea149f0134f602c38da309c13e62da6dd867258a)), closes [#293](https://github.com/mctlhq/mctl-agents/issues/293)
+
 ## [1.38.0](https://github.com/mctlhq/mctl-agents/compare/1.37.0...1.38.0) (2026-09-02)
 
 
