@@ -128,6 +128,13 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
     changed: list[str] = []
 
     async def _converge_spec(input: ScheduleUpdateInput) -> ScheduleUpdate | None:
+        # Cleared first: `update()` uses optimistic concurrency and may call
+        # this callback again after a conflicting server-side write. Without
+        # the reset an earlier attempt's entries survive, so a retry that
+        # decides no update is needed still logs a convergence that never
+        # happened — the log lying about the cluster, which is the one thing
+        # these messages exist not to do (agy P3 on #297).
+        changed.clear()
         schedule = input.description.schedule
         spec_stale = schedule.spec.intervals != desired.spec.intervals
         # The overlap policy is converged for the SAME reason the spec is, and
@@ -136,11 +143,23 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         # interval for a year. Declaring `overlap` without converging it would
         # repeat it exactly — every schedule this code registers already
         # exists on the cluster, so a fresh `create_schedule` never runs again.
-        live_overlap = getattr(schedule.policy, "overlap", None)
-        want_overlap = getattr(desired.policy, "overlap", None)
-        policy_stale = live_overlap != want_overlap
+        desired_policy = desired.policy
+        live_overlap = schedule.policy.overlap if schedule.policy else None
+        want_overlap = desired_policy.overlap if desired_policy else None
+        # A caller that declares no policy gets no convergence: there is
+        # nothing to converge TO, and pushing `None` would mean this function
+        # deciding to clear a live value nobody asked it to touch.
+        policy_stale = want_overlap is not None and live_overlap != want_overlap
         if not spec_stale and not policy_stale:
             return None
+        # Assign the FIELD, never the whole object. `schedule.spec =
+        # desired.spec` would drop any jitter/calendars/time_zone_name the
+        # live schedule carries, and `schedule.policy = desired.policy` would
+        # drop catchup_window and pause_on_failure — and only on the boots
+        # where an update happens to trigger, so the loss is intermittent and
+        # looks like something else (agy P2 on #297). This code declares an
+        # interval and an overlap policy; those are the only two things it
+        # gets to decide.
         if spec_stale:
             logger.info(
                 "Updating Temporal schedule %s spec: %s -> %s",
@@ -148,16 +167,18 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
                 schedule.spec.intervals,
                 desired.spec.intervals,
             )
-            schedule.spec = desired.spec
+            schedule.spec.intervals = desired.spec.intervals
             changed.append("spec")
-        if policy_stale:
+        if policy_stale and desired_policy is not None:
             logger.info(
                 "Updating Temporal schedule %s overlap policy: %s -> %s",
                 schedule_id,
                 live_overlap,
                 want_overlap,
             )
-            schedule.policy = desired.policy
+            if schedule.policy is None:
+                schedule.policy = SchedulePolicy()
+            schedule.policy.overlap = desired_policy.overlap
             changed.append("overlap policy")
         return ScheduleUpdate(schedule=schedule)
 

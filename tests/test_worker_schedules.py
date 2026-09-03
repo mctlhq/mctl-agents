@@ -281,3 +281,85 @@ class TestConvergenceLogging:
         assert any(
             "spec and overlap policy are current" in r.getMessage() for r in caplog.records
         ), [r.getMessage() for r in caplog.records]
+
+
+class TestConvergenceIsNotDestructive:
+    """Converging one field must not silently drop the others.
+
+    `schedule.spec = desired.spec` and `schedule.policy = desired.policy`
+    replaced whole objects, so a live schedule's jitter, calendars,
+    catchup_window or pause_on_failure disappeared — and only on the boots
+    where an update happened to trigger, which makes the loss intermittent
+    and easy to attribute to something else (agy P2 on #297).
+
+    This code declares an interval and an overlap policy. Those are the only
+    two things it gets to decide.
+    """
+
+    async def test_a_policy_convergence_keeps_the_rest_of_the_policy(self):
+        existing = _schedule(timedelta(hours=1), overlap=ScheduleOverlapPolicy.ALLOW_ALL)
+        existing.policy.catchup_window = timedelta(hours=6)
+        existing.policy.pause_on_failure = True
+        client = _FakeClient(existing=existing)
+
+        await _ensure_schedule(client, SCHEDULE_ID, _schedule(timedelta(hours=1)), "IncidentLoopWorkflow")
+
+        updated = client.handle.updates[0].schedule
+        assert updated.policy.overlap == ScheduleOverlapPolicy.SKIP
+        assert updated.policy.catchup_window == timedelta(hours=6)
+        assert updated.policy.pause_on_failure is True
+
+    async def test_a_spec_convergence_keeps_the_rest_of_the_spec(self):
+        existing = _schedule(timedelta(minutes=30))
+        existing.spec.jitter = timedelta(seconds=90)
+        existing.spec.time_zone_name = "Europe/Berlin"
+        client = _FakeClient(existing=existing)
+
+        await _ensure_schedule(client, SCHEDULE_ID, _schedule(timedelta(hours=1)), "IncidentLoopWorkflow")
+
+        updated = client.handle.updates[0].schedule
+        assert updated.spec.intervals == [ScheduleIntervalSpec(every=timedelta(hours=1))]
+        assert updated.spec.jitter == timedelta(seconds=90)
+        assert updated.spec.time_zone_name == "Europe/Berlin"
+
+
+class TestConvergenceRetries:
+    """`update()` uses optimistic concurrency and may call the callback again
+    after a conflicting server-side write.
+
+    `changed` lives in the enclosing scope, so without a reset an earlier
+    attempt's entries survive into the next — and a retry that decides no
+    update is needed would still log a convergence that never happened (agy
+    P3 on #297). The log lying about the cluster is the one thing these
+    messages exist not to do.
+    """
+
+    async def test_a_retry_does_not_carry_the_previous_attempts_verdict(self, caplog):
+        """First call sees a stale interval, second sees a current one — as a
+        server-side write landing between attempts would produce. The verdict
+        must come from the LAST call."""
+        stale = _schedule(timedelta(minutes=30))
+        current = _schedule(timedelta(hours=1))
+        client = _FakeClient(existing=stale)
+
+        seen: list[int] = []
+
+        async def _twice(updater):
+            for existing in (stale, current):
+                seen.append(1)
+                result = await updater(
+                    SimpleNamespace(description=SimpleNamespace(schedule=existing))
+                )
+                if result is not None and existing is current:
+                    client.handle.updates.append(result)
+            return None
+
+        client.handle.update = _twice  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.INFO):
+            await _ensure_schedule(client, SCHEDULE_ID, current, "IncidentLoopWorkflow")
+
+        assert len(seen) == 2, "the callback was not driven twice"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("spec and overlap policy are current" in m for m in messages), messages
+        assert not any("converged to the declared" in m for m in messages), messages
