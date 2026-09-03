@@ -143,6 +143,68 @@ _LEGACY_MODEL_ENV_VAR_BY_AGENT = {
     "question-author": "QUESTION_AUTHOR_MODEL",
 }
 
+# The Argo boundaries orchestrator/ reasons about, pinned to the values the
+# Python was written against.
+#
+# Five places derive behaviour from a ClusterWorkflowTemplate's
+# activeDeadlineSeconds or ttlStrategy.secondsAfterCompletion:
+# activities/argo.py ("do not re-read Argo for a result" rests on
+# investigate's 86400s TTL), workflows/dev_loop.py (APPROVE_STEP_TIMEOUT is
+# chosen against approve's 600s deadline), workflows/reconcile.py
+# (APPLY_STEP_TIMEOUT against reconcile's 1800s), github_token.py (a GitHub
+# App token outlived by a 7200s pod) and activities/state.py (persist the
+# audit trail because Argo objects expire).
+#
+# All five were correct when written and NONE of them was checked, so a value
+# edited in mctl-gitops silently invalidated the Python that quotes it. The
+# values are not uniform either -- deadlines span 600..7200 and TTLs
+# 86400..1209600 -- so "they are all the same anyway" is not a fallback.
+#
+# Bidirectional, the same contract as _TIMEOUT_CONSTANT_BY_AGENT above: a
+# ClusterWorkflowTemplate with no entry here is an error, and an entry naming
+# a template that does not exist is an error. Adding a template is therefore a
+# deliberate act of recording what the worker may assume about it.
+_CWFT_BOUNDARIES: dict[str, tuple[int, int]] = {
+    # name: (activeDeadlineSeconds, ttlStrategy.secondsAfterCompletion)
+    "mctl-agents-approve": (600, 86400),
+    "mctl-agents-implement": (7200, 86400),
+    "mctl-agents-investigate": (7200, 86400),
+    "mctl-agents-issue-poll": (1800, 86400),
+    "mctl-agents-reconcile": (1800, 259200),
+    "mctl-agents-run": (3600, 1209600),
+    "mctl-agents-shepherd": (7200, 259200),
+}
+
+# Activity timeouts that must not expire BEFORE the pod they wait on, read from
+# the real module rather than trusted as a literal -- the same "check the value,
+# not the YAML" contract the tables above use.
+#
+# The relation is the actual correctness claim, and it is sharper than either
+# number alone: an activity that gives up first abandons a pod that is still
+# running -- and, for the templates that take mctl-gitops-main-writes, a held
+# mutex -- and then retries on top of it. Pinning only the CWFT value would let
+# someone raise a deadline past its waiter and keep CI green (ADR 009).
+#
+# The bound is ">=", not ">", and equality is a legitimate floor rather than a
+# tolerated near-miss: the pod's clock starts strictly after the activity's
+# (submit, schedule, image pull), so an equal deadline still kills the pod
+# first. dev_loop's SDK_STEP_TIMEOUT sits exactly on investigate/implement's
+# 7200s for that reason. Where a constant was deliberately given headroom the
+# comment at its definition says so -- APPROVE_STEP_TIMEOUT (15 min against
+# 600s) and APPLY_STEP_TIMEOUT (35 min against 1800s, room for a sibling
+# writer to hold the mutex).
+_DERIVED_STEP_TIMEOUTS: tuple[tuple[str, str, str], ...] = (
+    ("orchestrator.temporal.workflows.dev_loop", "APPROVE_STEP_TIMEOUT", "mctl-agents-approve"),
+    ("orchestrator.temporal.workflows.dev_loop", "SDK_STEP_TIMEOUT", "mctl-agents-investigate"),
+    ("orchestrator.temporal.workflows.dev_loop", "SDK_STEP_TIMEOUT", "mctl-agents-implement"),
+    ("orchestrator.temporal.workflows.reconcile", "APPLY_STEP_TIMEOUT", "mctl-agents-reconcile"),
+    # The incident path: IncidentLoopWorkflow waits on mctl-agents-run in
+    # incident-responder mode. ADR 009 records why this activity's retry budget
+    # buys re-attachment rather than re-execution -- which only holds while the
+    # activity outlasts the pod.
+    ("orchestrator.temporal.workflows.incidents", "SDK_STEP_TIMEOUT", "mctl-agents-run"),
+)
+
 
 def _builder_call_args(builder_name: str) -> tuple[tuple[object, ...], dict[str, object]]:
     """Positional/keyword args for each build_*_options() signature."""
@@ -764,6 +826,113 @@ def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) ->
     return errors
 
 
+def _cluster_workflow_templates() -> dict[str, dict[str, Any]]:
+    """Every ClusterWorkflowTemplate in the gitops checkout, keyed by name.
+
+    Selected on `kind`, not on the filename glob, and that distinction is
+    load-bearing: cwft-mctl-agents-daily.yaml is a CronWorkflow — a thin
+    wrapper that submits mctl-agents-run once a week — so it carries no
+    activeDeadlineSeconds and no ttlStrategy of its own and there is no
+    boundary in it for the worker to reason about. Globbing on the filename
+    would drag it in and force a fake entry in _CWFT_BOUNDARIES, which is
+    exactly the kind of "exception" that later reads as a real value.
+    """
+    templates: dict[str, dict[str, Any]] = {}
+    for path in sorted(GITOPS_CWFT_DIR.glob("cwft-*.yaml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict) or doc.get("kind") != "ClusterWorkflowTemplate":
+            continue
+        templates[doc["metadata"]["name"]] = doc
+    return templates
+
+
+def check_cwft_boundaries_match_orchestrator() -> list[str]:
+    """The Argo boundaries orchestrator/ quotes are the ones mctl-gitops ships.
+
+    Repo-level rather than per-manifest: these numbers are read by workflow
+    and activity code that no agent manifest names, so hanging the check off a
+    manifest would leave the sites that matter most unguarded.
+    """
+    if not GITOPS_CWFT_DIR.is_dir():
+        return _gitops_missing(GITOPS_CWFT_DIR, "the Argo boundaries orchestrator/ reasons about")
+
+    errors: list[str] = []
+    templates = _cluster_workflow_templates()
+
+    # Only mctl-agents' own templates: mctl-gitops holds ClusterWorkflowTemplates
+    # for tenant provisioning and deploys too, and this repo's Python neither
+    # submits nor reasons about those.
+    ours = {name for name in templates if name.startswith("mctl-agents-")}
+
+    for name in sorted(ours - _CWFT_BOUNDARIES.keys()):
+        errors.append(
+            f"ClusterWorkflowTemplate {name!r} has no entry in _CWFT_BOUNDARIES. "
+            "Record the activeDeadlineSeconds and ttlStrategy.secondsAfterCompletion "
+            "the orchestrator may assume about it, or it becomes another unchecked "
+            "boundary."
+        )
+    for name in sorted(_CWFT_BOUNDARIES.keys() - ours):
+        errors.append(
+            f"_CWFT_BOUNDARIES names {name!r}, which is not a ClusterWorkflowTemplate "
+            f"in {GITOPS_CWFT_DIR}. Drop the entry, or fix the name."
+        )
+
+    for name in sorted(ours & _CWFT_BOUNDARIES.keys()):
+        spec = templates[name].get("spec") or {}
+        expected_deadline, expected_ttl = _CWFT_BOUNDARIES[name]
+
+        actual_deadline = spec.get("activeDeadlineSeconds")
+        if actual_deadline != expected_deadline:
+            errors.append(
+                f"{name}: activeDeadlineSeconds is {actual_deadline!r}, but orchestrator/ "
+                f"was written against {expected_deadline}. Update the Python that reasons "
+                "about it and this table together, or revert the template."
+            )
+
+        actual_ttl = (spec.get("ttlStrategy") or {}).get("secondsAfterCompletion")
+        if actual_ttl != expected_ttl:
+            errors.append(
+                f"{name}: ttlStrategy.secondsAfterCompletion is {actual_ttl!r}, but "
+                f"orchestrator/ was written against {expected_ttl}. A shorter TTL means a "
+                "result the worker expected to still be readable is already deleted."
+            )
+
+    errors += _check_step_timeouts_outlive_their_pods(templates)
+    return errors
+
+
+def _check_step_timeouts_outlive_their_pods(templates: dict[str, dict[str, Any]]) -> list[str]:
+    """A Temporal activity that waits on an Argo pod must not give up first."""
+    errors: list[str] = []
+    for module_name, constant, cwft_name in _DERIVED_STEP_TIMEOUTS:
+        template = templates.get(cwft_name)
+        if template is None:
+            # Already reported as a missing template by the caller.
+            continue
+        deadline = (template.get("spec") or {}).get("activeDeadlineSeconds")
+        if not isinstance(deadline, int):
+            errors.append(f"{cwft_name}: no activeDeadlineSeconds for {constant} to be checked against")
+            continue
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - a broken import is this check's failure
+            errors.append(f"{module_name} does not import, so {constant} cannot be checked: {exc}")
+            continue
+        value = getattr(module, constant, None)
+        if value is None:
+            errors.append(f"{module_name} no longer defines {constant}, which _DERIVED_STEP_TIMEOUTS names")
+            continue
+        seconds = value.total_seconds()
+        if seconds < deadline:
+            errors.append(
+                f"{module_name}.{constant} is {seconds:.0f}s, which expires before "
+                f"{cwft_name}'s activeDeadlineSeconds={deadline}. The activity would abandon a "
+                "pod that is still running — and still holding whatever mutex it took — then "
+                "retry on top of it (ADR 009)."
+            )
+    return errors
+
+
 def validate(manifest: AgentManifest) -> list[str]:
     """Return human-readable errors for one manifest; empty means valid."""
     errors: list[str] = []
@@ -858,6 +1027,13 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             print("FAIL mctl-gitops agent-platform catalog <-> orchestrator/options.py:")
             for error in catalog_errors:
+                print(f"  - {error}")
+
+        boundary_errors = check_cwft_boundaries_match_orchestrator()
+        if boundary_errors:
+            exit_code = 1
+            print("FAIL mctl-gitops Argo boundaries <-> orchestrator/:")
+            for error in boundary_errors:
                 print(f"  - {error}")
 
         pin_errors = check_binding_pins_match_definitions(manifests)

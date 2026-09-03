@@ -868,3 +868,143 @@ def test_bindings_for_another_repository_are_skipped_but_never_silently(
     errors = check_binding_pins_match_definitions(MANIFESTS)
 
     assert errors and "none targets mctlhq/mctl-agents" in errors[0], errors
+
+
+# --- The Argo boundaries orchestrator/ reasons about (#149) -----------------
+#
+# These assert on `check_cwft_boundaries_match_orchestrator`'s behaviour
+# against synthetic templates rather than on _CWFT_BOUNDARIES' contents, so
+# they survive the table growing legitimately — the same reasoning as
+# test_an_unmapped_catalog_profile_is_an_error_not_a_skip above.
+
+
+def _write_cwft(
+    directory: Path,
+    name: str,
+    deadline: object,
+    ttl: object,
+    kind: str = "ClusterWorkflowTemplate",
+) -> None:
+    spec: dict[str, object] = {}
+    if deadline is not None:
+        spec["activeDeadlineSeconds"] = deadline
+    if ttl is not None:
+        spec["ttlStrategy"] = {"secondsAfterCompletion": ttl}
+    (directory / f"cwft-{name}.yaml").write_text(
+        yaml.safe_dump({"kind": kind, "metadata": {"name": name}, "spec": spec}),
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def cwft_dir(tmp_path, monkeypatch):
+    """A gitops cluster-templates directory holding every pinned template."""
+    directory = tmp_path / "cluster-templates"
+    directory.mkdir()
+    for name, (deadline, ttl) in validate_manifest_module._CWFT_BOUNDARIES.items():
+        _write_cwft(directory, name, deadline, ttl)
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+    return directory
+
+
+def test_the_real_templates_match_what_the_orchestrator_assumes() -> None:
+    """The check passes against the templates mctl-gitops actually ships."""
+    if not validate_manifest_module.GITOPS_CWFT_DIR.is_dir() and not os.environ.get("CI"):
+        pytest.skip(f"mctl-gitops not checked out at {validate_manifest_module.GITOPS_CWFT_DIR}")
+    assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
+
+
+def test_a_changed_deadline_in_gitops_is_rejected(cwft_dir) -> None:
+    """The whole point: editing the template without the Python turns CI red."""
+    _write_cwft(cwft_dir, "mctl-agents-investigate", 3600, 86400)
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any("mctl-agents-investigate" in e and "activeDeadlineSeconds" in e for e in errors), errors
+
+
+def test_a_shortened_ttl_in_gitops_is_rejected(cwft_dir) -> None:
+    """activities/argo.py refuses to re-read Argo because of this number."""
+    _write_cwft(cwft_dir, "mctl-agents-investigate", 7200, 3600)
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any("mctl-agents-investigate" in e and "ttlStrategy" in e for e in errors), errors
+
+
+def test_a_template_with_no_entry_is_an_error_not_a_skip(cwft_dir) -> None:
+    """A new mctl-agents template must be recorded, not waved through."""
+    _write_cwft(cwft_dir, "mctl-agents-brand-new", 900, 86400)
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any("mctl-agents-brand-new" in e and "_CWFT_BOUNDARIES" in e for e in errors), errors
+
+
+def test_an_entry_naming_a_vanished_template_is_an_error(cwft_dir) -> None:
+    (cwft_dir / "cwft-mctl-agents-shepherd.yaml").unlink()
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any("mctl-agents-shepherd" in e and "not a ClusterWorkflowTemplate" in e for e in errors), errors
+
+
+def test_templates_this_repo_does_not_own_are_ignored(cwft_dir) -> None:
+    """mctl-gitops also holds provisioning/deploy templates; not our business."""
+    _write_cwft(cwft_dir, "provision-database", 300, 600)
+    assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
+
+
+def test_a_cronworkflow_is_not_treated_as_a_template(cwft_dir) -> None:
+    """cwft-mctl-agents-daily.yaml is a CronWorkflow wrapping mctl-agents-run.
+
+    It carries no activeDeadlineSeconds and no ttlStrategy of its own, so
+    selecting on the filename glob instead of `kind` would demand a fake
+    entry in _CWFT_BOUNDARIES — an "exception" that later reads as a value.
+    """
+    _write_cwft(cwft_dir, "mctl-agents-daily", None, None, kind="CronWorkflow")
+    assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
+
+
+def test_a_step_timeout_that_does_not_outlive_its_pod_is_rejected(cwft_dir) -> None:
+    """APPROVE_STEP_TIMEOUT is 15 min; push approve's deadline past it.
+
+    The sharper half of the check: pinning the CWFT value alone would let
+    someone raise a deadline past the activity waiting on it and keep CI
+    green, leaving the activity to abandon a live pod and retry on top of it.
+    """
+    _write_cwft(cwft_dir, "mctl-agents-approve", 5400, 86400)
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any("APPROVE_STEP_TIMEOUT" in e and "expires before" in e for e in errors), errors
+
+
+def test_a_missing_cwft_checkout_fails_under_ci(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", tmp_path / "absent")
+
+    monkeypatch.delenv("CI", raising=False)
+    assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
+
+    monkeypatch.setenv("CI", "true")
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert errors and "absent" in errors[0]
+
+
+def test_an_equal_deadline_is_accepted_as_the_floor(cwft_dir) -> None:
+    """dev_loop's SDK_STEP_TIMEOUT sits exactly on investigate's 7200s.
+
+    Equality is correct, not a tolerated near-miss: the pod's clock starts
+    strictly after the activity's (submit, schedule, image pull), so an equal
+    deadline still kills the pod first. A `>` bound here would report the
+    shipped configuration as a defect.
+    """
+    assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
+
+
+def test_the_incident_path_waiter_is_checked_too(cwft_dir) -> None:
+    """ADR 009's ownership split holds only while the activity outlasts the pod.
+
+    IncidentLoopWorkflow waits on mctl-agents-run; if that deadline is raised
+    past the two-hour SDK_STEP_TIMEOUT, the activity abandons a live responder
+    and its retry budget stops buying re-attachment and starts buying a second
+    paid SDK run.
+    """
+    _write_cwft(cwft_dir, "mctl-agents-run", 3600, 1209600)
+    assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
+
+    _write_cwft(cwft_dir, "mctl-agents-run", 10800, 1209600)
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any(
+        "incidents" in e and "SDK_STEP_TIMEOUT" in e and "expires before" in e for e in errors
+    ), errors
