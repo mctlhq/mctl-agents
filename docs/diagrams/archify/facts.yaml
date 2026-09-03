@@ -33,7 +33,7 @@ cronworkflows:
   cwft-mctl-agents-daily.yaml: 0 0 * * 6
 cwft_env_overrides:
   IMPLEMENTER_BUDGET_USD: '20.00'
-  IMPLEMENTER_TIMEOUT_SECONDS: '2400'
+  IMPLEMENTER_TIMEOUT_SECONDS: '5400'
   INCIDENT_RESPONDER_BUDGET_USD: '20.00'
   ISSUE_INVESTIGATOR_BUDGET_USD: '3.00'
   MENTOR_BUDGET_USD: '10.00'
@@ -79,7 +79,7 @@ manifest_api_versions:
   question-author: agents.mctl.ai/v1alpha1
   service-agent: agents.mctl.ai/v1alpha1
   shepherd: agents.mctl.ai/v1alpha1
-mcp_tool_count: 71
+mcp_tool_count: 73
 mcp_tools:
 - mctl_acknowledge_incident
 - mctl_add_custom_domain
@@ -144,10 +144,12 @@ mcp_tools:
 - mctl_scale_service
 - mctl_sync_repos
 - mctl_trigger_agents_run
+- mctl_trigger_approve
 - mctl_trigger_implementer
 - mctl_trigger_incident_responder
 - mctl_trigger_issue
 - mctl_trigger_mentor_only
+- mctl_trigger_reconcile
 - mctl_trigger_shepherd
 - mctl_trigger_single_service
 - mctl_verify_domain
@@ -199,11 +201,11 @@ registry_environments:
 releases_seen:
   mctlhq/mctl-academy: 0.1.50
   mctlhq/mctl-agent: 2.0.1
-  mctlhq/mctl-agents: 1.38.0
+  mctlhq/mctl-agents: 1.39.0
   mctlhq/mctl-api: 4.37.0
   mctlhq/mctl-docs: 0.1.38
   mctlhq/mctl-portal: 4.15.0
-  mctlhq/mctl-telegram: 0.58.0
+  mctlhq/mctl-telegram: 0.59.0
 schedules:
   IncidentLoopWorkflow: 1 h
   IssuePollWorkflow: 12 h
