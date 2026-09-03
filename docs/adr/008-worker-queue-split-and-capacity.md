@@ -224,6 +224,43 @@ there until timeout.
 5. Soak one full dev-loop, then tighten the control limits (D3) from real
    numbers.
 
+   **Shipped in 1.39.0 (2026-09-03).** Steps 3 and 4 were in `main` from
+   09-02 and 09-03, but production ran 1.38.0 until this release — so the
+   flip only started routing anything at 21:16 UTC on 09-03. The
+   distinction matters more than it looks: for those ~44 hours the exec
+   worker was polling an empty queue while every activity still went to
+   control, and a reader of steps 3–4 marked "done" would reasonably have
+   assumed otherwise. Merged is not deployed.
+
+### The pre-flip baseline, measured
+
+Step 3 exists so the flip has something to be read against. Recording the
+numbers here rather than leaving them in a dashboard, because the whole
+point is that step 5 tightens limits "from real numbers" and those numbers
+have to survive the session that took them.
+
+Window: 2026-09-01 ~21:00 → 2026-09-03 21:00 UTC (~44 h), VictoriaMetrics,
+task queue `mctl-dev-loop`:
+
+| | |
+|---|---|
+| activities received | **809** |
+| minimum free activity slots, whole window | **96 of 100** |
+| max p95 schedule-to-start | **0.87 s** |
+| `mctl-dev-loop-exec` activities received | **0** |
+| `mctl-dev-loop-exec` free slots | 40 of 40, throughout |
+
+**Read it as an idle baseline, not a healthy one.** The premise of this ADR
+is that long `submit_and_wait` pollers fill a shared pool once 9–11 loops
+run concurrently. Nothing close to that happened in this window: four slots
+of a hundred were the deepest it ever went. So the baseline establishes
+what quiet looks like and says nothing yet about contention — which is
+exactly why step 5 must wait for load rather than for elapsed time. Two
+more days of this would add no information.
+
+The zero on the exec row is not a fault: it is step 4 not being deployed
+yet, and it dates the "before" side of the comparison precisely.
+
 Steps 1–3 are individually reversible. Step 4 is one-way for histories
 that record the patch, which is why it is alone.
 

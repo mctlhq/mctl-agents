@@ -108,6 +108,19 @@ the issue-investigator manifest now requires a mctl-gitops checkout.** It
 used to be self-contained. That is the cost of having one catalog instead of
 two descriptions of one.
 
+## Status as of 1.39.0 (2026-09-03)
+
+Shipped: the resolver reads the mctl-gitops catalog (#277 step 4, #291), the
+definition half of every binding is pinned by
+`spec.sourceManifest.contentHash` and that pin is verified for **all three**
+bindings rather than only the one the resolver reads (#293, #294), and a
+profile whose content changes without a `spec.version` bump now fails
+mctl-gitops CI (mctl-gitops#1009).
+
+Unchanged: `ISSUE_INVESTIGATOR_RESOLVER_MODE` still defaults to `legacy`, so
+nothing in production resolves declaratively. Shipping the code is not
+activation.
+
 ## Rollback
 
 Set `ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy` (already the default) —
