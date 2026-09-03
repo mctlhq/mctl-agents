@@ -28,6 +28,7 @@ from orchestrator.validate_manifest import (
     GITOPS_CATALOG_PROFILES_DIR,
     _check_legacy_env_override,
     _check_prompt_sources,
+    check_binding_pins_match_definitions,
     check_catalog_profiles_match_builders,
     check_manifests_match_inventory,
     validate,
@@ -584,3 +585,176 @@ def test_the_real_catalog_task_test_fails_rather_than_no_ops_under_ci(tmp_path, 
     monkeypatch.delenv("CI", raising=False)
     with pytest.raises(Skipped):
         test_every_real_catalog_profile_names_a_resolvable_model_task()
+
+
+def _write_binding(root: Path, agent: str, *, path: str, content_hash: str) -> Path:
+    """One ReleaseBindingIntent under <root>/<env>/<agent>.yaml, catalog shape."""
+    target = root / "shadow" / f"{agent}.yaml"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "agents.mctl.ai/v1alpha2",
+                "kind": "ReleaseBindingIntent",
+                "metadata": {"agent": agent, "environment": "shadow"},
+                "spec": {
+                    "sourceManifest": {
+                        "repo": "mctlhq/mctl-agents",
+                        "path": path,
+                        "gitSha": "0" * 40,
+                        "contentHash": content_hash,
+                    },
+                    "bindingSource": "compatibility-fixture",
+                    "promotable": False,
+                    "definition": {"name": agent, "version": "1"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return target
+
+
+def test_every_real_binding_pin_matches_its_definition() -> None:
+    """The end this check exists for: all three catalog bindings pin the real
+    sha256 of the manifest they name, not just the one the resolver reads.
+
+    Emptiness is the guard, not `is_dir()`: a glob over a missing or
+    restructured directory yields nothing without raising, so under CI the
+    skip would be bypassed and the loop would verify zero bindings — the
+    silent-no-op shape that reached review on #288.
+    """
+    bindings = sorted(validate_manifest_module.GITOPS_CATALOG_RELEASES_DIR.glob("*/*.yaml"))
+    if not bindings:
+        if os.environ.get("CI"):
+            pytest.fail(
+                f"no <env>/<agent>.yaml under "
+                f"{validate_manifest_module.GITOPS_CATALOG_RELEASES_DIR} under CI — the "
+                "release catalog is not checked out or has moved, and this test checked nothing"
+            )
+        pytest.skip("mctl-gitops release catalog not checked out")
+    assert check_binding_pins_match_definitions(MANIFESTS) == []
+
+
+def test_a_stale_pin_is_reported(tmp_path, monkeypatch) -> None:
+    """A definition edited without re-pinning must fail.
+
+    This is the whole point: two of the three pins are read by nothing else
+    (only `issue-investigator` resolves), so without this check they would rot
+    silently (#293).
+    """
+    releases = tmp_path / "releases"
+    _write_binding(
+        releases, "shepherd",
+        path="agents/_manifests/shepherd/agent.yaml",
+        content_hash="sha256:" + "0" * 64,
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases)
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert any("does not match" in e and "shepherd" in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/etc/passwd", "escapes"),
+        ("../../../../etc/passwd", "escapes"),
+        ("agents/_manifests/nope/agent.yaml", "does not exist"),
+        ("agents/_manifests/implementer/agent.yaml", "is not shepherd's manifest"),
+    ],
+    ids=["absolute", "traversal", "missing", "wrong-agent"],
+)
+def test_a_binding_cannot_pin_the_wrong_file(tmp_path, monkeypatch, path, expected) -> None:
+    """`sourceManifest.path` comes from another repository, so it is checked
+    rather than trusted.
+
+    The `wrong-agent` case is the one that is not about safety: a binding
+    pinning the CORRECT hash of the WRONG manifest would otherwise validate
+    green forever, which is a pin that proves nothing about the agent it
+    claims to bind.
+    """
+    releases = tmp_path / "releases"
+    _write_binding(releases, "shepherd", path=path, content_hash="sha256:" + "0" * 64)
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases)
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert any(expected in e for e in errors), errors
+
+
+@pytest.mark.parametrize(
+    "content_hash", [None, "", "not-a-hash", "1234", 42],
+    ids=["absent", "empty", "unprefixed", "digits", "not-a-string"],
+)
+def test_a_missing_or_malformed_pin_is_reported(tmp_path, monkeypatch, content_hash) -> None:
+    """A binding without a usable pin must fail, not read as "nothing to
+    check" — that is exactly how the pin came to be unverified for two of the
+    three agents in the first place."""
+    releases = tmp_path / "releases"
+    binding = _write_binding(
+        releases, "shepherd",
+        path="agents/_manifests/shepherd/agent.yaml",
+        content_hash="sha256:" + "0" * 64,
+    )
+    document = yaml.safe_load(binding.read_text(encoding="utf-8"))
+    if content_hash is None:
+        del document["spec"]["sourceManifest"]["contentHash"]
+    else:
+        document["spec"]["sourceManifest"]["contentHash"] = content_hash
+    binding.write_text(yaml.safe_dump(document), encoding="utf-8")
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases)
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert any("unpinned" in e for e in errors), errors
+
+
+def test_an_empty_release_directory_is_an_error(tmp_path, monkeypatch) -> None:
+    """A directory that exists but holds no bindings verified nothing.
+
+    Same shape as the missing checkout, reached by a rename in mctl-gitops
+    instead of an absent clone — and the loop would return [] having checked
+    zero pins.
+    """
+    empty = tmp_path / "releases"
+    empty.mkdir()
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", empty)
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert errors and "no <environment>/<agent>.yaml" in errors[0], errors
+
+
+@pytest.mark.parametrize(
+    "spec", [None, "a string", [], {"sourceManifest": "oops"}],
+    ids=["empty-spec", "string-spec", "list-spec", "source-not-a-mapping"],
+)
+def test_a_malformed_binding_is_reported_not_crashed(tmp_path, monkeypatch, spec) -> None:
+    """One bad file in ANOTHER repository must not abort the run and hide
+    every other binding's result behind it."""
+    releases = tmp_path / "releases" / "shadow"
+    releases.mkdir(parents=True)
+    (releases / "shepherd.yaml").write_text(yaml.safe_dump({"spec": spec}), encoding="utf-8")
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases.parent
+    )
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert errors, "a malformed binding produced no error at all"
+    assert all("shepherd.yaml" in e for e in errors), errors
+
+
+def test_a_missing_release_checkout_fails_under_ci(tmp_path, monkeypatch) -> None:
+    """Absence must be an error where this check is the only thing looking."""
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", tmp_path / "absent"
+    )
+    monkeypatch.delenv("CI", raising=False)
+    assert check_binding_pins_match_definitions(MANIFESTS) == []
+
+    monkeypatch.setenv("CI", "true")
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+    assert errors and "absent" in errors[0]

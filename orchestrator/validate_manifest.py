@@ -15,6 +15,7 @@ the next one fails loudly instead of merging quietly.
 from __future__ import annotations
 
 import glob as globmod
+import hashlib
 import importlib
 import os
 import re
@@ -58,6 +59,7 @@ GITOPS_ROOT = Path(
 )
 GITOPS_CWFT_DIR = GITOPS_ROOT / "argo-workflows" / "cluster-templates"
 GITOPS_CATALOG_PROFILES_DIR = GITOPS_ROOT / "agent-platform" / "execution-profiles"
+GITOPS_CATALOG_RELEASES_DIR = GITOPS_ROOT / "agent-platform" / "releases"
 
 
 def _gitops_missing(directory: Path, what: str) -> list[str]:
@@ -613,6 +615,108 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
     return errors
 
 
+def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) -> list[str]:
+    """Every ReleaseBindingIntent's `spec.sourceManifest.contentHash` must be
+    the sha256 of the AgentDefinition it names.
+
+    mctl-gitops#1011 made that pin required on every binding, so all three
+    shadow bindings carry one. Only ONE of them was verified by anything:
+    `orchestrator/resolver.py` recomputes it, and the resolver runs for
+    `issue-investigator` alone — the only v1alpha2 manifest. mctl-gitops CI
+    cannot verify any of them, because it cannot read this repository's files;
+    its own binding schema says so.
+
+    So two of the three pins were values shaped like a gate that nothing
+    checked (#293), introduced while closing exactly that class of defect in
+    #277. Harmless today, because nothing reads them — and precisely the kind
+    of harmless that ends with a hash which has been wrong for months
+    surfacing as a resolver bug the day `implementer` migrates to v1alpha2.
+
+    This is the only process that can see both repositories, so it is the only
+    place the claim is checkable at all. Same reason the tools and
+    model-policy comparisons live here.
+    """
+    if not GITOPS_CATALOG_RELEASES_DIR.is_dir():
+        return _gitops_missing(GITOPS_CATALOG_RELEASES_DIR, "the release binding pins")
+
+    binding_paths = sorted(GITOPS_CATALOG_RELEASES_DIR.glob("*/*.yaml"))
+    # A directory that exists but holds no bindings validates nothing and
+    # would report success for doing so — the same silent-no-op shape as the
+    # missing checkout above, reached by a restructure rather than an absent
+    # clone. Identical guard to the profiles check, for the identical reason.
+    if not binding_paths:
+        return [
+            f"{GITOPS_CATALOG_RELEASES_DIR} contains no <environment>/<agent>.yaml; the "
+            "release catalog moved or was emptied, and nothing was checked."
+        ]
+
+    errors: list[str] = []
+    for binding_path in binding_paths:
+        try:
+            document = yaml.safe_load(binding_path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
+                raise ManifestError("missing or non-mapping 'spec'")
+            spec = document["spec"]
+            source_manifest = spec.get("sourceManifest")
+            if not isinstance(source_manifest, dict):
+                raise ManifestError("spec.sourceManifest must be a mapping")
+            declared_path = source_manifest.get("path")
+            declared_hash = source_manifest.get("contentHash")
+            definition = spec.get("definition")
+            agent_name = definition.get("name") if isinstance(definition, dict) else None
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            errors.append(f"{binding_path}: {exc}")
+            continue
+
+        if not isinstance(declared_hash, str) or not declared_hash.startswith("sha256:"):
+            errors.append(
+                f"{binding_path}: spec.sourceManifest.contentHash is missing or not a "
+                f"'sha256:...' pin (got {declared_hash!r}); the definition half of this "
+                "binding is unpinned"
+            )
+            continue
+        if not isinstance(declared_path, str) or not declared_path:
+            errors.append(f"{binding_path}: spec.sourceManifest.path is required")
+            continue
+
+        # Refuse an absolute path or one that climbs out of the repository
+        # before it is joined: `REPO_ROOT / "/etc/passwd"` is "/etc/passwd",
+        # and this file comes from a different repository.
+        target = (REPO_ROOT / declared_path).resolve()
+        if REPO_ROOT not in target.parents:
+            errors.append(
+                f"{binding_path}: spec.sourceManifest.path {declared_path!r} escapes "
+                "this repository"
+            )
+            continue
+        if not target.is_file():
+            errors.append(
+                f"{binding_path}: spec.sourceManifest.path {declared_path!r} does not "
+                "exist in mctl-agents — the binding names a definition that is not here"
+            )
+            continue
+
+        # Cross-check the path against the agent it claims to bind, so a
+        # binding cannot pin the RIGHT hash of the WRONG file and pass.
+        if agent_name and agent_name in manifests:
+            expected_path = manifests[agent_name].path.relative_to(REPO_ROOT).as_posix()
+            if declared_path != expected_path:
+                errors.append(
+                    f"{binding_path}: spec.sourceManifest.path {declared_path!r} is not "
+                    f"{agent_name}'s manifest ({expected_path!r})"
+                )
+                continue
+
+        actual = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+        if actual != declared_hash:
+            errors.append(
+                f"{binding_path}: spec.sourceManifest.contentHash {declared_hash} does not "
+                f"match {declared_path} ({actual}). The definition was edited without "
+                "re-pinning the binding — re-pin it in mctl-gitops."
+            )
+    return errors
+
+
 def validate(manifest: AgentManifest) -> list[str]:
     """Return human-readable errors for one manifest; empty means valid."""
     errors: list[str] = []
@@ -707,6 +811,13 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             print("FAIL mctl-gitops agent-platform catalog <-> orchestrator/options.py:")
             for error in catalog_errors:
+                print(f"  - {error}")
+
+        pin_errors = check_binding_pins_match_definitions(manifests)
+        if pin_errors:
+            exit_code = 1
+            print("FAIL mctl-gitops release bindings <-> agents/_manifests/:")
+            for error in pin_errors:
                 print(f"  - {error}")
 
     return exit_code
