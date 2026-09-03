@@ -1,0 +1,273 @@
+name: diagrams refresh
+
+# Keeps docs/diagrams/archify/*.json true to the code they describe.
+#
+# Two signals, both polled (the same choice ADR 006 made for PR state — no
+# new webhook/ingress surface):
+#   1. tools/diagram_facts.py re-reads the constants the diagrams quote
+#      (dev-loop timeouts, status vocabulary, budgets, CWFT list, MCP tool
+#      count, ...) from mctl-agents, mctl-gitops and mctl-api and diffs them
+#      against docs/diagrams/archify/facts.yaml.
+#   2. The latest release of every mctlhq repository is compared with the
+#      `releases_seen` watermark in the same file.
+# Only when at least one signal fires does an agent run. It may edit the
+# diagram sources and facts.yaml, nothing else; every candidate is then
+# re-validated deterministically (archify showcase profile) and the change
+# lands as a PR — never on main. The PR goes through the same claude-review
+# gate as code and is merged by a human.
+#
+# The PR is opened with the mctl-agents App token, not GITHUB_TOKEN: GitHub
+# suppresses workflow triggers for events raised by GITHUB_TOKEN, so the
+# diagrams.yml validation and claude-review would never run on the PR
+# (the release-please.yml comment explains the same trap).
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC — after the weekend mentor digest, before the work week
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Run the agent even when no drift and no new release is detected
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: diagrams-refresh
+  cancel-in-progress: false
+
+env:
+  ARCHIFY_REF: 06dd052602dd9a369e4d034e24faef0917b5a60c   # keep in step with diagrams.yml and the Dockerfile
+  # Every repository whose releases can change a fact drawn in the diagrams.
+  # mctl-telegram is here although no diagram names it: a release there can
+  # add an MCP tool namespace or a CWFT notification step.
+  WATCHED_REPOS: mctl-agents mctl-api mctl-gitops mctl-docs mctl-telegram mctl-academy mctl-agent mctl-portal
+
+jobs:
+  detect:
+    name: detect drift + new releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.drift.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mctlhq/mctl-gitops
+          path: _gitops
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mctlhq/mctl-api
+          path: _api
+          persist-credentials: false
+
+      - name: Collect the latest release of every watched repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "[" > releases.json
+          first=1
+          for repo in $WATCHED_REPOS; do
+            # Public repos, read-only, so GITHUB_TOKEN is enough; a repo with
+            # no release yet returns 404 and is simply skipped.
+            if ! rel=$(gh api "repos/mctlhq/${repo}/releases/latest" 2>/dev/null); then
+              continue
+            fi
+            [ $first -eq 1 ] || echo "," >> releases.json
+            first=0
+            jq -n --arg repo "mctlhq/${repo}" --argjson r "$rel" \
+              '{repo: $repo, tag: $r.tag_name, published_at: $r.published_at, body: ($r.body // "")}' >> releases.json
+          done
+          echo "]" >> releases.json
+          jq -r '.[] | "\(.repo) \(.tag) \(.published_at)"' releases.json
+
+      - name: Diff facts against the code
+        id: drift
+        run: |
+          set +e
+          pip install --quiet pyyaml
+          python3 tools/diagram_facts.py \
+            --gitops _gitops/platform-gitops --api _api \
+            --releases releases.json --report drift.md --json drift.json
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "changed=false" >> "$GITHUB_OUTPUT" ;;
+            3) echo "changed=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::diagram_facts.py failed with exit $rc"; exit 1 ;;
+          esac
+          cat drift.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drift
+          path: |
+            drift.md
+            drift.json
+            releases.json
+          retention-days: 14
+
+  refresh:
+    name: agent updates the diagrams
+    needs: detect
+    if: needs.detect.outputs.changed == 'true' || inputs.force == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+    steps:
+      - name: Generate mctl-agents App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.AGENTS_APP_ID }}
+          private-key: ${{ secrets.AGENTS_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mctlhq/mctl-gitops
+          path: _gitops
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mctlhq/mctl-api
+          path: _api
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tt-a1i/archify
+          ref: ${{ env.ARCHIFY_REF }}
+          path: _archify
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: drift
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install archify validators
+        run: npm ci --prefix _archify/archify --ignore-scripts
+
+      - name: Install the archify-diagrams platform skill for this run
+        # The skill's source of truth is the gitops catalog (agent-inventory.yaml,
+        # "skills" section). Copying it into .claude/skills/ for the duration
+        # of the job is how the SDK picks it up; it is never committed.
+        run: |
+          mkdir -p .claude/skills
+          cp -r _gitops/platform-gitops/platform-skills/catalog/archify-diagrams .claude/skills/archify-diagrams
+          pip install --quiet pyyaml
+
+      - name: Build the prompt
+        run: |
+          {
+            echo 'You maintain docs/diagrams/archify/*.json — the architecture, workflow, sequence,'
+            echo 'lifecycle and dataflow diagrams of the mctl agent platform, rendered by archify.'
+            echo 'Read .claude/skills/archify-diagrams/SKILL.md first and follow it exactly.'
+            echo
+            echo 'Below is a drift report: facts the diagrams quote that no longer match the code,'
+            echo 'and releases of mctlhq repositories not yet reflected. Checkouts you may read:'
+            echo '  . (mctl-agents), _gitops/platform-gitops (mctl-gitops), _api (mctl-api).'
+            echo
+            echo 'Do exactly this:'
+            echo '1. For each drifted fact, find the diagram node/label/card that quotes it and update it.'
+            echo '2. For each release, read its notes and the diff of the paths it names; if it changes'
+            echo '   a step, a state, a timeout, a tool or a boundary that a diagram draws, update that'
+            echo '   diagram. If a release changes nothing drawn, leave the diagrams alone and say so.'
+            echo '3. Never invent a component that does not exist in the checkouts. Keep exact'
+            echo '   identifiers (CWFT names, status values, mctl_* tool names, env vars).'
+            echo '4. After every edit run:'
+            echo '     node _archify/archify/bin/archify.mjs validate <type> <file> --quality showcase --json'
+            echo '   and fix only what the diagnostics name, until ok:true with 0 errors and 0 warnings.'
+            echo '5. Regenerate the facts file so the next run starts from these values:'
+            echo '     python3 tools/diagram_facts.py --gitops _gitops/platform-gitops --api _api --releases releases.json --update'
+            echo '6. Write a short CHANGES.md at the repository root: one line per diagram changed and'
+            echo '   why (which fact or release), plus one line per release you judged irrelevant.'
+            echo
+            echo 'Do not edit anything outside docs/diagrams/archify/ and CHANGES.md. Do not run git.'
+            echo
+            echo '----- drift report -----'
+            cat drift.md
+          } > prompt.md
+          # Same mechanism claude-review.yml uses: the prompt travels through
+          # GITHUB_ENV so the action receives the file's content verbatim.
+          {
+            echo "AGENT_PROMPT<<__PROMPT_EOF__"
+            cat prompt.md
+            echo "__PROMPT_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Agent edits the diagram sources
+        id: agent
+        uses: anthropics/claude-code-action@6b082c41935b4c8a3b8b0ef85ba4ba4d9eeb8975 # v1.0.189 (CLI 2.1.226)
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ steps.app-token.outputs.token }}
+          prompt: ${{ env.AGENT_PROMPT }}
+          # Read anything, write only the diagram sources and the summary;
+          # the only commands it may run are the validator, the facts
+          # regenerator and git read-only inspection of the release diffs.
+          claude_args: >-
+            --model claude-sonnet-5
+            --max-turns 60
+            --allowedTools "Read,Glob,Grep,Edit(docs/diagrams/archify/**),Write(docs/diagrams/archify/**),Write(CHANGES.md),Bash(node _archify/archify/bin/archify.mjs validate:*),Bash(node _archify/archify/bin/archify.mjs brands:*),Bash(python3 tools/diagram_facts.py:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git -C _gitops log:*),Bash(git -C _gitops diff:*),Bash(git -C _api log:*),Bash(git -C _api diff:*)"
+
+      - name: Every diagram must still pass showcase validation
+        # The agent's own validate calls are advice; this is the gate. A
+        # candidate that regressed is dropped here, before any commit.
+        run: python3 tools/check_diagrams.py --archify _archify/archify/bin/archify.mjs docs/diagrams/archify
+
+      - name: Open the pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          git add docs/diagrams/archify
+          if git diff --cached --quiet; then
+            echo "The agent changed nothing under docs/diagrams/archify — no PR."
+            exit 0
+          fi
+          branch="docs/diagrams-refresh-$(date -u +%Y%m%d)"
+          git config user.name "mctl-agents[bot]"
+          git config user.email "mctl-agents[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          # docs: prefix on purpose — release-please must not cut a release
+          # for a diagram refresh (see the commit-lint job in pr-validation).
+          git commit -m "docs(diagrams): refresh archify sources from code and releases"
+          git push -u origin "$branch"
+          {
+            echo "Automated refresh of the archify diagram sources."
+            echo
+            echo "## What changed and why"
+            echo
+            cat CHANGES.md 2>/dev/null || echo "(the agent left no CHANGES.md)"
+            echo
+            echo "## Drift report this run acted on"
+            echo
+            cat drift.md
+            echo
+            echo "Rendered HTML for review: the \`diagrams\` workflow uploads it on this PR;"
+            echo "on merge it deploys to GitHub Pages."
+          } > pr-body.md
+          gh pr create --base main --head "$branch" \
+            --title "docs(diagrams): refresh archify sources $(date -u +%Y-%m-%d)" \
+            --body-file pr-body.md --label documentation

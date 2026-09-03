@@ -1,0 +1,381 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "Dev Loop \u2014 one GitHub issue, end to end",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "propose",
+        "label": "Issue to approved proposal",
+        "focus": [
+          "issue",
+          "start",
+          "investigate",
+          "pod_inv",
+          "wait",
+          "approve"
+        ],
+        "note": "An agent turns the issue into a reviewable proposal, then the loop parks \u2014 for hours or days \u2014 until a human approves."
+      },
+      {
+        "id": "ship",
+        "label": "Implement, review, merge",
+        "focus": [
+          "implement",
+          "pod_impl",
+          "watchpr",
+          "review",
+          "pod_shep"
+        ],
+        "note": "The implementer opens a PR; review bots gate it; the shepherd addresses findings and merges with the head SHA pinned."
+      },
+      {
+        "id": "observe",
+        "label": "Observe what shipped",
+        "focus": [
+          "watchpr",
+          "deploy",
+          "notmerged",
+          "noship"
+        ],
+        "note": "After merge the same workflow waits for the release, watches the rollout, and opens a 30-minute incident window."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "github",
+      "label": "GitHub"
+    },
+    {
+      "id": "loop",
+      "label": "Temporal DevLoopWorkflow \u00b7 durable, one per issue"
+    },
+    {
+      "id": "human",
+      "label": "Human gate"
+    },
+    {
+      "id": "sandbox",
+      "label": "Argo sandbox \u00b7 Claude Agent SDK"
+    },
+    {
+      "id": "stops",
+      "label": "Stops",
+      "variant": "exception"
+    }
+  ],
+  "phases": [
+    {
+      "id": "intake",
+      "label": "Intake",
+      "fromCol": 0,
+      "toCol": 0
+    },
+    {
+      "id": "propose",
+      "label": "Propose + approve",
+      "fromCol": 1,
+      "toCol": 2,
+      "variant": "emphasis"
+    },
+    {
+      "id": "ship",
+      "label": "Implement + merge",
+      "fromCol": 3,
+      "toCol": 4
+    },
+    {
+      "id": "observe",
+      "label": "Observe",
+      "fromCol": 5,
+      "toCol": 5,
+      "variant": "dashed"
+    }
+  ],
+  "mainPath": [
+    "issue",
+    "start",
+    "investigate",
+    "wait",
+    "implement",
+    "watchpr",
+    "deploy"
+  ],
+  "nodes": [
+    {
+      "id": "issue",
+      "lane": "github",
+      "col": 0,
+      "type": "external",
+      "label": "Issue",
+      "sublabel": "label agents:intake",
+      "width": 128
+    },
+    {
+      "id": "review",
+      "lane": "github",
+      "col": 4,
+      "type": "external",
+      "label": "Review bots",
+      "sublabel": "claude \u00b7 codex",
+      "tag": "0 open P1/P2",
+      "width": 128
+    },
+    {
+      "id": "start",
+      "lane": "loop",
+      "col": 0,
+      "type": "backend",
+      "label": "Start loop",
+      "sublabel": "resolve + pin version",
+      "width": 128
+    },
+    {
+      "id": "investigate",
+      "lane": "loop",
+      "col": 1,
+      "type": "backend",
+      "label": "Investigate",
+      "sublabel": "submit CWFT \u00b7 wait",
+      "tag": "\u22642 h",
+      "width": 128
+    },
+    {
+      "id": "wait",
+      "lane": "loop",
+      "col": 2,
+      "type": "backend",
+      "label": "Wait",
+      "sublabel": "durable, for days",
+      "tag": "wait_condition",
+      "width": 128
+    },
+    {
+      "id": "implement",
+      "lane": "loop",
+      "col": 3,
+      "type": "backend",
+      "label": "Implement",
+      "sublabel": "approve CWFT \u2192 PR",
+      "tag": "\u22642 h",
+      "width": 128
+    },
+    {
+      "id": "watchpr",
+      "lane": "loop",
+      "col": 4,
+      "type": "backend",
+      "label": "Watch PR",
+      "sublabel": "poll 30 min \u00b7 \u226414 d",
+      "width": 128
+    },
+    {
+      "id": "deploy",
+      "lane": "loop",
+      "col": 5,
+      "type": "cloud",
+      "label": "Observe deploy",
+      "sublabel": "rollout + incidents",
+      "tag": "\u226465 + 30 min",
+      "width": 128
+    },
+    {
+      "id": "approve",
+      "lane": "human",
+      "col": 2,
+      "type": "security",
+      "label": "Approve",
+      "sublabel": "MCP tool + reason",
+      "tag": "the only stop",
+      "width": 128
+    },
+    {
+      "id": "pod_inv",
+      "lane": "sandbox",
+      "col": 1,
+      "type": "backend",
+      "label": "issue-investigator",
+      "sublabel": "writes the proposal",
+      "tag": "$3 budget",
+      "width": 128
+    },
+    {
+      "id": "pod_impl",
+      "lane": "sandbox",
+      "col": 3,
+      "type": "backend",
+      "label": "implementer",
+      "sublabel": "branch + PR + status",
+      "tag": "$20 \u00b7 40 min",
+      "width": 128
+    },
+    {
+      "id": "pod_shep",
+      "lane": "sandbox",
+      "col": 4,
+      "type": "backend",
+      "label": "shepherd",
+      "sublabel": "fix findings \u00b7 merge",
+      "tag": "\u22484 h \u00b7 max 12",
+      "width": 128
+    },
+    {
+      "id": "failed",
+      "lane": "stops",
+      "col": 1,
+      "type": "security",
+      "label": "Investigate failed",
+      "sublabel": "loop ends",
+      "width": 128
+    },
+    {
+      "id": "notmerged",
+      "lane": "stops",
+      "col": 4,
+      "type": "security",
+      "label": "Closed unmerged",
+      "sublabel": "status \u2192 rejected",
+      "width": 128
+    },
+    {
+      "id": "noship",
+      "lane": "stops",
+      "col": 5,
+      "type": "security",
+      "label": "Nothing shipped",
+      "sublabel": "no release / target",
+      "width": 128
+    }
+  ],
+  "edges": [
+    {
+      "id": "issue-start",
+      "from": "issue",
+      "to": "start",
+      "label": "trigger"
+    },
+    {
+      "id": "start-investigate",
+      "from": "start",
+      "to": "investigate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "investigate-pod",
+      "from": "investigate",
+      "to": "pod_inv",
+      "label": "run",
+      "variant": "emphasis",
+      "role": "branch"
+    },
+    {
+      "id": "investigate-wait",
+      "from": "investigate",
+      "to": "wait",
+      "label": "status: proposed",
+      "variant": "emphasis"
+    },
+    {
+      "id": "wait-approve",
+      "from": "wait",
+      "to": "approve",
+      "label": "signal",
+      "variant": "security",
+      "role": "branch"
+    },
+    {
+      "id": "wait-implement",
+      "from": "wait",
+      "to": "implement",
+      "label": "approved by \u2026",
+      "variant": "emphasis"
+    },
+    {
+      "id": "implement-pod",
+      "from": "implement",
+      "to": "pod_impl",
+      "label": "run",
+      "variant": "emphasis",
+      "role": "branch"
+    },
+    {
+      "id": "implement-watch",
+      "from": "implement",
+      "to": "watchpr",
+      "label": "PR url",
+      "variant": "emphasis"
+    },
+    {
+      "id": "watch-review",
+      "from": "watchpr",
+      "to": "review",
+      "label": "PR state",
+      "variant": "dashed",
+      "role": "async"
+    },
+    {
+      "id": "watch-shepherd",
+      "from": "watchpr",
+      "to": "pod_shep",
+      "label": "tick",
+      "variant": "dashed",
+      "role": "branch"
+    },
+    {
+      "id": "watch-deploy",
+      "from": "watchpr",
+      "to": "deploy",
+      "label": "merged",
+      "variant": "emphasis"
+    },
+    {
+      "id": "investigate-failed",
+      "from": "pod_inv",
+      "to": "failed",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "watch-notmerged",
+      "from": "pod_shep",
+      "to": "notmerged",
+      "variant": "security",
+      "role": "error"
+    },
+    {
+      "id": "deploy-noship",
+      "from": "deploy",
+      "to": "noship",
+      "variant": "security",
+      "role": "error"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "amber",
+      "title": "One human gate",
+      "items": [
+        "Everything before it (investigate) and after it (approve, implement, merge, observe) is automatic",
+        "Temporal holds the wait for free \u2014 no pod, no cron, no lost state"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Pinned versions",
+      "items": [
+        "The loop resolves the agent release once, at the step that uses it",
+        "A promote or rollback never changes an in-flight or replayed execution"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Merge is earned",
+      "items": [
+        "Review bots must leave 0 unaddressed P1/P2 findings",
+        "gh pr merge --merge --match-head-commit: a late push cannot smuggle code through"
+      ]
+    }
+  ]
+}

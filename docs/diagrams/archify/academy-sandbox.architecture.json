@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Academy AI Sandbox — three auth domains, one hard dry-run",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1000,
+      560
+    ],
+    "views": [
+      {
+        "id": "identity",
+        "label": "Who is the student",
+        "focus": [
+          "browser",
+          "api"
+        ],
+        "note": "Domain 1: better-auth session cookie. Quotas, lesson progress and context capping live here."
+      },
+      {
+        "id": "billing",
+        "label": "Who pays for inference",
+        "focus": [
+          "api",
+          "gateway",
+          "anthropic",
+          "openrouter",
+          "vault"
+        ],
+        "note": "Domain 2: managed keys from Vault, OpenRouter OAuth PKCE with revenue share, or BYOK encrypted with Vault Transit."
+      },
+      {
+        "id": "platform",
+        "label": "What the agent may execute",
+        "focus": [
+          "api",
+          "broker",
+          "mcp"
+        ],
+        "note": "Domain 3: an OAuth 2.1 token for api.mctl.ai/mcp. The broker forces dry_run=true — the model cannot override it."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "frontend",
+      "label": "Student",
+      "sublabel": "React · academy.mctl.ai",
+      "pos": [
+        38,
+        200
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "Sandbox API",
+      "sublabel": "Hono · quotas · context",
+      "pos": [
+        240,
+        200
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "domain 1"
+    },
+    {
+      "id": "broker",
+      "type": "security",
+      "label": "MCP Broker",
+      "sublabel": "injects dry_run=true",
+      "pos": [
+        442,
+        90
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "domain 3"
+    },
+    {
+      "id": "mcp",
+      "type": "backend",
+      "label": "api.mctl.ai/mcp",
+      "sublabel": "71 platform tools",
+      "pos": [
+        644,
+        90
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "sandbox env"
+    },
+    {
+      "id": "gateway",
+      "type": "backend",
+      "label": "LLM Gateway",
+      "sublabel": "managed · OpenRouter · BYOK",
+      "pos": [
+        442,
+        310
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "domain 2"
+    },
+    {
+      "id": "anthropic",
+      "type": "external",
+      "label": "Anthropic",
+      "sublabel": "managed key",
+      "brand": "claude",
+      "pos": [
+        644,
+        260
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "openrouter",
+      "type": "external",
+      "label": "OpenRouter",
+      "sublabel": "user PKCE key",
+      "brand": "openrouter",
+      "pos": [
+        644,
+        360
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "revenue share"
+    },
+    {
+      "id": "vault",
+      "type": "security",
+      "label": "Vault",
+      "sublabel": "keys · Transit for BYOK",
+      "pos": [
+        240,
+        420
+      ],
+      "size": [
+        138,
+        68
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "security-group",
+      "label": "Domain 3 · platform authorization",
+      "wraps": [
+        "broker",
+        "mcp"
+      ],
+      "pad": 14
+    },
+    {
+      "kind": "security-group",
+      "label": "Domain 2 · inference billing",
+      "wraps": [
+        "gateway",
+        "anthropic",
+        "openrouter"
+      ],
+      "pad": 14
+    }
+  ],
+  "connections": [
+    {
+      "id": "session",
+      "from": "browser",
+      "to": "api",
+      "label": "session cookie",
+      "variant": "security",
+      "labelDy": -28
+    },
+    {
+      "id": "mcp-token",
+      "from": "api",
+      "to": "broker",
+      "label": "MCP OAuth token",
+      "variant": "security",
+      "labelAt": [
+        400,
+        172
+      ]
+    },
+    {
+      "id": "forced",
+      "from": "broker",
+      "to": "mcp",
+      "label": "dry_run · sandbox",
+      "variant": "emphasis",
+      "labelDy": 65
+    },
+    {
+      "id": "inference",
+      "from": "api",
+      "to": "gateway",
+      "label": "inference credential",
+      "variant": "emphasis",
+      "labelAt": [
+        410,
+        290
+      ]
+    },
+    {
+      "id": "managed",
+      "from": "gateway",
+      "to": "anthropic",
+      "label": "server key",
+      "variant": "default"
+    },
+    {
+      "id": "pkce",
+      "from": "gateway",
+      "to": "openrouter",
+      "label": "App ID headers",
+      "variant": "dashed",
+      "labelAt": [
+        612,
+        442
+      ]
+    },
+    {
+      "id": "secrets",
+      "from": "vault",
+      "to": "gateway",
+      "label": "decrypt in RAM only",
+      "variant": "security"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "rose",
+      "title": "Safety is not a prompt",
+      "items": [
+        "\"Please always use dry-run\" can be prompt-injected away",
+        "The broker mutates every tool call server-side: environment=sandbox, dry_run=true"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Three questions, three tokens",
+      "items": [
+        "Who is the student · who pays for tokens · what may run",
+        "No credential ever crosses a domain; BYOK never touches localStorage"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Status",
+      "items": [
+        "Design spec tracked as mctl-academy#74 and #75",
+        "Telemetry panel shows tokens, context %, cost and the forced dry-run trace"
+      ]
+    }
+  ]
+}

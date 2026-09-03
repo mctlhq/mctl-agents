@@ -1,0 +1,265 @@
+{
+  "schema_version": 1,
+  "diagram_type": "dataflow",
+  "meta": {
+    "title": "An agent is a versioned artifact",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1068,
+      500
+    ],
+    "views": [
+      {
+        "id": "publish",
+        "label": "Publish",
+        "focus": [
+          "manifest",
+          "tag",
+          "version"
+        ],
+        "note": "A git tag freezes the manifest, every prompt source and the image; the registry stores an immutable version with a prompt hash."
+      },
+      {
+        "id": "release",
+        "label": "Release and promote",
+        "focus": [
+          "version",
+          "release",
+          "operator"
+        ],
+        "note": "One active version per environment. Promote and rollback are the same transaction, audited, under an advisory lock."
+      },
+      {
+        "id": "run",
+        "label": "Resolve and run",
+        "focus": [
+          "release",
+          "resolve",
+          "pod",
+          "execution"
+        ],
+        "note": "A workflow step resolves once and pins the image; the execution record carries version and target SHA for replay and search."
+      }
+    ]
+  },
+  "stages": [
+    {
+      "label": "Author"
+    },
+    {
+      "label": "Publish"
+    },
+    {
+      "label": "Registry"
+    },
+    {
+      "label": "Resolve"
+    },
+    {
+      "label": "Execute"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "manifest",
+      "type": "frontend",
+      "label": "agent.yaml",
+      "sublabel": "prompt sources",
+      "stage": 0,
+      "row": 0,
+      "tag": "in repo"
+    },
+    {
+      "id": "tag",
+      "type": "backend",
+      "label": "git tag 1.38.0",
+      "sublabel": "publish + image",
+      "stage": 1,
+      "row": 0,
+      "tag": "no v prefix"
+    },
+    {
+      "id": "version",
+      "type": "database",
+      "label": "agent_versions",
+      "sublabel": "hash · sha · image",
+      "stage": 2,
+      "row": 0,
+      "tag": "409 on rewrite"
+    },
+    {
+      "id": "release",
+      "type": "database",
+      "label": "agent_releases",
+      "sublabel": "prod · shadow",
+      "stage": 2,
+      "row": 2,
+      "tag": "one per env"
+    },
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "promote · rollback",
+      "stage": 3,
+      "row": 2,
+      "tag": "admin only"
+    },
+    {
+      "id": "resolve",
+      "type": "backend",
+      "label": "resolve_agent_release",
+      "sublabel": "once per step",
+      "stage": 3,
+      "row": 0,
+      "tag": "pinned",
+      "width": 136
+    },
+    {
+      "id": "pod",
+      "type": "backend",
+      "label": "Argo CWFT",
+      "sublabel": "agent_image param",
+      "stage": 4,
+      "row": 0,
+      "tag": "sandbox"
+    },
+    {
+      "id": "execution",
+      "type": "database",
+      "label": "agent_executions",
+      "sublabel": "version · SHA",
+      "stage": 4,
+      "row": 2,
+      "tag": "searchable"
+    }
+  ],
+  "flows": [
+    {
+      "id": "sources",
+      "from": "manifest",
+      "to": "tag",
+      "label": "hashed",
+      "classification": "sha256 · length-prefixed",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        208,
+        111
+      ]
+    },
+    {
+      "id": "publish",
+      "from": "tag",
+      "to": "version",
+      "label": "publish",
+      "classification": "manifest · git_sha · hash",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        423,
+        111
+      ]
+    },
+    {
+      "id": "bind",
+      "from": "version",
+      "to": "release",
+      "label": "promote",
+      "classification": "advisory lock · audit",
+      "variant": "default",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelDy": 24
+    },
+    {
+      "id": "govern",
+      "from": "operator",
+      "to": "release",
+      "label": "promote / rollback",
+      "classification": "MCP tool · reason",
+      "variant": "security",
+      "route": "straight",
+      "labelAt": [
+        638,
+        418
+      ]
+    },
+    {
+      "id": "lookup",
+      "from": "release",
+      "to": "resolve",
+      "label": "GET /resolve",
+      "classification": "active version",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "via": [
+        [
+          638,
+          385
+        ],
+        [
+          638,
+          157
+        ]
+      ],
+      "labelAt": [
+        640,
+        271
+      ]
+    },
+    {
+      "id": "pin",
+      "from": "resolve",
+      "to": "pod",
+      "label": "pinned",
+      "classification": "never re-read",
+      "variant": "emphasis",
+      "route": "straight",
+      "labelAt": [
+        853,
+        111
+      ]
+    },
+    {
+      "id": "record",
+      "from": "pod",
+      "to": "execution",
+      "label": "record",
+      "classification": "at-least-once",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "route": "straight",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "What a version covers",
+      "items": [
+        "Inline prompt template + CLAUDE.md + sub-agent .md + skills, hashed from the tag's tree",
+        "Inputs outside the repo (target repo, proposal) are pinned per execution, not hashed"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Why it exists",
+      "items": [
+        "The shepherd sat pinned at 1.25.0 for three weeks while the repo shipped 1.33.0",
+        "Editing a sub-agent file must not silently change behaviour without a bump"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Fail closed",
+      "items": [
+        "A missing release fails the dev loop non-retryably — no baked-in default",
+        "Shadow environment exists for comparison; canary weights are deferred"
+      ]
+    }
+  ]
+}

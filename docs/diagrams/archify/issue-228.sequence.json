@@ -1,0 +1,369 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": {
+    "title": "One real traversal — mctl-api#228 (2026-09-02)",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1040,
+      1010
+    ],
+    "column_fit": "spread",
+    "views": [
+      {
+        "id": "intake",
+        "label": "Trigger and investigate",
+        "focus": [
+          "operator",
+          "api",
+          "temporal",
+          "argo",
+          "pod",
+          "gitops"
+        ],
+        "note": "The loop starts from an MCP call, pins the investigator version, and runs it in a sandboxed Argo pod that writes the proposal to gitops."
+      },
+      {
+        "id": "approve",
+        "label": "Approve and implement",
+        "focus": [
+          "operator",
+          "api",
+          "temporal",
+          "argo",
+          "pod",
+          "github",
+          "gitops"
+        ],
+        "note": "After ~18 h parked in wait_condition, one approval signal drives approve, implement and the PR without any further operator action."
+      },
+      {
+        "id": "merge",
+        "label": "Review, merge, observe",
+        "focus": [
+          "temporal",
+          "pod",
+          "github",
+          "api"
+        ],
+        "note": "Review bots approve; the shepherd merges with the head SHA pinned; the loop then observes the release and rollout."
+      }
+    ]
+  },
+  "participants": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "MCP client"
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "mctl-api",
+      "sublabel": "REST + MCP"
+    },
+    {
+      "id": "temporal",
+      "type": "backend",
+      "label": "DevLoopWorkflow",
+      "sublabel": "Temporal"
+    },
+    {
+      "id": "argo",
+      "type": "cloud",
+      "label": "Argo",
+      "sublabel": "CWFT"
+    },
+    {
+      "id": "pod",
+      "type": "backend",
+      "label": "Agent pod",
+      "sublabel": "Claude Agent SDK"
+    },
+    {
+      "id": "github",
+      "type": "external",
+      "label": "GitHub",
+      "sublabel": "PR + bots"
+    },
+    {
+      "id": "gitops",
+      "type": "database",
+      "label": "mctl-gitops",
+      "sublabel": ".status.yaml"
+    }
+  ],
+  "segments": [
+    {
+      "from": 150,
+      "to": 395,
+      "label": "Intake · investigate (00:05 UTC)"
+    },
+    {
+      "from": 410,
+      "to": 445,
+      "label": "Parked in wait_condition for ~18 h — no pod, no cost"
+    },
+    {
+      "from": 460,
+      "to": 700,
+      "label": "Approve · implement (17:39 → 17:54)"
+    },
+    {
+      "from": 715,
+      "to": 925,
+      "label": "Review · merge · observe (17:56 → 19:01)"
+    }
+  ],
+  "messages": [
+    {
+      "id": "trigger",
+      "from": "operator",
+      "to": "api",
+      "y": 185,
+      "label": "mctl_trigger_issue #228",
+      "variant": "emphasis"
+    },
+    {
+      "id": "start",
+      "from": "api",
+      "to": "temporal",
+      "y": 222,
+      "label": "start dev-loop-mctlhq-mctl-api-228",
+      "variant": "emphasis"
+    },
+    {
+      "id": "resolve1",
+      "from": "temporal",
+      "to": "api",
+      "y": 258,
+      "label": "resolve issue-investigator",
+      "variant": "default"
+    },
+    {
+      "id": "pinned1",
+      "from": "api",
+      "to": "temporal",
+      "y": 288,
+      "label": "release → image pinned",
+      "variant": "return"
+    },
+    {
+      "id": "exec1",
+      "from": "temporal",
+      "to": "argo",
+      "y": 322,
+      "label": "execute mctl-agents-investigate",
+      "variant": "emphasis"
+    },
+    {
+      "id": "run1",
+      "from": "argo",
+      "to": "pod",
+      "y": 352,
+      "label": "sandboxed run · $3 · ≤2 h",
+      "variant": "default"
+    },
+    {
+      "id": "proposed",
+      "from": "pod",
+      "to": "gitops",
+      "y": 385,
+      "label": "proposal + status: proposed",
+      "variant": "emphasis"
+    },
+    {
+      "id": "approve",
+      "from": "operator",
+      "to": "api",
+      "y": 490,
+      "label": "approve (curl then; mctl_approve_dev_loop since #236)",
+      "variant": "security"
+    },
+    {
+      "id": "signal",
+      "from": "api",
+      "to": "temporal",
+      "y": 522,
+      "label": "signal approve",
+      "variant": "security"
+    },
+    {
+      "id": "execapprove",
+      "from": "temporal",
+      "to": "argo",
+      "y": 556,
+      "label": "execute mctl-agents-approve",
+      "variant": "security"
+    },
+    {
+      "id": "accepted",
+      "from": "argo",
+      "to": "gitops",
+      "y": 588,
+      "label": "status: accepted · approval block",
+      "variant": "security"
+    },
+    {
+      "id": "exec2",
+      "from": "temporal",
+      "to": "argo",
+      "y": 624,
+      "label": "execute mctl-agents-implement (slug-scoped)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "run2",
+      "from": "argo",
+      "to": "pod",
+      "y": 654,
+      "label": "implementer@1.38.0 · $20",
+      "variant": "default"
+    },
+    {
+      "id": "pr",
+      "from": "pod",
+      "to": "github",
+      "y": 686,
+      "label": "PR mctl-api#236 · status: implemented",
+      "variant": "emphasis"
+    },
+    {
+      "id": "review",
+      "from": "github",
+      "to": "temporal",
+      "y": 755,
+      "label": "poll: claude-review APPROVED (1 P3)",
+      "variant": "return"
+    },
+    {
+      "id": "tick",
+      "from": "temporal",
+      "to": "pod",
+      "y": 792,
+      "label": "shepherd tick (via Argo CWFT)",
+      "variant": "dashed"
+    },
+    {
+      "id": "merge",
+      "from": "pod",
+      "to": "github",
+      "y": 826,
+      "label": "merge --merge --match-head-commit c0f2f560",
+      "variant": "emphasis"
+    },
+    {
+      "id": "merged",
+      "from": "github",
+      "to": "temporal",
+      "y": 860,
+      "label": "merged → status: merged",
+      "variant": "return"
+    },
+    {
+      "id": "observe",
+      "from": "temporal",
+      "to": "api",
+      "y": 894,
+      "label": "release + rollout status · incidents (30 min)",
+      "variant": "dashed"
+    },
+    {
+      "id": "healthy",
+      "from": "api",
+      "to": "temporal",
+      "y": 922,
+      "label": "DevLoopResult",
+      "variant": "return"
+    }
+  ],
+  "activations": [
+    {
+      "participant": "api",
+      "from": 180,
+      "to": 300,
+      "type": "backend"
+    },
+    {
+      "participant": "temporal",
+      "from": 218,
+      "to": 930,
+      "type": "backend"
+    },
+    {
+      "participant": "argo",
+      "from": 318,
+      "to": 392,
+      "type": "cloud"
+    },
+    {
+      "participant": "pod",
+      "from": 348,
+      "to": 392,
+      "type": "backend"
+    },
+    {
+      "participant": "api",
+      "from": 485,
+      "to": 530,
+      "type": "backend"
+    },
+    {
+      "participant": "argo",
+      "from": 552,
+      "to": 694,
+      "type": "cloud"
+    },
+    {
+      "participant": "pod",
+      "from": 650,
+      "to": 694,
+      "type": "backend"
+    },
+    {
+      "participant": "pod",
+      "from": 788,
+      "to": 834,
+      "type": "backend"
+    },
+    {
+      "participant": "github",
+      "from": 682,
+      "to": 866,
+      "type": "external"
+    },
+    {
+      "participant": "api",
+      "from": 890,
+      "to": 928,
+      "type": "backend"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "amber",
+      "title": "Where the humans were",
+      "items": [
+        "One MCP call to start, one REST call to approve — approver and reason recorded in gitops",
+        "Nothing after 17:39:56 was operator-driven"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Where the model was",
+      "items": [
+        "Only inside Argo pods: investigate, implement, and the shepherd's review normalisation",
+        "Each run had a USD budget, a deadline and a pinned image"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "What the loop fixed about itself",
+      "items": [
+        "#228 was 'no MCP tool to approve a dev loop' — its own PR #236 added mctl_approve_dev_loop, live since",
+        "The gap it left open became mctl-api#235"
+      ]
+    }
+  ]
+}

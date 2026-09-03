@@ -1,0 +1,157 @@
+name: diagrams
+
+# docs/diagrams/archify/*.json are the presentable diagrams of this repo
+# (dev loop, proposal lifecycle, agent versioning, ...). They are validated
+# like code: a PR that changes one must still pass archify's showcase
+# composition checks (no crossing edges, no label collisions, readable at
+# 1440px). Rendered HTML is never committed — the same rule as the PNGs for
+# docs/diagrams/*.mmd — but on main it is rendered once, checked in a real
+# browser and deployed to GitHub Pages, so the published diagrams are always
+# the ones main describes. docs.mctl.ai embeds them from there.
+#
+# One-time repository setting: Settings → Pages → Source = "GitHub Actions".
+#
+# archify is pinned by commit, not by tag: the toolkit is fetched from a
+# third-party repository at CI time and a moved tag would silently change
+# what "valid" means. Keep ARCHIFY_REF in step with the Dockerfile pin.
+
+on:
+  pull_request:
+    paths:
+      - "docs/diagrams/archify/**"
+      - ".github/workflows/diagrams.yml"
+  push:
+    branches: [main]
+    paths:
+      - "docs/diagrams/archify/**"
+      - ".github/workflows/diagrams.yml"
+
+permissions:
+  contents: read
+
+env:
+  ARCHIFY_REF: 06dd052602dd9a369e4d034e24faef0917b5a60c   # tt-a1i/archify, v2.17 line, 2026-09-02
+
+concurrency:
+  group: diagrams-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: validate (showcase)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tt-a1i/archify
+          ref: ${{ env.ARCHIFY_REF }}
+          path: _archify
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install archify validators
+        run: npm ci --prefix _archify/archify --ignore-scripts
+
+      - name: Validate every diagram at showcase quality
+        run: python3 tools/check_diagrams.py --archify _archify/archify/bin/archify.mjs docs/diagrams/archify
+
+  render:
+    name: render + browser check
+    needs: validate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tt-a1i/archify
+          ref: ${{ env.ARCHIFY_REF }}
+          path: _archify
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install archify validators
+        run: npm ci --prefix _archify/archify --ignore-scripts
+
+      - name: Deliver and visual-check
+        env:
+          # ubuntu-latest runners ship Chromium via Playwright's cache only
+          # after `npx playwright install`; the system chromium-browser is
+          # a snap stub. Install the real binary once.
+          ARCHIFY_CHROME: /usr/bin/chromium
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq chromium >/dev/null
+          python3 tools/check_diagrams.py --archify _archify/archify/bin/archify.mjs \
+            --deliver --out rendered docs/diagrams/archify
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diagrams-${{ github.sha }}
+          path: rendered/
+          retention-days: 30
+
+      - name: Build the Pages site
+        # A plain index over the rendered HTML. The diagrams are self-contained
+        # (inline CSS/JS, no CDN), so Pages needs nothing else. Screenshots
+        # from visual-check are kept as PNG previews next to each page.
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, html
+          out = pathlib.Path("rendered")
+          rows = []
+          for f in sorted(out.glob("*.html")):
+              if ".visual-check." in f.name:
+                  continue
+              name, kind = f.stem.rsplit(".", 1)
+              src = pathlib.Path("docs/diagrams/archify") / (f.stem + ".json")
+              title = json.loads(src.read_text())["meta"]["title"] if src.exists() else f.stem
+              png = f"{f.stem}.visual-check.1440x900.dark.png"
+              rows.append(
+                  f'<li><a href="{f.name}">{html.escape(title)}</a> '
+                  f'<span class="k">{kind}</span> · <a href="{png}">preview</a> · '
+                  f'<a href="https://github.com/${{ github.repository }}/blob/main/docs/diagrams/archify/{f.stem}.json">source</a></li>'
+              )
+          sha = "${{ github.sha }}"[:12]
+          (out / "index.html").write_text(
+              "<!doctype html><meta charset='utf-8'><title>mctl platform diagrams</title>"
+              "<style>body{font:16px/1.5 system-ui;max-width:52rem;margin:3rem auto;padding:0 1rem;color:#1a2230}"
+              "h1{font-size:1.6rem}.k{font:12px ui-monospace,monospace;background:#eef1f5;padding:1px 6px;border-radius:3px}"
+              "li{margin:.5rem 0}small{color:#6b7686}</style>"
+              "<h1>mctl platform — architecture diagrams</h1>"
+              "<p>Rendered from <code>docs/diagrams/archify/*.json</code> on every merge to main. "
+              "Each page is interactive: search, trace, guided views, dark/light, export.</p>"
+              f"<ul>{''.join(rows)}</ul><small>built from {sha}</small>",
+              encoding="utf-8",
+          )
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: rendered/
+
+  deploy:
+    name: deploy to GitHub Pages
+    needs: render
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
