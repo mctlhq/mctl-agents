@@ -69,14 +69,11 @@ ENV PATH="/app/.venv/bin:$PATH"
 COPY orchestrator/ ./orchestrator/
 COPY config/ ./config/
 COPY agents/ ./agents/
-# orchestrator/resolver.py's ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative
-# path reads these checked-in, explicitly non-promotable compatibility
-# fixtures at runtime (FIXTURES_DIR in orchestrator/resolver.py) — without
-# this COPY, load_profile()/load_release_binding() raise ResolverError in
-# a deployed container even though the pilot is otherwise opt-in and
-# working. Scoped to just the resolver fixtures, not all of tests/, so no
-# test code ships in the image.
-COPY tests/fixtures/resolver/ ./tests/fixtures/resolver/
+# No resolver fixtures are copied any more. Until #277 step 4 this image
+# carried tests/fixtures/resolver/ so the declarative mode had something to
+# read; it now resolves against the mctl-gitops agent-platform catalog,
+# which the Argo CWFT clones into the shared workdir and points at with
+# MCTL_GITOPS_ROOT (mctl-gitops#1004). Nothing under tests/ ships.
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

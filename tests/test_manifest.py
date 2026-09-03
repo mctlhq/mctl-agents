@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -387,11 +388,16 @@ def test_issue_investigator_manifest_is_v1alpha2() -> None:
     v1alpha1 (see test_only_issue_investigator_is_v1alpha2 below)."""
     manifest = MANIFESTS["issue-investigator"]
     assert manifest.api_version == "agents.mctl.ai/v1alpha2"
-    assert manifest.execution_profile_ref == {
-        "name": "investigator-default",
-        "compatibility": manifest.execution_profile_ref["compatibility"],
-    }
-    assert manifest.execution_profile_ref["compatibility"].startswith("sha256:")
+    # The mctl-gitops catalog profile, and a SEMVER RANGE rather than the
+    # sha256 content pin this carried while the profile lived under
+    # tests/fixtures/ (#277 step 4). The range is asserted for shape, not
+    # value, so a legitimate widening does not have to be edited here twice.
+    assert manifest.execution_profile_ref["name"] == "issue-investigator-default"
+    compatibility = manifest.execution_profile_ref["compatibility"]
+    assert not compatibility.startswith("sha256:")
+    assert re.fullmatch(r"(?:[<>]=?|==)\s*\d+(?:\.\d+)*(?:\s+(?:[<>]=?|==)\s*\d+(?:\.\d+)*)*", compatibility), (
+        f"executionProfileRef.compatibility {compatibility!r} is not a comparator range"
+    )
 
 
 def test_only_issue_investigator_is_v1alpha2() -> None:
