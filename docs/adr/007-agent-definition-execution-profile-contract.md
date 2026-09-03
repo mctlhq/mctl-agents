@@ -136,10 +136,26 @@ definition:
   name: issue-investigator
   version: 3
 profile:
-  name: investigator-default
+  name: issue-investigator-default
   version: 5
 revision: 12
 ```
+
+**What actually shipped differs from this sketch in one load-bearing way.**
+The mctl-gitops catalog implements `ReleaseBindingIntent` (mctl-gitops#950
+and after), and its `spec.sourceManifest` carries a `contentHash` — the
+sha256 of the `AgentDefinition` file — which this design has no equivalent
+of. It is not bookkeeping: `definition.version` above is a registry number
+that names no bytes, so without the hash the definition half of a binding
+is unpinned. A definition can be edited and resolved silently while the
+profile half is pinned by `profile.version`, which is one atomic binding
+with one floating half. That gap was live until mctl-gitops#1011 added the
+field and made it required, and mctlhq/mctl-agents#294 made every binding's
+pin checkable rather than only the one the resolver happens to read.
+
+The profile name here is the catalog's (`issue-investigator-default`). An
+earlier draft said `investigator-default`, which was the in-repo
+compatibility fixture's name; that fixture is deleted (#277 step 4).
 
 Promotion validates that the definition's `executionProfileRef.name` and
 `compatibility` accept the selected profile version, then replaces the
