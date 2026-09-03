@@ -25,6 +25,8 @@ from temporalio.client import (
     ScheduleActionStartWorkflow,
     ScheduleAlreadyRunningError,
     ScheduleIntervalSpec,
+    ScheduleOverlapPolicy,
+    SchedulePolicy,
     ScheduleSpec,
     ScheduleUpdate,
     ScheduleUpdateInput,
@@ -123,41 +125,111 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         )
         return
 
-    converged = False
+    changed: list[str] = []
 
     async def _converge_spec(input: ScheduleUpdateInput) -> ScheduleUpdate | None:
-        nonlocal converged
+        # Cleared first: `update()` uses optimistic concurrency and may call
+        # this callback again after a conflicting server-side write. Without
+        # the reset an earlier attempt's entries survive, so a retry that
+        # decides no update is needed still logs a convergence that never
+        # happened — the log lying about the cluster, which is the one thing
+        # these messages exist not to do (agy P3 on #297).
+        changed.clear()
         schedule = input.description.schedule
-        if schedule.spec.intervals == desired.spec.intervals:
+        spec_stale = schedule.spec.intervals != desired.spec.intervals
+        # The overlap policy is converged for the SAME reason the spec is, and
+        # the reason is already written above: a value declared here but never
+        # pushed to an existing schedule is decorative. That happened to the
+        # interval for a year. Declaring `overlap` without converging it would
+        # repeat it exactly — every schedule this code registers already
+        # exists on the cluster, so a fresh `create_schedule` never runs again.
+        desired_policy = desired.policy
+        live_overlap = schedule.policy.overlap if schedule.policy else None
+        want_overlap = desired_policy.overlap if desired_policy else None
+        # A caller that declares no policy gets no convergence: there is
+        # nothing to converge TO, and pushing `None` would mean this function
+        # deciding to clear a live value nobody asked it to touch.
+        policy_stale = want_overlap is not None and live_overlap != want_overlap
+        if not spec_stale and not policy_stale:
             return None
-        logger.info(
-            "Updating Temporal schedule %s spec: %s -> %s",
-            schedule_id,
-            schedule.spec.intervals,
-            desired.spec.intervals,
-        )
-        schedule.spec = desired.spec
-        converged = True
+        # Assign the FIELD, never the whole object. `schedule.spec =
+        # desired.spec` would drop any jitter/calendars/time_zone_name the
+        # live schedule carries, and `schedule.policy = desired.policy` would
+        # drop catchup_window and pause_on_failure — and only on the boots
+        # where an update happens to trigger, so the loss is intermittent and
+        # looks like something else (agy P2 on #297). This code declares an
+        # interval and an overlap policy; those are the only two things it
+        # gets to decide.
+        if spec_stale:
+            logger.info(
+                "Updating Temporal schedule %s spec: %s -> %s",
+                schedule_id,
+                schedule.spec.intervals,
+                desired.spec.intervals,
+            )
+            schedule.spec.intervals = desired.spec.intervals
+            changed.append("spec")
+        if policy_stale and desired_policy is not None:
+            logger.info(
+                "Updating Temporal schedule %s overlap policy: %s -> %s",
+                schedule_id,
+                live_overlap,
+                want_overlap,
+            )
+            if schedule.policy is None:
+                schedule.policy = SchedulePolicy()
+            schedule.policy.overlap = desired_policy.overlap
+            changed.append("overlap policy")
         return ScheduleUpdate(schedule=schedule)
 
     try:
         await client.get_schedule_handle(schedule_id).update(_converge_spec)
-        # Distinct messages, because these logs are the only way to tell from
-        # outside whether a cadence change actually landed — claiming "spec is
-        # current" on the same boot that just rewrote it reads as a no-op.
-        if converged:
-            logger.info("Temporal schedule %s spec converged to the declared one", schedule_id)
+        # These logs are the only way to tell from outside whether a change
+        # actually landed, so they name WHAT converged rather than asserting
+        # "spec" for everything. Saying "spec converged" on a boot that only
+        # pushed an overlap policy is the same defect as claiming "spec is
+        # current" on a boot that just rewrote it — one field's log standing
+        # in for another's (claude P3 on #297).
+        if changed:
+            logger.info(
+                "Temporal schedule %s converged to the declared %s",
+                schedule_id,
+                " and ".join(changed),
+            )
         else:
-            logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
+            logger.info(
+                "Temporal schedule %s already exists; spec and overlap policy are current",
+                schedule_id,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(
-            "Temporal schedule %s NOT converged (%s) — its live spec may "
-            "differ from the one declared here",
+            "Temporal schedule %s NOT converged (%s) — its live spec or overlap "
+            "policy may differ from the ones declared here",
             schedule_id,
             exc,
         )
 
 
+# Duplicate-run behaviour for every scheduled loop (mctlhq/mctl-agents#149).
+#
+# All three schedules below declare `overlap=SKIP`: while a tick is still
+# running, the next scheduled fire is DROPPED rather than started alongside
+# it. That is the behaviour these loops need — reconcile and the incident
+# responder both take the shared `mctl-gitops-main-writes` mutex, so two
+# concurrent ticks would serialize behind each other while holding worker
+# slots, and the second would do nothing the first has not already done.
+#
+# It was the behaviour before this declaration too, because temporalio's
+# default is SKIP. The declaration is not a change; it is the difference
+# between a property and an accident. Nothing here said it, nothing checked
+# it, and it would have moved silently with a dependency bump.
+#
+# What SKIP costs, stated so it is not later mistaken for a fault:
+# reconcile fires every 15 minutes and its apply step waits up to 35 for the
+# mutex (`reconcile.APPLY_STEP_TIMEOUT`), so a tick that reaches apply can
+# swallow the next two fires. Skipped ticks under load are expected. The
+# alternative — BUFFER or ALLOW_ALL — trades that for a queue of ticks all
+# contending for one mutex, which is worse.
 async def setup_schedules(client: Client) -> None:
     reconcile_schedule = Schedule(
         action=ScheduleActionStartWorkflow(
@@ -169,6 +241,7 @@ async def setup_schedules(client: Client) -> None:
         spec=ScheduleSpec(
             intervals=[ScheduleIntervalSpec(every=timedelta(minutes=15))],
         ),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
 
     await _ensure_schedule(client, RECONCILE_SCHEDULE_ID, reconcile_schedule, "ReconcileWorkflow")
@@ -183,6 +256,7 @@ async def setup_schedules(client: Client) -> None:
         spec=ScheduleSpec(
             intervals=[ScheduleIntervalSpec(every=timedelta(hours=12))],
         ),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
 
     await _ensure_schedule(client, ISSUE_POLL_SCHEDULE_ID, issue_poll_schedule, "IssuePollWorkflow")
@@ -202,6 +276,7 @@ async def setup_schedules(client: Client) -> None:
             # Matches what the (suspended) Argo cron did: `15 * * * *`.
             intervals=[ScheduleIntervalSpec(every=timedelta(hours=1))],
         ),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
 
     await _ensure_schedule(client, INCIDENTS_SCHEDULE_ID, incidents_schedule, "IncidentLoopWorkflow")
