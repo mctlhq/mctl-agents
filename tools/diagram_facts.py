@@ -65,6 +65,7 @@ _SHEPHERD_CONSTANTS = {
 
 _BUDGET_RE = re.compile(r'^([A-Z_]+)_BUDGET_USD = float\(os\.getenv\("[A-Z_]+", "([\d.]+)"\)\)', re.M)
 _CWFT_ENV_RE = re.compile(r'- name: ([A-Z_]+_(?:BUDGET_USD|TIMEOUT_SECONDS))\n\s*value: "([\d.]+)"', re.M)
+_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/@+-]+$")
 _STATUS_SET_RE = re.compile(r"^(RECONCILE_INPUT_STATUSES|SHEPHERD_INPUT_STATUSES) = \{([^}]*)\}", re.M | re.S)
 _SCHEDULE_RE = re.compile(
     r"every=timedelta\(([^)]+)\)\)\],\n(?:.*\n){0,6}?.*_ensure_schedule\(client, \w+, \w+, \"(\w+)\""
@@ -97,35 +98,35 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def facts_from_code(gitops: Path | None, api: Path | None) -> dict[str, Any]:
+def facts_from_code(gitops: Path | None, api: Path | None, repo_root: Path = REPO_ROOT) -> dict[str, Any]:
     facts: dict[str, Any] = {}
 
-    dev_loop = _read(REPO_ROOT / "orchestrator" / "temporal" / "workflows" / "dev_loop.py")
+    dev_loop = _read(repo_root / "orchestrator" / "temporal" / "workflows" / "dev_loop.py")
     facts["dev_loop"] = _grep(dev_loop, _DEV_LOOP_CONSTANTS)
     facts["dev_loop"]["patched_markers"] = sorted(set(re.findall(r'workflow\.patched\("([^"]+)"\)', dev_loop)))
 
-    shepherd = _read(REPO_ROOT / "orchestrator" / "run_shepherd.py")
+    shepherd = _read(repo_root / "orchestrator" / "run_shepherd.py")
     facts["shepherd"] = _grep(shepherd, _SHEPHERD_CONSTANTS)
     for name, body in _STATUS_SET_RE.findall(shepherd):
         facts["shepherd"][name.lower()] = sorted(re.findall(r'"([a-z-]+)"', body))
     facts["shepherd"]["gating_bots"] = sorted(set(re.findall(r'^[A-Z_]*BOT = "([^"]+)"', shepherd, re.M)))
 
-    options = _read(REPO_ROOT / "orchestrator" / "options.py")
+    options = _read(repo_root / "orchestrator" / "options.py")
     facts["budgets_usd"] = {agent.lower(): value for agent, value in _BUDGET_RE.findall(options)}
-    facts["implementer"] = _grep(_read(REPO_ROOT / "orchestrator" / "run_implementer.py"), _IMPLEMENTER_CONSTANTS)
+    facts["implementer"] = _grep(_read(repo_root / "orchestrator" / "run_implementer.py"), _IMPLEMENTER_CONSTANTS)
 
-    inventory = yaml.safe_load(_read(REPO_ROOT / "docs" / "agent-inventory.yaml"))
+    inventory = yaml.safe_load(_read(repo_root / "docs" / "agent-inventory.yaml"))
     facts["agents"] = sorted(a["name"] for a in inventory.get("agents", []))
     facts["agent_risk"] = {a["name"]: a.get("riskLevel", "") for a in inventory.get("agents", [])}
 
-    worker = _read(REPO_ROOT / "orchestrator" / "temporal" / "worker.py")
+    worker = _read(repo_root / "orchestrator" / "temporal" / "worker.py")
     facts["schedules"] = {wf: _timedelta_text(every) for every, wf in _SCHEDULE_RE.findall(worker)}
-    workflows_dir = REPO_ROOT / "orchestrator" / "temporal" / "workflows"
+    workflows_dir = repo_root / "orchestrator" / "temporal" / "workflows"
     facts["workflows"] = sorted(
         m for f in workflows_dir.glob("*.py") for m in re.findall(r"^class (\w+Workflow)\b", _read(f), re.M)
     )
 
-    manifests_dir = REPO_ROOT / "agents" / "_manifests"
+    manifests_dir = repo_root / "agents" / "_manifests"
     facts["manifest_api_versions"] = {
         p.parent.name: yaml.safe_load(_read(p)).get("apiVersion", "")
         for p in sorted(manifests_dir.glob("*/agent.yaml"))
@@ -188,8 +189,10 @@ def diff_facts(recorded: dict[str, Any], current: dict[str, Any]) -> list[tuple[
     return drift
 
 
-def new_releases(releases_path: Path, seen: dict[str, str]) -> list[dict[str, str]]:
-    """releases.json: [{repo, tag, published_at, body}] as fetched by the workflow.
+def new_releases(releases_path: Path, seen: dict[str, str]) -> list[dict[str, Any]]:
+    """releases.json: [{repo, tag, previous_tag, published_at, changed_paths}] as fetched by the workflow.
+
+    No release notes: they are third-party prose and never reach the agent.
 
     A release counts as new when its tag differs from the recorded watermark
     for that repo. Tags in this org carry no v prefix, but compare as strings
@@ -198,14 +201,14 @@ def new_releases(releases_path: Path, seen: dict[str, str]) -> list[dict[str, st
     if not releases_path.exists():
         return []
     entries = json.loads(releases_path.read_text(encoding="utf-8"))
-    latest: dict[str, dict[str, str]] = {}
+    latest: dict[str, dict[str, Any]] = {}
     for e in entries:
         if e["repo"] not in latest or e["published_at"] > latest[e["repo"]]["published_at"]:
             latest[e["repo"]] = e
     return [e for repo, e in sorted(latest.items()) if seen.get(repo) != e["tag"]]
 
 
-def render_report(drift: list[tuple[str, Any, Any]], releases: list[dict[str, str]]) -> str:
+def render_report(drift: list[tuple[str, Any, Any]], releases: list[dict[str, Any]]) -> str:
     lines = ["# Diagram drift report", ""]
     if drift:
         lines += ["## Facts that changed since the diagrams were authored", ""]
@@ -215,9 +218,11 @@ def render_report(drift: list[tuple[str, Any, Any]], releases: list[dict[str, st
     if releases:
         lines += ["## Releases not yet reflected", ""]
         for r in releases:
-            lines.append(f"### {r['repo']} {r['tag']} ({r['published_at'][:10]})")
+            prev = r.get("previous_tag") or "?"
+            lines.append(f"### {r['repo']} {prev} -> {r['tag']} ({r['published_at'][:10]})")
             lines.append("")
-            lines.append((r.get("body") or "").strip()[:4000])
+            paths = [p for p in r.get("changed_paths", []) if _SAFE_PATH_RE.match(str(p))]
+            lines += [f"- `{p}`" for p in paths[:200]] or ["- (changed paths unavailable)"]
             lines.append("")
     if not drift and not releases:
         lines.append("No drift. Nothing to do.")

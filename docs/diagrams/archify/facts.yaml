@@ -196,7 +196,14 @@ policy_ceilings: {}
 registry_environments:
 - production
 - shadow
-releases_seen: {}
+releases_seen:
+  mctlhq/mctl-academy: 0.1.50
+  mctlhq/mctl-agent: 2.0.1
+  mctlhq/mctl-agents: 1.38.0
+  mctlhq/mctl-api: 4.37.0
+  mctlhq/mctl-docs: 0.1.38
+  mctlhq/mctl-portal: 4.15.0
+  mctlhq/mctl-telegram: 0.58.0
 schedules:
   IncidentLoopWorkflow: 1 h
   IssuePollWorkflow: 12 h
