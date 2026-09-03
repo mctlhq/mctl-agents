@@ -90,6 +90,7 @@ def _base_binding_doc(
     *,
     definition_version: str,
     profile_version: str,
+    definition_content_hash: str,
     revision: int = 1,
     compatibility: str = _COMPATIBILITY,
 ) -> dict:
@@ -102,6 +103,12 @@ def _base_binding_doc(
                 "repo": "mctlhq/mctl-agents",
                 "path": f"agents/_manifests/{_AGENT}/agent.yaml",
                 "gitSha": "deadbeef" * 5,
+                # The REAL hash of the definition written alongside, not a
+                # placeholder: this is the pin execute() checks, and a
+                # builder that fed it an arbitrary string would make every
+                # test pass whether the gate worked or not — which is how
+                # the gate went missing unnoticed in the first place.
+                "contentHash": definition_content_hash,
             },
             "bindingSource": "compatibility-fixture",
             "promotable": False,
@@ -165,6 +172,7 @@ def _build_fixture_set(
         binding_doc = _base_binding_doc(
             definition_version="1",
             profile_version=profile_version,
+            definition_content_hash=definition_hash,
             # The binding mirrors whatever the definition actually declares,
             # so the default set stays self-consistent and the mirror-drift
             # check only fires for tests that deliberately break it.
@@ -453,7 +461,11 @@ def test_load_profile_fails_closed_on_non_mapping_model_policy_ref(tmp_path, mon
 
 def test_load_release_binding_requires_compatibility_fixture_source(tmp_path, monkeypatch):
     monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
-    doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
+    doc = _base_binding_doc(
+        definition_version="1",
+        profile_version="1.0.0",
+        definition_content_hash="sha256:" + "0" * 64,
+    )
     doc["spec"]["bindingSource"] = "registry"
     _write(tmp_path / "releases" / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="bindingSource"):
@@ -462,7 +474,11 @@ def test_load_release_binding_requires_compatibility_fixture_source(tmp_path, mo
 
 def test_load_release_binding_requires_promotable_false(tmp_path, monkeypatch):
     monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
-    doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
+    doc = _base_binding_doc(
+        definition_version="1",
+        profile_version="1.0.0",
+        definition_content_hash="sha256:" + "0" * 64,
+    )
     doc["spec"]["promotable"] = True
     _write(tmp_path / "releases" / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="promotable"):
@@ -473,7 +489,11 @@ def test_load_release_binding_fails_closed_on_non_mapping_registry_lifecycle(tmp
     """A scalar where `registryLifecycle` must be a mapping raises
     `ResolverError`, not a raw `AttributeError` from a bare `.get()` call."""
     monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
-    doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
+    doc = _base_binding_doc(
+        definition_version="1",
+        profile_version="1.0.0",
+        definition_content_hash="sha256:" + "0" * 64,
+    )
     doc["spec"]["registryLifecycle"] = "oops"
     _write(tmp_path / "releases" / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="registryLifecycle must be a mapping"):
@@ -712,3 +732,65 @@ def test_the_catalogs_legacy_env_override_actually_overrides(monkeypatch):
 
     assert from_policy != "claude-opus-4-8", "pick a sentinel the policy would not return"
     assert overridden == "claude-opus-4-8"
+
+
+def test_execute_fails_when_the_definition_drifts_from_its_pin(tmp_path, monkeypatch):
+    """Editing the AgentDefinition without re-pinning the binding must fail
+    closed.
+
+    This gate existed under the in-repo fixture, was dropped when the
+    profile moved to the catalog, and was found by BOTH reviewers on #291 --
+    independently, both P1. The catalog's `definition.version` is a registry
+    number ("1") that names no bytes, so `spec.sourceManifest.contentHash`
+    (gitops#1011) is the only thing pinning this half.
+
+    Asserted on a real edit rather than a hand-written hash: the failure has
+    to come from the definition's actual bytes moving, which is what happens
+    in practice.
+    """
+    built = _build_fixture_set(tmp_path, monkeypatch)
+    definition_doc = _base_definition_doc(_COMPATIBILITY)
+    definition_doc["metadata"]["owner"] = "someone-else"
+    _write(built["definition_path"], definition_doc)
+
+    with pytest.raises(resolver.ResolverError, match="ambiguous version"):
+        resolver.execute(_AGENT, resolver.Task(target_repository_sha="p" * 40))
+
+
+def test_a_binding_without_a_definition_pin_does_not_resolve(tmp_path, monkeypatch):
+    """A binding that simply omits the pin must be refused, not treated as
+    "nothing to check" -- that is how the gate disappeared the first time."""
+    _build_fixture_set(
+        tmp_path, monkeypatch,
+        binding_overrides={
+            "sourceManifest": {
+                "repo": "mctlhq/mctl-agents",
+                "path": f"agents/_manifests/{_AGENT}/agent.yaml",
+                "gitSha": "deadbeef" * 5,
+            }
+        },
+    )
+    with pytest.raises(resolver.ResolverError, match=r"sourceManifest\.contentHash"):
+        resolver.execute(_AGENT, resolver.Task(target_repository_sha="q" * 40))
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [">=1.0.0 GARBAGE <2.0.0", "~1.0.0", ">=1.0.0 or something", "whatever >=1.0.0"],
+    ids=["text-between", "unsupported-operator", "trailing-prose", "leading-prose"],
+)
+def test_a_partly_understood_constraint_does_not_resolve(constraint):
+    """`findall` skips whatever sits BETWEEN matches, so
+    ">=1.0.0 GARBAGE <2.0.0" evaluated as ">=1.0.0 <2.0.0" -- a constraint
+    nobody wrote, silently honoured, while `_version_satisfies`'s own
+    docstring promised an unparseable constraint would raise (agy P3 on
+    #291).
+
+    "Only partly understood" is the point: `~1.0.0` has no comparator at all
+    and already raised, but the three that contain a VALID comparator plus
+    text are the ones that resolved happily.
+    """
+    with pytest.raises(resolver.ResolverError, match=r"not a parseable constraint|outside its comparators"):
+        resolver._version_satisfies(
+            "1.0.0", constraint, path=Path("x"), field_path="compatibility"
+        )

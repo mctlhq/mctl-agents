@@ -35,8 +35,22 @@ bump resolves exactly as before, and nothing here detects it. Closing that
 needs a mctl-gitops CI check comparing a profile's diff against its version
 bump; it is not something this repository can do.
 
-What this module can check, and does, is the pair of cross-repository
-claims neither repository's own CI is able to reach:
+The DEFINITION half is pinned properly, and by content: the binding's
+`spec.sourceManifest.contentHash` is the sha256 of `agent.yaml`, recomputed
+on every resolution. That gate existed under the fixture, was dropped when
+the profile moved to the catalog, and was restored after both reviewers on
+#291 caught it independently — the catalog's `definition.version` is "1", a
+registry number naming no bytes, so without the hash the definition floated
+while the profile was pinned. One pinned half and one floating half is not
+an atomic binding.
+
+So the asymmetry is deliberate and worth stating in one line: the
+definition cannot drift unnoticed, the profile's *content* can. Note the
+difference between the two gaps — the definition one was recoverable from
+here, the profile one is not.
+
+What this module also checks, and what neither repository's own CI is able
+to reach because each can only read its own files:
 
 - the binding's `spec.definition.profileCompatibility` still matches the
   definition's own `executionProfileRef.compatibility` — the binding schema
@@ -143,7 +157,8 @@ class AgentDefinition:
     execution_profile_compatibility: str
     path: Path
     # Hashed from the same bytes that were parsed, not re-read later — see
-    # _read_yaml_and_hash. This is the value the release binding pins.
+    # _read_yaml_and_hash. This is the value the release binding pins, via
+    # spec.sourceManifest.contentHash.
     content_hash: str
 
 
@@ -194,6 +209,14 @@ class ReleaseBinding:
     # checks the mirror is honest — the one guarantee neither repository's
     # own CI is able to give.
     profile_compatibility: str
+    # spec.sourceManifest.contentHash — the sha256 of the AgentDefinition
+    # file this binding was written against, and the only thing pinning the
+    # definition half. The catalog's `definition.version` is a registry
+    # number ("1") that names no bytes, so without this the definition
+    # floats while the profile is pinned: one atomic binding with one
+    # floating half (claude P1 + agy finding 1 on #291, found
+    # independently). Added to the catalog by gitops#1011.
+    definition_content_hash: str
     release_revision: int
     registry_lifecycle: Mapping[str, str]
     path: Path
@@ -351,11 +374,23 @@ def _version_satisfies(version: str, constraint: str, *, path: Path, field_path:
     defaulting either way — a constraint nobody can evaluate must not
     resolve.
     """
-    matches = _COMPAT_RE.findall(constraint)
+    # findall alone is not enough: it skips whatever sits BETWEEN matches, so
+    # ">=1.0.0 GARBAGE <2.0.0" parsed as ">=1.0.0 <2.0.0" and resolved a
+    # constraint nobody wrote — while this docstring promised the opposite
+    # (agy P3 on #291). mctl-gitops' copy had the identical hole and is
+    # hardened in the same way (gitops#1011), because the cross-check test
+    # below asserts the two agree.
+    matches = list(_COMPAT_RE.finditer(constraint))
     if not matches:
         raise ResolverError(f"{path}: {field_path} {constraint!r} is not a parseable constraint")
+    consumed = "".join(m.group(0) for m in matches)
+    if re.sub(r"\s+", "", constraint) != re.sub(r"\s+", "", consumed):
+        raise ResolverError(
+            f"{path}: {field_path} {constraint!r} contains text outside its comparators — a "
+            "constraint that is only partly understood must not resolve"
+        )
     actual = _parse_version(version, path=path, field_path="version")
-    for op, bound_text in matches:
+    for op, bound_text in (m.groups() for m in matches):
         bound = _parse_version(bound_text, path=path, field_path=field_path)
         width = max(len(actual), len(bound))
         a = actual + (0,) * (width - len(actual))
@@ -593,6 +628,17 @@ def load_release_binding(agent: str, environment: str = DEFAULT_ENVIRONMENT) -> 
             f"{path}: metadata.agent {metadata.get('agent')!r} does not match file name {agent!r}"
         )
 
+    source_manifest = _require_mapping(
+        spec.get("sourceManifest") or {}, path=path, field_path="spec.sourceManifest"
+    )
+    definition_content_hash = source_manifest.get("contentHash")
+    if not isinstance(definition_content_hash, str) or not definition_content_hash.startswith("sha256:"):
+        raise ResolverError(
+            f"{path}: spec.sourceManifest.contentHash must be a 'sha256:...' pin of the "
+            "AgentDefinition file — without it the definition half of this binding is "
+            "unpinned and agent.yaml resolves whatever it currently says"
+        )
+
     binding_source = spec.get("bindingSource")
     if binding_source != "compatibility-fixture":
         raise ResolverError(
@@ -638,6 +684,7 @@ def load_release_binding(agent: str, environment: str = DEFAULT_ENVIRONMENT) -> 
         profile_name=prof_name,
         profile_version=prof_version,
         profile_compatibility=profile_compatibility,
+        definition_content_hash=definition_content_hash,
         release_revision=revision,
         registry_lifecycle=dict(lifecycle),
         path=path,
@@ -763,6 +810,26 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
             f"not match resolved definition {definition.name!r}"
         )
     definition_content_hash = definition.content_hash
+
+    # Restore the definition pin the move to the catalog dropped. The
+    # fixture this replaced pinned BOTH halves by content hash; the catalog
+    # pins the profile via profile.version and gives the definition a
+    # registry number ("1") that names no bytes — so agent.yaml (prompt
+    # sources, triggers, the profile reference itself) could be edited and
+    # resolved silently. One pinned half and one floating half is not an
+    # atomic binding. Both reviewers on #291 found this independently.
+    #
+    # Deliberately NOT the same kind of gap as the profile's spec.version:
+    # that one cannot be closed from this repository and is documented and
+    # tested as accepted. This one is a gate that existed and was lost, so
+    # it is restored rather than described.
+    if binding.definition_content_hash != definition_content_hash:
+        raise ResolverError(
+            f"ambiguous version: release binding sourceManifest.contentHash "
+            f"{binding.definition_content_hash!r} does not match the current definition file "
+            f"content ({definition_content_hash!r}) at {definition.path} — the binding is stale "
+            "or the definition changed without re-pinning it"
+        )
 
     # The binding mirrors the definition's own compatibility constraint,
     # because mctl-gitops CI cannot read agents/_manifests/*/agent.yaml (the

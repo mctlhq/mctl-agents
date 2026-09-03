@@ -51,9 +51,23 @@ edited without a version bump resolves exactly as before, and nothing in
 this repository detects it. Closing that needs a mctl-gitops CI check
 comparing a profile's diff against its version bump.
 
-What `execute()` can check, and does, are the two cross-repository claims
-neither repository's own CI can reach, because each can only read its own
-files:
+The **definition** half is a different story, and pinned properly: the
+binding's `spec.sourceManifest.contentHash` is the sha256 of `agent.yaml`,
+recomputed on every resolution. That gate existed under the fixture, was
+dropped when the profile moved to the catalog, and was restored after both
+reviewers on #291 caught it independently — `definition.version` in the
+catalog is `"1"`, a registry number naming no bytes, so without the hash the
+definition floated while the profile was pinned. One pinned half and one
+floating half is not an atomic binding.
+
+The asymmetry is therefore deliberate: **the definition cannot drift
+unnoticed; the profile's content can.** The first gap was recoverable from
+this side, the second is not. The cost of closing the first is that editing
+`agent.yaml` now requires a mctl-gitops PR to re-pin — the atomic-binding
+discipline, not an accident of it.
+
+What `execute()` also checks are the two cross-repository claims neither
+repository's own CI can reach, because each can only read its own files:
 
 - the binding's `spec.definition.profileCompatibility` still matches the
   definition's own `executionProfileRef.compatibility`. The binding schema
