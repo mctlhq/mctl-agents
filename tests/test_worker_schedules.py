@@ -14,6 +14,7 @@ the helper was written to end:
 from __future__ import annotations
 
 import inspect
+import logging
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -237,3 +238,46 @@ class TestOverlapPolicy:
         assert updated.spec.intervals == [ScheduleIntervalSpec(every=timedelta(hours=1))]
         assert updated.state.paused is True
         assert updated.state.note == "Paused 2026-08-15: see #179"
+
+
+class TestConvergenceLogging:
+    """These logs are the only signal from outside that a declared value
+    reached the cluster, so they have to name what actually converged.
+
+    The version before this said "spec converged" for every update, including
+    one that pushed only an overlap policy — one field's log standing in for
+    another's (claude P3 on #297). Nothing caught it because nothing asserted
+    the messages at all.
+    """
+
+    async def test_a_policy_only_convergence_does_not_claim_the_spec_changed(self, caplog):
+        existing = _schedule(timedelta(hours=1), overlap=ScheduleOverlapPolicy.ALLOW_ALL)
+        client = _FakeClient(existing=existing)
+
+        with caplog.at_level(logging.INFO):
+            await _ensure_schedule(client, SCHEDULE_ID, _schedule(timedelta(hours=1)), "IncidentLoopWorkflow")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("converged to the declared overlap policy" in m for m in messages), messages
+        assert not any("declared spec" in m for m in messages), messages
+
+    async def test_a_spec_only_convergence_does_not_claim_the_policy_changed(self, caplog):
+        client = _FakeClient(existing=_schedule(timedelta(minutes=30)))
+
+        with caplog.at_level(logging.INFO):
+            await _ensure_schedule(client, SCHEDULE_ID, _schedule(timedelta(hours=1)), "IncidentLoopWorkflow")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("converged to the declared spec" in m for m in messages), messages
+        assert not any("overlap policy" in m and "converged" in m for m in messages), messages
+
+    async def test_no_change_says_both_are_current(self, caplog):
+        client = _FakeClient(existing=_schedule(timedelta(hours=1)))
+
+        with caplog.at_level(logging.INFO):
+            await _ensure_schedule(client, SCHEDULE_ID, _schedule(timedelta(hours=1)), "IncidentLoopWorkflow")
+
+        assert client.handle.updates == []
+        assert any(
+            "spec and overlap policy are current" in r.getMessage() for r in caplog.records
+        ), [r.getMessage() for r in caplog.records]

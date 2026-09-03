@@ -125,10 +125,9 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
         )
         return
 
-    converged = False
+    changed: list[str] = []
 
     async def _converge_spec(input: ScheduleUpdateInput) -> ScheduleUpdate | None:
-        nonlocal converged
         schedule = input.description.schedule
         spec_stale = schedule.spec.intervals != desired.spec.intervals
         # The overlap policy is converged for the SAME reason the spec is, and
@@ -150,6 +149,7 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
                 desired.spec.intervals,
             )
             schedule.spec = desired.spec
+            changed.append("spec")
         if policy_stale:
             logger.info(
                 "Updating Temporal schedule %s overlap policy: %s -> %s",
@@ -158,22 +158,32 @@ async def _ensure_schedule(client: Client, schedule_id: str, desired: Schedule, 
                 want_overlap,
             )
             schedule.policy = desired.policy
-        converged = True
+            changed.append("overlap policy")
         return ScheduleUpdate(schedule=schedule)
 
     try:
         await client.get_schedule_handle(schedule_id).update(_converge_spec)
-        # Distinct messages, because these logs are the only way to tell from
-        # outside whether a cadence change actually landed — claiming "spec is
-        # current" on the same boot that just rewrote it reads as a no-op.
-        if converged:
-            logger.info("Temporal schedule %s spec converged to the declared one", schedule_id)
+        # These logs are the only way to tell from outside whether a change
+        # actually landed, so they name WHAT converged rather than asserting
+        # "spec" for everything. Saying "spec converged" on a boot that only
+        # pushed an overlap policy is the same defect as claiming "spec is
+        # current" on a boot that just rewrote it — one field's log standing
+        # in for another's (claude P3 on #297).
+        if changed:
+            logger.info(
+                "Temporal schedule %s converged to the declared %s",
+                schedule_id,
+                " and ".join(changed),
+            )
         else:
-            logger.info("Temporal schedule %s already exists; spec is current", schedule_id)
+            logger.info(
+                "Temporal schedule %s already exists; spec and overlap policy are current",
+                schedule_id,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.error(
-            "Temporal schedule %s NOT converged (%s) — its live spec may "
-            "differ from the one declared here",
+            "Temporal schedule %s NOT converged (%s) — its live spec or overlap "
+            "policy may differ from the ones declared here",
             schedule_id,
             exc,
         )
