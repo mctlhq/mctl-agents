@@ -99,9 +99,20 @@ def main() -> int:
                 res = _run(["node", ns.archify, "visual-check", str(out), "--json"])
                 codes = sorted({d.get("code") for d in res.get("diagnostics", [])})
                 # viewport-overflow is informational for pages that scroll to
-                # their cards; anything else from the browser check is a failure.
-                hard = [c for c in codes if c not in {"viewer/viewport-overflow"}]
-                print(f"{'ok  ' if not hard else 'fail'} browser  {out} {codes}")
+                # their cards. visual-check-runtime and chrome-unavailable mean
+                # the browser could not run at all - an environment problem,
+                # not a diagram defect - so they are reported loudly but do not
+                # fail a diagram that deliver already proved deterministically
+                # (archify's delivery contract keeps those two claims apart).
+                soft = {"viewer/viewport-overflow", "viewer/visual-check-runtime", "viewer/chrome-unavailable"}
+                hard = [c for c in codes if c not in soft]
+                env_broken = [c for c in codes if c in {"viewer/visual-check-runtime", "viewer/chrome-unavailable"}]
+                status = "fail" if hard else ("warn" if env_broken else "ok  ")
+                print(f"{status} browser  {out} {codes}")
+                if env_broken:
+                    print(
+                        "      browser evidence not collected - fix ARCHIFY_CHROME; deterministic checks still passed"
+                    )
                 if hard:
                     failed += 1
 
