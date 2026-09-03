@@ -207,6 +207,31 @@ def _check_model_policy_task(manifest: AgentManifest) -> list[str]:
     return []
 
 
+def _check_catalog_model_policy_task(profile_name: str, declared_task: object) -> list[str]:
+    """A catalog profile's modelPolicyRef.task must be a key this repo's
+    config/model-policy.yaml actually defines.
+
+    The mctl-gitops half of this (`knownModelPolicyTasks` in
+    `agent-platform/policy.yaml`) is an allowlist maintained by hand in a
+    repository that cannot read model-policy.yaml — which is exactly how it
+    came to list two task names that do not exist. Only this side can make
+    the claim checkable.
+    """
+    tasks = yaml.safe_load(MODEL_POLICY.read_text(encoding="utf-8"))["tasks"]
+    if not isinstance(declared_task, str) or not declared_task:
+        return [
+            f"{profile_name}: spec.modelPolicyRef.task is missing or not a string "
+            f"({declared_task!r}), so the profile names no model tier at all"
+        ]
+    if declared_task not in tasks:
+        return [
+            f"{profile_name}: spec.modelPolicyRef.task {declared_task!r} is not a task in "
+            f"config/model-policy.yaml ({sorted(tasks)}); resolve_model() would raise "
+            "ModelPolicyError on it"
+        ]
+    return []
+
+
 def _check_legacy_env_override(manifest: AgentManifest) -> list[str]:
     """spec.modelPolicy.legacyEnvOverride documents an env var the agent's own
     driver module reads directly (bypassing config/model_policy.py) as the
@@ -464,11 +489,23 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
     the day something started reading it. The implementer profile named
     `build_implementer_options`, which does not exist.
 
-    Only `spec.tools` is compared. Budgets are deliberately NOT: the catalog
-    records EFFECTIVE values, which come from the CWFT's env, not from this
-    module's defaults — implementer-default correctly says $20.00 where
-    options.py defaults to $3.00. Comparing them here would fire immediately
-    and be wrong.
+    `spec.tools` and `spec.modelPolicyRef.task` are compared. Budgets are
+    deliberately NOT: the catalog records EFFECTIVE values, which come from
+    the CWFT's env, not from this module's defaults — implementer-default
+    correctly says $20.00 where options.py defaults to $3.00. Comparing them
+    here would fire immediately and be wrong.
+
+    modelPolicyRef.task was added on 2026-09-03 after two of the three
+    profiles turned out to name tasks that do not exist —
+    `issue_investigator` and `shepherd`, against a config/model-policy.yaml
+    that defines only service_agent/mentor_digest/review_findings_normalize.
+    `resolve_model()` raises on either, so the resolver would have failed
+    closed the moment #277 step 4 pointed it here. mctl-gitops' own
+    `policy.yaml` did not catch it because its `knownModelPolicyTasks`
+    allowlist listed both phantom names: a profile was checked against a
+    list that had never been compared to the file it mirrors. This check is
+    that comparison, and it belongs here for the same reason the tools one
+    does — model-policy.yaml only exists in this repo.
     """
     if not GITOPS_CATALOG_PROFILES_DIR.is_dir():
         return _gitops_missing(GITOPS_CATALOG_PROFILES_DIR, "the agent-platform catalog")
@@ -497,6 +534,10 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
             # run, hiding every other profile's result behind one malformed
             # file in a DIFFERENT repository (agy P2 on #284).
             declared_builder = (spec.get("runtime") or {}).get("optionsBuilder")
+            # Same guard, same reason: `modelPolicyRef:` with nothing under
+            # it parses as None, and `.get("task")` on that raises outside
+            # this block.
+            declared_task = (spec.get("modelPolicyRef") or {}).get("task")
             tools = spec.get("tools") or []
             # Explicitly a list. `set("Read")` on a scalar `tools: Read` is
             # not an error — it silently yields {'R','e','a','d'}, and the
@@ -522,6 +563,11 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
         if manifest is None:
             errors.append(f"{profile_name}: maps to unknown agent {agent_name!r}")
             continue
+
+        # Checked before the builder is resolved and called: this needs
+        # nothing but the YAML and model-policy.yaml, and reporting it is
+        # useful even when the builder half cannot run at all.
+        errors += _check_catalog_model_policy_task(profile_name, declared_task)
 
         if declared_builder != manifest.options_builder:
             errors.append(

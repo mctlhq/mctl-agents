@@ -12,12 +12,15 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 import yaml
+from _pytest.outcomes import Failed, Skipped
 
+from config.model_policy import resolve_model
 from orchestrator import validate_manifest as validate_manifest_module
 from orchestrator.manifest import AgentManifest, ManifestError, load, load_all
 from orchestrator.validate_manifest import (
@@ -472,3 +475,106 @@ def test_manifest_without_owner_is_rejected() -> None:
         path.write_text(yaml.dump(document))
         with pytest.raises(ManifestError, match="owner"):
             load(path)
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        ("issue_investigator", "not a task in config/model-policy.yaml"),
+        ("shepherd", "not a task in config/model-policy.yaml"),
+        (None, "missing or not a string"),
+        (["service_agent"], "missing or not a string"),
+    ],
+    ids=["phantom-investigator-task", "phantom-shepherd-task", "absent", "not-a-string"],
+)
+def test_a_catalog_profile_naming_an_unknown_model_task_is_an_error(
+    tmp_path, monkeypatch, task, expected
+) -> None:
+    """A profile must name a model-policy task that exists in THIS repo.
+
+    The two phantom ids are the real values the catalog carried until
+    2026-09-03. mctl-gitops' own `knownModelPolicyTasks` allowlist listed
+    both, so its validator compared each profile against a list nobody had
+    compared to `config/model-policy.yaml` — the profile was checked, the
+    allowlist was not. `resolve_model()` raises `ModelPolicyError` on either,
+    so #277 step 4 would have failed closed on its first resolution.
+
+    Parametrized over absence and a non-string too: this check reads a nested
+    key, and "task is missing entirely" must fail as loudly as "task is
+    wrong" rather than falling through as None == not-in-tasks by accident.
+    """
+    profiles = tmp_path / "execution-profiles" / "shepherd-default"
+    profiles.mkdir(parents=True)
+    spec = {
+        "tools": ["Read"],
+        "runtime": {"optionsBuilder": "orchestrator.options:build_shepherd_options"},
+    }
+    if task is not None:
+        spec["modelPolicyRef"] = {"task": task}
+    (profiles / "profile.yaml").write_text(yaml.safe_dump({"spec": spec}), encoding="utf-8")
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent
+    )
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert any("shepherd-default" in e and expected in e for e in errors), errors
+
+
+def test_every_real_catalog_profile_names_a_resolvable_model_task() -> None:
+    """The end the check exists for: every task the catalog names must
+    actually resolve through config/model_policy.py, not merely appear in a
+    dict. Asserted against `resolve_model()` itself rather than against the
+    same `tasks` mapping the check reads, so a profile naming a key that
+    parses but cannot resolve is still caught."""
+    profiles = sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml"))
+    if not profiles:
+        # The skip idiom the sibling tests use is NOT enough here, and the
+        # first version of this test got it wrong (agy P2 on #288). Those
+        # tests call check_catalog_profiles_match_builders(), which turns an
+        # absent catalog into an error under CI itself. This one iterates the
+        # glob directly — and a glob over a missing or emptied directory
+        # yields nothing without raising, so under CI the skip was bypassed,
+        # the loop body never ran, and the test passed green having checked
+        # zero profiles.
+        #
+        # Emptiness covers both causes deliberately: no checkout at all, and
+        # a checkout whose layout moved.
+        if os.environ.get("CI"):
+            pytest.fail(
+                f"no */profile.yaml under {GITOPS_CATALOG_PROFILES_DIR} under CI — the "
+                "catalog is not checked out or has moved, and this test checked nothing"
+            )
+        pytest.skip(f"mctl-gitops catalog not checked out at {GITOPS_CATALOG_PROFILES_DIR}")
+    for profile_path in profiles:
+        spec = yaml.safe_load(profile_path.read_text(encoding="utf-8"))["spec"]
+        task = spec["modelPolicyRef"]["task"]
+        resolve_model(task, log=False)
+
+
+def test_the_real_catalog_task_test_fails_rather_than_no_ops_under_ci(tmp_path, monkeypatch) -> None:
+    """The guard above must fail under CI, not pass having iterated nothing.
+
+    Asserting on the behaviour rather than on the presence of the guard: a
+    glob over a missing directory raises nothing and yields nothing, so the
+    first version of that test bypassed its own skip under CI and then passed
+    green with zero profiles checked (agy P2 on #288) — the exact silent-no-op
+    shape this PR exists to remove, reproduced inside its own test.
+
+    Locally the same absence must stay a visible skip: a developer without the
+    sibling checkout should not get a failure about someone else's repository.
+    """
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", tmp_path / "absent"
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "GITOPS_CATALOG_PROFILES_DIR", tmp_path / "absent"
+    )
+
+    monkeypatch.setenv("CI", "true")
+    with pytest.raises(Failed, match="checked nothing"):
+        test_every_real_catalog_profile_names_a_resolvable_model_task()
+
+    monkeypatch.delenv("CI", raising=False)
+    with pytest.raises(Skipped):
+        test_every_real_catalog_profile_names_a_resolvable_model_task()
