@@ -958,16 +958,33 @@ def test_a_cronworkflow_is_not_treated_as_a_template(cwft_dir) -> None:
     assert validate_manifest_module.check_cwft_boundaries_match_orchestrator() == []
 
 
-def test_a_step_timeout_that_does_not_outlive_its_pod_is_rejected(cwft_dir) -> None:
-    """APPROVE_STEP_TIMEOUT is 15 min; push approve's deadline past it.
+@pytest.mark.parametrize(
+    ("cwft_name", "constant"),
+    [
+        ("mctl-agents-approve", "APPROVE_STEP_TIMEOUT"),
+        ("mctl-agents-reconcile", "APPLY_STEP_TIMEOUT"),
+        ("mctl-agents-investigate", "SDK_STEP_TIMEOUT"),
+        ("mctl-agents-implement", "SDK_STEP_TIMEOUT"),
+        # The in-loop shepherd tick — _run_cwft("mctl-agents-shepherd", ...)
+        # with no override, so it waits on SDK_STEP_TIMEOUT like the other two.
+        ("mctl-agents-shepherd", "SDK_STEP_TIMEOUT"),
+    ],
+)
+def test_a_step_timeout_that_does_not_outlive_its_pod_is_rejected(
+    cwft_dir, cwft_name, constant
+) -> None:
+    """Every waiter, not just the one that was easiest to think of.
 
     The sharper half of the check: pinning the CWFT value alone would let
     someone raise a deadline past the activity waiting on it and keep CI
     green, leaving the activity to abandon a live pod and retry on top of it.
+    Parametrised because the table had exactly this shape of hole — the
+    shepherd tick was missing from it until review caught the omission.
     """
-    _write_cwft(cwft_dir, "mctl-agents-approve", 5400, 86400)
+    _, ttl = validate_manifest_module._CWFT_BOUNDARIES[cwft_name]
+    _write_cwft(cwft_dir, cwft_name, 99999, ttl)
     errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
-    assert any("APPROVE_STEP_TIMEOUT" in e and "expires before" in e for e in errors), errors
+    assert any(constant in e and "expires before" in e for e in errors), errors
 
 
 def test_a_missing_cwft_checkout_fails_under_ci(tmp_path, monkeypatch) -> None:
@@ -1008,3 +1025,104 @@ def test_the_incident_path_waiter_is_checked_too(cwft_dir) -> None:
     assert any(
         "incidents" in e and "SDK_STEP_TIMEOUT" in e and "expires before" in e for e in errors
     ), errors
+
+
+def _submitted_operations() -> set[str]:
+    """Every CWFT operation the workflow modules submit, read from the AST.
+
+    Enumerated from the code rather than listed by hand, because a
+    hand-maintained list of submit sites is the same kind of unverified claim
+    the boundary tables exist to remove — and it is how the shepherd tick came
+    to be missing from `_DERIVED_STEP_TIMEOUTS` in the first place (claude P2
+    on #302). The call is `_run_cwft("<operation>", ...)` or
+    `SubmitAndWaitInput(operation=..., ...)`; only the literal form is
+    resolvable here, so a constant is followed one level into the module.
+    """
+    import ast
+
+    workflows_dir = Path(validate_manifest_module.__file__).parent / "temporal" / "workflows"
+    found: set[str] = set()
+    for path in sorted(workflows_dir.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        constants = {
+            target.id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant)
+            for target in node.targets
+            if isinstance(target, ast.Name) and isinstance(node.value.value, str)
+        }
+
+        def _literal(value, constants=constants):
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                return value.value
+            if isinstance(value, ast.Name):
+                return constants.get(value.id)
+            return None
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name == "_run_cwft" and node.args:
+                operation = _literal(node.args[0])
+                if operation:
+                    found.add(operation)
+            elif name == "SubmitAndWaitInput":
+                for kw in node.keywords:
+                    if kw.arg == "operation":
+                        operation = _literal(kw.value)
+                        if operation:
+                            found.add(operation)
+    return found
+
+
+def test_every_cwft_the_workflows_submit_has_a_checked_waiter() -> None:
+    """A new submit must not be able to slip past _DERIVED_STEP_TIMEOUTS.
+
+    Adding the shepherd row closed today's hole; this closes the class. The
+    invariant is that anything orchestrator/ waits on has its activity timeout
+    checked against the pod's deadline — otherwise raising that deadline in
+    mctl-gitops keeps CI green while the activity abandons a live pod.
+
+    mctl-agents-incidents is mapped, not exempted: the operation name is an
+    mctl-api operation that resolves 1:1 to the mctl-agents-run template with
+    mode=incident-responder, which is the template that carries the deadline.
+    """
+    operation_to_template = {"mctl-agents-incidents": "mctl-agents-run"}
+    submitted = {
+        operation_to_template.get(op, op)
+        for op in _submitted_operations()
+        if op.startswith("mctl-agents-")
+    }
+    assert submitted, "found no submits at all — the AST walk stopped matching"
+
+    checked = {cwft for _, _, cwft in validate_manifest_module._DERIVED_STEP_TIMEOUTS}
+    assert submitted <= checked, (
+        f"submitted but unchecked: {sorted(submitted - checked)}. "
+        "Add a _DERIVED_STEP_TIMEOUTS entry naming the constant that waits on it."
+    )
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("cwft-multidoc.yaml", "kind: ClusterWorkflowTemplate\nmetadata:\n  name: a\n---\nkind: Other\n"),
+        ("cwft-tabs.yaml", "kind: ClusterWorkflowTemplate\nmetadata:\n\tname: a\n"),
+        ("cwft-no-metadata.yaml", "kind: ClusterWorkflowTemplate\nspec: {}\n"),
+        ("cwft-metadata-not-a-map.yaml", "kind: ClusterWorkflowTemplate\nmetadata: a-string\n"),
+        ("cwft-name-not-a-string.yaml", "kind: ClusterWorkflowTemplate\nmetadata:\n  name: [a, b]\n"),
+    ],
+    ids=["multi-document", "unparseable", "no-metadata", "metadata-not-a-map", "name-not-a-string"],
+)
+def test_a_malformed_template_is_reported_not_crashed(cwft_dir, filename, content) -> None:
+    """Same standard the catalog check already holds itself to.
+
+    This runs at repo level, outside main()'s per-manifest try/except, so an
+    uncaught ComposerError or KeyError surfaces as a traceback rather than a
+    FAIL line naming the file. No such file exists in mctl-gitops today — the
+    point is that one arriving must be reported, and a crash reports nothing
+    a reader can act on (agy P2 on #302).
+    """
+    (cwft_dir / filename).write_text(content, encoding="utf-8")
+    errors = validate_manifest_module.check_cwft_boundaries_match_orchestrator()
+    assert any(filename in e for e in errors), errors

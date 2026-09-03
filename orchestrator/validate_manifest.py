@@ -197,6 +197,12 @@ _DERIVED_STEP_TIMEOUTS: tuple[tuple[str, str, str], ...] = (
     ("orchestrator.temporal.workflows.dev_loop", "APPROVE_STEP_TIMEOUT", "mctl-agents-approve"),
     ("orchestrator.temporal.workflows.dev_loop", "SDK_STEP_TIMEOUT", "mctl-agents-investigate"),
     ("orchestrator.temporal.workflows.dev_loop", "SDK_STEP_TIMEOUT", "mctl-agents-implement"),
+    # The in-loop shepherd tick: _shepherd_tick calls _run_cwft("mctl-agents-
+    # shepherd", ...) with no step_timeout override, so it defaults to
+    # SDK_STEP_TIMEOUT like investigate and implement. Easy to miss because it
+    # is the one submit in the funnel whose operation is not named next to a
+    # stage constant (claude P2 on #302).
+    ("orchestrator.temporal.workflows.dev_loop", "SDK_STEP_TIMEOUT", "mctl-agents-shepherd"),
     ("orchestrator.temporal.workflows.reconcile", "APPLY_STEP_TIMEOUT", "mctl-agents-reconcile"),
     # The incident path: IncidentLoopWorkflow waits on mctl-agents-run in
     # incident-responder mode. ADR 009 records why this activity's retry budget
@@ -826,7 +832,7 @@ def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) ->
     return errors
 
 
-def _cluster_workflow_templates() -> dict[str, dict[str, Any]]:
+def _cluster_workflow_templates() -> tuple[dict[str, dict[str, Any]], list[str]]:
     """Every ClusterWorkflowTemplate in the gitops checkout, keyed by name.
 
     Selected on `kind`, not on the filename glob, and that distinction is
@@ -838,12 +844,27 @@ def _cluster_workflow_templates() -> dict[str, dict[str, Any]]:
     exactly the kind of "exception" that later reads as a real value.
     """
     templates: dict[str, dict[str, Any]] = {}
+    problems: list[str] = []
     for path in sorted(GITOPS_CWFT_DIR.glob("cwft-*.yaml")):
-        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        # Reported, not crashed — the standard the sibling catalog check
+        # already holds itself to (test_a_malformed_profile_is_reported_not_
+        # crashed). This runs at repo level, outside main()'s per-manifest
+        # try/except, so an uncaught ComposerError from a multi-document file
+        # or a KeyError from an absent `metadata` would surface as a traceback
+        # instead of a FAIL line naming the file (agy P2 on #302).
+        try:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except yaml.YAMLError as exc:
+            problems.append(f"{path}: not parseable as a single YAML document: {exc}")
+            continue
         if not isinstance(doc, dict) or doc.get("kind") != "ClusterWorkflowTemplate":
             continue
-        templates[doc["metadata"]["name"]] = doc
-    return templates
+        name = (doc.get("metadata") or {}).get("name") if isinstance(doc.get("metadata"), dict) else None
+        if not isinstance(name, str) or not name:
+            problems.append(f"{path}: ClusterWorkflowTemplate with no usable metadata.name")
+            continue
+        templates[name] = doc
+    return templates, problems
 
 
 def check_cwft_boundaries_match_orchestrator() -> list[str]:
@@ -856,8 +877,7 @@ def check_cwft_boundaries_match_orchestrator() -> list[str]:
     if not GITOPS_CWFT_DIR.is_dir():
         return _gitops_missing(GITOPS_CWFT_DIR, "the Argo boundaries orchestrator/ reasons about")
 
-    errors: list[str] = []
-    templates = _cluster_workflow_templates()
+    templates, errors = _cluster_workflow_templates()
 
     # Only mctl-agents' own templates: mctl-gitops holds ClusterWorkflowTemplates
     # for tenant provisioning and deploys too, and this repo's Python neither
