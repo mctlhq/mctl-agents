@@ -86,12 +86,13 @@ jobs:
 
       - name: Deliver and visual-check
         env:
-          # ubuntu-latest runners ship Chromium via Playwright's cache only
-          # after `npx playwright install`; the system chromium-browser is
-          # a snap stub. Install the real binary once.
-          ARCHIFY_CHROME: /usr/bin/chromium
+          # ubuntu-latest runner images ship Google Chrome stable; archify's
+          # visual-check only needs a Chromium-family binary. The apt
+          # `chromium` package on 24.04 is a snap stub that cannot run
+          # headless inside Actions (first main run, #5, failed on it).
+          ARCHIFY_CHROME: /usr/bin/google-chrome
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq chromium >/dev/null
+          "$ARCHIFY_CHROME" --version
           python3 tools/check_diagrams.py --archify _archify/archify/bin/archify.mjs \
             --deliver --out rendered docs/diagrams/archify
 
