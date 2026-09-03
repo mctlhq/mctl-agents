@@ -366,7 +366,7 @@
       "dot": "cyan",
       "title": "One API for humans and agents",
       "items": [
-        "71 MCP tools behind OAuth 2.1 PKCE \u2014 the same surface an operator and an agent use",
+        "73 MCP tools behind OAuth 2.1 PKCE \u2014 the same surface an operator and an agent use",
         "Agent registry: definition \u2192 immutable version \u2192 per-environment release"
       ]
     },
