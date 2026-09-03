@@ -1,0 +1,390 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "mctl Agent Control Plane",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1220,
+      600
+    ],
+    "views": [
+      {
+        "id": "control-plane",
+        "label": "Control plane",
+        "focus": [
+          "operator",
+          "mctlapi",
+          "temporal",
+          "registry"
+        ],
+        "note": "Humans and agents share one API. Temporal owns durable state; the registry owns which agent version may run."
+      },
+      {
+        "id": "sandbox",
+        "label": "Sandboxed execution",
+        "focus": [
+          "mctlapi",
+          "argo",
+          "agentpod",
+          "anthropic",
+          "vault"
+        ],
+        "note": "The Claude Agent SDK only ever runs inside an Argo pod with a scoped budget, timeout and mutex \u2014 never inside the Temporal worker."
+      },
+      {
+        "id": "evidence",
+        "label": "Evidence and delivery",
+        "focus": [
+          "agentpod",
+          "github",
+          "gitops",
+          "argocd",
+          "observability"
+        ],
+        "note": "Every agent action lands as a commit, PR or status file. GitHub is authoritative; gitops is the durable projection ArgoCD deploys from."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "operator",
+      "type": "external",
+      "label": "Operator",
+      "sublabel": "MCP client \u00b7 CLI",
+      "pos": [
+        38,
+        110
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "mctlapi",
+      "type": "backend",
+      "label": "mctl-api",
+      "sublabel": "REST + MCP server",
+      "pos": [
+        240,
+        110
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "Go"
+    },
+    {
+      "id": "temporal",
+      "type": "backend",
+      "label": "Temporal worker",
+      "sublabel": "DevLoop \u00b7 Reconcile",
+      "pos": [
+        442,
+        110
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "no SDK in-process"
+    },
+    {
+      "id": "argo",
+      "type": "cloud",
+      "label": "Argo Workflows",
+      "sublabel": "CWFT sandbox runs",
+      "pos": [
+        644,
+        110
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "agentpod",
+      "type": "backend",
+      "label": "Agent pod",
+      "sublabel": "Claude Agent SDK",
+      "pos": [
+        846,
+        110
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "budget \u00b7 timeout"
+    },
+    {
+      "id": "anthropic",
+      "type": "external",
+      "label": "Anthropic",
+      "sublabel": "Claude models",
+      "brand": "claude",
+      "pos": [
+        1048,
+        110
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "registry",
+      "type": "database",
+      "label": "Agent registry",
+      "sublabel": "PostgreSQL (CNPG)",
+      "brand": "postgresql",
+      "pos": [
+        240,
+        300
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "observability",
+      "type": "external",
+      "label": "Observability",
+      "sublabel": "VM \u00b7 Grafana \u00b7 Loki",
+      "brand": "grafana",
+      "pos": [
+        442,
+        300
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "vault",
+      "type": "security",
+      "label": "Vault",
+      "sublabel": "tokens \u00b7 GitHub App",
+      "pos": [
+        644,
+        300
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "github",
+      "type": "external",
+      "label": "GitHub",
+      "sublabel": "issues \u00b7 PRs \u00b7 bots",
+      "brand": "github",
+      "pos": [
+        846,
+        300
+      ],
+      "size": [
+        138,
+        68
+      ]
+    },
+    {
+      "id": "gitops",
+      "type": "database",
+      "label": "mctl-gitops",
+      "sublabel": "agents-state/\u2026",
+      "pos": [
+        1048,
+        300
+      ],
+      "size": [
+        138,
+        68
+      ],
+      "tag": "mutex"
+    },
+    {
+      "id": "argocd",
+      "type": "cloud",
+      "label": "ArgoCD",
+      "sublabel": "K3s on Hetzner",
+      "brand": "argo",
+      "pos": [
+        1048,
+        470
+      ],
+      "size": [
+        138,
+        68
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "K3s cluster \u00b7 Hetzner",
+      "wraps": [
+        "mctlapi",
+        "temporal",
+        "argo",
+        "agentpod",
+        "registry",
+        "observability",
+        "vault",
+        "argocd"
+      ],
+      "pad": 22
+    },
+    {
+      "kind": "security-group",
+      "label": "argo-workflows namespace \u00b7 sandbox",
+      "wraps": [
+        "argo",
+        "agentpod"
+      ],
+      "pad": 12
+    }
+  ],
+  "connections": [
+    {
+      "id": "operator-api",
+      "from": "operator",
+      "to": "mctlapi",
+      "label": "OAuth 2.1 PKCE",
+      "variant": "security",
+      "labelDy": 58
+    },
+    {
+      "id": "api-temporal",
+      "from": "mctlapi",
+      "to": "temporal",
+      "label": "start \u00b7 approve signal",
+      "variant": "emphasis",
+      "labelDy": -28
+    },
+    {
+      "id": "api-argo",
+      "from": "mctlapi",
+      "to": "argo",
+      "label": "execute operation",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "top",
+      "via": [
+        [
+          309,
+          62
+        ],
+        [
+          713,
+          62
+        ]
+      ]
+    },
+    {
+      "id": "argo-pod",
+      "from": "argo",
+      "to": "agentpod",
+      "label": "sandboxed run",
+      "variant": "emphasis",
+      "labelAt": [
+        762,
+        192
+      ]
+    },
+    {
+      "id": "pod-anthropic",
+      "from": "agentpod",
+      "to": "anthropic",
+      "label": "SDK session",
+      "variant": "emphasis",
+      "labelDy": -21
+    },
+    {
+      "id": "api-registry",
+      "from": "mctlapi",
+      "to": "registry",
+      "label": "SQL",
+      "route": "straight",
+      "labelDy": 24
+    },
+    {
+      "id": "temporal-metrics",
+      "from": "temporal",
+      "to": "observability",
+      "label": "Prometheus",
+      "variant": "dashed",
+      "route": "straight",
+      "labelDy": 24
+    },
+    {
+      "id": "vault-pod",
+      "from": "vault",
+      "to": "agentpod",
+      "label": "credentials",
+      "variant": "security"
+    },
+    {
+      "id": "pod-github",
+      "from": "agentpod",
+      "to": "github",
+      "label": "branch \u00b7 PR \u00b7 merge",
+      "route": "straight",
+      "labelDy": 24
+    },
+    {
+      "id": "pod-gitops",
+      "from": "agentpod",
+      "to": "gitops",
+      "label": "status commit"
+    },
+    {
+      "id": "github-gitops",
+      "from": "github",
+      "to": "gitops",
+      "label": "release",
+      "variant": "dashed",
+      "labelDy": 24
+    },
+    {
+      "id": "gitops-argocd",
+      "from": "gitops",
+      "to": "argocd",
+      "label": "sync",
+      "route": "straight",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "One API for humans and agents",
+      "items": [
+        "71 MCP tools behind OAuth 2.1 PKCE \u2014 the same surface an operator and an agent use",
+        "Agent registry: definition \u2192 immutable version \u2192 per-environment release"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Durable orchestration, sandboxed judgement",
+      "items": [
+        "Temporal holds waits for days; a worker isolation test forbids the SDK in-process",
+        "Argo pods run the model with a USD budget, a wall-clock deadline and a gitops mutex"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Everything is a commit",
+      "items": [
+        "Proposals, status and approvals live in mctl-gitops as reviewable files",
+        "Merged PRs release through ArgoCD; the loop then watches rollout and incidents"
+      ]
+    }
+  ]
+}

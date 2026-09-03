@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "diagram_type": "lifecycle",
+  "meta": {
+    "title": "Proposal lifecycle — .status.yaml as a durable projection",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1000,
+      700
+    ],
+    "views": [
+      {
+        "id": "rail",
+        "label": "Happy path",
+        "focus": [
+          "proposed",
+          "accepted",
+          "inprogress",
+          "implemented",
+          "merged"
+        ],
+        "note": "Five ordered statuses, each written by a different actor: investigator, human, implementer, implementer, shepherd."
+      },
+      {
+        "id": "review",
+        "label": "Review loop",
+        "focus": [
+          "implemented",
+          "reviewfixing",
+          "reviewstuck"
+        ],
+        "note": "The shepherd addresses P1/P2 findings up to three times; only deterministic content failures consume an attempt."
+      },
+      {
+        "id": "exits",
+        "label": "Exits and triage",
+        "focus": [
+          "inprogress",
+          "needstriage",
+          "implemented",
+          "rejected",
+          "merged"
+        ],
+        "note": "Only merged and rejected are terminal; other unhappy statuses re-open when a live PR shows up."
+      }
+    ]
+  },
+  "lanes": [
+    {
+      "id": "main",
+      "label": "Proposal rail · platform-gitops/agents-state/<svc>/proposals/<slug>/.status.yaml"
+    },
+    {
+      "id": "review",
+      "label": "Shepherd review loop · triage"
+    },
+    {
+      "id": "terminal",
+      "label": "Terminal"
+    }
+  ],
+  "states": [
+    {
+      "id": "proposed",
+      "type": "start",
+      "label": "proposed",
+      "sublabel": "agent-written",
+      "lane": "main",
+      "col": 0,
+      "step": "01",
+      "tag": "agent writes"
+    },
+    {
+      "id": "accepted",
+      "type": "decision",
+      "label": "accepted",
+      "sublabel": "approve CWFT",
+      "lane": "main",
+      "col": 1,
+      "step": "02",
+      "tag": "human gate"
+    },
+    {
+      "id": "inprogress",
+      "type": "active",
+      "label": "in-progress",
+      "sublabel": "lease 130 min",
+      "lane": "main",
+      "col": 2,
+      "step": "03",
+      "tag": "one per run"
+    },
+    {
+      "id": "implemented",
+      "type": "waiting",
+      "label": "implemented",
+      "sublabel": "PR open",
+      "lane": "main",
+      "col": 3,
+      "step": "04",
+      "tag": "shepherd owns"
+    },
+    {
+      "id": "merged",
+      "type": "success",
+      "label": "merged",
+      "sublabel": "merge commit",
+      "lane": "main",
+      "col": 4,
+      "step": "05",
+      "tag": "terminal"
+    },
+    {
+      "id": "reviewfixing",
+      "type": "active",
+      "label": "review-fixing",
+      "sublabel": "fix → push → implemented",
+      "lane": "review",
+      "col": 1,
+      "tag": "max 3"
+    },
+    {
+      "id": "needstriage",
+      "type": "failure",
+      "label": "needs-triage",
+      "sublabel": "failure.code",
+      "lane": "review",
+      "col": 0,
+      "tag": "never auto-retried"
+    },
+    {
+      "id": "reviewstuck",
+      "type": "failure",
+      "label": "review-stuck",
+      "sublabel": "reconcile can re-open",
+      "lane": "terminal",
+      "col": 1,
+      "tag": "human"
+    },
+    {
+      "id": "rejected",
+      "type": "failure",
+      "label": "rejected",
+      "sublabel": "closed unmerged",
+      "lane": "terminal",
+      "col": 2,
+      "tag": "terminal"
+    }
+  ],
+  "transitions": [
+    {
+      "from": "implemented",
+      "to": "reviewfixing",
+      "label": "P1/P2 findings",
+      "variant": "security",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "from": "reviewfixing",
+      "to": "implemented",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "left",
+      "via": [
+        [
+          484,
+          307
+        ],
+        [
+          484,
+          157
+        ]
+      ]
+    },
+    {
+      "from": "reviewfixing",
+      "to": "reviewstuck",
+      "label": "3rd failure",
+      "variant": "security",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "from": "inprogress",
+      "to": "needstriage",
+      "label": "timeout · guard",
+      "variant": "security",
+      "route": "straight",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "from": "implemented",
+      "to": "rejected",
+      "label": "PR closed unmerged",
+      "variant": "security",
+      "labelAt": [
+        633,
+        400
+      ]
+    },
+    {
+      "from": "reviewstuck",
+      "to": "implemented",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "top",
+      "via": [
+        [
+          470,
+          479
+        ],
+        [
+          470,
+          104
+        ],
+        [
+          556,
+          104
+        ]
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "GitHub is authoritative",
+      "items": [
+        ".status.yaml is a projection for coordination and audit, not the truth about a PR",
+        "A reconciler re-projects GitHub onto disk every 15 minutes and adopts orphans"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Every writer preserves what it did not change",
+      "items": [
+        "update_status_file merges fields; None deletes, omit keeps",
+        "Every write stamps updated_at / updated_by = mctl-agents[bot]"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Retiring is a human decision",
+      "items": [
+        "The loop makes the reason legible (missing-pr, source-resolved, source-not-planned)",
+        "Only an operator writes rejected by hand; needs-triage stays in the queue"
+      ]
+    }
+  ]
+}
