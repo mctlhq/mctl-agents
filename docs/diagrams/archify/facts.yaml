@@ -31,6 +31,14 @@ cronworkflows:
   cronworkflow-mctl-agents-issue-poll.yaml: '*/15 * * * *'
   cronworkflow-mctl-agents-shepherd.yaml: 0 7-21/2 * * *
   cwft-mctl-agents-daily.yaml: 0 0 * * 6
+cwft_env_overrides:
+  IMPLEMENTER_BUDGET_USD: '20.00'
+  IMPLEMENTER_TIMEOUT_SECONDS: '2400'
+  INCIDENT_RESPONDER_BUDGET_USD: '20.00'
+  ISSUE_INVESTIGATOR_BUDGET_USD: '3.00'
+  MENTOR_BUDGET_USD: '10.00'
+  SERVICE_AGENT_BUDGET_USD: '5.00'
+  SHEPHERD_BUDGET_USD: '5.00'
 cwfts:
 - mctl-agents-approve
 - mctl-agents-daily
@@ -61,6 +69,8 @@ dev_loop:
   sdk_step_timeout: 2 h
   shepherd_tick_every_polls: '8'
   shepherd_ticks_max: '12'
+implementer:
+  lease_minutes: '130'
 manifest_api_versions:
   implementer: agents.mctl.ai/v1alpha1
   incident-responder: agents.mctl.ai/v1alpha1
@@ -172,6 +182,7 @@ operations:
 - rollback-service
 - smoke-test
 platform_skills:
+- archify-diagrams
 - argocd-health-remediation
 - git-flow
 - mcp-troubleshooting

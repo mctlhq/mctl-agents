@@ -52,12 +52,19 @@ _DEV_LOOP_CONSTANTS = {
     "sdk_step_retry_attempts": r"^SDK_STEP_RETRY_POLICY = RetryPolicy\(maximum_attempts=(\d+)\)",
 }
 
+_IMPLEMENTER_CONSTANTS = {
+    # The attempt lease the implementer writes into .status.yaml before it
+    # pushes (run_implementer.py); the lifecycle diagram quotes it.
+    "lease_minutes": r"started \+ timedelta\(minutes=(\d+)\)",
+}
+
 _SHEPHERD_CONSTANTS = {
     "max_review_attempts": r"^MAX_REVIEW_ATTEMPTS = (\d+)",
     "merge_settle_min_default": r'os\.environ\.get\("SHEPHERD_MERGE_SETTLE_MIN", "(\d+)"\)',
 }
 
 _BUDGET_RE = re.compile(r'^([A-Z_]+)_BUDGET_USD = float\(os\.getenv\("[A-Z_]+", "([\d.]+)"\)\)', re.M)
+_CWFT_ENV_RE = re.compile(r'- name: ([A-Z_]+_(?:BUDGET_USD|TIMEOUT_SECONDS))\n\s*value: "([\d.]+)"', re.M)
 _STATUS_SET_RE = re.compile(r"^(RECONCILE_INPUT_STATUSES|SHEPHERD_INPUT_STATUSES) = \{([^}]*)\}", re.M | re.S)
 _SCHEDULE_RE = re.compile(
     r"every=timedelta\(([^)]+)\)\)\],\n(?:.*\n){0,6}?.*_ensure_schedule\(client, \w+, \w+, \"(\w+)\""
@@ -82,7 +89,7 @@ def _grep(text: str, patterns: dict[str, str]) -> dict[str, str]:
             out[key] = "<not found>"
             continue
         raw = m.group(1)
-        out[key] = _timedelta_text(raw) if "timedelta" in pattern else raw
+        out[key] = _timedelta_text(raw) if "=" in raw else raw
     return out
 
 
@@ -105,6 +112,7 @@ def facts_from_code(gitops: Path | None, api: Path | None) -> dict[str, Any]:
 
     options = _read(REPO_ROOT / "orchestrator" / "options.py")
     facts["budgets_usd"] = {agent.lower(): value for agent, value in _BUDGET_RE.findall(options)}
+    facts["implementer"] = _grep(_read(REPO_ROOT / "orchestrator" / "run_implementer.py"), _IMPLEMENTER_CONSTANTS)
 
     inventory = yaml.safe_load(_read(REPO_ROOT / "docs" / "agent-inventory.yaml"))
     facts["agents"] = sorted(a["name"] for a in inventory.get("agents", []))
@@ -134,6 +142,14 @@ def facts_from_code(gitops: Path | None, api: Path | None) -> dict[str, Any]:
             if m:
                 crons[p.name] = m.group(1).strip()
         facts["cronworkflows"] = crons
+        # Production overrides of the Python defaults: the CWFTs set
+        # *_BUDGET_USD / *_TIMEOUT_SECONDS env values that are what the
+        # diagrams actually quote ("$20 · 40 min"), not options.py's $3/900.
+        overrides: dict[str, str] = {}
+        for p in sorted(cwft_dir.glob("cwft-mctl-agents-*.yaml")):
+            for name, value in _CWFT_ENV_RE.findall(_read(p)):
+                overrides[name] = value
+        facts["cwft_env_overrides"] = overrides
         catalog = gitops / "platform-skills" / "catalog"
         facts["platform_skills"] = sorted(p.name for p in catalog.iterdir() if (p / "SKILL.md").exists())
         policy = gitops / "agent-platform" / "policy.yaml"
@@ -237,7 +253,11 @@ def main() -> int:
     print(report)
 
     if ns.update:
-        updated = dict(current)
+        # Merge, never replace: a run without --gitops/--api still knows
+        # nothing about the cwft/mcp sections and must not delete them.
+        updated = dict(recorded_doc)
+        updated.pop("releases_seen", None)
+        updated.update(current)
         for r in releases:
             seen_releases[r["repo"]] = r["tag"]
         updated["releases_seen"] = dict(sorted(seen_releases.items()))
