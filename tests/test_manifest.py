@@ -12,11 +12,13 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 import yaml
+from _pytest.outcomes import Failed, Skipped
 
 from config.model_policy import resolve_model
 from orchestrator import validate_manifest as validate_manifest_module
@@ -525,9 +527,54 @@ def test_every_real_catalog_profile_names_a_resolvable_model_task() -> None:
     dict. Asserted against `resolve_model()` itself rather than against the
     same `tasks` mapping the check reads, so a profile naming a key that
     parses but cannot resolve is still caught."""
-    if not GITOPS_CATALOG_PROFILES_DIR.is_dir() and not os.environ.get("CI"):
-        pytest.skip("mctl-gitops catalog not checked out")
-    for profile_path in sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml")):
+    profiles = sorted(GITOPS_CATALOG_PROFILES_DIR.glob("*/profile.yaml"))
+    if not profiles:
+        # The skip idiom the sibling tests use is NOT enough here, and the
+        # first version of this test got it wrong (agy P2 on #288). Those
+        # tests call check_catalog_profiles_match_builders(), which turns an
+        # absent catalog into an error under CI itself. This one iterates the
+        # glob directly — and a glob over a missing or emptied directory
+        # yields nothing without raising, so under CI the skip was bypassed,
+        # the loop body never ran, and the test passed green having checked
+        # zero profiles.
+        #
+        # Emptiness covers both causes deliberately: no checkout at all, and
+        # a checkout whose layout moved.
+        if os.environ.get("CI"):
+            pytest.fail(
+                f"no */profile.yaml under {GITOPS_CATALOG_PROFILES_DIR} under CI — the "
+                "catalog is not checked out or has moved, and this test checked nothing"
+            )
+        pytest.skip(f"mctl-gitops catalog not checked out at {GITOPS_CATALOG_PROFILES_DIR}")
+    for profile_path in profiles:
         spec = yaml.safe_load(profile_path.read_text(encoding="utf-8"))["spec"]
         task = spec["modelPolicyRef"]["task"]
         resolve_model(task, log=False)
+
+
+def test_the_real_catalog_task_test_fails_rather_than_no_ops_under_ci(tmp_path, monkeypatch) -> None:
+    """The guard above must fail under CI, not pass having iterated nothing.
+
+    Asserting on the behaviour rather than on the presence of the guard: a
+    glob over a missing directory raises nothing and yields nothing, so the
+    first version of that test bypassed its own skip under CI and then passed
+    green with zero profiles checked (agy P2 on #288) — the exact silent-no-op
+    shape this PR exists to remove, reproduced inside its own test.
+
+    Locally the same absence must stay a visible skip: a developer without the
+    sibling checkout should not get a failure about someone else's repository.
+    """
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", tmp_path / "absent"
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "GITOPS_CATALOG_PROFILES_DIR", tmp_path / "absent"
+    )
+
+    monkeypatch.setenv("CI", "true")
+    with pytest.raises(Failed, match="checked nothing"):
+        test_every_real_catalog_profile_names_a_resolvable_model_task()
+
+    monkeypatch.delenv("CI", raising=False)
+    with pytest.raises(Skipped):
+        test_every_real_catalog_profile_names_a_resolvable_model_task()
