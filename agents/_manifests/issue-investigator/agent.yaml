@@ -6,9 +6,11 @@
 #
 # The execution shape that used to live inline here (toolPolicy, execution,
 # runtime.optionsBuilder/entrypoint) now lives in the referenced
-# ExecutionProfile — see tests/fixtures/resolver/profiles/investigator-default.yaml
-# for the pilot's compatibility fixture (checked-in, explicitly
-# non-promotable; NOT a second production catalog — see that file's header).
+# ExecutionProfile, which since #277 step 4 is the real mctl-gitops catalog:
+# platform-gitops/agent-platform/execution-profiles/issue-investigator-default/
+# profile.yaml. Loading this manifest therefore needs a mctl-gitops checkout
+# (MCTL_GITOPS_ROOT, or the sibling layout) — the in-repo fixture under
+# tests/fixtures/resolver/ that used to stand in for it is deleted.
 #
 # orchestrator/manifest.py's v1alpha2 branch still resolves this file's
 # executionProfileRef down to the identical toolPolicy/execution/runtime
@@ -40,11 +42,21 @@ spec:
     - mctl_trigger_issue (MCP, admin-only)
     - orchestrator/run_issue_poller.py (agents:intake label)
   executionProfileRef:
-    name: investigator-default
+    # The mctl-gitops agent-platform catalog profile
+    # (platform-gitops/agent-platform/execution-profiles/<name>/profile.yaml),
+    # not the in-repo fixture this used to name -- see #277 step 4.
+    name: issue-investigator-default
     # Checked against the CONCRETE selected ExecutionProfile version
-    # (orchestrator/resolver.py's execute(): the profile fixture's own
-    # content hash), never read from a profile-owned range (mctlhq/mctl-agents#227
-    # requirements). A profile edit that is not also re-pinned here fails
-    # resolution closed instead of silently accepting an incompatible
-    # profile version.
-    compatibility: "sha256:ea35387723c6837b6aef275617db7cbf52f145f9619c58f6217c7a2c0ccd8f2f"
+    # (orchestrator/resolver.py's execute(): the profile's declared
+    # spec.version), never read from a profile-owned range
+    # (mctlhq/mctl-agents#227 requirements).
+    #
+    # This was a sha256 of the fixture file while the profile lived in this
+    # repository, which made a profile edit without re-pinning fail closed.
+    # The catalog versions profiles with semver instead, and the binding
+    # mirrors THIS line as spec.definition.profileCompatibility -- so the
+    # constraint is now a range, and the resolver checks that the mirror
+    # still matches what is written here. What semver does not give back is
+    # drift detection on the profile's own content: bumping spec.version
+    # when a profile changes is a mctl-gitops CI concern, tracked separately.
+    compatibility: ">=1.0.0 <2.0.0"

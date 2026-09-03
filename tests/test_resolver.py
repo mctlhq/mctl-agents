@@ -5,14 +5,18 @@ for the fail-closed contract every negative test here asserts.
 
 Every test builds its own isolated fixture tree under `tmp_path` and
 monkeypatches resolver's directory constants rather than touching the real
-`agents/_manifests/issue-investigator/` / `tests/fixtures/resolver/` files —
+`agents/_manifests/issue-investigator/` files or the real mctl-gitops
+catalog —
 those are exercised end-to-end by `test_real_issue_investigator_fixtures_resolve`
 below plus `tests/test_manifest.py`'s existing parametrized checks.
 """
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import inspect
+import os
+import re
 from pathlib import Path
 
 import pytest
@@ -27,6 +31,8 @@ from orchestrator.manifest import PromptSource
 
 _AGENT = "test-agent"
 _PROFILE = "test-profile"
+_PROFILE_VERSION = "1.0.0"
+_COMPATIBILITY = ">=1.0.0 <2.0.0"
 
 
 def _content_hash(path: Path) -> str:
@@ -37,9 +43,10 @@ def _base_profile_doc() -> dict:
     return {
         "apiVersion": "agents.mctl.ai/v1alpha2",
         "kind": "ExecutionProfile",
-        "metadata": {"name": _PROFILE, "promotable": False},
+        "metadata": {"name": _PROFILE, "owner": "platform"},
         "spec": {
-            "modelPolicyRef": {"task": "service_agent"},
+            "version": _PROFILE_VERSION,
+            "modelPolicyRef": {"task": "service_agent", "compatibility": ">=1.0.0 <2.0.0"},
             "skills": [],
             "tools": ["Read", "Write"],
             "policyRef": "test-policy",
@@ -47,7 +54,6 @@ def _base_profile_doc() -> dict:
             "budgetUsd": 3.0,
             "timeoutSeconds": 900.0,
             "runtime": {
-                "type": "claude-agent-sdk",
                 "entrypoint": "orchestrator.run_issue_investigator:investigate",
                 "optionsBuilder": "orchestrator.options:build_issue_investigator_options",
                 "sandbox": {
@@ -56,8 +62,8 @@ def _base_profile_doc() -> dict:
                     "approved": True,
                 },
             },
-            "approval": {"required": False},
-            "evidence": ["proposal_triplet"],
+            "approval": {"requiredBefore": []},
+            "evidence": {"required": ["proposal"]},
         },
     }
 
@@ -80,15 +86,34 @@ def _dummy_prompt() -> str:
     return "dummy"
 
 
-def _base_binding_doc(*, definition_version: str, profile_version: str, revision: int = 1) -> dict:
+def _base_binding_doc(
+    *,
+    definition_version: str,
+    profile_version: str,
+    revision: int = 1,
+    compatibility: str = _COMPATIBILITY,
+) -> dict:
     return {
-        "bindingSource": "compatibility-fixture",
-        "promotable": False,
-        "environment": "production",
-        "definition": {"name": _AGENT, "version": definition_version},
-        "profile": {"name": _PROFILE, "version": profile_version},
-        "releaseRevision": revision,
-        "registryLifecycle": {"definition": "published", "profile": "published"},
+        "apiVersion": "agents.mctl.ai/v1alpha2",
+        "kind": "ReleaseBindingIntent",
+        "metadata": {"agent": _AGENT, "environment": resolver.DEFAULT_ENVIRONMENT},
+        "spec": {
+            "sourceManifest": {
+                "repo": "mctlhq/mctl-agents",
+                "path": f"agents/_manifests/{_AGENT}/agent.yaml",
+                "gitSha": "deadbeef" * 5,
+            },
+            "bindingSource": "compatibility-fixture",
+            "promotable": False,
+            "registryLifecycle": {"definition": "published", "profile": "published"},
+            "definition": {
+                "name": _AGENT,
+                "version": definition_version,
+                "profileCompatibility": compatibility,
+            },
+            "profile": {"name": _PROFILE, "version": profile_version},
+            "bindingRevision": revision,
+        },
     }
 
 
@@ -113,38 +138,52 @@ def _build_fixture_set(
     Returns the three parsed documents (pre-write) for callers that want to
     mutate one field and rewrite just that file."""
     definitions_dir = tmp_path / "manifests"
-    profiles_dir = tmp_path / "profiles"
-    releases_dir = tmp_path / "releases"
+    catalog_dir = tmp_path / "agent-platform"
+    profiles_dir = catalog_dir / "execution-profiles"
+    releases_dir = catalog_dir / "releases"
     monkeypatch.setattr(resolver, "DEFINITIONS_DIR", definitions_dir)
-    monkeypatch.setattr(resolver, "PROFILES_FIXTURE_DIR", profiles_dir)
-    monkeypatch.setattr(resolver, "RELEASES_FIXTURE_DIR", releases_dir)
+    monkeypatch.setattr(resolver, "CATALOG_DIR", catalog_dir)
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", profiles_dir)
+    monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", releases_dir)
 
     profile_doc = _base_profile_doc()
     if profile_overrides:
         profile_doc["spec"].update(profile_overrides)
-    profile_path = _write(profiles_dir / f"{_PROFILE}.yaml", profile_doc)
+    # Catalog layout: <profiles>/<name>/profile.yaml, not <profiles>/<name>.yaml.
+    profile_path = _write(profiles_dir / _PROFILE / "profile.yaml", profile_doc)
     profile_hash = _content_hash(profile_path)
+    profile_version = profile_doc["spec"]["version"]
 
-    definition_doc = _base_definition_doc(compatibility if compatibility is not None else profile_hash)
+    effective_compatibility = compatibility if compatibility is not None else _COMPATIBILITY
+    definition_doc = _base_definition_doc(effective_compatibility)
     if definition_overrides:
         definition_doc["spec"].update(definition_overrides)
     definition_path = _write(definitions_dir / _AGENT / "agent.yaml", definition_doc)
     definition_hash = _content_hash(definition_path)
 
     if write_binding:
-        binding_doc = _base_binding_doc(definition_version=definition_hash, profile_version=profile_hash)
+        binding_doc = _base_binding_doc(
+            definition_version="1",
+            profile_version=profile_version,
+            # The binding mirrors whatever the definition actually declares,
+            # so the default set stays self-consistent and the mirror-drift
+            # check only fires for tests that deliberately break it.
+            compatibility=definition_doc["spec"]["executionProfileRef"]["compatibility"],
+        )
         if binding_overrides:
-            binding_doc.update(binding_overrides)
-        _write(releases_dir / f"{_AGENT}.yaml", binding_doc)
+            binding_doc["spec"].update(binding_overrides)
+        _write(releases_dir / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", binding_doc)
 
     return {
         "definitions_dir": definitions_dir,
+        "catalog_dir": catalog_dir,
         "profiles_dir": profiles_dir,
         "releases_dir": releases_dir,
         "profile_path": profile_path,
         "definition_path": definition_path,
         "profile_hash": profile_hash,
         "definition_hash": definition_hash,
+        "profile_version": profile_version,
     }
 
 
@@ -218,31 +257,94 @@ def test_execute_fails_on_disabled_registry_lifecycle(tmp_path, monkeypatch):
         resolver.execute(_AGENT, resolver.Task(target_repository_sha="g" * 40))
 
 
-def test_execute_fails_on_compatibility_mismatch(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "constraint", [">=2.0.0 <3.0.0", "<1.0.0", "==1.1.0"],
+    ids=["above-range", "below-range", "pinned-elsewhere"],
+)
+def test_execute_fails_on_compatibility_mismatch(tmp_path, monkeypatch, constraint):
     """T4: compatibility is checked against the CONCRETE selected profile
-    version — a definition pinned to the wrong hash must fail, and the
-    profile's own file never declares an accepted range for this to read."""
-    _build_fixture_set(tmp_path, monkeypatch, compatibility="sha256:" + "0" * 64)
+    version (its declared `spec.version`), never read from a profile-owned
+    range."""
+    _build_fixture_set(tmp_path, monkeypatch, compatibility=constraint)
     with pytest.raises(resolver.ResolverError, match="compatibility mismatch"):
         resolver.execute(_AGENT, resolver.Task(target_repository_sha="h" * 40))
 
 
-def test_execute_fails_when_profile_drifts_from_pinned_hash(tmp_path, monkeypatch):
-    """Editing the profile fixture without re-pinning the release binding's
-    profile.version must fail closed — an 'ambiguous version', not a silent
-    re-resolution of whatever the profile file now says."""
+def test_execute_fails_when_the_binding_and_the_profile_disagree_on_version(tmp_path, monkeypatch):
+    """Bumping a profile's `spec.version` without re-binding must fail
+    closed — an 'ambiguous version', not a silent re-resolution of whatever
+    the profile file now says."""
     built = _build_fixture_set(tmp_path, monkeypatch)
     profile_doc = _base_profile_doc()
-    profile_doc["spec"]["budgetUsd"] = 99.0  # any content change moves the hash
+    profile_doc["spec"]["version"] = "1.1.0"
     _write(built["profile_path"], profile_doc)
     with pytest.raises(resolver.ResolverError, match="ambiguous version"):
         resolver.execute(_AGENT, resolver.Task(target_repository_sha="i" * 40))
 
 
+def test_a_profile_edited_without_a_version_bump_still_resolves(tmp_path, monkeypatch):
+    """The guarantee this pilot GAVE UP when the profile moved to the
+    catalog, asserted rather than described.
+
+    While the profile lived under `tests/fixtures/`, its version was the
+    sha256 of the file: any content edit moved it, so editing without
+    re-pinning the binding could not resolve. The catalog versions profiles
+    with a declared `spec.version` — a claim about the content, not the
+    content — so an edit that leaves that string alone resolves exactly as
+    before, with the NEW values.
+
+    Here the budget changes from 3.0 to 9.0 and the plan carries 9.0 against
+    an unchanged `1.0.0`. That is the real behaviour and it must be visible
+    in the test suite rather than only in a docstring. Closing the gap needs
+    a mctl-gitops CI check comparing a profile's diff against its version
+    bump; when that lands, this test is the one that documents what changed.
+
+    The plan's `profile_content_hash` does move, which is the point of
+    recording it: provenance survives even where the gate did not.
+    """
+    built = _build_fixture_set(tmp_path, monkeypatch)
+    before = resolver.execute(_AGENT, resolver.Task(target_repository_sha="k" * 40))
+
+    profile_doc = _base_profile_doc()
+    profile_doc["spec"]["budgetUsd"] = 9.0
+    _write(built["profile_path"], profile_doc)
+    after = resolver.execute(_AGENT, resolver.Task(target_repository_sha="k" * 40))
+
+    assert before.budget_usd == 3.0
+    assert after.budget_usd == 9.0
+    assert before.profile_version == after.profile_version == "1.0.0"
+    assert before.profile_content_hash != after.profile_content_hash
+
+
+def test_execute_fails_when_the_binding_mirrors_a_stale_compatibility(tmp_path, monkeypatch):
+    """The binding duplicates the definition's `executionProfileRef.
+    compatibility` as `spec.definition.profileCompatibility`, because
+    mctl-gitops CI cannot read the mctl-agents source file — its schema says
+    so. This process reads both, so it is the only place the mirror is
+    checkable at all.
+
+    Left unchecked, gitops CI would evaluate compatibility against its copy
+    while the resolver used the real one: two sources of truth wearing one
+    name, agreeing right up until someone edited one of them.
+    """
+    _build_fixture_set(
+        tmp_path, monkeypatch,
+        binding_overrides={
+            "definition": {
+                "name": _AGENT,
+                "version": "1",
+                "profileCompatibility": ">=9.0.0 <10.0.0",
+            }
+        },
+    )
+    with pytest.raises(resolver.ResolverError, match="mirror drift"):
+        resolver.execute(_AGENT, resolver.Task(target_repository_sha="m" * 40))
+
+
 def test_execute_fails_on_unknown_profile_reference(tmp_path, monkeypatch):
     _build_fixture_set(
         tmp_path, monkeypatch,
-        binding_overrides={"profile": {"name": "some-other-profile", "version": "sha256:" + "0" * 64}},
+        binding_overrides={"profile": {"name": "some-other-profile", "version": "1.0.0"}},
     )
     with pytest.raises(resolver.ResolverError, match="unknown reference"):
         resolver.execute(_AGENT, resolver.Task(target_repository_sha="j" * 40))
@@ -319,40 +421,50 @@ def test_load_definition_fails_closed_on_non_mapping_metadata(tmp_path, monkeypa
 # ---------------------------------------------------------------------------
 # T8 — fixtures cannot be interpreted as promotable registry state.
 # ---------------------------------------------------------------------------
-def test_load_profile_requires_explicit_promotable_false(tmp_path, monkeypatch):
-    monkeypatch.setattr(resolver, "PROFILES_FIXTURE_DIR", tmp_path / "profiles")
+def test_load_profile_requires_a_declared_version(tmp_path, monkeypatch):
+    """`spec.version` is what the binding references and what the
+    definition's compatibility range is evaluated against, so a profile
+    without one cannot resolve.
+
+    This replaced a `metadata.promotable: false` assertion. The catalog
+    schema is `additionalProperties: false` and declares no such field, so
+    demanding it here would reject every real profile. Non-promotability is
+    still asserted — on the RELEASE BINDING, which is where the catalog
+    actually carries it (see the two binding tests below).
+    """
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", tmp_path / "profiles")
     doc = _base_profile_doc()
-    del doc["metadata"]["promotable"]
-    _write(tmp_path / "profiles" / f"{_PROFILE}.yaml", doc)
-    with pytest.raises(resolver.ResolverError, match="promotable"):
+    del doc["spec"]["version"]
+    _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
+    with pytest.raises(resolver.ResolverError, match=r"spec\.version is required"):
         resolver.load_profile(_PROFILE)
 
 
 def test_load_profile_fails_closed_on_non_mapping_model_policy_ref(tmp_path, monkeypatch):
     """A scalar where `spec.modelPolicyRef` must be a mapping raises
     `ResolverError`, not a raw `AttributeError` from a bare `.get()` call."""
-    monkeypatch.setattr(resolver, "PROFILES_FIXTURE_DIR", tmp_path / "profiles")
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", tmp_path / "profiles")
     doc = _base_profile_doc()
     doc["spec"]["modelPolicyRef"] = "oops"
-    _write(tmp_path / "profiles" / f"{_PROFILE}.yaml", doc)
+    _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="modelPolicyRef must be a mapping"):
         resolver.load_profile(_PROFILE)
 
 
 def test_load_release_binding_requires_compatibility_fixture_source(tmp_path, monkeypatch):
-    monkeypatch.setattr(resolver, "RELEASES_FIXTURE_DIR", tmp_path / "releases")
+    monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
     doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
-    doc["bindingSource"] = "registry"
-    _write(tmp_path / "releases" / f"{_AGENT}.yaml", doc)
+    doc["spec"]["bindingSource"] = "registry"
+    _write(tmp_path / "releases" / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="bindingSource"):
         resolver.load_release_binding(_AGENT)
 
 
 def test_load_release_binding_requires_promotable_false(tmp_path, monkeypatch):
-    monkeypatch.setattr(resolver, "RELEASES_FIXTURE_DIR", tmp_path / "releases")
+    monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
     doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
-    doc["promotable"] = True
-    _write(tmp_path / "releases" / f"{_AGENT}.yaml", doc)
+    doc["spec"]["promotable"] = True
+    _write(tmp_path / "releases" / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="promotable"):
         resolver.load_release_binding(_AGENT)
 
@@ -360,18 +472,39 @@ def test_load_release_binding_requires_promotable_false(tmp_path, monkeypatch):
 def test_load_release_binding_fails_closed_on_non_mapping_registry_lifecycle(tmp_path, monkeypatch):
     """A scalar where `registryLifecycle` must be a mapping raises
     `ResolverError`, not a raw `AttributeError` from a bare `.get()` call."""
-    monkeypatch.setattr(resolver, "RELEASES_FIXTURE_DIR", tmp_path / "releases")
+    monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
     doc = _base_binding_doc(definition_version="sha256:" + "0" * 64, profile_version="sha256:" + "1" * 64)
-    doc["registryLifecycle"] = "oops"
-    _write(tmp_path / "releases" / f"{_AGENT}.yaml", doc)
+    doc["spec"]["registryLifecycle"] = "oops"
+    _write(tmp_path / "releases" / resolver.DEFAULT_ENVIRONMENT / f"{_AGENT}.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="registryLifecycle must be a mapping"):
         resolver.load_release_binding(_AGENT)
 
 
 # ---------------------------------------------------------------------------
-# Real, checked-in issue-investigator fixtures — end-to-end, no monkeypatch.
+# The real issue-investigator definition against the real mctl-gitops
+# catalog — end-to-end, no monkeypatch.
 # ---------------------------------------------------------------------------
-def test_real_issue_investigator_fixtures_resolve():
+def _require_real_catalog() -> None:
+    """Guard for the tests below, which read the actual mctl-gitops catalog.
+
+    Absence must FAIL under CI and only skip locally. A plain `pytest.skip`
+    on `not is_dir()` would let these pass having resolved nothing in the one
+    environment that gates the merge — the silent-no-op shape that got
+    through review once already on #288, so it is not repeated here.
+    """
+    if resolver.CATALOG_DIR.is_dir():
+        return
+    message = (
+        f"mctl-gitops catalog not present at {resolver.CATALOG_DIR}; set MCTL_GITOPS_ROOT "
+        "or check the repository out as a sibling"
+    )
+    if os.environ.get("CI"):
+        pytest.fail(f"{message} — under CI this must not be skipped")
+    pytest.skip(message)
+
+
+def test_real_issue_investigator_definition_resolves_against_the_catalog():
+    _require_real_catalog()
     plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="f" * 40))
     assert plan.agent == "issue-investigator"
     assert plan.budget_usd == 3.0
@@ -379,15 +512,32 @@ def test_real_issue_investigator_fixtures_resolve():
     assert plan.cluster_workflow_template == "mctl-agents-investigate"
     assert plan.entrypoint == "orchestrator.run_issue_investigator:investigate"
     assert plan.options_builder == "orchestrator.options:build_issue_investigator_options"
-    assert plan.approval == {
-        "required": False,
-        "reason": "investigation only writes a status:proposed proposal; no mutation.",
-    }
+    # Catalog shape, not the fixture's boolean `required`.
+    assert plan.approval == {"requiredBefore": []}
+    assert plan.evidence == ("proposal",)
+    # The values that only exist because this is the real catalog: the
+    # corrected model-policy task (#277 / gitops#1002) and the renamed
+    # policy (gitops#981).
+    assert plan.model == "claude-sonnet-5"
+    assert plan.policy_ref == "scoped-proposal-authoring"
+    assert plan.binding_source == "compatibility-fixture"
+    # The legacy env override the catalog could not express until
+    # gitops#1007 -- it OUTRANKS modelPolicyRef.task, so a plan that
+    # resolved without it would name a model the environment can silently
+    # replace.
+    assert plan.model_policy_version.startswith("v1+sha256:")
+    # Shape, not a pinned value: asserting "1.1.0" here would make every
+    # legitimate profile bump a two-repository edit, and the version's
+    # correctness is already gated by the binding/profile agreement inside
+    # execute() plus mctl-gitops' own validator.
+    assert re.fullmatch(r"\d+\.\d+\.\d+", plan.profile_version), plan.profile_version
+    assert plan.profile_content_hash.startswith("sha256:")
 
 
 def test_prompt_hash_changes_when_prompt_source_changes():
     """Sanity check on `_hash_prompt_source`'s inline branch: it hashes the
     real source text, not a static placeholder."""
+    _require_real_catalog()
     from orchestrator import run_issue_investigator
 
     expected = "sha256:" + hashlib.sha256(inspect.getsource(run_issue_investigator._build_prompt).encode()).hexdigest()
@@ -429,23 +579,25 @@ def test_a_file_prompt_source_cannot_reach_outside_the_repository(value):
         resolver._hash_prompt_source(PromptSource(kind="file", value=value))
 
 
-def test_an_absent_fixture_tree_is_named_not_reported_as_a_missing_profile(monkeypatch):
-    """The Dockerfile ships `tests/fixtures/resolver/` explicitly, so the
-    tree is present in the image as well as in a checkout — its absence is
-    not a normal condition in either.
+def test_an_absent_catalog_is_named_not_reported_as_a_missing_profile(monkeypatch):
+    """CI checks mctl-gitops out, the Argo CWFT clones it and points
+    MCTL_GITOPS_ROOT at it, and a developer has it as a sibling — so its
+    absence is not a normal condition anywhere.
 
     That is exactly why the message matters: the failure would otherwise
     surface as "missing execution profile issue-investigator-default",
     which reads like a catalog typo and sends the operator looking for one
-    file to add, when in fact nothing is there at all (claude P2 on #234).
+    file to add, when in fact no catalog is mounted at all (claude P2 on
+    #234, carried across the move to the real catalog).
     """
-    monkeypatch.setattr(resolver, "FIXTURES_DIR", resolver.REPO_ROOT / "no-such-dir")
+    monkeypatch.setattr(resolver, "CATALOG_DIR", resolver.REPO_ROOT / "no-such-dir")
 
     with pytest.raises(resolver.ResolverError) as excinfo:
         resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
 
     message = str(excinfo.value)
-    assert "no fixtures to resolve against" in message
+    assert "no catalog to resolve against" in message
+    assert "MCTL_GITOPS_ROOT" in message
     # The old, misleading message must not be what surfaces.
     assert "missing execution profile" not in message
 
@@ -488,3 +640,75 @@ def test_the_recorded_hash_describes_the_bytes_that_were_parsed(tmp_path, monkey
     # the parsed name.
     assert calls["n"] == 1
     assert definition.content_hash == "sha256:" + hashlib.sha256(original).hexdigest()
+
+
+def test_semver_matches_the_mctl_gitops_implementation():
+    """`_version_satisfies` duplicates mctl-gitops' `version_satisfies`.
+
+    There is no package shared between the two repositories, so the
+    duplication is unavoidable — but it must not stay an assumption. Both
+    evaluate the SAME constraint against the SAME catalog: gitops CI decides
+    whether a binding is valid, this resolver decides whether it resolves,
+    and a disagreement means one of them accepts a pair the other rejects
+    while both report success.
+
+    So the real script is loaded and the two are compared over a table that
+    includes the boundary cases a hand-rolled comparator gets wrong:
+    exclusive vs inclusive bounds, unequal component counts (zero-padding),
+    and a multi-comparator range.
+    """
+    _require_real_catalog()
+    script = resolver.GITOPS_ROOT.parent / "scripts" / "validate-agent-platform.py"
+    if not script.is_file():
+        pytest.fail(f"cannot cross-check semver: {script} is missing")
+    spec = importlib.util.spec_from_file_location("_gitops_validator", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cases = [
+        ("1.0.0", ">=1.0.0 <2.0.0"),
+        ("1.9.9", ">=1.0.0 <2.0.0"),
+        ("2.0.0", ">=1.0.0 <2.0.0"),
+        ("0.9.9", ">=1.0.0 <2.0.0"),
+        ("1.0", ">=1.0.0"),
+        ("1", ">=1.0.0 <2.0.0"),
+        ("1.0.0", "<=1.0.0"),
+        ("1.0.1", "<=1.0.0"),
+        ("1.0.0", "==1.0.0"),
+        ("1.0.0.1", ">1.0.0"),
+        ("10.0.0", ">=9.0.0 <11.0.0"),
+        ("1.2.3", ">1.2.2 <1.2.4"),
+    ]
+    for version, constraint in cases:
+        mine = resolver._version_satisfies(
+            version, constraint, path=Path("x"), field_path="compatibility"
+        )
+        theirs = module.version_satisfies(version, constraint)
+        assert mine == theirs, (
+            f"{version!r} vs {constraint!r}: resolver says {mine}, mctl-gitops says {theirs}"
+        )
+
+
+def test_the_catalogs_legacy_env_override_actually_overrides(monkeypatch):
+    """`modelPolicyRef.legacyEnvOverride` must reach the resolved model, not
+    merely be present in the profile.
+
+    The catalog schema could not express this field until gitops#1007, so
+    the profile described a model selection that `ISSUE_INVESTIGATOR_MODEL`
+    could silently replace. Asserting the OVERRIDE rather than the string
+    means a future profile that drops the field, or a resolver that reads it
+    and ignores it, both go red — a field that is declared but not wired is
+    the same lie as one that is missing.
+    """
+    _require_real_catalog()
+    task = resolver.Task(target_repository_sha="n" * 40)
+
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_MODEL", raising=False)
+    from_policy = resolver.execute("issue-investigator", task).model
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_MODEL", "claude-opus-4-8")
+    overridden = resolver.execute("issue-investigator", task).model
+
+    assert from_policy != "claude-opus-4-8", "pick a sentinel the policy would not return"
+    assert overridden == "claude-opus-4-8"

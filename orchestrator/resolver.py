@@ -4,13 +4,14 @@ ADR 007 (docs/adr/007-agent-definition-execution-profile-contract.md) defines
 `AgentDefinition`, an independently published `ExecutionProfile`, an atomic
 per-environment `ReleaseBinding`, and one immutable `ExecutionPlan` per run.
 This module implements that resolver for exactly one agent —
-`issue-investigator` — against checked-in, explicitly non-promotable
-compatibility fixtures (`tests/fixtures/resolver/`). It is a pilot, not
-production activation:
+`issue-investigator` — against the **mctl-gitops agent-platform catalog**
+(`platform-gitops/agent-platform/`), which mctlhq/mctl-agents#277 made the
+source of truth. It is a pilot, not production activation:
 
-- Real `mctl-api` registry/release resolution is mctlhq/mctl-gitops#950's
-  job. This module never calls it and never invents a substitute — every
-  input it reads is a file already reviewed and committed to this repo.
+- Real `mctl-api` registry/release resolution is still future work. This
+  module never calls it and never invents a substitute — every input it
+  reads is a file already reviewed and committed to one of the two
+  repositories.
 - `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`
   (orchestrator/run_issue_investigator.py) is opt-in; the default stays
   `legacy`, which does not import or call this module at all.
@@ -19,18 +20,35 @@ production activation:
   `ResolverError` before Argo submission. It never falls back to a
   baked-in CWFT default, and a `ResolverError` never triggers legacy mode —
   that switch is only ever explicit operator/env configuration.
-- Fixture files under `tests/fixtures/resolver/` are marked
-  `promotable: false` (profiles) / `bindingSource: compatibility-fixture`
-  + `promotable: false` (releases) and this module refuses to load a
-  fixture missing either marker. They must never be read as registry or
-  production-activation state.
+- The catalog's release bindings declare `bindingSource:
+  compatibility-fixture` and `promotable: false`, and this module refuses to
+  load one missing either marker. A `bindingSource: registry` intent must
+  not resolve here: there is no registry client behind it.
 
-`ExecutionPlan` identifiers (definition/profile version, release revision,
-hashes, target SHA) are a pure function of the fixture files' committed
-content plus the caller's `Task` — the same binding fixture and the same
-task/target SHA always resolve to the identical plan, and a later edit to
-the profile/definition without also updating the release binding's pinned
-hashes fails closed instead of silently promoting a different pair.
+**What the version identifiers do and do not guarantee.** Until #277 step 4
+the profile lived under `tests/fixtures/` and its "version" WAS the sha256
+of the file, so editing a profile without re-pinning its binding could not
+resolve — drift was impossible by construction. The catalog versions
+profiles with a declared `spec.version` instead. That is a claim about the
+content rather than the content itself: a profile edited without a version
+bump resolves exactly as before, and nothing here detects it. Closing that
+needs a mctl-gitops CI check comparing a profile's diff against its version
+bump; it is not something this repository can do.
+
+What this module can check, and does, is the pair of cross-repository
+claims neither repository's own CI is able to reach:
+
+- the binding's `spec.definition.profileCompatibility` still matches the
+  definition's own `executionProfileRef.compatibility` — the binding schema
+  documents that mirror as necessary "because mctl-gitops CI cannot read the
+  mctl-agents source file", which makes an unchecked mirror two sources of
+  truth wearing one name;
+- the binding's `spec.profile.version` still matches the profile's declared
+  `spec.version`, and that version satisfies the definition's range.
+
+`ExecutionPlan` also records the sha256 of every file it actually read, as
+provenance rather than as a gate — so a plan says what it was built from
+even where nothing forced those bytes to match a version number.
 """
 from __future__ import annotations
 
@@ -39,6 +57,8 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,18 +67,39 @@ from typing import Any, cast
 import yaml
 
 from config.model_policy import DEFAULT_POLICY_PATH, resolve_model
-from orchestrator.manifest import SUPPORTED_RUNTIME_TYPE, PromptSource
 from orchestrator.manifest import ManifestError as _ManifestError
+from orchestrator.manifest import PromptSource
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITIONS_DIR = REPO_ROOT / "agents" / "_manifests"
-FIXTURES_DIR = REPO_ROOT / "tests" / "fixtures" / "resolver"
-PROFILES_FIXTURE_DIR = FIXTURES_DIR / "profiles"
-RELEASES_FIXTURE_DIR = FIXTURES_DIR / "releases"
+
+# The mctl-gitops agent-platform catalog. Same resolution rule as
+# orchestrator/validate_manifest.py's GITOPS_ROOT, deliberately: one way to
+# find that repo, not two that can disagree. `MCTL_GITOPS_ROOT` is what CI
+# and the Argo CWFT set (the image's own root is /app, so the sibling
+# fallback below would resolve to /mctl-gitops and find nothing); the
+# fallback is the layout a developer has locally.
+GITOPS_ROOT = Path(
+    os.environ.get("MCTL_GITOPS_ROOT") or REPO_ROOT.parent / "mctl-gitops" / "platform-gitops"
+)
+CATALOG_DIR = GITOPS_ROOT / "agent-platform"
+CATALOG_PROFILES_DIR = CATALOG_DIR / "execution-profiles"
+CATALOG_RELEASES_DIR = CATALOG_DIR / "releases"
 
 SUPPORTED_DEFINITION_API_VERSION = "agents.mctl.ai/v1alpha2"
 SUPPORTED_PROFILE_API_VERSION = "agents.mctl.ai/v1alpha2"
-DEFAULT_ENVIRONMENT = "production"
+SUPPORTED_BINDING_KIND = "ReleaseBindingIntent"
+
+# The only environment the catalog publishes today. `production` exists in
+# the binding schema's enum but no production binding is written, and the
+# resolver must not silently resolve one environment while claiming another.
+DEFAULT_ENVIRONMENT = "shadow"
+
+# Mirrors mctl-gitops scripts/validate-agent-platform.py's COMPAT_RE. The
+# duplication is real and deliberate — there is no package shared between
+# the two repositories — so it is not left as an assumption: a test loads
+# that script and asserts both implementations agree on a table of cases.
+_COMPAT_RE = re.compile(r"(>=|<=|==|>|<)\s*([0-9]+(?:\.[0-9]+)*)")
 
 # "unbounded limit" (mctlhq/mctl-agents#227 acceptance criteria) means missing
 # OR unreasonably large, not just missing — these are sanity ceilings, not
@@ -108,10 +149,15 @@ class AgentDefinition:
 
 @dataclass(frozen=True)
 class ExecutionProfile:
-    """Parsed `ExecutionProfile` compatibility fixture. See ADR 007 sec. 2
-    for the field list this mirrors."""
+    """Parsed `ExecutionProfile` from the mctl-gitops agent-platform
+    catalog. See ADR 007 sec. 2 for the field list this mirrors."""
 
     name: str
+    # spec.version -- the catalog's declared semver, which the release
+    # binding references and the definition's compatibility range is
+    # evaluated against. See load_profile on what this does and does not
+    # guarantee compared to the content hash it replaced.
+    version: str
     model_policy_task: str
     model_policy_legacy_env_override: str | None
     skills: tuple[str, ...]
@@ -132,7 +178,7 @@ class ExecutionProfile:
 
 @dataclass(frozen=True)
 class ReleaseBinding:
-    """Parsed atomic environment `ReleaseBinding` compatibility fixture."""
+    """Parsed `ReleaseBindingIntent` from the mctl-gitops catalog."""
 
     agent: str
     environment: str
@@ -141,6 +187,13 @@ class ReleaseBinding:
     definition_version: str
     profile_name: str
     profile_version: str
+    # spec.definition.profileCompatibility — the catalog's MIRROR of the
+    # definition's own executionProfileRef.compatibility. The binding schema
+    # documents why it is duplicated there: mctl-gitops CI cannot read the
+    # mctl-agents source file. This resolver can read both, so execute()
+    # checks the mirror is honest — the one guarantee neither repository's
+    # own CI is able to give.
+    profile_compatibility: str
     release_revision: int
     registry_lifecycle: Mapping[str, str]
     path: Path
@@ -153,8 +206,15 @@ class ExecutionPlan:
     (mctlhq/mctl-agents#227 design.md) and ADR 007 sec. 5 verbatim."""
 
     agent: str
+    # The binding's registry version identifiers, and separately the sha256
+    # of the bytes actually read. Under the fixture these were the same
+    # value; in the catalog they are not, and conflating them would let a
+    # plan log a version number as if it were provenance. The hashes are
+    # recorded, never gated on — see load_profile.
     definition_version: str
+    definition_content_hash: str
     profile_version: str
+    profile_content_hash: str
     release_revision: int
     binding_source: str
     model: str
@@ -181,7 +241,9 @@ class ExecutionPlan:
         return {
             "agent": self.agent,
             "definition_version": self.definition_version,
+            "definition_content_hash": self.definition_content_hash,
             "profile_version": self.profile_version,
+            "profile_content_hash": self.profile_content_hash,
             "release_revision": self.release_revision,
             "binding_source": self.binding_source,
             "model": self.model,
@@ -260,6 +322,57 @@ def _require_mapping(value: Any, *, path: Path, field_path: str) -> dict[str, An
     return value
 
 
+def _parse_version(version: str, *, path: Path, field_path: str) -> tuple[int, ...]:
+    """Parse a dotted numeric version into a comparable tuple.
+
+    Mirrors mctl-gitops' `parse_version`, including its refusal of
+    non-numeric components: a version like `1.0.0-rc1` is rejected rather
+    than silently ordered, because two implementations that disagree about
+    ordering are worse than one that refuses.
+    """
+    parts = version.split(".")
+    out: list[int] = []
+    for part in parts:
+        if not part.isdigit():
+            raise ResolverError(
+                f"{path}: {field_path} {version!r} has non-numeric component {part!r}"
+            )
+        out.append(int(part))
+    return tuple(out)
+
+
+def _version_satisfies(version: str, constraint: str, *, path: Path, field_path: str) -> bool:
+    """Whether `version` satisfies a space-separated comparator constraint
+    such as `>=1.0.0 <2.0.0`.
+
+    Semantics copied from mctl-gitops' `version_satisfies`: every comparator
+    must hold, and unequal-length versions are zero-padded so `1.0` and
+    `1.0.0` compare equal. An unparseable constraint raises rather than
+    defaulting either way — a constraint nobody can evaluate must not
+    resolve.
+    """
+    matches = _COMPAT_RE.findall(constraint)
+    if not matches:
+        raise ResolverError(f"{path}: {field_path} {constraint!r} is not a parseable constraint")
+    actual = _parse_version(version, path=path, field_path="version")
+    for op, bound_text in matches:
+        bound = _parse_version(bound_text, path=path, field_path=field_path)
+        width = max(len(actual), len(bound))
+        a = actual + (0,) * (width - len(actual))
+        b = bound + (0,) * (width - len(bound))
+        if op == ">=" and not a >= b:
+            return False
+        if op == "<=" and not a <= b:
+            return False
+        if op == ">" and not a > b:
+            return False
+        if op == "<" and not a < b:
+            return False
+        if op == "==" and not a == b:
+            return False
+    return True
+
+
 def _bounded(value: Any, *, maximum: float) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= maximum
 
@@ -327,13 +440,14 @@ def load_definition(agent: str) -> AgentDefinition:
 
 
 def load_profile(name: str) -> ExecutionProfile:
-    """Load and validate one checked-in `ExecutionProfile` compatibility
-    fixture. Fails closed on every unbounded/missing/unapproved field this
-    pilot's acceptance criteria name — a profile fixture missing any of
-    these is treated the same as a missing profile, not silently accepted."""
-    path = PROFILES_FIXTURE_DIR / f"{name}.yaml"
+    """Load and validate one `ExecutionProfile` from the mctl-gitops
+    agent-platform catalog. Fails closed on every unbounded/missing/
+    unapproved field this pilot's acceptance criteria name — a profile
+    missing any of these is treated the same as a missing profile, not
+    silently accepted."""
+    path = CATALOG_PROFILES_DIR / name / "profile.yaml"
     if not path.is_file():
-        raise ResolverError(f"missing execution profile {name!r}: no fixture at {path}")
+        raise ResolverError(f"missing execution profile {name!r}: no profile at {path}")
     document, content_hash = _read_yaml_and_hash(path)
     if document.get("apiVersion") != SUPPORTED_PROFILE_API_VERSION:
         raise ResolverError(f"{path}: unsupported profile apiVersion {document.get('apiVersion')!r}")
@@ -344,12 +458,22 @@ def load_profile(name: str) -> ExecutionProfile:
     spec = _require_mapping(document.get("spec") or {}, path=path, field_path="spec")
     profile_name = metadata.get("name")
     if profile_name != name:
-        raise ResolverError(f"{path}: metadata.name {profile_name!r} must match fixture file name {name!r}")
-    if metadata.get("promotable") is not False:
         raise ResolverError(
-            f"{path}: metadata.promotable must be explicit false — a compatibility fixture must "
-            "never be interpretable as promotable registry state"
+            f"{path}: metadata.name {profile_name!r} must match its directory name {name!r}"
         )
+
+    # The catalog's declared version, and the whole reason this loader also
+    # returns a content hash it no longer gates on. Under the fixture this
+    # replaced, the version WAS the sha256 of the file, so a profile edit
+    # without re-pinning the binding could not resolve. `spec.version` is a
+    # claim about the content instead: edit the profile without bumping it
+    # and every check here still passes. That gap is real and is not closed
+    # from this repo -- it needs a mctl-gitops CI check comparing a profile
+    # diff against its version bump. The content hash stays in the
+    # ExecutionPlan as provenance (what was actually read), never as a gate.
+    profile_version = spec.get("version")
+    if not isinstance(profile_version, str) or not profile_version:
+        raise ResolverError(f"{path}: spec.version is required")
 
     model_policy_ref = _require_mapping(
         spec.get("modelPolicyRef") or {}, path=path, field_path="spec.modelPolicyRef"
@@ -375,9 +499,14 @@ def load_profile(name: str) -> ExecutionProfile:
     budget = cast("int | float", budget)
     timeout = cast("int | float", timeout)
 
+    # No spec.runtime.type check: the catalog schema is
+    # `additionalProperties: false` and declares no such field, so a profile
+    # carrying one would fail mctl-gitops validation. Every profile in this
+    # catalog is claude-agent-sdk by construction -- what actually bounds
+    # that is the sandbox allowlist below plus policy.yaml's
+    # approvedSandboxes, not a self-declared string. SUPPORTED_RUNTIME_TYPE
+    # is still what manifest.py stamps on the resolved AgentManifest.
     runtime = _require_mapping(spec.get("runtime") or {}, path=path, field_path="spec.runtime")
-    if runtime.get("type") != SUPPORTED_RUNTIME_TYPE:
-        raise ResolverError(f"{path}: spec.runtime.type must be {SUPPORTED_RUNTIME_TYPE!r}")
     entrypoint = runtime.get("entrypoint")
     options_builder = runtime.get("optionsBuilder")
     if not entrypoint or not options_builder:
@@ -392,15 +521,25 @@ def load_profile(name: str) -> ExecutionProfile:
             "and approved=true — an unapproved sandbox must not resolve"
         )
 
+    # Catalog shape: `approval.requiredBefore` is a list of gate names (an
+    # empty list meaning "no gate"), where the fixture had a boolean
+    # `approval.required`. Emptiness is therefore NOT an error here -- the
+    # investigator legitimately has no approval gate -- but the key must be
+    # present and a list, so a profile that simply omits its approval
+    # posture cannot resolve.
     approval = spec.get("approval")
-    if not isinstance(approval, dict) or "required" not in approval:
-        raise ResolverError(f"{path}: spec.approval.required is required")
-    evidence = spec.get("evidence")
+    if not isinstance(approval, dict) or not isinstance(approval.get("requiredBefore"), list):
+        raise ResolverError(f"{path}: spec.approval.requiredBefore must be a list")
+    evidence_block = spec.get("evidence")
+    if not isinstance(evidence_block, dict):
+        raise ResolverError(f"{path}: spec.evidence must be a mapping with a 'required' list")
+    evidence = evidence_block.get("required")
     if not isinstance(evidence, list) or not evidence:
-        raise ResolverError(f"{path}: spec.evidence must be a non-empty list")
+        raise ResolverError(f"{path}: spec.evidence.required must be a non-empty list")
 
     return ExecutionProfile(
         name=profile_name,
+        version=profile_version,
         model_policy_task=model_policy_task,
         model_policy_legacy_env_override=model_policy_ref.get("legacyEnvOverride"),
         skills=tuple(spec.get("skills") or []),
@@ -420,52 +559,85 @@ def load_profile(name: str) -> ExecutionProfile:
     )
 
 
-def load_release_binding(agent: str) -> ReleaseBinding:
-    """Load one atomic environment `ReleaseBinding` compatibility fixture.
-    `execute()` is the only caller that also cross-checks its pinned hashes
-    against the live definition/profile files — this function only checks
-    the fixture's own shape."""
-    path = RELEASES_FIXTURE_DIR / f"{agent}.yaml"
+def load_release_binding(agent: str, environment: str = DEFAULT_ENVIRONMENT) -> ReleaseBinding:
+    """Load one atomic `ReleaseBindingIntent` from the mctl-gitops catalog.
+    `execute()` is the only caller that also cross-checks it against the
+    live definition/profile — this function only checks its own shape."""
+    path = CATALOG_RELEASES_DIR / environment / f"{agent}.yaml"
     if not path.is_file():
-        raise ResolverError(f"missing release: no compatibility-fixture binding for {agent!r} at {path}")
+        raise ResolverError(
+            f"missing release: no {environment!r} binding for {agent!r} at {path}"
+        )
     document = _read_yaml(path)
-    if document.get("bindingSource") != "compatibility-fixture":
-        raise ResolverError(f"{path}: bindingSource must be 'compatibility-fixture'")
-    if document.get("promotable") is not False:
-        raise ResolverError(f"{path}: promotable must be explicit false")
+    if document.get("apiVersion") != SUPPORTED_DEFINITION_API_VERSION:
+        raise ResolverError(f"{path}: unsupported binding apiVersion {document.get('apiVersion')!r}")
+    if document.get("kind") != SUPPORTED_BINDING_KIND:
+        raise ResolverError(f"{path}: kind must be {SUPPORTED_BINDING_KIND!r}")
 
-    environment = document.get("environment")
-    if not environment:
-        raise ResolverError(f"{path}: environment is required")
+    metadata = _require_mapping(document.get("metadata") or {}, path=path, field_path="metadata")
+    spec = _require_mapping(document.get("spec") or {}, path=path, field_path="spec")
+
+    # metadata.environment is the binding's OWN claim about which
+    # environment it is for. It must agree with the directory it was read
+    # from: releases/<env>/ is how it was found, and a file claiming
+    # `production` while sitting under shadow/ would otherwise resolve as
+    # shadow while logging production into the ExecutionPlan.
+    declared_environment = metadata.get("environment")
+    if declared_environment != environment:
+        raise ResolverError(
+            f"{path}: metadata.environment {declared_environment!r} does not match the "
+            f"directory it was read from ({environment!r})"
+        )
+    if metadata.get("agent") != agent:
+        raise ResolverError(
+            f"{path}: metadata.agent {metadata.get('agent')!r} does not match file name {agent!r}"
+        )
+
+    binding_source = spec.get("bindingSource")
+    if binding_source != "compatibility-fixture":
+        raise ResolverError(
+            f"{path}: spec.bindingSource must be 'compatibility-fixture' — this resolver has no "
+            "mctl-api registry client, so a 'registry' binding must not resolve here"
+        )
+    if spec.get("promotable") is not False:
+        raise ResolverError(f"{path}: spec.promotable must be explicit false")
 
     lifecycle = _require_mapping(
-        document.get("registryLifecycle") or {}, path=path, field_path="registryLifecycle"
+        spec.get("registryLifecycle") or {}, path=path, field_path="spec.registryLifecycle"
     )
     if lifecycle.get("definition") != "published" or lifecycle.get("profile") != "published":
         raise ResolverError(
-            f"{path}: registryLifecycle.definition and .profile must both be 'published' — a "
+            f"{path}: spec.registryLifecycle.definition and .profile must both be 'published' — a "
             "disabled/deprecated/draft version must not resolve"
         )
 
-    revision = document.get("releaseRevision")
+    revision = spec.get("bindingRevision")
     if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
-        raise ResolverError(f"{path}: releaseRevision must be a positive integer")
+        raise ResolverError(f"{path}: spec.bindingRevision must be a positive integer")
 
-    definition = _require_mapping(document.get("definition") or {}, path=path, field_path="definition")
-    profile = _require_mapping(document.get("profile") or {}, path=path, field_path="profile")
+    definition = _require_mapping(
+        spec.get("definition") or {}, path=path, field_path="spec.definition"
+    )
+    profile = _require_mapping(spec.get("profile") or {}, path=path, field_path="spec.profile")
     def_name, def_version = definition.get("name"), definition.get("version")
     prof_name, prof_version = profile.get("name"), profile.get("version")
+    profile_compatibility = definition.get("profileCompatibility")
     if not def_name or not def_version or not prof_name or not prof_version:
-        raise ResolverError(f"{path}: definition.{{name,version}} and profile.{{name,version}} are required")
+        raise ResolverError(
+            f"{path}: spec.definition.{{name,version}} and spec.profile.{{name,version}} are required"
+        )
+    if not profile_compatibility:
+        raise ResolverError(f"{path}: spec.definition.profileCompatibility is required")
 
     return ReleaseBinding(
         agent=agent,
         environment=environment,
-        binding_source=document["bindingSource"],
+        binding_source=binding_source,
         definition_name=def_name,
         definition_version=def_version,
         profile_name=prof_name,
         profile_version=prof_version,
+        profile_compatibility=profile_compatibility,
         release_revision=revision,
         registry_lifecycle=dict(lifecycle),
         path=path,
@@ -534,36 +706,35 @@ def _hash_prompt_source(source: PromptSource) -> str:
     raise ResolverError(f"unknown prompt source kind {source.kind!r}")
 
 
-def _require_fixtures_present() -> None:
-    """Say the real thing when the fixture tree is not where it should be.
+def _require_catalog_present() -> None:
+    """Say the real thing when the mctl-gitops catalog is not where it
+    should be.
 
-    `FIXTURES_DIR` lives under `tests/`, which is otherwise not shipped —
-    the Dockerfile copies exactly `tests/fixtures/resolver/` and nothing
-    else from that tree, deliberately. So its absence is not a normal
-    condition anywhere: not in a source checkout, and not in the image.
-    It means the build lost that COPY, or the resolver is running somewhere
+    Its absence is never a normal condition: CI checks the repository out,
+    the Argo CWFT clones it and sets `MCTL_GITOPS_ROOT` at it, and a
+    developer has it as a sibling. So absence means the checkout was lost,
+    the env var points somewhere wrong, or the resolver is running somewhere
     nobody designed for.
 
-    Defence in depth, then, rather than an expected path — but it earns its
-    keep by what the alternative reports. Without it the failure surfaces as
-    "missing execution profile issue-investigator-default", which reads like
-    a catalog typo and sends the operator looking for a file to add, when
-    the actual problem is that no fixtures exist at all.
+    Defence in depth, then — but it earns its keep by what the alternative
+    reports. Without it the failure surfaces as "missing execution profile
+    issue-investigator-default", which reads like a catalog typo and sends
+    the operator looking for a file to add, when the actual problem is that
+    no catalog is mounted at all.
     """
-    # Deliberately the fixture ROOT, not the two directories execute()
+    # Deliberately the catalog ROOT, not the two directories execute()
     # actually reads. Their absence is a real and different failure — a
     # missing profile or an unwritten release binding — which must keep
     # reporting itself as such; tests redirect those two paths and this
     # guard must not fire for them. What the root's absence uniquely means
-    # is "tests/ was never shipped here", i.e. the image.
-    if FIXTURES_DIR.is_dir():
+    # is "mctl-gitops is not here".
+    if CATALOG_DIR.is_dir():
         return
     raise ResolverError(
-        f"declarative resolver mode has no fixtures to resolve against: {FIXTURES_DIR} "
-        "does not exist. This is not a missing profile — the whole compatibility-fixture "
-        "tree is absent. In the image that means the Dockerfile's "
-        "`COPY tests/fixtures/resolver/` was lost; in a checkout it means the tree was "
-        "deleted. Set ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy to fall back explicitly."
+        f"declarative resolver mode has no catalog to resolve against: {CATALOG_DIR} does not "
+        "exist. This is not a missing profile — the whole mctl-gitops agent-platform catalog is "
+        "absent. Set MCTL_GITOPS_ROOT to the platform-gitops directory of a mctl-gitops "
+        "checkout, or set ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy to fall back explicitly."
     )
 
 
@@ -573,7 +744,7 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
     for every missing/ambiguous/disabled/incompatible/unbounded/unapproved
     condition ADR 007 and mctlhq/mctl-agents#227's acceptance criteria name.
     """
-    _require_fixtures_present()
+    _require_catalog_present()
 
     if not task.target_repository_sha or not task.target_repository_sha.strip():
         raise ResolverError("task.target_repository_sha is required and must be non-empty")
@@ -592,11 +763,21 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
             f"not match resolved definition {definition.name!r}"
         )
     definition_content_hash = definition.content_hash
-    if binding.definition_version != definition_content_hash:
+
+    # The binding mirrors the definition's own compatibility constraint,
+    # because mctl-gitops CI cannot read agents/_manifests/*/agent.yaml (the
+    # binding schema says so in as many words). This process CAN read both,
+    # which makes it the only place the mirror is checkable at all. An
+    # unchecked mirror is two sources of truth wearing one name: gitops CI
+    # would evaluate compatibility against its copy while the resolver used
+    # the real one, and they would agree right up until someone edited one.
+    if binding.profile_compatibility != definition.execution_profile_compatibility:
         raise ResolverError(
-            f"ambiguous version: release binding definition.version {binding.definition_version!r} "
-            f"does not match the current definition file content ({definition_content_hash!r}) — "
-            "the fixture is stale or the definition changed without updating the binding"
+            f"mirror drift: release binding definition.profileCompatibility "
+            f"{binding.profile_compatibility!r} does not match the definition's own "
+            f"executionProfileRef.compatibility {definition.execution_profile_compatibility!r} "
+            f"({definition.path}) — mctl-gitops evaluates compatibility against its mirrored "
+            "copy, so a stale mirror means the two repositories disagree silently"
         )
 
     if binding.profile_name != definition.execution_profile_name:
@@ -606,18 +787,23 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
             f"{binding.profile_name!r}"
         )
     profile = load_profile(binding.profile_name)
-    if binding.profile_version != profile.content_hash:
+    if binding.profile_version != profile.version:
         raise ResolverError(
             f"ambiguous version: release binding profile.version {binding.profile_version!r} does "
-            f"not match the current profile file content ({profile.content_hash!r}) — the fixture "
-            "is stale or the profile changed without updating the binding"
+            f"not match the profile's declared spec.version ({profile.version!r}) — the binding is "
+            "stale or the profile was versioned without re-binding"
         )
 
-    if definition.execution_profile_compatibility != profile.content_hash:
+    if not _version_satisfies(
+        profile.version,
+        definition.execution_profile_compatibility,
+        path=definition.path,
+        field_path="spec.executionProfileRef.compatibility",
+    ):
         raise ResolverError(
             f"compatibility mismatch: definition executionProfileRef.compatibility "
             f"{definition.execution_profile_compatibility!r} does not accept the concrete "
-            f"selected profile version {profile.content_hash!r} — compatibility is evaluated "
+            f"selected profile version {profile.version!r} — compatibility is evaluated "
             "against the resolved profile version, not a profile-owned range"
         )
 
@@ -629,8 +815,10 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
 
     return ExecutionPlan(
         agent=definition.name,
-        definition_version=definition_content_hash,
-        profile_version=profile.content_hash,
+        definition_version=binding.definition_version,
+        definition_content_hash=definition_content_hash,
+        profile_version=profile.version,
+        profile_content_hash=profile.content_hash,
         release_revision=binding.release_revision,
         binding_source=binding.binding_source,
         model=model_selection.model,
