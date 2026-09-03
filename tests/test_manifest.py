@@ -10,6 +10,7 @@ here has a manifest and vice versa."
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib
 import os
 import re
@@ -661,10 +662,15 @@ def test_a_stale_pin_is_reported(tmp_path, monkeypatch) -> None:
     [
         ("/etc/passwd", "escapes"),
         ("../../../../etc/passwd", "escapes"),
-        ("agents/_manifests/nope/agent.yaml", "does not exist"),
+        # Both of these are "not shepherd's manifest" — one names a file that
+        # does not exist, the other a real manifest belonging to a different
+        # agent. The path cross-check subsumes existence, and says the more
+        # useful thing: the problem is not that a file is missing, it is that
+        # this binding points somewhere it must not.
+        ("agents/_manifests/nope/agent.yaml", "is not shepherd's manifest"),
         ("agents/_manifests/implementer/agent.yaml", "is not shepherd's manifest"),
     ],
-    ids=["absolute", "traversal", "missing", "wrong-agent"],
+    ids=["absolute", "traversal", "nonexistent", "wrong-agent"],
 )
 def test_a_binding_cannot_pin_the_wrong_file(tmp_path, monkeypatch, path, expected) -> None:
     """`sourceManifest.path` comes from another repository, so it is checked
@@ -758,3 +764,107 @@ def test_a_missing_release_checkout_fails_under_ci(tmp_path, monkeypatch) -> Non
     monkeypatch.setenv("CI", "true")
     errors = check_binding_pins_match_definitions(MANIFESTS)
     assert errors and "absent" in errors[0]
+
+
+@pytest.mark.parametrize(
+    ("agent_field", "expected"),
+    [
+        ({"version": "1"}, "spec.definition.name is required"),
+        ({"name": "typoed-agent", "version": "1"}, "unknown agent"),
+        (None, "spec.definition.name is required"),
+    ],
+    ids=["name-absent", "name-unknown", "definition-absent"],
+)
+def test_an_unresolvable_agent_is_an_error_not_a_skipped_cross_check(
+    tmp_path, monkeypatch, agent_field, expected
+) -> None:
+    """A binding whose agent cannot be resolved must fail.
+
+    The first version fell through -- `if agent_name and agent_name in
+    manifests:` -- so a binding with an absent, typo'd or renamed
+    `definition.name` skipped the path cross-check entirely and was accepted
+    as long as its hash matched SOME real file. That is precisely the "right
+    hash of the wrong manifest" case the cross-check exists to refuse, and it
+    was reachable by a typo. Both reviewers on #294 found it independently and
+    both noted no test covered the path.
+
+    The binding here pins shepherd's REAL path and hash, so nothing else can
+    fail: the only reason this must error is the unresolvable agent.
+    """
+    releases = tmp_path / "releases"
+    real = MANIFESTS["shepherd"].path
+    binding = _write_binding(
+        releases, "shepherd",
+        path=real.relative_to(validate_manifest_module.REPO_ROOT).as_posix(),
+        content_hash="sha256:" + hashlib.sha256(real.read_bytes()).hexdigest(),
+    )
+    document = yaml.safe_load(binding.read_text(encoding="utf-8"))
+    if agent_field is None:
+        del document["spec"]["definition"]
+    else:
+        document["spec"]["definition"] = agent_field
+    binding.write_text(yaml.safe_dump(document), encoding="utf-8")
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases)
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert any(expected in e for e in errors), errors
+
+
+def test_a_control_character_in_the_path_is_reported_not_crashed(tmp_path, monkeypatch) -> None:
+    """YAML permits control characters in a double-quoted scalar, and a NUL
+    raises `ValueError: embedded null byte` inside pathlib -- before any check
+    of ours runs.
+
+    Path construction used to sit OUTSIDE the try/except, so that ValueError
+    escaped the function, aborted main(), and hid every other binding's result
+    and every later check (claude P2 on #294) -- the exact failure the
+    malformed-binding test above claims this function guards against.
+    """
+    releases = tmp_path / "releases" / "shadow"
+    releases.mkdir(parents=True)
+    (releases / "shepherd.yaml").write_text(
+        'apiVersion: agents.mctl.ai/v1alpha2\n'
+        'kind: ReleaseBindingIntent\n'
+        'metadata: {agent: shepherd, environment: shadow}\n'
+        'spec:\n'
+        '  sourceManifest:\n'
+        '    repo: mctlhq/mctl-agents\n'
+        '    path: "\\0/etc/passwd"\n'
+        f'    contentHash: "sha256:{"0" * 64}"\n'
+        '  definition: {name: shepherd, version: "1"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases.parent
+    )
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert errors, "a NUL in the path produced no error at all"
+    assert all("shepherd.yaml" in e for e in errors), errors
+
+
+def test_bindings_for_another_repository_are_skipped_but_never_silently(
+    tmp_path, monkeypatch
+) -> None:
+    """A binding for a different repository cannot be verified here — its file
+    is not in this checkout — so it is skipped. But if EVERY binding is
+    skipped that way, the loop would return [] having verified nothing and
+    read as success (agy P3 on #294). Emptiness of the verified set is
+    therefore its own error, the same shape as the empty-directory guard.
+    """
+    releases = tmp_path / "releases"
+    binding = _write_binding(
+        releases, "someone-else",
+        path="agents/_manifests/shepherd/agent.yaml",
+        content_hash="sha256:" + "0" * 64,
+    )
+    document = yaml.safe_load(binding.read_text(encoding="utf-8"))
+    document["spec"]["sourceManifest"]["repo"] = "mctlhq/some-other-repo"
+    binding.write_text(yaml.safe_dump(document), encoding="utf-8")
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_RELEASES_DIR", releases)
+
+    errors = check_binding_pins_match_definitions(MANIFESTS)
+
+    assert errors and "none targets mctlhq/mctl-agents" in errors[0], errors

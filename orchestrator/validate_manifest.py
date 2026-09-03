@@ -651,7 +651,17 @@ def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) ->
         ]
 
     errors: list[str] = []
+    checked = 0
     for binding_path in binding_paths:
+        # Everything that touches values from the other repository lives
+        # inside this block, path construction and the final read included.
+        # `declared_path` is a YAML scalar from mctl-gitops, and a
+        # double-quoted scalar may carry control characters — `path: "\0/x"`
+        # raises ValueError on `Path.__truediv__` before any check of ours
+        # runs. Outside the guard that ValueError aborts main() and hides
+        # every OTHER binding's result plus every later check, which is the
+        # exact failure this function's malformed-binding test claims to
+        # prevent (claude P2 on #294).
         try:
             document = yaml.safe_load(binding_path.read_text(encoding="utf-8"))
             if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
@@ -660,45 +670,63 @@ def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) ->
             source_manifest = spec.get("sourceManifest")
             if not isinstance(source_manifest, dict):
                 raise ManifestError("spec.sourceManifest must be a mapping")
+            declared_repo = source_manifest.get("repo")
             declared_path = source_manifest.get("path")
             declared_hash = source_manifest.get("contentHash")
             definition = spec.get("definition")
             agent_name = definition.get("name") if isinstance(definition, dict) else None
-        except Exception as exc:  # noqa: BLE001 - report and continue
-            errors.append(f"{binding_path}: {exc}")
-            continue
 
-        if not isinstance(declared_hash, str) or not declared_hash.startswith("sha256:"):
-            errors.append(
-                f"{binding_path}: spec.sourceManifest.contentHash is missing or not a "
-                f"'sha256:...' pin (got {declared_hash!r}); the definition half of this "
-                "binding is unpinned"
-            )
-            continue
-        if not isinstance(declared_path, str) or not declared_path:
-            errors.append(f"{binding_path}: spec.sourceManifest.path is required")
-            continue
+            # A binding for a DIFFERENT repository cannot be verified from
+            # here — its file is not in this checkout. Skipping is a fact,
+            # not a policy choice. It is still counted, though: if every
+            # binding were skipped this way the loop would return [] having
+            # verified nothing, and the guard below turns that into an error
+            # rather than a green run (agy P3 on #294).
+            if declared_repo != "mctlhq/mctl-agents":
+                continue
 
-        # Refuse an absolute path or one that climbs out of the repository
-        # before it is joined: `REPO_ROOT / "/etc/passwd"` is "/etc/passwd",
-        # and this file comes from a different repository.
-        target = (REPO_ROOT / declared_path).resolve()
-        if REPO_ROOT not in target.parents:
-            errors.append(
-                f"{binding_path}: spec.sourceManifest.path {declared_path!r} escapes "
-                "this repository"
-            )
-            continue
-        if not target.is_file():
-            errors.append(
-                f"{binding_path}: spec.sourceManifest.path {declared_path!r} does not "
-                "exist in mctl-agents — the binding names a definition that is not here"
-            )
-            continue
+            if not isinstance(declared_hash, str) or not declared_hash.startswith("sha256:"):
+                errors.append(
+                    f"{binding_path}: spec.sourceManifest.contentHash is missing or not a "
+                    f"'sha256:...' pin (got {declared_hash!r}); the definition half of this "
+                    "binding is unpinned"
+                )
+                continue
+            if not isinstance(declared_path, str) or not declared_path:
+                errors.append(f"{binding_path}: spec.sourceManifest.path is required")
+                continue
 
-        # Cross-check the path against the agent it claims to bind, so a
-        # binding cannot pin the RIGHT hash of the WRONG file and pass.
-        if agent_name and agent_name in manifests:
+            # The agent must resolve, and an unresolvable one is an ERROR, not
+            # a skipped cross-check. Falling through left the "right hash of
+            # the wrong manifest" case wide open for any binding whose
+            # definition.name was absent, typo'd or renamed — defeating the
+            # one comparison this block exists for. Both reviewers on #294
+            # found it independently; the sibling check above already treats
+            # an unknown agent this way.
+            if not agent_name:
+                errors.append(
+                    f"{binding_path}: spec.definition.name is required — without it the "
+                    "path below is checked against nothing"
+                )
+                continue
+            if agent_name not in manifests:
+                errors.append(
+                    f"{binding_path}: maps to unknown agent {agent_name!r}; it has no "
+                    "manifest in this repository, so its pin cannot be verified"
+                )
+                continue
+
+            # Refuse an absolute path or one that climbs out of the repository
+            # before it is joined: `REPO_ROOT / "/etc/passwd"` is "/etc/passwd",
+            # and this value comes from a different repository.
+            target = (REPO_ROOT / declared_path).resolve()
+            if REPO_ROOT not in target.parents:
+                errors.append(
+                    f"{binding_path}: spec.sourceManifest.path {declared_path!r} escapes "
+                    "this repository"
+                )
+                continue
+
             expected_path = manifests[agent_name].path.relative_to(REPO_ROOT).as_posix()
             if declared_path != expected_path:
                 errors.append(
@@ -706,14 +734,33 @@ def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) ->
                     f"{agent_name}'s manifest ({expected_path!r})"
                 )
                 continue
+            # No `is_file()` branch: `expected_path` is derived from a manifest
+            # this process already loaded, so a path equal to it exists by
+            # construction and the check above rejects every path that is not.
+            # A dead branch reads as a guard and is not one — if the read
+            # somehow fails anyway, the try/except reports it as this
+            # binding's error rather than aborting the run.
+            actual = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+            checked += 1
+            if actual != declared_hash:
+                errors.append(
+                    f"{binding_path}: spec.sourceManifest.contentHash {declared_hash} does not "
+                    f"match {declared_path} ({actual}). The definition was edited without "
+                    "re-pinning the binding — re-pin it in mctl-gitops."
+                )
+        except Exception as exc:  # noqa: BLE001 - report and continue
+            errors.append(f"{binding_path}: {exc}")
+            continue
 
-        actual = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
-        if actual != declared_hash:
-            errors.append(
-                f"{binding_path}: spec.sourceManifest.contentHash {declared_hash} does not "
-                f"match {declared_path} ({actual}). The definition was edited without "
-                "re-pinning the binding — re-pin it in mctl-gitops."
-            )
+    # Bindings existed but not one of them was verifiable here. Without this
+    # the function returns [] and reads as success — the same silent-no-op
+    # shape as the empty directory above, reached by every binding naming
+    # another repository.
+    if not checked and not errors:
+        errors.append(
+            f"{GITOPS_CATALOG_RELEASES_DIR} holds {len(binding_paths)} binding(s) but none "
+            "targets mctlhq/mctl-agents, so no pin was verified."
+        )
     return errors
 
 
