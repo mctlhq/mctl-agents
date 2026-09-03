@@ -13,6 +13,7 @@ the helper was written to end:
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from datetime import timedelta
@@ -363,3 +364,115 @@ class TestConvergenceRetries:
         messages = [r.getMessage() for r in caplog.records]
         assert any("spec and overlap policy are current" in m for m in messages), messages
         assert not any("converged to the declared" in m for m in messages), messages
+
+
+class _FakeCluster:
+    """One Temporal cluster seen by several worker replicas at once.
+
+    `_FakeClient` above models a single process. Criterion 3 of #152 —
+    "scaling worker replicas does not create duplicate schedules or duplicate
+    runs" — is about what happens when two of them boot together, which a
+    per-process fake cannot express: both would see `existing=None` and both
+    would "create" into their own list.
+    """
+
+    def __init__(self, existing: Schedule | None = None) -> None:
+        self.schedules: dict[str, Schedule] = {}
+        if existing is not None:
+            self.schedules[SCHEDULE_ID] = existing
+        self.create_attempts: list[str] = []
+        self.updates: list[object] = []
+
+
+class _ReplicaClient:
+    """One replica's view of `_FakeCluster` — the race is in the shared dict."""
+
+    def __init__(self, cluster: _FakeCluster) -> None:
+        self.cluster = cluster
+
+    async def create_schedule(self, schedule_id: str, schedule: Schedule) -> None:
+        self.cluster.create_attempts.append(schedule_id)
+        # Yield between the check and the write, which is where the race
+        # lives. Without it asyncio would run each call to completion and the
+        # test would pass on a client that had no idempotency at all.
+        await asyncio.sleep(0)
+        if schedule_id in self.cluster.schedules:
+            raise ScheduleAlreadyRunningError
+        self.cluster.schedules[schedule_id] = schedule
+
+    def get_schedule_handle(self, schedule_id: str):
+        cluster = self.cluster
+
+        class _Handle:
+            async def update(self, updater) -> None:
+                result = updater(
+                    SimpleNamespace(
+                        description=SimpleNamespace(schedule=cluster.schedules[schedule_id])
+                    )
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not None:
+                    cluster.updates.append(result)
+                    cluster.schedules[schedule_id] = result.schedule
+
+        return _Handle()
+
+
+class TestConcurrentReplicas:
+    """Two replicas booting at once (#152 criterion 3).
+
+    `replicaCount` is 1 on both deployments today, so this behaviour has
+    never run in production. Asserting it here is what makes raising the
+    count a checked change rather than a hopeful one.
+    """
+
+    async def test_the_loser_of_the_race_converges_instead_of_failing(self):
+        """The replica that loses must not take its worker down.
+
+        A `ScheduleAlreadyRunningError` escaping here would crash-loop every
+        replica after the first, which is a scale-out that scales to one.
+        """
+        cluster = _FakeCluster(existing=_schedule(timedelta(minutes=30), paused=True, note="paused pending #179"))
+        desired = _schedule(timedelta(hours=1))
+
+        await asyncio.gather(
+            _ensure_schedule(_ReplicaClient(cluster), SCHEDULE_ID, desired, "IncidentLoopWorkflow"),
+            _ensure_schedule(_ReplicaClient(cluster), SCHEDULE_ID, desired, "IncidentLoopWorkflow"),
+        )
+
+        live = cluster.schedules[SCHEDULE_ID]
+        assert live.spec.intervals == desired.spec.intervals
+        # Convergence is idempotent: the second replica finds the spec already
+        # current and pushes nothing, so two replicas do not mean two updates.
+        assert len(cluster.updates) == 1, cluster.updates
+        assert live.state.paused is True
+        assert live.state.note == "paused pending #179"
+
+    async def test_every_schedule_survives_a_concurrent_boot_with_skip(self):
+        """setup_schedules() as a whole, not one schedule at a time.
+
+        Asserts the overlap policy on each, for the reason above: the count
+        alone cannot fail, but a schedule that came out of the race without
+        SKIP would let two replicas' ticks run side by side — the duplicate
+        run criterion 3 is about.
+        """
+        cluster = _FakeCluster(existing=None)
+
+        await asyncio.gather(
+            setup_schedules(_ReplicaClient(cluster)),
+            setup_schedules(_ReplicaClient(cluster)),
+        )
+
+        # Both replicas must actually have tried, or the fake staged no race
+        # and everything below is asserted about a sequential boot.
+        assert len(cluster.create_attempts) == 6, cluster.create_attempts
+        assert sorted(cluster.schedules) == sorted(
+            {
+                "reconcile-mctl-agents-schedule",
+                "issue-poll-mctl-agents-schedule",
+                "incidents-mctl-agents-schedule",
+            }
+        )
+        for schedule_id, schedule in cluster.schedules.items():
+            assert schedule.policy.overlap is ScheduleOverlapPolicy.SKIP, schedule_id

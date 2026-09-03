@@ -319,8 +319,44 @@ that record the patch, which is why it is alone.
   listening on one queue would leave patched executions with no poller
   until they time out, which is not a rollback.
 
+## Replica strategy
+
+Fixed replicas, raised by hand, and no HPA. Recorded here because #152's Scope
+asks for "an HPA/replica strategy" and the honest answer is a strategy that
+declines the HPA rather than a missing one.
+
+**Why not an HPA.** Both roles are I/O-bound waiters: the execution worker's
+whole job is holding a slot while it polls Argo, and the control worker's is
+short calls between long sleeps. CPU is therefore flat under exactly the load
+that needs more capacity, so a CPU-target HPA measures the one signal
+guaranteed not to move. The signal that does move is slot availability
+(`temporal_worker_task_slots_available`, per `task_queue`), and turning it into
+a scaling input needs a custom-metrics adapter this cluster does not run. An
+HPA on the wrong metric is worse than none: it adds replicas when nothing is
+saturated and stays still when everything is.
+
+**When to add a replica.** `temporal_worker_task_slots_available` for a queue
+sitting at or near zero across a sustained window, with p95
+`temporal_activity_schedule_to_start_latency` rising on the same queue. Either
+signal alone is not it — a full pool that nothing is waiting behind is a pool
+doing its job, and latency without a full pool is a slow downstream, which more
+replicas will not fix.
+
+**What N>1 is safe against, and how that is known.** Schedules are owned by the
+control role alone (`owns_schedules`), so an execution replica cannot register
+one at all. Two control replicas race in `_ensure_schedule`, and the loser
+converges instead of crashing —
+`tests/test_worker_schedules.py::TestConcurrentReplicas` stages that race
+against a shared fake cluster rather than trusting it, and the assertion fails
+if the `ScheduleAlreadyRunningError` branch is removed. Duplicate *runs* are
+prevented by `overlap=SKIP` on all three schedules, asserted after the race.
+
+**Order of operations.** Raise the execution worker first: it is the role with
+no schedules, no workflows and one activity, so a bad outcome there is bounded.
+The control worker is a second, separate change.
+
 ## Non-goals
 
-HPA and per-agent quotas/cost budgets (D6 and #152's "per-agent quotas"
-bullet — both need D5's metrics first); splitting reconcile onto a third
-queue; any change to what runs in Argo.
+Per-agent quotas and cost budgets (D6 and #152's "per-agent quotas" bullet —
+both need D5's metrics first); splitting reconcile onto a third queue; any
+change to what runs in Argo; autoscaling of any kind, per the section above.
