@@ -27,11 +27,11 @@ async def start(issue_url: str) -> None:
     print(f"started {handle.id} (run_id={handle.result_run_id})")
 
 
-async def approve(workflow_id: str) -> None:
+async def approve(workflow_id: str, approver: str) -> None:
     client = await connect()
     handle = client.get_workflow_handle(workflow_id)
-    await handle.signal(DevLoopWorkflow.approve)
-    print(f"signalled approve on {workflow_id}")
+    await handle.signal(DevLoopWorkflow.approve, {"approver": approver})
+    print(f"signalled approve on {workflow_id} as {approver}")
 
 
 async def status(workflow_id: str) -> None:
@@ -86,7 +86,12 @@ async def status(workflow_id: str) -> None:
                 print(f"    detail:    {w.detail}")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI's argument parser.
+
+    Split out of main() so tests can assert that the approve command the
+    investigator posts to real GitHub issues still parses (gitops#986).
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -95,15 +100,35 @@ def main() -> None:
 
     p_approve = sub.add_parser("approve", help="Signal approval on a running DevLoopWorkflow")
     p_approve.add_argument("workflow_id")
+    # Required, and deliberately not defaulted. A bare signal carried no
+    # payload, so the approver recorded in .status.yaml and in the gitops
+    # commit message was the literal string "unknown" - an approval naming
+    # nobody. The implementer now refuses those (gitops#986), so a default
+    # here would only produce proposals it declines to act on.
+    #
+    # This is an operator escape hatch against the Temporal frontend, so the
+    # value is asserted rather than verified. The endpoint that takes the
+    # approver from the authenticated caller is the trustworthy path:
+    # POST /api/v1/agents/dev-loop/{workflow_id}/approve.
+    p_approve.add_argument(
+        "--approver",
+        required=True,
+        help="Identity to record as the approver (not verified here; prefer "
+             "the mctl-api approve endpoint, which takes it from the caller)",
+    )
 
     p_status = sub.add_parser("status", help="Print a DevLoopWorkflow's status (and result, if complete)")
     p_status.add_argument("workflow_id")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if args.command == "start":
         asyncio.run(start(args.issue_url))
     elif args.command == "approve":
-        asyncio.run(approve(args.workflow_id))
+        asyncio.run(approve(args.workflow_id, args.approver))
     elif args.command == "status":
         asyncio.run(status(args.workflow_id))
 
