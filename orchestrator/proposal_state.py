@@ -41,6 +41,42 @@ def load_status(path: Path) -> dict[str, Any]:
     return data
 
 
+# Approvers that record no identity. "unknown" is the literal default in
+# mctl-api's operations registry and in cwft-mctl-agents-approve.yaml, and the
+# Temporal CLI's `approve` signals with no payload at all, which lands the same
+# value. Treating it as an approval would leave the gate open through exactly
+# the paths that record nothing.
+_ANONYMOUS_APPROVERS = {"", "unknown", "none", "null"}
+
+
+def human_approval_satisfied(data: dict[str, Any]) -> bool:
+    """Whether a proposal's recorded approval meets its own requirement.
+
+    ``control.requires_human_approval`` was written by the investigator,
+    self-checked once at publish time, and then read by nothing: the
+    implementer gated on ``status == accepted`` alone, so a proposal committed
+    as ``accepted`` was indistinguishable from one a human approved
+    (gitops#986).
+
+    A proposal with no ``control`` block does NOT require approval. The
+    incident-responder writes ``status: accepted`` with no control block at
+    all, and defaulting to deny would strand that entire path.
+    """
+    control = data.get("control")
+    if not isinstance(control, dict):
+        return True
+    if control.get("requires_human_approval") is not True:
+        return True
+
+    approval = data.get("approval")
+    if not isinstance(approval, dict):
+        return False
+    approved_by = approval.get("approved_by")
+    if not isinstance(approved_by, str):
+        return False
+    return approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
+
+
 def update_status_file(
     path: Path,
     new_status: str,

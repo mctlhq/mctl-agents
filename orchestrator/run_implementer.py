@@ -90,7 +90,12 @@ from orchestrator.options import (
     build_implementer_agent_options,
 )
 from orchestrator.proc import describe_output, run_capturing
-from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.proposal_state import (
+    human_approval_satisfied,
+    load_status,
+    now_iso,
+    update_status_file,
+)
 
 # ---------------------------------------------------------------------------
 # State directory resolution.
@@ -164,6 +169,12 @@ class ProposalRef:
     slug: str             # e.g. "wrangler-cve-0933"
     proposal_dir: Path    # state-dir / service / proposals / slug
     status: str           # current value parsed from .status.yaml (or "proposed" if absent)
+    # Whether this proposal's own control block is satisfied. Carried here
+    # because find_accepted_proposals already has the parsed .status.yaml in
+    # hand and used to throw it away, leaving the consumer with nothing but
+    # `status` to gate on (gitops#986). Defaults True so a ref built by hand
+    # -- tests, --review-feedback -- behaves as it did before.
+    approval_ok: bool = True
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -296,6 +307,7 @@ def find_accepted_proposals(
                         slug=slug,
                         proposal_dir=proposal_dir,
                         status=status,
+                        approval_ok=human_approval_satisfied(data),
                     )
                 )
     return refs
@@ -1130,6 +1142,23 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=None,
             skipped_reason=f"status is {ref.status}; only accepted proposals are runnable",
+        )
+
+    # `accepted` alone is not authorisation. A proposal whose control block
+    # requires human approval must carry an approval naming someone; without
+    # it, a status flip committed by anything -- or by anyone with write
+    # access to agents-state -- is indistinguishable from a real approval
+    # (gitops#986). Refuse rather than run the model.
+    if not ref.approval_ok:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason=(
+                "requires_human_approval is set but no verified approval is "
+                "recorded; approve through the dev-loop endpoint, which takes "
+                "the approver from the authenticated caller"
+            ),
+            counts_toward_limit=False,
         )
 
     if dry_run:
