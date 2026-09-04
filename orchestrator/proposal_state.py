@@ -48,6 +48,11 @@ def load_status(path: Path) -> dict[str, Any]:
 # the paths that record nothing.
 _ANONYMOUS_APPROVERS = {"", "unknown", "none", "null"}
 
+# Spellings that waive the approval requirement. Deliberately a denylist: the
+# gate defaults to ON, so a value nobody anticipated is refused rather than
+# read as consent.
+_FALSEY = {"false", "no", "0", "off", ""}
+
 
 def human_approval_satisfied(data: dict[str, Any]) -> bool:
     """Whether a proposal's recorded approval meets its own requirement.
@@ -72,14 +77,27 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
         # unreadable, so it fails closed (agy P2).
         return False
 
-    # Not `is not True`: a hand-edited or re-serialised status file can carry
-    # `requires_human_approval: "true"`, which YAML leaves as a string. An
-    # identity check against the bool would treat that as "not required" and
-    # skip the gate entirely — failing OPEN on exactly the value that asked
-    # for the gate (agy P1). Every status file in gitops today serialises a
-    # real boolean; this is about the ones that will not.
+    # Only a value that recognisably says "no" waives the gate. Everything
+    # else — including anything unrecognised — requires an approval.
+    #
+    # Two ways to get this wrong, both of which fail OPEN and both of which a
+    # reviewer caught in turn (agy P1, twice):
+    #
+    #   `required is not True`      → `requires_human_approval: "true"` waives
+    #                                 the gate, because YAML leaves a quoted
+    #                                 scalar a string.
+    #   `str(required) not in {…}`  → a list, a dict or a typo waives it,
+    #                                 because an allowlist of truthy spellings
+    #                                 treats everything unlisted as falsey.
+    #
+    # So the test is against the FALSEY spellings, and the default is to
+    # require approval. An absent key still means "never asked".
     required = control.get("requires_human_approval")
-    if str(required).strip().lower() not in {"true", "yes", "1"}:
+    if required is None or required is False:
+        return True
+    if isinstance(required, str) and required.strip().lower() in _FALSEY:
+        return True
+    if isinstance(required, int) and not isinstance(required, bool) and required == 0:
         return True
 
     approval = data.get("approval")

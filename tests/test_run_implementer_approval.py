@@ -79,6 +79,16 @@ def test_a_falsey_string_does_not_require_approval() -> None:
         assert human_approval_satisfied(data) is True, falsey
 
 
+def test_an_unrecognised_requirement_value_fails_closed() -> None:
+    # An allowlist of truthy spellings reads everything unlisted as falsey, so
+    # a list, a dict or a typo would waive the gate (agy P1, second pass). The
+    # test is against the falsey spellings instead, so the default is to
+    # require approval.
+    for weird in (["true"], {"v": True}, "required", "yep", 42, object()):
+        data = {"status": "accepted", "control": {"requires_human_approval": weird}}
+        assert human_approval_satisfied(data) is False, weird
+
+
 def test_a_malformed_control_block_fails_closed() -> None:
     # Absent means "never asked for approval". A control block that is present
     # but not a mapping asked for something unreadable, which is not the same
