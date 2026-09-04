@@ -141,6 +141,22 @@ class TestEnsureSchedule:
         assert client.handle.updates == []
 
 
+def _minutes_of_hour(interval: ScheduleIntervalSpec) -> set[int]:
+    """Which minutes past the hour an interval schedule fires on.
+
+    The window is `lcm(period, 60)`, not a flat 60. For a period that divides
+    an hour — every schedule here today — the two are the same. For one that
+    does not (say 25 minutes) the firing pattern SHIFTS from hour to hour, so
+    scanning only the first 60 absolute minutes reports a subset and the check
+    quietly stops being a check: 25/0 fires at absolute 75, i.e. :15, which a
+    60-minute scan never reaches (agy on #309).
+    """
+    period = int(interval.every.total_seconds() // 60)
+    offset = int((interval.offset or timedelta()).total_seconds() // 60)
+    assert period > 0, f"schedule fires more often than once a minute: {interval}"
+    return {m % 60 for m in range(lcm(period, 60)) if (m - offset) % period == 0}
+
+
 class TestOverlapPolicy:
     """Duplicate-run behaviour for the scheduled loops (#149 criterion 3).
 
@@ -348,9 +364,18 @@ class TestConvergenceRetries:
         async def _twice(updater):
             for existing in (stale, current):
                 seen.append(1)
-                result = await updater(
+                # Mirrors _FakeHandle.update above, which has always handled
+                # both shapes. `_converge_spec` is `async def`, so awaiting
+                # unconditionally is correct TODAY and this changes no
+                # behaviour — but two mocks in one file disagreeing about the
+                # same SDK contract is the kind of difference a reader has to
+                # resolve by going and checking, and a reviewer flagged it
+                # three times running for exactly that reason.
+                result = updater(
                     SimpleNamespace(description=SimpleNamespace(schedule=existing))
                 )
+                if inspect.isawaitable(result):
+                    result = await result
                 if result is not None and existing is current:
                     client.handle.updates.append(result)
             return None
@@ -475,13 +500,47 @@ class TestIntakeCadence:
         offenders: dict[str, int] = {}
         for schedule_id, schedule in client.created:
             for interval in schedule.spec.intervals or []:
-                period = int(interval.every.total_seconds() // 60)
-                offset = int((interval.offset or timedelta()).total_seconds() // 60)
-                for minute in range(60):
-                    if (minute - offset) % period == 0 and minute in argo_minutes:
-                        offenders[schedule_id] = minute
+                hit = _minutes_of_hour(interval) & argo_minutes
+                if hit:
+                    offenders[schedule_id] = min(hit)
 
         assert not offenders, (
             f"{offenders} fire on a minute an Argo cron already uses — both sides "
             "take mctl-gitops-main-writes, so this is contention on the shared mutex"
         )
+
+    def test_the_hour_window_covers_a_period_that_does_not_divide_60(self):
+        """The scan window is lcm(period, 60), and that is load-bearing.
+
+        Every schedule registered today has a period dividing an hour, so a
+        flat 60-minute scan happens to be complete and this test would pass
+        either way against the real ones. It uses a synthetic 25-minute
+        schedule instead, where the two windows genuinely disagree: 25/0 fires
+        at absolute minute 75, i.e. :15 past the hour — a minute an Argo cron
+        uses — which a 60-minute scan never reaches.
+
+        Written against the helper directly rather than through
+        setup_schedules, because the bug is only reachable with a cadence this
+        repo does not currently register; going through the caller would make
+        the assertion true for the wrong reason.
+        """
+        every_25 = ScheduleIntervalSpec(every=timedelta(minutes=25))
+
+        minutes = _minutes_of_hour(every_25)
+        assert 15 in minutes, (
+            "a 25-minute schedule fires at :15 past the hour (absolute minute 75); "
+            "a window of 60 stops at :50 and never sees it"
+        )
+
+        naive = {m for m in range(60) if m % 25 == 0}
+        assert 15 not in naive, "the naive 60-minute scan is supposed to miss this"
+
+    def test_the_hour_window_is_exact_for_a_period_that_does_divide_60(self):
+        """No over-reporting: the wider window must not invent firing minutes."""
+        assert _minutes_of_hour(
+            ScheduleIntervalSpec(every=timedelta(minutes=15), offset=timedelta(minutes=3))
+        ) == {3, 18, 33, 48}
+        assert _minutes_of_hour(
+            ScheduleIntervalSpec(every=timedelta(hours=1), offset=timedelta(minutes=11))
+        ) == {11}
+
