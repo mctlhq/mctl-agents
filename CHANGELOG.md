@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.39.1](https://github.com/mctlhq/mctl-agents/compare/1.39.0...1.39.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* **agents:** enforce requires_human_approval at consumption ([d3e924f](https://github.com/mctlhq/mctl-agents/commit/d3e924fba457edf389e21a0fcb1153a425853087))
+* **agents:** enforce requires_human_approval at consumption ([8355e20](https://github.com/mctlhq/mctl-agents/commit/8355e20f919cfb4569f983f4c9b7628f806e1313))
+* **agents:** fail closed on malformed approval state, keep the posted command valid ([44e6e64](https://github.com/mctlhq/mctl-agents/commit/44e6e64b4a6adcd6d26d113766dfc6827be969ec))
+* **agents:** skip a non-string status instead of crashing the whole scan ([3406ef9](https://github.com/mctlhq/mctl-agents/commit/3406ef98b7e48487bef395e8a005d4f40ecbcc18))
+* **agents:** the approval requirement fails closed on unrecognised values ([832ba2e](https://github.com/mctlhq/mctl-agents/commit/832ba2e432b0043a6e7d981887b3d59f9fc119c8))
+* **agents:** write .status.yaml atomically, so the gate cannot be erased ([6fd91c2](https://github.com/mctlhq/mctl-agents/commit/6fd91c2680a240d504ced55c259f198f06f57699))
+* **temporal:** converge fields, not whole objects, and reset the retry verdict ([569bb1b](https://github.com/mctlhq/mctl-agents/commit/569bb1baf256c9fcb67ff5953cf34b9aabd82997)), closes [#149](https://github.com/mctlhq/mctl-agents/issues/149)
+* **temporal:** declare the schedule overlap policy instead of inheriting it ([f74583e](https://github.com/mctlhq/mctl-agents/commit/f74583ecd82981d3df1c7c1bb8691d8a3e89b479)), closes [#149](https://github.com/mctlhq/mctl-agents/issues/149)
+* **temporal:** poll intake every 15 minutes, not every 12 hours ([681a2ef](https://github.com/mctlhq/mctl-agents/commit/681a2ef5b023e75bb0121d086d6ae2c615a4c497))
+* **temporal:** poll intake every 15 minutes, not every 12 hours ([32e2b26](https://github.com/mctlhq/mctl-agents/commit/32e2b267582828ab12f07a8bf667e2ce33a12e48))
+* **temporal:** stop incidents and reconcile firing on the same minute ([e7cb091](https://github.com/mctlhq/mctl-agents/commit/e7cb091b61ed3e552f686cc17d88e7ce8a2aeb33)), closes [#309](https://github.com/mctlhq/mctl-agents/issues/309)
+* **temporal:** the convergence log names what actually converged ([bc61287](https://github.com/mctlhq/mctl-agents/commit/bc61287de3233def0ef15ca37fc03164d4cd007e)), closes [#149](https://github.com/mctlhq/mctl-agents/issues/149)
+
 ## [1.39.0](https://github.com/mctlhq/mctl-agents/compare/1.38.0...1.39.0) (2026-09-03)
 
 
