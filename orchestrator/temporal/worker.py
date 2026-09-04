@@ -239,7 +239,22 @@ async def setup_schedules(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleIntervalSpec(every=timedelta(minutes=15))],
+            # Offset for the same reason as incidents below: with none, this
+            # fires at :00/:15/:30/:45, which puts it on top of the Argo crons
+            # that hold the same `mctl-gitops-main-writes` mutex from the other
+            # side — rotate-github-app-tokens at :00/:30 and
+            # mctl-agents-shepherd at :00. Staggering only the Temporal
+            # schedules against each other and leaving this one on the hour
+            # would be half the invariant (agy P3 on #309).
+            #
+            # 3 gives :03/:18/:33/:48, clear of the Argo minutes and of both
+            # other Temporal schedules (:07/:22/:37/:52 and :11).
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(minutes=15),
+                    offset=timedelta(minutes=3),
+                )
+            ],
         ),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
@@ -254,7 +269,39 @@ async def setup_schedules(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleIntervalSpec(every=timedelta(hours=12))],
+            # 15 minutes, which is what the Argo CronWorkflow this schedule
+            # replaced actually ran (`*/15` in
+            # cronworkflow-mctl-agents-issue-poll.yaml, now suspended).
+            #
+            # It was 12h between 2026-08-09 and 2026-09-04, on the stated
+            # grounds of "excessive GitHub API polling". That does not survive
+            # arithmetic: an idle tick is exactly ONE `gh search issues` call
+            # (run_issue_poller.search_labeled_issues), so 15 minutes costs 96
+            # requests a day against a 5000/hour limit. What it did cost was
+            # intake latency — up to 12 hours between labelling an issue and
+            # the investigator seeing it, which is how five issues sat
+            # untouched on 2026-09-04.
+            #
+            # Nor is the interval a volume-churn throttle, which is the other
+            # thing it looked like it might be doing. Each DISPATCHED issue
+            # raises an Argo investigate workflow, so the number of workflows
+            # tracks the number of labelled issues and not the tick rate;
+            # polling more often spreads the same arrivals out instead of
+            # firing 12 hours of them at once. Measured before changing this:
+            # peak concurrent PVC-backed agent workflows over a week was 6,
+            # against an attach ceiling of 48 (16/node x 3 workers).
+            #
+            # The offset keeps this tick off the same instant as
+            # `reconcile-mctl-agents-schedule`, which also fires every 15
+            # minutes. Interval schedules are aligned to the epoch, so without
+            # it the two would land together and contend for the shared
+            # `mctl-gitops-main-writes` mutex on every single tick.
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(minutes=15),
+                    offset=timedelta(minutes=7),
+                )
+            ],
         ),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
@@ -273,8 +320,29 @@ async def setup_schedules(client: Client) -> None:
             # cadence is also a volume-churn budget (mctl-gitops#856). The
             # responder ignores incidents younger than MIN_AGE_MINUTES=30
             # anyway, so halving the tick rate costs no real responsiveness.
-            # Matches what the (suspended) Argo cron did: `15 * * * *`.
-            intervals=[ScheduleIntervalSpec(every=timedelta(hours=1))],
+            #
+            # The offset is NOT cosmetic. Interval schedules are aligned to
+            # the epoch, so `every=1h` with no offset fires at :00 — the same
+            # minute as reconcile's `every=15m` (:00/:15/:30/:45). Both ticks
+            # end in a step holding `mctl-gitops-main-writes`
+            # (cwft-mctl-agents-reconcile.yaml and cwft-mctl-agents-run.yaml),
+            # so they contended for it every hour, on the hour. Observed
+            # directly on 2026-09-04: `temporal schedule list` showed both
+            # schedules with `NextRunTime: 2 seconds from now` at 20:59:56.
+            #
+            # 11 avoids reconcile's phase and issue-poll's (:07/:22/:37/:52),
+            # and also the Argo crons that take the same mutex from the other
+            # side: mctl-agents-incidents at :15, rotate-github-app-tokens at
+            # :00/:30, mctl-agents-shepherd at :00.
+            #
+            # A comment here used to claim this schedule matched the Argo
+            # cron's `15 * * * *`; without an offset it never did.
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(hours=1),
+                    offset=timedelta(minutes=11),
+                )
+            ],
         ),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )

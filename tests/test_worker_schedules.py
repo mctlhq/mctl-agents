@@ -16,6 +16,7 @@ from __future__ import annotations
 import inspect
 import logging
 from datetime import timedelta
+from math import lcm
 from types import SimpleNamespace
 
 import pytest
@@ -31,7 +32,7 @@ from temporalio.client import (
 )
 
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.worker import _ensure_schedule, setup_schedules
+from orchestrator.temporal.worker import ISSUE_POLL_SCHEDULE_ID, _ensure_schedule, setup_schedules
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 
 pytestmark = pytest.mark.anyio
@@ -138,6 +139,22 @@ class TestEnsureSchedule:
         await _ensure_schedule(client, SCHEDULE_ID, _schedule(timedelta(hours=1)), "IncidentLoopWorkflow")
 
         assert client.handle.updates == []
+
+
+def _minutes_of_hour(interval: ScheduleIntervalSpec) -> set[int]:
+    """Which minutes past the hour an interval schedule fires on.
+
+    The window is `lcm(period, 60)`, not a flat 60. For a period that divides
+    an hour — every schedule here today — the two are the same. For one that
+    does not (say 25 minutes) the firing pattern SHIFTS from hour to hour, so
+    scanning only the first 60 absolute minutes reports a subset and the check
+    quietly stops being a check: 25/0 fires at absolute 75, i.e. :15, which a
+    60-minute scan never reaches (agy on #309).
+    """
+    period = int(interval.every.total_seconds() // 60)
+    offset = int((interval.offset or timedelta()).total_seconds() // 60)
+    assert period > 0, f"schedule fires more often than once a minute: {interval}"
+    return {m % 60 for m in range(lcm(period, 60)) if (m - offset) % period == 0}
 
 
 class TestOverlapPolicy:
@@ -347,9 +364,18 @@ class TestConvergenceRetries:
         async def _twice(updater):
             for existing in (stale, current):
                 seen.append(1)
-                result = await updater(
+                # Mirrors _FakeHandle.update above, which has always handled
+                # both shapes. `_converge_spec` is `async def`, so awaiting
+                # unconditionally is correct TODAY and this changes no
+                # behaviour — but two mocks in one file disagreeing about the
+                # same SDK contract is the kind of difference a reader has to
+                # resolve by going and checking, and a reviewer flagged it
+                # three times running for exactly that reason.
+                result = updater(
                     SimpleNamespace(description=SimpleNamespace(schedule=existing))
                 )
+                if inspect.isawaitable(result):
+                    result = await result
                 if result is not None and existing is current:
                     client.handle.updates.append(result)
             return None
@@ -363,3 +389,158 @@ class TestConvergenceRetries:
         messages = [r.getMessage() for r in caplog.records]
         assert any("spec and overlap policy are current" in m for m in messages), messages
         assert not any("converged to the declared" in m for m in messages), messages
+
+
+class TestIntakeCadence:
+    """The intake poller's tick rate, which is a latency budget.
+
+    This value drifted to 12 hours on 2026-08-09 with a commit message citing
+    "excessive GitHub API polling", and nothing here noticed. It surfaced on
+    2026-09-04 as five issues sitting in `agents:intake` for hours with no
+    proposal — not a failure anyone could see, because the schedule was
+    healthy and every tick returned `{"started": 0}` truthfully.
+
+    An idle tick is one `gh search issues` call, so the cost side of that
+    trade was never real. The latency side was.
+    """
+
+    async def test_intake_polls_at_least_four_times_an_hour(self):
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        registered = dict(client.created)
+        spec = registered[ISSUE_POLL_SCHEDULE_ID].spec
+        assert spec.intervals, f"{ISSUE_POLL_SCHEDULE_ID} declares no interval"
+        every = spec.intervals[0].every
+        assert every <= timedelta(minutes=15), (
+            f"intake polls every {every} — an issue labelled just after a tick waits "
+            f"that long for a proposal, and an idle tick costs one `gh search` call"
+        )
+
+    async def test_no_two_schedules_fire_on_the_same_minute(self):
+        """No two registered schedules share a firing minute.
+
+        Interval schedules are aligned to the epoch, so `every` and `offset`
+        together fix the phase. reconcile, issue-poll and the incident loop all
+        end in a step that holds `mctl-gitops-main-writes`, so two of them
+        landing on the same minute is contention on the shared gitops write
+        mutex — the thing the Argo cron was moved off `*/5` to avoid.
+
+        The first version of this test grouped schedules by `every` and only
+        compared offsets WITHIN a group. That is blind by construction to the
+        collision that was actually live: incidents at `every=1h, offset=0`
+        fires at :00, exactly where reconcile's `every=15m` already fires, and
+        the two groups were never compared. Confirmed on the cluster before
+        fixing — `temporal schedule list` at 2026-09-04 20:59:56 showed both
+        with `NextRunTime: 2 seconds from now` (agy P2 on #309).
+
+        Simulating the phases over their least common multiple compares every
+        pair regardless of cadence.
+        """
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        def minutes(interval: ScheduleIntervalSpec) -> tuple[int, int]:
+            period = interval.every.total_seconds() / 60
+            offset = (interval.offset or timedelta()).total_seconds() / 60
+            assert period == int(period) and offset == int(offset), (
+                f"schedule fires on a sub-minute boundary ({interval}) — this test "
+                "reasons in whole minutes and would silently under-report collisions"
+            )
+            return int(period), int(offset)
+
+        specs: list[tuple[str, int, int]] = []
+        for schedule_id, schedule in client.created:
+            for interval in schedule.spec.intervals or []:
+                period, offset = minutes(interval)
+                specs.append((schedule_id, period, offset))
+
+        window = 1
+        for _, period, _ in specs:
+            window = lcm(window, period)
+
+        fires: dict[int, list[str]] = {}
+        for schedule_id, period, offset in specs:
+            for minute in range(window):
+                if (minute - offset) % period == 0:
+                    fires.setdefault(minute, []).append(schedule_id)
+
+        collisions = {m: ids for m, ids in fires.items() if len(ids) > 1}
+        assert not collisions, (
+            f"schedules fire together at minute(s) {sorted(collisions)}: {collisions} — "
+            "they race the shared mctl-gitops-main-writes mutex on every such tick"
+        )
+
+    async def test_no_schedule_lands_on_an_argo_cron_minute(self):
+        """Temporal schedules also avoid the Argo crons holding the same mutex.
+
+        `mctl-gitops-main-writes` is contended from both sides: the Temporal
+        schedules here, and CronWorkflows in mctl-gitops whose commit-and-push
+        steps take the same mutex. Staggering only the Temporal schedules
+        against each other is half the invariant — reconcile at :00/:15/:30/:45
+        sat directly on top of two Argo crons until this was checked (agy P3
+        on #309).
+
+        The minutes below MIRROR another repository and cannot be derived from
+        here, so they are stated explicitly rather than implied by a comment
+        on the schedule. If a CronWorkflow's cadence changes in mctl-gitops
+        this list has to change with it; a stale mirror is a real limitation,
+        but a visible and testable one, which the previous arrangement — a
+        prose claim in worker.py that nothing checked — was not.
+        """
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        # platform-gitops/argo-workflows/cluster-templates/, schedules as of
+        # 2026-09-04: rotate-github-app-tokens `*/30` -> :00/:30;
+        # mctl-agents-shepherd `0 7-21/2` -> :00; mctl-agents-incidents
+        # `15 * * * *` -> :15.
+        argo_minutes = {0, 15, 30}
+
+        offenders: dict[str, int] = {}
+        for schedule_id, schedule in client.created:
+            for interval in schedule.spec.intervals or []:
+                hit = _minutes_of_hour(interval) & argo_minutes
+                if hit:
+                    offenders[schedule_id] = min(hit)
+
+        assert not offenders, (
+            f"{offenders} fire on a minute an Argo cron already uses — both sides "
+            "take mctl-gitops-main-writes, so this is contention on the shared mutex"
+        )
+
+    def test_the_hour_window_covers_a_period_that_does_not_divide_60(self):
+        """The scan window is lcm(period, 60), and that is load-bearing.
+
+        Every schedule registered today has a period dividing an hour, so a
+        flat 60-minute scan happens to be complete and this test would pass
+        either way against the real ones. It uses a synthetic 25-minute
+        schedule instead, where the two windows genuinely disagree: 25/0 fires
+        at absolute minute 75, i.e. :15 past the hour — a minute an Argo cron
+        uses — which a 60-minute scan never reaches.
+
+        Written against the helper directly rather than through
+        setup_schedules, because the bug is only reachable with a cadence this
+        repo does not currently register; going through the caller would make
+        the assertion true for the wrong reason.
+        """
+        every_25 = ScheduleIntervalSpec(every=timedelta(minutes=25))
+
+        minutes = _minutes_of_hour(every_25)
+        assert 15 in minutes, (
+            "a 25-minute schedule fires at :15 past the hour (absolute minute 75); "
+            "a window of 60 stops at :50 and never sees it"
+        )
+
+        naive = {m for m in range(60) if m % 25 == 0}
+        assert 15 not in naive, "the naive 60-minute scan is supposed to miss this"
+
+    def test_the_hour_window_is_exact_for_a_period_that_does_divide_60(self):
+        """No over-reporting: the wider window must not invent firing minutes."""
+        assert _minutes_of_hour(
+            ScheduleIntervalSpec(every=timedelta(minutes=15), offset=timedelta(minutes=3))
+        ) == {3, 18, 33, 48}
+        assert _minutes_of_hour(
+            ScheduleIntervalSpec(every=timedelta(hours=1), offset=timedelta(minutes=11))
+        ) == {11}
+

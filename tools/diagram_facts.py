@@ -67,8 +67,15 @@ _BUDGET_RE = re.compile(r'^([A-Z_]+)_BUDGET_USD = float\(os\.getenv\("[A-Z_]+", 
 _CWFT_ENV_RE = re.compile(r'- name: ([A-Z_]+_(?:BUDGET_USD|TIMEOUT_SECONDS))\n\s*value: "([\d.]+)"', re.M)
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._/@+-]+$")
 _STATUS_SET_RE = re.compile(r"^(RECONCILE_INPUT_STATUSES|SHEPHERD_INPUT_STATUSES) = \{([^}]*)\}", re.M | re.S)
+# Tolerates both spellings of a schedule spec: the one-liner
+# `intervals=[ScheduleIntervalSpec(every=timedelta(...))],` and the multi-line
+# form that an added `offset=` forces. Anchoring on `)],` matched only the
+# former, so the first schedule to gain an offset silently emptied
+# facts["schedules"] instead of reporting a changed cadence.
 _SCHEDULE_RE = re.compile(
-    r"every=timedelta\(([^)]+)\)\)\],\n(?:.*\n){0,6}?.*_ensure_schedule\(client, \w+, \w+, \"(\w+)\""
+    r"every=timedelta\(([^)]+)\)"
+    r"(?:.*\n){1,12}?"
+    r".*_ensure_schedule\(client, \w+, \w+, \"(\w+)\""
 )
 
 

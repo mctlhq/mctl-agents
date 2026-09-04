@@ -22,7 +22,7 @@ flowchart TB
         direction TB
         DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>ALLOW_DUPLICATE_FAILED_ONLY + USE_EXISTING"]
         REC["ReconcileWorkflow<br/>schedule 15m"]
-        ISS["IssuePollWorkflow<br/>schedule 12h"]
+        ISS["IssuePollWorkflow<br/>schedule 15 min"]
         INC["IncidentLoopWorkflow<br/>schedule 1h · создаётся paused (#179)"]
         DOC["DocsDeltaWorkflow<br/>(по запросу)"]
     end
@@ -158,7 +158,7 @@ flowchart LR
     REC --> D["discover_and_project<br/>non-terminal proposals → PR на GitHub<br/>merged → merged, closed → rejected<br/>ТОЛЬКО проекция, без записи"]
     REC --> O["detect_orphans<br/>accepted/in-progress/implemented/review-fixing<br/>с открытым PR и без активного DevLoop → лог ORPHAN<br/>(id из issue-номера слага; активные id пока не передаются — #151)"]
 
-    S2["schedule 12h"] --> ISS["IssuePollWorkflow"]
+    S2["schedule 15 min"] --> ISS["IssuePollWorkflow"]
     ISS --> P["poll_issues_activity → run_issue_poller.poll<br/>label agents:intake, max 5<br/>старт DevLoop + снятие лейбла"]
 
     S3["schedule 1h<br/>создаётся paused (#179)"] --> INC["IncidentLoopWorkflow"]
