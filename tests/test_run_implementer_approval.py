@@ -9,12 +9,21 @@ These tests assert on the REFUSAL. A test asserting that a properly approved
 proposal is accepted passes on the unenforced code too and proves nothing, so
 the approved cases here are only guards against the gate being too strict.
 """
+import builtins
+import io
+import os
+import stat
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
 from orchestrator import run_implementer
-from orchestrator.proposal_state import human_approval_satisfied
+from orchestrator.proposal_state import (
+    human_approval_satisfied,
+    load_status,
+    update_status_file,
+)
 
 
 def write_proposal(state_dir: Path, service: str, slug: str, payload: dict) -> Path:
@@ -187,3 +196,89 @@ def test_the_posted_approve_command_is_valid(monkeypatch) -> None:
     args = parser.parse_args(argv)          # raises SystemExit if it drifted
     assert args.command == "approve"
     assert args.approver == "someone"
+
+
+# --- the write that could erase the requirement ----------------------------
+# These belong with the gate rather than in a general status-file test:
+# what makes the truncation window dangerous is precisely that an empty
+# .status.yaml has no `control` block, and no control block waives approval.
+
+def test_a_failed_dump_leaves_the_previous_status_intact(tmp_path: Path) -> None:
+    path = tmp_path / ".status.yaml"
+    path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
+
+    class Unserialisable:
+        pass
+
+    try:
+        update_status_file(path, "accepted", note=Unserialisable())
+    except yaml.YAMLError:
+        pass
+    else:
+        raise AssertionError("expected safe_dump to refuse an arbitrary object")
+
+    # The file the implementer will read next must still carry the gate.
+    survived = load_status(path)
+    assert survived["control"] == {"requires_human_approval": True}
+    assert human_approval_satisfied(survived) is False
+
+
+def test_the_target_is_never_opened_for_writing(tmp_path: Path) -> None:
+    # The behavioural statement, not an implementation detail: no writer may
+    # open the real path in a mode that truncates it, because that is the
+    # window in which a kill leaves an empty file — which reads as "approval
+    # was never required".
+    path = tmp_path / ".status.yaml"
+    path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
+
+    target = os.fspath(path)
+    offenders: list[str] = []
+
+    real_builtin_open = builtins.open
+    real_os_open = os.open
+
+    def spy_builtin(file, mode="r", *args, **kwargs):
+        # `file` may be an integer descriptor — os.fdopen goes through
+        # io.open too — and fspath() raises on those.
+        if not isinstance(file, int) and os.fspath(file) == target:
+            if any(c in mode for c in "wa+"):
+                offenders.append(f"open({mode!r})")
+        return real_builtin_open(file, mode, *args, **kwargs)
+
+    def spy_os(target_path, flags, *args, **kwargs):
+        if os.fspath(target_path) == target and flags & (
+            os.O_TRUNC | os.O_WRONLY | os.O_RDWR
+        ):
+            offenders.append(f"os.open(flags={flags})")
+        return real_os_open(target_path, flags, *args, **kwargs)
+
+    # io.open as well as builtins.open: they are the same function object,
+    # but Path.open resolves `io.open` at call time, so patching only
+    # builtins leaves the path this test exists to forbid unobserved.
+    with mock.patch.object(builtins, "open", spy_builtin), mock.patch.object(
+        io, "open", spy_builtin
+    ), mock.patch.object(os, "open", spy_os):
+        update_status_file(path, "accepted")
+
+    assert offenders == []
+    assert load_status(path)["status"] == "accepted"
+
+
+def test_a_rewrite_keeps_the_file_readable_by_other_components(tmp_path: Path) -> None:
+    # The approve CWFT, the reconcile sweep and the implementer do not all
+    # run as this user. A temp-file rename must not carry 0600 onto the
+    # published file.
+    path = tmp_path / ".status.yaml"
+    path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
+    os.chmod(path, 0o644)
+
+    update_status_file(path, "accepted")
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+
+def test_no_temp_file_is_left_behind(tmp_path: Path) -> None:
+    path = tmp_path / ".status.yaml"
+    path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
+    update_status_file(path, "accepted")
+    assert [p.name for p in tmp_path.iterdir()] == [".status.yaml"]
