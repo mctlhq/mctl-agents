@@ -197,5 +197,12 @@ def _write_status_atomic(path: Path, payload: dict[str, Any]) -> None:
                 os.fchmod(stream.fileno(), mode)
         os.replace(tmp_path, path)
     except BaseException:
-        tmp_path.unlink(missing_ok=True)
+        # The cleanup must not become the exception the caller sees: if the
+        # unlink fails too (a read-only directory, say), the original error
+        # -- which is the one that says why the write failed -- would be
+        # replaced by a PermissionError about a temp file (agy P3).
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise

@@ -304,6 +304,16 @@ def find_accepted_proposals(
                 print(f"warn: {service}/{slug}: failed to parse .status.yaml ({e}); skipping")
                 continue
             status = data.get("status", "proposed")
+            if not isinstance(status, str):
+                # `status in accepted_states` raises TypeError on an
+                # unhashable value, and this is outside the try above that
+                # exists to skip one bad file -- so a single hand-edited
+                # `status: [accepted]` anywhere under agents-state took the
+                # whole scan down and no proposal ran (agy P2). Predates this
+                # PR; fixed here because the same edit reaches the gate below.
+                print(f"warn: {service}/{slug}: status is "
+                      f"{type(status).__name__}, not a string; skipping")
+                continue
             if status in accepted_states:
                 refs.append(
                     ProposalRef(

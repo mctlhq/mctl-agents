@@ -270,11 +270,14 @@ def test_a_rewrite_keeps_the_file_readable_by_other_components(tmp_path: Path) -
     # published file.
     path = tmp_path / ".status.yaml"
     path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
-    os.chmod(path, 0o644)
+    # NOT 0o644: that is exactly what O_CREAT with 0o666 produces under the
+    # umask 022 of a normal CI runner, so the assertion would hold whether
+    # or not the mode was actually carried across the rename (claude P3).
+    os.chmod(path, 0o640)
 
     update_status_file(path, "accepted")
 
-    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
 
 
 def test_no_temp_file_is_left_behind(tmp_path: Path) -> None:
@@ -282,3 +285,20 @@ def test_no_temp_file_is_left_behind(tmp_path: Path) -> None:
     path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
     update_status_file(path, "accepted")
     assert [p.name for p in tmp_path.iterdir()] == [".status.yaml"]
+
+
+def test_one_unparseable_status_does_not_stop_the_scan(tmp_path: Path) -> None:
+    # `status in accepted_states` raises on an unhashable value, and it sits
+    # outside the try that exists to skip one bad file — so a single
+    # hand-edited status took down the whole scan and nothing ran.
+    state = tmp_path / "agents-state"
+    write_proposal(state, "svc", "broken", {"status": ["accepted"]})
+    write_proposal(state, "svc", "good", {
+        "status": "accepted",
+        "control": {"requires_human_approval": True},
+        "approval": {"approved_by": "a-person"},
+    })
+
+    refs = run_implementer.find_accepted_proposals(state)
+
+    assert [r.slug for r in refs] == ["good"]
