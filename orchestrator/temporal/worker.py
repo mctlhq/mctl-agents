@@ -239,7 +239,22 @@ async def setup_schedules(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleIntervalSpec(every=timedelta(minutes=15))],
+            # Offset for the same reason as incidents below: with none, this
+            # fires at :00/:15/:30/:45, which puts it on top of the Argo crons
+            # that hold the same `mctl-gitops-main-writes` mutex from the other
+            # side — rotate-github-app-tokens at :00/:30 and
+            # mctl-agents-shepherd at :00. Staggering only the Temporal
+            # schedules against each other and leaving this one on the hour
+            # would be half the invariant (agy P3 on #309).
+            #
+            # 3 gives :03/:18/:33/:48, clear of the Argo minutes and of both
+            # other Temporal schedules (:07/:22/:37/:52 and :11).
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(minutes=15),
+                    offset=timedelta(minutes=3),
+                )
+            ],
         ),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )

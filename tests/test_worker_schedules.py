@@ -445,3 +445,43 @@ class TestIntakeCadence:
             f"schedules fire together at minute(s) {sorted(collisions)}: {collisions} — "
             "they race the shared mctl-gitops-main-writes mutex on every such tick"
         )
+
+    async def test_no_schedule_lands_on_an_argo_cron_minute(self):
+        """Temporal schedules also avoid the Argo crons holding the same mutex.
+
+        `mctl-gitops-main-writes` is contended from both sides: the Temporal
+        schedules here, and CronWorkflows in mctl-gitops whose commit-and-push
+        steps take the same mutex. Staggering only the Temporal schedules
+        against each other is half the invariant — reconcile at :00/:15/:30/:45
+        sat directly on top of two Argo crons until this was checked (agy P3
+        on #309).
+
+        The minutes below MIRROR another repository and cannot be derived from
+        here, so they are stated explicitly rather than implied by a comment
+        on the schedule. If a CronWorkflow's cadence changes in mctl-gitops
+        this list has to change with it; a stale mirror is a real limitation,
+        but a visible and testable one, which the previous arrangement — a
+        prose claim in worker.py that nothing checked — was not.
+        """
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        # platform-gitops/argo-workflows/cluster-templates/, schedules as of
+        # 2026-09-04: rotate-github-app-tokens `*/30` -> :00/:30;
+        # mctl-agents-shepherd `0 7-21/2` -> :00; mctl-agents-incidents
+        # `15 * * * *` -> :15.
+        argo_minutes = {0, 15, 30}
+
+        offenders: dict[str, int] = {}
+        for schedule_id, schedule in client.created:
+            for interval in schedule.spec.intervals or []:
+                period = int(interval.every.total_seconds() // 60)
+                offset = int((interval.offset or timedelta()).total_seconds() // 60)
+                for minute in range(60):
+                    if (minute - offset) % period == 0 and minute in argo_minutes:
+                        offenders[schedule_id] = minute
+
+        assert not offenders, (
+            f"{offenders} fire on a minute an Argo cron already uses — both sides "
+            "take mctl-gitops-main-writes, so this is contention on the shared mutex"
+        )

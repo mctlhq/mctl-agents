@@ -208,7 +208,7 @@ releases_seen:
   mctlhq/mctl-telegram: 0.59.0
 schedules:
   IncidentLoopWorkflow: 1 h
-  IssuePollWorkflow: 12 h
+  IssuePollWorkflow: 15 min
   ReconcileWorkflow: 15 min
 shepherd:
   gating_bots:
