@@ -16,6 +16,7 @@ from __future__ import annotations
 import inspect
 import logging
 from datetime import timedelta
+from math import lcm
 from types import SimpleNamespace
 
 import pytest
@@ -391,29 +392,56 @@ class TestIntakeCadence:
             f"that long for a proposal, and an idle tick costs one `gh search` call"
         )
 
-    async def test_schedules_sharing_a_cadence_are_offset_apart(self):
-        """Two 15-minute schedules with no offset fire on the same instant.
+    async def test_no_two_schedules_fire_on_the_same_minute(self):
+        """No two registered schedules share a firing minute.
 
-        Interval schedules are aligned to the epoch, so `every` alone decides
-        the phase. reconcile and issue-poll both write mctl-gitops and contend
-        for the same `mctl-gitops-main-writes` mutex, and colliding on every
-        tick is the contention the Argo cron was moved off `*/5` to avoid.
+        Interval schedules are aligned to the epoch, so `every` and `offset`
+        together fix the phase. reconcile, issue-poll and the incident loop all
+        end in a step that holds `mctl-gitops-main-writes`, so two of them
+        landing on the same minute is contention on the shared gitops write
+        mutex — the thing the Argo cron was moved off `*/5` to avoid.
 
-        Asserted on the pair rather than on a literal offset: what matters is
-        that they do not coincide, not which minute either one picks.
+        The first version of this test grouped schedules by `every` and only
+        compared offsets WITHIN a group. That is blind by construction to the
+        collision that was actually live: incidents at `every=1h, offset=0`
+        fires at :00, exactly where reconcile's `every=15m` already fires, and
+        the two groups were never compared. Confirmed on the cluster before
+        fixing — `temporal schedule list` at 2026-09-04 20:59:56 showed both
+        with `NextRunTime: 2 seconds from now` (agy P2 on #309).
+
+        Simulating the phases over their least common multiple compares every
+        pair regardless of cadence.
         """
         client = _FakeClient(existing=None)
         await setup_schedules(client)
 
-        phases: dict[timedelta, list[tuple[str, timedelta]]] = {}
+        def minutes(interval: ScheduleIntervalSpec) -> tuple[int, int]:
+            period = interval.every.total_seconds() / 60
+            offset = (interval.offset or timedelta()).total_seconds() / 60
+            assert period == int(period) and offset == int(offset), (
+                f"schedule fires on a sub-minute boundary ({interval}) — this test "
+                "reasons in whole minutes and would silently under-report collisions"
+            )
+            return int(period), int(offset)
+
+        specs: list[tuple[str, int, int]] = []
         for schedule_id, schedule in client.created:
             for interval in schedule.spec.intervals or []:
-                offset = interval.offset or timedelta()
-                phases.setdefault(interval.every, []).append((schedule_id, offset))
+                period, offset = minutes(interval)
+                specs.append((schedule_id, period, offset))
 
-        for every, entries in phases.items():
-            offsets = [offset for _, offset in entries]
-            assert len(set(offsets)) == len(offsets), (
-                f"schedules {[i for i, _ in entries]} all fire every {every} at the same "
-                f"offset {offsets[0]} — they tick together and race the gitops write mutex"
-            )
+        window = 1
+        for _, period, _ in specs:
+            window = lcm(window, period)
+
+        fires: dict[int, list[str]] = {}
+        for schedule_id, period, offset in specs:
+            for minute in range(window):
+                if (minute - offset) % period == 0:
+                    fires.setdefault(minute, []).append(schedule_id)
+
+        collisions = {m: ids for m, ids in fires.items() if len(ids) > 1}
+        assert not collisions, (
+            f"schedules fire together at minute(s) {sorted(collisions)}: {collisions} — "
+            "they race the shared mctl-gitops-main-writes mutex on every such tick"
+        )

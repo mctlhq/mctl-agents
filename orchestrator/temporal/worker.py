@@ -305,8 +305,29 @@ async def setup_schedules(client: Client) -> None:
             # cadence is also a volume-churn budget (mctl-gitops#856). The
             # responder ignores incidents younger than MIN_AGE_MINUTES=30
             # anyway, so halving the tick rate costs no real responsiveness.
-            # Matches what the (suspended) Argo cron did: `15 * * * *`.
-            intervals=[ScheduleIntervalSpec(every=timedelta(hours=1))],
+            #
+            # The offset is NOT cosmetic. Interval schedules are aligned to
+            # the epoch, so `every=1h` with no offset fires at :00 — the same
+            # minute as reconcile's `every=15m` (:00/:15/:30/:45). Both ticks
+            # end in a step holding `mctl-gitops-main-writes`
+            # (cwft-mctl-agents-reconcile.yaml and cwft-mctl-agents-run.yaml),
+            # so they contended for it every hour, on the hour. Observed
+            # directly on 2026-09-04: `temporal schedule list` showed both
+            # schedules with `NextRunTime: 2 seconds from now` at 20:59:56.
+            #
+            # 11 avoids reconcile's phase and issue-poll's (:07/:22/:37/:52),
+            # and also the Argo crons that take the same mutex from the other
+            # side: mctl-agents-incidents at :15, rotate-github-app-tokens at
+            # :00/:30, mctl-agents-shepherd at :00.
+            #
+            # A comment here used to claim this schedule matched the Argo
+            # cron's `15 * * * *`; without an offset it never did.
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(hours=1),
+                    offset=timedelta(minutes=11),
+                )
+            ],
         ),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
