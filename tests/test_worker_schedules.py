@@ -31,7 +31,7 @@ from temporalio.client import (
 )
 
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.worker import _ensure_schedule, setup_schedules
+from orchestrator.temporal.worker import ISSUE_POLL_SCHEDULE_ID, _ensure_schedule, setup_schedules
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 
 pytestmark = pytest.mark.anyio
@@ -363,3 +363,57 @@ class TestConvergenceRetries:
         messages = [r.getMessage() for r in caplog.records]
         assert any("spec and overlap policy are current" in m for m in messages), messages
         assert not any("converged to the declared" in m for m in messages), messages
+
+
+class TestIntakeCadence:
+    """The intake poller's tick rate, which is a latency budget.
+
+    This value drifted to 12 hours on 2026-08-09 with a commit message citing
+    "excessive GitHub API polling", and nothing here noticed. It surfaced on
+    2026-09-04 as five issues sitting in `agents:intake` for hours with no
+    proposal — not a failure anyone could see, because the schedule was
+    healthy and every tick returned `{"started": 0}` truthfully.
+
+    An idle tick is one `gh search issues` call, so the cost side of that
+    trade was never real. The latency side was.
+    """
+
+    async def test_intake_polls_at_least_four_times_an_hour(self):
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        registered = dict(client.created)
+        spec = registered[ISSUE_POLL_SCHEDULE_ID].spec
+        assert spec.intervals, f"{ISSUE_POLL_SCHEDULE_ID} declares no interval"
+        every = spec.intervals[0].every
+        assert every <= timedelta(minutes=15), (
+            f"intake polls every {every} — an issue labelled just after a tick waits "
+            f"that long for a proposal, and an idle tick costs one `gh search` call"
+        )
+
+    async def test_schedules_sharing_a_cadence_are_offset_apart(self):
+        """Two 15-minute schedules with no offset fire on the same instant.
+
+        Interval schedules are aligned to the epoch, so `every` alone decides
+        the phase. reconcile and issue-poll both write mctl-gitops and contend
+        for the same `mctl-gitops-main-writes` mutex, and colliding on every
+        tick is the contention the Argo cron was moved off `*/5` to avoid.
+
+        Asserted on the pair rather than on a literal offset: what matters is
+        that they do not coincide, not which minute either one picks.
+        """
+        client = _FakeClient(existing=None)
+        await setup_schedules(client)
+
+        phases: dict[timedelta, list[tuple[str, timedelta]]] = {}
+        for schedule_id, schedule in client.created:
+            for interval in schedule.spec.intervals or []:
+                offset = interval.offset or timedelta()
+                phases.setdefault(interval.every, []).append((schedule_id, offset))
+
+        for every, entries in phases.items():
+            offsets = [offset for _, offset in entries]
+            assert len(set(offsets)) == len(offsets), (
+                f"schedules {[i for i, _ in entries]} all fire every {every} at the same "
+                f"offset {offsets[0]} — they tick together and race the gitops write mutex"
+            )

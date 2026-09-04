@@ -254,7 +254,39 @@ async def setup_schedules(client: Client) -> None:
             task_queue=TASK_QUEUE,
         ),
         spec=ScheduleSpec(
-            intervals=[ScheduleIntervalSpec(every=timedelta(hours=12))],
+            # 15 minutes, which is what the Argo CronWorkflow this schedule
+            # replaced actually ran (`*/15` in
+            # cronworkflow-mctl-agents-issue-poll.yaml, now suspended).
+            #
+            # It was 12h between 2026-08-09 and 2026-09-04, on the stated
+            # grounds of "excessive GitHub API polling". That does not survive
+            # arithmetic: an idle tick is exactly ONE `gh search issues` call
+            # (run_issue_poller.search_labeled_issues), so 15 minutes costs 96
+            # requests a day against a 5000/hour limit. What it did cost was
+            # intake latency — up to 12 hours between labelling an issue and
+            # the investigator seeing it, which is how five issues sat
+            # untouched on 2026-09-04.
+            #
+            # Nor is the interval a volume-churn throttle, which is the other
+            # thing it looked like it might be doing. Each DISPATCHED issue
+            # raises an Argo investigate workflow, so the number of workflows
+            # tracks the number of labelled issues and not the tick rate;
+            # polling more often spreads the same arrivals out instead of
+            # firing 12 hours of them at once. Measured before changing this:
+            # peak concurrent PVC-backed agent workflows over a week was 6,
+            # against an attach ceiling of 48 (16/node x 3 workers).
+            #
+            # The offset keeps this tick off the same instant as
+            # `reconcile-mctl-agents-schedule`, which also fires every 15
+            # minutes. Interval schedules are aligned to the epoch, so without
+            # it the two would land together and contend for the shared
+            # `mctl-gitops-main-writes` mutex on every single tick.
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(minutes=15),
+                    offset=timedelta(minutes=7),
+                )
+            ],
         ),
         policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
     )
