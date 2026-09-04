@@ -86,7 +86,12 @@ async def status(workflow_id: str) -> None:
                 print(f"    detail:    {w.detail}")
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI's argument parser.
+
+    Split out of main() so tests can assert that the approve command the
+    investigator posts to real GitHub issues still parses (gitops#986).
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -115,7 +120,11 @@ def main() -> None:
     p_status = sub.add_parser("status", help="Print a DevLoopWorkflow's status (and result, if complete)")
     p_status.add_argument("workflow_id")
 
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
     if args.command == "start":
         asyncio.run(start(args.issue_url))
     elif args.command == "approve":

@@ -61,6 +61,46 @@ def test_a_malformed_approval_block_does_not_satisfy() -> None:
         assert human_approval_satisfied(data) is False, approval
 
 
+def test_a_string_true_still_requires_approval() -> None:
+    # A hand-edited or re-serialised status file can carry
+    # `requires_human_approval: "true"`, which YAML leaves as a string. An
+    # `is not True` identity check treats that as "not required" and skips the
+    # gate — failing OPEN on exactly the value that asked for it (agy P1).
+    # Every file in gitops today serialises a real boolean; this is about the
+    # ones that will not.
+    for truthy in ("true", "True", "TRUE", " yes ", "1"):
+        data = {"status": "accepted", "control": {"requires_human_approval": truthy}}
+        assert human_approval_satisfied(data) is False, truthy
+
+
+def test_a_falsey_string_does_not_require_approval() -> None:
+    for falsey in (False, "false", "no", "0", None):
+        data = {"status": "accepted", "control": {"requires_human_approval": falsey}}
+        assert human_approval_satisfied(data) is True, falsey
+
+
+def test_a_malformed_control_block_fails_closed() -> None:
+    # Absent means "never asked for approval". A control block that is present
+    # but not a mapping asked for something unreadable, which is not the same
+    # thing and must not be read as consent (agy P2).
+    for malformed in ("requires_human_approval: true", ["requires_human_approval"], 42):
+        assert human_approval_satisfied({"control": malformed}) is False, malformed
+
+
+def test_a_hand_built_ref_is_not_assumed_approved() -> None:
+    # approval_ok is fail-closed: a ref built without consulting the status
+    # file has not established that anyone approved it, and defaulting to True
+    # would make "forgot to pass it" indistinguishable from "a human approved
+    # it" (agy P2).
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="issue-x", proposal_dir=Path("/nonexistent"),
+        status="accepted",
+    )
+    assert ref.approval_ok is False
+    result = run_implementer.implement_one(ref, dry_run=True)
+    assert "requires_human_approval" in (result.skipped_reason or "")
+
+
 # --- the gate, through the implementer's own entry point -------------------
 
 def test_scan_marks_an_unapproved_proposal(tmp_path: Path) -> None:
@@ -100,3 +140,40 @@ def test_the_refusal_precedes_the_dry_run_shortcut(tmp_path: Path) -> None:
     ref = run_implementer.find_accepted_proposals(tmp_path)[0]
     result = run_implementer.implement_one(ref, dry_run=True)
     assert "requires_human_approval" in (result.skipped_reason or "")
+
+
+# --- the approve command the investigator posts to real issues -------------
+
+def test_the_posted_approve_command_is_valid(monkeypatch) -> None:
+    """The comment tells a human exactly what to run, on a real GitHub issue.
+
+    Requiring --approver on the CLI silently invalidated that copy-pasteable
+    command (claude P2). Asserting the text against the CLI's own parser keeps
+    the two from drifting again, rather than fixing the one line and leaving
+    the next change to break it.
+    """
+    import re
+    import shlex
+
+    from orchestrator import run_issue_investigator
+    from orchestrator.temporal import cli as temporal_cli
+
+    posted: dict[str, str] = {}
+
+    def fake_run(argv, **kwargs):
+        posted["body"] = argv[argv.index("--body") + 1]
+        return None
+
+    monkeypatch.setattr(run_issue_investigator, "_run", fake_run)
+    run_issue_investigator.post_proposal_comment(
+        "https://github.com/mctlhq/mctl-web/issues/1", "mctl-web", "issue-1-x")
+
+    m = re.search(r"`python -m orchestrator\.temporal\.cli (approve [^`]+)`",
+                  posted["body"])
+    assert m, f"no approve command found in the posted comment:\n{posted['body']}"
+
+    argv = shlex.split(m.group(1).replace("<your-identity>", "someone"))
+    parser = temporal_cli.build_parser()
+    args = parser.parse_args(argv)          # raises SystemExit if it drifted
+    assert args.command == "approve"
+    assert args.approver == "someone"

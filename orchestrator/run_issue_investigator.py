@@ -1062,12 +1062,18 @@ def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
         "Status: `proposed` — pending human approval. Review `requirements.md`, "
         "`design.md` and `tasks.md`, then approve: signal this issue's "
         f"DevLoopWorkflow (mctl-api `POST /api/v1/agents/dev-loop/{workflow_id}/approve`, "
-        f"or `python -m orchestrator.temporal.cli approve {workflow_id}`) — the "
+        f"or `python -m orchestrator.temporal.cli approve {workflow_id} "
+        "--approver <your-identity>`) — the "
         "workflow flips `.status.yaml` to `accepted` via the "
         "`mctl-agents-approve` operation and runs the Tier 2 implementer. "
         "If no DevLoopWorkflow is running for this issue (pre-Temporal "
         "proposal), run the `mctl-agents-approve` operation directly with "
-        f"`service={service} slug={slug}`."
+        f"`service={service} slug={slug}`.\n\n"
+        "The approver is recorded in `.status.yaml` and in the gitops commit, "
+        "and the implementer refuses a proposal whose "
+        "`control.requires_human_approval` carries no named approver — so "
+        "prefer the mctl-api endpoint, which takes the approver from the "
+        "authenticated caller rather than from what the caller types."
     )
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 

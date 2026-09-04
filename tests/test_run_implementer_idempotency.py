@@ -28,6 +28,10 @@ def make_ref(tmp_path: Path, status: str = "accepted") -> run_implementer.Propos
         slug="incident-example",
         proposal_dir=proposal,
         status=status,
+        # Stated explicitly because approval_ok is fail-closed (gitops#986):
+        # these tests are about idempotency and preflight, so the proposal
+        # they model is an approved one.
+        approval_ok=True,
     )
 
 
@@ -274,6 +278,7 @@ def test_failed_preflight_does_not_starve_later_proposal(
         slug="second",
         proposal_dir=second_dir,
         status="accepted",
+        approval_ok=True,
     )
     calls: list[str] = []
 

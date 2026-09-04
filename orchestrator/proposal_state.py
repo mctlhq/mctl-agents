@@ -63,9 +63,23 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
     all, and defaulting to deny would strand that entire path.
     """
     control = data.get("control")
-    if not isinstance(control, dict):
+    if control is None:
         return True
-    if control.get("requires_human_approval") is not True:
+    if not isinstance(control, dict):
+        # A control block that is present but not a mapping is corrupt, not
+        # absent. "Absent means not required" is a statement about proposals
+        # that never asked for approval; a malformed one asked for something
+        # unreadable, so it fails closed (agy P2).
+        return False
+
+    # Not `is not True`: a hand-edited or re-serialised status file can carry
+    # `requires_human_approval: "true"`, which YAML leaves as a string. An
+    # identity check against the bool would treat that as "not required" and
+    # skip the gate entirely — failing OPEN on exactly the value that asked
+    # for the gate (agy P1). Every status file in gitops today serialises a
+    # real boolean; this is about the ones that will not.
+    required = control.get("requires_human_approval")
+    if str(required).strip().lower() not in {"true", "yes", "1"}:
         return True
 
     approval = data.get("approval")

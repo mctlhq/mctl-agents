@@ -172,9 +172,13 @@ class ProposalRef:
     # Whether this proposal's own control block is satisfied. Carried here
     # because find_accepted_proposals already has the parsed .status.yaml in
     # hand and used to throw it away, leaving the consumer with nothing but
-    # `status` to gate on (gitops#986). Defaults True so a ref built by hand
-    # -- tests, --review-feedback -- behaves as it did before.
-    approval_ok: bool = True
+    # `status` to gate on (gitops#986).
+    #
+    # Fail-CLOSED default: a ref built without consulting the status file has
+    # not established that anyone approved it, and defaulting to True would
+    # make "forgot to pass it" indistinguishable from "a human approved it"
+    # (agy P2). find_accepted_proposals always computes it.
+    approval_ok: bool = False
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
