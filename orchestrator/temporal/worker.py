@@ -41,7 +41,6 @@ from orchestrator.temporal.activities.deploy_state import (
     resolve_deploy_target,
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
-from orchestrator.temporal.activities.docs_delta import process_docs_delta_activity
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.orphans import detect_orphans
@@ -59,7 +58,6 @@ from orchestrator.temporal.constants import (
     TASK_QUEUE,
 )
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
-from orchestrator.temporal.workflows.docs_delta import DocsDeltaWorkflow
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 from orchestrator.temporal.workflows.issue_poll import IssuePollWorkflow, IssuePollWorkflowInput
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
@@ -460,10 +458,9 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         detect_orphans,
         visibility.list_active_dev_loop_ids,
         poll_issues_activity,
-        process_docs_delta_activity,
     ]
     workflows: list[type] = [
-        DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow, DocsDeltaWorkflow
+        DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow
     ]
 
     execution_plan = WorkerPlan(

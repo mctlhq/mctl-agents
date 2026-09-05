@@ -5,7 +5,6 @@ agent_risk:
   incident-responder: medium
   issue-investigator: low
   mentor: low
-  question-author: low
   service-agent: low
   shepherd: high
 agents:
@@ -13,7 +12,6 @@ agents:
 - incident-responder
 - issue-investigator
 - mentor
-- question-author
 - service-agent
 - shepherd
 budgets_usd:
@@ -21,7 +19,6 @@ budgets_usd:
   incident_responder: '5.00'
   issue_investigator: '3.00'
   mentor: '2.00'
-  question_author: '2.00'
   service_agent: '5.00'
   shepherd: '5.00'
 cronworkflows:
@@ -76,7 +73,6 @@ manifest_api_versions:
   incident-responder: agents.mctl.ai/v1alpha1
   issue-investigator: agents.mctl.ai/v1alpha2
   mentor: agents.mctl.ai/v1alpha1
-  question-author: agents.mctl.ai/v1alpha1
   service-agent: agents.mctl.ai/v1alpha1
   shepherd: agents.mctl.ai/v1alpha1
 mcp_tool_count: 73
@@ -232,7 +228,6 @@ shepherd:
   - review-fixing
 workflows:
 - DevLoopWorkflow
-- DocsDeltaWorkflow
 - IncidentLoopWorkflow
 - IssuePollWorkflow
 - ReconcileWorkflow

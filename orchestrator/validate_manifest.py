@@ -116,7 +116,6 @@ _ENV_VARS_AFFECTING_OPTIONS_DEFAULTS = (
     "SHEPHERD_BUDGET_USD",
     "ISSUE_INVESTIGATOR_BUDGET_USD",
     "INCIDENT_RESPONDER_BUDGET_USD",
-    "QUESTION_AUTHOR_BUDGET_USD",
 )
 
 # Agents whose execution.timeoutSeconds claims to mirror a real options.py
@@ -140,7 +139,6 @@ _TIMEOUT_CONSTANT_BY_AGENT = {
 _LEGACY_MODEL_ENV_VAR_BY_AGENT = {
     "issue-investigator": "ISSUE_INVESTIGATOR_MODEL",
     "incident-responder": "INCIDENT_RESPONDER_MODEL",
-    "question-author": "QUESTION_AUTHOR_MODEL",
 }
 
 

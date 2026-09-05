@@ -4,16 +4,10 @@ profiles:
   cheap:
     model: claude-haiku-4-5
     model_env: CLAUDE_CHEAP_MODEL
-    escalates_to: balanced
 
   balanced:
     model: claude-sonnet-5
     model_env: CLAUDE_BALANCED_MODEL
-    escalates_to: strong
-
-  strong:
-    model: claude-opus-4-8
-    model_env: CLAUDE_STRONG_MODEL
 
 tasks:
   service_agent: balanced

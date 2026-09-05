@@ -29,14 +29,12 @@ class ModelSelection:
     profile: str
     model: str
     source: str
-    escalation_profile: str | None
 
     def log(self) -> None:
-        escalation = self.escalation_profile or "none"
         print(
             "[model-policy] "
             f"task={self.task} profile={self.profile} model={self.model} "
-            f"source={self.source} escalation_target={escalation}"
+            f"source={self.source}"
         )
 
 
@@ -92,11 +90,6 @@ class ModelPolicy:
                 raise ModelPolicyError(
                     f"profile {name!r} model_env must be a non-empty string"
                 )
-            escalation = profile.get("escalates_to")
-            if escalation is not None and escalation not in self._profiles:
-                raise ModelPolicyError(
-                    f"profile {name!r} escalates to unknown profile {escalation!r}"
-                )
 
         for task, profile_name in self._tasks.items():
             if profile_name not in self._profiles:
@@ -109,27 +102,17 @@ class ModelPolicy:
         task: str,
         *,
         legacy_model_env: str | None = None,
-        escalate: bool = False,
         log: bool = True,
     ) -> ModelSelection:
         """Resolve a task to a concrete model.
 
         Precedence is task-specific legacy override, profile environment
-        override, then the YAML default. ``escalate`` advances exactly one
-        configured profile and is intended for retry policies added by callers.
+        override, then the YAML default.
         """
         try:
             profile_name = self._tasks[task]
         except KeyError as exc:
             raise ModelPolicyError(f"unknown model-policy task {task!r}") from exc
-
-        if escalate:
-            escalation = self._profiles[profile_name].get("escalates_to")
-            if escalation is None:
-                raise ModelPolicyError(
-                    f"profile {profile_name!r} has no escalation target"
-                )
-            profile_name = escalation
 
         profile = self._profiles[profile_name]
         model = ""
@@ -154,7 +137,6 @@ class ModelPolicy:
             profile=profile_name,
             model=model,
             source=source,
-            escalation_profile=profile.get("escalates_to"),
         )
         if log:
             selection.log()
@@ -165,13 +147,11 @@ def resolve_model(
     task: str,
     *,
     legacy_model_env: str | None = None,
-    escalate: bool = False,
     log: bool = True,
 ) -> ModelSelection:
     """Resolve one task using the configured policy file."""
     return ModelPolicy.load().resolve(
         task,
         legacy_model_env=legacy_model_env,
-        escalate=escalate,
         log=log,
     )

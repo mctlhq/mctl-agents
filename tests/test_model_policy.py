@@ -13,14 +13,11 @@ def _policy() -> ModelPolicy:
                 "cheap": {
                     "model": "cheap-default",
                     "model_env": "CLAUDE_CHEAP_MODEL",
-                    "escalates_to": "balanced",
                 },
                 "balanced": {
                     "model": "balanced-default",
                     "model_env": "CLAUDE_BALANCED_MODEL",
-                    "escalates_to": "strong",
                 },
-                "strong": {"model": "strong-default"},
             },
             "tasks": {
                 "mentor_digest": "cheap",
@@ -39,7 +36,6 @@ def test_low_cost_tasks_use_cheap_profile() -> None:
 
     assert (mentor.profile, mentor.model) == ("cheap", "cheap-default")
     assert (shepherd.profile, shepherd.model) == ("cheap", "cheap-default")
-    assert mentor.escalation_profile == "balanced"
 
 
 def test_legacy_task_override_has_highest_precedence(monkeypatch) -> None:
@@ -63,14 +59,6 @@ def test_profile_environment_override(monkeypatch) -> None:
 
     assert selection.model == "profile-override"
     assert selection.source == "CLAUDE_CHEAP_MODEL"
-
-
-def test_escalation_advances_one_profile() -> None:
-    selection = _policy().resolve("mentor_digest", escalate=True, log=False)
-
-    assert selection.profile == "balanced"
-    assert selection.model == "balanced-default"
-    assert selection.escalation_profile == "strong"
 
 
 def test_unknown_task_is_rejected() -> None:

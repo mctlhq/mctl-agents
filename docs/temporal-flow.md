@@ -24,7 +24,6 @@ flowchart TB
         REC["ReconcileWorkflow<br/>schedule 15m"]
         ISS["IssuePollWorkflow<br/>schedule 15 min"]
         INC["IncidentLoopWorkflow<br/>schedule 1h · создаётся paused (#179)"]
-        DOC["DocsDeltaWorkflow<br/>(по запросу)"]
     end
 
     subgraph ACT["Activities воркера (тонкие HTTP/GitHub-вызовы; SDK — только в Argo)"]
@@ -35,7 +34,6 @@ flowchart TB
         DISC["discover_and_project (read-only)"]
         ORPH["detect_orphans"]
         IPA["poll_issues_activity<br/>→ run_issue_poller.poll<br/>gh search label:agents:intake<br/>старт DevLoop + снятие лейбла"]
-        DDA["process_docs_delta_activity<br/>⚠ SDK в воркере — остаток #149"]
     end
 
     subgraph EXT["Внешние системы"]
@@ -163,9 +161,6 @@ flowchart LR
 
     S3["schedule 1h<br/>создаётся paused (#179)"] --> INC["IncidentLoopWorkflow"]
     INC --> I["submit_and_wait('mctl-agents-incidents')<br/>SDK работает в Argo, не в воркере (agents#179)"]
-
-    S4["по запросу"] --> DOC["DocsDeltaWorkflow"]
-    DOC --> DD["process_docs_delta_activity<br/>deprecated/formatting_only → no-op<br/>иначе author_question → mctl-academy<br/>⚠ SDK-вызов в воркере — открытый остаток #149"]
 ```
 
 [исходник](diagrams/temporal-flow-schedules.mmd)
