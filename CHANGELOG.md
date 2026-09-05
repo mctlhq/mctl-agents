@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.40.0](https://github.com/mctlhq/mctl-agents/compare/1.39.1...1.40.0) (2026-09-05)
+
+
+### Features
+
+* retire question-author, DocsDeltaWorkflow and the strong profile ([b517e12](https://github.com/mctlhq/mctl-agents/commit/b517e1249e0949f235f1a5b1a0457e6630226340))
+
 ## [1.39.1](https://github.com/mctlhq/mctl-agents/compare/1.39.0...1.39.1) (2026-09-04)
 
 
