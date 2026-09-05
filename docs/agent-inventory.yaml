@@ -254,22 +254,6 @@ agents:
     triggeredBy:
       - cwft-mctl-agents-daily (after the service-agent rotation)
 
-  - name: question-author
-    driver: orchestrator/run_question_author.py
-    entrypoint: orchestrator.run_question_author:author_question
-    optionsBuilder: orchestrator.options:build_question_author_options
-    promptSources:
-      - inline: orchestrator/run_question_author.py:QUESTION_AUTHOR_PROMPT
-    modelPolicyTask: service_agent
-    budgetEnv: QUESTION_AUTHOR_BUDGET_USD
-    sandbox:
-      backend: argo
-      clusterWorkflowTemplate: mctl-agents-run
-    writes: content/ questions review_ready status
-    riskLevel: low
-    triggeredBy:
-      - DocsDeltaWorkflow (Temporal)
-
 # ---------------------------------------------------------------------------
 # Orchestration — NOT agents. No manifest, no version, no release.
 # ---------------------------------------------------------------------------

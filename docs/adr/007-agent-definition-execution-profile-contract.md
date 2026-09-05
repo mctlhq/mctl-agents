@@ -12,8 +12,7 @@
 `AgentManifest` (`orchestrator/manifest.py`, `agents/_manifests/*/agent.yaml`,
 formalising the classification in `docs/agent-inventory.yaml`) describes each
 of the six SDK-backed agents (issue-investigator, implementer, shepherd,
-incident-responder, service-agent, mentor; question-author exists as a
-seventh manifest but is not yet part of the dev-loop).
+incident-responder, service-agent, mentor).
 `orchestrator/validate_manifest.py` checks every manifest claim against the
 real `orchestrator/options.py` builder it describes — the "manifest is a
 checked claim, not a second implementation" contract this ADR must not

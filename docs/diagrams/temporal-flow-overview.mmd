@@ -10,7 +10,6 @@ flowchart TB
         REC["ReconcileWorkflow<br/>schedule 15m"]
         ISS["IssuePollWorkflow<br/>schedule 12h"]
         INC["IncidentLoopWorkflow<br/>schedule 1h · создаётся paused (#179)"]
-        DOC["DocsDeltaWorkflow<br/>(по запросу)"]
     end
 
     subgraph ACT["Activities воркера (тонкие HTTP/GitHub-вызовы; SDK — только в Argo)"]
@@ -21,7 +20,6 @@ flowchart TB
         DISC["discover_and_project (read-only)"]
         ORPH["detect_orphans"]
         IPA["poll_issues_activity<br/>→ run_issue_poller.poll<br/>gh search label:agents:intake<br/>старт DevLoop + снятие лейбла"]
-        DDA["process_docs_delta_activity<br/>⚠ SDK в воркере — остаток #149"]
     end
 
     subgraph EXT["Внешние системы"]

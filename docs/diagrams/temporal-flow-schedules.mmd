@@ -8,6 +8,3 @@ flowchart LR
 
     S3["schedule 1h<br/>создаётся paused (#179)"] --> INC["IncidentLoopWorkflow"]
     INC --> I["submit_and_wait('mctl-agents-incidents')<br/>SDK работает в Argo, не в воркере (agents#179)"]
-
-    S4["по запросу"] --> DOC["DocsDeltaWorkflow"]
-    DOC --> DD["process_docs_delta_activity<br/>deprecated/formatting_only → no-op<br/>иначе author_question → mctl-academy<br/>⚠ SDK-вызов в воркере — открытый остаток #149"]
