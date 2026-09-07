@@ -25,7 +25,6 @@ cronworkflows:
   cronworkflow-labs-claude-remote-restart.yaml: 0 3 * * 0
   cronworkflow-mctl-agents-implement.yaml: '*/5 * * * *'
   cronworkflow-mctl-agents-incidents.yaml: 15 * * * *
-  cronworkflow-mctl-agents-issue-poll.yaml: '*/15 * * * *'
   cronworkflow-mctl-agents-shepherd.yaml: 0 7-21/2 * * *
   cwft-mctl-agents-daily.yaml: 0 0 * * 6
 cwft_env_overrides:
@@ -41,7 +40,6 @@ cwfts:
 - mctl-agents-daily
 - mctl-agents-implement
 - mctl-agents-investigate
-- mctl-agents-issue-poll
 - mctl-agents-reconcile
 - mctl-agents-run
 - mctl-agents-shepherd
@@ -195,13 +193,13 @@ registry_environments:
 - production
 - shadow
 releases_seen:
-  mctlhq/mctl-academy: 0.1.50
-  mctlhq/mctl-agent: 2.0.1
-  mctlhq/mctl-agents: 1.39.0
-  mctlhq/mctl-api: 4.37.0
-  mctlhq/mctl-docs: 0.1.38
-  mctlhq/mctl-portal: 4.15.0
-  mctlhq/mctl-telegram: 0.59.0
+  mctlhq/mctl-academy: 0.1.51
+  mctlhq/mctl-agent: 2.1.0
+  mctlhq/mctl-agents: 1.40.0
+  mctlhq/mctl-api: 4.38.0
+  mctlhq/mctl-docs: 0.1.40
+  mctlhq/mctl-portal: 4.16.0
+  mctlhq/mctl-telegram: 0.62.0
 schedules:
   IncidentLoopWorkflow: 1 h
   IssuePollWorkflow: 15 min
