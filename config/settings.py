@@ -54,6 +54,7 @@ SERVICES = [
     "mctl-design",
     "mctl-pairdesk",
     "mctl-academy",
+    "seerrsense",
     # "upwork-mcp",
 ]
 
@@ -65,6 +66,7 @@ NON_ROTATING_SERVICES = {
     "mctl-design",
     "mctl-pairdesk",
     "mctl-academy",
+    "seerrsense",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
