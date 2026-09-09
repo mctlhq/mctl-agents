@@ -24,6 +24,10 @@ WORKDIR /app
 # `gh` CLI is required by the Tier 2 implementer (orchestrator/run_implementer.py)
 # for `gh repo clone mctlhq/<svc>` + `gh pr create`. Installed from the
 # official cli.github.com Debian repo.
+# gcc + libc6-dev are here for the Go repositories, not for Python: `go test
+# -race` needs a working C toolchain even though the production binaries build
+# with CGO_ENABLED=0. Without them an agent either skips the race detector or
+# spends part of its budget bootstrapping a compiler by hand (see #304).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
@@ -31,6 +35,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         nodejs \
         npm \
         git \
+        gcc \
+        libc6-dev \
         openssh-client \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -39,6 +45,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
          > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
+
+# Go toolchain. Three of the services in SERVICES (config/settings.py) are Go
+# repositories — mctl-telegram, mctl-api, mctl-agent — and none of them can be
+# built, vetted or tested without this. It is installed at build time because
+# the runtime user below is non-root (SOC F8): an agent that finds no compiler
+# cannot install one, and the run fails with "implementer produced no commits"
+# after spending real model budget discovering that. See #327.
+#
+# Pinned by version and verified by checksum for the same reason uv is pinned
+# by digest: a toolchain fetched unpinned at run time is drift that no lockfile
+# can catch. All three Go repositories declare `go 1.26.6` with no `toolchain`
+# directive, so this satisfies them; bump it deliberately when they move.
+ARG GO_VERSION=1.26.7
+ARG GO_SHA256_AMD64=ffb5f8de10c62550dfddab66b36b57030721e0a44a3218e9e1181d7b59f121ca
+ARG GO_SHA256_ARM64=5a4ec883379d51ee9ce1040d5e87f8d35e20387574dd8c947feb01eabc3c1b37
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$GO_SHA256_AMD64" ;; \
+      arm64) sha="$GO_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture for the Go toolchain: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz"; \
+    echo "${sha}  /tmp/go.tar.gz" | sha256sum -c -; \
+    tar -C /usr/local -xzf /tmp/go.tar.gz; \
+    rm /tmp/go.tar.gz; \
+    /usr/local/go/bin/go version
+
+ENV PATH="/usr/local/go/bin:$PATH"
 
 # uv, pinned by digest like everything else here: an unpinned installer is the
 # same class of drift the lockfile exists to prevent, and a registry tag can be
