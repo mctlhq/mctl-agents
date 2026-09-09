@@ -8,7 +8,7 @@ permissions: {}
 
 jobs:
   agy-review:
-    uses: mctlhq/.github/.github/workflows/agy-review.yml@4d6e0141861e5de4a975131b775964c74d8c51da
+    uses: mctlhq/.github/.github/workflows/agy-review.yml@70d677cc1be17eb5c7e7b89e8d6f7cb5db20b79e
     permissions:
       contents: read
       pull-requests: write
