@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.40.2](https://github.com/mctlhq/mctl-agents/compare/1.40.1...1.40.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* **image:** install the Go toolchain and a C compiler ([7d7bef3](https://github.com/mctlhq/mctl-agents/commit/7d7bef3662d4ff1719156f865e00c7dacaf00390))
+* **image:** install the Go toolchain and a C compiler ([2a3ec13](https://github.com/mctlhq/mctl-agents/commit/2a3ec1355109bbf420cbe85c5c16e30eacf06872)), closes [#327](https://github.com/mctlhq/mctl-agents/issues/327) [#304](https://github.com/mctlhq/mctl-agents/issues/304)
+* **options:** match the investigator budget the deployment actually uses ([8c106dc](https://github.com/mctlhq/mctl-agents/commit/8c106dc0a256d999d952c540b801b0be3b24b6c9))
+* **options:** match the investigator budget the deployment actually uses ([82b2402](https://github.com/mctlhq/mctl-agents/commit/82b240238ca95505ec6959e90b94822224f9fbe2))
+
 ## [1.40.1](https://github.com/mctlhq/mctl-agents/compare/1.40.0...1.40.1) (2026-09-08)
 
 
