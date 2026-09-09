@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.40.1](https://github.com/mctlhq/mctl-agents/compare/1.40.0...1.40.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **config:** register seerrsense as a known service ([88a1eae](https://github.com/mctlhq/mctl-agents/commit/88a1eae862aea45b00117eba92fd8d00b98da6b0))
+* **config:** register seerrsense as a known service ([3b99dbe](https://github.com/mctlhq/mctl-agents/commit/3b99dbec9dd7b9e3ab7fa1cf748ca4052f9dd073))
+
 ## [1.40.0](https://github.com/mctlhq/mctl-agents/compare/1.39.1...1.40.0) (2026-09-05)
 
 
