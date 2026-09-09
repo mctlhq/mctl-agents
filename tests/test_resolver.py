@@ -527,7 +527,10 @@ def test_real_issue_investigator_definition_resolves_against_the_catalog():
     _require_real_catalog()
     plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="f" * 40))
     assert plan.agent == "issue-investigator"
-    assert plan.budget_usd == 3.0
+    # Tracks the deployed profile, not a preference of this test: mctl-gitops'
+    # execution-profiles/issue-investigator-default declares 8.00, raised with
+    # ISSUE_INVESTIGATOR_MODEL=claude-opus-5 in the same commit (2046e7e0).
+    assert plan.budget_usd == 8.0
     assert plan.timeout_seconds == 7200.0
     assert plan.cluster_workflow_template == "mctl-agents-investigate"
     assert plan.entrypoint == "orchestrator.run_issue_investigator:investigate"
