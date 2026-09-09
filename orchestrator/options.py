@@ -89,9 +89,14 @@ IMPLEMENTER_COMMAND_TIMEOUT_SECONDS = float(
 SHEPHERD_BUDGET_USD = float(os.getenv("SHEPHERD_BUDGET_USD", "5.00"))
 # Issue-investigator budget — covers reading a GitHub issue, exploring the
 # target repo clone, and writing the requirements/design/tasks triplet.
-# Comparable to a single spec-writer pass; $3 leaves headroom for a large
-# repo that needs a fair amount of Grep/Read to ground the design.
-ISSUE_INVESTIGATOR_BUDGET_USD = float(os.getenv("ISSUE_INVESTIGATOR_BUDGET_USD", "3.00"))
+# Raised 3.00 -> 8.00 to match the deployment: mctl-gitops' CWFT
+# (cwft-mctl-agents-investigate.yaml) sets ISSUE_INVESTIGATOR_BUDGET_USD=8.00
+# alongside ISSUE_INVESTIGATOR_MODEL=claude-opus-5, and the ExecutionProfile
+# issue-investigator-default declares the same. This default is what
+# tests/test_manifest.py compares the resolved profile against, so leaving it
+# at 3.00 turned that test red on main the moment the profile moved — in
+# another repository, with no commit here.
+ISSUE_INVESTIGATOR_BUDGET_USD = float(os.getenv("ISSUE_INVESTIGATOR_BUDGET_USD", "8.00"))
 # Incident-responder budget — covers listing/getting incidents, fetching logs,
 # writing proposal triplets (requirements/design/tasks/.status.yaml), and
 # resolving incidents.  Each incident requires ~7 MCP + Write calls; with up
