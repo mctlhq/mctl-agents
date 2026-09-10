@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.41.0](https://github.com/mctlhq/mctl-agents/compare/1.40.2...1.41.0) (2026-09-10)
+
+
+### Features
+
+* **agents:** issue-330-register-portfolio-as-a-non-rotating-dev ([22227c9](https://github.com/mctlhq/mctl-agents/commit/22227c97a9b04721c5b558dbc7c74dab47c5ac96))
+
+
+### Bug Fixes
+
+* **config:** register portfolio as a non-rotating service ([51c3b85](https://github.com/mctlhq/mctl-agents/commit/51c3b85be08cfa751806f333b6cd2f8d172a2dbc))
+
 ## [1.40.2](https://github.com/mctlhq/mctl-agents/compare/1.40.1...1.40.2) (2026-09-09)
 
 
