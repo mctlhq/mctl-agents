@@ -41,6 +41,12 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # also excluded from the shepherd (SHEPHERD_SKIP_SERVICES in the gitops
 # CronWorkflow) and are not steward-owned — content merges are gated on a
 # human CODEOWNER by design.
+#
+# `portfolio` is a static Astro site in tenant `labs`, developed exclusively
+# through the DevLoop. It has no agents/portfolio/ scaffold, so it must not
+# enter ROTATING_SERVICES — the rotation would fail immediately without a
+# scaffold. Its intake is human-labelled `agents:intake` issues, dispatched
+# by run_issue_poller.py.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -55,6 +61,7 @@ SERVICES = [
     "mctl-pairdesk",
     "mctl-academy",
     "seerrsense",
+    "portfolio",
     # "upwork-mcp",
 ]
 
@@ -67,6 +74,7 @@ NON_ROTATING_SERVICES = {
     "mctl-pairdesk",
     "mctl-academy",
     "seerrsense",
+    "portfolio",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via
