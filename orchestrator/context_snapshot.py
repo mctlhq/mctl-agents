@@ -301,6 +301,30 @@ class ContextSource:
         # already-computed content_hash.
         object.__setattr__(self, "selector", MappingProxyType(dict(self.selector)))
 
+    def __eq__(self, other: object) -> bool:
+        # The dataclass-generated __eq__ would compare `selector` via plain
+        # mapping equality (e.g. {"x": 1} == {"x": 1.0}), while __hash__
+        # below hashes selector's canonical JSON, where those two render
+        # differently ("1" vs "1.0"). Left as dataclass default, that
+        # mismatch would violate a == b => hash(a) == hash(b). Comparing
+        # selector via the same canonical JSON __hash__ uses keeps both in
+        # lockstep.
+        if not isinstance(other, ContextSource):
+            return NotImplemented
+        return (
+            self.source_id == other.source_id
+            and self.kind == other.kind
+            and self.locator == other.locator
+            and _canonical_json(dict(self.selector)) == _canonical_json(dict(other.selector))
+            and self.content_hash == other.content_hash
+            and self.byte_count == other.byte_count
+            and self.retrieved_at == other.retrieved_at
+            and self.freshness == other.freshness
+            and self.trust == other.trust
+            and self.selection == other.selection
+            and self.redaction == other.redaction
+        )
+
     def __hash__(self) -> int:
         # The dataclass-generated __hash__ would hash self.selector directly;
         # a MappingProxyType wrapping a dict is exactly as unhashable as that

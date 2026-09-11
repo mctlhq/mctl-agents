@@ -633,6 +633,30 @@ def test_context_source_is_hashable():
     assert hash(source_a) == hash(source_b)
 
 
+def test_context_source_equal_selectors_hash_equal():
+    # a == b must imply hash(a) == hash(b) (T9-style regression): the
+    # dataclass-generated __eq__ would compare `selector` via plain mapping
+    # equality (e.g. {"x": 1} == {"x": 1.0}), while __hash__ hashes
+    # selector's canonical JSON, where "1" and "1.0" differ. A manual
+    # __eq__ compares selector via the same canonical JSON __hash__ uses,
+    # so two sources with identical selectors always hash equal.
+    source_a = _source(selector={"mode": "agent-directed"})
+    source_b = _source(selector={"mode": "agent-directed"})
+    assert source_a == source_b
+    assert hash(source_a) == hash(source_b)
+
+
+def test_context_source_selectors_differing_only_by_number_type_are_unequal():
+    # Regression: {"x": 1} == {"x": 1.0} under plain dict/mapping equality
+    # (1 == 1.0 in Python), but their canonical JSON renders differently
+    # ("1" vs "1.0"). ContextSource.__eq__ must not call these two sources
+    # equal, since doing so while __hash__ derives from canonical JSON
+    # would violate a == b => hash(a) == hash(b).
+    source_int = _source(selector={"x": 1})
+    source_float = _source(selector={"x": 1.0})
+    assert source_int != source_float
+
+
 # ---------------------------------------------------------------------------
 # Cross-cutting: fixture matches the worked-example shape tasks.md describes.
 # ---------------------------------------------------------------------------
