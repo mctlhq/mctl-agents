@@ -165,7 +165,15 @@ agents:
       only to normalise review findings into a JSON bundle. When this moves to
       Temporal, decide() and the GitHub polling belong in the worker; only the
       normalisation call needs a sandboxed run. Runs with mcp_servers={} — it
-      is the one agent with no mctl MCP access at all.
+      is the one agent with no mctl MCP access at all. Merge is conditional on
+      per-service mode (_service_mode): SHEPHERD_SKIP_SERVICES services are
+      never discovered; SHEPHERD_FIX_ONLY_SERVICES services (and any run
+      started with --fix-only) are discovered, reviewed and fixed but never
+      merged — decide() returns defer-merge instead, leaving merge to another
+      PR lifecycle (e.g. mctl-claude-remote's pr-steward). mctl-academy is
+      never mergeable by an agent, regardless of environment: it is a code
+      constant (NEVER_MERGE_SERVICES) checked independently in decide() and
+      merge_pr().
 
   - name: incident-responder
     driver: orchestrator/run_incident_responder.py

@@ -265,6 +265,253 @@ def test_discover_no_skip_includes_all(tmp_path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SHEPHERD_FIX_ONLY_SERVICES / defer-merge / NEVER_MERGE_SERVICES (#292)
+# ---------------------------------------------------------------------------
+def test_fix_only_services_from_env_parses_comma_and_space(monkeypatch) -> None:
+    """T1a: comma- or whitespace-separated names both parse, blanks dropped."""
+    monkeypatch.setenv(
+        "SHEPHERD_FIX_ONLY_SERVICES", "mctl-telegram, mctl-design  mctl-gitops"
+    )
+    assert run_shepherd._service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES") == frozenset(
+        {"mctl-telegram", "mctl-design", "mctl-gitops"}
+    )
+
+
+def test_fix_only_services_from_env_warns_on_unknown(monkeypatch, capsys) -> None:
+    """T1b: a name not in SERVICES (typo) is kept but warned about, not silent."""
+    monkeypatch.setenv("SHEPHERD_FIX_ONLY_SERVICES", "mctl-telegran")
+    names = run_shepherd._service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
+    assert names == frozenset({"mctl-telegran"})
+    assert "not in SERVICES" in capsys.readouterr().out
+
+
+def test_service_mode_fix_only_wins_over_skip(monkeypatch, capsys) -> None:
+    """T2: a service in both env lists resolves to FIX_ONLY and warns."""
+    monkeypatch.setattr(
+        run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset({"mctl-telegram"})
+    )
+    monkeypatch.setattr(
+        run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-telegram"})
+    )
+    assert run_shepherd._service_mode("mctl-telegram") == run_shepherd.FIX_ONLY
+    out = capsys.readouterr().out
+    assert "mctl-telegram" in out
+    assert "warn:" in out
+
+
+def test_service_mode_defaults_unchanged_when_env_unset(monkeypatch) -> None:
+    """T3: with both vars empty, every service resolves to FULL except academy."""
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset())
+    for service in run_shepherd.SERVICES:
+        expected = (
+            run_shepherd.FIX_ONLY
+            if service in run_shepherd.NEVER_MERGE_SERVICES
+            else run_shepherd.FULL
+        )
+        assert run_shepherd._service_mode(service) == expected
+
+
+def test_discover_includes_fix_only_service(tmp_path, monkeypatch, capsys) -> None:
+    """T4: a fix-only service is discovered (not skipped) with mode set."""
+    make_status_yaml(tmp_path, service="mctl-telegram", slug="idempotency-fix")
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    monkeypatch.setattr(
+        run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset({"mctl-telegram"})
+    )
+    refs = run_shepherd._discover_refs(tmp_path)
+    assert len(refs) == 1
+    assert refs[0].service == "mctl-telegram"
+    assert refs[0].mode == run_shepherd.FIX_ONLY
+    assert "skipping" not in capsys.readouterr().out
+
+
+def test_discover_force_fix_only_overrides_skip_list(tmp_path, monkeypatch) -> None:
+    """T5: --fix-only (fix_only=True) discovers a service that is still skipped."""
+    make_status_yaml(tmp_path, service="mctl-telegram", slug="idempotency-fix")
+    monkeypatch.setattr(
+        run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-telegram"})
+    )
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset())
+    refs = run_shepherd._discover_refs(tmp_path, fix_only=True)
+    assert {r.service for r in refs} == {"mctl-telegram"}
+
+
+def test_decide_defer_merge_in_fix_only() -> None:
+    """T6: the clean-green-settled fixture with fix_only=True defers instead of merging."""
+    pr = make_pr(merged=False, checks_green=True, merge_state_status="CLEAN")
+    review = CodexReview(has_responded=True, findings=[])
+    now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=UTC)
+    assert decide(pr, review, now=now, fix_only=True) == ("defer-merge", None)
+    assert decide(pr, review, now=now, fix_only=False) == ("merge", None)
+
+
+@pytest.mark.parametrize(
+    "pr_kwargs, review_kwargs",
+    [
+        ({}, {"has_responded": False, "findings": []}),  # wait
+        ({}, {"has_responded": True, "findings": [make_finding(severity="P1")]}),  # address-review
+        ({"merged": True, "merge_commit": "deadbeef"}, {"has_responded": False, "findings": []}),  # flip-to-merged
+        ({"closed_unmerged": True}, {"has_responded": False, "findings": []}),  # flip-to-rejected
+    ],
+)
+def test_decide_fix_only_does_not_change_non_merge_decisions(pr_kwargs, review_kwargs) -> None:
+    """T7: wait/address-review/flip-to-merged/flip-to-rejected are identical
+    regardless of fix_only — only the merge->defer-merge substitution changes."""
+    pr = make_pr(**pr_kwargs)
+    review = CodexReview(**review_kwargs)
+    assert decide(pr, review, fix_only=False) == decide(pr, review, fix_only=True)
+
+
+def test_process_one_defer_merge_writes_merge_owner_once(tmp_path) -> None:
+    """T8: fix-only + clean/green PR writes merge_owner once; merge_pr not called;
+    a second identical tick makes no further write (updated_at unchanged)."""
+    ref = make_ref(tmp_path, service="mctl-telegram")
+    ref.mode = run_shepherd.FIX_ONLY
+    pr = make_pr(checks_green=True)
+    review = CodexReview(has_responded=True, findings=[])
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "merge_pr") as mocked_merge:
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "defer-merge"
+    mocked_merge.assert_not_called()
+    first = read_status(ref)
+    assert first["merge_owner"] == "pr-steward"
+    assert first["status"] == "implemented"
+    first_updated_at = first["updated_at"]
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "merge_pr") as mocked_merge:
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "defer-merge"
+    mocked_merge.assert_not_called()
+    second = read_status(ref)
+    assert second["updated_at"] == first_updated_at
+
+
+def test_process_one_fix_only_still_applies_review_feedback(tmp_path) -> None:
+    """T9: address-review is unchanged in fix-only mode — regression for #292."""
+    ref = make_ref(tmp_path, service="mctl-telegram")
+    ref.mode = run_shepherd.FIX_ONLY
+    pr = make_pr(checks_green=True)
+    review = CodexReview(
+        has_responded=True, findings=[make_finding(severity="P1", commit_id=HEAD_SHA)]
+    )
+    apply_calls: list[tuple] = []
+    trigger_calls: list[PRSnapshot] = []
+
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
+        apply_calls.append((service, slug))
+        return {"p1": True, "p2": False, "summaries": ["fix it"]}
+
+    def fake_trigger_review(pr):
+        trigger_calls.append(pr)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup), \
+         patch.object(run_shepherd, "trigger_review", side_effect=fake_trigger_review):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "address-review"
+    assert len(apply_calls) == 1
+    assert len(trigger_calls) == 1
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert final["review_attempts"] == 1
+
+
+def test_process_one_fix_only_flips_to_merged_when_steward_merges(tmp_path) -> None:
+    """T10: a fix-only ref whose PR the steward merged still flips to terminal
+    merged, and merge_owner is cleared from .status.yaml."""
+    ref = make_ref(tmp_path, service="mctl-telegram")
+    ref.mode = run_shepherd.FIX_ONLY
+    # Pre-seed merge_owner as if a prior tick deferred it.
+    run_shepherd.update_status(ref, "implemented", merge_owner="pr-steward")
+
+    pr = make_pr(merged=True, merge_commit="abc123" + "0" * 34)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review",
+                      return_value=CodexReview(False, [])), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)):
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "flip-to-merged"
+    final = read_status(ref)
+    assert final["status"] == "merged"
+    assert "merge_owner" not in final
+
+
+def test_merge_pr_refuses_never_merge_service(monkeypatch, capsys) -> None:
+    """T11: merge_pr refuses mctl-academy without any subprocess/token call."""
+    pr = make_pr()
+    pr.repo = "mctlhq/mctl-academy"
+
+    with patch.object(run_shepherd, "subprocess") as mocked_subprocess, \
+         patch.object(run_shepherd, "refresh_github_token") as mocked_refresh:
+        result = run_shepherd.merge_pr(pr)
+    assert result == (False, None)
+    mocked_subprocess.run.assert_not_called()
+    mocked_refresh.assert_not_called()
+    assert "error:" in capsys.readouterr().out
+
+
+def test_decide_never_returns_merge_for_academy() -> None:
+    """T12: mctl-academy always resolves to FIX_ONLY, so decide() — called
+    with the fix_only value process_one derives from ref.mode — never
+    yields merge for it, across every otherwise-mergeable fixture."""
+    assert run_shepherd._service_mode("mctl-academy") == run_shepherd.FIX_ONLY
+
+    now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=UTC)
+    mergeable_fixtures = [
+        make_pr(checks_green=True, merge_state_status="CLEAN"),
+        make_pr(checks_green=True, merge_state_status="UNSTABLE"),
+        make_pr(head_pushed_at="2026-04-29T10:00:00Z"),  # after settle window
+    ]
+    review = CodexReview(has_responded=True, findings=[])
+    for pr in mergeable_fixtures:
+        # Sanity: this fixture would merge for a FULL-mode service.
+        assert decide(pr, review, now=now, fix_only=False) == ("merge", None)
+        # For academy (mode always FIX_ONLY) it defers instead.
+        decision, _ = decide(pr, review, now=now, fix_only=True)
+        assert decision != "merge"
+
+
+def test_main_rejects_fix_only_with_reconcile(tmp_path, monkeypatch) -> None:
+    """T13: --fix-only --reconcile exits with code 2."""
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--fix-only", "--reconcile", "--state-dir", str(state_dir)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        run_shepherd.main()
+    assert exc.value.code == 2
+
+
+def test_print_summary_includes_defer_merge(tmp_path, capsys) -> None:
+    """T14: the summary line for a defer-merge result shows decision + notes."""
+    ref = make_ref(tmp_path, service="mctl-telegram")
+    result = run_shepherd.ShepherdResult(
+        ref=ref, decision="defer-merge", notes="merge owned by pr-steward"
+    )
+    run_shepherd._print_summary([result])
+    out = capsys.readouterr().out
+    assert "mctl-telegram/test-slug: defer-merge" in out
+    assert "merge owned by pr-steward" in out
+
+
+# ---------------------------------------------------------------------------
 # Reconcile mode: read-only status repair for skip-listed repos
 # ---------------------------------------------------------------------------
 def test_discover_reconcile_covers_all_services(tmp_path, monkeypatch) -> None:
