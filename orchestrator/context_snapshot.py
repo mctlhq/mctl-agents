@@ -80,7 +80,10 @@ def _hash_bytes(raw: bytes) -> str:
 
 
 def _canonical_json(payload: Any) -> bytes:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except TypeError as exc:
+        raise ContextSnapshotError(f"payload is not JSON-serializable: {exc}") from exc
 
 
 def _reject_unknown_keys(data: Mapping[str, Any], allowed: frozenset[str], *, where: str) -> None:
@@ -156,7 +159,7 @@ class Freshness:
             mapping, frozenset({"observed_at", "staleness", "max_age_seconds"}), where="freshness"
         )
         observed_at = _require_str(mapping.get("observed_at"), where="freshness.observed_at")
-        staleness = mapping.get("staleness", "unknown")
+        staleness = _require_str(mapping.get("staleness", "unknown"), where="freshness.staleness")
         max_age_raw = mapping.get("max_age_seconds")
         max_age_seconds = None if max_age_raw is None else _require_int(max_age_raw, where="freshness.max_age_seconds")
         return cls(observed_at=observed_at, staleness=staleness, max_age_seconds=max_age_seconds)
@@ -195,6 +198,18 @@ class Selection:
     score: float | None = None
     strategy_step: str | None = None
 
+    def __post_init__(self) -> None:
+        # Normalize on every construction path (direct/seal AND from_dict),
+        # so an integer score hashes identically whether sealed directly or
+        # reloaded via from_dict, and a bool (an int subclass) is rejected
+        # rather than silently becoming 1.0/0.0.
+        if self.score is None:
+            return
+        if isinstance(self.score, bool) or not isinstance(self.score, (int, float)):
+            raise ContextSnapshotError("selection.score must be a number or null")
+        if not isinstance(self.score, float):
+            object.__setattr__(self, "score", float(self.score))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "rank": self.rank,
@@ -215,10 +230,7 @@ class Selection:
         rank = _require_int(mapping.get("rank"), where="selection.rank")
         reason_code = _require_str(mapping.get("reason_code"), where="selection.reason_code")
         included = _require_bool(mapping.get("included"), where="selection.included")
-        score_raw = mapping.get("score")
-        if score_raw is not None and not isinstance(score_raw, (int, float)):
-            raise ContextSnapshotError("selection.score must be a number or null")
-        score = None if score_raw is None else float(score_raw)
+        score = mapping.get("score")
         strategy_step = _optional_str(mapping.get("strategy_step"), where="selection.strategy_step")
         return cls(rank=rank, reason_code=reason_code, included=included, score=score, strategy_step=strategy_step)
 
@@ -277,6 +289,12 @@ class ContextSource:
     selection: Selection
     redaction: Redaction = field(default_factory=Redaction)
 
+    def __post_init__(self) -> None:
+        # Defensively copy on every construction path (direct/seal AND
+        # from_dict): a caller that mutates the dict it passed in after
+        # seal() must never silently change the sealed document's content.
+        object.__setattr__(self, "selector", dict(self.selector))
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "source_id": self.source_id,
@@ -319,7 +337,7 @@ class ContextSource:
             source_id=source_id,
             kind=kind,
             locator=locator,
-            selector=dict(selector),
+            selector=selector,
             content_hash=content_hash,
             byte_count=byte_count,
             retrieved_at=retrieved_at,
@@ -695,6 +713,25 @@ class ContextSnapshot:
                     f"budget.used_bytes ({budget.used_bytes}) exceeds max_bytes "
                     f"({budget.max_bytes}) without truncated=true"
                 )
+            for source in self.sources:
+                if source.byte_count > budget.max_bytes_per_source:
+                    raise ContextSnapshotError(
+                        f"source {source.source_id!r}: byte_count ({source.byte_count}) exceeds "
+                        f"budget.max_bytes_per_source ({budget.max_bytes_per_source}) without "
+                        f"truncated=true"
+                    )
+            included_sources = [s for s in self.sources if s.selection.included]
+            if budget.used_sources != len(included_sources):
+                raise ContextSnapshotError(
+                    f"budget.used_sources ({budget.used_sources}) does not match the number of "
+                    f"included sources ({len(included_sources)}) without truncated=true"
+                )
+            included_bytes = sum(s.byte_count for s in included_sources)
+            if budget.used_bytes != included_bytes:
+                raise ContextSnapshotError(
+                    f"budget.used_bytes ({budget.used_bytes}) does not match the sum of included "
+                    f"sources' byte_count ({included_bytes}) without truncated=true"
+                )
 
         if parent is not None:
             if self.step is None:
@@ -853,14 +890,25 @@ def recompute_content_hash(snapshot: ContextSnapshot) -> str:
 
 
 def validate_step_sequence(children: Sequence[ContextSnapshot]) -> None:
-    """`sequence` must be strictly increasing across `children`, given in
-    the order the caller wants to assert (ADR 009 sec. 4). Every child must
-    carry a `step` block; use `ContextSnapshot.validate(parent=...)`
-    separately to check each child's `execution` block against its parent."""
+    """`sequence` must be strictly increasing among siblings sharing one
+    `parent_snapshot_id`, in the order the caller wants to assert (ADR 009
+    sec. 4, `StepRef`'s docstring). Every child must carry a `step` block and
+    every child's `step.parent_snapshot_id` must match the others'; use
+    `ContextSnapshot.validate(parent=...)` separately to check each child's
+    `execution` block against its parent."""
     previous: int | None = None
+    parent_snapshot_id: str | None = None
     for child in children:
         if child.step is None:
             raise ContextSnapshotError(f"snapshot {child.snapshot_id!r} has no step block to sequence")
+        if parent_snapshot_id is None:
+            parent_snapshot_id = child.step.parent_snapshot_id
+        elif child.step.parent_snapshot_id != parent_snapshot_id:
+            raise ContextSnapshotError(
+                f"snapshot {child.snapshot_id!r} has parent_snapshot_id "
+                f"{child.step.parent_snapshot_id!r}, which does not match the other siblings' "
+                f"parent_snapshot_id {parent_snapshot_id!r}"
+            )
         if previous is not None and child.step.sequence <= previous:
             raise ContextSnapshotError(
                 f"snapshot {child.snapshot_id!r} has sequence {child.step.sequence}, which is not "

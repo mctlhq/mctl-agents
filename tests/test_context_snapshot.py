@@ -50,12 +50,15 @@ def _strategy(**overrides) -> cs.ContextStrategy:
 
 
 def _budget(**overrides) -> cs.ContextBudget:
+    # used_sources/used_bytes default to 0/0 (matching zero sources) since
+    # validate() now reconciles them against the actual `sources` list
+    # whenever truncated=False; callers that attach sources override both.
     fields = {
         "max_sources": 5,
         "max_bytes": 60000,
         "max_bytes_per_source": 50000,
-        "used_sources": 1,
-        "used_bytes": 100,
+        "used_sources": 0,
+        "used_bytes": 0,
         "truncated": False,
     }
     fields.update(overrides)
@@ -115,6 +118,29 @@ def test_round_trip_minimal_snapshot_with_no_sources():
     snapshot = _minimal_snapshot()
     assert snapshot.sources == ()
     assert cs.ContextSnapshot.from_dict(snapshot.to_dict()) == snapshot
+
+
+# ---------------------------------------------------------------------------
+# Selection.score normalization: coerced to float on every construction
+# path (not just from_dict), so seal -> serialize -> reload -> verify keeps
+# the golden-hash guarantee for a non-null integer score.
+# ---------------------------------------------------------------------------
+def test_selection_score_int_normalizes_to_float_and_hash_is_stable_after_reload():
+    source = _source(
+        selection=cs.Selection(rank=1, reason_code="target-repository-tree", included=True, score=1)
+    )
+    assert source.selection.score == 1.0
+    assert isinstance(source.selection.score, float)
+
+    snapshot = _minimal_snapshot(sources=[source], budget=_budget(used_sources=1, used_bytes=100))
+    reloaded = cs.ContextSnapshot.from_dict(snapshot.to_dict())
+    assert reloaded.content_hash == snapshot.content_hash
+    assert cs.recompute_content_hash(reloaded) == snapshot.content_hash
+
+
+def test_selection_score_rejects_bool():
+    with pytest.raises(cs.ContextSnapshotError, match="score"):
+        cs.Selection(rank=1, reason_code="x", included=True, score=True)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +328,15 @@ def test_freshness_defaults_to_unknown_not_fresh():
     assert freshness.staleness == "unknown"
 
 
+def test_freshness_rejects_a_malformed_staleness_with_context_snapshot_error():
+    # Regression: staleness used to skip _require_str, so an unhashable
+    # value (e.g. a list) blew up with a raw TypeError inside the later
+    # `staleness not in FRESHNESS_VALUES` check instead of failing closed
+    # with ContextSnapshotError.
+    with pytest.raises(cs.ContextSnapshotError, match=r"freshness\.staleness"):
+        cs.Freshness.from_dict({"observed_at": "2026-09-11T00:00:00Z", "staleness": ["fresh"]})
+
+
 def test_validate_rejects_unknown_freshness_staleness():
     # Built via dataclasses.replace, not seal(), so the invalid value is
     # injected AFTER construction and validate() is the thing under test —
@@ -349,6 +384,18 @@ def test_every_documented_freshness_value_is_accepted(value):
 def test_every_documented_trust_tier_is_accepted(value):
     trust = cs.Trust.from_dict({"tier": value, "rationale_code": "x"})
     assert trust.tier == value
+
+
+def test_validate_wraps_unserializable_selector_as_context_snapshot_error():
+    # Regression: _canonical_json could raise a raw TypeError out of
+    # validate() (via the selector-length check in _check_source), violating
+    # the documented contract that validate()/seal() only ever raise
+    # ContextSnapshotError.
+    snapshot = _minimal_snapshot(sources=[_source()], budget=_budget(used_sources=1, used_bytes=100))
+    bad_source = dc_replace(snapshot.sources[0], selector={"bad": {1, 2, 3}})
+    bad_snapshot = dc_replace(snapshot, sources=(bad_source,))
+    with pytest.raises(cs.ContextSnapshotError, match="JSON-serializable"):
+        bad_snapshot.validate()
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +477,24 @@ def test_validate_step_sequence_rejects_a_stepless_entry():
         cs.validate_step_sequence([_minimal_snapshot()])
 
 
+def test_validate_step_sequence_rejects_siblings_with_different_parents():
+    # Regression: validate_step_sequence only checked that `sequence` was
+    # strictly increasing, never that every child shared one
+    # parent_snapshot_id, despite StepRef's docstring promising both halves
+    # of the "siblings sharing one parent" rule.
+    parent_one = _minimal_snapshot()
+    parent_two = _minimal_snapshot(execution=_execution(agent="implementer"))
+    children = [
+        _minimal_snapshot(step=cs.StepRef(parent_snapshot_id=parent_one.snapshot_id, step="investigate", sequence=1)),
+        _minimal_snapshot(
+            execution=_execution(agent="shepherd"),
+            step=cs.StepRef(parent_snapshot_id=parent_two.snapshot_id, step="implement", sequence=2),
+        ),
+    ]
+    with pytest.raises(cs.ContextSnapshotError, match="parent_snapshot_id"):
+        cs.validate_step_sequence(children)
+
+
 # ---------------------------------------------------------------------------
 # T9 — budget semantics: used_sources/used_bytes exceeding maxima without
 # truncated=true is rejected; no token/context-window field exists anywhere
@@ -455,6 +520,58 @@ def test_budget_overrun_with_truncated_true_is_accepted():
     ok_snapshot.validate()  # must not raise
 
 
+def test_budget_rejects_source_over_max_bytes_per_source():
+    # Regression: max_bytes_per_source was declared, parsed, hashed and
+    # documented (ADR 009 sec. 1/6) but never enforced by validate().
+    snapshot = _minimal_snapshot(sources=[_source()], budget=_budget(used_sources=1, used_bytes=100))
+    bad_snapshot = dc_replace(
+        snapshot, budget=_budget(used_sources=1, used_bytes=100, max_bytes_per_source=50)
+    )
+    with pytest.raises(cs.ContextSnapshotError, match="max_bytes_per_source"):
+        bad_snapshot.validate()
+
+
+def test_budget_per_source_cap_skipped_when_truncated():
+    snapshot = _minimal_snapshot(sources=[_source()], budget=_budget(used_sources=1, used_bytes=100))
+    ok_snapshot = dc_replace(
+        snapshot,
+        budget=_budget(used_sources=1, used_bytes=100, max_bytes_per_source=50, truncated=True),
+    )
+    ok_snapshot.validate()  # must not raise
+
+
+def test_budget_used_sources_must_reconcile_with_included_sources():
+    # Regression: used_sources/used_bytes were never reconciled against the
+    # actual `sources` list, so a snapshot could declare totals that don't
+    # match reality.
+    snapshot = _minimal_snapshot(sources=[_source()], budget=_budget(used_sources=1, used_bytes=100))
+    bad_snapshot = dc_replace(snapshot, budget=_budget(used_sources=2, used_bytes=100))
+    with pytest.raises(cs.ContextSnapshotError, match="used_sources"):
+        bad_snapshot.validate()
+
+
+def test_budget_used_bytes_must_reconcile_with_included_sources_byte_sum():
+    snapshot = _minimal_snapshot(sources=[_source()], budget=_budget(used_sources=1, used_bytes=100))
+    bad_snapshot = dc_replace(snapshot, budget=_budget(used_sources=1, used_bytes=999))
+    with pytest.raises(cs.ContextSnapshotError, match="used_bytes"):
+        bad_snapshot.validate()
+
+
+def test_budget_reconciliation_only_counts_included_sources():
+    # A dropped/not-included source still appears in `sources` (the ADR's
+    # "every source considered, included or not"), but must not count
+    # toward used_sources/used_bytes — matching the golden fixture's shape.
+    included = _source()
+    excluded = _source(
+        source_id="s2",
+        selection=cs.Selection(rank=2, reason_code="budget-exhausted", included=False),
+    )
+    snapshot = _minimal_snapshot(
+        sources=[included, excluded], budget=_budget(used_sources=1, used_bytes=100)
+    )
+    snapshot.validate()  # must not raise: the excluded source doesn't count
+
+
 def test_no_token_or_context_window_field_in_budget():
     field_names = {f.name for f in __import__("dataclasses").fields(cs.ContextBudget)}
     for name in field_names:
@@ -467,6 +584,18 @@ def test_context_budget_from_dict_rejects_a_smuggled_token_field():
     doc["max_tokens"] = 8000
     with pytest.raises(cs.ContextSnapshotError, match="unknown key"):
         cs.ContextBudget.from_dict(doc)
+
+
+# ---------------------------------------------------------------------------
+# ContextSource.selector defensive copy: a caller mutating the dict it
+# passed to a direct-construction/seal() call must never change the sealed
+# document's effective content.
+# ---------------------------------------------------------------------------
+def test_context_source_defensively_copies_selector_on_direct_construction():
+    selector = {"mode": "agent-directed"}
+    source = _source(selector=selector)
+    selector["mode"] = "mutated-after-construction"
+    assert source.selector == {"mode": "agent-directed"}
 
 
 # ---------------------------------------------------------------------------
