@@ -69,6 +69,23 @@ After implement succeeds, the workflow drives its OWN proposal to merge:
   (poll `get_pr_state` first, submit the shepherd CWFT only when there is
   something for it to do).
 
+**Addendum (issue-292, 2026-09).** `SHEPHERD_SKIP_SERVICES` no longer implies
+"no in-loop review fixing". Ownership is now split by *stage*: a service in
+`SHEPHERD_FIX_ONLY_SERVICES` (or any run started with `--fix-only`) is still
+discovered, reviewed and pushed a follow-up commit by the shepherd — only the
+`merge` decision is withheld (`decide()` returns `defer-merge`; merge is left
+to another PR lifecycle, e.g. `mctl-claude-remote`'s pr-steward). Before this,
+`SHEPHERD_SKIP_SERVICES` removed both stages together, so a DevLoop claiming
+`shepherd_in_loop` on a skipped repo orphaned the proposal from both drivers
+at once: the cron sweeper stood down because the DevLoop claimed ownership,
+and the DevLoop's own in-loop ticks were silently discarded inside
+`_discover_refs` before `service_filter` ever ran. `mctl-academy` is the one
+exception left fully skipped, and is additionally hardened at the code level
+(`NEVER_MERGE_SERVICES`) so no environment configuration can make it
+agent-mergeable. See
+`agents-state/mctl-agents/proposals/issue-292-fix-lifecycle-steward-owned-repos-have-n/`
+for the full design.
+
 ### 6.2 Release observation (#215)
 
 After merge: watch the release land, using only existing read surfaces —

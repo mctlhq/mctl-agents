@@ -11,14 +11,28 @@ follow-up gitops PR; this module is the orchestrator only):
        filter to state=open, otherwise a human merge between ticks is
        never observed and the proposal sits in `implemented` forever).
     3. Run decide(pr, codex_review). One of: wait, address-review,
-       merge, flip-to-merged, flip-to-rejected. `decide()` is a pure
-       function. The 3-attempt cap on follow-up loops lives in the
-       OUTER state machine (this module), not in decide().
+       merge, flip-to-merged, flip-to-rejected, defer-merge. `decide()`
+       is a pure function. The 3-attempt cap on follow-up loops lives in
+       the OUTER state machine (this module), not in decide().
     4. Apply the decision: merge_pr (with --match-head-commit),
        apply_followup (subprocess into run_implementer with
-       --review-feedback), or update_status (terminal flip).
+       --review-feedback), update_status (terminal flip), or, for
+       defer-merge, record `merge_owner: pr-steward` without touching
+       `status`.
     5. Print `<service>/<slug>: <decision>` so the workflow log is
        greppable.
+
+Ownership is split per-service into three modes (`_service_mode`):
+    - full     — discover, review, fix and merge (today's behaviour).
+    - fix-only — discover, review and push follow-up commits, but
+        `decide()` returns `defer-merge` instead of `merge`; merge is
+        left to another PR lifecycle (e.g. mctl-claude-remote's
+        pr-steward). Set via SHEPHERD_FIX_ONLY_SERVICES or --fix-only.
+    - skip     — discover nothing (SHEPHERD_SKIP_SERVICES).
+A service in both SHEPHERD_FIX_ONLY_SERVICES and SHEPHERD_SKIP_SERVICES
+resolves to fix-only. NEVER_MERGE_SERVICES (a code constant, currently
+{"mctl-academy"}) never resolves to full and merge_pr() independently
+refuses to merge those repos, regardless of env or --fix-only.
 
 The Claude SDK is used for one specific decision: parsing review
 findings into "merge-ready vs. needs-fix" and shaping the followup
@@ -31,6 +45,13 @@ Env:
         run_implementer.py — the workflow PVC mounts the gitops worktree
         at /workdir/mctl-gitops/...).
     SHEPHERD_BUDGET_USD — soft budget cap per tick (default 5.00).
+    SHEPHERD_SKIP_SERVICES — comma/whitespace-separated services the
+        shepherd must not discover, fix, or merge (owned end-to-end by
+        another PR lifecycle).
+    SHEPHERD_FIX_ONLY_SERVICES — comma/whitespace-separated services the
+        shepherd discovers and fixes but never merges (merge owned by
+        another PR lifecycle). Wins over SHEPHERD_SKIP_SERVICES when a
+        service is listed in both.
     GITHUB_TOKEN — required for `gh api` and `gh pr merge` calls.
 
 Usage:
@@ -38,6 +59,8 @@ Usage:
     python -m orchestrator.run_shepherd --service mctl-web
     python -m orchestrator.run_shepherd --service mctl-web --slug wrangler-cve-0933
     python -m orchestrator.run_shepherd --budget 2.00
+    python -m orchestrator.run_shepherd \\
+        --service mctl-telegram --slug issue-481-idempotency-key-scope --fix-only
 """
 from __future__ import annotations
 
@@ -307,27 +330,85 @@ def _settle_min_from_env() -> int:
 SHEPHERD_MERGE_SETTLE_MIN = _settle_min_from_env()
 
 
-# Per-service opt-out. A repo whose name is listed here is owned by a
-# different PR lifecycle (e.g. mctl-claude-remote's pr-steward) and the
-# shepherd must NOT discover, fix, or merge its proposals — otherwise two
-# actors push fixes to the same feat/agents-* branch and race on merge.
-# Comma- or whitespace-separated; unset = empty set = today's behavior
-# (zero blast radius for every other repo).
-def _skip_services_from_env() -> frozenset[str]:
-    raw = os.environ.get("SHEPHERD_SKIP_SERVICES", "")
+# Per-service ownership. A repo whose name is listed in SHEPHERD_SKIP_SERVICES
+# is owned by a different PR lifecycle (e.g. mctl-claude-remote's pr-steward)
+# and the shepherd must NOT discover, fix, or merge its proposals — otherwise
+# two actors push fixes to the same feat/agents-* branch and race on merge.
+# SHEPHERD_FIX_ONLY_SERVICES splits that ownership by stage: the shepherd
+# still discovers, reviews and pushes follow-up commits, but merge stays with
+# the other actor. Both vars are comma- or whitespace-separated; unset = empty
+# set = today's behavior (zero blast radius for every other repo).
+def _service_set_from_env(var: str) -> frozenset[str]:
+    raw = os.environ.get(var, "")
     names = frozenset(s for s in raw.replace(",", " ").split() if s)
     unknown = names - set(SERVICES)
     if unknown:
         # A typo (e.g. `mctl-desig`) would silently skip nothing — warn so the
         # operator notices, mirroring the --service validation in main().
         print(
-            "warn: SHEPHERD_SKIP_SERVICES contains names not in SERVICES "
-            f"(typo?): {sorted(unknown)}"
+            f"warn: {var} contains names not in SERVICES (typo?): {sorted(unknown)}"
         )
     return names
 
 
-SHEPHERD_SKIP_SERVICES = _skip_services_from_env()
+def _skip_services_from_env() -> frozenset[str]:
+    """Thin alias kept for existing callers/tests; use _service_set_from_env."""
+    return _service_set_from_env("SHEPHERD_SKIP_SERVICES")
+
+
+SHEPHERD_SKIP_SERVICES = _service_set_from_env("SHEPHERD_SKIP_SERVICES")
+SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
+
+# Merge is content publication for these repos and is gated on a human
+# CODEOWNER by design. No environment value may grant an agent the merge
+# decision for a service listed here, regardless of SHEPHERD_SKIP_SERVICES,
+# SHEPHERD_FIX_ONLY_SERVICES, or --fix-only.
+NEVER_MERGE_SERVICES = frozenset({"mctl-academy"})
+
+# Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
+# but never merges (merge is owned by another PR lifecycle, e.g. pr-steward);
+# SKIP discovers nothing at all.
+FULL, FIX_ONLY, SKIP = "full", "fix-only", "skip"
+
+
+def _merge_owner_for(service: str) -> str:
+    """Who a deferred merge is handed off to for ``service``.
+
+    Most fix-only services are deferred to the ``pr-steward`` PR lifecycle.
+    NEVER_MERGE_SERVICES repos are explicitly not steward-owned — merge
+    there is gated on a human CODEOWNER by design — so recording
+    ``pr-steward`` for them would misattribute ownership to an actor that
+    has no role in the repo.
+    """
+    return "human-codeowner" if service in NEVER_MERGE_SERVICES else "pr-steward"
+
+
+def _service_mode(service: str, *, force_fix_only: bool = False) -> str:
+    """Resolve a service's shepherd ownership mode.
+
+    ``force_fix_only`` (the CLI's ``--fix-only``) wins over everything else,
+    including SHEPHERD_SKIP_SERVICES — the operator one-shot must work on a
+    still-skipped repo. Otherwise fix-only wins over skip when a service is
+    listed in both env vars, so the gitops migration is order-independent: a
+    rollout that adds SHEPHERD_FIX_ONLY_SERVICES before removing the matching
+    SHEPHERD_SKIP_SERVICES entry converges to fix-only rather than being
+    stuck between the two. A one-line warn: is printed for that overlap so
+    the transitional state is visible in the tick's log. NEVER_MERGE_SERVICES
+    never resolves to FULL: an agent may fix findings for such a service
+    (that is not content publication) but merge stays with a human CODEOWNER.
+    """
+    if force_fix_only:
+        return FIX_ONLY
+    if service in SHEPHERD_FIX_ONLY_SERVICES:
+        if service in SHEPHERD_SKIP_SERVICES:
+            print(
+                f"warn: {service} is listed in both SHEPHERD_FIX_ONLY_SERVICES "
+                "and SHEPHERD_SKIP_SERVICES; resolving to fix-only"
+            )
+        return FIX_ONLY
+    if service in SHEPHERD_SKIP_SERVICES:
+        return SKIP
+    return FIX_ONLY if service in NEVER_MERGE_SERVICES else FULL
 
 
 class FollowupSubprocessError(RuntimeError):
@@ -364,6 +445,7 @@ class ProposalRef:
     status: str
     review_attempts: int = 0
     pr_url: str | None = None
+    mode: str = FULL
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -495,6 +577,7 @@ def _discover_refs(
     slug_filter: str | None = None,
     reconcile: bool = False,
     dry_run: bool = False,
+    fix_only: bool = False,
 ) -> list[ProposalRef]:
     """Glob agents-state for proposals in SHEPHERD_INPUT_STATUSES.
 
@@ -502,10 +585,16 @@ def _discover_refs(
     requirements.md L41-58. Proposals without a `pr:` URL are skipped —
     the shepherd has nothing to do until the implementer opens a PR.
 
-    Normal mode skips services in SHEPHERD_SKIP_SERVICES entirely (they are
-    owned by another PR lifecycle, e.g. pr-steward). Reconcile mode covers all
-    services because GitHub-to-YAML projection is independent of which actor
-    owns the active review/fix/merge loop.
+    Normal mode discovers every service whose resolved mode
+    (`_service_mode`) is not SKIP — FULL and FIX_ONLY services are both
+    discovered, the mode just changes whether `merge` is later available.
+    ``fix_only`` (the CLI's ``--fix-only``) forces the ``service_filter``
+    target's mode to FIX_ONLY, so a still-skipped service is discovered too
+    when explicitly targeted. It does not affect any other service's mode —
+    when ``service_filter`` is unset, ``fix_only`` applies to every service
+    processed (there is nothing to scope it to). Reconcile mode covers all
+    services regardless of mode because GitHub-to-YAML projection is
+    independent of which actor owns the active review/fix/merge loop.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -515,8 +604,16 @@ def _discover_refs(
         if not service_dir.is_dir() or service_dir.name.startswith("_"):
             continue
         service = service_dir.name
-        is_skipped = service in SHEPHERD_SKIP_SERVICES
-        if not reconcile and is_skipped:
+        # Scope the force_fix_only override to the targeted service: when a
+        # service_filter is set (as --fix-only requires via --service), a
+        # different, still-skipped service must keep resolving to SKIP and
+        # print its normal skip notice rather than silently having its mode
+        # overridden too.
+        force_fix_only = fix_only and (
+            service_filter is None or service == service_filter
+        )
+        mode = _service_mode(service, force_fix_only=force_fix_only)
+        if not reconcile and mode == SKIP:
             # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
             # but log it (only for real targets with a proposals/ dir) so an
             # operator isn't confused about why its proposals never appear.
@@ -571,6 +668,7 @@ def _discover_refs(
                     status=status,
                     review_attempts=int(data.get("review_attempts", 0) or 0),
                     pr_url=pr_url,
+                    mode=mode,
                 )
             )
     return refs
@@ -1139,14 +1237,19 @@ def decide(
     pr: PRSnapshot,
     codex_review: CodexReview,
     now: datetime | None = None,
+    *,
+    fix_only: bool = False,
 ) -> tuple[str, Any]:
-    """Return one of the five decisions per design.md L62-75.
+    """Return one of the six decisions per design.md L62-75.
 
     Pure: only depends on its arguments. `now` is injected so the settling
     window stays deterministic in tests; it defaults to the current UTC time.
     The 3-attempt cap on address-review loops lives in the OUTER state machine
     (process_one), NOT here, so this function stays trivially testable with
-    hand-built fixtures.
+    hand-built fixtures. `fix_only` changes only the final return: a
+    proposal that would otherwise merge is instead returned as `defer-merge`
+    so callers hand the merge off to another PR lifecycle (e.g. pr-steward)
+    without touching `.status.yaml`'s `status`.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -1172,7 +1275,7 @@ def decide(
         # hold one tick so a human or second-opinion reviewer can land fix-ups
         # before we merge. See SHEPHERD_MERGE_SETTLE_MIN.
         return ("wait", None)
-    return ("merge", None)
+    return ("defer-merge", None) if fix_only else ("merge", None)
 
 
 # ---------------------------------------------------------------------------
@@ -1514,6 +1617,14 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     so the next tick re-evaluates the new head (a push that landed
     between review and merge cannot smuggle unreviewed code through).
     """
+    service = pr.repo.split("/")[-1]
+    if service in NEVER_MERGE_SERVICES:
+        print(
+            f"error: refusing to merge {pr.repo}#{pr.number}: "
+            f"{service} merges are gated on a human CODEOWNER"
+        )
+        return (False, None)
+
     pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
     cmd = [
         "gh", "pr", "merge",
@@ -1603,7 +1714,7 @@ def process_one(
 
     codex = read_codex_review(pr)
     copilot = read_copilot_review(pr)  # observed only — never gates
-    decision, payload = decide(pr, codex)
+    decision, payload = decide(pr, codex, fix_only=(ref.mode == FIX_ONLY))
 
     # Per-tick operator log line — Copilot's findings ride along here so
     # they are visible without gating the merge.
@@ -1626,6 +1737,7 @@ def process_one(
             merged_at=_now_iso(),
             merge_commit=payload,
             review_attempts=None,  # clear it so terminal status is clean
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
 
@@ -1635,8 +1747,22 @@ def process_one(
             "rejected",
             notes=payload or "PR was closed without merging.",
             review_attempts=None,
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
+
+    if decision == "defer-merge":
+        owner = _merge_owner_for(ref.service)
+        print(
+            f"info: {ref.service}/{ref.slug} pr={pr.repo}#{pr.number} is "
+            f"clean and green; merge owned by {owner} — deferring"
+        )
+        _update_status_if_changed(ref, ref.status, merge_owner=owner)
+        return ShepherdResult(
+            ref=ref,
+            decision="defer-merge",
+            notes=f"merge owned by {owner}",
+        )
 
     if decision == "address-review":
         # Outer-loop cap. design.md L122-142:
@@ -1746,6 +1872,21 @@ def process_one(
         return ShepherdResult(ref=ref, decision="address-review")
 
     if decision == "merge":
+        # Defensive re-check: decide() should never return "merge" for a
+        # never-merge or fix-only service, but this belt-and-braces guard
+        # makes that a property of process_one too, not just of decide().
+        if ref.service in NEVER_MERGE_SERVICES or ref.mode == FIX_ONLY:
+            owner = _merge_owner_for(ref.service)
+            print(
+                f"error: {ref.service}/{ref.slug}: decide() returned merge "
+                f"for a {ref.mode} service; refusing and deferring instead"
+            )
+            _update_status_if_changed(ref, ref.status, merge_owner=owner)
+            return ShepherdResult(
+                ref=ref,
+                decision="defer-merge",
+                notes=f"merge owned by {owner}",
+            )
         ok, merge_commit = merge_pr(pr)
         if not ok:
             # Transient: HEAD-SHA mismatch or branch-protection rejection.
@@ -1760,6 +1901,7 @@ def process_one(
             merged_at=_now_iso(),
             merge_commit=merge_commit,
             review_attempts=None,
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="merge")
 
@@ -2047,6 +2189,7 @@ def reconcile_one(
             merge_commit=pr.merge_commit,
             review_attempts=None,
             failure=None,
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
     if pr.closed_unmerged:
@@ -2059,6 +2202,7 @@ def reconcile_one(
             notes=pr.close_comment_or_default or "PR was closed without merging.",
             review_attempts=None,
             failure=None,
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
     if ref.status == "needs-triage" and failure_code == "merge-conflict":
@@ -2208,11 +2352,38 @@ def main() -> None:
             "reads reviews, applies fixes, merges, or calls the SDK."
         ),
     )
+    ap.add_argument(
+        "--fix-only", action="store_true",
+        help=(
+            "Force fix-only mode for every proposal processed in this run, "
+            "whatever SHEPHERD_FIX_ONLY_SERVICES/SHEPHERD_SKIP_SERVICES say: "
+            "discover, review and push follow-up commits, but never merge. "
+            "Requires --service (a targeted one-shot for a single repo, not "
+            "a blanket override). Cannot be combined with --reconcile."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
         print(
             f"Unknown service '{args.service}'. Available: {', '.join(SERVICES)}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.fix_only and args.reconcile:
+        print(
+            "--fix-only cannot be combined with --reconcile: reconcile "
+            "never merges or fixes anything",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.fix_only and not args.service:
+        print(
+            "--fix-only requires --service: it is a targeted one-shot "
+            "override for a single repo, not a blanket override of "
+            "SHEPHERD_SKIP_SERVICES for every service",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -2239,7 +2410,11 @@ def main() -> None:
         slug_filter=args.slug or None,
         reconcile=args.reconcile,
         dry_run=args.dry_run,
+        fix_only=args.fix_only,
     )
+    if args.fix_only:
+        for r in refs:
+            r.mode = FIX_ONLY
 
     # Sweep mode only (#213): a targeted --slug run — including the
     # DevLoop's own in-loop shepherd tick — always processes its slug;

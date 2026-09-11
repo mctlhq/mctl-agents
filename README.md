@@ -176,6 +176,10 @@ python -m orchestrator.run_shepherd --dry-run
 
 # GitHub-first projection repair for every service; no SDK or merge.
 python -m orchestrator.run_shepherd --reconcile
+
+# One-shot: fix review findings on a steward-owned repo without merging.
+python -m orchestrator.run_shepherd \
+    --service mctl-telegram --slug issue-481-idempotency-key-scope --fix-only
 ```
 
 The local one-shot needs the same env as the implementer: a
@@ -184,6 +188,27 @@ api` and `gh pr merge`) and either `CLAUDE_CODE_OAUTH_TOKEN`
 (Pro/Max) or `ANTHROPIC_API_KEY` for the SDK call that summarises
 codex findings. See `.env.example` for the full list.
 
+**Per-service ownership modes.** PR lifecycle ownership is split by repo
+*and* by stage. `_service_mode(service)` resolves one of three modes:
+
+- **full** (default) — discover, review, fix and merge.
+- **fix-only** (`SHEPHERD_FIX_ONLY_SERVICES`, or every proposal in a run
+  started with `--fix-only`) — discover, review and push follow-up
+  commits, but `decide()` returns `defer-merge` instead of `merge`; merge
+  is left to another PR lifecycle (e.g. `mctl-claude-remote`'s
+  pr-steward). A service listed in both `SHEPHERD_FIX_ONLY_SERVICES` and
+  `SHEPHERD_SKIP_SERVICES` resolves to fix-only (with a `warn:` line),
+  so a gitops rollout that adds the new variable before removing the old
+  one converges to the intended behaviour.
+- **skip** (`SHEPHERD_SKIP_SERVICES`) — discover nothing; the service is
+  owned end-to-end by another PR lifecycle.
+
+`NEVER_MERGE_SERVICES` (currently `{"mctl-academy"}`) is a code
+constant, not an env var: such a service never resolves to full, and
+`merge_pr()` independently refuses to merge it — content publication
+stays gated on a human CODEOWNER regardless of environment or
+`--fix-only`.
+
 **State machine.** Normal mode drives proposals in
 `{implemented, review-fixing, in-progress}`. Missing PR URLs are recovered
 from GitHub before the decision loop. Reconcile mode additionally repairs
@@ -191,7 +216,7 @@ from GitHub before the decision loop. Reconcile mode additionally repairs
 reviewing, fixing, or merging a PR.
 
 ```python
-def decide(pr, codex_review):
+def decide(pr, codex_review, *, fix_only=False):
     if pr.merged:
         return "flip-to-merged", pr.merge_commit
     if pr.closed_unmerged:
@@ -205,7 +230,7 @@ def decide(pr, codex_review):
         return "wait", None
     if not pr.checks_green:
         return "wait", None
-    return "merge", None
+    return ("defer-merge", None) if fix_only else ("merge", None)
 ```
 
 Decisions:
@@ -216,16 +241,27 @@ Decisions:
   SHA. Build a JSON bundle of the findings via the shepherd
   sub-agent (`agents/_shepherd/shepherd.md`), persist it to a temp
   file, and fork `run_implementer.py --review-feedback <path>` so it
-  pushes a follow-up commit on the existing branch.
-- **merge** — codex clean, CI green, merge state mergeable. Calls
+  pushes a follow-up commit on the existing branch. Unchanged by
+  fix-only mode — this is the stage the shepherd keeps for
+  steward-owned repos.
+- **merge** — codex clean, CI green, merge state mergeable, and the
+  service is not fix-only or in `NEVER_MERGE_SERVICES`. Calls
   `gh pr merge --merge --delete-branch --match-head-commit <SHA>` so
   a push that lands between review and merge cannot smuggle
   unreviewed code through. On HEAD-SHA mismatch we fall back to
   `wait` and the next tick re-evaluates.
-- **flip-to-merged** — human merged the PR out of band. Record
-  `merge_commit` and flip the proposal to terminal `merged`.
+- **defer-merge** — codex clean, CI green, merge state mergeable, but
+  the service is in fix-only mode: merge is owned by another PR
+  lifecycle. Records `merge_owner: pr-steward` in `.status.yaml`
+  (via the change-only writer, so repeated ticks produce no new
+  gitops commit) and leaves `status` untouched. `merge_pr()` is never
+  called.
+- **flip-to-merged** — human (or the steward) merged the PR out of
+  band. Record `merge_commit` and flip the proposal to terminal
+  `merged`; clears `merge_owner` if it was set.
 - **flip-to-rejected** — human closed without merging. Flip to
-  terminal `rejected` with the close comment in `notes:`.
+  terminal `rejected` with the close comment in `notes:`; clears
+  `merge_owner` if it was set.
 
 **Three-attempt cap.** The outer loop tracks `review_attempts:` in
 `.status.yaml`. After three consecutive `address-review` ticks
