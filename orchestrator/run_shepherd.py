@@ -371,6 +371,18 @@ NEVER_MERGE_SERVICES = frozenset({"mctl-academy"})
 FULL, FIX_ONLY, SKIP = "full", "fix-only", "skip"
 
 
+def _merge_owner_for(service: str) -> str:
+    """Who a deferred merge is handed off to for ``service``.
+
+    Most fix-only services are deferred to the ``pr-steward`` PR lifecycle.
+    NEVER_MERGE_SERVICES repos are explicitly not steward-owned — merge
+    there is gated on a human CODEOWNER by design — so recording
+    ``pr-steward`` for them would misattribute ownership to an actor that
+    has no role in the repo.
+    """
+    return "human-codeowner" if service in NEVER_MERGE_SERVICES else "pr-steward"
+
+
 def _service_mode(service: str, *, force_fix_only: bool = False) -> str:
     """Resolve a service's shepherd ownership mode.
 
@@ -1729,15 +1741,16 @@ def process_one(
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
 
     if decision == "defer-merge":
+        owner = _merge_owner_for(ref.service)
         print(
             f"info: {ref.service}/{ref.slug} pr={pr.repo}#{pr.number} is "
-            "clean and green; merge owned by pr-steward — deferring"
+            f"clean and green; merge owned by {owner} — deferring"
         )
-        _update_status_if_changed(ref, ref.status, merge_owner="pr-steward")
+        _update_status_if_changed(ref, ref.status, merge_owner=owner)
         return ShepherdResult(
             ref=ref,
             decision="defer-merge",
-            notes="merge owned by pr-steward",
+            notes=f"merge owned by {owner}",
         )
 
     if decision == "address-review":
@@ -1852,15 +1865,16 @@ def process_one(
         # never-merge or fix-only service, but this belt-and-braces guard
         # makes that a property of process_one too, not just of decide().
         if ref.service in NEVER_MERGE_SERVICES or ref.mode == FIX_ONLY:
+            owner = _merge_owner_for(ref.service)
             print(
                 f"error: {ref.service}/{ref.slug}: decide() returned merge "
                 f"for a {ref.mode} service; refusing and deferring instead"
             )
-            _update_status_if_changed(ref, ref.status, merge_owner="pr-steward")
+            _update_status_if_changed(ref, ref.status, merge_owner=owner)
             return ShepherdResult(
                 ref=ref,
                 decision="defer-merge",
-                notes="merge owned by pr-steward",
+                notes=f"merge owned by {owner}",
             )
         ok, merge_commit = merge_pr(pr)
         if not ok:
@@ -2331,7 +2345,8 @@ def main() -> None:
             "Force fix-only mode for every proposal processed in this run, "
             "whatever SHEPHERD_FIX_ONLY_SERVICES/SHEPHERD_SKIP_SERVICES say: "
             "discover, review and push follow-up commits, but never merge. "
-            "Cannot be combined with --reconcile."
+            "Requires --service (a targeted one-shot for a single repo, not "
+            "a blanket override). Cannot be combined with --reconcile."
         ),
     )
     args = ap.parse_args()
@@ -2347,6 +2362,15 @@ def main() -> None:
         print(
             "--fix-only cannot be combined with --reconcile: reconcile "
             "never merges or fixes anything",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if args.fix_only and not args.service:
+        print(
+            "--fix-only requires --service: it is a targeted one-shot "
+            "override for a single repo, not a blanket override of "
+            "SHEPHERD_SKIP_SERVICES for every service",
             file=sys.stderr,
         )
         sys.exit(2)

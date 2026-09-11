@@ -396,6 +396,30 @@ def test_process_one_defer_merge_writes_merge_owner_once(tmp_path) -> None:
     assert second["updated_at"] == first_updated_at
 
 
+def test_process_one_defer_merge_never_merge_service_owner_is_not_steward(
+    tmp_path,
+) -> None:
+    """Regression: NEVER_MERGE_SERVICES repos are not steward-owned, so a
+    deferred merge for one of them must not record `merge_owner: pr-steward`.
+    """
+    ref = make_ref(tmp_path, service="mctl-academy")
+    ref.mode = run_shepherd.FIX_ONLY
+    pr = make_pr(checks_green=True)
+    review = CodexReview(has_responded=True, findings=[])
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "merge_pr") as mocked_merge:
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "defer-merge"
+    mocked_merge.assert_not_called()
+    status = read_status(ref)
+    assert status["merge_owner"] == "human-codeowner"
+    assert status["merge_owner"] != "pr-steward"
+
+
 def test_process_one_fix_only_still_applies_review_feedback(tmp_path) -> None:
     """T9: address-review is unchanged in fix-only mode — regression for #292."""
     ref = make_ref(tmp_path, service="mctl-telegram")
@@ -493,6 +517,22 @@ def test_main_rejects_fix_only_with_reconcile(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         "sys.argv",
         ["run_shepherd", "--fix-only", "--reconcile", "--state-dir", str(state_dir)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        run_shepherd.main()
+    assert exc.value.code == 2
+
+
+def test_main_rejects_fix_only_without_service(tmp_path, monkeypatch) -> None:
+    """Regression: bare --fix-only (no --service) would otherwise override
+    SHEPHERD_SKIP_SERVICES for every service in state-dir, not just a
+    targeted one. --fix-only is a one-shot for a single repo, so it must
+    require --service and exit 2 without it."""
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--fix-only", "--state-dir", str(state_dir)],
     )
     with pytest.raises(SystemExit) as exc:
         run_shepherd.main()
