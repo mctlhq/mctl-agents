@@ -1,0 +1,209 @@
+{
+  "api_version": "context.mctl.ai/v1alpha1",
+  "budget": {
+    "max_bytes": 60000,
+    "max_bytes_per_source": 50000,
+    "max_sources": 5,
+    "truncated": true,
+    "used_bytes": 326,
+    "used_sources": 4
+  },
+  "content_hash": "sha256:de22a552ea05cf198ad582262f8aea1a3c3813272b7854c736e2d8415b8140eb",
+  "created_at": "2026-09-11T00:00:40Z",
+  "evidence_refs": [
+    {
+      "evidence_id": "ev-issue-264-investigation-proposal",
+      "kind": "proposal"
+    }
+  ],
+  "execution": {
+    "agent": "issue-investigator",
+    "argo_workflow_name": "mctl-agents-investigate-8f2a1c",
+    "definition_content_hash": "sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+    "definition_version": "3",
+    "environment": "production",
+    "profile_content_hash": "sha256:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+    "profile_version": "5",
+    "release_revision": 12,
+    "target_repository_sha": "9f2c1e4a7b3d5068c1a4f9e2b7d0c3a6e5f81402",
+    "temporal_run_id": "01J8ZQK7N3XG9F6C2R4D8T1M5W",
+    "temporal_workflow_id": "dev-loop-mctlhq-mctl-agents-264"
+  },
+  "kind": "ContextSnapshot",
+  "retention": {
+    "class": "execution-record",
+    "expires_after_days": 180
+  },
+  "snapshot_id": "cs-de22a552ea05cf19",
+  "sources": [
+    {
+      "byte_count": 119,
+      "content_hash": "sha256:7607c8b22e089139bfd966e9af320a59570d05e4ba34d26400a6b23991e785aa",
+      "freshness": {
+        "max_age_seconds": 3600,
+        "observed_at": "2026-09-11T00:00:05Z",
+        "staleness": "fresh"
+      },
+      "kind": "github-issue",
+      "locator": "https://github.com/mctlhq/mctl-agents/issues/264",
+      "redaction": {
+        "applied": false,
+        "dropped_bytes": 0,
+        "rules": []
+      },
+      "retrieved_at": "2026-09-11T00:00:05Z",
+      "selection": {
+        "included": true,
+        "rank": 1,
+        "reason_code": "primary-problem-statement",
+        "score": null,
+        "strategy_step": "primary"
+      },
+      "selector": {
+        "fields": "number,title,body,state,url"
+      },
+      "source_id": "issue",
+      "trust": {
+        "rationale_code": "github-issue-body-third-party-text",
+        "tier": "untrusted"
+      }
+    },
+    {
+      "byte_count": 0,
+      "content_hash": "sha256:b19b24840a1007606c775d68e536eed1806c44af8d7c703daea15c77aaea7f29",
+      "freshness": {
+        "max_age_seconds": null,
+        "observed_at": "2026-09-11T00:00:12Z",
+        "staleness": "fresh"
+      },
+      "kind": "target-repo",
+      "locator": "git+https://github.com/mctlhq/mctl-agents@9f2c1e4a7b3d5068c1a4f9e2b7d0c3a6e5f81402",
+      "redaction": {
+        "applied": false,
+        "dropped_bytes": 0,
+        "rules": []
+      },
+      "retrieved_at": "2026-09-11T00:00:12Z",
+      "selection": {
+        "included": true,
+        "rank": 2,
+        "reason_code": "target-repository-tree",
+        "score": null,
+        "strategy_step": "primary"
+      },
+      "selector": {
+        "mode": "agent-directed"
+      },
+      "source_id": "target-repo",
+      "trust": {
+        "rationale_code": "pinned-target-repository-sha",
+        "tier": "authoritative"
+      }
+    },
+    {
+      "byte_count": 106,
+      "content_hash": "sha256:41b34dc90dbcd2748e051f5b2ac16cc47de27297c878bef46f10b75cafffa594",
+      "freshness": {
+        "max_age_seconds": 3600,
+        "observed_at": "2026-09-11T00:00:20Z",
+        "staleness": "fresh"
+      },
+      "kind": "loki-logs",
+      "locator": "loki://team-admins/mctl-api",
+      "redaction": {
+        "applied": false,
+        "dropped_bytes": 0,
+        "rules": []
+      },
+      "retrieved_at": "2026-09-11T00:00:20Z",
+      "selection": {
+        "included": true,
+        "rank": 3,
+        "reason_code": "recent-service-logs",
+        "score": null,
+        "strategy_step": "secondary"
+      },
+      "selector": {
+        "lines": 50,
+        "since": "1h"
+      },
+      "source_id": "loki-mctl-api",
+      "trust": {
+        "rationale_code": "platform-telemetry",
+        "tier": "corroborated"
+      }
+    },
+    {
+      "byte_count": 101,
+      "content_hash": "sha256:c9ba92a7c02d4e404c3aa9c710dda11346361b0dcf03235933f38e8ab84f5f1c",
+      "freshness": {
+        "max_age_seconds": 21600,
+        "observed_at": "2026-09-10T18:00:00Z",
+        "staleness": "aging"
+      },
+      "kind": "incident",
+      "locator": "mctl-incident://6ab54770",
+      "redaction": {
+        "applied": false,
+        "dropped_bytes": 0,
+        "rules": []
+      },
+      "retrieved_at": "2026-09-11T00:00:25Z",
+      "selection": {
+        "included": true,
+        "rank": 4,
+        "reason_code": "root-cause-context",
+        "score": null,
+        "strategy_step": "secondary"
+      },
+      "selector": {
+        "fields": "analysis,status"
+      },
+      "source_id": "incident-6ab54770",
+      "trust": {
+        "rationale_code": "platform-incident-record",
+        "tier": "corroborated"
+      }
+    },
+    {
+      "byte_count": 84,
+      "content_hash": "sha256:c3ab028703c695d6214425d981a8b9080bd784592199a64b1ad66a1a2509b881",
+      "freshness": {
+        "max_age_seconds": 3600,
+        "observed_at": "2026-09-11T00:00:30Z",
+        "staleness": "fresh"
+      },
+      "kind": "loki-logs",
+      "locator": "loki://team-admins/mctl-agents",
+      "redaction": {
+        "applied": false,
+        "dropped_bytes": 0,
+        "rules": []
+      },
+      "retrieved_at": "2026-09-11T00:00:30Z",
+      "selection": {
+        "included": false,
+        "rank": 5,
+        "reason_code": "budget-exhausted",
+        "score": null,
+        "strategy_step": "secondary"
+      },
+      "selector": {
+        "lines": 200,
+        "since": "6h"
+      },
+      "source_id": "loki-mctl-agents",
+      "trust": {
+        "rationale_code": "platform-telemetry",
+        "tier": "corroborated"
+      }
+    }
+  ],
+  "step": null,
+  "strategy": {
+    "name": "deterministic-fixed-order",
+    "ranker_name": null,
+    "ranker_version": null,
+    "version": "1.0.0"
+  }
+}

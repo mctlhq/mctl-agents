@@ -339,7 +339,9 @@ tests, not documentation convention:
 - The enabling work tracked separately (#149 isolated Argo execution, #195
   execution traces, #196 execution identity/context, #197 runtime policy
   checkpoints, #198 human approval, #199 execution evidence) — this ADR
-  states how they plug into the model but does not implement them.
+  states how they plug into the model but does not implement them. #196/#264
+  runtime-context provenance is specified separately in ADR 009
+  (`docs/adr/009-context-snapshot-contract.md`).
 - Merging or starting implementation of the resolver/schema as part of this
   investigation.
 
