@@ -64,6 +64,11 @@ version: 1
 # agent version is reproducible only against a fixed target SHA. A shadow or
 # canary comparison that runs two agent versions against different target SHAs
 # is confounded and its diff means nothing.
+#
+# The per-run contract for runtimeContextInputs (what was actually placed in
+# front of the model, beyond the single target SHA pinned above) now lives in
+# ADR 009 (docs/adr/009-context-snapshot-contract.md) and
+# orchestrator/context_snapshot.py.
 
 agents:
   - name: issue-investigator
