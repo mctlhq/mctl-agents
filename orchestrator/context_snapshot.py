@@ -32,6 +32,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 API_VERSION = "context.mctl.ai/v1alpha1"
@@ -293,7 +294,10 @@ class ContextSource:
         # Defensively copy on every construction path (direct/seal AND
         # from_dict): a caller that mutates the dict it passed in after
         # seal() must never silently change the sealed document's content.
-        object.__setattr__(self, "selector", dict(self.selector))
+        # Wrapped in a read-only MappingProxyType so `source.selector[...]
+        # = ...` also fails loudly instead of silently invalidating the
+        # already-computed content_hash.
+        object.__setattr__(self, "selector", MappingProxyType(dict(self.selector)))
 
     def to_dict(self) -> dict[str, Any]:
         return {

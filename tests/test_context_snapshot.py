@@ -598,6 +598,15 @@ def test_context_source_defensively_copies_selector_on_direct_construction():
     assert source.selector == {"mode": "agent-directed"}
 
 
+def test_context_source_selector_is_immutable_after_construction():
+    # Regression: a defensive copy on construction is not enough — the
+    # copy itself must be read-only, or `source.selector[...] = ...` can
+    # still silently invalidate an already-computed content_hash.
+    source = _source(selector={"mode": "agent-directed"})
+    with pytest.raises(TypeError):
+        source.selector["mode"] = "mutated-in-place"
+
+
 # ---------------------------------------------------------------------------
 # Cross-cutting: fixture matches the worked-example shape tasks.md describes.
 # ---------------------------------------------------------------------------
