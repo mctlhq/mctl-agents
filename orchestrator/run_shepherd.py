@@ -588,10 +588,13 @@ def _discover_refs(
     Normal mode discovers every service whose resolved mode
     (`_service_mode`) is not SKIP — FULL and FIX_ONLY services are both
     discovered, the mode just changes whether `merge` is later available.
-    ``fix_only`` (the CLI's ``--fix-only``) forces every service's mode to
-    FIX_ONLY, so a still-skipped service is discovered too. Reconcile mode
-    covers all services regardless of mode because GitHub-to-YAML projection
-    is independent of which actor owns the active review/fix/merge loop.
+    ``fix_only`` (the CLI's ``--fix-only``) forces the ``service_filter``
+    target's mode to FIX_ONLY, so a still-skipped service is discovered too
+    when explicitly targeted. It does not affect any other service's mode —
+    when ``service_filter`` is unset, ``fix_only`` applies to every service
+    processed (there is nothing to scope it to). Reconcile mode covers all
+    services regardless of mode because GitHub-to-YAML projection is
+    independent of which actor owns the active review/fix/merge loop.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -601,7 +604,15 @@ def _discover_refs(
         if not service_dir.is_dir() or service_dir.name.startswith("_"):
             continue
         service = service_dir.name
-        mode = _service_mode(service, force_fix_only=fix_only)
+        # Scope the force_fix_only override to the targeted service: when a
+        # service_filter is set (as --fix-only requires via --service), a
+        # different, still-skipped service must keep resolving to SKIP and
+        # print its normal skip notice rather than silently having its mode
+        # overridden too.
+        force_fix_only = fix_only and (
+            service_filter is None or service == service_filter
+        )
+        mode = _service_mode(service, force_fix_only=force_fix_only)
         if not reconcile and mode == SKIP:
             # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
             # but log it (only for real targets with a proposals/ dir) so an
@@ -2178,6 +2189,7 @@ def reconcile_one(
             merge_commit=pr.merge_commit,
             review_attempts=None,
             failure=None,
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
     if pr.closed_unmerged:
@@ -2190,6 +2202,7 @@ def reconcile_one(
             notes=pr.close_comment_or_default or "PR was closed without merging.",
             review_attempts=None,
             failure=None,
+            merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
     if ref.status == "needs-triage" and failure_code == "merge-conflict":
