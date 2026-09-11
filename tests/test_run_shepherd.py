@@ -5,8 +5,8 @@ Covers:
   flip-to-merged, flip-to-rejected (T1-T5).
 - Findings anchored to head_sha — codex-P1 fix from PR #83's design,
   mirrors the docstring on ``CodexReview.findings_p1_p2``.
-- T6: outer-loop 3-attempt cap on address-review before flipping the
-  proposal to ``review-stuck``.
+- T6: outer-loop ``MAX_REVIEW_ATTEMPTS`` cap on address-review before
+  flipping the proposal to ``review-stuck``.
 - T7: end-to-end happy path (clean review -> merge) and loop path
   (P1 finding -> followup -> re-evaluate -> merge).
 
@@ -1660,15 +1660,18 @@ def test_connector_issue_comment_finding_time_anchored() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T6: outer-loop 3-attempt cap
+# T6: outer-loop MAX_REVIEW_ATTEMPTS cap
 # ---------------------------------------------------------------------------
-def test_outer_loop_review_stuck_after_three_attempts(tmp_path, monkeypatch) -> None:
-    """Drive process_one with three consecutive address-review returns.
+def test_outer_loop_review_stuck_at_max_review_attempts(tmp_path, monkeypatch) -> None:
+    """Drive process_one with MAX_REVIEW_ATTEMPTS consecutive address-review
+    returns, then one more that flips to review-stuck.
 
     Tick 1: counter=0 -> call -> counter=1
-    Tick 2: counter=1 -> call -> counter=2
-    Tick 3: counter=2 -> call -> counter=3
-    Tick 4: counter=3 -> flip to review-stuck, NO call
+    ...
+    Tick MAX_REVIEW_ATTEMPTS: counter=MAX_REVIEW_ATTEMPTS-1 -> call ->
+        counter=MAX_REVIEW_ATTEMPTS
+    Tick MAX_REVIEW_ATTEMPTS+1: counter=MAX_REVIEW_ATTEMPTS -> flip to
+        review-stuck, NO call
     """
     ref = make_ref(tmp_path)
 
@@ -1693,38 +1696,45 @@ def test_outer_loop_review_stuck_after_three_attempts(tmp_path, monkeypatch) -> 
          patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup), \
          patch.object(run_shepherd, "trigger_review", side_effect=fake_trigger_review):
 
-        # Tick 1
-        result = process_one(ref, skip_subprocess=True)
-        assert result.decision == "address-review"
-        assert read_status(ref)["review_attempts"] == 1
-        assert read_status(ref)["status"] == "implemented"
+        for i in range(1, run_shepherd.MAX_REVIEW_ATTEMPTS + 1):
+            result = process_one(ref, skip_subprocess=True)
+            assert result.decision == "address-review"
+            assert read_status(ref)["review_attempts"] == i
+            assert read_status(ref)["status"] == "implemented"
 
-        # Re-load ref counter from disk like the cron would.
-        ref.review_attempts = read_status(ref)["review_attempts"]
+            if i == 4 and run_shepherd.MAX_REVIEW_ATTEMPTS >= 4:
+                # Explicit boundary the old cap of 3 could not reach:
+                # still implemented with review_attempts == 4, no flip.
+                assert read_status(ref)["review_attempts"] == 4
+                assert read_status(ref)["status"] == "implemented"
 
-        # Tick 2
-        result = process_one(ref, skip_subprocess=True)
-        assert result.decision == "address-review"
-        assert read_status(ref)["review_attempts"] == 2
-        ref.review_attempts = 2
+            # Re-load ref counter from disk like the cron would.
+            ref.review_attempts = read_status(ref)["review_attempts"]
 
-        # Tick 3
-        result = process_one(ref, skip_subprocess=True)
-        assert result.decision == "address-review"
-        assert read_status(ref)["review_attempts"] == 3
-        ref.review_attempts = 3
-
-        # Tick 4 — should flip to review-stuck, NOT call apply_followup
-        # and NOT post `@claude review` (no fix-up push happened).
+        # One more tick — should flip to review-stuck, NOT call
+        # apply_followup and NOT post `@claude review` (no fix-up push
+        # happened).
         result = process_one(ref, skip_subprocess=True)
         assert result.decision == "review-stuck"
-        assert read_status(ref)["status"] == "review-stuck"
+        stuck_status = read_status(ref)
+        assert stuck_status["status"] == "review-stuck"
+        assert (
+            f"{run_shepherd.MAX_REVIEW_ATTEMPTS} follow-up attempts"
+            in stuck_status["notes"]
+        )
 
-    # Three followup attempts, no fourth — and one `@claude review`
-    # trigger per successful followup, no trigger on the review-stuck
-    # flip.
-    assert len(apply_calls) == 3
-    assert len(trigger_calls) == 3
+    # MAX_REVIEW_ATTEMPTS followup attempts, no more — and one
+    # `@claude review` trigger per successful followup, no trigger on
+    # the review-stuck flip.
+    assert len(apply_calls) == run_shepherd.MAX_REVIEW_ATTEMPTS
+    assert len(trigger_calls) == run_shepherd.MAX_REVIEW_ATTEMPTS
+
+
+def test_max_review_attempts_is_five() -> None:
+    """Regression pin for #343: the cap was raised from 3 to 5 so a review
+    that finds something new on the fix still has room to be resolved
+    without human intervention."""
+    assert run_shepherd.MAX_REVIEW_ATTEMPTS == 5
 
 
 # ---------------------------------------------------------------------------
@@ -1992,10 +2002,10 @@ def test_outer_loop_counts_attempt_on_deterministic_subprocess_failure(tmp_path)
 def test_outer_loop_flips_to_review_stuck_on_deterministic_at_cap(tmp_path) -> None:
     """Deterministic failure at the cap flips the proposal to review-stuck.
 
-    Counter starts at MAX_REVIEW_ATTEMPTS - 1 = 2. The subprocess fails
-    deterministically; the new counter value (3) hits the cap, so the
-    proposal flips terminal so a human can intervene instead of the
-    shepherd spinning indefinitely.
+    Counter starts at MAX_REVIEW_ATTEMPTS - 1. The subprocess fails
+    deterministically; the new counter value hits MAX_REVIEW_ATTEMPTS,
+    so the proposal flips terminal so a human can intervene instead of
+    the shepherd spinning indefinitely.
     """
     ref = make_ref(tmp_path, review_attempts=run_shepherd.MAX_REVIEW_ATTEMPTS - 1)
     pr = make_pr()

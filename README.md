@@ -263,8 +263,8 @@ Decisions:
   terminal `rejected` with the close comment in `notes:`; clears
   `merge_owner` if it was set.
 
-**Three-attempt cap.** The outer loop tracks `review_attempts:` in
-`.status.yaml`. After three consecutive `address-review` ticks
+**Review-attempt cap.** The outer loop tracks `review_attempts:` in
+`.status.yaml`. After five consecutive `address-review` ticks
 without resolving the findings, the next tick flips the proposal to
 `status: review-stuck` (terminal) instead of forking the
 implementer again. The pure `decide()` function does not see the
@@ -291,6 +291,7 @@ counter — it stays trivially testable with hand-built fixtures.
 
 **Tests.** `pytest tests/test_run_shepherd.py` covers every branch
 of `decide()`, the head-SHA anchor on stale findings, the
-3-attempt outer-loop cap, and end-to-end happy + loop paths driving
-`process_one()` against a real `tmp_path` worktree fixture with the
-GitHub API + implementer subprocess mocked at the module boundary.
+`MAX_REVIEW_ATTEMPTS` outer-loop cap, and end-to-end happy + loop
+paths driving `process_one()` against a real `tmp_path` worktree
+fixture with the GitHub API + implementer subprocess mocked at the
+module boundary.

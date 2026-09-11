@@ -12,8 +12,9 @@ follow-up gitops PR; this module is the orchestrator only):
        never observed and the proposal sits in `implemented` forever).
     3. Run decide(pr, codex_review). One of: wait, address-review,
        merge, flip-to-merged, flip-to-rejected, defer-merge. `decide()`
-       is a pure function. The 3-attempt cap on follow-up loops lives in
-       the OUTER state machine (this module), not in decide().
+       is a pure function. The `MAX_REVIEW_ATTEMPTS` cap on follow-up
+       loops lives in the OUTER state machine (this module), not in
+       decide().
     4. Apply the decision: merge_pr (with --match-head-commit),
        apply_followup (subprocess into run_implementer with
        --review-feedback), update_status (terminal flip), or, for
@@ -299,8 +300,11 @@ RECONCILE_INPUT_STATUSES = {
 
 # Outer-loop cap on consecutive address-review attempts before giving up
 # and flipping to `review-stuck`. Lives here (NOT in decide()) so the
-# pure function stays trivially testable. See design.md L122-142.
-MAX_REVIEW_ATTEMPTS = 3
+# pure function stays trivially testable. See design.md L122-142. Raised
+# from 3 to 5 by #343: three left no room for a review that finds
+# something new on the fix itself. This does not address #342 (attempts
+# spent on a finding the approved proposal already excluded).
+MAX_REVIEW_ATTEMPTS = 5
 
 # mergeStateStatus values that are safe to merge per design.md L143-154.
 # CLEAN = nothing in the way. HAS_HOOKS = pre-receive hooks (org-level
@@ -1244,9 +1248,10 @@ def decide(
 
     Pure: only depends on its arguments. `now` is injected so the settling
     window stays deterministic in tests; it defaults to the current UTC time.
-    The 3-attempt cap on address-review loops lives in the OUTER state machine
-    (process_one), NOT here, so this function stays trivially testable with
-    hand-built fixtures. `fix_only` changes only the final return: a
+    The `MAX_REVIEW_ATTEMPTS` cap on address-review loops lives in the
+    OUTER state machine (process_one), NOT here, so this function stays
+    trivially testable with hand-built fixtures. `fix_only` changes only
+    the final return: a
     proposal that would otherwise merge is instead returned as `defer-merge`
     so callers hand the merge off to another PR lifecycle (e.g. pr-steward)
     without touching `.status.yaml`'s `status`.
@@ -1665,8 +1670,8 @@ def process_one(
     """Drive a single proposal one tick further.
 
     - Reads the linked PR (open/closed/merged — never filter to open).
-    - Calls decide(); honours the 3-attempt cap on address-review loops
-      per design.md L122-142.
+    - Calls decide(); honours the `MAX_REVIEW_ATTEMPTS` cap on
+      address-review loops per design.md L122-142.
     - Writes back .status.yaml.
     - Returns a ShepherdResult with the decision name (greppable in
       the workflow log).
@@ -1767,9 +1772,10 @@ def process_one(
     if decision == "address-review":
         # Outer-loop cap. design.md L122-142:
         #   tick 1: counter=0 -> call -> counter=1
-        #   tick 2: counter=1 -> call -> counter=2
-        #   tick 3: counter=2 -> call -> counter=3
-        #   tick 4: counter=3 -> flip to review-stuck, NO call
+        #   ...
+        #   tick 5: counter=4 -> call -> counter=5
+        #   tick 6: counter=5 == MAX_REVIEW_ATTEMPTS -> flip to
+        #     review-stuck, NO call
         if ref.review_attempts >= MAX_REVIEW_ATTEMPTS:
             update_status(
                 ref,
@@ -1786,8 +1792,9 @@ def process_one(
         # flipping status. The MAX_REVIEW_ATTEMPTS cap is for codex
         # content fix attempts, not subprocess plumbing failures — a
         # transient auth/network/branch error in the implementer push
-        # must NOT burn one of the three slots. On transient failure we
-        # leave .status.yaml untouched so the next tick retries cleanly.
+        # must NOT burn one of the `MAX_REVIEW_ATTEMPTS` slots. On
+        # transient failure we leave .status.yaml untouched so the next
+        # tick retries cleanly.
         #
         # Deterministic content failures (the implementer ran but
         # produced no commits, or the PR branch was deleted on origin)

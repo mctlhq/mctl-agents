@@ -140,8 +140,9 @@ PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 # and never on the first poll (claude review auto-fires on PR open; an
 # immediate tick would just observe "review pending"). Capped: after
 # SHEPHERD_TICKS_MAX active ticks the loop keeps watching passively —
-# the shepherd itself flips review-stuck after 3 address-review attempts,
-# so a stuck PR must not burn a volume every 4 h for two weeks.
+# the shepherd itself flips review-stuck after MAX_REVIEW_ATTEMPTS
+# address-review attempts, so a stuck PR must not burn a volume every
+# 4 h for two weeks.
 SHEPHERD_TICK_EVERY_POLLS = 8
 SHEPHERD_TICKS_MAX = 12
 
