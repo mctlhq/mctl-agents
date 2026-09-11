@@ -16,11 +16,6 @@ WORKDIR /app
 # version controlled nothing. Bump the harness by bumping claude-agent-sdk in
 # pyproject.toml, deliberately, in an explicit commit (see issue #44).
 #
-# nodejs/npm stay: they are not CLI-install plumbing, they are tools the
-# implementer agent needs directly. 6 of the 11 services in SERVICES
-# (config/settings.py) are Node repositories, and
-# agents/mctl-web/.claude/agents/implementer.md tells the agent to run
-# `npm install --no-save && npm run lint` as its sanity check.
 # `gh` CLI is required by the Tier 2 implementer (orchestrator/run_implementer.py)
 # for `gh repo clone mctlhq/<svc>` + `gh pr create`. Installed from the
 # official cli.github.com Debian repo.
@@ -28,22 +23,51 @@ WORKDIR /app
 # -race` needs a working C toolchain even though the production binaries build
 # with CGO_ENABLED=0. Without them an agent either skips the race detector or
 # spends part of its budget bootstrapping a compiler by hand (see #304).
+#
+# Node stays: it is not CLI-install plumbing, it is a tool the implementer
+# agent needs directly. 6 of the 11 services in SERVICES (config/settings.py)
+# are Node repositories, and agents/mctl-web/.claude/agents/implementer.md
+# tells the agent to run `npm install --no-save && npm run lint` as its sanity
+# check.
+#
+# It comes from NodeSource, NOT from Debian: trixie's `nodejs` package is
+# 20.19.2, and the agent working mctlhq/portfolio reported on 2026-09-11 that
+# it could run neither `astro check` nor `npm test` there. Both need 22 —
+# astro@7 declares `engines.node: >=22.12.0`, and portfolio's `npm test` is
+# `node --test test/*.test.ts`, which needs Node's TypeScript type stripping
+# (unflagged only from 22.18). An agent that cannot run the repo's own checks
+# burns model budget producing a change it cannot verify.
+#
+# NodeSource's package bundles npm, so there is no separate `npm` apt package
+# below any more.
+#
+# Bump NODE_MAJOR deliberately, the same way GO_VERSION below is bumped: when
+# the Node repositories in SERVICES need it, not incidentally.
+ARG NODE_MAJOR=22
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         gnupg \
-        nodejs \
-        npm \
         git \
         gcc \
         libc6-dev \
         openssh-client \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+         | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg \
+    && chmod go+r /usr/share/keyrings/nodesource.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+         > /etc/apt/sources.list.d/nodesource.list \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
          -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
          > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs gh \
+    # Fail the build rather than ship a too-old Node: if NodeSource ever
+    # resolves to something below 22.12 the agent silently loses `astro check`
+    # and `npm test` again, which is exactly how this went unnoticed until an
+    # agent reported it in a PR description.
+    && node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a<22 || (a===22 && b<12)) { console.error("node too old: "+process.versions.node); process.exit(1); }' \
     && rm -rf /var/lib/apt/lists/*
 
 # Go toolchain. Three of the services in SERVICES (config/settings.py) are Go
