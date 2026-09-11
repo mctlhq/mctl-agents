@@ -51,8 +51,10 @@ def _strategy(**overrides) -> cs.ContextStrategy:
 
 def _budget(**overrides) -> cs.ContextBudget:
     # used_sources/used_bytes default to 0/0 (matching zero sources) since
-    # validate() now reconciles them against the actual `sources` list
-    # whenever truncated=False; callers that attach sources override both.
+    # validate() always reconciles them against the actual `sources` list
+    # (truncated=true only excuses the max_sources/max_bytes/
+    # max_bytes_per_source overrun checks); callers that attach sources
+    # override both.
     fields = {
         "max_sources": 5,
         "max_bytes": 60000,
@@ -398,6 +400,14 @@ def test_validate_wraps_unserializable_selector_as_context_snapshot_error():
         bad_snapshot.validate()
 
 
+def test_canonical_json_rejects_nan_and_infinity():
+    # Regression: json.dumps emits bare NaN/Infinity/-Infinity tokens by
+    # default, which are not valid JSON and must not end up hashed into a
+    # sealed document's content_hash.
+    with pytest.raises(cs.ContextSnapshotError):
+        cs._canonical_json({"x": float("nan")})
+
+
 # ---------------------------------------------------------------------------
 # T8 — step chaining: a child whose execution block differs from its
 # parent's is rejected; sequence must be strictly increasing; a root
@@ -515,9 +525,15 @@ def test_budget_byte_overrun_without_truncated_is_rejected():
 
 
 def test_budget_overrun_with_truncated_true_is_accepted():
-    snapshot = _minimal_snapshot()
-    ok_snapshot = dc_replace(snapshot, budget=_budget(max_sources=1, used_sources=2, truncated=True))
-    ok_snapshot.validate()  # must not raise
+    # truncated=true excuses used_sources/used_bytes exceeding max_sources/
+    # max_bytes, but used_sources/used_bytes must still reconcile with the
+    # actual included sources (see test_budget_used_sources_must_reconcile_*).
+    sources = [_source(), _source(source_id="s2", content_hash="sha256:" + "4d" * 32)]
+    snapshot = _minimal_snapshot(sources=sources, budget=_budget(used_sources=2, used_bytes=200))
+    ok_snapshot = dc_replace(
+        snapshot, budget=_budget(max_sources=1, used_sources=2, used_bytes=200, truncated=True)
+    )
+    ok_snapshot.validate()  # must not raise: max_sources overrun is excused by truncated=true
 
 
 def test_budget_rejects_source_over_max_bytes_per_source():
@@ -605,6 +621,16 @@ def test_context_source_selector_is_immutable_after_construction():
     source = _source(selector={"mode": "agent-directed"})
     with pytest.raises(TypeError):
         source.selector["mode"] = "mutated-in-place"
+
+
+def test_context_source_is_hashable():
+    # Regression: ContextSource is a frozen dataclass, but the
+    # dataclass-generated __hash__ used to hash `selector` directly, and a
+    # MappingProxyType over a dict is exactly as unhashable as the dict it
+    # wraps.
+    source_a = _source()
+    source_b = _source()
+    assert hash(source_a) == hash(source_b)
 
 
 # ---------------------------------------------------------------------------

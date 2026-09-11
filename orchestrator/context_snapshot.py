@@ -82,8 +82,10 @@ def _hash_bytes(raw: bytes) -> str:
 
 def _canonical_json(payload: Any) -> bytes:
     try:
-        return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    except TypeError as exc:
+        return json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
         raise ContextSnapshotError(f"payload is not JSON-serializable: {exc}") from exc
 
 
@@ -298,6 +300,26 @@ class ContextSource:
         # = ...` also fails loudly instead of silently invalidating the
         # already-computed content_hash.
         object.__setattr__(self, "selector", MappingProxyType(dict(self.selector)))
+
+    def __hash__(self) -> int:
+        # The dataclass-generated __hash__ would hash self.selector directly;
+        # a MappingProxyType wrapping a dict is exactly as unhashable as that
+        # dict (__post_init__ makes it immutable, not hashable). Hash the
+        # selector's canonical JSON bytes instead so ContextSource stays
+        # truly hashable, consistent with its frozen, immutable contract.
+        return hash((
+            self.source_id,
+            self.kind,
+            self.locator,
+            _canonical_json(dict(self.selector)),
+            self.content_hash,
+            self.byte_count,
+            self.retrieved_at,
+            self.freshness,
+            self.trust,
+            self.selection,
+            self.redaction,
+        ))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -689,8 +711,11 @@ class ContextSnapshot:
         """Enforce everything `from_dict`'s shape checks and `seal()`'s
         construction cannot: closed vocabularies, budget semantics, and (when
         `parent` is supplied) the step-chaining rule that a child's
-        `execution` block must equal its parent's. Raises
-        `ContextSnapshotError`; never silently coerces or drops a field."""
+        `execution` block must equal its parent's. `budget.truncated=true`
+        only excuses the max_sources/max_bytes/max_bytes_per_source overrun
+        checks; used_sources/used_bytes must always reconcile with the
+        actual `sources` list. Raises `ContextSnapshotError`; never silently
+        coerces or drops a field."""
         if self.api_version != API_VERSION:
             raise ContextSnapshotError(f"api_version must be {API_VERSION!r}, got {self.api_version!r}")
         if self.kind != KIND:
@@ -724,18 +749,25 @@ class ContextSnapshot:
                         f"budget.max_bytes_per_source ({budget.max_bytes_per_source}) without "
                         f"truncated=true"
                     )
-            included_sources = [s for s in self.sources if s.selection.included]
-            if budget.used_sources != len(included_sources):
-                raise ContextSnapshotError(
-                    f"budget.used_sources ({budget.used_sources}) does not match the number of "
-                    f"included sources ({len(included_sources)}) without truncated=true"
-                )
-            included_bytes = sum(s.byte_count for s in included_sources)
-            if budget.used_bytes != included_bytes:
-                raise ContextSnapshotError(
-                    f"budget.used_bytes ({budget.used_bytes}) does not match the sum of included "
-                    f"sources' byte_count ({included_bytes}) without truncated=true"
-                )
+
+        # Reconciliation against the actual `sources` list is bookkeeping
+        # accuracy, not a limit check: truncated=true legitimately excuses
+        # used_sources/used_bytes from exceeding max_sources/max_bytes/
+        # max_bytes_per_source, but it never excuses them from matching what
+        # `sources` actually contains. The golden fixture sets truncated=true
+        # and already reconciles cleanly, so this holds unconditionally.
+        included_sources = [s for s in self.sources if s.selection.included]
+        if budget.used_sources != len(included_sources):
+            raise ContextSnapshotError(
+                f"budget.used_sources ({budget.used_sources}) does not match the number of "
+                f"included sources ({len(included_sources)})"
+            )
+        included_bytes = sum(s.byte_count for s in included_sources)
+        if budget.used_bytes != included_bytes:
+            raise ContextSnapshotError(
+                f"budget.used_bytes ({budget.used_bytes}) does not match the sum of included "
+                f"sources' byte_count ({included_bytes})"
+            )
 
         if parent is not None:
             if self.step is None:
