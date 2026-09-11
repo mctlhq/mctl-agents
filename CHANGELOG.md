@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.41.1](https://github.com/mctlhq/mctl-agents/compare/1.41.0...1.41.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* **image:** assert Node &gt;= 22.18, not 22.12 ([5c24447](https://github.com/mctlhq/mctl-agents/commit/5c24447aad5a20cd7113c6336836a49957647bd2))
+* **image:** install Node 22 from NodeSource instead of Debian's 20 ([d998b28](https://github.com/mctlhq/mctl-agents/commit/d998b2834de3ccb8034066753c98a7252e77577b))
+* **image:** install Node 22 from NodeSource instead of Debian's 20 ([f223fdc](https://github.com/mctlhq/mctl-agents/commit/f223fdcf2a62f84b9faea916bcf892ad0075c5d8))
+
 ## [1.41.0](https://github.com/mctlhq/mctl-agents/compare/1.40.2...1.41.0) (2026-09-10)
 
 
