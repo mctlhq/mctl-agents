@@ -29,7 +29,7 @@
           "reviewfixing",
           "reviewstuck"
         ],
-        "note": "The shepherd addresses P1/P2 findings up to three times; only deterministic content failures consume an attempt."
+        "note": "The shepherd addresses P1/P2 findings up to five times; only deterministic content failures consume an attempt."
       },
       {
         "id": "exits",

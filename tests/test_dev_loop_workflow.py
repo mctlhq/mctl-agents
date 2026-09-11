@@ -1687,10 +1687,10 @@ class TestDevLoopWorkflow:
         """SHEPHERD_TICKS_MAX must actually stop ticking (#230 P3).
 
         Each tick provisions a Hetzner volume, and the shepherd itself
-        flips review-stuck after 3 address-review attempts — so a wedged
-        PR must not burn one every ~4 h for the full 14-day watch. Drive
-        the watch past 13 tick boundaries and assert the 13th produces
-        nothing.
+        flips review-stuck after MAX_REVIEW_ATTEMPTS address-review
+        attempts — so a wedged PR must not burn one every ~4 h for the
+        full 14-day watch. Drive the watch past 13 tick boundaries and
+        assert the 13th produces nothing.
         """
         open_pr = PRState(
             found=True,

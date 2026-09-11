@@ -211,7 +211,7 @@ shepherd:
   - chatgpt-codex-connector[bot]
   - claude[bot]
   - copilot-pull-request-reviewer[bot]
-  max_review_attempts: '3'
+  max_review_attempts: '5'
   merge_settle_min_default: '15'
   reconcile_input_statuses:
   - accepted
