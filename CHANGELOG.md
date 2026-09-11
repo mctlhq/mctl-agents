@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.42.0](https://github.com/mctlhq/mctl-agents/compare/1.41.1...1.42.0) (2026-09-11)
+
+
+### Features
+
+* **agents:** issue-292-fix-lifecycle-steward-owned-repos-have-n ([ffc262d](https://github.com/mctlhq/mctl-agents/commit/ffc262da86633eb7f9423c8b505f20f57615bc44))
+* **agents:** issue-343-shepherd-raise-the-review-attempt-cap-fr ([c4a6e6d](https://github.com/mctlhq/mctl-agents/commit/c4a6e6d53dc6ef8fde4de62be3c41c5eb68c8145))
+* **agents:** issue-343-shepherd-raise-the-review-attempt-cap-fr ([dbf8cfa](https://github.com/mctlhq/mctl-agents/commit/dbf8cfa7271abb5c84c68d016dca56a3a508cdbc))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-292-fix-lifecycle-steward-owned-repos-have-n ([ad9fd48](https://github.com/mctlhq/mctl-agents/commit/ad9fd4811f1bd7112e12547fb64155652712827b))
+* **agents:** address P1/P2 codex findings on issue-292-fix-lifecycle-steward-owned-repos-have-n ([147abb7](https://github.com/mctlhq/mctl-agents/commit/147abb785886b8df7ca52b2f731d94a2f2547f22))
+
 ## [1.41.1](https://github.com/mctlhq/mctl-agents/compare/1.41.0...1.41.1) (2026-09-11)
 
 
