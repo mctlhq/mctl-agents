@@ -63,11 +63,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
          > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y --no-install-recommends nodejs gh \
-    # Fail the build rather than ship a too-old Node: if NodeSource ever
-    # resolves to something below 22.12 the agent silently loses `astro check`
-    # and `npm test` again, which is exactly how this went unnoticed until an
-    # agent reported it in a PR description.
-    && node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a<22 || (a===22 && b<12)) { console.error("node too old: "+process.versions.node); process.exit(1); }' \
+    # Fail the build rather than ship a too-old Node, which is exactly how this
+    # went unnoticed until an agent reported it in a PR description.
+    #
+    # The bar is 22.18, not astro's 22.12: the two requirements above are not
+    # the same number, and the binding one is type stripping for
+    # `node --test *.ts`. A 22.12-22.17 build would satisfy a 22.12 assertion,
+    # pass the build, and then fail `npm test` at run time — the failure mode
+    # this whole change exists to remove (agy P2 on #337).
+    #
+    # NODE_MAJOR pins the major only, so the patch NodeSource resolves can
+    # still move between builds — weaker than GO_VERSION + GO_SHA256_* below,
+    # and a deliberate trade: NodeSource publishes no stable per-patch URL to
+    # checksum, and this assertion is what guards the property that actually
+    # matters here (claude P3 on #337).
+    && node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (a<22 || (a===22 && b<18)) { console.error("node too old: "+process.versions.node); process.exit(1); }' \
     && rm -rf /var/lib/apt/lists/*
 
 # Go toolchain. Three of the services in SERVICES (config/settings.py) are Go
