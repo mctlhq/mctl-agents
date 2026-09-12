@@ -252,8 +252,40 @@ class OwnershipAnswer:
 # becomes a coin flip.
 
 
+# The one route that CLAIMS an entity. Keyed on the request path rather than a
+# parameter because both transports already pass `path` and neither can forget
+# to: a flag would be a third thing the sync client and the Temporal activity
+# have to agree about, which is exactly the drift this module exists to stop.
+ACQUIRE_PATH_SUFFIX = "/acquire"
+
+
+def _claims_ownership(path: str) -> bool:
+    return path.endswith(ACQUIRE_PATH_SUFFIX)
+
+
 def _error_of(status: int, payload: dict[str, Any]) -> str:
     return str(payload.get("error") or f"HTTP {status}")
+
+
+def record_of(payload: dict[str, Any]) -> Ownership | None:
+    """The record in a response body, top level or nested under ``ownership``.
+
+    ONE unwrapper, because the two shapes are both real and both in use: the
+    single-record routes answer with the record at the top level, and the
+    conflict envelope and the batch route nest it. Having recognition and
+    parsing disagree about which shapes count produced the worst answer in the
+    module's vocabulary — ``accepted=True`` with ``verdict=UNKNOWN`` and no
+    record attached, i.e. "I recognise this body" followed immediately by "it
+    contains nothing" — and on a read the same body was UNKNOWN for every
+    entity in it.
+    """
+    own = Ownership.from_payload(payload)
+    if own is not None:
+        return own
+    nested = payload.get("ownership")
+    if isinstance(nested, dict):
+        return Ownership.from_payload(nested)
+    return None
 
 
 def _looks_like_our_answer(payload: dict[str, Any]) -> bool:
@@ -264,10 +296,7 @@ def _looks_like_our_answer(payload: dict[str, Any]) -> bool:
     — an error object, a health page rendered as JSON, a proxy's own schema —
     is a 2xx we did not ask for.
     """
-    if Ownership.from_payload(payload) is not None:
-        return True
-    nested = payload.get("ownership")
-    return isinstance(nested, dict) and Ownership.from_payload(nested) is not None
+    return record_of(payload) is not None
 
 
 # The two states in which the record still holds the entity, and the two in
@@ -341,10 +370,10 @@ def answer_from(
         # answer. Parsing it into an all-empty record would produce a confident
         # OWNED_BY_OTHER with no reason — a wrong answer stated as firmly as a
         # right one.
-        own = Ownership.from_payload(payload)
+        own = record_of(payload)
         if own is None:
-            if not is_read and body_empty:
-                # A genuinely body-less 2xx on a mutating call means the write
+            if not is_read and body_empty and path and not _claims_ownership(path):
+                # A genuinely body-less 2xx on a RELINQUISHING write means it
                 # SUCCEEDED and told us nothing more. Reporting UNKNOWN would
                 # make it indistinguishable from a 503, and a caller gating its
                 # local state on the result could never record a successful
@@ -353,6 +382,18 @@ def answer_from(
                 # An empty PARSE is a different thing and must not reach here:
                 # a 200 carrying an HTML error page from a gateway is not a
                 # successful write, and body_empty is what separates them.
+                #
+                # And it must not reach here for a CLAIMING write. This verdict
+                # is the only one outside the three "somebody holds it" answers,
+                # so blocks_others is False — correct for a release, which is
+                # precisely the statement that nobody holds the entity now, and
+                # fail-open for an acquire, where it would tell every other
+                # actor the entity is free while this one also declines to act
+                # (may_mutate is False too, since the record naming us never
+                # arrived). A body-less 2xx on acquire is a protocol anomaly
+                # — mctl-api answers acquire with the record — so it is UNKNOWN,
+                # and an unknown path is treated the same way rather than
+                # guessed at.
                 return OwnershipAnswer(
                     verdict=WROTE_NO_RECORD,
                     reason=f"{status} with no body",
@@ -371,12 +412,18 @@ def answer_from(
             verdict=verdict, ownership=own, reason=reason, accepted=accepted
         )
     if status == 404 and is_read:
-        if not payload:
-            # A 404 with no readable JSON envelope did not come from mctl-api:
-            # an ingress rule that stopped matching, a wrong base path, or a
-            # proxy's HTML page all look like this, and answering UNOWNED would
-            # free EVERY entity asked. The write half of this was fixed first;
-            # the read half frees more.
+        if not isinstance(payload.get("error"), str) or not payload["error"]:
+            # A 404 without mctl-api's own error envelope did not come from
+            # mctl-api: an ingress rule that stopped matching, a wrong base
+            # path, or a proxy's HTML page. Answering UNOWNED would free EVERY
+            # entity asked — this is the module's only fail-open branch.
+            #
+            # Gating on non-empty JSON was one step short, because every
+            # JSON-speaking intermediary answers exactly that: an ALB returns
+            # {"message": ...}, Envoy a {"code", "message"} pair, a misrouted
+            # apiserver a Status object. All parse non-empty. `error` is the
+            # key _error_of already treats as the envelope, so it is the one
+            # this must agree with.
             return OwnershipAnswer(
                 verdict=UNKNOWN, reason=f"404 with no error envelope from {path or 'a read'}"
             )
@@ -389,8 +436,7 @@ def answer_from(
         # fail-open, in the one place in this module that can produce it.
         return OwnershipAnswer(verdict=UNKNOWN, reason=f"404 from {path or 'a write'}")
     if status == 409:
-        raw = payload.get("ownership")
-        own = Ownership.from_payload(raw) if isinstance(raw, dict) else None
+        own = record_of(payload)
         if own is None:
             return OwnershipAnswer(verdict=OWNED_BY_OTHER, reason=_error_of(status, payload))
         # A 409 is a REFUSED write, and a refused write may inform but must

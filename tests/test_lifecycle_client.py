@@ -635,3 +635,85 @@ def test_a_409_naming_somebody_else_still_stands_the_caller_down(
     assert answer.may_mutate is False
     assert answer.ownership is not None
     assert answer.ownership.owner == OTHER
+
+
+# --- a body or a status believed further than the evidence supports ------
+
+
+def test_a_json_404_from_an_intermediary_is_not_our_no_such_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gating the read-404 on non-empty JSON was one step short.
+
+    Every JSON-speaking intermediary answers exactly that: an ALB returns a
+    `message`, Envoy a `code`/`message` pair, a misrouted apiserver a Status
+    object. All parse non-empty, so all reached the UNOWNED branch — the
+    module's only fail-open path, freeing every entity in the sweep because a
+    base path was wrong.
+    """
+    for body in (
+        {"message": "no healthy upstream"},
+        {"code": 404, "message": "NR"},
+        {"kind": "Status", "status": "Failure", "reason": "NotFound"},
+    ):
+        answer = _client(monkeypatch, _http_error(404, body)).get(ENTITY, PHASE, asking=ME)
+        assert answer.verdict == UNKNOWN, body
+        assert answer.blocks_others is True, body
+
+    # The other direction: mctl-api's own envelope still means no such record.
+    ok = _client(monkeypatch, _http_error(404, {"error": "no ownership record"})).get(
+        ENTITY, PHASE, asking=ME
+    )
+    assert ok.verdict == UNOWNED
+    assert ok.blocks_others is False
+
+
+def test_a_nested_ownership_envelope_is_read_not_merely_recognised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recognition and parsing used to disagree about which shapes count.
+
+    `_looks_like_our_answer` accepted the nested envelope; the classifier five
+    lines below parsed only the top level. A 200 carrying that body therefore
+    answered `accepted True` with `verdict UNKNOWN` and no record — the module
+    recognising a body and then reporting it contains nothing. Two of the three
+    known shapes nest the record, so this was not a corner case.
+    """
+    nested = {"ownership": _owned_payload(ME)}
+    answer = _client(monkeypatch, _ok(nested)).acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == OWNED_BY_ME
+    assert answer.ownership is not None
+    assert answer.ownership.owner == ME
+    assert answer.wrote is True
+
+    # And on a read, where the same body used to be UNKNOWN.
+    read = _client(monkeypatch, _ok(nested)).get(ENTITY, PHASE, asking=ME)
+    assert read.verdict == OWNED_BY_ME
+    assert read.ownership is not None
+
+
+def test_a_body_less_2xx_on_acquire_is_not_a_claim_and_frees_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WROTE_NO_RECORD is the one verdict outside the three "somebody holds it"
+    answers, so `blocks_others` is False.
+
+    That is exactly right for a release — the statement that nobody holds the
+    entity now — and fail-open for an acquire, where it would tell every other
+    actor the entity is free while this one also declines to act, because the
+    record naming it never arrived. mctl-api answers acquire with the record,
+    so a body-less 2xx there is a protocol anomaly, not a grant.
+    """
+    empty = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    answer = _client(monkeypatch, empty).acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
+    assert answer.blocks_others is True
+    # The write itself is still reported as accepted — something took it.
+    assert answer.wrote is True
+
+    # The other direction: release keeps the behaviour the verdict was made for.
+    rel = _client(monkeypatch, empty).release(ENTITY, PHASE, ME, epoch=1, reason="done")
+    assert rel.verdict == WROTE_NO_RECORD
+    assert rel.blocks_others is False
+    assert rel.wrote is True

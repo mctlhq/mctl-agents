@@ -223,6 +223,17 @@ class OwnershipClient:
         policy_ref: str = "",
         temporal_workflow_id: str = "",
     ) -> OwnershipAnswer:
+        """Claim the entity phase, or learn who holds it.
+
+        The RECORD is the answer here, not the status. Every other write on
+        this client relinquishes or annotates something the caller already
+        holds, so a body-less 2xx from those is a success that simply said
+        nothing more; acquire is the one call where a 2xx with no record means
+        the grant never arrived. `answer_from` keys that off the request path,
+        so this route answers UNKNOWN there rather than WROTE_NO_RECORD — which
+        would be `blocks_others` False, telling every other actor the entity is
+        free while this one also declines to act.
+        """
         return self._write(
             "/api/v1/lifecycle/ownership/acquire",
             entity,
