@@ -167,15 +167,24 @@ SHEPHERD_TICKS_MAX = 12
 # looks dead.
 LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 
-# Consecutive acquires that answer neither "mine" nor "someone else's" before
-# the loop drops back to the heartbeat cadence. Not a permanent give-up: a
-# store that is down for three hours is usually back later in a fourteen-day
-# watch, and a loop that stopped forever would hold no claim for the rest of
-# it. Retrying on the heartbeat boundary is the cheaper answer. The store being unreachable for six polls is three
-# hours; continuing to ask for the remaining fortnight is ~670 activities
-# against an endpoint that is not answering, and the cron sweeper owns the PR
-# throughout — the same outcome as before any of this existed.
-LIFECYCLE_UNKNOWN_ACQUIRE_LIMIT = 6
+# Consecutive ownership WRITES that answer neither "mine" nor "someone else's"
+# before the loop drops back to the heartbeat cadence.
+#
+# Not a permanent give-up. A store that is down for three hours is usually back
+# later in a fourteen-day watch, and a loop that stopped forever would hold no
+# claim for the rest of it; retrying on the heartbeat boundary is the cheaper
+# answer. Six polls is about three hours, and continuing to ask every poll for
+# the remaining fortnight is ~670 activities against an endpoint that is not
+# answering, with the cron sweeper owning the PR throughout — the same outcome
+# as before any of this existed.
+#
+# It applies to the acquire AND to the progress write. They are counted
+# separately because they fail separately: a claimed loop whose /progress 500s
+# still has a working acquire, and throttling one must not throttle the other.
+# (Contrast `_claim_refused` a few lines into _track_ownership, which IS
+# permanent: "somebody else owns this" is an answer, not a failure to answer,
+# and only the reconciler resolves it.)
+LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
 
 # Activity bounds for ownership calls. Short and few: ownership is a
 # coordination signal, and a loop must never stall on it.
@@ -546,6 +555,7 @@ class DevLoopWorkflow:
         # re-asking on every poll for the rest of the watch.
         self._claim_refused = False
         self._unknown_acquires = 0
+        self._unknown_progress = 0
         self._proposal_ref = ""
         self._policy_ref = ""
 
@@ -1222,10 +1232,7 @@ class DevLoopWorkflow:
         head = state.head_sha or ""
 
         if not self._owned_entity_id:
-            if (
-                self._unknown_acquires >= LIFECYCLE_UNKNOWN_ACQUIRE_LIMIT
-                and self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS != 0
-            ):
+            if self._backed_off(self._unknown_acquires):
                 # The store has been unreachable, or answering something
                 # unusable, for this many consecutive attempts. Re-asking on
                 # every poll for the rest of a 14-day watch is ~670 activities
@@ -1287,7 +1294,7 @@ class DevLoopWorkflow:
                 )
             return
 
-        if head and head != self._owned_head_sha:
+        if head and head != self._owned_head_sha and not self._backed_off(self._unknown_progress):
             result = await self._ownership(
                 "progress",
                 repo=repo,
@@ -1306,10 +1313,12 @@ class DevLoopWorkflow:
                 # landed progress write IS this poll's heartbeat.
                 self._owned_head_sha = head
                 self._owner_epoch = result.epoch or self._owner_epoch
+                self._unknown_progress = 0
                 return
             if result is not None and result.verdict == OWNED_BY_OTHER:
                 self._lose_claim(repo, number, result)
                 return
+            self._unknown_progress += 1
 
             # Everything else falls THROUGH to the heartbeat below, and the
             # unconditional return that used to sit here was a liveness bug.
@@ -1330,9 +1339,15 @@ class DevLoopWorkflow:
             # claim was never dropped — and, because of the same return, never
             # re-acquired either. The heartbeat's acquire re-establishes it.
             #
-            # It also bounds the retries. This path has no back-off of its own,
-            # so a persistently failing progress write meant one unanswered
-            # call per poll for the whole watch with nothing else happening.
+            # The retries are bounded by _backed_off on the way IN, with the
+            # counter this arm advances. Without it a /progress that 500s from
+            # poll 2 onward costs one activity per poll for the remaining ~670
+            # polls of a fourteen-day watch — precisely the history cost
+            # LIFECYCLE_UNKNOWN_WRITE_LIMIT exists to refuse, arriving by the
+            # path that falling through created. An earlier version of this
+            # comment claimed the existing counter already covered it; it did
+            # not, because that counter is only read and only written inside
+            # the unclaimed branch.
 
         if self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0:
             result = await self._ownership(
@@ -1348,6 +1363,21 @@ class DevLoopWorkflow:
                 # the winner's fencing generation while failing to notice,
                 # so every later call carried a competitor's epoch.
                 self._lose_claim(repo, number, result)
+
+    def _backed_off(self, unanswered: int) -> bool:
+        """Whether an ownership write should be skipped on this poll.
+
+        The store has answered neither "mine" nor "someone else's" this many
+        times running. Asking again on every remaining poll is the history cost
+        LIFECYCLE_UNKNOWN_WRITE_LIMIT refuses; asking on the heartbeat boundary
+        keeps the loop recovering when the store comes back. Deliberately not a
+        give-up, and deliberately evaluated per counter so a failing /progress
+        does not throttle the acquire that is still working.
+        """
+        return (
+            unanswered >= LIFECYCLE_UNKNOWN_WRITE_LIMIT
+            and self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS != 0
+        )
 
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
         """Poll get_pr_state until the PR reaches a terminal state.

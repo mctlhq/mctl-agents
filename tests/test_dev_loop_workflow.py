@@ -29,6 +29,7 @@ from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
+    LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
     DevLoopWorkflow,
@@ -1090,6 +1091,91 @@ class TestDevLoopWorkflow:
         )
         assert result.pr is not None and result.pr.state == "MERGED"
         assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
+
+    async def test_a_refused_claim_is_asked_about_once_not_every_poll(self, env):
+        """`_claim_refused` is permanent, and nothing pinned that it exists.
+
+        The sibling test above asserts only `all(op == "acquire")`, which is as
+        true of one acquire as of six hundred — so deleting the early return
+        left it green through three review rounds. "Somebody else owns this" is
+        an ANSWER, not a failure to answer: re-asking for the remaining
+        fortnight is ~670 activities to re-learn one fact, and the reconciler
+        is what resolves a conflict, not this loop.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 12 + [MERGED_PR],
+            issue=915,
+            ownership_owner=("pr-steward", "steward"),
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        assert len(acquires) == 1, (
+            f"a refused claim was re-asked {len(acquires)} times over 12 polls"
+        )
+
+    async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(
+        self, env
+    ):
+        """The unclaimed back-off is a DECAY, and both halves of that need cover.
+
+        Every ownership test drives at most four tracked polls against a limit
+        of six, so neither half was reachable: reverting the decay to the
+        previous permanent give-up stayed green, and deleting the gate stayed
+        green too. Twelve polls separates all three behaviours.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 12 + [MERGED_PR],
+            issue=916,
+            ownership_unavailable=True,
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        # Throttled: fewer than one per poll.
+        assert len(acquires) < 12, f"the gate never engaged: {len(acquires)} acquires"
+        # But NOT a permanent give-up: asking resumes on heartbeat boundaries
+        # after the limit, which is the whole difference from the behaviour
+        # this replaced.
+        assert len(acquires) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"the loop gave up permanently at the limit: {len(acquires)} acquires"
+        )
+
+    async def test_a_failing_progress_write_is_throttled_too(self, env):
+        """The commit that made the progress branch fall through claimed it
+        bounded the retries. It did not.
+
+        `LIFECYCLE_UNKNOWN_WRITE_LIMIT` was read and written only inside the
+        unclaimed branch, so a claimed loop whose /progress 500s from poll two
+        onward paid one activity per poll for the rest of the watch — the exact
+        history cost the constant exists to refuse, arriving by the path that
+        falling through created.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 12 + [MERGED_PR],
+            issue=917,
+            ownership_progress_fails=True,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert progress, f"the progress path was never reached: {[o.op for o in ops]}"
+        assert len(progress) < 12, f"the progress write was never throttled: {len(progress)}"
+        # And the heartbeat still runs while progress is throttled — the
+        # liveness fix this back-off sits on top of must survive it.
+        first = [o.op for o in ops].index("progress")
+        assert "acquire" in [o.op for o in ops][first:], [o.op for o in ops]
 
     async def test_progress_is_recorded_only_when_the_head_moves(self, env):
         """A poll that observed nothing new must not write progress.
