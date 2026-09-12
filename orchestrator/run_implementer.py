@@ -757,13 +757,14 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                         # Logged so the distinction is visible in the Argo log.
                         print(f"warn: {ledger.describe()}")
     except TimeoutError as exc:
-        # ledger.draining is set by drain_until_settled. The nested drain
-        # deadline only reclassifies the orphan while the OUTER budget still
-        # has room: a turn that runs 650s of its 900s and ends with a child
-        # live enters the drain with 250s left, so `fail_after` fires before
-        # `move_on_after` can. Without this the run would exit 44 --
-        # deterministic, charged to the proposal.
-        if ledger.draining and ledger.live:
+        # A live child when the outer bound fires is a harness loss WHEREVER we
+        # were -- draining, or still in the first turn loop. The earlier
+        # `draining and` conjunct was one narrower than the rule stated
+        # everywhere else: a task that started and then burned the whole budget
+        # without its turn ever emitting a ResultMessage never reached the
+        # drain, so it exited 44 -- deterministic, charged, MAX_HARNESS_FAILURES
+        # bypassed -- for a child that was demonstrably still running.
+        if ledger.live:
             # The outer wall-clock bound, not the drain's own -- but the cause
             # is still a child we could not await, so it is charged to the
             # harness, not to the proposal.

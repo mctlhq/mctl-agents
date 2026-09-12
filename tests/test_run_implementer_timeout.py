@@ -404,3 +404,26 @@ def test_implementer_waits_for_the_parents_post_delegation_turn(tmp_path, monkey
     )
     # ...and it stopped at the closing frame rather than draining the world.
     assert len(consumed) == 5
+
+
+def test_outer_timeout_with_a_live_child_is_an_orphan_even_before_the_drain(
+    tmp_path, monkeypatch
+) -> None:
+    """A live child at the outer bound is a harness loss wherever we were.
+
+    The earlier condition also required that the drain had started. That left a
+    task which began and then burned the whole budget without its turn ever
+    emitting a ResultMessage — so the drain was never entered — exiting 44:
+    deterministic, charged, MAX_HARNESS_FAILURES bypassed, for a child that was
+    demonstrably still running.
+    """
+    async def messages():
+        yield _started()
+        await anyio.sleep(10)   # turn never ends; drain never entered
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 30)
+
+    with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)

@@ -182,36 +182,64 @@ def test_drain_does_not_orphan_when_the_stream_ends_after_the_child_settles() ->
     )
 
 
-def test_the_sub_deadline_bounds_the_child_not_the_parents_work() -> None:
-    """`timeout_s` bounds phase 1 only — waiting for the child to go quiescent.
+def test_phase_two_gets_its_own_restarted_grace_and_expiry_is_not_an_error() -> None:
+    """The closing frame may never arrive, so waiting for it must not be fatal.
 
-    Once the child settles, the parent wakes and does real work (for the
-    review-feedback prompt, the `git commit` itself). Letting the sub-deadline
-    run on into that would make it a budget for productive work AND expire
-    silently: the ledger is empty, so there is no orphan to report, and the run
-    would fall through to an empty `git log` and a charged exit 42. The caller's
-    outer bound governs there instead.
+    Phase 2 runs on a RESTARTED deadline, not the remainder of phase 1's — a
+    slow child must not eat the parent's grace. And expiry here returns rather
+    than raising: nothing is outstanding, whatever the child produced is already
+    in the worktree, and `_has_new_commits` is the right adjudicator. If this
+    instead ran on the caller's outer bound, `fail_after` would fire with an
+    empty ledger, fall through to a plain operation timeout -> exit 44 -> a
+    CHARGED attempt, and the child's commit would go in the bin with the tmp
+    clone — the exact thing #366 is about.
     """
     ledger = LiveTaskLedger()
     ledger.observe(started("t1"))
 
-    async def slow_parent():
+    async def parent_never_closes():
         yield updated("t1", "completed")
-        await anyio.sleep(5)      # the parent, working
-        yield result_message()
+        await anyio.sleep(10)
+        yield result_message()   # too late
+
+    seen: list[str] = []
 
     async def run() -> str:
-        # A tiny sub-deadline must NOT cut the parent off; the outer bound must.
-        with anyio.move_on_after(0.2):
+        # Generous outer bound: it must NOT be what stops us.
+        with anyio.fail_after(5):
             await drain_until_settled(
-                slow_parent(), ledger, timeout_s=0.05,
+                parent_never_closes(), ledger, timeout_s=0.05,
                 on_message=lambda _m: None,
             )
-            return "returned"
-        return "outer bound fired"
+        return "returned cleanly"
 
-    assert anyio.run(run) == "outer bound fired"
-    assert ledger.live == set(), "no orphan: the child had already settled"
+    assert anyio.run(run) == "returned cleanly"
+    assert ledger.live == set()
+    assert not seen
+
+
+def test_phase_two_grace_does_not_run_on_phase_ones_remaining_clock() -> None:
+    """A child that nearly exhausts the phase-1 budget must still leave the
+    parent a full grace window — otherwise a slow child silently converts into
+    a truncated commit window."""
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def slow_child_then_parent():
+        await anyio.sleep(0.06)          # most of the phase-1 budget
+        yield updated("t1", "completed")
+        await anyio.sleep(0.06)          # more than what phase 1 had left
+        yield result_message()
+
+    async def run() -> bool:
+        with anyio.fail_after(5):
+            await drain_until_settled(
+                slow_child_then_parent(), ledger, timeout_s=0.1,
+                on_message=lambda _m: None,
+            )
+        return True
+
+    assert anyio.run(run) is True
 
 
 def test_drain_raises_when_stream_ends_with_live_task() -> None:

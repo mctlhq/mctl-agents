@@ -92,11 +92,6 @@ class LiveTaskLedger:
     def __init__(self) -> None:
         self._live: set[str] = set()
         self._settled: dict[str, str] = {}
-        # Set by drain_until_settled. The caller's outer wall-clock bound can
-        # fire mid-drain, and it needs this to tell "a child we could not await"
-        # (a harness failure) from "the turn itself ran too long" (a genuine
-        # operation timeout) -- see run_implementer's TimeoutError handler.
-        self.draining = False
         self._warned_types: set[str] = set()
 
     @property
@@ -229,8 +224,6 @@ async def drain_until_settled(
         )
     from claude_agent_sdk import ResultMessage  # deferred — see module docstring
 
-    ledger.draining = True
-
     # PHASE 1, bounded by timeout_s: wait for the delegated child to go
     # quiescent. This is the only thing the sub-deadline was ever meant to
     # bound, and it is still how options.py documents it.
@@ -251,18 +244,32 @@ async def drain_until_settled(
         # The stream ended with nothing live. Nothing more is coming.
         return
 
-    # PHASE 2, bounded by the CALLER's outer budget, deliberately NOT by
-    # timeout_s: wait for the closing result frame. A settling child wakes the
-    # parent, and the parent's remaining steps are real work -- for the
-    # implementer's review-feedback prompt, the `git commit` itself. Letting the
-    # sub-deadline run on into that would turn it into a budget for productive
-    # work and, worse, expire silently: the ledger is empty, so there is no
-    # orphan to report, and the run would fall through to an empty `git log` and
-    # a charged exit 42. The sub-deadline exists for classification, not for
-    # capping how long a commit may take; the outer wall-clock bound already
-    # covers the parent, and expiring THERE is a genuine operation timeout.
-    async for message in stream:
-        on_message(message)
-        ledger.observe(message)
-        if isinstance(message, ResultMessage) and not ledger.live:
-            return
+    # PHASE 2, its own restarted grace deadline: wait for the closing result
+    # frame. A settling child wakes the parent, and the parent's remaining
+    # steps are real work -- for the implementer's review-feedback prompt, the
+    # `git commit` itself -- so this must NOT run on the phase-1 clock, which a
+    # slow child may have nearly exhausted.
+    #
+    # But it must not be unbounded either, and the reason is asymmetric with
+    # phase 1. That frame may never arrive: the parent can end without one, and
+    # if this waited on the CALLER's outer bound instead, `fail_after` would
+    # fire here with an empty ledger, fall through to a plain operation timeout
+    # -> exit 44 -> a CHARGED attempt, and the child's commit would be thrown
+    # away with the tmp clone. The whole point of #366 is not charging the
+    # proposal for work the platform mislaid.
+    #
+    # So expiry here is a RETURN, not a raise: nothing is outstanding, whatever
+    # the child produced is already in the worktree, and `_has_new_commits` is
+    # the right adjudicator. Loud, because a run that regularly reaches this is
+    # telling us the parent is slower than the grace period.
+    with anyio.move_on_after(timeout_s):
+        async for message in stream:
+            on_message(message)
+            ledger.observe(message)
+            if isinstance(message, ResultMessage) and not ledger.live:
+                return
+        return
+    print(
+        f"warn: no closing result frame within {timeout_s:g}s of the sub-agent "
+        f"settling; proceeding on what is already in the worktree"
+    )

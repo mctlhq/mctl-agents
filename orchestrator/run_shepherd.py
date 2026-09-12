@@ -664,10 +664,16 @@ def update_status(
     """
     update_status_file(ref.status_path, new_status, actor=actor, **fields)
     ref.status = new_status
-    if "review_attempts" in fields and fields["review_attempts"] is not None:
-        ref.review_attempts = int(fields["review_attempts"])
-    if "harness_failures" in fields and fields["harness_failures"] is not None:
-        ref.harness_failures = int(fields["harness_failures"])
+    # `None` means "delete the key" in update_status_file, so mirror that as a
+    # reset rather than skipping: guarding on `is not None` left the in-memory
+    # ref holding its pre-clear value while the file on disk had none, so the
+    # two disagreed for the rest of the tick. Harmless while the only consumer
+    # of the returned ref is the summary line, but the harness arm made these
+    # refs carry state that a later reader would reasonably trust.
+    for _field in ("review_attempts", "harness_failures"):
+        if _field in fields:
+            _value = fields[_field]
+            setattr(ref, _field, 0 if _value is None else int(_value))
 
 
 # ---------------------------------------------------------------------------
