@@ -75,6 +75,14 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 
+# subagent_wait defers its own claude_agent_sdk imports (see its module note),
+# so unlike options/mcp_guard below it is safe at module scope here.
+from orchestrator.subagent_wait import (
+    LiveTaskLedger,
+    OrphanedSubagentError,
+    drain_until_settled,
+)
+
 DEFAULT_STATE_DIR = Path(
     os.getenv(
         "STATE_DIR",
@@ -83,20 +91,6 @@ DEFAULT_STATE_DIR = Path(
 )
 INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
 
-# Sub-deadline for awaiting a sub-agent the CLI launched asynchronously
-# (mctl-agents#366), nested inside whatever wall-clock bound the caller
-# imposes on the investigate step. Not needed for liveness -- the Argo step
-# deadline provides that -- but for classification: a wedged child that ate
-# the whole remaining budget would surface as a plain step timeout instead of
-# naming the handoff we lost.
-#
-# Declared here rather than beside its implementer twin in
-# orchestrator/options.py because of the import rule stated above: this module
-# must stay importable by the Temporal worker, and a function-local import
-# would put the value out of reach of the tests that shorten it.
-INVESTIGATOR_DRAIN_TIMEOUT_SECONDS = float(
-    os.getenv("ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", "300")
-)
 
 # mctlhq/mctl-agents#227 declarative resolver pilot. "legacy" (the default)
 # does not import or call orchestrator/resolver.py at all — today's
@@ -1267,7 +1261,7 @@ class RateLimitExhaustedError(RuntimeError):
     """
 
 
-class InvestigatorOrphanedSubagent(RuntimeError):
+class InvestigatorOrphanedSubagent(OrphanedSubagentError):
     """The run ended while a delegated sub-agent was still live.
 
     A harness failure, not a content failure. ``cwd`` is a fresh clone of the
@@ -1279,12 +1273,12 @@ class InvestigatorOrphanedSubagent(RuntimeError):
     downstream pipeline gets nothing -- reported as an investigation failure
     whose message names the lost handoff rather than blaming the issue.
 
-    Deliberately NOT a subclass of ``orchestrator.subagent_wait``'s shared
-    ``OrphanedSubagentError``: that module imports ``claude_agent_sdk`` at
-    module scope, and this one must stay importable by the long-lived Temporal
-    worker (see the import note at the top of this file and
-    tests/test_worker_isolation.py). ``_run_agent`` catches the shared error
-    behind its local import and re-raises this one.
+    Subclasses the shared error so ``except OrphanedSubagentError`` catches it
+    like any other driver's, while this module keeps its greppable
+    ``Investigator*`` naming. That is only possible because
+    orchestrator/subagent_wait.py defers its own SDK imports and so stays
+    importable by the Temporal worker -- see its module note and
+    tests/test_worker_isolation.py.
     """
 
 
@@ -1301,13 +1295,9 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     from orchestrator import resolver
     from orchestrator.mcp_guard import ensure_mctl_connected
     from orchestrator.options import (
+        ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS,
         build_issue_investigator_options,
         build_issue_investigator_options_from_plan,
-    )
-    from orchestrator.subagent_wait import (
-        LiveTaskLedger,
-        OrphanedSubagentError,
-        drain_until_settled,
     )
 
     mode = _resolver_mode()
@@ -1381,7 +1371,7 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
                     await drain_until_settled(
                         stream,
                         ledger,
-                        timeout_s=INVESTIGATOR_DRAIN_TIMEOUT_SECONDS,
+                        timeout_s=ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS,
                     )
                 except OrphanedSubagentError as exc:
                     raise InvestigatorOrphanedSubagent(

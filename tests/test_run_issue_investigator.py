@@ -3258,7 +3258,7 @@ def test_investigator_waits_for_async_launched_subagent(tmp_path, monkeypatch):
         "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
     )
     monkeypatch.setattr(
-        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
     )
 
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -3296,7 +3296,7 @@ def test_investigator_raises_orphaned_when_task_never_settles(tmp_path, monkeypa
         "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
     )
     monkeypatch.setattr(
-        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 0.05
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 0.05
     )
 
     with pytest.raises(InvestigatorOrphanedSubagent, match=r"orphaned sub-agent:"):
@@ -3313,7 +3313,7 @@ def test_investigator_raises_orphaned_when_stream_ends_with_live_task(tmp_path, 
         "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
     )
     monkeypatch.setattr(
-        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
     )
 
     with pytest.raises(InvestigatorOrphanedSubagent):
@@ -3334,7 +3334,7 @@ def test_investigator_does_not_orphan_on_failed_terminal_status(tmp_path, monkey
         "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
     )
     monkeypatch.setattr(
-        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
     )
 
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -3354,7 +3354,7 @@ def test_investigator_rate_limit_still_wins_over_the_drain(tmp_path, monkeypatch
         "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
     )
     monkeypatch.setattr(
-        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
     )
 
     with pytest.raises(RateLimitExhaustedError):
