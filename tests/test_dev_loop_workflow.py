@@ -99,6 +99,8 @@ def _fake_activities(
     ownership_self_unhealthy_after: int | None = None,
     ownership_progress_fails: bool = False,
     ownership_progress_unowned: bool = False,
+    ownership_unowned_op: str | None = None,
+    ownership_unknown_state: str | None = None,
     ownership_body_less: str | None = None,
     ownership_terminal_fails: bool = False,
     ownership_raises: bool = False,
@@ -303,6 +305,37 @@ def _fake_activities(
             return OwnershipResult(
                 verdict=answer.verdict, reason=answer.reason, accepted=answer.accepted
             )
+        if ownership_unowned_op is not None and req.op == ownership_unowned_op:
+            # A released record answered to any op, not just progress. The
+            # heartbeat's UNOWNED arm has to sit ABOVE the accepted arm,
+            # because a released record arrives in a 2xx with accepted True —
+            # and the only `unowned` fixture was gated on progress, so no test
+            # had ever produced an unowned ACQUIRE.
+            #
+            # Only AFTER the op has succeeded once, like ownership_unavailable_op
+            # and for the same reason: answering it to the CLAIMING acquire
+            # means no claim ever lands, the heartbeat block is never reached,
+            # and every later op carries epoch 0 — which makes an assertion
+            # about the claim being dropped trivially true.
+            if [o for o in ownership_ops[:-1] if o.op == ownership_unowned_op]:
+                return OwnershipResult(
+                    verdict="unowned", state="released", reason="no record", accepted=True
+                )
+        if ownership_unknown_state is not None and req.op == "acquire":
+            # A 2xx carrying a holding state this image does not know. This
+            # container lags mctl-api by a release, so `verdict_for` answers
+            # UNKNOWN against its two CLOSED sets rather than guessing — and
+            # the row may be held by somebody else in that state.
+            #
+            # An EMPTY state is the body-less 2xx: accepted, verdict UNKNOWN,
+            # no record at all. It is the other side of the `result.state`
+            # conjunct, and the shape the claim must SURVIVE.
+            #
+            # After the claim, for the reason above.
+            if [o for o in ownership_ops[:-1] if o.op == "acquire"]:
+                return OwnershipResult(
+                    verdict="unknown", state=ownership_unknown_state, accepted=True
+                )
         if ownership_progress_unowned and req.op == "progress":
             # The reconciler already released the row underneath this loop, so
             # the progress write lands on nothing. Neither owned-by-me nor
@@ -1625,6 +1658,139 @@ class TestDevLoopWorkflow:
         assert len([o for o in ops if o.op == "acquire"]) > 1, (
             "a refusal naming nobody refused the claim permanently: "
             f"{[o.op for o in ops]}"
+        )
+
+    async def test_a_state_this_image_cannot_read_still_drops_the_claim(self, env):
+        """The one `accepted` shape that must COUNT rather than reset.
+
+        mctl-api adds a holding state and hands the row to another actor in it.
+        `verdict_for` classifies against two CLOSED sets and answers UNKNOWN
+        rather than guessing, because this container lags mctl-api by a
+        release; `accepted` is True because a record came back. An arm that
+        zeroed the counter on every such heartbeat made the give-up
+        UNFIREABLE — the loop would hold its claim indefinitely, and invisibly,
+        against a row somebody else owns.
+
+        Liveness is not the question here: the write landed. What is wrong
+        after this many of them is the BELIEF, and uncertainty resolves toward
+        dropping the claim — the same direction `verdict_for` itself takes.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=927,
+            ownership_unknown_state="quiescing",
+        )
+        # The claim was dropped, which is only reachable through the give-up:
+        # every op after it carries epoch 0.
+        assert any(o.epoch == 0 for o in ops[1:]), (
+            "a heartbeat in an unreadable state never dropped the claim: "
+            f"{[(o.op, o.epoch, o.version[:2]) for o in ops]}"
+        )
+
+    async def test_a_body_less_heartbeat_keeps_the_claim(self, env):
+        """The other side of the `result.state` conjunct.
+
+        A body-less 2xx on the heartbeat is accepted with verdict UNKNOWN and
+        NO record, so nothing suggests the row moved: `last_seen_at` was
+        refreshed and the claim must stand. Only a record whose STATE this
+        image cannot classify is a reason to stop believing, because only that
+        one says somebody may hold the row in a state we cannot read.
+
+        Without the conjunct both collapse into "count it", and a store
+        answering 204 to every heartbeat — legal, and what a body-less 2xx IS —
+        drops a healthy claim every six hours.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=930,
+            ownership_unknown_state="",
+        )
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a body-less heartbeat dropped a claim nothing said had moved: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_an_unowned_heartbeat_drops_the_claim_rather_than_keeping_it(self, env):
+        """The UNOWNED arm's POSITION is load-bearing and nothing tested it.
+
+        It must sit above the `accepted` arm, because a released record arrives
+        in a 2xx with `accepted=True`. Below it, an UNOWNED heartbeat resets the
+        counter and returns, so the loop keeps a claim on a row the store says
+        is free — forever, with no re-acquire, and a `finally` writing against a
+        claim it does not hold.
+
+        The only `unowned` fixture was gated on `req.op == "progress"`, so no
+        test had ever produced an unowned ACQUIRE, which is what a heartbeat is.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 20 + [MERGED_PR],
+            issue=928,
+            ownership_unowned_op="acquire",
+        )
+        # The claiming acquire is normal; from the first heartbeat on the row
+        # reads as released, and the claim must not survive it.
+        assert any(o.epoch == 0 for o in ops[1:]), (
+            "an unowned heartbeat kept a claim on a row the store says is free: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_a_body_less_progress_write_is_also_this_polls_heartbeat(self, env):
+        """The second landed-progress arm, which had the same fix and no test.
+
+        `ownership_unavailable_op` is checked before `ownership_body_less` in
+        the fake, so the two compose: every acquire after the claim fails while
+        every progress write lands with a body-less 2xx. Without the reset the
+        heartbeat counter climbs across writes that refreshed `last_seen_at`
+        and the claim is dropped — the behaviour this commit exists to remove,
+        reached through the arm that had no cover.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        heads = []
+        for i in range(1, 25):
+            if i % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0 and heads:
+                heads.append(heads[-1])
+            else:
+                heads.append(_pr(chr(ord("a") + i) * 40))
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=929,
+            ownership_unavailable_op="acquire",
+            ownership_body_less="progress",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) > LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT + 2, (
+            f"the progress path stopped: {[(o.op, o.epoch) for o in ops]}"
+        )
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a claim was dropped although its own body-less progress writes "
+            f"were landing: {[(o.op, o.epoch) for o in ops]}"
         )
 
     async def test_progress_is_recorded_only_when_the_head_moves(self, env):

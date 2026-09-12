@@ -1542,22 +1542,45 @@ class DevLoopWorkflow:
                 self._unknown_progress = 0
                 return
 
-            if result is not None and result.accepted:
+            if result is not None and result.accepted and result.verdict == UNKNOWN and result.state:
+                # A record came back in a 2xx and its STATE is one this image
+                # does not recognise — `verdict_for` classifies against two
+                # CLOSED sets and answers UNKNOWN rather than guessing, because
+                # this container lags mctl-api by a release.
+                #
+                # Counted, NOT reset, and it is the one accepted shape that
+                # must be. mctl-api took the write, so liveness is refreshed —
+                # but liveness is not the question here. A holding state added
+                # server-side means the row may now be held by somebody else in
+                # a state this image cannot read, and an arm that zeroed the
+                # counter on every such heartbeat made the give-up UNFIREABLE:
+                # the loop would hold its claim indefinitely, and invisibly,
+                # against a row another actor owns. Uncertainty resolves toward
+                # dropping the claim, the same direction `verdict_for` itself
+                # takes.
+                self._unknown_heartbeats += 1
+                workflow.logger.warning(
+                    "lifecycle: heartbeat for %s#%s came back in state %r, which "
+                    "this image does not recognise — %d consecutive; the claim is "
+                    "dropped at %d",
+                    repo, number, result.state, self._unknown_heartbeats,
+                    LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
+                )
+            elif result is not None and result.accepted:
                 # mctl-api TOOK the write, so last_seen_at IS refreshed; this
                 # loop simply learned nothing usable from the record that came
                 # back. That is not a missed heartbeat, and counting it toward
                 # a give-up whose entire premise is "liveness stopped" was the
                 # opposite of what the gate is for.
                 #
-                # Three real shapes reach here, all with `accepted` True and
-                # all of them written by mctl-api: a body-less 2xx on
-                # /ownership/acquire (the pair the claim and progress arms were
-                # rewritten to read — the heartbeat IS an acquire and got
-                # neither); our own record read back unhealthy, which
-                # `_lost_to_someone_else` correctly declines to treat as a
-                # loss; and a 2xx carrying a state this image does not
-                # recognise, which `verdict_for` deliberately answers UNKNOWN
-                # rather than guessing.
+                # Two shapes, and neither is a reason to stop claiming: a
+                # body-less 2xx on /ownership/acquire (the pair the claim and
+                # progress arms were rewritten to read — the heartbeat IS an
+                # acquire and got neither), which carries no record at all; and
+                # our own record read back unhealthy, which
+                # `_lost_to_someone_else` correctly declines to treat as a loss
+                # and which the give-up must not act on either, since ADR-010
+                # §4 gives `stuck` an ESCALATION and only `dead` a takeover.
                 #
                 # Getting this wrong was not cosmetic. Three of them dropped a
                 # claim the loop still held, after which it writes no progress,
@@ -1565,21 +1588,32 @@ class DevLoopWorkflow:
                 # releases nothing — the zero-owner state this epic exists to
                 # remove — on the strength of a warning that said liveness had
                 # stopped when it had not.
+                #
+                # Logged rather than returning in silence, which is the defect
+                # the previous commit fixed one block up and this arm
+                # reintroduced. The unhealthy-own-record case is precisely the
+                # condition ADR-010 wants an operator to see.
+                workflow.logger.info(
+                    "lifecycle: heartbeat for %s#%s landed but told us nothing "
+                    "usable (verdict=%s, state=%r, healthy=%s) — the claim stands",
+                    repo, number, result.verdict, result.state, result.healthy,
+                )
                 self._unknown_heartbeats = 0
                 return
+            else:
+                self._unknown_heartbeats += 1
+                workflow.logger.warning(
+                    "lifecycle: heartbeat for %s#%s did not land (verdict=%s, %s) — "
+                    "%d consecutive, last_seen_at is not being refreshed",
+                    repo, number,
+                    result.verdict if result is not None else "none",
+                    # `reason` is "" for every 2xx that carried a record, so the
+                    # verdict above is what makes those cases self-describing.
+                    (result.reason or "no reason given") if result is not None
+                    else "the activity failed outright",
+                    self._unknown_heartbeats,
+                )
 
-            self._unknown_heartbeats += 1
-            workflow.logger.warning(
-                "lifecycle: heartbeat for %s#%s did not land (verdict=%s, %s) — "
-                "%d consecutive, last_seen_at is not being refreshed",
-                repo, number,
-                result.verdict if result is not None else "none",
-                # `reason` is "" for every 2xx that carried a record, so the
-                # verdict above is what makes those cases self-describing.
-                (result.reason or "no reason given") if result is not None
-                else "the activity failed outright",
-                self._unknown_heartbeats,
-            )
             if self._unknown_heartbeats >= LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT:
                 # Deliberately NOT a back-off. Skipping the heartbeat is the
                 # one thing that cannot help here — it is the write whose
@@ -1588,8 +1622,9 @@ class DevLoopWorkflow:
                 # What is wrong after this many consecutive failures is the
                 # BELIEF. At LIFECYCLE_HEARTBEAT_EVERY_POLLS x
                 # MERGE_POLL_INTERVAL per heartbeat, last_seen_at has not moved
-                # for about six hours, and nothing above this line answered, so
-                # mctl-api took none of those writes. The reconciler will take
+                # for about six hours in the failure case, or the record has
+                # come back that many times in a state this image cannot read.
+                # Either way the BELIEF is what is wrong. The reconciler will take
                 # the row at the 10h bound whatever this loop thinks — and the
                 # correction has to arrive BEFORE that, not after. A loop that
                 # goes on believing it owns an entity the store is about to
