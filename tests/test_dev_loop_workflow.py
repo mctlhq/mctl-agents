@@ -1675,6 +1675,18 @@ class TestDevLoopWorkflow:
             ownership_owner=("pr-steward", ""),
             ownership_owner_after=1,
         )
+        # The HEARTBEAT must not read it as our own refresh either. That arm
+        # had the same hole one branch over, where it is worse: `accepted` is
+        # True, so the loop reset `_unknown_heartbeats` on a COMPETITOR's
+        # record and kept the claim alive indefinitely against a row it does
+        # not hold — the give-up could never fire. Observable as the claim
+        # eventually being dropped, which only happens if the heartbeat counts
+        # these answers.
+        assert any(o.epoch == 0 for o in ops[1:]), (
+            "a competitor with no id was read as our own heartbeat, so the "
+            f"claim was never given up: {[(o.op, o.epoch) for o in ops]}"
+        )
+
         progress = [o for o in ops if o.op == "progress"]
         # The head must NOT have been advanced on every poll as though the
         # record were ours: an unowned-by-us answer falls through, so the

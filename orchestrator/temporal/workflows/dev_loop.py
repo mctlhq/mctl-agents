@@ -1697,7 +1697,29 @@ class DevLoopWorkflow:
                     repo, number, result.state, self._unknown_heartbeats,
                     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
                 )
-            elif result is not None and result.accepted:
+            elif (
+                result is not None
+                and result.accepted
+                and (
+                    result.verdict != OWNED_BY_OTHER
+                    or result.owner_type == "devloop-workflow"
+                )
+            ):
+                # The same competitor check the progress branch got, which this
+                # block was missing — one branch over, which is where every
+                # defect in this PR has turned out to live.
+                #
+                # `Ownership.from_payload` does not require `owner.id`, so a
+                # 2xx carrying `owner: {"type": "pr-steward"}` answers
+                # OWNED_BY_OTHER, is declined as a loss by
+                # `_lost_to_someone_else`'s `bool(result.owner_id)` guard, and
+                # then landed HERE — where `accepted` is True, so the loop read
+                # a COMPETITOR's record as a successful refresh of its own
+                # claim, reset `_unknown_heartbeats`, and kept the claim alive
+                # indefinitely against a row it does not hold. The give-up
+                # could never fire, which is the state this whole block exists
+                # to prevent. (Found by agy.)
+                #
                 # mctl-api TOOK the write, so last_seen_at IS refreshed; this
                 # loop simply learned nothing usable from the record that came
                 # back. That is not a missed heartbeat, and counting it toward
