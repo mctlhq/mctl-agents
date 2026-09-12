@@ -165,8 +165,11 @@ class OwnershipClient:
         swept anyway — an unanswered probe read as "unowned". A single batched
         read removes the pool and that failure mode together.
 
-        On failure EVERY id comes back UNKNOWN rather than absent, so a caller
-        iterating the result cannot mistake a store outage for a clean sweep.
+        On failure every id IN THE FAILING CHUNK comes back UNKNOWN rather
+        than absent, so a caller iterating the result cannot mistake a store
+        outage for a clean sweep. Chunks succeed or fail independently; a
+        partial answer is still better than none, and each id carries its own
+        verdict either way.
         """
         if not ids:
             return {}
@@ -253,6 +256,11 @@ class OwnershipClient:
     def handoff_start(
         self, entity: EntityRef, phase: str, owner: Owner, epoch: int, to: Owner, reason: str = ""
     ) -> OwnershipAnswer:
+        if not to.type or not to.id:
+            # _write filters empty strings out of the payload, so an empty
+            # target would be dropped and the server would answer 400 with a
+            # message the caller never sees — the same trap `evidence` had.
+            raise ValueError("handoff_start requires a target owner type and id")
         return self._write(
             "/api/v1/lifecycle/ownership/handoff/start",
             entity,

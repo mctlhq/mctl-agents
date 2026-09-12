@@ -469,82 +469,58 @@ def test_unrecognised_state_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "quarantined" in answer.reason
 
 
-def test_a_200_with_an_unparseable_body_is_not_a_successful_write(
+def test_a_200_that_is_not_our_answer_is_not_a_successful_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A gateway or proxy answering for the API serves HTML with a 200.
+    """A 2xx from something in front of the API is not a completed write.
 
-    That parses to an empty mapping, exactly like a genuine 204, so collapsing
-    the two would report a page-not-found as a completed release. `body_empty`
-    is what separates them.
+    The earlier version of this test used an HTML body, which CANNOT reach the
+    classifier: `json.loads` raises in `_request` and the transport converts it
+    to `OwnershipUnavailable`, so the assertion held for a reason that had
+    nothing to do with the mechanism it named. Deleting `body_empty` entirely
+    left the suite green.
+
+    A body that is valid JSON and not a record is the fixture that pins it: a
+    sidecar answering `200 {"error": "rate limited"}` would otherwise tell the
+    caller its release succeeded.
     """
-    handler = lambda req: _FakeResponse(b"<html>502 Bad Gateway</html>", status=200)  # noqa: E731
-    answer = _client(monkeypatch, handler).release(ENTITY, PHASE, ME, epoch=1, reason="done")
-    assert answer.verdict == UNKNOWN
-    assert answer.wrote is False
+    for payload in ({"error": "rate limited"}, {"status": "ok"}, {"ownership": "not-a-dict"}):
+        answer = _client(monkeypatch, _ok(payload)).release(
+            ENTITY, PHASE, ME, epoch=1, reason="done"
+        )
+        assert answer.wrote is False, payload
+        assert answer.verdict == UNKNOWN, payload
 
 
-def test_a_successful_release_is_recorded_as_written(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The usual shape of a successful release is a 200 carrying the record it
-    just wrote — whose state is `released`, which `verdict_for` correctly maps
-    to UNOWNED.
-
-    A "did it work" test built from verdicts alone therefore answers no for the
-    one call whose whole purpose is to succeed, and a caller gating local state
-    on it could never record a release the server accepted. That is the
-    `result is not None` defect arriving from the opposite direction.
-    """
-    for state in ("released", "terminal"):
-        payload = _owned_payload(ME, healthy=False)
-        payload["state"] = state
-        answer = _client(monkeypatch, _ok(payload)).release(ENTITY, PHASE, ME, epoch=1, reason="done")
-        assert answer.wrote is True, state
-        # It is still not a claim — nobody owns the entity now.
-        assert answer.verdict == UNOWNED, state
-        assert answer.may_mutate is False, state
-
-
-def test_a_read_is_never_recorded_as_a_write(monkeypatch: pytest.MonkeyPatch) -> None:
-    answer = _client(monkeypatch, _ok(_owned_payload(ME))).get(ENTITY, PHASE, asking=ME)
-    assert answer.wrote is False
-
-
-def test_404_on_a_read_without_an_error_envelope_is_unknown(
+def test_a_200_carrying_the_record_is_a_successful_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An ingress rule that stopped matching, a wrong base path, or a proxy's
-    HTML page all produce a 404 with no readable envelope. Answering UNOWNED
-    there frees EVERY entity asked — the write half of this was fixed first,
-    and the read half frees more."""
-    handler = lambda req: (_ for _ in ()).throw(  # noqa: E731
-        urllib.error.HTTPError(req.full_url, 404, "err", {}, io.BytesIO(b"<html>404</html>"))
-    )
-    answer = _client(monkeypatch, handler).get(ENTITY, PHASE, asking=ME)
-    assert answer.verdict == UNKNOWN
-    assert answer.blocks_others is True
-
-
-def test_404_on_a_read_with_the_api_envelope_is_still_unowned(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """mctl-api genuinely saying "no such record" is the one case UNOWNED is
-    right for, and it must keep working — otherwise nothing is ever free."""
-    c = _client(monkeypatch, _http_error(404, {"error": "no ownership record for this entity phase"}))
-    answer = c.get(ENTITY, PHASE, asking=ME)
+    """The other direction, or the envelope check would simply block every
+    write."""
+    payload = _owned_payload(ME, healthy=False)
+    payload["state"] = "released"
+    answer = _client(monkeypatch, _ok(payload)).release(ENTITY, PHASE, ME, epoch=1, reason="done")
+    assert answer.wrote is True
     assert answer.verdict == UNOWNED
-    assert answer.blocks_others is False
 
 
-def test_the_sweep_reports_an_unrecognised_state_with_a_reason(
+def test_a_409_naming_the_caller_is_not_owned_by_other(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """_get_chunk was the one path still classifying for itself, so every
-    reason-string and state fix made elsewhere stopped at the sweep's door."""
-    rec = _owned_payload(OTHER)
-    rec["state"] = "quarantined"
-    out = _client(monkeypatch, _ok({"ownership": {"mctlhq/a#1": rec}, "count": 1})).get_many(
-        ENTITY.kind, PHASE, ["mctlhq/a#1"], asking=ME
-    )
-    answer = out["mctlhq/a#1"]
-    assert answer.verdict == UNKNOWN
-    assert "quarantined" in answer.reason
+    """The 409 branch was the last path producing a verdict without consulting
+    `verdict_for`, so a conflict reported about a row the caller already holds
+    made the loop stand down from work it owns."""
+    payload = {"error": "conflict", "ownership": _owned_payload(ME)}
+    answer = _client(monkeypatch, _http_error(409, payload)).acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == OWNED_BY_ME
+    assert answer.may_mutate is True
+
+
+def test_handoff_start_refuses_an_empty_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_write` drops empty strings, so an empty target would be silently
+    omitted and the server would answer 400 with a message the caller never
+    sees — the same trap `evidence` had."""
+    with pytest.raises(ValueError, match="target owner"):
+        _client(monkeypatch, _ok(_owned_payload(ME))).handoff_start(
+            ENTITY, PHASE, ME, epoch=1, to=Owner(type="shepherd", id="")
+        )

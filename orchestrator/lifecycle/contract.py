@@ -256,6 +256,20 @@ def _error_of(status: int, payload: dict[str, Any]) -> str:
     return str(payload.get("error") or f"HTTP {status}")
 
 
+def _looks_like_our_answer(payload: dict[str, Any]) -> bool:
+    """Whether this body came from the lifecycle API rather than something in
+    front of it.
+
+    An ownership record, or the conflict envelope that nests one. Anything else
+    — an error object, a health page rendered as JSON, a proxy's own schema —
+    is a 2xx we did not ask for.
+    """
+    if Ownership.from_payload(payload) is not None:
+        return True
+    nested = payload.get("ownership")
+    return isinstance(nested, dict) and Ownership.from_payload(nested) is not None
+
+
 # The two states in which the record still holds the entity, and the two in
 # which it has let go. Both lists are CLOSED, and a state in neither is
 # deliberately not classified — see _verdict_for.
@@ -311,7 +325,17 @@ def answer_from(
     reads an HTML error page served with a 200 — a gateway answering for the
     API — as a successful write.
     """
-    accepted = not is_read
+    # `accepted` requires mctl-api's OWN answer, not merely a 2xx.
+    #
+    # Deriving it from the status alone meant a sidecar answering
+    # `200 {"error": "rate limited"}`, or anything else returning valid JSON
+    # that is not a record, told a caller its release had succeeded. The module
+    # already applies this rule to 404s — believe the status only when the
+    # envelope backs it — and a 2xx deserves the same, because the 2xx is the
+    # one a caller acts on.
+    accepted = False
+    if not is_read and 200 <= status < 300:
+        accepted = body_empty or _looks_like_our_answer(payload)
     if 200 <= status < 300:
         # A 200 whose body is not an ownership record is a surprise, not an
         # answer. Parsing it into an all-empty record would produce a confident
@@ -367,7 +391,15 @@ def answer_from(
     if status == 409:
         raw = payload.get("ownership")
         own = Ownership.from_payload(raw) if isinstance(raw, dict) else None
-        return OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=own, reason=_error_of(status, payload))
+        if own is None:
+            return OwnershipAnswer(verdict=OWNED_BY_OTHER, reason=_error_of(status, payload))
+        # Through verdict_for, like every other path: a 409 that names the
+        # CALLER is the server reporting a conflict about a row we already
+        # hold, and answering OWNED_BY_OTHER for our own record would make the
+        # loop stand down from work it owns.
+        return OwnershipAnswer(
+            verdict=verdict_for(own, asking), ownership=own, reason=_error_of(status, payload)
+        )
     # 412, 503, 5xx, 401/403 — every one of these means "I could not establish
     # ownership", which is UNKNOWN and never UNOWNED. A 412 in particular means
     # the record moved underneath the caller, which is the strongest possible
