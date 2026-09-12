@@ -18,6 +18,16 @@ import pytest
 
 from orchestrator import options, resolver
 
+# Every drain sub-deadline (mctl-agents#366/#368). They share the
+# `_positive_seconds` clamp, so the clamp and env-name tests below are one
+# property of that helper's callers rather than three separate facts — a fourth
+# knob belongs here the moment it is added.
+_DRAIN_TIMEOUT_ENV_VARS = (
+    "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS",
+    "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS",
+    "ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS",
+)
+
 
 def test_mctl_mcp_config_default_omits_always_load(monkeypatch):
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
@@ -357,7 +367,8 @@ def test_the_mentor_has_neither_hooks_nor_an_sdk_mcp_server(tmp_path, monkeypatc
     ], "an sdk-type server WOULD satisfy the precondition — the mentor is now drainable"
 
 
-def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
+@pytest.mark.parametrize("name", _DRAIN_TIMEOUT_ENV_VARS)
+def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys, name):
     """A bad value must be loud and harmless, not silent and unbounded.
 
     `move_on_after(0)` cancels before the first read, so a drain deadline of 0
@@ -367,6 +378,14 @@ def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
     with no counter at all. A typo in one env var would then re-clone the repo
     and re-run a paid SDK call every tick forever, which is precisely what
     MAX_HARNESS_FAILURES exists to prevent.
+
+    Parametrised over all three knobs rather than the implementer's alone: they
+    read through the same `_positive_seconds` clamp, so this is one property of
+    that helper's callers, and a fourth knob added with a bare
+    `float(os.getenv(...))` should fail here rather than reintroduce the
+    pathology under a new name. The blast radius does differ — the
+    service-agent and issue-investigator do not go through the shepherd's
+    classification — but the clamp is the right shape for all of them.
     """
     import importlib
 
@@ -375,13 +394,13 @@ def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
     # whose every `deadline <= now` test is False — the scope never cancels and
     # the sub-deadline is silently gone. inf disables it the same way.
     for bad in ("0", "-5", "not-a-number", "nan", "inf", "-inf"):
-        monkeypatch.setenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", bad)
+        monkeypatch.setenv(name, bad)
         reloaded = importlib.reload(options)
         try:
-            assert reloaded.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 300.0, bad
-            assert "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS" in capsys.readouterr().err
+            assert getattr(reloaded, name) == 300.0, bad
+            assert name in capsys.readouterr().err
         finally:
-            monkeypatch.delenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", raising=False)
+            monkeypatch.delenv(name, raising=False)
             importlib.reload(options)
 
 
@@ -391,10 +410,8 @@ def test_the_other_two_drain_timeouts_default_to_five_minutes():
     assert options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS == 300.0
 
 
-@pytest.mark.parametrize(
-    "name", ["SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", "ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS"]
-)
-def test_the_other_two_drain_timeouts_honour_their_env_overrides(monkeypatch, name):
+@pytest.mark.parametrize("name", _DRAIN_TIMEOUT_ENV_VARS)
+def test_every_drain_timeout_honours_its_env_override(monkeypatch, name):
     """Pins the env-var NAME, which the driver tests cannot.
 
     They monkeypatch the module attribute, so the value is exercised but the
