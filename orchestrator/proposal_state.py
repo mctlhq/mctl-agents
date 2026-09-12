@@ -164,9 +164,7 @@ def _write_status_atomic(path: Path, payload: dict[str, Any]) -> None:
     Closing that needs a lock, and the obvious place for one — a sidecar
     beside the file — is inside the gitops worktree, where the investigate
     CWFT's `git add ':(glob)…/proposals/*/**'` would stage it. Tracked in
-    mctlhq/mctl-agents#354 rather than improvised here. (#307 asked for both
-    halves and shipped only this one, then closed — leaving that pointer
-    dangling. #354 carries the remaining lock.)
+    mctlhq/mctl-agents#307 rather than improvised here.
 
     Mirrors `run_issue_investigator.write_status_yaml`, which was given the
     same treatment for the same reason; not shared with it because that one
