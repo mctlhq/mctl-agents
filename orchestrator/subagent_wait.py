@@ -97,6 +97,7 @@ class LiveTaskLedger:
         # (a harness failure) from "the turn itself ran too long" (a genuine
         # operation timeout) -- see run_implementer's TimeoutError handler.
         self.draining = False
+        self._warned_types: set[str] = set()
 
     @property
     def live(self) -> set[str]:
@@ -140,15 +141,18 @@ class LiveTaskLedger:
             # to wait for.
             if message.task_type in AWAITED_TASK_TYPES:
                 self._live.add(message.task_id)
-            else:
-                # Say so out loud. This filter is the single assumption the
-                # whole fix rests on: a delegated launch arriving with a new
-                # SDK task_type (or None) would leave the ledger empty, skip
-                # the drain, and reproduce mctl-agents#366 exactly -- with
-                # every test still green, since they all construct
-                # task_type="local_agent". The Argo log was the only forensic
-                # trail the original incident left, so make the skip greppable
-                # rather than silent.
+            elif message.task_type not in self._warned_types:
+                # Once per distinct type, not once per task. This filter is the
+                # single assumption the whole fix rests on -- a delegated launch
+                # arriving with a new SDK task_type (or None) would leave the
+                # ledger empty, skip the drain, and reproduce mctl-agents#366
+                # exactly, with every test still green, since they all build
+                # task_type="local_agent". So the skip must be greppable. But
+                # background shells are excluded ON PURPOSE and an agent may run
+                # dozens, and this is the same Argo log `_settle` was narrowed to
+                # keep readable. De-duplicating keeps the signal (a type nobody
+                # has seen before shows up) without the spam.
+                self._warned_types.add(message.task_type or "")
                 print(
                     f"warn: not awaiting task {message.task_id} of untracked "
                     f"type {message.task_type!r}"
@@ -226,28 +230,39 @@ async def drain_until_settled(
     from claude_agent_sdk import ResultMessage  # deferred — see module docstring
 
     ledger.draining = True
+
+    # PHASE 1, bounded by timeout_s: wait for the delegated child to go
+    # quiescent. This is the only thing the sub-deadline was ever meant to
+    # bound, and it is still how options.py documents it.
+    settled = False
     with anyio.move_on_after(timeout_s):
         async for message in stream:
             on_message(message)
             ledger.observe(message)
-            # Stop at a RESULT FRAME WITH NOTHING IN FLIGHT -- the same
-            # condition the SDK itself uses to close stdin -- not at the moment
-            # the child settles. Those are different instants: a task
-            # completing WAKES the parent for a follow-up turn, so returning on
-            # an empty ledger abandons whatever the parent does after
-            # delegating. For the implementer's review-feedback prompt that is
-            # steps 2-4, the commit among them, which is the very loss
-            # mctl-agents#366 is about -- just moved one actor along.
-            if isinstance(message, ResultMessage) and not ledger.live:
-                return
-    # Past the deadline, or the stream ended. Raise ONLY if something is still
-    # live: a settled ledger means nothing is outstanding and everything the
-    # child produced is already in the worktree, even if the parent never
-    # emitted its closing frame. Widening the stop condition above must not
-    # turn runs that used to succeed into orphans.
-    if not ledger.live:
+            if not ledger.live:
+                settled = True
+                break
+    if ledger.live:
+        raise OrphanedSubagentError(
+            f"sub-agent task(s) never reported a terminal status within "
+            f"{timeout_s:g}s: {ledger.describe()}"
+        )
+    if not settled:
+        # The stream ended with nothing live. Nothing more is coming.
         return
-    raise OrphanedSubagentError(
-        f"sub-agent task(s) never reported a terminal status within "
-        f"{timeout_s:g}s: {ledger.describe()}"
-    )
+
+    # PHASE 2, bounded by the CALLER's outer budget, deliberately NOT by
+    # timeout_s: wait for the closing result frame. A settling child wakes the
+    # parent, and the parent's remaining steps are real work -- for the
+    # implementer's review-feedback prompt, the `git commit` itself. Letting the
+    # sub-deadline run on into that would turn it into a budget for productive
+    # work and, worse, expire silently: the ledger is empty, so there is no
+    # orphan to report, and the run would fall through to an empty `git log` and
+    # a charged exit 42. The sub-deadline exists for classification, not for
+    # capping how long a commit may take; the outer wall-clock bound already
+    # covers the parent, and expiring THERE is a genuine operation timeout.
+    async for message in stream:
+        on_message(message)
+        ledger.observe(message)
+        if isinstance(message, ResultMessage) and not ledger.live:
+            return

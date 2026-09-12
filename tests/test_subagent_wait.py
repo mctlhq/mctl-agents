@@ -163,12 +163,11 @@ def test_drain_returns_at_the_result_frame_not_when_the_child_settles() -> None:
     assert len(seen) == 3, "drain stopped before the parent's closing frame"
 
 
-def test_drain_does_not_orphan_when_the_closing_frame_never_comes() -> None:
+def test_drain_does_not_orphan_when_the_stream_ends_after_the_child_settles() -> None:
     """Widening the stop condition must not turn successes into orphans.
 
-    If the parent never emits its closing frame, everything the child produced
-    is still in the worktree and nothing is outstanding — so a settled ledger
-    at the deadline or at stream exhaustion is a clean finish, not an orphan.
+    The stream ending with nothing live means the CLI exited; everything the
+    child produced is already in the worktree, so this is a clean finish.
     """
     ledger = LiveTaskLedger()
     ledger.observe(started("t1"))
@@ -182,18 +181,37 @@ def test_drain_does_not_orphan_when_the_closing_frame_never_comes() -> None:
         )
     )
 
-    ledger2 = LiveTaskLedger()
-    ledger2.observe(started("t1"))
 
-    async def goes_quiet():
+def test_the_sub_deadline_bounds_the_child_not_the_parents_work() -> None:
+    """`timeout_s` bounds phase 1 only — waiting for the child to go quiescent.
+
+    Once the child settles, the parent wakes and does real work (for the
+    review-feedback prompt, the `git commit` itself). Letting the sub-deadline
+    run on into that would make it a budget for productive work AND expire
+    silently: the ledger is empty, so there is no orphan to report, and the run
+    would fall through to an empty `git log` and a charged exit 42. The caller's
+    outer bound governs there instead.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def slow_parent():
         yield updated("t1", "completed")
-        await anyio.sleep(10)
+        await anyio.sleep(5)      # the parent, working
+        yield result_message()
 
-    anyio.run(
-        lambda: drain_until_settled(
-            goes_quiet(), ledger2, timeout_s=0.05, on_message=lambda _m: None,
-        )
-    )
+    async def run() -> str:
+        # A tiny sub-deadline must NOT cut the parent off; the outer bound must.
+        with anyio.move_on_after(0.2):
+            await drain_until_settled(
+                slow_parent(), ledger, timeout_s=0.05,
+                on_message=lambda _m: None,
+            )
+            return "returned"
+        return "outer bound fired"
+
+    assert anyio.run(run) == "outer bound fired"
+    assert ledger.live == set(), "no orphan: the child had already settled"
 
 
 def test_drain_raises_when_stream_ends_with_live_task() -> None:
@@ -306,3 +324,21 @@ def test_drain_rejects_a_non_positive_timeout() -> None:
                 stream(), ledger, timeout_s=0, on_message=lambda _m: None,
             )
         )
+
+
+def test_untracked_type_warns_once_per_type_not_once_per_task(capsys) -> None:
+    """Keep the signal, drop the spam.
+
+    Background shells are excluded on purpose and an agent may run dozens; this
+    is the same Argo log `_settle` was narrowed to keep readable. A type nobody
+    has seen before must still show up.
+    """
+    ledger = LiveTaskLedger()
+    for i in range(5):
+        ledger.observe(started(f"sh{i}", task_type="bash"))
+    ledger.observe(started("x1", task_type="remote_agent"))
+    out = capsys.readouterr().out
+
+    assert out.count("of untracked type 'bash'") == 1
+    assert "remote_agent" in out
+    assert ledger.live == set()

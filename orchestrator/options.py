@@ -59,8 +59,6 @@ def _mctl_tool_globs() -> list[str]:
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
-SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
-MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 def _positive_seconds(name: str, *, default: float) -> float:
     """Read a wall-clock env var, falling back loudly on a non-positive value.
 
@@ -95,6 +93,8 @@ def _positive_seconds(name: str, *, default: float) -> float:
     return value
 
 
+SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
+MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # Tier 2 implementer budget — soft cap per single proposal implementation.
 # A proposal touching one or two files usually finishes well under this.
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
