@@ -27,6 +27,13 @@ subprocess alive for exactly this case. `claude_agent_sdk._internal.query`:
     `build_implementer_agent_options` passes `hooks=_command_audit_hooks()`, so
     the implementer qualifies.
 
+    Read `sdk_mcp_servers` carefully before relying on it: `_internal/client.py`
+    lifts an entry into it ONLY when its config says `type: "sdk"`, and this
+    repo's `mctl_mcp_config()` emits `type: "http"`. So a non-empty
+    `mcp_servers` does NOT satisfy the precondition -- `hooks` is the whole of
+    it for every driver here. Strip the audit hooks from a driver and its
+    delegated children stop being awaitable, silently.
+
 Hence AWAITED_TASK_TYPES below must stay identical to the SDK's own
 DEFERRING_TASK_TYPES: awaiting a task type the SDK does not track would mean the
 SDK closes stdin at the first result, the CLI exits, our stream ends -- and we

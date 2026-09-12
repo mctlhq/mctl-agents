@@ -267,6 +267,16 @@ def test_implementer_keeps_hooks_which_is_what_holds_stdin_open(tmp_path, monkey
     hooks and the CLI would exit at the first result, so awaiting the sub-agent
     would block on a dead child instead of recovering its commit.
     """
-    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    monkeypatch.setenv("MCTL_TOKEN", "t")
     built = options.build_implementer_agent_options(tmp_path, "claude-sonnet-5")
     assert built.hooks
+    # And it must be the HOOKS carrying it, not the MCP config: the SDK lifts a
+    # server into `sdk_mcp_servers` only when its config says `type: "sdk"`, and
+    # mctl_mcp_config() emits `type: "http"`. Asserting this keeps the test from
+    # passing for the wrong reason, and makes it demand an update the day an
+    # sdk-type server does appear.
+    assert built.mcp_servers, "expected the http mctl server to be configured"
+    assert not [
+        name for name, cfg in built.mcp_servers.items()
+        if isinstance(cfg, dict) and cfg.get("type") == "sdk"
+    ]
