@@ -69,6 +69,15 @@ IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 IMPLEMENTER_TIMEOUT_SECONDS = float(
     os.getenv("IMPLEMENTER_TIMEOUT_SECONDS", "900")
 )
+# Sub-deadline for awaiting a sub-agent the CLI launched asynchronously, nested
+# inside IMPLEMENTER_TIMEOUT_SECONDS above (mctl-agents#366). Not needed for
+# liveness -- the outer bound already provides that -- but for classification: a
+# wedged child that ate the whole remaining budget would surface as a plain
+# operation timeout, which the shepherd charges to the proposal's review-attempt
+# budget, which is the very bug #366 is about. See orchestrator/subagent_wait.py.
+IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = float(
+    os.getenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", "300")
+)
 # Bound every synchronous git/gh command as well.  The model-stream timeout
 # above cannot interrupt a clone, fetch, or push that has stalled before or
 # after the SDK call.

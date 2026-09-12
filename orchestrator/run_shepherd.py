@@ -442,6 +442,32 @@ def _service_mode(service: str, *, force_fix_only: bool = False) -> str:
     return FIX_ONLY if service in NEVER_MERGE_SERVICES else FULL
 
 
+def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
+    """Return ``(deterministic, harness)`` implementer follow-up exit codes.
+
+    A function rather than two module-level constants because ``run_implementer``
+    must stay a deferred import: it pulls in the Claude agent SDK, which the
+    Temporal worker deliberately does not load (#149, guarded by
+    tests/test_worker_isolation.py). Tests call this directly so the
+    classification is asserted explicitly rather than inferred from which set a
+    code happens to be missing from.
+
+    - deterministic: the implementer did its job and the answer is no. Re-running
+      reproduces it, so these consume a ``MAX_REVIEW_ATTEMPTS`` slot.
+    - harness: our own plumbing lost the work before the agent could finish
+      (mctl-agents#366). The proposal is blameless — never charge it an attempt.
+    """
+    from orchestrator import run_implementer  # deferred — see apply_followup
+
+    deterministic = frozenset({
+        run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
+        run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+        run_implementer.EXIT_OPERATION_TIMEOUT,
+    })
+    harness = frozenset({run_implementer.EXIT_ORPHANED_SUBAGENT})
+    return deterministic, harness
+
+
 class FollowupSubprocessError(RuntimeError):
     """Raised when ``apply_followup`` cannot push a new commit.
 
@@ -456,11 +482,26 @@ class FollowupSubprocessError(RuntimeError):
     that raise without specifying — they are assumed safe-to-retry.
     Deterministic failures are surfaced via sentinel exit codes from
     ``run_implementer`` (see ``run_implementer._review_feedback_exit_code``).
+
+    ``kind`` labels *why* without adding a third decision state. There are only
+    two behaviours — charge an attempt or don't — and a harness failure
+    (mctl-agents#366: our own orchestration lost the agent's work) wants exactly
+    the existing non-charging one. But "don't charge" must not be reachable by
+    omission from ``deterministic_codes``, so the label carries the intent
+    explicitly, drives a distinct operator-facing log line, and is directly
+    assertable in tests. Values: ``"transient" | "deterministic" | "harness"``.
     """
 
-    def __init__(self, message: str, *, transient: bool = True) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        transient: bool = True,
+        kind: str = "transient",
+    ) -> None:
         super().__init__(message)
         self.transient = transient
+        self.kind = kind
 
 
 # ---------------------------------------------------------------------------
@@ -1590,19 +1631,23 @@ def apply_followup(
         # The implementer encodes the kind of failure via sentinel exit
         # codes (`run_implementer.EXIT_NO_FOLLOWUP_COMMITS` = 42,
         # `EXIT_BRANCH_MISSING_ON_ORIGIN` = 43,
-        # `EXIT_OPERATION_TIMEOUT` = 44). Anything else (1, 137, 2, ...)
-        # is treated as transient — we cannot tell the kind from the code
-        # alone.
-        deterministic_codes = {
-            run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
-            run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
-            run_implementer.EXIT_OPERATION_TIMEOUT,
-        }
-        is_transient = proc.returncode not in deterministic_codes
+        # `EXIT_OPERATION_TIMEOUT` = 44). `EXIT_ORPHANED_SUBAGENT` = 46 is
+        # the third kind: our own handoff lost the agent's work, so it is
+        # retried like a transient but named distinctly (mctl-agents#366).
+        # Anything else (1, 137, 2, ...) is treated as transient — we
+        # cannot tell the kind from the code alone.
+        deterministic_codes, harness_codes = _followup_code_sets()
+        if proc.returncode in harness_codes:
+            kind, is_transient = "harness", True
+        elif proc.returncode in deterministic_codes:
+            kind, is_transient = "deterministic", False
+        else:
+            kind, is_transient = "transient", True
         raise FollowupSubprocessError(
             f"implementer follow-up exited non-zero "
             f"({proc.returncode}) for {service}/{slug}",
             transient=is_transient,
+            kind=kind,
         )
     return bundle
 
@@ -1836,6 +1881,22 @@ def process_one(
                 state_dir=state_dir,
             )
         except FollowupSubprocessError as e:
+            if e.kind == "harness":
+                # The implementer never got its attempt — our own orchestration
+                # dropped the work (mctl-agents#366). Same behaviour as a
+                # transient failure, but named so the operator can tell a
+                # platform bug from a flaky push in the run log.
+                print(
+                    f"warn: {ref.service}/{ref.slug}: harness failure — not "
+                    f"charging a review attempt ({e}); leaving "
+                    f"review_attempts={ref.review_attempts} and "
+                    f"status={ref.status} for retry next tick"
+                )
+                return ShepherdResult(
+                    ref=ref,
+                    decision="wait",
+                    notes="harness failure (orphaned sub-agent); will retry next tick",
+                )
             if e.transient:
                 print(
                     f"warn: {ref.service}/{ref.slug}: follow-up subprocess "
