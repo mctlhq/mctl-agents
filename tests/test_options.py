@@ -148,6 +148,14 @@ def test_build_issue_investigator_options_from_plan_matches_legacy_builder(tmp_p
     assert declarative.max_budget_usd == legacy.max_budget_usd
     assert declarative.add_dirs == legacy.add_dirs
     assert declarative.env == legacy.env
+    # hooks too: build_issue_investigator_options_from_plan's docstring lists it
+    # among the structural fields "the equivalence tests in tests/test_options.py
+    # assert this directly", and it was the one field that claim did not cover.
+    # It is also load-bearing, not cosmetic — hooks are what make the SDK hold
+    # the CLI open past a result frame (mctl-agents#366), so dropping them from
+    # the declarative builder alone would turn every delegating investigation in
+    # that mode into a stream that ends with a live task.
+    assert declarative.hooks == legacy.hooks
 
 
 def test_build_issue_investigator_options_from_plan_omits_mctl_tools_without_token(tmp_path, monkeypatch):

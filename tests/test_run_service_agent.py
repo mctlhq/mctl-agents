@@ -15,15 +15,16 @@ import types
 
 import anyio
 import pytest
-from claude_agent_sdk import (
-    ResultMessage,
-    TaskNotificationMessage,
-    TaskStartedMessage,
-    TaskUpdatedMessage,
-)
+from claude_agent_sdk import TaskUpdatedMessage
 
 from orchestrator import run_service_agent as rsa
-from tests.conftest import fake_mcp_client_factory
+from tests.conftest import (
+    fake_mcp_client_factory,
+    result_message,
+    task_notification_message,
+    task_started_message,
+    task_updated_message,
+)
 
 
 def _stub_build_options(monkeypatch, *, mcp_servers):
@@ -108,28 +109,6 @@ def _streaming_factory(messages):
     return _factory
 
 
-def _task_started(task_id="t1", task_type="local_agent"):
-    return TaskStartedMessage(
-        subtype="task_started", data={}, task_id=task_id,
-        description="research deps", uuid="u", session_id="s",
-        task_type=task_type,
-    )
-
-
-def _task_updated(task_id="t1", status="completed"):
-    return TaskUpdatedMessage(
-        subtype="task_updated", data={}, task_id=task_id,
-        patch={"status": status}, status=status,
-    )
-
-
-def _result():
-    return ResultMessage(
-        subtype="success", duration_ms=1, duration_api_ms=0, is_error=False,
-        num_turns=4, session_id="s", total_cost_usd=0.1,
-    )
-
-
 def test_service_agent_waits_for_async_launched_subagent(monkeypatch):
     """The headline regression: fails without the drain.
 
@@ -140,7 +119,7 @@ def test_service_agent_waits_for_async_launched_subagent(monkeypatch):
     consumed: list[object] = []
 
     async def messages():
-        for message in (_task_started(), _result(), _task_updated()):
+        for message in (task_started_message(), result_message(), task_updated_message()):
             consumed.append(message)
             yield message
 
@@ -160,7 +139,7 @@ def test_service_agent_returns_immediately_when_no_tasks_are_live(monkeypatch):
     consumed: list[object] = []
 
     async def messages():
-        for message in ("chatter", _result(), _task_updated()):
+        for message in ("chatter", result_message(), task_updated_message()):
             consumed.append(message)
             yield message
 
@@ -175,8 +154,8 @@ def test_service_agent_raises_orphaned_when_task_never_settles(monkeypatch):
     _stub_build_options(monkeypatch, mcp_servers={})
 
     async def messages():
-        yield _task_started()
-        yield _result()
+        yield task_started_message()
+        yield result_message()
         await anyio.sleep(10)
 
     monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
@@ -191,8 +170,8 @@ def test_service_agent_raises_orphaned_when_stream_ends_with_live_task(monkeypat
     _stub_build_options(monkeypatch, mcp_servers={})
 
     async def messages():
-        yield _task_started()
-        yield _result()
+        yield task_started_message()
+        yield result_message()
 
     monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
@@ -210,12 +189,9 @@ def test_service_agent_does_not_orphan_on_failed_terminal_status(monkeypatch, ca
     _stub_build_options(monkeypatch, mcp_servers={})
 
     async def messages():
-        yield _task_started()
-        yield _result()
-        yield TaskNotificationMessage(
-            subtype="task_notification", data={}, task_id="t1", status="failed",
-            output_file="/dev/null", summary="boom", uuid="u", session_id="s",
-        )
+        yield task_started_message()
+        yield result_message()
+        yield task_notification_message(status="failed", summary="boom")
 
     monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)

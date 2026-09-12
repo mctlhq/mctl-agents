@@ -1325,6 +1325,37 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
             await ensure_mctl_connected(client, fatal=False)
         await client.query(prompt)
         ledger = LiveTaskLedger()
+
+        def _note(message: Any) -> None:
+            """Print one message, and re-apply the rate-limit verdict to it.
+
+            The CLI's final message for a run that never got a completion —
+            e.g. the account's five_hour/seven_day usage limit was already
+            exhausted — is a ResultMessage with is_error=True and
+            api_error_status=429 (emitted since CLI v2.1.110), NOT a raised
+            exception. Surface it as one so the except-clause plumbing in
+            investigate() below can tell it apart from an agent/tooling failure.
+
+            Used as `on_message` for the drain as well as in the turn loop, so
+            the verdict is applied to EVERY result frame rather than only the
+            first. When a delegated child settles the SDK wakes the parent for
+            a follow-up turn, and a limit hit while that turn writes the
+            triplet would otherwise be lost: the drain returns as soon as the
+            ledger empties, `_run_agent` returns normally, and investigate()
+            reports "no triplet" with `rate_limited=False` — so the account-2
+            fallback that exists for exactly this case is never taken.
+            """
+            print(message)
+            if (
+                isinstance(message, ResultMessage)
+                and message.is_error
+                and message.api_error_status == 429
+            ):
+                raise RateLimitExhaustedError(
+                    f"SDK reported api_error_status=429 (rate/usage limit "
+                    f"exhausted): {message.result!r}"
+                )
+
         # receive_messages(), NOT receive_response(): the latter returns at the
         # first ResultMessage, and a ResultMessage ends one TURN, not the RUN.
         # When the CLI launches a sub-agent asynchronously the top-level
@@ -1341,26 +1372,14 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
         stream = cast("AsyncGenerator[Any, None]", client.receive_messages())
         async with aclosing(stream):
             async for message in stream:
-                print(message)
+                # _note raises on a 429 verdict before the drain is reached: an
+                # out-of-quota account has no live child to wait for, and the
+                # quota verdict is the one the caller must act on.
+                _note(message)
                 ledger.observe(message)
                 # Also stop on stream exhaustion (the `async for` ending on its
                 # own): that means the CLI exited.
                 if isinstance(message, ResultMessage):
-                    # The CLI's final message for a run that never got a
-                    # completion — e.g. the account's five_hour/seven_day usage
-                    # limit was already exhausted before the first turn — is a
-                    # ResultMessage with is_error=True and api_error_status=429
-                    # (emitted since CLI v2.1.110), NOT a raised exception.
-                    # Surface it as one here so the normal except-clause
-                    # plumbing in investigate() below can tell it apart from an
-                    # agent/tooling failure. Checked before the drain: an
-                    # out-of-quota account has no live child to wait for, and
-                    # the quota verdict is the one the caller must act on.
-                    if message.is_error and message.api_error_status == 429:
-                        raise RateLimitExhaustedError(
-                            f"SDK reported api_error_status=429 (rate/usage "
-                            f"limit exhausted): {message.result!r}"
-                        )
                     break
             if ledger.live:
                 print(
@@ -1372,6 +1391,7 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
                         stream,
                         ledger,
                         timeout_s=ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS,
+                        on_message=_note,
                     )
                 except OrphanedSubagentError as exc:
                     raise InvestigatorOrphanedSubagent(

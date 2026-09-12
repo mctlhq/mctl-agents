@@ -41,6 +41,7 @@ class ServiceAgentOrphanedSubagent(OrphanedSubagentError):
     without tearing down the sibling agents in the same task group.
     """
 
+
 PROMPT = """\
 **Output language: English only. Write every artifact (inbox, proposals, summary report) in English. Do not switch languages even if context/ files contain non-English text.**
 

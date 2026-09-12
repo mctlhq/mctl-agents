@@ -19,7 +19,7 @@ from pathlib import Path
 import anyio
 import pytest
 import yaml
-from claude_agent_sdk import ResultMessage
+from claude_agent_sdk import ResultMessage, TaskUpdatedMessage
 
 from orchestrator import run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
@@ -42,7 +42,12 @@ from orchestrator.run_issue_investigator import (
     try_parse_issue_url,
     write_status_yaml,
 )
-from tests.conftest import fake_mcp_client_factory
+from tests.conftest import (
+    fake_mcp_client_factory,
+    task_notification_message,
+    task_started_message,
+    task_updated_message,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3211,32 +3216,6 @@ def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
 # into a wait for a process nobody is keeping alive, so that precondition is
 # pinned once for every builder in tests/test_options.py rather than here.
 # ---------------------------------------------------------------------------
-from claude_agent_sdk import (  # noqa: E402 — grouped with the tests that use them
-    TaskNotificationMessage,
-    TaskStartedMessage,
-    TaskUpdatedMessage,
-)
-
-from orchestrator.run_issue_investigator import (  # noqa: E402
-    InvestigatorOrphanedSubagent,
-)
-
-
-def _task_started(task_id="t1", task_type="local_agent"):
-    return TaskStartedMessage(
-        subtype="task_started", data={}, task_id=task_id,
-        description="write the triplet", uuid="u", session_id="s",
-        task_type=task_type,
-    )
-
-
-def _task_updated(task_id="t1", status="completed"):
-    return TaskUpdatedMessage(
-        subtype="task_updated", data={}, task_id=task_id,
-        patch={"status": status}, status=status,
-    )
-
-
 def _ok_result():
     return _result_message(is_error=False, api_error_status=None)
 
@@ -3250,7 +3229,7 @@ def test_investigator_waits_for_async_launched_subagent(tmp_path, monkeypatch):
     consumed: list[object] = []
 
     async def messages():
-        for message in (_task_started(), _ok_result(), _task_updated()):
+        for message in (task_started_message(), _ok_result(), task_updated_message()):
             consumed.append(message)
             yield message
 
@@ -3273,7 +3252,7 @@ def test_investigator_returns_immediately_when_no_tasks_are_live(tmp_path, monke
     consumed: list[object] = []
 
     async def messages():
-        for message in ("chatter", _ok_result(), _task_updated()):
+        for message in ("chatter", _ok_result(), task_updated_message()):
             consumed.append(message)
             yield message
 
@@ -3288,7 +3267,7 @@ def test_investigator_returns_immediately_when_no_tasks_are_live(tmp_path, monke
 
 def test_investigator_raises_orphaned_when_task_never_settles(tmp_path, monkeypatch):
     async def messages():
-        yield _task_started()
+        yield task_started_message()
         yield _ok_result()
         await anyio.sleep(10)
 
@@ -3299,14 +3278,14 @@ def test_investigator_raises_orphaned_when_task_never_settles(tmp_path, monkeypa
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 0.05
     )
 
-    with pytest.raises(InvestigatorOrphanedSubagent, match=r"orphaned sub-agent:"):
+    with pytest.raises(run_issue_investigator.InvestigatorOrphanedSubagent, match=r"orphaned sub-agent:"):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
 
 
 def test_investigator_raises_orphaned_when_stream_ends_with_live_task(tmp_path, monkeypatch):
     """The CLI exited while the child was still live."""
     async def messages():
-        yield _task_started()
+        yield task_started_message()
         yield _ok_result()
 
     monkeypatch.setattr(
@@ -3316,19 +3295,16 @@ def test_investigator_raises_orphaned_when_stream_ends_with_live_task(tmp_path, 
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
     )
 
-    with pytest.raises(InvestigatorOrphanedSubagent):
+    with pytest.raises(run_issue_investigator.InvestigatorOrphanedSubagent):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
 
 
 def test_investigator_does_not_orphan_on_failed_terminal_status(tmp_path, monkeypatch, capsys):
     """A failed child is quiescent, not orphaned — warn, do not raise."""
     async def messages():
-        yield _task_started()
+        yield task_started_message()
         yield _ok_result()
-        yield TaskNotificationMessage(
-            subtype="task_notification", data={}, task_id="t1", status="failed",
-            output_file="/dev/null", summary="boom", uuid="u", session_id="s",
-        )
+        yield task_notification_message(status="failed", summary="boom")
 
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
@@ -3347,7 +3323,7 @@ def test_investigator_rate_limit_still_wins_over_the_drain(tmp_path, monkeypatch
     """A 429 result must still raise RateLimitExhaustedError, not be masked by
     a drain for a child an out-of-quota account never actually ran."""
     async def messages():
-        yield _task_started()
+        yield task_started_message()
         yield _result_message(is_error=True, api_error_status=429)
 
     monkeypatch.setattr(
@@ -3369,7 +3345,7 @@ def test_investigator_orphan_surfaces_as_a_named_harness_failure(tmp_path, monke
     issue" when what happened is that the platform threw the child's work away.
     """
     def orphaning_agent(repo_dir, prompt, proposal_dir):
-        raise InvestigatorOrphanedSubagent(
+        raise run_issue_investigator.InvestigatorOrphanedSubagent(
             "orphaned sub-agent: sub-agent task(s) never reported a terminal "
             "status within 300s: 1 task(s) still live: t1"
         )
@@ -3381,3 +3357,57 @@ def test_investigator_orphan_surfaces_as_a_named_harness_failure(tmp_path, monke
     assert "harness failure" in result.error
     assert "still live" in result.error
     assert result.rate_limited is False
+
+
+def test_investigator_classifies_a_rate_limit_seen_during_the_drain(tmp_path, monkeypatch):
+    """A 429 arriving while a delegated child is still live must be classified
+    (claude P3 on #368).
+
+    Before `on_message=_note`, the drain read with a bare `print` and nothing
+    re-applied the rate-limit predicate to frames seen after the first result.
+    A limit hit here returned normally, investigate() failed the triplet check,
+    and the result said `rate_limited=False` — so an operator (or the account-2
+    fallback) read "agent produced no triplet" instead of "this account is out
+    of quota", and the retry that exists for exactly this case was not taken.
+
+    KNOWN RESIDUAL, deliberately not covered here: if the child reaches a
+    terminal status FIRST and the 429 lands on the parent's follow-up turn
+    after that, `drain_until_settled` has already returned — it stops the
+    instant `ledger.live` empties — so no `on_message` can see that frame.
+    Closing it needs the shared helper to keep reading to the next result
+    frame, which is orchestrator/subagent_wait.py in #367 and is depended on by
+    the implementer; it is escalated rather than changed from this branch.
+    """
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+        # Still live: the parent emits its limit verdict before the child
+        # settles, which is the ordering on_message can actually observe.
+        yield _result_message(is_error=True, api_error_status=429)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_rate_limit_reaches_investigate_as_rate_limited(tmp_path, monkeypatch):
+    """And it must arrive as rate_limited=True, not as a generic failure.
+
+    The classification is the whole point of the finding: `rate_limited` is the
+    one structured flag callers branch on to tell "this account is out of
+    quota" apart from "the agent broke on this issue".
+    """
+    def rate_limited_agent(repo_dir, prompt, proposal_dir):
+        raise RateLimitExhaustedError("SDK reported api_error_status=429")
+
+    issue = _investigate_harness(tmp_path, monkeypatch, agent=rate_limited_agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.rate_limited is True
+    assert result.error is not None and "429" in result.error
