@@ -22,6 +22,7 @@ import yaml
 from claude_agent_sdk import ResultMessage
 
 from orchestrator import run_issue_investigator
+from orchestrator.proposal_state import unrunnable_reason
 from orchestrator.run_implementer import (
     ProposalRef,
     _issue_closing_line,
@@ -212,6 +213,21 @@ def test_write_status_yaml_shape(tmp_path):
         "url": "https://github.com/mctlhq/mctl-telegram/issues/123",
     }
     assert data["control"]["requires_human_approval"] is True
+
+
+def test_write_status_yaml_never_publishes_an_unrunnable_proposal(tmp_path):
+    # `write_status_yaml` publishes `proposed` with `requires_human_approval:
+    # True` and no `approval` block -- the exact shape that would be
+    # permanently unrunnable if it were ever published as `accepted`
+    # (mctl-agents#349). It never is: `unrunnable_reason` only fires for
+    # `status == accepted`, and the investigator always publishes
+    # `proposed`. This is a regression guard on that invariant, not a
+    # statement that this function does anything new.
+    proposal_dir = tmp_path / "proposals" / "issue-123-add-monitoring"
+    status_path = write_status_yaml(proposal_dir, _issue())
+
+    data = yaml.safe_load(status_path.read_text())
+    assert unrunnable_reason(data) is None
 
 
 # ---------------------------------------------------------------------------

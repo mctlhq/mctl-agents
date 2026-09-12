@@ -42,6 +42,25 @@ def test_result_without_outcome_is_failure() -> None:
     assert run_implementer._batch_outcome([result]).failed == 1
 
 
+def test_blocked_result_is_counted_separately_from_skipped() -> None:
+    # A blocked result also carries `skipped_reason` (for consumers of that
+    # older channel alone), so `_batch_outcome` must classify it as
+    # `blocked` before it ever reaches the `skipped_reason` branch.
+    blocked = run_implementer.ImplementResult(
+        ref=_ref("blocked"),
+        pr_url=None,
+        blocked=run_implementer.BLOCKED_APPROVAL_MISSING,
+        skipped_reason="requires_human_approval is set but no verified approval is recorded",
+        counts_toward_limit=False,
+    )
+
+    outcome = run_implementer._batch_outcome([blocked])
+
+    assert outcome == run_implementer.BatchOutcome(
+        succeeded=0, failed=0, skipped=0, blocked=1
+    )
+
+
 def test_explicit_skip_takes_precedence_over_pr_url() -> None:
     result = run_implementer.ImplementResult(
         ref=_ref("closed-pr"),
