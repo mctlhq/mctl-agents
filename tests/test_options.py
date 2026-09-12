@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from orchestrator import options, resolver
 
 
@@ -381,3 +383,31 @@ def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
         finally:
             monkeypatch.delenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", raising=False)
             importlib.reload(options)
+
+
+def test_the_other_two_drain_timeouts_default_to_five_minutes():
+    """Same sub-deadline, same default, for the two drivers #368 converted."""
+    assert options.SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS == 300.0
+    assert options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS == 300.0
+
+
+@pytest.mark.parametrize(
+    "name", ["SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", "ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS"]
+)
+def test_the_other_two_drain_timeouts_honour_their_env_overrides(monkeypatch, name):
+    """Pins the env-var NAME, which the driver tests cannot.
+
+    They monkeypatch the module attribute, so the value is exercised but the
+    `os.getenv` string never is. A typo there would be silent in exactly the
+    worst way: the knob documents itself as tunable while doing nothing, and
+    you find out when you raise it during an incident and nothing changes.
+    """
+    import importlib
+
+    monkeypatch.setenv(name, "42")
+    reloaded = importlib.reload(options)
+    try:
+        assert getattr(reloaded, name) == 42.0
+    finally:
+        monkeypatch.delenv(name, raising=False)
+        importlib.reload(options)
