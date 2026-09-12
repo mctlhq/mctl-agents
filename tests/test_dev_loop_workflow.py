@@ -1757,19 +1757,37 @@ class TestDevLoopWorkflow:
             f"the same head was re-sent: {[v[:2] for v in versions]}"
         )
 
-    async def test_an_unreadable_state_on_progress_also_drops_the_claim(self, env):
-        """The progress arm had the heartbeat's defect and the heartbeat's fix
-        did not reach it.
+    async def test_an_unreadable_state_on_progress_backs_off_without_dropping_the_claim(self, env):
+        """A progress write that comes back in a state this image cannot read
+        must not advance the head, must back off, and must NOT decide on its
+        own that the claim is gone.
 
-        A 2xx on /ownership/progress carrying a state this image cannot
-        classify took the landed-write arm: it advanced the head, zeroed BOTH
-        counters, and returned in silence. The reset is the live part — the
-        give-up needs three heartbeats and the heartbeat fires every fourth
-        poll, so a remediation loop that pushes at least once every ~6h zeroed
-        the counter before it could reach the limit. The claim was then held
-        indefinitely, and invisibly, against a row another actor may hold in a
-        state this loop cannot read — in the case where a collision matters
-        most, because the loop is actively working.
+        `verdict_for` classifies against two CLOSED sets and answers UNKNOWN
+        rather than guessing, because this container lags mctl-api by a
+        release. The head therefore must not advance — the row may be held by
+        somebody else in that state, so the evidence has to be re-sent rather
+        than treated as recorded — and `_unknown_progress` has to count it, or
+        the re-send happens once per poll forever.
+
+        What it must NOT do is drive the give-up. An earlier version
+        incremented `_unknown_heartbeats` here and returned, which inverted the
+        constant: that counter is documented as three HEARTBEATS, about six
+        hours and inside the 10h liveness bound, and this arm runs once per
+        POLL — so the limit was reached in three polls, about ninety minutes,
+        and the claim was dropped four times sooner than the bound it precedes.
+        (Found by agy, not by this suite.)
+
+        This test therefore pins the fall-through, not the arm: the arm is now
+        a log line, and deleting it leaves this green. What it cannot be
+        deleted from is the body-less arm below, which must keep requiring an
+        empty state or an unreadable record advances the head after all.
+
+        Falling through keeps the arithmetic honest, and it also gives the
+        right answer here: /acquire still says the row is ours, so the claim
+        stands. The case where the row really has moved is covered by
+        test_a_state_this_image_cannot_read_still_drops_the_claim, where the
+        heartbeat's own acquire answers the same way and counts at the
+        heartbeat cadence.
         """
         def _pr(sha: str) -> PRState:
             return PRState(
@@ -1777,14 +1795,9 @@ class TestDevLoopWorkflow:
                 number=MERGED_PR.number, state="OPEN", head_sha=sha,
             )
 
-        # A head that moves on the non-heartbeat polls, so the progress arm is
-        # the one being exercised and it is the one resetting the counter.
-        heads = []
-        for i in range(1, 30):
-            if i % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0 and heads:
-                heads.append(heads[-1])
-            else:
-                heads.append(_pr(chr(ord("a") + i) * 40))
+        # A head that moves on every poll, so every poll would issue a progress
+        # write if nothing throttled it.
+        heads = [_pr(f"{i:040d}") for i in range(1, 41)]
         _result, ops = await self._run_ownership_loop(
             env,
             pr_states=[*heads, MERGED_PR],
@@ -1794,8 +1807,27 @@ class TestDevLoopWorkflow:
         )
         progress = [o for o in ops if o.op == "progress"]
         assert progress, [o.op for o in ops]
-        assert any(o.epoch == 0 for o in ops[1:]), (
-            "progress in an unreadable state never dropped the claim: "
+        # Throttled by the SHARED fall-through at the end of the block, not by
+        # anything this arm does: `_backed_off` closes the gate once
+        # `_unknown_progress` passes the limit.
+        ceiling = (
+            LIFECYCLE_UNKNOWN_WRITE_LIMIT
+            + len(heads) // LIFECYCLE_HEARTBEAT_EVERY_POLLS
+            + 2
+        )
+        assert len(progress) <= ceiling, (
+            "an unreadable state on progress was re-sent every poll: "
+            f"{len(progress)} of {len(heads)} polls, ceiling {ceiling}"
+        )
+        # The head never advanced, so the evidence really is being re-sent
+        # rather than treated as recorded: every progress write carries the
+        # head of its own poll, and none of them is repeated.
+        assert len({o.version for o in progress}) == len(progress), (
+            f"the same head was re-sent: {[o.version[-3:] for o in progress]}"
+        )
+        # And the claim stands, because /acquire still says the row is ours.
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "the progress arm dropped a claim /acquire was still confirming: "
             f"{[(o.op, o.epoch) for o in ops]}"
         )
 
@@ -2052,6 +2084,43 @@ class TestDevLoopWorkflow:
         first_progress = kinds.index("progress")
         assert "acquire" in kinds[first_progress:], (
             f"a released row was never re-acquired: {kinds}"
+        )
+
+    async def test_a_released_row_re_acquires_even_while_the_head_keeps_moving(self, env):
+        """The dangerous half of the case above, which had no test — and whose
+        absence let an arm intercept UNOWNED silently.
+
+        `test_progress_against_a_released_row_re_acquires` lets the head stop
+        moving after poll 2, so the `acquire` its assertion finds is the
+        routine heartbeat rather than a recovery: any behaviour that keeps
+        heart-beating satisfies it. With the head moving on EVERY poll the
+        progress branch is entered every poll, so an arm that answers UNOWNED
+        and returns starves the heartbeat entirely.
+
+        That is the §5 recovery this epic is built on: the pod stalls past the
+        liveness bound, the reconciler force-releases the row, the pod resumes
+        pushing fixes. The loop must REACH the heartbeat at all: its acquire
+        is what re-establishes the claim, and under the defect no acquire
+        happens after the first progress for the rest of the watch.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*[_pr(chr(ord("a") + i) * 40) for i in range(1, 13)], MERGED_PR],
+            issue=934,
+            ownership_unowned_op="progress",
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        after = ops[first_progress:]
+        assert any(o.op == "acquire" for o in after), (
+            "the heartbeat was starved by the progress branch, so a released "
+            f"row was never re-acquired: {[(o.op, o.epoch) for o in ops]}"
         )
 
 

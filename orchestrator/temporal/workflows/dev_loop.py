@@ -1426,33 +1426,59 @@ class DevLoopWorkflow:
                 and result.state
             ):
                 # A record came back and its STATE is one this image does not
-                # recognise — the same shape the heartbeat block answers, and
-                # for two rounds this arm read it without the distinction.
+                # recognise — `verdict_for` classifies against two CLOSED sets
+                # and answers UNKNOWN rather than guessing, because this
+                # container lags mctl-api by a release.
                 #
-                # It must NOT advance the head and must NOT reset either
-                # counter. The reset was the live part: the give-up needs three
-                # heartbeats, the heartbeat fires every fourth poll, so a
-                # remediation loop that pushes at least once every ~6h zeroed
-                # the counter before it could reach the limit — and the claim
-                # was then held indefinitely, and invisibly, against a row
-                # another actor may hold in a state this loop cannot read.
-                # That is the very state the heartbeat split was added to
-                # remove, reached through the path it did not cover, in the
-                # case where a collision matters most: the loop is working.
-                self._unknown_heartbeats += 1
+                # This arm is a LOG, and nothing else. Deleting it leaves every
+                # test green, because the fall-through below produces exactly
+                # the behaviour it wants: the head is not advanced, so the
+                # evidence is re-sent rather than treated as recorded, and
+                # `_unknown_progress` closes the `_backed_off` gate so the
+                # re-sends drop to the heartbeat cadence. Said here rather than
+                # asserted, because a predicate no test can turn red is not a
+                # guard — and the reason to keep it is that an unrecognised
+                # state is otherwise completely silent on this path, while the
+                # heartbeat names it.
+                #
+                # Two earlier versions of this arm did have behaviour and both
+                # were wrong. The first advanced the head, which is the
+                # body-less arm's behaviour applied to a record that says
+                # somebody may hold the row. The second incremented
+                # `_unknown_heartbeats` and returned, which inverted the
+                # constant it counted into: that counter is three HEARTBEATS —
+                # about six hours, inside the 10h liveness bound — and this arm
+                # runs once per POLL, so the claim was dropped after three
+                # polls, about ninety minutes. (Found by agy, not by this
+                # suite.)
+                #
+                # Falling through also gives the right answer, not merely a
+                # safe one. If the row really has moved to a state this image
+                # cannot read, the heartbeat's own /acquire answers the same
+                # way and counts it at the heartbeat cadence, where the
+                # give-up's number means what it says. If only /progress is
+                # answering strangely while /acquire still says the row is
+                # ours, then it is ours and the claim should stand.
                 workflow.logger.warning(
                     "lifecycle: progress on %s#%s came back in state %r, which "
-                    "this image does not recognise — %d consecutive; the claim "
-                    "is dropped at %d",
-                    repo, number, result.state, self._unknown_heartbeats,
-                    LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
+                    "this image does not recognise — the head is not advanced "
+                    "and the evidence will be re-sent",
+                    repo, number, result.state,
                 )
-                self._give_up_claim_if_unanswered(repo, number)
-                return
-            if result is not None and result.accepted and result.verdict == UNKNOWN:
+            if (
+                result is not None
+                and result.accepted
+                and result.verdict == UNKNOWN
+                and not result.state
+            ):
                 # The write LANDED — mctl-api took it — and carried NO record
                 # at all (an empty state is the body-less 2xx), so the head
                 # must advance, and
+                #
+                # `not result.state` is explicit rather than implied by the arm
+                # above, which no longer returns: a record whose state this
+                # image cannot read must not fall out of that arm and into this
+                # one, where the head would advance after all.
                 # counting it as unanswered would be the opposite of what the
                 # gate is for.
                 #
@@ -1488,10 +1514,35 @@ class DevLoopWorkflow:
             ):
                 self._lose_claim(repo, number, result)
                 return
-            if result is not None and result.accepted:
+            if (
+                result is not None
+                and result.accepted
+                and result.verdict == OWNED_BY_OTHER
+            ):
                 # BELOW the guard above, deliberately: a real competitor can
                 # answer with `accepted` True too, and must still reach
                 # _lose_claim.
+                #
+                # And narrowed to OWNED_BY_OTHER, which is the only verdict
+                # this arm's reasoning covers. Gated on `accepted` alone it
+                # also caught UNOWNED — a 2xx carrying a RELEASED record has
+                # `accepted` True — and then did the opposite of what the
+                # fall-through below documents for exactly that verdict:
+                # it kept the claim, so the unclaimed re-acquire path stayed
+                # unreachable; advanced the head, so the progress signal was
+                # treated as recorded although it landed on a row this loop
+                # does not hold; and returned, so neither _backed_off nor the
+                # give-up could ever fire. The heartbeat block puts its UNOWNED
+                # arm ABOVE its accepted arm for this reason, and the two
+                # blocks then answered the same wire shape in opposite ways.
+                #
+                # The cost was the §5 recovery this epic is built on: the pod
+                # stalls past the liveness bound, the reconciler force-releases
+                # the row, the pod resumes pushing fixes, and because every
+                # poll moves the head every poll takes this arm and returns —
+                # the heartbeat is never reached, which is the starvation shape
+                # an earlier commit removed. A live worker and a zero-owner row
+                # is the #239 gap this PR closes, reached from inside it.
                 #
                 # What is left here is our OWN record read back unhealthy.
                 # `verdict_for` answers OWNED_BY_OTHER for an active row whose
