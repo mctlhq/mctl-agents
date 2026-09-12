@@ -7,7 +7,8 @@ Two transports, because there are two callers with different constraints:
   the same https pin and no-redirect opener ``run_shepherd`` already applies
   to its dev-loop probe.
 The Temporal side does NOT use this module. Activities talk to the same
-endpoints over httpx in ``orchestrator/temporal/activities/lifecycle.py``,
+endpoints over httpx in ``orchestrator/temporal/activities/lifecycle.py``
+(which lands with mctlhq/mctl-agents#362),
 because an activity is async and this client is not — and workflow code must
 never call either one: network I/O inside ``@workflow.defn`` breaks determinism
 and replay, which is the property this whole contract depends on (ADR-010 §9).
@@ -223,6 +224,17 @@ class OwnershipClient:
         policy_ref: str = "",
         temporal_workflow_id: str = "",
     ) -> OwnershipAnswer:
+        """Claim the entity phase, or learn who holds it.
+
+        The RECORD is the answer here, not the status. Only `release` and
+        `terminal` leave the entity unheld, so only their body-less 2xx is a
+        success that simply said nothing more; on every other route — this one
+        included — a 2xx with no record means the answer never arrived.
+        `answer_from` keys that off the request path, so this route answers
+        UNKNOWN rather than WROTE_NO_RECORD, which would be `blocks_others`
+        False: telling every other actor the entity is free while this one also
+        declines to act.
+        """
         return self._write(
             "/api/v1/lifecycle/ownership/acquire",
             entity,

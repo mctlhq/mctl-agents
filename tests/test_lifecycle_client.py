@@ -507,13 +507,18 @@ def test_a_200_carrying_the_record_is_a_successful_write(
 def test_a_409_naming_the_caller_is_not_owned_by_other(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The 409 branch was the last path producing a verdict without consulting
-    `verdict_for`, so a conflict reported about a row the caller already holds
-    made the loop stand down from work it owns."""
+    """A conflict reported about a row the caller already holds must not be
+    read as somebody else holding it — that made the loop give up work it owns.
+
+    It must not be read as a licence either. This test asserted OWNED_BY_ME and
+    `may_mutate True`, which is a refused write granting a mutation; the answer
+    to both is UNKNOWN, where the caller neither acts nor concludes it lost the
+    record, and asks again on the next tick."""
     payload = {"error": "conflict", "ownership": _owned_payload(ME)}
     answer = _client(monkeypatch, _http_error(409, payload)).acquire(ENTITY, PHASE, ME)
-    assert answer.verdict == OWNED_BY_ME
-    assert answer.may_mutate is True
+    assert answer.verdict != OWNED_BY_OTHER
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
 
 
 def test_handoff_start_refuses_an_empty_target(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -524,3 +529,277 @@ def test_handoff_start_refuses_an_empty_target(monkeypatch: pytest.MonkeyPatch) 
         _client(monkeypatch, _ok(_owned_payload(ME))).handoff_start(
             ENTITY, PHASE, ME, epoch=1, to=Owner(type="shepherd", id="")
         )
+
+
+# --- restored cover -----------------------------------------------------
+#
+# These three were deleted in 48e0dd3 alongside the tests that replaced the
+# ones it rewrote, but nothing replaced them: each was the only guard on a fix
+# from the two preceding commits, and reverting any of those fixes left the
+# suite green. The production code was and is correct; the cover was gone.
+
+
+def test_a_read_is_never_recorded_as_a_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`accepted` is about whether mctl-api wrote something, and a read never
+    did. Every other `.wrote` assertion in this file is on `release()`, so
+    without this one the read half of that distinction is unpinned."""
+    answer = _client(monkeypatch, _ok(_owned_payload(ME))).get(ENTITY, PHASE, asking=ME)
+    assert answer.wrote is False
+
+
+def test_404_on_a_read_without_an_error_envelope_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ingress rule that stopped matching, a wrong base path, or a proxy's
+    HTML page all produce a 404 with no readable envelope. Answering UNOWNED
+    there frees EVERY entity asked — the write half of this was fixed first,
+    and the read half frees more.
+
+    This is the module's only fail-open branch, and both surviving 404 tests
+    carry an error envelope, so nothing else reaches it."""
+    handler = lambda req: (_ for _ in ()).throw(  # noqa: E731
+        urllib.error.HTTPError(req.full_url, 404, "err", {}, io.BytesIO(b"<html>404</html>"))
+    )
+    answer = _client(monkeypatch, handler).get(ENTITY, PHASE, asking=ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.blocks_others is True
+
+
+def test_the_sweep_reports_an_unrecognised_state_with_a_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_get_chunk` was the one path still classifying for itself, so every
+    reason-string and state fix made elsewhere stopped at the sweep's door.
+
+    No other batch fixture uses a non-`active` state, so without this the
+    routing through `answer_from` can be reverted with the suite still green."""
+    rec = _owned_payload(OTHER)
+    rec["state"] = "quarantined"
+    out = _client(monkeypatch, _ok({"ownership": {"mctlhq/a#1": rec}, "count": 1})).get_many(
+        ENTITY.kind, PHASE, ["mctlhq/a#1"], asking=ME
+    )
+    answer = out["mctlhq/a#1"]
+    assert answer.verdict == UNKNOWN
+    assert "quarantined" in answer.reason
+
+
+# --- a 409 informs, it does not grant -----------------------------------
+
+
+def test_a_409_on_a_row_we_are_handing_off_does_not_license_a_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`handing-off` is a HOLDING state, so routing a 409 through `verdict_for`
+    answered OWNED_BY_ME for the caller's own row — a refused write producing
+    `may_mutate True`, and the loop kept pushing after the server said no."""
+    rec = _owned_payload(ME)
+    rec["state"] = "handing-off"
+    c = _client(monkeypatch, _http_error(409, {"error": "epoch is stale", "ownership": rec}))
+    answer = c.acquire(ENTITY, PHASE, ME)
+    assert answer.may_mutate is False
+    assert answer.verdict == UNKNOWN
+    # Still informative: the caller can see the record the server saw.
+    assert answer.ownership is not None
+    assert answer.ownership.state == "handing-off"
+
+
+def test_a_409_carrying_a_finished_record_does_not_free_the_entity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A released or terminal record maps to UNOWNED, which is
+    `blocks_others False` — the one verdict that licenses action, produced by
+    a write the server declined. Same fail-open the 404-on-a-write branch
+    exists to stop."""
+    for state in ("released", "terminal"):
+        rec = _owned_payload(ME)
+        rec["state"] = state
+        c = _client(monkeypatch, _http_error(409, {"error": "conflict", "ownership": rec}))
+        answer = c.acquire(ENTITY, PHASE, ME)
+        assert answer.verdict == UNKNOWN, state
+        assert answer.blocks_others is True, state
+        assert answer.may_mutate is False, state
+
+
+def test_a_409_naming_somebody_else_still_stands_the_caller_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other direction: the standing-down half of the 409 branch survives.
+    A 409 naming another live owner is the server answering the question
+    directly, and must not be softened into UNKNOWN."""
+    c = _client(
+        monkeypatch,
+        _http_error(409, {"error": "owned by another actor", "ownership": _owned_payload(OTHER)}),
+    )
+    answer = c.acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == OWNED_BY_OTHER
+    assert answer.may_mutate is False
+    assert answer.ownership is not None
+    assert answer.ownership.owner == OTHER
+
+
+# --- a body or a status believed further than the evidence supports ------
+
+
+def test_a_json_404_from_an_intermediary_is_not_our_no_such_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gating the read-404 on non-empty JSON was one step short.
+
+    Every JSON-speaking intermediary answers exactly that: an ALB returns a
+    `message`, Envoy a `code`/`message` pair, a misrouted apiserver a Status
+    object. All parse non-empty, so all reached the UNOWNED branch — the
+    module's only fail-open path, freeing every entity in the sweep because a
+    base path was wrong.
+    """
+    for body in (
+        {"message": "no healthy upstream"},
+        {"code": 404, "message": "NR"},
+        {"kind": "Status", "status": "Failure", "reason": "NotFound"},
+    ):
+        answer = _client(monkeypatch, _http_error(404, body)).get(ENTITY, PHASE, asking=ME)
+        assert answer.verdict == UNKNOWN, body
+        assert answer.blocks_others is True, body
+
+    # The other direction: mctl-api's own envelope still means no such record.
+    ok = _client(monkeypatch, _http_error(404, {"error": "no ownership record"})).get(
+        ENTITY, PHASE, asking=ME
+    )
+    assert ok.verdict == UNOWNED
+    assert ok.blocks_others is False
+
+
+def test_a_nested_ownership_envelope_is_read_not_merely_recognised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recognition and parsing used to disagree about which shapes count.
+
+    `_looks_like_our_answer` accepted the nested envelope; the classifier five
+    lines below parsed only the top level. A 200 carrying that body therefore
+    answered `accepted True` with `verdict UNKNOWN` and no record — the module
+    recognising a body and then reporting it contains nothing. Two of the three
+    known shapes nest the record, so this was not a corner case.
+    """
+    nested = {"ownership": _owned_payload(ME)}
+    answer = _client(monkeypatch, _ok(nested)).acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == OWNED_BY_ME
+    assert answer.ownership is not None
+    assert answer.ownership.owner == ME
+    assert answer.wrote is True
+
+    # And on a read, where the same body used to be UNKNOWN.
+    read = _client(monkeypatch, _ok(nested)).get(ENTITY, PHASE, asking=ME)
+    assert read.verdict == OWNED_BY_ME
+    assert read.ownership is not None
+
+
+def test_a_body_less_2xx_on_acquire_is_not_a_claim_and_frees_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WROTE_NO_RECORD is the one verdict outside the three "somebody holds it"
+    answers, so `blocks_others` is False.
+
+    That is exactly right for a release — the statement that nobody holds the
+    entity now — and fail-open for an acquire, where it would tell every other
+    actor the entity is free while this one also declines to act, because the
+    record naming it never arrived. mctl-api answers acquire with the record,
+    so a body-less 2xx there is a protocol anomaly, not a grant.
+    """
+    empty = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    answer = _client(monkeypatch, empty).acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
+    assert answer.blocks_others is True
+    # The write itself is still reported as accepted — something took it.
+    assert answer.wrote is True
+
+    # The other direction: release keeps the behaviour the verdict was made for.
+    rel = _client(monkeypatch, empty).release(ENTITY, PHASE, ME, epoch=1, reason="done")
+    assert rel.verdict == WROTE_NO_RECORD
+    assert rel.blocks_others is False
+    assert rel.wrote is True
+
+
+def test_a_batch_value_that_is_not_a_mapping_does_not_kill_the_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_get_chunk` screens each per-id value for `None` and nothing else.
+
+    A batch answering a string, a list or a number for an id therefore reached
+    the unwrapper directly, where `.get` raised AttributeError and took down the
+    whole sweep tick — out of a module whose contract is that uncertainty is a
+    VALUE, never an exception. mypy cannot see it: that value is typed `Any`.
+    """
+    for bad in ("active", ["active"], 7, True):
+        out = _client(
+            monkeypatch, _ok({"ownership": {"mctlhq/a#1": bad, "mctlhq/b#2": _owned_payload(ME)}, "count": 2})
+        ).get_many(ENTITY.kind, PHASE, ["mctlhq/a#1", "mctlhq/b#2"], asking=ME)
+        assert out["mctlhq/a#1"].verdict == UNKNOWN, bad
+        assert out["mctlhq/a#1"].blocks_others is True, bad
+        # And the well-formed sibling in the same response is still answered,
+        # which is the point of not raising.
+        assert out["mctlhq/b#2"].verdict == OWNED_BY_ME, bad
+
+
+def test_only_release_and_terminal_may_answer_nobody_holds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claiming/relinquishing list has to be closed on the FAIL-OPEN side.
+
+    The first version listed the claiming routes and treated everything else as
+    relinquishing, so a route this image does not recognise — mctl-api adds
+    one, or a base path gains a prefix — answered `blocks_others` False, i.e.
+    nobody holds the entity. It was also wrong about two routes that already
+    existed: `/progress` leaves the record active and owned by the caller, and
+    `/handoff/start` writes handing-off, a HOLDING state this file pins
+    elsewhere as blocking, so the same row answered True when read back and
+    False when the write that produced it returned 204.
+    """
+    empty = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    for call, name in (
+        (lambda c: c.progress(ENTITY, PHASE, ME, epoch=1, evidence="pushed"), "progress"),
+        (lambda c: c.handoff_start(ENTITY, PHASE, ME, epoch=1, to=OTHER, reason="x"), "handoff/start"),
+        (lambda c: c.handoff_complete(ENTITY, PHASE, ME), "handoff/complete"),
+        (lambda c: c.acquire(ENTITY, PHASE, ME), "acquire"),
+    ):
+        answer = call(_client(monkeypatch, empty))
+        assert answer.verdict == UNKNOWN, name
+        assert answer.blocks_others is True, name
+
+    # The two that genuinely leave the entity unheld keep the verdict it was
+    # made for — this is the direction the closed list must not break.
+    for call, name in (
+        (lambda c: c.release(ENTITY, PHASE, ME, epoch=1, reason="done"), "release"),
+        (lambda c: c.terminal(ENTITY, PHASE, ME, epoch=1, reason="merged"), "terminal"),
+    ):
+        answer = call(_client(monkeypatch, empty))
+        assert answer.verdict == WROTE_NO_RECORD, name
+        assert answer.blocks_others is False, name
+        assert answer.wrote is True, name
+
+
+def test_a_body_less_2xx_on_handoff_complete_is_not_a_claim_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/handoff/complete` is a claiming route by the same definition as
+    `/acquire`: the caller is the incoming owner (ADR-010 §10 path 2).
+
+    Answering WROTE_NO_RECORD there is `blocks_others` False — nobody holds the
+    entity — at the exact instant a new owner took it. That is the fail-open
+    the acquire carve-out was added to prevent, arriving on the transition the
+    ADR calls the deterministic unowned window, where a second actor moving in
+    does the most damage.
+    """
+    empty = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    answer = _client(monkeypatch, empty).handoff_complete(ENTITY, PHASE, ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
+    assert answer.blocks_others is True
+
+    # Unchanged for the relinquishing writes, which is what the verdict is for.
+    for call in (
+        lambda c: c.release(ENTITY, PHASE, ME, epoch=1, reason="done"),
+        lambda c: c.terminal(ENTITY, PHASE, ME, epoch=1, reason="merged"),
+    ):
+        rel = call(_client(monkeypatch, empty))
+        assert rel.verdict == WROTE_NO_RECORD
+        assert rel.blocks_others is False
