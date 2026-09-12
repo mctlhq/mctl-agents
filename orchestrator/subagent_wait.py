@@ -46,12 +46,17 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import anyio
-from claude_agent_sdk import (
-    TERMINAL_TASK_STATUSES,
-    TaskNotificationMessage,
-    TaskStartedMessage,
-    TaskUpdatedMessage,
-)
+
+# NOTE: claude_agent_sdk is imported INSIDE observe() and _settle(), not here.
+# The Temporal worker imports orchestrator.run_shepherd and
+# orchestrator.run_issue_investigator at module scope (temporal/activities/
+# discovery.py, orphans.py, and the poller), and must not pull in the agent SDK
+# -- see tests/test_worker_isolation.py. Those are exactly the two drivers most
+# likely to need this helper next, so a module-scope SDK import here would force
+# each of them into a bespoke workaround (a non-subclassing local exception plus
+# a driver-local timeout constant) instead of just using it. The SDK touches
+# only those two methods; everything else in this module is pure Python. Cost is
+# one sys.modules lookup per message, after the first.
 
 # Mirror of claude_agent_sdk._internal.query.DEFERRING_TASK_TYPES. Deliberately
 # a literal copy rather than an import of a private name: the drift guard in
@@ -118,6 +123,12 @@ class LiveTaskLedger:
 
     def observe(self, message: Any) -> None:
         """Fold one stream message into the ledger. Never raises."""
+        from claude_agent_sdk import (  # deferred — see the module docstring
+            TaskNotificationMessage,
+            TaskStartedMessage,
+            TaskUpdatedMessage,
+        )
+
         if isinstance(message, TaskStartedMessage):
             # task_type is optional on the wire; only delegated agent work is
             # kept alive by the SDK past the result frame, so only that is safe
@@ -151,6 +162,8 @@ class LiveTaskLedger:
             self._settle(message.task_id, status)
 
     def _settle(self, task_id: str, status: str | None) -> None:
+        from claude_agent_sdk import TERMINAL_TASK_STATUSES  # deferred
+
         # Only tasks this ledger actually adopted. Notifications arrive for
         # every task the CLI runs, including the background shells
         # AWAITED_TASK_TYPES deliberately excludes -- folding those in would

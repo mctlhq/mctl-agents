@@ -77,3 +77,28 @@ def test_the_guard_can_actually_see_the_sdk():
     loaded = _modules_imported_by("orchestrator.run_implementer")
 
     assert "claude_agent_sdk" in loaded
+
+
+def test_subagent_wait_is_importable_by_the_worker():
+    """The sub-agent-await helper must not drag the SDK in at import time.
+
+    Not merely a nice property: the worker imports `orchestrator.run_shepherd`
+    and `orchestrator.run_issue_investigator` at module scope (see
+    temporal/activities/discovery.py and orphans.py, and the issue poller), and
+    those are exactly the two drivers most likely to need this helper next —
+    shepherd is the last delegating driver. A module-scope `claude_agent_sdk`
+    import in `subagent_wait` would force each of them into a bespoke workaround
+    (a local exception that cannot subclass the shared one, plus a driver-local
+    timeout constant) rather than just using it.
+
+    Stated as a positive assertion because the property is invisible otherwise:
+    `FORBIDDEN_IN_WORKER` only catches the SDK once some worker-imported module
+    already pulls it in, which is one step too late to explain why.
+    """
+    loaded = _modules_imported_by("orchestrator.subagent_wait")
+
+    assert "claude_agent_sdk" not in loaded, (
+        "orchestrator.subagent_wait imports the agent SDK at module scope. "
+        "Keep those imports inside LiveTaskLedger.observe/_settle so every "
+        "worker-imported driver can use this helper directly."
+    )
