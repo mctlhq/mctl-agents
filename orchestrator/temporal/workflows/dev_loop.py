@@ -45,7 +45,7 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, UNKNOWN, EntityRef
+    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, UNKNOWN, UNOWNED, EntityRef
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -1211,7 +1211,6 @@ class DevLoopWorkflow:
             return None
 
 
-
     def _lost_to_someone_else(self, result: OwnershipResult) -> bool:
         """Is the OWNED_BY_OTHER record naming somebody other than this loop?
 
@@ -1243,7 +1242,13 @@ class DevLoopWorkflow:
         heartbeat block counts it, logs it, and gives up the claim WITHOUT
         setting the permanent flag, so the loop re-acquires under its own gate.
         """
-        return result.owner_id != workflow.info().workflow_id
+        # A non-empty id is half the question. A 409 whose body is not a
+        # record answers OWNED_BY_OTHER with `owner_id=""` (answer_from's
+        # `record_of(payload) is None` branch), and "" != our workflow_id — so
+        # that reached _lose_claim, logged `lost … to /`, and set the permanent
+        # flag naming nobody, on a refusal that may well have been caused by
+        # this loop's own stale belief.
+        return bool(result.owner_id) and result.owner_id != workflow.info().workflow_id
 
     def _lose_claim(self, repo: str, number: int, result: OwnershipResult) -> None:
         """Another actor holds this PR now. Stop claiming to own it.
@@ -1401,6 +1406,17 @@ class DevLoopWorkflow:
                 self._owned_head_sha = head
                 self._owner_epoch = result.epoch or self._owner_epoch
                 self._unknown_progress = 0
+                # ...so it resets the HEARTBEAT counter too. Both landed arms
+                # return, which skips the heartbeat block on this poll, so the
+                # counter neither advanced nor decayed across a write that
+                # refreshed last_seen_at — and the give-up reads it as a count
+                # of CONSECUTIVE missed heartbeats. With /acquire answering 503
+                # while /progress stays healthy (the mirror of the case this
+                # loop already handles) every progress write would land, the
+                # heartbeat would fail on every fourth poll, and the claim
+                # would be dropped on the premise that last_seen_at had not
+                # moved for six hours — which its own landed writes disprove.
+                self._unknown_heartbeats = 0
                 return
             if result is not None and result.accepted and result.verdict == UNKNOWN:
                 # The write LANDED — mctl-api took it — but carried no record
@@ -1431,6 +1447,7 @@ class DevLoopWorkflow:
                 # No epoch came back, so the caller keeps the one it had.
                 self._owned_head_sha = head
                 self._unknown_progress = 0
+                self._unknown_heartbeats = 0
                 return
             if (
                 result is not None
@@ -1503,12 +1520,64 @@ class DevLoopWorkflow:
             # last_seen_at with zero log lines and zero history signal, and the
             # reconciler force-released the row at the 10h bound while the
             # workflow was alive and polling.
+            if result is not None and result.verdict == UNOWNED:
+                # The row this loop believed it held names nobody — the
+                # reconciler released it, or it was never written. The acquire
+                # did NOT take it (an acquire that took it would answer
+                # owned-by-caller), so this is not a refreshed heartbeat.
+                #
+                # Drop the claim rather than counting toward the give-up: the
+                # unclaimed path re-acquires on the next poll, which is the
+                # recovery the progress branch's UNOWNED note already names.
+                # NOT _claim_refused — nobody said they own this.
+                workflow.logger.info(
+                    "lifecycle: %s#%s is owned by nobody — this loop drops its "
+                    "stale claim and re-acquires",
+                    repo, number,
+                )
+                self._owned_entity_id = ""
+                self._owner_epoch = 0
+                self._owned_head_sha = ""
+                self._unknown_heartbeats = 0
+                self._unknown_progress = 0
+                return
+
+            if result is not None and result.accepted:
+                # mctl-api TOOK the write, so last_seen_at IS refreshed; this
+                # loop simply learned nothing usable from the record that came
+                # back. That is not a missed heartbeat, and counting it toward
+                # a give-up whose entire premise is "liveness stopped" was the
+                # opposite of what the gate is for.
+                #
+                # Three real shapes reach here, all with `accepted` True and
+                # all of them written by mctl-api: a body-less 2xx on
+                # /ownership/acquire (the pair the claim and progress arms were
+                # rewritten to read — the heartbeat IS an acquire and got
+                # neither); our own record read back unhealthy, which
+                # `_lost_to_someone_else` correctly declines to treat as a
+                # loss; and a 2xx carrying a state this image does not
+                # recognise, which `verdict_for` deliberately answers UNKNOWN
+                # rather than guessing.
+                #
+                # Getting this wrong was not cosmetic. Three of them dropped a
+                # claim the loop still held, after which it writes no progress,
+                # writes no terminal when the PR merges, and the finally
+                # releases nothing — the zero-owner state this epic exists to
+                # remove — on the strength of a warning that said liveness had
+                # stopped when it had not.
+                self._unknown_heartbeats = 0
+                return
+
             self._unknown_heartbeats += 1
             workflow.logger.warning(
-                "lifecycle: heartbeat for %s#%s did not land (%s) — "
+                "lifecycle: heartbeat for %s#%s did not land (verdict=%s, %s) — "
                 "%d consecutive, last_seen_at is not being refreshed",
                 repo, number,
-                result.reason if result is not None else "the activity failed outright",
+                result.verdict if result is not None else "none",
+                # `reason` is "" for every 2xx that carried a record, so the
+                # verdict above is what makes those cases self-describing.
+                (result.reason or "no reason given") if result is not None
+                else "the activity failed outright",
                 self._unknown_heartbeats,
             )
             if self._unknown_heartbeats >= LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT:
@@ -1519,13 +1588,13 @@ class DevLoopWorkflow:
                 # What is wrong after this many consecutive failures is the
                 # BELIEF. At LIFECYCLE_HEARTBEAT_EVERY_POLLS x
                 # MERGE_POLL_INTERVAL per heartbeat, last_seen_at has not moved
-                # for about six hours — inside the 10 h liveness bound, which is
-                # the point: the correction has to arrive BEFORE the reconciler
-                # acts, not after. So
-                # the reconciler will take the row at the 10h bound whatever
-                # this loop thinks; a loop that goes on believing it owns an
-                # entity the store is about to hand to somebody else is the
-                # divergence this epic exists to remove. Dropping the claim
+                # for about six hours, and nothing above this line answered, so
+                # mctl-api took none of those writes. The reconciler will take
+                # the row at the 10h bound whatever this loop thinks — and the
+                # correction has to arrive BEFORE that, not after. A loop that
+                # goes on believing it owns an entity the store is about to
+                # hand to somebody else is the divergence this epic exists to
+                # remove. Dropping the claim
                 # makes the belief match the outcome, and returns the loop to
                 # the unclaimed path, which re-acquires under its own gate.
                 workflow.logger.warning(

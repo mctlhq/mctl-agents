@@ -1472,6 +1472,161 @@ class TestDevLoopWorkflow:
         )
         assert held_without_liveness < timedelta(hours=10), held_without_liveness
 
+    async def test_a_heartbeat_the_store_accepted_is_not_a_missed_heartbeat(self, env):
+        """The heartbeat was the only one of the three write paths with no
+        `accepted` arm, so a liveness write mctl-api TOOK was counted as one
+        that did not land.
+
+        Three shapes reach it, all with `accepted` True: a body-less 2xx on
+        /ownership/acquire (the exact pair the claim and progress arms were
+        rewritten to read — the heartbeat IS an acquire and got neither), our
+        own record read back unhealthy, and a 2xx carrying a state this image
+        does not recognise. In all three `last_seen_at` was refreshed and the
+        warning said the opposite.
+
+        Three of them then dropped a claim the loop still held, after which it
+        writes no progress, writes no terminal when the PR merges, and the
+        finally releases nothing — the zero-owner state this epic exists to
+        remove.
+
+        Pinned on the EPOCH, which is what the give-up clears: the sibling test
+        uses the same instrument in the other direction.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # ownership_body_less is op-scoped, so the claiming acquire answers
+        # body-less too and no claim lands. Drive it through the record-naming-
+        # us shape instead, which is the one that reaches a CLAIMED loop.
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=923,
+            ownership_self_unhealthy_after=1,
+        )
+        after_claim = [o for o in ops[1:] if o.op != "terminal"]
+        assert after_claim, [o.op for o in ops]
+        assert all(o.epoch != 0 for o in after_claim), (
+            "a heartbeat the store accepted dropped a claim the loop held: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_a_landed_progress_write_is_also_this_polls_heartbeat(self, env):
+        """`_unknown_heartbeats` is read as a count of CONSECUTIVE missed
+        heartbeats, and a landed progress write did not reset it.
+
+        Both landed progress arms `return`, which skips the heartbeat block on
+        that poll, so the counter neither advanced nor decayed across a write
+        that refreshed `last_seen_at` server-side — which the line above it
+        says it does, and ADR-010 §3 agrees (`last_seen_at` is refreshed by ANY
+        tick).
+
+        The failure is the actively-working loop this PR is built for:
+        /ownership/acquire answering 503 while /ownership/progress stays
+        healthy — the mirror of the case the give-up was added for. Every
+        progress write lands, the heartbeat fails on every fourth poll, and the
+        claim is dropped on the premise that liveness stopped, which its own
+        landed writes disprove. The give-up then clears `_owned_head_sha`, so
+        the progress writes stop too: the one path that was working is silenced
+        and only then does the row genuinely go stale.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # The head must REPEAT on the heartbeat polls and move on the others.
+        # A head that moves on every poll makes the progress branch return
+        # before the heartbeat block is ever reached, so the counter never
+        # advances and the test passes with or without the fix — which is
+        # exactly how the first version of this test was a false guard.
+        heads = []
+        for i in range(1, 25):
+            if i % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0 and heads:
+                heads.append(heads[-1])
+            else:
+                heads.append(_pr(chr(ord("a") + i) * 40))
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=924,
+            ownership_unavailable_op="acquire",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) > LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT + 2, (
+            f"the progress path stopped: {[(o.op, o.epoch) for o in ops]}"
+        )
+        # Every op AFTER the claim, not just the progress writes: the give-up
+        # clears the epoch, so an op carrying 0 is the claim having been
+        # dropped. Asserting only on the progress ops cannot see it, because
+        # the twelve that landed BEFORE the give-up already satisfy the count
+        # above — which is how the first version of this assertion passed under
+        # its own mutation.
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a claim was dropped although its own progress writes were landing: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_the_unclaimed_path_also_refuses_to_lose_to_itself(self, env):
+        """The second call site of the guard, and the one the give-up lands on.
+
+        After the heartbeat give-up the loop returns to the UNCLAIMED path —
+        deliberately, since the give-up does not set `_claim_refused` — while
+        the store is still returning our own active row with `healthy` False,
+        which is why it gave up. Without the guard there, that answer sets
+        `_claim_refused = True` and the loop stops making ownership calls of
+        any kind for the remaining thirteen days, having refused a claim nobody
+        else ever held.
+
+        Every other test passes `ownership_self_unhealthy_after=1`, so `ops[0]`
+        — the claiming acquire — is always a normal answer and this site is
+        never exercised. `0` makes the very first call self-naming.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 20 + [MERGED_PR],
+            issue=925,
+            ownership_self_unhealthy_after=0,
+        )
+        # _claim_refused would stop every ownership call after the first.
+        assert len([o for o in ops if o.op == "acquire"]) > 1, (
+            "a record naming this loop refused its own claim permanently: "
+            f"{[o.op for o in ops]}"
+        )
+
+    async def test_a_refusal_naming_nobody_does_not_refuse_the_claim(self, env):
+        """`_lose_claim` compared ids, and a 409 whose body is not a record
+        answers OWNED_BY_OTHER with `owner_id=""`.
+
+        `"" != workflow_id`, so that reached `_lose_claim`, logged `lost … to
+        /`, and set the one PERMANENT flag on the path naming nobody — from a
+        refused write that may well have been refused because of this loop's
+        own stale belief. `answer_from` produces exactly this shape from its
+        `record_of(payload) is None` branch on a 409.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 20 + [MERGED_PR],
+            issue=926,
+            ownership_owner=("", ""),
+        )
+        assert len([o for o in ops if o.op == "acquire"]) > 1, (
+            "a refusal naming nobody refused the claim permanently: "
+            f"{[o.op for o in ops]}"
+        )
+
     async def test_progress_is_recorded_only_when_the_head_moves(self, env):
         """A poll that observed nothing new must not write progress.
 
