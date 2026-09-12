@@ -123,6 +123,53 @@ IMPLEMENTER_TIMEOUT_SECONDS = float(
 IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
     "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", default=300.0
 )
+# The same VALUE and the same clamp for the other two drivers that drain
+# (mctl-agents#368), kept beside the implementer's so the family is read and
+# changed together -- but NOT the same ceiling, and the difference matters.
+#
+# IMPLEMENTER_DRAIN_TIMEOUT_SECONDS is a sub-deadline nested inside
+# IMPLEMENTER_TIMEOUT_SECONDS: `_run_implementer_agent` wraps the whole run in
+# `anyio.fail_after`, so the outer bound is what actually caps elapsed time and
+# the drain budget only decides how a wedged child is CLASSIFIED.
+#
+# Neither driver below has an outer `fail_after`. Nothing trips first, and
+# `drain_until_settled` restarts this clock on every relaunch, so the
+# in-process ceiling is N x 300s for N delegations rather than 300s. That is
+# bounded in practice by the Argo step deadline (issue-investigator) and the
+# CronWorkflow's own limit (service-agent), which is why it is acceptable
+# rather than a leak -- but it is an EXTERNAL bound, so shortening these knobs
+# does not shorten the worst case, and phase 2's
+# `anyio.current_effective_deadline()` clamp is inert for both (infinite
+# remaining budget, nothing to clamp against). Read that way, not as "same as
+# the implementer's".
+#
+# Clamped like the implementer's regardless: a knob that documents itself as
+# tunable while silently doing nothing is bad in every mode, even where the
+# blast radius is smaller (neither of these goes through the shepherd's
+# classification, so a bad value orphans runs rather than looping forever).
+#
+# Both modes have the precondition the drain rests on -- their builders below
+# pass `hooks=_command_audit_hooks()`, and the SDK holds the CLI subprocess
+# open past a result frame only when `sdk_mcp_servers or hooks` is truthy.
+#
+# service-agent: its prompt walks four steps named after the
+# `.claude/agents/{researcher,analyst,spec-writer}.md` personas that
+# setting_sources=["project"] loads from cwd, so there are real sub-agents to
+# delegate to.
+SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
+    "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", default=300.0
+)
+# issue-investigator: cwd is a fresh clone of the TARGET repository, so
+# setting_sources=["project"] loads whatever `.claude/agents/*.md` that
+# repository ships. An orphan there means the downstream pipeline gets no
+# proposal -- but by CHOICE, not by physics: the agent may well have written a
+# complete triplet into the staging directory before the child was orphaned,
+# and `investigate()`'s `finally` discards staging on any error path rather
+# than publish work whose provenance it cannot vouch for. See the orphan branch
+# in run_issue_investigator.investigate() for why that trade is made there.
+ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
+    "ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", default=300.0
+)
 # Bound every synchronous git/gh command as well.  The model-stream timeout
 # above cannot interrupt a clone, fetch, or push that has stalled before or
 # after the SDK call.

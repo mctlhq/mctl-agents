@@ -19,7 +19,7 @@ from pathlib import Path
 import anyio
 import pytest
 import yaml
-from claude_agent_sdk import ResultMessage
+from claude_agent_sdk import TaskUpdatedMessage
 
 from orchestrator import run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
@@ -42,7 +42,13 @@ from orchestrator.run_issue_investigator import (
     try_parse_issue_url,
     write_status_yaml,
 )
-from tests.conftest import fake_mcp_client_factory
+from tests.conftest import (
+    fake_mcp_client_factory,
+    result_message,
+    task_notification_message,
+    task_started_message,
+    task_updated_message,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -374,53 +380,12 @@ def test_issue_closing_line_rejects_incomplete_source(tmp_path, source):
 # ---------------------------------------------------------------------------
 # _run_agent — rate-limit exhaustion detection
 # ---------------------------------------------------------------------------
-def _result_message(*, is_error: bool, api_error_status: int | None, subtype: str = "success") -> ResultMessage:
-    return ResultMessage(
-        subtype=subtype,
-        duration_ms=1,
-        duration_api_ms=0,
-        is_error=is_error,
-        num_turns=1,
-        session_id="test-session",
-        api_error_status=api_error_status,
-    )
-
-
-class _FakeClient:
-    """Stands in for ClaudeSDKClient — no MCTL_TOKEN in the test env means
-    build_issue_investigator_options() returns mcp_servers={}, so
-    ensure_mctl_connected() is never called; only query()/receive_response()
-    need faking here."""
-
-    def __init__(self, *, options, messages):
-        self._messages = messages
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def query(self, prompt):
-        pass
-
-    async def receive_response(self):
-        for m in self._messages:
-            yield m
-
-
-def _fake_client_factory(messages):
-    def _factory(*, options):
-        return _FakeClient(options=options, messages=messages)
-    return _factory
-
-
 def test_run_agent_raises_on_429_result(tmp_path, monkeypatch):
     """A final ResultMessage with is_error + api_error_status=429 must raise
     RateLimitExhaustedError, not just be printed and swallowed."""
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([_result_message(is_error=True, api_error_status=429)]),
+        fake_mcp_client_factory(messages=[result_message(is_error=True, api_error_status=429)]),
     )
     with pytest.raises(RateLimitExhaustedError):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -431,7 +396,7 @@ def test_run_agent_does_not_raise_on_clean_success(tmp_path, monkeypatch):
     rate-limit exhaustion."""
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([_result_message(is_error=False, api_error_status=None)]),
+        fake_mcp_client_factory(messages=[result_message(is_error=False, api_error_status=None)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 
@@ -444,7 +409,7 @@ def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
     poll()'s rate_limited_failures."""
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([_result_message(is_error=True, api_error_status=500)]),
+        fake_mcp_client_factory(messages=[result_message(is_error=True, api_error_status=500)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 
@@ -3081,7 +3046,7 @@ def _stub_client_no_messages(monkeypatch):
     # _run_agent test here stubs it.
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([]),
+        fake_mcp_client_factory(messages=[]),
     )
 
 
@@ -3182,3 +3147,251 @@ def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
 
     with pytest.raises(RuntimeError, match="cannot pin target_repository_sha"):
         run_issue_investigator._target_repository_sha(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# _run_agent — awaiting an async-launched sub-agent (mctl-agents#366)
+#
+# `ResultMessage` ends one TURN, not the RUN. `receive_response()` returns at
+# the first one by contract, so the pre-#366 driver abandoned any sub-agent the
+# CLI had launched asynchronously (`isAsync: True`, `status: "async_launched"`).
+# For THIS driver that is the worst case of the family: an orphan here writes no
+# requirements/design/tasks triplet at all, so the entire downstream pipeline
+# gets nothing and the issue looks like it simply failed to investigate.
+#
+# The precondition that makes draining sound is the SDK's own: it keeps stdin
+# (and so the subprocess) open past the result frame while `_inflight_tasks` is
+# non-empty, but ONLY when `sdk_mcp_servers or hooks` is truthy.
+# `build_issue_investigator_options` and its `_from_plan` twin both pass
+# `hooks=_command_audit_hooks()`. Dropping them would silently turn the drain
+# into a wait for a process nobody is keeping alive, so that precondition is
+# pinned once for every builder in tests/test_options.py rather than here.
+# ---------------------------------------------------------------------------
+def _ok_result():
+    return result_message(is_error=False, api_error_status=None)
+
+
+def test_investigator_waits_for_async_launched_subagent(tmp_path, monkeypatch):
+    """The headline regression: fails without the drain.
+
+    `consumed` is the real assertion — returning normally is not enough, the
+    driver must have read *past* the ResultMessage to see the child settle.
+    """
+    consumed: list[object] = []
+
+    async def messages():
+        for message in (task_started_message(), _ok_result(), task_updated_message()):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    assert any(isinstance(m, TaskUpdatedMessage) for m in consumed), (
+        "driver stopped at the ResultMessage and abandoned the live sub-agent"
+    )
+
+
+def test_investigator_returns_immediately_when_no_tasks_are_live(tmp_path, monkeypatch):
+    """Runs without a delegated child must not pay for the drain."""
+    consumed: list[object] = []
+
+    async def messages():
+        for message in ("chatter", _ok_result(), task_updated_message()):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    assert not any(isinstance(m, TaskUpdatedMessage) for m in consumed)
+
+
+def test_investigator_raises_orphaned_when_task_never_settles(tmp_path, monkeypatch):
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+        await anyio.sleep(10)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 0.05
+    )
+
+    with pytest.raises(run_issue_investigator.InvestigatorOrphanedSubagent, match=r"orphaned sub-agent:"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_raises_orphaned_when_stream_ends_with_live_task(tmp_path, monkeypatch):
+    """The CLI exited while the child was still live."""
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(run_issue_investigator.InvestigatorOrphanedSubagent):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_does_not_orphan_on_failed_terminal_status(tmp_path, monkeypatch, capsys):
+    """A failed child is quiescent, not orphaned — warn, do not raise."""
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+        yield task_notification_message(status="failed", summary="boom")
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    out = capsys.readouterr().out
+    assert "warn:" in out and "failed" in out
+
+
+def test_investigator_rate_limit_still_wins_over_the_drain(tmp_path, monkeypatch):
+    """A 429 result must still raise RateLimitExhaustedError, not be masked by
+    a drain for a child an out-of-quota account never actually ran."""
+    async def messages():
+        yield task_started_message()
+        yield result_message(is_error=True, api_error_status=429)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_orphan_surfaces_as_a_named_harness_failure(tmp_path, monkeypatch):
+    """investigate() maps the orphan explicitly, ahead of its generic branch.
+
+    The wording matters: this driver reports through InvestigateResult.error,
+    not exit codes, and an orphan must not read as "the agent broke on this
+    issue" when what happened is that the platform threw the child's work away.
+    """
+    def orphaning_agent(repo_dir, prompt, proposal_dir):
+        raise run_issue_investigator.InvestigatorOrphanedSubagent(
+            "orphaned sub-agent: sub-agent task(s) never reported a terminal "
+            "status within 300s: 1 task(s) still live: t1"
+        )
+
+    issue = _investigate_harness(tmp_path, monkeypatch, agent=orphaning_agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "harness failure" in result.error
+    assert "still live" in result.error
+    assert result.rate_limited is False
+
+
+def test_investigator_classifies_a_rate_limit_seen_during_the_drain(tmp_path, monkeypatch):
+    """A 429 arriving while a delegated child is still live must be classified
+    (claude P3 on #368).
+
+    Before `on_message=_note`, the drain read with a bare `print` and nothing
+    re-applied the rate-limit predicate to frames seen after the first result.
+    A limit hit here returned normally, investigate() failed the triplet check,
+    and the result said `rate_limited=False` — so an operator (or the account-2
+    fallback) read "agent produced no triplet" instead of "this account is out
+    of quota", and the retry that exists for exactly this case was not taken.
+
+    This is the ordering where the verdict arrives while the child is still
+    live. The other ordering — child settles first, 429 on the parent's
+    follow-up turn — is covered by the test below; it used to be unreachable
+    and is not any more (see there).
+    """
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+        # Still live: the parent emits its limit verdict before the child
+        # settles. This ordering was already observable in phase 1.
+        yield result_message(is_error=True, api_error_status=429)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_classifies_a_rate_limit_on_the_follow_up_turn(tmp_path, monkeypatch):
+    """The child settles FIRST, then the parent's follow-up turn hits the limit.
+
+    This ordering was a known residual while `drain_until_settled` returned the
+    instant `ledger.live` emptied: the drain was already gone by the time the
+    429 frame arrived, so no `on_message` could see it, and the run reported
+    "no triplet" with `rate_limited=False` — losing the account-2 fallback.
+
+    #367's merged helper closes it. The drain is now a loop whose stop
+    condition is the SDK's own — a `ResultMessage` arriving with nothing in
+    flight — so it keeps reading past the child's terminal status and into the
+    turn that settling woke, which is exactly where this frame lands. Both
+    orderings are therefore classified, and `_note` is what does it in both.
+
+    Pinned as a test rather than left as a happy accident of the helper's
+    stop condition: if that condition ever reverts to "the ledger emptied",
+    this is the driver-level consequence, and it should be this test that says
+    so rather than an operator reading the wrong cause off a failed run.
+    """
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+        yield task_updated_message()
+        yield result_message(is_error=True, api_error_status=429)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_rate_limit_reaches_investigate_as_rate_limited(tmp_path, monkeypatch):
+    """And it must arrive as rate_limited=True, not as a generic failure.
+
+    The classification is the whole point of the finding: `rate_limited` is the
+    one structured flag callers branch on to tell "this account is out of
+    quota" apart from "the agent broke on this issue".
+    """
+    def rate_limited_agent(repo_dir, prompt, proposal_dir):
+        raise RateLimitExhaustedError("SDK reported api_error_status=429")
+
+    issue = _investigate_harness(tmp_path, monkeypatch, agent=rate_limited_agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.rate_limited is True
+    assert result.error is not None and "429" in result.error

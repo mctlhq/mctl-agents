@@ -64,15 +64,27 @@ class FakeMcpClient:
     async def query(self, prompt):
         self.queried_prompt = prompt
 
-    async def receive_response(self):
+    async def _iter_messages(self):
+        # `messages` may be a plain sequence or a zero-argument callable
+        # returning an async generator. The callable form is what the #366
+        # drain tests need: it lets a test block the stream, record what the
+        # driver actually consumed, or relaunch a task mid-drain.
+        if callable(self._messages):
+            async for message in self._messages():
+                yield message
+            return
         for message in self._messages:
             yield message
 
+    async def receive_response(self):
+        async for message in self._iter_messages():
+            yield message
+
     async def receive_messages(self):
-        # The implementer driver reads this one (mctl-agents#366): it must not
+        # The drivers converted for mctl-agents#366 read this one: it must not
         # stop at the first ResultMessage, or an async-launched sub-agent is
         # abandoned mid-flight.
-        for message in self._messages:
+        async for message in self._iter_messages():
             yield message
 
 
@@ -84,3 +96,55 @@ def fake_mcp_client_factory(*, statuses=(), messages=(), status_error=None):
             status_error=status_error,
         )
     return _factory
+
+
+# ---------------------------------------------------------------------------
+# SDK lifecycle-message builders (mctl-agents#366).
+#
+# The drain tests in test_run_implementer_timeout.py, test_run_service_agent.py
+# and test_run_issue_investigator.py all need the same three task messages.
+# Built here so a future SDK field addition is one edit rather than one per
+# driver — the same reason FakeMcpClient lives here rather than in each file.
+# ---------------------------------------------------------------------------
+def task_started_message(task_id="t1", *, task_type="local_agent", description="delegated work"):
+    """A delegated sub-agent launching. `task_type` is what decides whether the
+    ledger adopts it — `local_agent`/`local_workflow` are awaited, anything
+    else (including None) is deliberately not."""
+    from claude_agent_sdk import TaskStartedMessage
+
+    return TaskStartedMessage(
+        subtype="task_started", data={}, task_id=task_id,
+        description=description, uuid="u", session_id="s", task_type=task_type,
+    )
+
+
+def task_updated_message(task_id="t1", status="completed"):
+    """A status patch. The SDK documents that a terminal state can arrive this
+    way with no accompanying notification, so drains must honour both."""
+    from claude_agent_sdk import TaskUpdatedMessage
+
+    return TaskUpdatedMessage(
+        subtype="task_updated", data={}, task_id=task_id,
+        patch={"status": status}, status=status,
+    )
+
+
+def task_notification_message(task_id="t1", status="completed", summary="done"):
+    """The other terminal vocabulary: reports `stopped` where task_updated
+    reports the raw `killed`."""
+    from claude_agent_sdk import TaskNotificationMessage
+
+    return TaskNotificationMessage(
+        subtype="task_notification", data={}, task_id=task_id, status=status,
+        output_file="/dev/null", summary=summary, uuid="u", session_id="s",
+    )
+
+
+def result_message(*, is_error=False, api_error_status=None, subtype="success"):
+    """A result frame — which ends one TURN, not the RUN."""
+    from claude_agent_sdk import ResultMessage
+
+    return ResultMessage(
+        subtype=subtype, duration_ms=1, duration_api_ms=0, is_error=is_error,
+        num_turns=1, session_id="s", api_error_status=api_error_status,
+    )

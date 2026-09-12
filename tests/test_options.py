@@ -14,7 +14,19 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from orchestrator import options, resolver
+
+# Every drain sub-deadline (mctl-agents#366/#368). They share the
+# `_positive_seconds` clamp, so the clamp and env-name tests below are one
+# property of that helper's callers rather than three separate facts — a fourth
+# knob belongs here the moment it is added.
+_DRAIN_TIMEOUT_ENV_VARS = (
+    "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS",
+    "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS",
+    "ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS",
+)
 
 
 def test_mctl_mcp_config_default_omits_always_load(monkeypatch):
@@ -148,6 +160,14 @@ def test_build_issue_investigator_options_from_plan_matches_legacy_builder(tmp_p
     assert declarative.max_budget_usd == legacy.max_budget_usd
     assert declarative.add_dirs == legacy.add_dirs
     assert declarative.env == legacy.env
+    # hooks too: build_issue_investigator_options_from_plan's docstring lists it
+    # among the structural fields "the equivalence tests in tests/test_options.py
+    # assert this directly", and it was the one field that claim did not cover.
+    # It is also load-bearing, not cosmetic — hooks are what make the SDK hold
+    # the CLI open past a result frame (mctl-agents#366), so dropping them from
+    # the declarative builder alone would turn every delegating investigation in
+    # that mode into a stream that ends with a live task.
+    assert declarative.hooks == legacy.hooks
 
 
 def test_build_issue_investigator_options_from_plan_omits_mctl_tools_without_token(tmp_path, monkeypatch):
@@ -259,30 +279,96 @@ def test_implementer_drain_timeout_honours_its_env_override(monkeypatch):
         importlib.reload(options)
 
 
-def test_implementer_keeps_hooks_which_is_what_holds_stdin_open(tmp_path, monkeypatch):
+def test_hooks_are_what_hold_stdin_open_for_every_drainable_builder(tmp_path, monkeypatch):
     """Load-bearing precondition for the #366 drain, not incidental config.
 
     claude_agent_sdk only keeps stdin open past a result frame with tasks in
-    flight when `sdk_mcp_servers or hooks` is truthy. Strip the implementer's
-    hooks and the CLI would exit at the first result, so awaiting the sub-agent
-    would block on a dead child instead of recovering its commit.
+    flight when `sdk_mcp_servers or hooks` is truthy. Strip a mode's hooks and
+    the CLI would exit at the first result, so awaiting the sub-agent would
+    block on a dead child instead of recovering its work.
+
+    And it must be the HOOKS carrying it, not the MCP config: the SDK lifts a
+    server into `sdk_mcp_servers` only when its config says `type: "sdk"`
+    (`_internal/client.py`), and mctl_mcp_config() emits `type: "http"`.
+    Asserting both halves keeps the test from passing for the wrong reason, and
+    makes it demand an update the day an sdk-type server does appear.
+
+    MCTL_TOKEN is set so mcp_servers is actually populated — without it the
+    config is `{}` and the "no sdk-type server" half is vacuously true, which
+    is the specific way this test could rot into a no-op.
+
+    One test over every builder rather than one per driver: the property is a
+    single fact about the SDK, and stating it once is what keeps the drivers
+    that drain (implementer #367, issue-investigator and service-agent #368)
+    from drifting apart from the one that could (incident-responder, which has
+    the precondition but nothing to delegate to today).
     """
-    monkeypatch.setenv("MCTL_TOKEN", "t")
-    built = options.build_implementer_agent_options(tmp_path, "claude-sonnet-5")
-    assert built.hooks
-    # And it must be the HOOKS carrying it, not the MCP config: the SDK lifts a
-    # server into `sdk_mcp_servers` only when its config says `type: "sdk"`, and
-    # mctl_mcp_config() emits `type: "http"`. Asserting this keeps the test from
-    # passing for the wrong reason, and makes it demand an update the day an
-    # sdk-type server does appear.
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    incident_dir = tmp_path / "_incident-responder"
+    incident_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    builders = {
+        "implementer": options.build_implementer_agent_options(repo_dir, "test-model"),
+        "service-agent": options.build_service_agent_options(repo_dir, "test-model"),
+        "incident-responder": options.build_incident_responder_options(
+            agent_dir=incident_dir, model="test-model", state_dir=tmp_path,
+        ),
+        "issue-investigator": options.build_issue_investigator_options(
+            repo_dir, model="test-model", proposal_dir=proposal_dir,
+        ),
+        "issue-investigator/from_plan": options.build_issue_investigator_options_from_plan(
+            plan, repo_dir, proposal_dir,
+        ),
+    }
+    for name, built in builders.items():
+        assert built.hooks, f"{name} lost the hooks the #366 drain relies on"
+        assert built.mcp_servers, f"{name}: expected the http mctl server to be configured"
+        assert not [
+            server for server, cfg in built.mcp_servers.items()
+            if isinstance(cfg, dict) and cfg.get("type") == "sdk"
+        ], f"{name}: an sdk-type server would also satisfy the precondition — update this test"
+
+
+def test_the_mentor_has_neither_hooks_nor_an_sdk_mcp_server(tmp_path, monkeypatch):
+    """The negative result of the #368 audit, made executable.
+
+    `build_mentor_options` passes `mcp_servers=` but NO hooks, and the mctl
+    server it passes is `type: "http"` — which the SDK does not lift into
+    `sdk_mcp_servers`. So `sdk_mcp_servers or hooks` is falsy and the SDK
+    closes stdin at the first result frame: the CLI exits, the stream ends, and
+    there is no child left alive to drain toward.
+
+    This test exists to stop the #366 pattern being copied here on the
+    assumption that "it has an MCP server, so it qualifies". It does not.
+    Draining run_mentor as it stands would convert a silent loss into a
+    guaranteed OrphanedSubagentError on every delegating run. Giving the mentor
+    the audit hooks to make it drainable is a real behaviour change to a mode
+    that does not delegate today — a deliberate decision, not a refactor, and
+    if it is ever taken this test is the thing that must change with it.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    mentor_dir = tmp_path / "_mentor"
+    mentor_dir.mkdir()
+
+    built = options.build_mentor_options(mentor_dir, "test-model")
+
+    assert not built.hooks, (
+        "the mentor grew hooks — it is now drainable, which is a deliberate "
+        "behaviour change; see mctl-agents#366/#368 before updating this test"
+    )
     assert built.mcp_servers, "expected the http mctl server to be configured"
     assert not [
-        name for name, cfg in built.mcp_servers.items()
+        server for server, cfg in built.mcp_servers.items()
         if isinstance(cfg, dict) and cfg.get("type") == "sdk"
-    ]
+    ], "an sdk-type server WOULD satisfy the precondition — the mentor is now drainable"
 
 
-def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
+@pytest.mark.parametrize("name", _DRAIN_TIMEOUT_ENV_VARS)
+def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys, name):
     """A bad value must be loud and harmless, not silent and unbounded.
 
     `move_on_after(0)` cancels before the first read, so a drain deadline of 0
@@ -292,6 +378,14 @@ def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
     with no counter at all. A typo in one env var would then re-clone the repo
     and re-run a paid SDK call every tick forever, which is precisely what
     MAX_HARNESS_FAILURES exists to prevent.
+
+    Parametrised over all three knobs rather than the implementer's alone: they
+    read through the same `_positive_seconds` clamp, so this is one property of
+    that helper's callers, and a fourth knob added with a bare
+    `float(os.getenv(...))` should fail here rather than reintroduce the
+    pathology under a new name. The blast radius does differ — the
+    service-agent and issue-investigator do not go through the shepherd's
+    classification — but the clamp is the right shape for all of them.
     """
     import importlib
 
@@ -300,11 +394,37 @@ def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
     # whose every `deadline <= now` test is False — the scope never cancels and
     # the sub-deadline is silently gone. inf disables it the same way.
     for bad in ("0", "-5", "not-a-number", "nan", "inf", "-inf"):
-        monkeypatch.setenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", bad)
+        monkeypatch.setenv(name, bad)
         reloaded = importlib.reload(options)
         try:
-            assert reloaded.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 300.0, bad
-            assert "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS" in capsys.readouterr().err
+            assert getattr(reloaded, name) == 300.0, bad
+            assert name in capsys.readouterr().err
         finally:
-            monkeypatch.delenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", raising=False)
+            monkeypatch.delenv(name, raising=False)
             importlib.reload(options)
+
+
+def test_the_other_two_drain_timeouts_default_to_five_minutes():
+    """Same sub-deadline, same default, for the two drivers #368 converted."""
+    assert options.SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS == 300.0
+    assert options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS == 300.0
+
+
+@pytest.mark.parametrize("name", _DRAIN_TIMEOUT_ENV_VARS)
+def test_every_drain_timeout_honours_its_env_override(monkeypatch, name):
+    """Pins the env-var NAME, which the driver tests cannot.
+
+    They monkeypatch the module attribute, so the value is exercised but the
+    `os.getenv` string never is. A typo there would be silent in exactly the
+    worst way: the knob documents itself as tunable while doing nothing, and
+    you find out when you raise it during an incident and nothing changes.
+    """
+    import importlib
+
+    monkeypatch.setenv(name, "42")
+    reloaded = importlib.reload(options)
+    try:
+        assert getattr(reloaded, name) == 42.0
+    finally:
+        monkeypatch.delenv(name, raising=False)
+        importlib.reload(options)
