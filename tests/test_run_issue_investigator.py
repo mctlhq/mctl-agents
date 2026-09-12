@@ -3370,19 +3370,52 @@ def test_investigator_classifies_a_rate_limit_seen_during_the_drain(tmp_path, mo
     fallback) read "agent produced no triplet" instead of "this account is out
     of quota", and the retry that exists for exactly this case was not taken.
 
-    KNOWN RESIDUAL, deliberately not covered here: if the child reaches a
-    terminal status FIRST and the 429 lands on the parent's follow-up turn
-    after that, `drain_until_settled` has already returned — it stops the
-    instant `ledger.live` empties — so no `on_message` can see that frame.
-    Closing it needs the shared helper to keep reading to the next result
-    frame, which is orchestrator/subagent_wait.py in #367 and is depended on by
-    the implementer; it is escalated rather than changed from this branch.
+    This is the ordering where the verdict arrives while the child is still
+    live. The other ordering — child settles first, 429 on the parent's
+    follow-up turn — is covered by the test below; it used to be unreachable
+    and is not any more (see there).
     """
     async def messages():
         yield task_started_message()
         yield _ok_result()
         # Still live: the parent emits its limit verdict before the child
-        # settles, which is the ordering on_message can actually observe.
+        # settles. This ordering was already observable in phase 1.
+        yield _result_message(is_error=True, api_error_status=429)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_classifies_a_rate_limit_on_the_follow_up_turn(tmp_path, monkeypatch):
+    """The child settles FIRST, then the parent's follow-up turn hits the limit.
+
+    This ordering was a known residual while `drain_until_settled` returned the
+    instant `ledger.live` emptied: the drain was already gone by the time the
+    429 frame arrived, so no `on_message` could see it, and the run reported
+    "no triplet" with `rate_limited=False` — losing the account-2 fallback.
+
+    #367's merged helper closes it. The drain is now a loop whose stop
+    condition is the SDK's own — a `ResultMessage` arriving with nothing in
+    flight — so it keeps reading past the child's terminal status and into the
+    turn that settling woke, which is exactly where this frame lands. Both
+    orderings are therefore classified, and `_note` is what does it in both.
+
+    Pinned as a test rather than left as a happy accident of the helper's
+    stop condition: if that condition ever reverts to "the ledger emptied",
+    this is the driver-level consequence, and it should be this test that says
+    so rather than an operator reading the wrong cause off a failed run.
+    """
+    async def messages():
+        yield task_started_message()
+        yield _ok_result()
+        yield task_updated_message()
         yield _result_message(is_error=True, api_error_status=429)
 
     monkeypatch.setattr(

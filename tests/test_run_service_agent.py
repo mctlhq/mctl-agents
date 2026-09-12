@@ -218,3 +218,45 @@ def test_orphan_does_not_tear_down_the_sibling_agents(monkeypatch, capsys):
     anyio.run(run_all._safe_run_service, "mctl-agent")  # must not raise
 
     assert "ServiceAgentOrphanedSubagent" in capsys.readouterr().err
+
+
+def test_service_agent_awaits_a_second_delegation(monkeypatch):
+    """The parent may delegate AGAIN in the turn its first child woke.
+
+    #367's helper loops for exactly this: a straight phase-1-then-phase-2 pass
+    saw the relaunch only as "the ledger is non-empty again" and abandoned it,
+    reproducing #366 on the second delegation. This driver's prompt makes that
+    the expected shape rather than an edge case — steps 1-3 (researcher,
+    analyst, spec-writer) are three named personas in sequence, so a run that
+    delegates twice is the normal path, not a pathological one.
+
+    Pinned here at driver level because the helper's own test cannot see the
+    driver's break-then-drain wiring: it is possible to consume the relaunch in
+    the turn loop and never enter the drain at all.
+    """
+    consumed: list[object] = []
+
+    _stub_build_options(monkeypatch, mcp_servers={})
+
+    async def messages():
+        for message in (
+            task_started_message("researcher"),
+            result_message(),
+            task_updated_message("researcher"),
+            # The turn the first child woke delegates again.
+            task_started_message("spec-writer"),
+            task_updated_message("spec-writer"),
+            result_message(),
+        ):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
+
+    anyio.run(rsa.run_service_agent, "mctl-agent")
+
+    assert any(
+        isinstance(m, TaskUpdatedMessage) and m.task_id == "spec-writer"
+        for m in consumed
+    ), "driver abandoned the SECOND delegation"
