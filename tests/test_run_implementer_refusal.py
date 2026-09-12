@@ -423,3 +423,81 @@ def test_subagent_definitions_exclude_the_blocked_case() -> None:
         body = path.read_text(encoding="utf-8")
         assert "BLOCKED" in body, path
         assert "do NOT write the marker" in body, path
+
+
+# ---------------------------------------------------------------------------
+# Review round 3 on #369 (agy P2): the marker is untrusted in SIZE too
+#
+# The file sits in a cloned target repo's worktree and is written by an LLM
+# holding a Bash tool. A redirect into the wrong path, a loop that appends, or a
+# stray `tee` makes it enormous without any malice, and `read_text()` would pull
+# all of it into the orchestrator. An implementer OOM is the least diagnosable
+# failure available here: memory pressure on that workload is a live issue and
+# an OOMKill does not surface in `last_terminated_reason`.
+# ---------------------------------------------------------------------------
+def test_oversized_marker_is_refused_without_being_read(repo, monkeypatch) -> None:
+    """The guard must be a `stat()`, not a truncating read.
+
+    Asserted by making any `read_text` fatal: if the implementation ever reads
+    first and checks afterwards, this fails instead of quietly reintroducing the
+    unbounded read. Truncating would also be wrong for a second reason — the
+    fragment would fail the JSON check and reach the charged path for an
+    accidental reason, hiding an operational problem behind a correct outcome.
+    """
+    path = repo / run_implementer.REFUSAL_MARKER_FILENAME
+    path.write_text(
+        "x" * (run_implementer.MAX_REFUSAL_MARKER_BYTES + 1), encoding="utf-8",
+    )
+
+    def fatal_read(*_a, **_kw):
+        raise AssertionError("the oversized marker must never be read")
+
+    monkeypatch.setattr(Path, "read_text", fatal_read)
+    assert run_implementer._read_refusal_marker(repo) is None
+
+
+def test_oversized_marker_falls_back_to_the_charged_path(repo, monkeypatch) -> None:
+    """Refusing the marker must leave the ordinary failure intact, not a crash."""
+    _stub_review_feedback(monkeypatch, repo)
+    (repo / run_implementer.REFUSAL_MARKER_FILENAME).write_text(
+        "y" * (run_implementer.MAX_REFUSAL_MARKER_BYTES + 1), encoding="utf-8",
+    )
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error == "implementer produced no follow-up commits"
+    assert run_implementer._review_feedback_exit_code(result.error) == 42
+
+
+def test_a_marker_at_the_cap_is_still_honoured(repo) -> None:
+    """The bound must not clip a legitimate marker — the boundary is inclusive."""
+    payload = {"refused": True, "reason": "operator decision"}
+    envelope = json.dumps(payload)
+    pad = run_implementer.MAX_REFUSAL_MARKER_BYTES - len(envelope.encode("utf-8"))
+    assert pad > 0
+    # Pad with whitespace inside the JSON so the file is exactly at the cap and
+    # still parses.
+    padded = envelope[:-1] + (" " * pad) + "}"
+    path = repo / run_implementer.REFUSAL_MARKER_FILENAME
+    path.write_text(padded, encoding="utf-8")
+    assert path.stat().st_size == run_implementer.MAX_REFUSAL_MARKER_BYTES
+
+    assert run_implementer._read_refusal_marker(repo) == "operator decision"
+
+
+def test_vanished_marker_between_stat_and_read_is_not_a_crash(repo, monkeypatch) -> None:
+    """`is_file()` then `stat()` is a race by construction; it must degrade."""
+    _write_marker(repo, {"refused": True, "reason": "r"})
+    real_stat = Path.stat
+    seen = []
+
+    def racing_stat(self, *a, **kw):
+        # Let `is_file()` succeed, then fail the size check the way a deleted
+        # file would — the window the two calls actually leave open.
+        seen.append(self)
+        if len(seen) > 1:
+            raise FileNotFoundError("vanished")
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    assert run_implementer._read_refusal_marker(repo) is None

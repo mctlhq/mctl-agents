@@ -3968,3 +3968,55 @@ def test_alternating_harness_and_refusal_reaches_the_refusal_cap(tmp_path) -> No
     assert final["review_attempts"] == 0
     assert "not at fault" in final["notes"]
     assert "harness defect" not in final["notes"]
+
+
+def test_oversized_refusal_reason_file_is_not_read(tmp_path, monkeypatch) -> None:
+    """Mirror of the implementer-side cap (agy P2 on #369).
+
+    The shepherd writes the temp path itself and its own child fills it, so this
+    is the least likely of the two to grow — but it is the same unbounded
+    `read_text` on the same class of file, and the exit code already carries the
+    decision, so refusing by size costs nothing but the prose.
+    """
+    path = tmp_path / "refusal.json"
+    path.write_text("z" * (run_shepherd.MAX_REFUSAL_FILE_BYTES + 1), encoding="utf-8")
+
+    def fatal_read(*_a, **_kw):
+        raise AssertionError("the oversized reason file must never be read")
+
+    monkeypatch.setattr(Path, "read_text", fatal_read)
+    assert run_shepherd._read_refusal_reason(str(path)) is None
+
+
+def test_stuck_note_spends_its_budget_on_the_evidence(tmp_path) -> None:
+    """The reason is the part a human cannot reconstruct, so it gets the room.
+
+    Slicing the finished string charged the ~210 chars of fixed prose against
+    the same budget, and since the reason is interpolated last it was the only
+    part that could be lost — on the one note whose whole argument is "a human
+    must reconcile the review with the operator decision".
+    """
+    reason = "E" * 4000
+    note = run_shepherd._stuck_note(3, reason)
+
+    assert len(note) == run_shepherd.MAX_NOTES_CHARS
+    assert "not at fault" in note
+    # The evidence gets everything the boilerplate does not need, not what is
+    # left of a budget the boilerplate already spent.
+    assert note.endswith("E" * 400)
+
+
+def test_refusal_cap_note_keeps_the_reason(tmp_path) -> None:
+    """End to end: a long reason survives into `.status.yaml` at the cap."""
+    ref = make_ref(tmp_path)
+    ref.refusals = run_shepherd.MAX_REFUSALS - 1
+    ref.refusals_head = HEAD_SHA
+    reason = "operator deferred this to a separate issue. " + ("D" * 500)
+
+    result = _drive(ref, _refuse(reason))
+
+    assert result.decision == "review-stuck"
+    notes = read_status(ref)["notes"]
+    assert len(notes) <= run_shepherd.MAX_NOTES_CHARS
+    assert "operator deferred this to a separate issue." in notes
+    assert notes.count("D") > 200

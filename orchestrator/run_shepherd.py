@@ -309,6 +309,13 @@ MAX_REVIEW_ATTEMPTS = 5
 # caps the refusal reason it emits; this is the shepherd-side backstop so no
 # agent-authored prose can bloat the durable projection (mctl-agents#360).
 MAX_NOTES_CHARS = 700
+# Same bound, same reason, as run_implementer.MAX_REFUSAL_MARKER_BYTES: refuse
+# to read an oversized refusal file rather than pulling it into memory and
+# rejecting it afterwards. Duplicated rather than imported because
+# `run_implementer` must stay a deferred import here (#149) and this is read on
+# a path that runs before that import; a drifting copy of a generous bound is
+# cheaper than loading the SDK into the Temporal worker.
+MAX_REFUSAL_FILE_BYTES = 64 * 1024
 
 # Separate, much smaller cap on consecutive HARNESS failures (exit 46: our own
 # orchestration lost the implementer's work — mctl-agents#366). Deliberately not
@@ -511,6 +518,27 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
 FollowupKind = Literal["transient", "deterministic", "harness", "refused"]
 
 
+def _stuck_note(refusals: int, reason: str) -> str:
+    """The terminal note for a proposal stuck on repeated refusals.
+
+    Budgets ``MAX_NOTES_CHARS`` for the REASON rather than for the whole
+    string. Slicing the finished f-string charges the fixed prose (~210 chars)
+    against the same budget, and because the reason is interpolated last it is
+    the only part that can be lost. That is backwards for this note
+    specifically: its entire argument is "a human must reconcile the review
+    with the operator decision", the boilerplate is reconstructible and the
+    agent's evidence — the operator note it quoted, or the code it says already
+    satisfies the finding — is not.
+    """
+    prose = (
+        f"The implementer declined to act {refusals} time(s) and the findings "
+        f"still stand. review_attempts was never charged — the proposal is not "
+        f"at fault; a human must reconcile the review with the operator "
+        f"decision. Last reason: "
+    )
+    return prose + reason[: max(0, MAX_NOTES_CHARS - len(prose))]
+
+
 def _refusal_codes() -> frozenset[int]:
     """Exit codes that mean "the agent deliberately changed nothing".
 
@@ -539,10 +567,19 @@ def _read_refusal_reason(path: str) -> str | None:
     the point where agent-authored text enters the shepherd, and a cap applied
     per call site is one new log line away from being incomplete. The
     implementer caps too (``MAX_REFUSAL_REASON_CHARS``); this is the backstop
-    for anything that writes the file some other way.
+    for anything that writes the file some other way — including one that wrote
+    far too much of it, which is refused by size before it is read at all.
     """
+    marker = Path(path)
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if marker.stat().st_size > MAX_REFUSAL_FILE_BYTES:
+            print(
+                f"warn: refusal reason file {path} is over the "
+                f"{MAX_REFUSAL_FILE_BYTES}-byte cap; ignoring it. The exit code "
+                f"still decides — this only costs the operator the prose"
+            )
+            return None
+        data = json.loads(marker.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(data, dict):
@@ -2090,14 +2127,7 @@ def process_one(
                         # operator the standoff — not the platform — is the
                         # thing to look at.
                         harness_failures=None,
-                        notes=(
-                            f"The implementer declined to act {new_refusals} "
-                            f"time(s) and the findings still stand. "
-                            f"review_attempts was never charged — the proposal "
-                            f"is not at fault; a human must reconcile the "
-                            f"review with the operator decision. Last reason: "
-                            f"{reason}"
-                        )[:MAX_NOTES_CHARS],
+                        notes=_stuck_note(new_refusals, reason),
                     )
                     return ShepherdResult(
                         ref=ref,

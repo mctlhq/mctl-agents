@@ -207,6 +207,17 @@ REFUSAL_ERROR_PREFIX = "deliberate no-op:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
+# Refuse to READ a marker larger than this, rather than reading it and then
+# rejecting it. The file sits in a cloned target repo's worktree and is written
+# by an LLM holding a Bash tool: a redirect into the wrong path, a loop that
+# appends, or a stray `tee` is enough to make it enormous, with no malice
+# required. `Path.read_text()` would pull all of it into the orchestrator, and
+# an implementer OOM is the least diagnosable failure this platform has --
+# memory pressure there is a live issue, and an OOMKill does not appear in the
+# container's `last_terminated_reason`. Generous next to a legitimate marker,
+# whose `reason` is itself capped at MAX_REFUSAL_REASON_CHARS, so nothing
+# honest is anywhere near it.
+MAX_REFUSAL_MARKER_BYTES = 64 * 1024
 
 
 def _read_refusal_marker(repo_dir: Path) -> str | None:
@@ -215,6 +226,12 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
     Every check below exists to make "the agent refused" something that cannot
     be produced by accident:
 
+    - the file must be small enough to read at all
+      (``MAX_REFUSAL_MARKER_BYTES``). Checked with ``stat()`` BEFORE the read,
+      and refused outright rather than read-and-truncated: a truncated marker
+      would fail the JSON check below and reach the charged path for an
+      accidental reason, which hides an operational problem behind a correct
+      outcome;
     - the file must parse as a JSON object with ``refused`` exactly ``True``
       and a non-empty string ``reason`` — a stray file, a truncated write or a
       progress note does not qualify;
@@ -229,6 +246,19 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
     """
     path = repo_dir / REFUSAL_MARKER_FILENAME
     if not path.is_file():
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        print(f"warn: cannot stat {REFUSAL_MARKER_FILENAME} ({e}); ignoring")
+        return None
+    if size > MAX_REFUSAL_MARKER_BYTES:
+        print(
+            f"warn: {REFUSAL_MARKER_FILENAME} is {size} bytes, over the "
+            f"{MAX_REFUSAL_MARKER_BYTES}-byte cap; refusing to read it. A "
+            f"marker this size is not a considered no-op — treating the run as "
+            f"a plain no-commit failure"
+        )
         return None
     tracked = _run(
         ["git", "ls-files", "--error-unmatch", REFUSAL_MARKER_FILENAME],
