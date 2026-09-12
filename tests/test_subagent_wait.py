@@ -182,7 +182,7 @@ def test_drain_does_not_orphan_when_the_stream_ends_after_the_child_settles() ->
     )
 
 
-def test_phase_two_gets_its_own_restarted_grace_and_expiry_is_not_an_error() -> None:
+def test_phase_two_gets_its_own_restarted_grace_and_expiry_is_not_an_error(capsys) -> None:
     """The closing frame may never arrive, so waiting for it must not be fatal.
 
     Phase 2 runs on a RESTARTED deadline, not the remainder of phase 1's — a
@@ -202,20 +202,28 @@ def test_phase_two_gets_its_own_restarted_grace_and_expiry_is_not_an_error() -> 
         await anyio.sleep(10)
         yield result_message()   # too late
 
-    seen: list[str] = []
+    seen: list[object] = []
 
     async def run() -> str:
         # Generous outer bound: it must NOT be what stops us.
         with anyio.fail_after(5):
             await drain_until_settled(
                 parent_never_closes(), ledger, timeout_s=0.05,
-                on_message=lambda _m: None,
+                on_message=seen.append,
             )
         return "returned cleanly"
 
     assert anyio.run(run) == "returned cleanly"
     assert ledger.live == set()
-    assert not seen
+    # This is the only test that drives the grace to expiry, so it is where
+    # expiry's OBSERVABLE behaviour belongs. Asserting only "it returned" is
+    # what let a whole expiry branch sit dead: `for ... else` does not run when
+    # the loop is cancelled, so the warn below was unreachable while every test
+    # stayed green. A cut-off parent must not look like a clean finish in the
+    # log either.
+    assert len(seen) == 1, "only the child's settle message arrives before expiry"
+    assert isinstance(seen[0], TaskUpdatedMessage)
+    assert "no closing result frame" in capsys.readouterr().out
 
 
 def test_phase_two_grace_does_not_run_on_phase_ones_remaining_clock() -> None:

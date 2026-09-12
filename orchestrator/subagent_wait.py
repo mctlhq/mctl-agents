@@ -136,7 +136,7 @@ class LiveTaskLedger:
             # to wait for.
             if message.task_type in AWAITED_TASK_TYPES:
                 self._live.add(message.task_id)
-            elif message.task_type not in self._warned_types:
+            elif (_type := message.task_type or "") not in self._warned_types:
                 # Once per distinct type, not once per task. This filter is the
                 # single assumption the whole fix rests on -- a delegated launch
                 # arriving with a new SDK task_type (or None) would leave the
@@ -147,7 +147,7 @@ class LiveTaskLedger:
                 # dozens, and this is the same Argo log `_settle` was narrowed to
                 # keep readable. De-duplicating keeps the signal (a type nobody
                 # has seen before shows up) without the spam.
-                self._warned_types.add(message.task_type or "")
+                self._warned_types.add(_type)
                 print(
                     f"warn: not awaiting task {message.task_id} of untracked "
                     f"type {message.task_type!r}"
@@ -233,50 +233,53 @@ async def drain_until_settled(
         if ledger.live:
             # WAIT FOR QUIESCENCE, bounded. A child that never reports is the
             # orphan this whole module exists to catch.
-            settled = False
             with anyio.move_on_after(timeout_s):
                 async for message in stream:
                     on_message(message)
                     ledger.observe(message)
                     if not ledger.live:
-                        settled = True
                         break
+            # Covers both ways out: the deadline, and the stream ending. There
+            # is no third case -- the ONLY way the ledger empties in that loop
+            # is the break above, so reaching here with it non-empty means we
+            # stopped waiting on a child that never reported.
             if ledger.live:
                 raise OrphanedSubagentError(
                     f"sub-agent task(s) never reported a terminal status within "
                     f"{timeout_s:g}s: {ledger.describe()}"
                 )
-            if not settled:
-                return  # stream ended with nothing live; nothing more is coming
 
         # WAIT FOR THE CLOSING FRAME, on a RESTARTED clock -- a slow child must
         # not silently truncate the parent's commit window. Three ways out:
         # the run ends, the stream ends, or the parent delegates again and we
         # go back to waiting for quiescence.
         relaunched = False
-        exhausted = True
-        with anyio.move_on_after(timeout_s):
+        # `as scope` + cancelled_caught, NOT a flag set before the `with`:
+        # move_on_after expiring cancels the `async for` with an exception, and
+        # a `for ... else` does not run when the loop is left that way. A flag
+        # pre-set to "exhausted" therefore made a grace expiry indistinguishable
+        # from a clean stream end, and everything meant to happen on expiry --
+        # the raise below, and the warn -- was dead code.
+        with anyio.move_on_after(timeout_s) as scope:
             async for message in stream:
                 on_message(message)
                 ledger.observe(message)
                 if ledger.live:
                     relaunched = True
-                    exhausted = False
                     break
                 if isinstance(message, ResultMessage):
                     return
-            else:
-                exhausted = True
         if relaunched:
             continue
-        if exhausted:
-            return
+        if not scope.cancelled_caught:
+            return  # the stream ended on its own; nothing more is coming
         # Grace expired. If something is live we raced a launch we cannot see
         # settle -- that is an orphan. Otherwise nothing is outstanding:
         # whatever the child produced is already in the worktree and
         # `_has_new_commits` adjudicates, so this is a RETURN, not a raise.
         # Expiring here must never charge the proposal for a frame the parent
-        # simply never sent.
+        # simply never sent -- but it must SAY so, or a parent cut off mid
+        # commit looks exactly like a clean finish in the log too.
         if ledger.live:
             raise OrphanedSubagentError(
                 f"sub-agent task(s) still live when the closing frame grace of "
