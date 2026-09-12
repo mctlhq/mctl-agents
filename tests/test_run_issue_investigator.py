@@ -3207,9 +3207,9 @@ def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
 # (and so the subprocess) open past the result frame while `_inflight_tasks` is
 # non-empty, but ONLY when `sdk_mcp_servers or hooks` is truthy.
 # `build_issue_investigator_options` and its `_from_plan` twin both pass
-# `hooks=_command_audit_hooks()` — pinned by the last test in this block,
-# because dropping those hooks would silently turn the drain into a wait for a
-# process nobody is keeping alive.
+# `hooks=_command_audit_hooks()`. Dropping them would silently turn the drain
+# into a wait for a process nobody is keeping alive, so that precondition is
+# pinned once for every builder in tests/test_options.py rather than here.
 # ---------------------------------------------------------------------------
 from claude_agent_sdk import (  # noqa: E402 — grouped with the tests that use them
     TaskNotificationMessage,
@@ -3381,24 +3381,3 @@ def test_investigator_orphan_surfaces_as_a_named_harness_failure(tmp_path, monke
     assert "harness failure" in result.error
     assert "still live" in result.error
     assert result.rate_limited is False
-
-
-def test_investigator_options_keep_the_hooks_the_drain_depends_on():
-    """The precondition, pinned.
-
-    The SDK holds the CLI subprocess open past the result frame only when
-    `sdk_mcp_servers or hooks` is truthy. Every mctl MCP server this repo
-    configures is `type: "http"`, so `sdk_mcp_servers` is always empty and
-    `hooks` is the whole precondition. Drop them and the drain becomes a wait
-    for a child nobody is keeping alive.
-    """
-    from orchestrator.options import build_issue_investigator_options
-
-    options = build_issue_investigator_options(
-        Path("/tmp"), "claude-sonnet-4-5", Path("/tmp")
-    )
-    assert options.hooks, "issue-investigator lost the hooks the #366 drain relies on"
-    assert not any(
-        isinstance(cfg, dict) and cfg.get("type") == "sdk"
-        for cfg in (options.mcp_servers or {}).values()
-    ), "an SDK-MCP server would also satisfy the precondition — update this test"

@@ -259,27 +259,92 @@ def test_implementer_drain_timeout_honours_its_env_override(monkeypatch):
         importlib.reload(options)
 
 
-def test_implementer_keeps_hooks_which_is_what_holds_stdin_open(tmp_path, monkeypatch):
+def test_hooks_are_what_hold_stdin_open_for_every_drainable_builder(tmp_path, monkeypatch):
     """Load-bearing precondition for the #366 drain, not incidental config.
 
     claude_agent_sdk only keeps stdin open past a result frame with tasks in
-    flight when `sdk_mcp_servers or hooks` is truthy. Strip the implementer's
-    hooks and the CLI would exit at the first result, so awaiting the sub-agent
-    would block on a dead child instead of recovering its commit.
+    flight when `sdk_mcp_servers or hooks` is truthy. Strip a mode's hooks and
+    the CLI would exit at the first result, so awaiting the sub-agent would
+    block on a dead child instead of recovering its work.
+
+    And it must be the HOOKS carrying it, not the MCP config: the SDK lifts a
+    server into `sdk_mcp_servers` only when its config says `type: "sdk"`
+    (`_internal/client.py`), and mctl_mcp_config() emits `type: "http"`.
+    Asserting both halves keeps the test from passing for the wrong reason, and
+    makes it demand an update the day an sdk-type server does appear.
+
+    MCTL_TOKEN is set so mcp_servers is actually populated — without it the
+    config is `{}` and the "no sdk-type server" half is vacuously true, which
+    is the specific way this test could rot into a no-op.
+
+    One test over every builder rather than one per driver: the property is a
+    single fact about the SDK, and stating it once is what keeps the drivers
+    that drain (implementer #367, issue-investigator and service-agent #368)
+    from drifting apart from the one that could (incident-responder, which has
+    the precondition but nothing to delegate to today).
     """
-    monkeypatch.setenv("MCTL_TOKEN", "t")
-    built = options.build_implementer_agent_options(tmp_path, "claude-sonnet-5")
-    assert built.hooks
-    # And it must be the HOOKS carrying it, not the MCP config: the SDK lifts a
-    # server into `sdk_mcp_servers` only when its config says `type: "sdk"`, and
-    # mctl_mcp_config() emits `type: "http"`. Asserting this keeps the test from
-    # passing for the wrong reason, and makes it demand an update the day an
-    # sdk-type server does appear.
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    incident_dir = tmp_path / "_incident-responder"
+    incident_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    builders = {
+        "implementer": options.build_implementer_agent_options(repo_dir, "test-model"),
+        "service-agent": options.build_service_agent_options(repo_dir, "test-model"),
+        "incident-responder": options.build_incident_responder_options(
+            agent_dir=incident_dir, model="test-model", state_dir=tmp_path,
+        ),
+        "issue-investigator": options.build_issue_investigator_options(
+            repo_dir, model="test-model", proposal_dir=proposal_dir,
+        ),
+        "issue-investigator/from_plan": options.build_issue_investigator_options_from_plan(
+            plan, repo_dir, proposal_dir,
+        ),
+    }
+    for name, built in builders.items():
+        assert built.hooks, f"{name} lost the hooks the #366 drain relies on"
+        assert built.mcp_servers, f"{name}: expected the http mctl server to be configured"
+        assert not [
+            server for server, cfg in built.mcp_servers.items()
+            if isinstance(cfg, dict) and cfg.get("type") == "sdk"
+        ], f"{name}: an sdk-type server would also satisfy the precondition — update this test"
+
+
+def test_the_mentor_has_neither_hooks_nor_an_sdk_mcp_server(tmp_path, monkeypatch):
+    """The negative result of the #368 audit, made executable.
+
+    `build_mentor_options` passes `mcp_servers=` but NO hooks, and the mctl
+    server it passes is `type: "http"` — which the SDK does not lift into
+    `sdk_mcp_servers`. So `sdk_mcp_servers or hooks` is falsy and the SDK
+    closes stdin at the first result frame: the CLI exits, the stream ends, and
+    there is no child left alive to drain toward.
+
+    This test exists to stop the #366 pattern being copied here on the
+    assumption that "it has an MCP server, so it qualifies". It does not.
+    Draining run_mentor as it stands would convert a silent loss into a
+    guaranteed OrphanedSubagentError on every delegating run. Giving the mentor
+    the audit hooks to make it drainable is a real behaviour change to a mode
+    that does not delegate today — a deliberate decision, not a refactor, and
+    if it is ever taken this test is the thing that must change with it.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    mentor_dir = tmp_path / "_mentor"
+    mentor_dir.mkdir()
+
+    built = options.build_mentor_options(mentor_dir, "test-model")
+
+    assert not built.hooks, (
+        "the mentor grew hooks — it is now drainable, which is a deliberate "
+        "behaviour change; see mctl-agents#366/#368 before updating this test"
+    )
     assert built.mcp_servers, "expected the http mctl server to be configured"
     assert not [
-        name for name, cfg in built.mcp_servers.items()
+        server for server, cfg in built.mcp_servers.items()
         if isinstance(cfg, dict) and cfg.get("type") == "sdk"
-    ]
+    ], "an sdk-type server WOULD satisfy the precondition — the mentor is now drainable"
 
 
 def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):

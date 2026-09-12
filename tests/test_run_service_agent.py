@@ -78,7 +78,8 @@ def test_mcp_not_configured_skips_status_check_entirely(monkeypatch):
 # Draining is sound here only because `build_service_agent_options` passes
 # `hooks=_command_audit_hooks()` — the SDK keeps stdin (and so the CLI
 # subprocess) open past the result frame while tasks are in flight, but ONLY
-# when `sdk_mcp_servers or hooks` is truthy. Pinned by the last test below.
+# when `sdk_mcp_servers or hooks` is truthy. That precondition is pinned once
+# for every builder in tests/test_options.py, not re-asserted here.
 # ---------------------------------------------------------------------------
 class _StreamingClient:
     """Like conftest's FakeMcpClient, but `messages` is an async-generator
@@ -241,22 +242,3 @@ def test_orphan_does_not_tear_down_the_sibling_agents(monkeypatch, capsys):
     anyio.run(run_all._safe_run_service, "mctl-agent")  # must not raise
 
     assert "ServiceAgentOrphanedSubagent" in capsys.readouterr().err
-
-
-def test_service_agent_options_keep_the_hooks_the_drain_depends_on(tmp_path):
-    """The precondition, pinned.
-
-    The SDK holds the CLI subprocess open past the result frame only when
-    `sdk_mcp_servers or hooks` is truthy. Every mctl MCP server this repo
-    configures is `type: "http"`, so `sdk_mcp_servers` is always empty and
-    `hooks` is the whole precondition. Drop them and the drain becomes a wait
-    for a child nobody is keeping alive.
-    """
-    from orchestrator.options import build_service_agent_options
-
-    options = build_service_agent_options(tmp_path, "claude-sonnet-4-5")
-    assert options.hooks, "service-agent lost the hooks the #366 drain relies on"
-    assert not any(
-        isinstance(cfg, dict) and cfg.get("type") == "sdk"
-        for cfg in (options.mcp_servers or {}).values()
-    ), "an SDK-MCP server would also satisfy the precondition — update this test"
