@@ -2431,6 +2431,11 @@ def reconcile_one(
         repair_fields["attempt"] = _finished_attempt(ref)
         if ref.status == "review-stuck":
             repair_fields["review_attempts"] = None
+            # Both counters, or the un-stick hands back a proposal with no
+            # budget: a proposal driven to review-stuck by repeated harness
+            # failures would come back at harness_failures == MAX and re-trip
+            # the cap on the very next one. Caught by the #366 sweep.
+            repair_fields["harness_failures"] = None
     changed = _update_status_if_changed(
         ref,
         target_status,

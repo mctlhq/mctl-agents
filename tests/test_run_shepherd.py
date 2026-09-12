@@ -3404,3 +3404,40 @@ def test_followup_subprocess_error_cannot_contradict_itself() -> None:
     assert run_shepherd.FollowupSubprocessError(
         "x", kind="deterministic"
     ).transient is False
+
+
+def test_reconcile_unstick_clears_both_counters(tmp_path) -> None:
+    """Un-sticking must hand back a fresh budget on BOTH axes.
+
+    The reconcile path clears `review_attempts`, and before this test it cleared
+    only that. A proposal driven to `review-stuck` by repeated harness failures
+    would then come back with `harness_failures` still at MAX and re-trip the cap
+    on the very next one — un-stuck in name only.
+    """
+    ref = make_ref(
+        tmp_path,
+        service="mctl-agents",
+        slug="stuck-on-harness",
+        status="review-stuck",
+    )
+    status = read_status(ref)
+    status["github"] = {
+        "state": "open",
+        "head_sha": HEAD_SHA,
+        "observed_at": "2026-04-29T12:00:00Z",
+    }
+    status["review_attempts"] = 5
+    status["harness_failures"] = run_shepherd.MAX_HARNESS_FAILURES
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False), encoding="utf-8",
+    )
+
+    approved = make_pr(review_decision="APPROVED")
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=approved):
+        result = run_shepherd.reconcile_one(ref)
+
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert "review_attempts" not in final
+    assert "harness_failures" not in final
