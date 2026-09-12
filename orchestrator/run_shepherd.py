@@ -305,16 +305,27 @@ RECONCILE_INPUT_STATUSES = {
 # something new on the fix itself. This does not address #342 (attempts
 # spent on a finding the approved proposal already excluded).
 MAX_REVIEW_ATTEMPTS = 5
-# Upper bound on a note written into `.status.yaml`. The implementer already
-# caps the refusal reason it emits; this is the shepherd-side backstop so no
+# Upper bound on the AGENT-AUTHORED PORTION of a note written into
+# `.status.yaml` — not on the finished note. The implementer already caps the
+# refusal reason it emits; this is the shepherd-side backstop so no
 # agent-authored prose can bloat the durable projection (mctl-agents#360).
+#
+# Scoping it to the agent's text rather than the whole string is the point: our
+# own framing around it is fixed-size and reconstructible, so charging it
+# against the same budget would silently spend the evidence's room on
+# boilerplate. Notes stay bounded either way — a fixed prefix plus a bounded
+# reason is bounded.
 MAX_NOTES_CHARS = 700
 # Same bound, same reason, as run_implementer.MAX_REFUSAL_MARKER_BYTES: refuse
 # to read an oversized refusal file rather than pulling it into memory and
-# rejecting it afterwards. Duplicated rather than imported because
-# `run_implementer` must stay a deferred import here (#149) and this is read on
-# a path that runs before that import; a drifting copy of a generous bound is
-# cheaper than loading the SDK into the Temporal worker.
+# rejecting it afterwards. Duplicated for one narrow reason — a module-level
+# constant cannot reference a deferred import, and `run_implementer` must stay
+# deferred here (#149, guarded by tests/test_worker_isolation.py). The equality
+# is load-bearing in one direction: this is the OUTER bound, so a raised
+# implementer-side cap with this one left behind would honour a marker whose
+# reason the shepherd then refuses to read, losing the evidence for exactly the
+# oversized case the bound exists to make visible. Pinned by
+# test_the_duplicated_byte_cap_matches_the_implementers.
 MAX_REFUSAL_FILE_BYTES = 64 * 1024
 
 # Separate, much smaller cap on consecutive HARNESS failures (exit 46: our own
@@ -521,14 +532,18 @@ FollowupKind = Literal["transient", "deterministic", "harness", "refused"]
 def _stuck_note(refusals: int, reason: str) -> str:
     """The terminal note for a proposal stuck on repeated refusals.
 
-    Budgets ``MAX_NOTES_CHARS`` for the REASON rather than for the whole
-    string. Slicing the finished f-string charges the fixed prose (~210 chars)
-    against the same budget, and because the reason is interpolated last it is
-    the only part that can be lost. That is backwards for this note
-    specifically: its entire argument is "a human must reconcile the review
-    with the operator decision", the boilerplate is reconstructible and the
-    agent's evidence — the operator note it quoted, or the code it says already
-    satisfies the finding — is not.
+    The reason gets the WHOLE ``MAX_NOTES_CHARS`` budget and the fixed prose
+    sits outside it, so the finished note is a little longer than the constant.
+    That is deliberate, and it is the difference from ``(prose + reason)[:N]``,
+    which spends ~210 characters of the agent's budget on boilerplate — and,
+    because the reason is interpolated last, drops precisely the evidence.
+    Backwards for this note above all: its entire argument is that a human must
+    reconcile the review with the operator decision, the framing is
+    reconstructible and the operator note the agent quoted is not.
+
+    The slice is still a backstop rather than decoration: the reason usually
+    arrives already capped by ``_read_refusal_reason``, but ``e.reason`` can be
+    set by any caller, so the bound is applied where the note is built too.
     """
     prose = (
         f"The implementer declined to act {refusals} time(s) and the findings "
@@ -536,7 +551,17 @@ def _stuck_note(refusals: int, reason: str) -> str:
         f"at fault; a human must reconcile the review with the operator "
         f"decision. Last reason: "
     )
-    return prose + reason[: max(0, MAX_NOTES_CHARS - len(prose))]
+    return prose + reason[:MAX_NOTES_CHARS]
+
+
+def _declined_note(reason: str) -> str:
+    """The non-terminal ``wait`` note, under the same rule as ``_stuck_note``.
+
+    A 28-character prefix crowds out far less than the terminal note's ~210,
+    but the rule is not about magnitude: two notes carrying the same evidence
+    should not budget it two different ways.
+    """
+    return f"implementer declined to act: {reason[:MAX_NOTES_CHARS]}"
 
 
 def _refusal_codes() -> frozenset[int]:
@@ -568,19 +593,34 @@ def _read_refusal_reason(path: str) -> str | None:
     per call site is one new log line away from being incomplete. The
     implementer caps too (``MAX_REFUSAL_REASON_CHARS``); this is the backstop
     for anything that writes the file some other way — including one that wrote
-    far too much of it, which is refused by size before it is read at all.
+    far too much of it, which a bounded read refuses without taking it into
+    memory. This file is an orchestrator-managed temp path outside the agent's
+    workspace, so the race that motivates the bound in
+    ``run_implementer._read_refusal_marker`` is not reachable here; the pattern
+    is still the unsafe one, and an unsafe pattern kept "because this caller is
+    fine" is how it ends up copied somewhere that is not.
+
+    The handler is broad for the reason spelled out in
+    ``run_implementer._read_refusal_marker``: deeply nested JSON raises
+    ``RecursionError``, which is not an ``OSError`` or a ``ValueError``, and an
+    escape from here propagates out of ``apply_followup`` past
+    ``process_one``'s ``except FollowupSubprocessError`` and aborts the whole
+    tick. Losing the prose is the designed degradation; losing the tick is not.
     """
-    marker = Path(path)
     try:
-        if marker.stat().st_size > MAX_REFUSAL_FILE_BYTES:
+        with Path(path).open("rb") as fh:
+            raw = fh.read(MAX_REFUSAL_FILE_BYTES + 1)
+        if len(raw) > MAX_REFUSAL_FILE_BYTES:
             print(
                 f"warn: refusal reason file {path} is over the "
-                f"{MAX_REFUSAL_FILE_BYTES}-byte cap; ignoring it. The exit code "
-                f"still decides — this only costs the operator the prose"
+                f"{MAX_REFUSAL_FILE_BYTES}-byte cap (the read stopped there); "
+                f"ignoring it. The exit code still decides — this only costs "
+                f"the operator the prose"
             )
             return None
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
+        print(f"warn: could not read refusal reason from {path} ({type(e).__name__}: {e})")
         return None
     if not isinstance(data, dict):
         return None
@@ -1768,22 +1808,27 @@ def apply_followup(
     )
     os.close(refusal_fd)
 
-    cmd = [
-        sys.executable, "-m", "orchestrator.run_implementer",
-        "--service", service,
-        "--slug", slug,
-        "--review-feedback", bundle_path,
-        "--refusal-out", refusal_path,
-    ]
-    # Forward --state-dir only when it differs from the implementer's
-    # own DEFAULT_STATE_DIR. The implementer's argparse default is the
-    # same env-driven path; appending it unconditionally would be noise.
-    from orchestrator import run_implementer  # deferred — see the SDK import above
-
-    if state_dir is not None and Path(state_dir) != run_implementer.DEFAULT_STATE_DIR:
-        cmd.extend(["--state-dir", str(state_dir)])
-    print(f"$ {' '.join(cmd)}")
+    # The `try` starts HERE, not at the subprocess call: everything below can
+    # raise — notably the deferred `run_implementer` import, which this repo
+    # deliberately expects to be absent in some environments (#149) — and the
+    # `finally` must cover the paths' whole lifetime, not just the fork. A
+    # shepherd that ticks on a schedule leaks two /tmp files per tick otherwise.
     try:
+        cmd = [
+            sys.executable, "-m", "orchestrator.run_implementer",
+            "--service", service,
+            "--slug", slug,
+            "--review-feedback", bundle_path,
+            "--refusal-out", refusal_path,
+        ]
+        # Forward --state-dir only when it differs from the implementer's
+        # own DEFAULT_STATE_DIR. The implementer's argparse default is the
+        # same env-driven path; appending it unconditionally would be noise.
+        from orchestrator import run_implementer  # deferred — see the SDK import above
+
+        if state_dir is not None and Path(state_dir) != run_implementer.DEFAULT_STATE_DIR:
+            cmd.extend(["--state-dir", str(state_dir)])
+        print(f"$ {' '.join(cmd)}")
         proc = subprocess.run(cmd, check=False, text=True)  # noqa: S603 — cmd is list[str], built above
         refusal_reason = _read_refusal_reason(refusal_path)
     finally:
@@ -2099,7 +2144,7 @@ def process_one(
                 # a later tick can act on new information. The reason is
                 # durable — it is the only record of why this tick was a no-op.
                 reason = e.reason or "no reason recorded by the implementer"
-                note = f"implementer declined to act: {reason}"[:MAX_NOTES_CHARS]
+                note = _declined_note(reason)
                 # Consecutive on ONE head: a push moves the branch, so the
                 # next bundle is about different code and deserves a fresh
                 # budget. Without this the counter would be lifetime-per-PR and

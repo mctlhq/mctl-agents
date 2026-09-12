@@ -435,26 +435,62 @@ def test_subagent_definitions_exclude_the_blocked_case() -> None:
 # failure available here: memory pressure on that workload is a live issue and
 # an OOMKill does not surface in `last_terminated_reason`.
 # ---------------------------------------------------------------------------
-def test_oversized_marker_is_refused_without_being_read(repo, monkeypatch) -> None:
-    """The guard must be a `stat()`, not a truncating read.
+def test_the_read_itself_is_bounded(repo, monkeypatch) -> None:
+    """The cap must bind the READ, not a syscall that preceded it.
 
-    Asserted by making any `read_text` fatal: if the implementation ever reads
-    first and checks afterwards, this fails instead of quietly reintroducing the
-    unbounded read. Truncating would also be wrong for a second reason — the
-    fragment would fail the JSON check and reach the charged path for an
-    accidental reason, hiding an operational problem behind a correct outcome.
+    `stat()` then `read_text()` establishes a size and then reads to EOF: the
+    marker lives in the agent's own workspace and the agent holds a Bash tool,
+    so a background appender (a stray loop, no malice needed) passes the check
+    and then makes the read grow without bound. A test cannot fix that shape —
+    it can only document it — so this asserts the property that replaces it:
+    the function never asks the file for more than one byte past the cap.
     """
-    path = repo / run_implementer.REFUSAL_MARKER_FILENAME
-    path.write_text(
-        "x" * (run_implementer.MAX_REFUSAL_MARKER_BYTES + 1), encoding="utf-8",
+    _write_marker(repo, {"refused": True, "reason": "r"})
+    cap = run_implementer.MAX_REFUSAL_MARKER_BYTES
+    requested = []
+    real_open = Path.open
+
+    class _CountingHandle:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, size=-1):
+            requested.append(size)
+            return self._fh.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self._fh.close()
+            return False
+
+    def counting_open(self, *a, **kw):
+        return _CountingHandle(real_open(self, *a, **kw))
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert requested == [cap + 1], (
+        "the marker must be read with an explicit bound, never to EOF"
     )
 
-    def fatal_read(*_a, **_kw):
-        raise AssertionError("the oversized marker must never be read")
 
-    monkeypatch.setattr(Path, "read_text", fatal_read)
+def test_an_enormous_marker_is_refused(repo) -> None:
+    """A real file far past the cap is rejected, and quickly."""
+    path = repo / run_implementer.REFUSAL_MARKER_FILENAME
+    path.write_bytes(b"x" * (run_implementer.MAX_REFUSAL_MARKER_BYTES * 80))
     assert run_implementer._read_refusal_marker(repo) is None
 
+
+def test_an_unreadable_marker_is_not_a_crash(repo, monkeypatch) -> None:
+    """`is_file()` then `open()` is still two syscalls; the file can vanish."""
+    _write_marker(repo, {"refused": True, "reason": "r"})
+
+    def gone(*_a, **_kw):
+        raise FileNotFoundError("vanished")
+
+    monkeypatch.setattr(Path, "open", gone)
+    assert run_implementer._read_refusal_marker(repo) is None
 
 def test_oversized_marker_falls_back_to_the_charged_path(repo, monkeypatch) -> None:
     """Refusing the marker must leave the ordinary failure intact, not a crash."""
@@ -485,19 +521,98 @@ def test_a_marker_at_the_cap_is_still_honoured(repo) -> None:
     assert run_implementer._read_refusal_marker(repo) == "operator decision"
 
 
-def test_vanished_marker_between_stat_and_read_is_not_a_crash(repo, monkeypatch) -> None:
-    """`is_file()` then `stat()` is a race by construction; it must degrade."""
-    _write_marker(repo, {"refused": True, "reason": "r"})
-    real_stat = Path.stat
-    seen = []
+def _deeply_nested_marker(repo: Path, depth: int = 20_000) -> Path:
+    """A marker that is small, syntactically valid, and blows the C stack."""
+    path = repo / run_implementer.REFUSAL_MARKER_FILENAME
+    payload = '{"refused": true, "reason": ' + "[" * depth + "]" * depth + "}"
+    path.write_text(payload, encoding="utf-8")
+    assert path.stat().st_size < run_implementer.MAX_REFUSAL_MARKER_BYTES, (
+        "the point of this test is a payload the SIZE cap lets through"
+    )
+    return path
 
-    def racing_stat(self, *a, **kw):
-        # Let `is_file()` succeed, then fail the size check the way a deleted
-        # file would — the window the two calls actually leave open.
-        seen.append(self)
-        if len(seen) > 1:
-            raise FileNotFoundError("vanished")
-        return real_stat(self, *a, **kw)
 
-    monkeypatch.setattr(Path, "stat", racing_stat)
+def test_deeply_nested_marker_is_ignored_not_raised(repo) -> None:
+    _deeply_nested_marker(repo)
     assert run_implementer._read_refusal_marker(repo) is None
+
+
+def test_nested_marker_falls_back_to_the_charged_path(repo, monkeypatch) -> None:
+    """The destination is what matters: 42, not the counter-less exit 1."""
+    _stub_review_feedback(monkeypatch, repo)
+    _deeply_nested_marker(repo)
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error == "implementer produced no follow-up commits"
+    assert run_implementer._review_feedback_exit_code(result.error) == 42
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RecursionError("maximum recursion depth exceeded"),
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        MemoryError(),
+        RuntimeError("something nobody enumerated"),
+    ],
+    ids=["recursion", "unicode", "memory", "unknown"],
+)
+def test_any_read_failure_means_not_a_refusal(repo, monkeypatch, exc) -> None:
+    """The property, stated once: no exception type escapes this function.
+
+    Pinning the class rather than today's four members is the whole point — the
+    next exception nobody enumerated must land on the charged path too, without
+    anyone having to add it to a tuple first.
+    """
+    _write_marker(repo, {"refused": True, "reason": "r"})
+
+    def boom(*_a, **_kw):
+        raise exc
+
+    monkeypatch.setattr(Path, "open", boom)
+    assert run_implementer._read_refusal_marker(repo) is None
+
+
+def test_a_failing_refusal_write_still_exits_47(tmp_path, monkeypatch) -> None:
+    """`_write_refusal_out` runs just before `sys.exit(47)`.
+
+    An escape there would swap a correctly-classified refusal for an uncaught
+    traceback and exit 1 — the counter-less arm — over prose that is advisory
+    by design.
+    """
+    ref = _ref(tmp_path)
+    bundle = tmp_path / "feedback.json"
+    bundle.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("sys.argv", [
+        "run_implementer.py",
+        "--service", "mctl-web",
+        "--slug", "test-slug",
+        "--state-dir", str(tmp_path),
+        "--review-feedback", str(bundle),
+        "--refusal-out", str(tmp_path / "refusal.json"),
+    ])
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(run_implementer, "_load_review_feedback", lambda _p: {})
+    monkeypatch.setattr(
+        run_implementer, "find_accepted_proposals", lambda *_a, **_kw: [ref],
+    )
+    monkeypatch.setattr(
+        run_implementer, "review_feedback_one",
+        lambda *_a, **_kw: run_implementer.ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"{run_implementer.REFUSAL_ERROR_PREFIX} operator decision",
+        ),
+    )
+
+    def boom(*_a, **_kw):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(Path, "write_text", boom)
+
+    with pytest.raises(SystemExit) as exc:
+        run_implementer.main()
+
+    assert exc.value.code == run_implementer.EXIT_DELIBERATE_NO_OP

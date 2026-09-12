@@ -227,11 +227,18 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
     be produced by accident:
 
     - the file must be small enough to read at all
-      (``MAX_REFUSAL_MARKER_BYTES``). Checked with ``stat()`` BEFORE the read,
-      and refused outright rather than read-and-truncated: a truncated marker
-      would fail the JSON check below and reach the charged path for an
-      accidental reason, which hides an operational problem behind a correct
-      outcome;
+      (``MAX_REFUSAL_MARKER_BYTES``). Enforced by a BOUNDED READ — one byte
+      past the cap, then a length test — not by ``stat()`` followed by
+      ``read_text()``. The marker lives in the agent's own workspace and the
+      agent holds a Bash tool, so a size established by an earlier syscall is
+      not a fact about the read that follows it: a background appender (a stray
+      loop, no malice needed) passes the check and then makes the read grow
+      without bound. A bounded read cannot be raced, needs no ``stat()``, and
+      the one extra byte distinguishes "exactly at the cap" from "over it"
+      without a second syscall. Over-cap is refused outright rather than
+      truncated: a truncated marker would fail the JSON check below and reach
+      the charged path for an accidental reason, hiding an operational problem
+      behind a correct outcome;
     - the file must parse as a JSON object with ``refused`` exactly ``True``
       and a non-empty string ``reason`` — a stray file, a truncated write or a
       progress note does not qualify;
@@ -243,21 +250,45 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
 
     Returns ``None`` (and logs why) for anything that does not qualify, so the
     caller falls back to the ordinary "no follow-up commits" failure.
+
+    The handlers below are deliberately BROAD rather than a tuple of the
+    exception types we happened to think of. Enumerating them is the same class
+    of bug as a bound written ``value <= 0`` that misses ``nan``: deeply nested
+    JSON raises ``RecursionError`` (a ``RuntimeError``, so ``OSError |
+    ValueError`` misses it) from a payload that fits inside
+    ``MAX_REFUSAL_MARKER_BYTES`` — and an escape from here does not fail safe.
+    It surfaces as a bare ``Exception`` with no prefix
+    ``_review_feedback_exit_code`` recognises, exits 1, and the shepherd
+    classifies 1 as *transient* — the one arm with no counter at all, so it
+    retries a paid run every tick forever. Catching broadly is safe here
+    precisely because the fallback is the conservative, charged path: every
+    failure means "not a refusal", which costs one bounded attempt.
+    ``BaseException`` (KeyboardInterrupt, SystemExit) is deliberately not
+    caught.
     """
     path = repo_dir / REFUSAL_MARKER_FILENAME
     if not path.is_file():
         return None
+    # Bounded read, binary: `read(n)` on a text handle counts CHARACTERS, which
+    # would let a multi-byte payload pull up to 4n bytes past a cap named in
+    # bytes. Reading one byte past the cap makes the over-cap case detectable
+    # from the length alone, and nothing is decoded unless the whole file
+    # arrived under the cap, so a partial UTF-8 sequence is never in play.
     try:
-        size = path.stat().st_size
-    except OSError as e:
-        print(f"warn: cannot stat {REFUSAL_MARKER_FILENAME} ({e}); ignoring")
-        return None
-    if size > MAX_REFUSAL_MARKER_BYTES:
+        with path.open("rb") as fh:
+            raw = fh.read(MAX_REFUSAL_MARKER_BYTES + 1)
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
         print(
-            f"warn: {REFUSAL_MARKER_FILENAME} is {size} bytes, over the "
-            f"{MAX_REFUSAL_MARKER_BYTES}-byte cap; refusing to read it. A "
-            f"marker this size is not a considered no-op — treating the run as "
-            f"a plain no-commit failure"
+            f"warn: cannot read {REFUSAL_MARKER_FILENAME} "
+            f"({type(e).__name__}: {e}); ignoring"
+        )
+        return None
+    if len(raw) > MAX_REFUSAL_MARKER_BYTES:
+        print(
+            f"warn: {REFUSAL_MARKER_FILENAME} is over the "
+            f"{MAX_REFUSAL_MARKER_BYTES}-byte cap (the read stopped there); "
+            f"refusing it. A marker this size is not a considered no-op — "
+            f"treating the run as a plain no-commit failure"
         )
         return None
     tracked = _run(
@@ -284,9 +315,15 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
         )
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        print(f"warn: {REFUSAL_MARKER_FILENAME} is not readable JSON ({e}); ignoring")
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
+        # RecursionError (nested JSON), UnicodeDecodeError (a binary file
+        # written to this path), MemoryError, and whatever the next one turns
+        # out to be all mean the same thing: we could not read a refusal here.
+        print(
+            f"warn: {REFUSAL_MARKER_FILENAME} is not readable JSON "
+            f"({type(e).__name__}: {e}); ignoring"
+        )
         return None
     if not isinstance(data, dict) or data.get("refused") is not True:
         print(f"warn: {REFUSAL_MARKER_FILENAME} has no `refused: true`; ignoring")
@@ -310,8 +347,17 @@ def _write_refusal_out(path: Path, reason: str) -> None:
             json.dumps({"refused": True, "reason": reason}, ensure_ascii=False),
             encoding="utf-8",
         )
-    except OSError as e:  # pragma: no cover — defensive
-        print(f"warn: could not write refusal reason to {path}: {e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001 — advisory write; see below
+        # Broad for the same reason as `_read_refusal_marker`, and with a
+        # sharper consequence: this runs immediately before `sys.exit(47)`, so
+        # an escape would replace a correctly-classified refusal with an
+        # uncaught traceback and exit 1 — the counter-less transient arm. The
+        # reason is advisory; the exit code is what matters.
+        print(
+            f"warn: could not write refusal reason to {path} "
+            f"({type(e).__name__}: {e}); the exit code still carries the decision",
+            file=sys.stderr,
+        )
 
 
 def _review_feedback_exit_code(error: str) -> int:

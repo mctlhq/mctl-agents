@@ -3735,12 +3735,20 @@ def test_refusal_counter_increments_below_the_cap(tmp_path) -> None:
 
 
 def test_refusal_note_is_bounded(tmp_path) -> None:
-    """An agent-authored string must not bloat the durable projection."""
+    """An agent-authored string must not bloat the durable projection.
+
+    The bound is on the AGENT's text, not on the finished note: our own framing
+    is fixed-size and reconstructible, so charging it against the same budget
+    would spend the evidence's room on boilerplate. A fixed prefix plus a
+    bounded reason is still bounded, which is what the second assertion pins.
+    """
     ref = make_ref(tmp_path)
 
     result = _drive(ref, _refuse("x" * 5000))
 
-    assert len(read_status(ref)["notes"]) <= run_shepherd.MAX_NOTES_CHARS
+    notes = read_status(ref)["notes"]
+    assert notes.count("x") == run_shepherd.MAX_NOTES_CHARS
+    assert len(notes) < 2 * run_shepherd.MAX_NOTES_CHARS
     assert result.decision == "wait"
 
 
@@ -3970,40 +3978,49 @@ def test_alternating_harness_and_refusal_reaches_the_refusal_cap(tmp_path) -> No
     assert "harness defect" not in final["notes"]
 
 
-def test_oversized_refusal_reason_file_is_not_read(tmp_path, monkeypatch) -> None:
-    """Mirror of the implementer-side cap (agy P2 on #369).
-
-    The shepherd writes the temp path itself and its own child fills it, so this
-    is the least likely of the two to grow — but it is the same unbounded
-    `read_text` on the same class of file, and the exit code already carries the
-    decision, so refusing by size costs nothing but the prose.
-    """
+def test_oversized_refusal_reason_file_is_refused(tmp_path) -> None:
+    """Mirror of the implementer-side cap (agy P2 on #369)."""
     path = tmp_path / "refusal.json"
-    path.write_text("z" * (run_shepherd.MAX_REFUSAL_FILE_BYTES + 1), encoding="utf-8")
-
-    def fatal_read(*_a, **_kw):
-        raise AssertionError("the oversized reason file must never be read")
-
-    monkeypatch.setattr(Path, "read_text", fatal_read)
+    path.write_bytes(b"z" * (run_shepherd.MAX_REFUSAL_FILE_BYTES * 4))
     assert run_shepherd._read_refusal_reason(str(path)) is None
 
 
-def test_stuck_note_spends_its_budget_on_the_evidence(tmp_path) -> None:
-    """The reason is the part a human cannot reconstruct, so it gets the room.
+def test_the_shepherd_read_is_bounded_too(tmp_path, monkeypatch) -> None:
+    """Same shape, same fix — even though this caller is not the exposed one.
 
-    Slicing the finished string charged the ~210 chars of fixed prose against
-    the same budget, and since the reason is interpolated last it was the only
-    part that could be lost — on the one note whose whole argument is "a human
-    must reconcile the review with the operator decision".
+    The file is an orchestrator-managed temp path outside the agent's
+    workspace, so the append race that motivates the bound in the implementer
+    is not reachable here. It is fixed anyway because an unsafe reading pattern
+    kept "because this caller is fine" is how it ends up copied somewhere that
+    is not.
     """
-    reason = "E" * 4000
-    note = run_shepherd._stuck_note(3, reason)
+    path = tmp_path / "refusal.json"
+    path.write_text(json.dumps({"refused": True, "reason": "r"}), encoding="utf-8")
+    cap = run_shepherd.MAX_REFUSAL_FILE_BYTES
+    requested = []
+    real_open = Path.open
 
-    assert len(note) == run_shepherd.MAX_NOTES_CHARS
-    assert "not at fault" in note
-    # The evidence gets everything the boilerplate does not need, not what is
-    # left of a budget the boilerplate already spent.
-    assert note.endswith("E" * 400)
+    class _CountingHandle:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, size=-1):
+            requested.append(size)
+            return self._fh.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self._fh.close()
+            return False
+
+    def counting_open(self, *a, **kw):
+        return _CountingHandle(real_open(self, *a, **kw))
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    assert run_shepherd._read_refusal_reason(str(path)) == "r"
+    assert requested == [cap + 1]
 
 
 def test_refusal_cap_note_keeps_the_reason(tmp_path) -> None:
@@ -4017,6 +4034,140 @@ def test_refusal_cap_note_keeps_the_reason(tmp_path) -> None:
 
     assert result.decision == "review-stuck"
     notes = read_status(ref)["notes"]
-    assert len(notes) <= run_shepherd.MAX_NOTES_CHARS
-    assert "operator deferred this to a separate issue." in notes
-    assert notes.count("D") > 200
+    # Whole, not merely present: a reason the trust boundary admits is never
+    # clipped by the framing wrapped around it.
+    assert reason in notes
+    assert notes.count("D") == 500
+
+
+def test_nested_refusal_reason_file_does_not_escape(tmp_path) -> None:
+    """Mirror of the implementer-side hole (agy's second P2 on #369).
+
+    `RecursionError` is not an `OSError` or a `ValueError`, and an escape here
+    propagates out of `apply_followup`, past `process_one`'s
+    `except FollowupSubprocessError`, and aborts the whole tick — every other
+    proposal in it included. Losing the prose is the designed degradation.
+    """
+    path = tmp_path / "refusal.json"
+    depth = 20_000
+    path.write_text(
+        '{"refused": true, "reason": ' + "[" * depth + "]" * depth + "}",
+        encoding="utf-8",
+    )
+    assert path.stat().st_size < run_shepherd.MAX_REFUSAL_FILE_BYTES
+
+    assert run_shepherd._read_refusal_reason(str(path)) is None
+
+
+def test_refusal_is_still_classified_when_the_reason_cannot_be_read() -> None:
+    """End to end: an unreadable reason must not cost the classification.
+
+    The exit code carries the decision; the file is advisory. This is the
+    property that keeps a malformed reason out of the counter-less arm.
+    """
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    depth = 20_000
+    nested = '{"refused": true, "reason": ' + "[" * depth + "]" * depth + "}"
+
+    class _Result:
+        returncode = run_implementer.EXIT_DELIBERATE_NO_OP
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(cmd[cmd.index("--refusal-out") + 1]).write_text(nested, encoding="utf-8")
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "refused"
+    assert exc.value.reason is None
+
+
+def test_the_duplicated_byte_cap_matches_the_implementers() -> None:
+    """Duplicated for the #149 deferred import, not because they may differ.
+
+    The shepherd's is the OUTER bound: raising the implementer's and leaving
+    this one behind would honour a marker whose reason the shepherd then
+    refuses to read, losing the evidence for exactly the oversized case the
+    bound exists to make visible.
+    """
+    assert (
+        run_shepherd.MAX_REFUSAL_FILE_BYTES
+        == run_implementer.MAX_REFUSAL_MARKER_BYTES
+    )
+
+
+def test_stuck_note_gives_the_whole_budget_to_the_evidence(tmp_path) -> None:
+    """Fails against `(prose + reason)[:MAX_NOTES_CHARS]`, which is the point.
+
+    The previous version of this test asserted `len(note) == MAX_NOTES_CHARS`
+    and a trailing run of the reason — both true of the plain slice it was
+    written to rule out, so it passed against the implementation it existed to
+    forbid. The property that actually distinguishes them is how much of the
+    AGENT's text survives: the slice spends ~210 characters of the reason's
+    budget on our own boilerplate.
+    """
+    reason = "E" * 4000
+    note = run_shepherd._stuck_note(3, reason)
+
+    assert note.count("E") == run_shepherd.MAX_NOTES_CHARS
+    assert len(note) > run_shepherd.MAX_NOTES_CHARS  # the framing sits outside it
+    assert "not at fault" in note
+
+
+def test_declined_note_gives_the_whole_budget_to_the_evidence() -> None:
+    """Same rule for the non-terminal note — one rule, not two."""
+    reason = "E" * 4000
+    note = run_shepherd._declined_note(reason)
+
+    assert note.count("E") == run_shepherd.MAX_NOTES_CHARS
+    assert note.startswith("implementer declined to act: ")
+
+
+def test_a_boundary_capped_reason_survives_whole_in_both_notes() -> None:
+    """The realistic case: nothing the trust boundary admits is ever clipped."""
+    reason = "R" * run_shepherd.MAX_NOTES_CHARS
+
+    assert reason in run_shepherd._stuck_note(3, reason)
+    assert reason in run_shepherd._declined_note(reason)
+
+
+def test_apply_followup_cleans_up_a_failure_before_the_subprocess(monkeypatch) -> None:
+    """The temp files must not outlive a failure BEFORE the subprocess call.
+
+    Everything between `mkstemp` and the fork can raise — notably the deferred
+    `run_implementer` import, the one this repo expects to be absent in some
+    environments (#149). Simulated here by the `Path(state_dir)` conversion two
+    lines later, which falls in the same window: with the `try` starting at the
+    fork, both /tmp files survived, on a process that ticks on a schedule.
+    """
+    findings = [make_finding()]
+    created = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    real_mkstemp = run_shepherd.tempfile.mkstemp
+
+    def tracking_mkstemp(*a, **kw):
+        fd, path = real_mkstemp(*a, **kw)
+        created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(run_shepherd.tempfile, "mkstemp", tracking_mkstemp)
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         pytest.raises(TypeError):
+        run_shepherd.apply_followup(
+            "mctl-web", "test-slug", findings, state_dir=object(),
+        )
+
+    assert created, "the refusal temp file was never created"
+    for path in created:
+        assert not Path(path).exists(), f"{path} leaked"
