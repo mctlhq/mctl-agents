@@ -1947,15 +1947,42 @@ class DevLoopWorkflow:
                 # "somebody must take this", which is the one state this
                 # contract defines as work remaining.
                 terminal_state = last is not None and last.state in ("MERGED", "CLOSED")
-                await self._ownership(
+                done = await self._ownership(
                     "terminal" if terminal_state else "release",
                     repo=repo,
                     number=int(number) if number.isdigit() else 0,
+                    # The head this watch last saw. `_payload` sends `version`
+                    # unconditionally, so omitting it made the LAST write of
+                    # the watch the only one carrying an empty one — and the
+                    # version is what the row records about the entity it is
+                    # letting go of.
+                    head_sha=(last.head_sha or "") if last is not None else "",
                     reason=(
                         f"pull request {(last.state or '').lower()}"
                         if terminal_state and last is not None
                         else "merge watch ended without a terminal pull-request state"
                     ),
                 )
-                self._owned_entity_id = ""
+                # The same distinction the in-loop terminal path makes, which
+                # this one discarded: clearing the claim on a write that did
+                # not land says the loop let go of a row the store still shows
+                # as active — the zero-owner state, written into the record by
+                # the cleanup meant to prevent it.
+                #
+                # Honestly: no test can turn this red. The workflow returns on
+                # the next line, `_owned_entity_id` is never read again, and
+                # the only difference is the log. It is here because the
+                # abandonment should be legible to whoever reads the history
+                # after the reconciler reaps the row, and because the two
+                # adjacent paths should not state opposite policies about the
+                # same one-way door.
+                if done is not None and done.accepted:
+                    self._owned_entity_id = ""
+                else:
+                    workflow.logger.warning(
+                        "lifecycle: the final %s for %s#%s did not land — the "
+                        "claim is abandoned and the reconciler reaps the row "
+                        "at the liveness bound",
+                        "terminal" if terminal_state else "release", repo, number,
+                    )
         return last

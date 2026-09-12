@@ -1148,6 +1148,13 @@ class TestDevLoopWorkflow:
         assert ops[0].op == "acquire"
         assert ops[-1].op == "release", [o.op for o in ops]
         assert "terminal" not in [o.op for o in ops]
+        # And it carries the head this watch last saw. `_payload` sends
+        # `version` unconditionally, so omitting it made the LAST write of the
+        # watch the only one carrying an empty one — and the version is what
+        # the row records about the entity it is letting go of.
+        assert ops[-1].version == "a" * 40, (
+            f"the final release carried no version: {ops[-1].version!r}"
+        )
 
     async def test_ownership_store_outage_does_not_fail_the_loop(self, env):
         """Ownership is a coordination signal, not the work.
