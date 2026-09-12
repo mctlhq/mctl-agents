@@ -393,12 +393,42 @@ def answer_from(
         own = Ownership.from_payload(raw) if isinstance(raw, dict) else None
         if own is None:
             return OwnershipAnswer(verdict=OWNED_BY_OTHER, reason=_error_of(status, payload))
-        # Through verdict_for, like every other path: a 409 that names the
-        # CALLER is the server reporting a conflict about a row we already
-        # hold, and answering OWNED_BY_OTHER for our own record would make the
-        # loop stand down from work it owns.
+        # A 409 is a REFUSED write, and a refused write may inform but must
+        # never grant. Routing it straight through verdict_for did both:
+        #
+        #   - a 409 on the heartbeat acquire of a row this loop is already
+        #     handing off answered OWNED_BY_ME (handing-off is a HOLDING
+        #     state), so the loop kept pushing after the server said no — and
+        #     a stale-epoch 409 did the same, while _owner_epoch still held
+        #     the value the server had just rejected;
+        #   - a 409 carrying a released or terminal record answered UNOWNED,
+        #     which is blocks_others False: the one verdict that licenses
+        #     action, produced by a write that was declined. That is the same
+        #     fail-open the 404-on-a-write branch nine lines above exists to
+        #     stop.
+        #
+        # So only the standing-down half survives. OWNED_BY_OTHER passes
+        # through, because a 409 naming somebody else is the server answering
+        # the question directly. Everything else — our own record, a free
+        # record, an unrecognised state — becomes UNKNOWN: may_mutate False,
+        # blocks_others True, and the record still attached so the caller can
+        # see what the server saw.
+        #
+        # This does not make the loop give up work it owns, which was the
+        # earlier finding here: UNKNOWN is "I could not establish ownership on
+        # this attempt", not "somebody else has it". The next tick asks again.
+        observed = verdict_for(own, asking)
+        if observed == OWNED_BY_OTHER:
+            return OwnershipAnswer(
+                verdict=OWNED_BY_OTHER, ownership=own, reason=_error_of(status, payload)
+            )
         return OwnershipAnswer(
-            verdict=verdict_for(own, asking), ownership=own, reason=_error_of(status, payload)
+            verdict=UNKNOWN,
+            ownership=own,
+            reason=(
+                f"{_error_of(status, payload)} (refused write; "
+                f"record reads {observed}, which a 409 may not grant)"
+            ),
         )
     # 412, 503, 5xx, 401/403 — every one of these means "I could not establish
     # ownership", which is UNKNOWN and never UNOWNED. A 412 in particular means
