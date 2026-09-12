@@ -496,8 +496,13 @@ ship in #351; the existing 130-minute `attempt` lease is untouched until #352.
 1. Two concurrent acquires on one `(entity, phase)` produce exactly one winner,
    and every loser names the same winner. Proven in Go against real Postgres —
    a Python test with mocked HTTP can only show the client *handles* a 409, not
-   that the database *produces* one. This requires a Postgres service in
-   mctl-api CI, where every store test currently skips.
+   that the database *produces* one. mctl-api CI already provides this: the
+   `test` job in `.github/workflows/validate.yml` runs a `postgres:16` service
+   and sets `TEST_DATABASE_URL`, so the store tests that skip on a developer
+   laptop do run on every PR. It runs `go test -p 1 ./...` deliberately, because
+   packages sharing that database wipe each other's rows in parallel — so the
+   lifecycle store's fixtures must clean up scoped to their own keys rather than
+   issuing unscoped deletes.
 2. A pre-handoff executor cannot mutate after the epoch increments.
 3. A claim pinned to head A cannot mutate once head B is current.
 4. Retry, replay and pod restart do not duplicate an effective mutation.
