@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import timedelta
 
 import anyio
 import pytest
@@ -19,16 +20,19 @@ from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
+from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
-from orchestrator.temporal.activities.lifecycle import OwnershipRequest, OwnershipResult
+from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest, OwnershipResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
+    LIFECYCLE_HEARTBEAT_EVERY_POLLS,
+    LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
@@ -92,6 +96,7 @@ def _fake_activities(
     ownership_unavailable_op: str | None = None,
     ownership_owner: tuple[str, str] | None = None,
     ownership_lost_after: int | None = None,
+    ownership_self_unhealthy_after: int | None = None,
     ownership_progress_fails: bool = False,
     ownership_progress_unowned: bool = False,
     ownership_body_less: str | None = None,
@@ -247,6 +252,26 @@ def _fake_activities(
                 healthy=True,
                 accepted=True,
             )
+        if (
+            ownership_self_unhealthy_after is not None
+            and len(ownership_ops) > ownership_self_unhealthy_after
+        ):
+            # OUR OWN record, read back unhealthy. `verdict_for` answers
+            # OWNED_BY_OTHER for an active record whose owner IS the caller
+            # whenever `healthy` is False, so the verdict names this very
+            # workflow. Reachable after a ~10h gap — a pod restart, or an
+            # /acquire outage — and after a 48h quiet PR if `healthy` also
+            # excludes `stuck`. No fake produced it, and the arms reading
+            # OWNED_BY_OTHER could not tell it from a competitor.
+            return OwnershipResult(
+                verdict="owned-by-other",
+                owner_type=req.owner_type,
+                owner_id=req.owner_id,
+                epoch=1,
+                state="active",
+                healthy=False,
+                accepted=True,
+            )
         if ownership_terminal_fails and req.op == "terminal":
             return OwnershipResult(verdict="unknown", reason="store down")
         if ownership_unavailable_op is not None and req.op == ownership_unavailable_op:
@@ -260,10 +285,24 @@ def _fake_activities(
                 return OwnershipResult(verdict="unknown", reason="store down")
         if ownership_body_less is not None and req.op == ownership_body_less:
             # A body-less 2xx: mctl-api took the write and returned no record.
-            # `answer_from` answers WROTE_NO_RECORD for it, and no fake in this
-            # file produced that verdict, so neither branch that reads it had
-            # workflow-level cover.
-            return OwnershipResult(verdict="wrote-no-record", accepted=True)
+            #
+            # Built by running the REAL classification over the REAL route for
+            # this op, not hand-written. The hand-written version returned
+            # `wrote-no-record` for whatever op it was handed, and that is a
+            # verdict `answer_from` reserves for /release and /terminal —
+            # RELINQUISHING_PATH_SUFFIXES is closed on those two precisely
+            # because /progress and /acquire leave the entity HELD. So the fake
+            # produced a shape the transport cannot, the arms reading it were
+            # unreachable, and the tests pinning them were false guards. Going
+            # through answer_from means the fake cannot drift from the contract
+            # again without the contract's own tests catching it.
+            answer = answer_from(
+                204, {}, Owner(type=req.owner_type, id=req.owner_id),
+                path=_PATHS[req.op], body_empty=True,
+            )
+            return OwnershipResult(
+                verdict=answer.verdict, reason=answer.reason, accepted=answer.accepted
+            )
         if ownership_progress_unowned and req.op == "progress":
             # The reconciler already released the row underneath this loop, so
             # the progress write lands on nothing. Neither owned-by-me nor
@@ -1195,9 +1234,20 @@ class TestDevLoopWorkflow:
         assert "acquire" in [o.op for o in ops][first:], [o.op for o in ops]
 
     async def test_a_body_less_2xx_on_progress_is_a_landed_write(self, env):
-        """`answer_from` answers WROTE_NO_RECORD for a body-less 2xx, and every
-        call on this path is a mutation — but the progress branch had no arm
-        for it, so a 204 landed on `_unknown_progress += 1`.
+        """A body-less 2xx on /progress is a write that LANDED, and the branch
+        had no arm for it, so a 204 landed on `_unknown_progress += 1`.
+
+        This test was a false guard for two rounds. The arm it covers read
+        `verdict == WROTE_NO_RECORD`, and `answer_from` never answers that for
+        /progress: RELINQUISHING_PATH_SUFFIXES is closed on ("/release",
+        "/terminal") because /progress leaves the record active and owned by
+        the caller. The arm was unreachable and the defect below was still
+        live — the test passed only because the fake hand-built that verdict
+        for whatever op it was handed. The fake now runs the real
+        classification over the real route, which is what makes the shape here
+        the one the transport can actually produce: `accepted` True with
+        verdict UNKNOWN. Both halves of the predicate are load-bearing and each
+        is killed by its own mutation.
 
         The write succeeded server-side while `_owned_head_sha` never advanced,
         so the identical evidence was re-sent for the rest of the watch. That
@@ -1225,6 +1275,15 @@ class TestDevLoopWorkflow:
             "a landed progress write was re-sent for a head that never moved "
             f"again: {[(o.op, o.version[:8]) for o in ops]}"
         )
+        # And the shape the fake produced is the one the transport produces —
+        # not the verdict the arm used to read. If RELINQUISHING_PATH_SUFFIXES
+        # ever grows /progress this assertion fails and the arm above has to be
+        # re-derived rather than silently going dead again.
+        landed = answer_from(
+            204, {}, Owner(type="devloop-workflow", id="w"),
+            path=_PATHS["progress"], body_empty=True,
+        )
+        assert landed.accepted is True and landed.verdict == "unknown", landed
 
     async def test_a_body_less_2xx_on_acquire_is_not_a_claim(self, env):
         """A body-less acquire is not a claim.
@@ -1233,11 +1292,13 @@ class TestDevLoopWorkflow:
         the back-off rather than silently taking no branch at all — which is
         what this pins, and which no fake produced before.
 
-        It does NOT pin the choice of predicate. The arm reads
-        `verdict == WROTE_NO_RECORD` rather than `accepted`, which is the
-        accurate one, but the else arm increments the same counter, so the two
-        are behaviourally identical today and swapping them leaves this test
-        green. That is stated on the arm itself rather than asserted here.
+        It still does not pin the choice of predicate — the else arm increments
+        the same counter, so the two remain behaviourally identical and no
+        assertion here can separate them. What changed is that the predicate is
+        now a REACHABLE one: the arm read `verdict == WROTE_NO_RECORD`, which
+        `answer_from` reserves for /release and /terminal, so it was dead code
+        that this test could not have detected. The reachability is asserted
+        directly below, against the real route.
         """
         open_pr = PRState(
             found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
@@ -1254,6 +1315,13 @@ class TestDevLoopWorkflow:
         # ...and it counted toward the back-off rather than being ignored.
         assert len(ops) < 12, f"a body-less acquire was never counted: {len(ops)}"
         assert len(ops) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, len(ops)
+        # The arm's predicate is reachable for this route, which is the thing
+        # the previous version of this test could not see.
+        landed = answer_from(
+            204, {}, Owner(type="devloop-workflow", id="w"),
+            path=_PATHS["acquire"], body_empty=True,
+        )
+        assert landed.accepted is True and landed.verdict == "unknown", landed
 
     async def test_a_failing_heartbeat_is_reported_and_eventually_drops_the_claim(self, env):
         """The heartbeat was the one ownership write whose failure was neither
@@ -1303,6 +1371,106 @@ class TestDevLoopWorkflow:
         )
         # And it never terminalised a PR whose ownership it had given up.
         assert "terminal" not in kinds[first_progress:], kinds
+
+    async def test_an_unhealthy_record_naming_this_loop_is_not_a_lost_claim(self, env):
+        """`OWNED_BY_OTHER` can name US, and treating that as a competitor set
+        the one permanent flag on the path.
+
+        `verdict_for` returns OWNED_BY_OTHER for an `active` record whose owner
+        IS the caller whenever `healthy` is False:
+
+            if asking is not None and own.owner == asking and own.healthy:
+                return OWNED_BY_ME
+            return OWNED_BY_OTHER
+
+        and both `_lose_claim` callers sit on the CLAIMED path, which is exactly
+        where the owner named back is us. The log then read "lost … to
+        devloop-workflow/<this workflow_id>", and `_claim_refused = True` ended
+        every ownership call for the remaining watch INCLUDING the heartbeat —
+        the write whose absence made the row unhealthy. One unhealthy read of
+        our own row permanently stopped the write that would have restored it.
+
+        The case does not depend on how mctl-api defines `healthy`: after a
+        ~10h gap the row is dead and the first call that reaches the store
+        returns our own record unhealthy.
+
+        What must happen instead is the give-up the heartbeat already
+        implements — drop the claim, do NOT refuse it — so the loop returns to
+        the unclaimed path and keeps trying under its own gate.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=921,
+            ownership_self_unhealthy_after=1,
+        )
+        kinds = [o.op for o in ops]
+        # Nobody else ever claimed this PR, so the loop must not have stood
+        # down permanently. With _claim_refused set, everything after the first
+        # unhealthy read is a single terminal at the end.
+        assert len(kinds) > LIFECYCLE_UNKNOWN_WRITE_LIMIT + 2, (
+            f"an unhealthy record naming this loop was read as a lost claim: {kinds}"
+        )
+        # And it never adopted a competitor's epoch, because there is none: the
+        # record is ours, so the writes keep going out under the claim's epoch
+        # or under none at all — never under somebody else's.
+        assert all(o.epoch in (0, 1) for o in ops), [(o.op, o.epoch) for o in ops]
+
+    async def test_the_heartbeat_gives_up_inside_the_liveness_bound(self, env):
+        """The give-up threshold counts HEARTBEATS, not polls.
+
+        `_unknown_heartbeats` advances inside the
+        `% LIFECYCLE_HEARTBEAT_EVERY_POLLS` block, so reusing
+        LIFECYCLE_UNKNOWN_WRITE_LIMIT (six, sized for once-per-poll counters)
+        made it six heartbeats — 24 polls, about twelve hours, past the 10h
+        liveness bound the correction exists to arrive before. The reconciler
+        force-releases at the bound and the loop went on believing it owned the
+        row for another two hours.
+
+        Pinned as a count of heartbeats rather than as a constant comparison,
+        so raising the constant back to six fails here rather than silently
+        restoring the twelve-hour window.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=922,
+            ownership_unavailable_op="acquire",
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        # Heartbeats and re-claims are both `acquire`, so the op name cannot
+        # separate them — the EPOCH can. A heartbeat goes out under the claim's
+        # epoch; the give-up clears it, so every acquire after it carries 0.
+        under_claim = 0
+        for op in ops[first_progress + 1:]:
+            if op.epoch == 0:
+                break
+            under_claim += 1
+        assert under_claim == LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT, (
+            "the heartbeat gave up after the wrong number of failures: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+        # And the threshold has to be inside the bound it exists to beat:
+        # 10h, derived in ADR-010 as 2 x the reconciler cadence.
+        held_without_liveness = (
+            LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT
+            * LIFECYCLE_HEARTBEAT_EVERY_POLLS
+            * dev_loop.MERGE_POLL_INTERVAL
+        )
+        assert held_without_liveness < timedelta(hours=10), held_without_liveness
 
     async def test_progress_is_recorded_only_when_the_head_moves(self, env):
         """A poll that observed nothing new must not write progress.

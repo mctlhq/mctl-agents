@@ -240,3 +240,55 @@ def test_acquire_sends_no_epoch_and_the_other_ops_do(monkeypatch: pytest.MonkeyP
     ):
         _run(monkeypatch, handler, _req(op=op, epoch=7, evidence="x", to_owner_type="shepherd", to_owner_id="cron"))
         assert seen[path].get("epoch") == 7, op
+
+
+def test_epoch_zero_and_an_empty_version_are_sent_not_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two more request-body divergences on the same axis as the epoch above.
+
+    `LifecycleClient._write` filters with `v not in ("", None)`, so it sends
+    `"epoch": 0` — an explicit "I hold no generation yet" — and it puts
+    `version` in the base dict where no filter can reach it. This module
+    filtered both on truthiness, so a zero epoch became a MISSING key, and the
+    release and terminal the workflow issues from its `finally` (where no head
+    SHA is carried) sent no `version` at all while the sync transport sent an
+    empty one. `answer_from` normalises the RESPONSE and cannot see either.
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path] = json.loads(request.content)
+        return httpx.Response(200, content=json.dumps(_record()).encode())
+
+    _run(monkeypatch, handler, _req(op="progress", epoch=0, evidence="x", version="abc"))
+    body = seen["/api/v1/lifecycle/ownership/progress"]
+    assert body.get("epoch") == 0, body
+
+    _run(monkeypatch, handler, _req(op="release", epoch=4, version=""))
+    body = seen["/api/v1/lifecycle/ownership/release"]
+    assert "version" in body and body["version"] == "", body
+
+
+def test_progress_without_evidence_is_answered_here_not_by_a_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard `LifecycleClient.progress` raises on, in the form this
+    transport is allowed to take.
+
+    Empty evidence is filtered out of the body, so mctl-api answers 400 with a
+    message that dies in the activity's own logs and reaches the caller as an
+    indistinguishable `unknown`. Answered here it carries a reason the caller
+    can log, and it costs no request at all. Raising is not an option: this
+    activity's contract is that it never does.
+    """
+    called: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request.url.path)
+        return httpx.Response(200, content=json.dumps(_record()).encode())
+
+    result = _run(monkeypatch, handler, _req(op="progress", epoch=4, evidence=""))
+    assert result.verdict == "unknown"
+    assert "evidence" in result.reason
+    assert called == [], called

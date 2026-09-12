@@ -107,9 +107,16 @@ def _payload(req: OwnershipRequest) -> dict[str, Any]:
         "phase": req.phase,
         "owner_type": req.owner_type,
         "owner_id": req.owner_id,
+        # Unconditional, matching LifecycleClient._write, which puts
+        # entity.version in the base dict and never filters it. Dropping it
+        # when empty meant the release and terminal this workflow issues from
+        # its finally — where head_sha is not carried — sent no `version` key
+        # at all, while the sync transport sent `"version": ""`. Same axis as
+        # the epoch below: answer_from normalises the RESPONSE and cannot see a
+        # divergence in the REQUEST.
+        "version": req.version,
     }
     for key, value in (
-        ("version", req.version),
         ("evidence", req.evidence),
         ("reason", req.reason),
         ("proposal_ref", req.proposal_ref),
@@ -120,7 +127,7 @@ def _payload(req: OwnershipRequest) -> dict[str, Any]:
     ):
         if value:
             body[key] = value
-    if req.epoch and req.op != "acquire":
+    if req.op != "acquire":
         # NOT on acquire, matching LifecycleClient.acquire, which takes no
         # epoch at all. The epoch is a fencing precondition on a write against
         # an existing claim; an acquire asserting one is asking the server to
@@ -139,6 +146,11 @@ def _payload(req: OwnershipRequest) -> dict[str, Any]:
         # differently. `answer_from` normalises the RESPONSE and cannot see a
         # divergence in the REQUEST, so it is the one axis the shared contract
         # does not protect, and it needs a test comparing bodies.
+        #
+        # Zero is SENT, not dropped. `_write`'s filter is `v not in ("", None)`,
+        # so the client sends `"epoch": 0` — an explicit "I hold no generation
+        # yet" — and a truthiness test here turned that into a missing key,
+        # which is a different request for the server to interpret.
         body["epoch"] = req.epoch
     return body
 
@@ -179,6 +191,18 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
     path = _PATHS.get(req.op)
     if path is None:
         return OwnershipResult(verdict=UNKNOWN, reason=f"unknown op {req.op!r}")
+
+    if req.op == "progress" and not req.evidence:
+        # The same guard LifecycleClient.progress raises on, in the form this
+        # transport is allowed to take. Empty evidence is filtered out of the
+        # body, so the server answers 400 with a message that dies in the
+        # activity's own logs; answered here it reaches the caller as a reason,
+        # and the caller's counter treats it like any other write that did not
+        # land. Raising is not an option: this activity's contract is that it
+        # never does.
+        return OwnershipResult(
+            verdict=UNKNOWN, reason="progress requires evidence: say what changed"
+        )
 
     try:
         headers = auth_headers()
