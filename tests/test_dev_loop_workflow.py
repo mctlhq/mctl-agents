@@ -1704,6 +1704,59 @@ class TestDevLoopWorkflow:
             f"{[(o.op, o.epoch, o.version[:2]) for o in ops]}"
         )
 
+    async def test_our_own_unhealthy_record_is_still_a_landed_progress_write(self, env):
+        """The progress branch matched none of its guards on the shape the
+        heartbeat has enumerated since the accepted arm was added.
+
+        `verdict_for` answers OWNED_BY_OTHER for an active row whose owner IS
+        the caller whenever `healthy` is False; `_lost_to_someone_else`
+        declines to call that a loss; and `accepted` is True because a 2xx
+        carried a record. The heartbeat logs it, resets and keeps the claim.
+        The progress branch fell to `_unknown_progress += 1`, so it counted a
+        write mctl-api TOOK, never advanced the head — re-sending the identical
+        evidence for the rest of the watch, every send landing, so
+        last_progress_at was refreshed forever for a head that stopped moving
+        and the stuck bound could never fire — and said nothing.
+
+        The fixture already produced this: `ownership_self_unhealthy_after` is
+        not op-scoped, so the sibling tests ran the defect on every poll while
+        asserting only on `epoch`, which the heartbeat keeps alive. This
+        asserts on the throttle instead, which is what the counter drives.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # A head that moves on every poll, so every poll SHOULD produce a
+        # progress write. Under the defect `_unknown_progress` reaches
+        # LIFECYCLE_UNKNOWN_WRITE_LIMIT and `_backed_off` throttles the path to
+        # the heartbeat cadence, so most of them never happen.
+        heads = [_pr(chr(ord("a") + i) * 40) for i in range(1, 25)]
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=933,
+            ownership_self_unhealthy_after=1,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        # Nearly every poll, not merely more than the limit: `_backed_off`
+        # still lets one through on each heartbeat boundary, so the throttled
+        # count is ~LIMIT + polls/HEARTBEAT_EVERY — which a threshold just
+        # above the limit does not separate from the healthy one. That is how
+        # the first version of this assertion survived its own mutation.
+        assert len(progress) >= len(heads) - 2, (
+            "landed progress writes were counted as failures and throttled: "
+            f"{len(progress)} of {len(heads)} polls — {[o.op for o in ops]}"
+        )
+        # And the head really advanced each time, rather than the same
+        # evidence being re-sent.
+        versions = [o.version for o in progress]
+        assert len(set(versions)) == len(versions), (
+            f"the same head was re-sent: {[v[:2] for v in versions]}"
+        )
+
     async def test_an_unreadable_state_on_progress_also_drops_the_claim(self, env):
         """The progress arm had the heartbeat's defect and the heartbeat's fix
         did not reach it.

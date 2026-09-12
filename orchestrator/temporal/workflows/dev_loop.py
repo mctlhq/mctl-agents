@@ -1488,6 +1488,41 @@ class DevLoopWorkflow:
             ):
                 self._lose_claim(repo, number, result)
                 return
+            if result is not None and result.accepted:
+                # BELOW the guard above, deliberately: a real competitor can
+                # answer with `accepted` True too, and must still reach
+                # _lose_claim.
+                #
+                # What is left here is our OWN record read back unhealthy.
+                # `verdict_for` answers OWNED_BY_OTHER for an active row whose
+                # owner IS the caller whenever `healthy` is False, and
+                # `_lost_to_someone_else` correctly declines to call that a
+                # loss — but mctl-api still TOOK the write, and the heartbeat
+                # block has enumerated this shape since 089cb6a while this
+                # branch matched none of its guards on it and fell to the
+                # counter.
+                #
+                # Three costs, and the second is the one this PR exists to
+                # prevent: `_unknown_progress` counted a write the store
+                # accepted, which is the defect 089cb6a removed from the
+                # heartbeat; `_owned_head_sha` never advanced, so the identical
+                # evidence was re-sent for the rest of the watch, every send
+                # landed, and last_progress_at was refreshed forever for a head
+                # that stopped moving — so the stuck bound could never fire,
+                # which is the argument already written on the body-less arm
+                # above, reached by the shape that arm does not cover; and it
+                # was silent, where the heartbeat gives this same record a
+                # warning because ADR-010 §4 makes `stuck` an escalation.
+                workflow.logger.warning(
+                    "lifecycle: progress on %s#%s landed but the record is not "
+                    "usable as ours (verdict=%s, state=%r, healthy=%s) — the "
+                    "claim stands and the head advances",
+                    repo, number, result.verdict, result.state, result.healthy,
+                )
+                self._owned_head_sha = head
+                self._unknown_progress = 0
+                self._unknown_heartbeats = 0
+                return
             self._unknown_progress += 1
 
             # Everything else falls THROUGH to the heartbeat below, and the
