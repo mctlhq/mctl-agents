@@ -87,14 +87,16 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import anyio
-from claude_agent_sdk import ClaudeSDKClient
+from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
 from config.settings import (
     AGENTS_DIR,
@@ -106,6 +108,7 @@ from orchestrator.github_token import refresh_github_token
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
+    IMPLEMENTER_DRAIN_TIMEOUT_SECONDS,
     IMPLEMENTER_TIMEOUT_SECONDS,
     build_implementer_agent_options,
 )
@@ -116,6 +119,11 @@ from orchestrator.proposal_state import (
     load_status,
     now_iso,
     update_status_file,
+)
+from orchestrator.subagent_wait import (
+    LiveTaskLedger,
+    OrphanedSubagentError,
+    drain_until_settled,
 )
 from orchestrator.temporal.issue_ref import workflow_id_for
 
@@ -135,11 +143,13 @@ DEFAULT_STATE_DIR = Path(
 
 # ---------------------------------------------------------------------------
 # Sentinel exit codes for review-feedback mode. These let the Tier 3 shepherd
-# tell deterministic *content* failures apart from transient subprocess /
-# auth / network plumbing failures: only the former should consume one of
+# tell three kinds of failure apart: deterministic *content* failures, transient
+# subprocess / auth / network plumbing failures, and *harness* failures where our
+# own orchestration lost the agent's work. Only the first should consume one of
 # the MAX_REVIEW_ATTEMPTS budget slots and eventually flip the proposal to
-# `review-stuck`. Without a sentinel, the shepherd treats every non-zero
-# exit as transient and retries forever — see codex P1 on PR #12.
+# `review-stuck`; the other two are retried without charging the proposal.
+# Without a sentinel, the shepherd treats every non-zero exit as transient and
+# retries forever — see codex P1 on PR #12.
 #
 # The mapping is intentionally narrow: any error path that is NOT one of
 # these explicit codes falls back to plain `sys.exit(1)` which the shepherd
@@ -166,6 +176,12 @@ EXIT_OPERATION_TIMEOUT = 44
 # proposal (mctl-agents#349). Tracked in mctl-gitops, not mctl-agents, since
 # both fixes are CWFT-side.
 EXIT_BLOCKED_ONLY = 45
+# Harness failure, NOT a content failure: the CLI launched the implementer
+# sub-agent asynchronously and the run ended before that child reported a
+# terminal status, so the work it was doing is lost (mctl-agents#366). Unlike
+# 42/43/44 this says nothing about the proposal or the findings -- re-running is
+# the correct response and the shepherd must NOT charge a review attempt for it.
+EXIT_ORPHANED_SUBAGENT = 46
 
 
 def _review_feedback_exit_code(error: str) -> int:
@@ -182,6 +198,14 @@ def _review_feedback_exit_code(error: str) -> int:
         bound. Re-running forever cannot make forward progress, so this
         consumes the shepherd's bounded review-attempt budget.
 
+    One code is deliberately NOT deterministic:
+
+      - 46: the CLI launched the sub-agent asynchronously and the run ended
+        before it reported a terminal status (mctl-agents#366). The agent never
+        got its attempt, so charging the proposal for it would let a PR exhaust
+        MAX_REVIEW_ATTEMPTS without a single real try at the findings. The
+        shepherd classifies this as a harness failure and retries.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -197,6 +221,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_NO_FOLLOWUP_COMMITS
     if error.startswith("branch ") and "not found on origin" in error:
         return EXIT_BRANCH_MISSING_ON_ORIGIN
+    if error.startswith("orphaned sub-agent:"):
+        return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
         return EXIT_OPERATION_TIMEOUT
     return EXIT_GENERIC_FAILURE
@@ -273,6 +299,19 @@ class GitHubPreflightError(RuntimeError):
 
 class ImplementerOperationTimeout(RuntimeError):
     """A bounded model or shell operation exceeded its wall-clock limit."""
+
+
+class ImplementerOrphanedSubagent(OrphanedSubagentError):
+    """The run ended while the delegated implementer sub-agent was still live.
+
+    A harness failure, not a content failure: the prompt asks the agent to
+    delegate to the `implementer` sub-agent, the CLI may launch that child
+    asynchronously, and a run that returns before the child settles throws away
+    whatever it produced. Mapped to EXIT_ORPHANED_SUBAGENT so the shepherd does
+    not charge the proposal a review attempt for our own lost handoff.
+    Subclasses the shared error so the helper can raise the generic type while
+    the orchestrator keeps its greppable `Implementer*` naming.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +700,11 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
     # proposal inside the workflow's larger deadline (incident e3649b04).
     # The fail_after wraps the mctl connectivity check too — a wedged
     # handshake must not silently eat into the caller's own timeout budget.
+    ledger = LiveTaskLedger()
+    # Set once every delegated child has been awaited to a terminal state. From
+    # that point on the work is on disk, so an outer expiry during teardown must
+    # not throw it away -- see the TimeoutError handler.
+    drain_completed = False
     try:
         with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
             async with ClaudeSDKClient(options=options) as client:
@@ -670,9 +714,86 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                     # Read/Write/Edit/Bash; mctl tools are supplementary.
                     await ensure_mctl_connected(client, fatal=False)
                 await client.query(prompt)
-                async for message in client.receive_response():
-                    print(message)
+                # receive_messages(), NOT receive_response(): the latter returns
+                # at the first ResultMessage, and a ResultMessage ends one TURN,
+                # not the RUN. The prompt asks the agent to delegate to the
+                # `implementer` sub-agent; when the CLI launches that child
+                # asynchronously the top-level session ends its turn with the
+                # child still working, and returning here abandons its commit
+                # and produces a false EXIT_NO_FOLLOWUP_COMMITS. mctl-agents#366.
+                #
+                # One generator for both phases: every receive_messages() call
+                # returns a fresh generator over the same underlying stream, so
+                # a second one would split messages with the first.
+                # cast: receive_messages() is declared AsyncIterator but is an
+                # async generator, so it does have aclose(). aclosing() is what
+                # guarantees the generator is closed on the error paths below.
+                stream = cast(
+                    "AsyncGenerator[Any, None]", client.receive_messages()
+                )
+                async with aclosing(stream):
+                    async for message in stream:
+                        print(message)
+                        ledger.observe(message)
+                        # Also stop on stream exhaustion (the `async for` ending
+                        # on its own): that means the CLI exited.
+                        if isinstance(message, ResultMessage):
+                            break
+                    if ledger.live:
+                        print(
+                            f"info: turn ended with {ledger.describe()}; "
+                            f"awaiting terminal status"
+                        )
+                        try:
+                            await drain_until_settled(
+                                stream,
+                                ledger,
+                                timeout_s=IMPLEMENTER_DRAIN_TIMEOUT_SECONDS,
+                            )
+                        except OrphanedSubagentError as exc:
+                            raise ImplementerOrphanedSubagent(
+                                f"orphaned sub-agent: {exc}"
+                            ) from exc
+                        drain_completed = True
+                    if not ledger.all_completed:
+                        # Quiescent, so NOT an orphan: nothing is still mutating
+                        # the worktree and _has_new_commits is the right
+                        # adjudicator (no commit -> 42, genuinely deterministic).
+                        # Logged so the distinction is visible in the Argo log.
+                        print(f"warn: {ledger.describe()}")
     except TimeoutError as exc:
+        # A live child when the outer bound fires is a harness loss WHEREVER we
+        # were -- draining, or still in the first turn loop. The earlier
+        # `draining and` conjunct was one narrower than the rule stated
+        # everywhere else: a task that started and then burned the whole budget
+        # without its turn ever emitting a ResultMessage never reached the
+        # drain, so it exited 44 -- deterministic, charged, MAX_HARNESS_FAILURES
+        # bypassed -- for a child that was demonstrably still running.
+        if ledger.live:
+            # The outer wall-clock bound, not the drain's own -- but the cause
+            # is still a child we could not await, so it is charged to the
+            # harness, not to the proposal.
+            raise ImplementerOrphanedSubagent(
+                f"orphaned sub-agent: outer timeout of "
+                f"{IMPLEMENTER_TIMEOUT_SECONDS:g}s expired while awaiting "
+                f"{ledger.describe()}"
+            ) from exc
+        if drain_completed:
+            # Every child was awaited to a terminal state before this fired, so
+            # whatever they produced is already in the worktree. What is left
+            # running is teardown -- closing the SDK generator and the client,
+            # which this branch by construction does with the CLI still mid-turn
+            # and, after the grace clamp, on very little clock. Raising here
+            # would exit 44: charged, MAX_HARNESS_FAILURES bypassed, and
+            # `_has_new_commits`/`_push_followup` never reached, so the commit we
+            # just spent the whole drain waiting for would go in the bin with the
+            # tmp clone. Return instead and let the git check adjudicate.
+            print(
+                f"warn: outer bound of {IMPLEMENTER_TIMEOUT_SECONDS:g}s expired "
+                f"after the sub-agent was awaited; proceeding on what is "
+                f"already in the worktree"
+            )
+            return
         raise ImplementerOperationTimeout(
             f"operation exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s "
             f"(model stream, client construction, or mctl connectivity check)"
@@ -769,6 +890,14 @@ def review_feedback_one(
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerOrphanedSubagent as e:
+        # The message is already prefixed "orphaned sub-agent:" — that prefix is
+        # what _review_feedback_exit_code() matches on. Deliberately do NOT try
+        # to push whatever is in the worktree here: by construction the child may
+        # still be writing, and racing its `git commit` (index.lock) or pushing a
+        # half-finished change is worse than a free retry on the next tick.
+        result = ImplementResult(ref=ref, pr_url=None, error=str(e))
+        return result
     except ImplementerOperationTimeout as e:
         result = ImplementResult(
             ref=ref,
@@ -1493,6 +1622,21 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerOrphanedSubagent as e:
+        # Batch mode has no review-attempt budget, so it needs no sentinel exit
+        # code — but it does need its own triage code, otherwise this lands in
+        # the generic `unexpected-error` arm below and a harness failure is
+        # indistinguishable from a crash in the proposal's history.
+        msg = str(e)
+        _mark_needs_triage(
+            ref,
+            code="orphaned-subagent",
+            stage="runtime",
+            message=msg,
+            attempt=attempt,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        return result
     except ImplementerOperationTimeout as e:
         msg = f"operation timed out: {e}"
         _mark_needs_triage(

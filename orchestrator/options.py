@@ -1,5 +1,7 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
+import math
 import os
+import sys
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -57,6 +59,40 @@ def _mctl_tool_globs() -> list[str]:
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
+def _positive_seconds(name: str, *, default: float) -> float:
+    """Read a wall-clock env var, falling back loudly on a non-positive value.
+
+    A floor rather than a raise, and it belongs here rather than at the point of
+    use. `anyio.move_on_after(0)` cancels before the first read, so a drain
+    deadline of 0 orphans every run that delegates -- but raising instead would
+    be worse: the error surfaces only once a sub-agent is actually launched, is
+    swallowed by the caller's catch-all into a generic exit 1, and the shepherd
+    then classifies it transient, which has NO counter. A typo in one env var
+    would re-clone the repo and re-run a paid SDK call every tick forever --
+    exactly the pathology MAX_HARNESS_FAILURES exists to prevent. Clamping at
+    config time makes a bad value loud and harmless instead of silent and
+    unbounded.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"warn: {name}={raw!r} is not a number; using {default:g}s", file=sys.stderr)
+        return default
+    # `not (value > 0)` rather than `value <= 0`: BOTH comparisons are False for
+    # nan, so the naive form lets nan through to anyio.move_on_after(), whose
+    # deadline is then nan, whose every `deadline <= now` test is False, so the
+    # scope never cancels and the sub-deadline is silently gone. A guard whose
+    # entire job is rejecting values that break move_on_after has to cover the
+    # one value that breaks it quietly.
+    if not (value > 0) or math.isinf(value):
+        print(f"warn: {name}={raw!r} is not a positive finite number; using {default:g}s", file=sys.stderr)
+        return default
+    return value
+
+
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
 # Tier 2 implementer budget — soft cap per single proposal implementation.
@@ -68,6 +104,24 @@ IMPLEMENTER_BUDGET_USD = float(os.getenv("IMPLEMENTER_BUDGET_USD", "3.00"))
 # without this a stalled stream can consume the whole Argo workflow deadline.
 IMPLEMENTER_TIMEOUT_SECONDS = float(
     os.getenv("IMPLEMENTER_TIMEOUT_SECONDS", "900")
+)
+# Sub-deadline for awaiting a sub-agent the CLI launched asynchronously, nested
+# inside IMPLEMENTER_TIMEOUT_SECONDS above (mctl-agents#366). Not needed for
+# liveness -- the outer bound already provides that -- but for classification: a
+# wedged child that ate the whole remaining budget would surface as a plain
+# operation timeout, which the shepherd charges to the proposal's review-attempt
+# budget, which is the very bug #366 is about.
+#
+# NOT a single spend. drain_until_settled loops: it allows this much for the
+# child to go quiescent, then this much AGAIN for the parent's closing frame,
+# and a second delegation observed while waiting for that frame sends it back
+# round on a fresh clock. So the worst case inside the drain is
+# 2 x N x this value for N delegations -- capped, because phase 2's grace is
+# clamped to what is left of IMPLEMENTER_TIMEOUT_SECONDS and phase 1 raises
+# rather than looping forever. Read it as "how long one wait may take", not as
+# "how long the drain may take". See orchestrator/subagent_wait.py.
+IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
+    "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", default=300.0
 )
 # Bound every synchronous git/gh command as well.  The model-stream timeout
 # above cannot interrupt a clone, fetch, or push that has stalled before or

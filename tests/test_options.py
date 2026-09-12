@@ -233,3 +233,78 @@ def test_a_profile_that_grants_the_mctl_tools_still_gets_them(tmp_path, monkeypa
     built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
 
     assert "mcp__mctl__*" in built.allowed_tools
+
+
+def test_implementer_drain_timeout_defaults_to_five_minutes():
+    """Sub-deadline for awaiting an async-launched sub-agent (mctl-agents#366).
+
+    Nested inside IMPLEMENTER_TIMEOUT_SECONDS on purpose, and strictly shorter:
+    if a wedged child were allowed to eat the whole outer budget the run would
+    surface as a plain operation timeout (exit 44), which the shepherd counts as
+    deterministic and charges to the proposal — the very bug #366 fixes.
+    """
+    assert options.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 300.0
+    assert options.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS < options.IMPLEMENTER_TIMEOUT_SECONDS
+
+
+def test_implementer_drain_timeout_honours_its_env_override(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", "42")
+    reloaded = importlib.reload(options)
+    try:
+        assert reloaded.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 42.0
+    finally:
+        monkeypatch.delenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", raising=False)
+        importlib.reload(options)
+
+
+def test_implementer_keeps_hooks_which_is_what_holds_stdin_open(tmp_path, monkeypatch):
+    """Load-bearing precondition for the #366 drain, not incidental config.
+
+    claude_agent_sdk only keeps stdin open past a result frame with tasks in
+    flight when `sdk_mcp_servers or hooks` is truthy. Strip the implementer's
+    hooks and the CLI would exit at the first result, so awaiting the sub-agent
+    would block on a dead child instead of recovering its commit.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "t")
+    built = options.build_implementer_agent_options(tmp_path, "claude-sonnet-5")
+    assert built.hooks
+    # And it must be the HOOKS carrying it, not the MCP config: the SDK lifts a
+    # server into `sdk_mcp_servers` only when its config says `type: "sdk"`, and
+    # mctl_mcp_config() emits `type: "http"`. Asserting this keeps the test from
+    # passing for the wrong reason, and makes it demand an update the day an
+    # sdk-type server does appear.
+    assert built.mcp_servers, "expected the http mctl server to be configured"
+    assert not [
+        name for name, cfg in built.mcp_servers.items()
+        if isinstance(cfg, dict) and cfg.get("type") == "sdk"
+    ]
+
+
+def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
+    """A bad value must be loud and harmless, not silent and unbounded.
+
+    `move_on_after(0)` cancels before the first read, so a drain deadline of 0
+    orphans every delegating run. Raising at the point of use would be worse:
+    the error surfaces only once a sub-agent is launched, gets swallowed into a
+    generic exit 1, and the shepherd classifies that transient — the one arm
+    with no counter at all. A typo in one env var would then re-clone the repo
+    and re-run a paid SDK call every tick forever, which is precisely what
+    MAX_HARNESS_FAILURES exists to prevent.
+    """
+    import importlib
+
+    # "nan" is the one that matters: `value <= 0` is False for nan, so a naive
+    # guard passes it straight to move_on_after(), whose deadline is then nan,
+    # whose every `deadline <= now` test is False — the scope never cancels and
+    # the sub-deadline is silently gone. inf disables it the same way.
+    for bad in ("0", "-5", "not-a-number", "nan", "inf", "-inf"):
+        monkeypatch.setenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", bad)
+        reloaded = importlib.reload(options)
+        try:
+            assert reloaded.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 300.0, bad
+            assert "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS" in capsys.readouterr().err
+        finally:
+            monkeypatch.delenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", raising=False)
+            importlib.reload(options)

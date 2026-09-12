@@ -370,3 +370,40 @@ def test_mark_failure_quarantines_and_preserves_pr(tmp_path: Path) -> None:
     assert status["status"] == "needs-triage"
     assert status["failure"]["code"] == "no-commits"
     assert status["pr"].endswith("/pull/1")
+
+
+def test_batch_mode_orphaned_subagent_marks_its_own_triage_code(tmp_path, monkeypatch) -> None:
+    """The batch-mode orphan arm writes terminal state; pin its triage code.
+
+    Without this, a refactor could collapse the arm back into the generic
+    `unexpected-error` handler — which is exactly what the comment above it says
+    it exists to prevent — and nothing would notice.
+
+    Note the asymmetry with review-feedback mode, which treats an orphan as
+    blameless and retries: batch mode has no attempt budget and no shepherd tick
+    behind it, so there is nothing to retry into and a human has to look.
+    """
+    ref = make_ref(tmp_path, status="accepted")
+
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(
+        run_implementer, "_preflight_existing_result",
+        lambda _ref: run_implementer.ExistingResult(action="none"),
+    )
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a: tmp_path / "clone")
+    monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
+
+    def orphan(*_a, **_kw):
+        raise run_implementer.ImplementerOrphanedSubagent(
+            "orphaned sub-agent: 1 task(s) still live: t1"
+        )
+
+    monkeypatch.setattr(run_implementer.anyio, "run", orphan)
+
+    result = run_implementer.implement_one(ref)
+
+    assert result.error.startswith("orphaned sub-agent:")
+    status = read_status(ref)
+    assert status["status"] == "needs-triage"
+    assert status["failure"]["code"] == "orphaned-subagent"

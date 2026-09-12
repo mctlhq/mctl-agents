@@ -4,6 +4,9 @@ venv/
 __pycache__/
 *.pyc
 .claude/projects/
+# Agent-isolation worktrees. Each is its own git checkout, so a plain
+# `git add -A` stages it as an embedded repository (observed 2026-09-12).
+.claude/worktrees/
 .DS_Store
 
 # Runtime state — lives in mctl-gitops/agents-state/, never committed here

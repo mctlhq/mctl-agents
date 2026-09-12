@@ -32,7 +32,7 @@ class FakeMcpClient:
 
     ``statuses`` is a list of {"mcpServers": [...]} dicts consumed in order
     by get_mcp_status() — the last entry repeats once exhausted. ``messages``
-    is what receive_response() yields. Pass ``status_error`` to make
+    is what receive_response()/receive_messages() yield. Pass ``status_error`` to make
     get_mcp_status() raise instead (SDK control-request failure). If
     get_mcp_status is never expected to be called (mcp_configured=False),
     leave ``statuses`` empty — it will raise AssertionError on any call.
@@ -65,6 +65,13 @@ class FakeMcpClient:
         self.queried_prompt = prompt
 
     async def receive_response(self):
+        for message in self._messages:
+            yield message
+
+    async def receive_messages(self):
+        # The implementer driver reads this one (mctl-agents#366): it must not
+        # stop at the first ResultMessage, or an async-launched sub-agent is
+        # abandoned mid-flight.
         for message in self._messages:
             yield message
 

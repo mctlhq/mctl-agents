@@ -2029,7 +2029,7 @@ def test_outer_loop_counts_attempt_on_deterministic_subprocess_failure(tmp_path)
     def boom(*_a, **_kw):
         raise run_shepherd.FollowupSubprocessError(
             "implementer follow-up exited non-zero (42)",
-            transient=False,
+            kind="deterministic",
         )
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
@@ -2064,7 +2064,7 @@ def test_outer_loop_flips_to_review_stuck_on_deterministic_at_cap(tmp_path) -> N
     def boom(*_a, **_kw):
         raise run_shepherd.FollowupSubprocessError(
             "implementer follow-up exited non-zero (43)",
-            transient=False,
+            kind="deterministic",
         )
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
@@ -2696,7 +2696,7 @@ def test_process_one_does_not_trigger_review_on_followup_failure(tmp_path) -> No
     trigger_calls: list = []
 
     def boom(*args, **kwargs):
-        raise run_shepherd.FollowupSubprocessError("transient", transient=True)
+        raise run_shepherd.FollowupSubprocessError("transient", kind="transient")
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
          patch.object(run_shepherd, "read_codex_review", return_value=review), \
@@ -3212,3 +3212,297 @@ def test_real_code_in_a_finding_survives_intact():
     body = "generic<T> and a[i] < b[j] and <div>markup</div>"
 
     assert run_shepherd._neutralize_findings_tags(body) == body
+
+
+# ---------------------------------------------------------------------------
+# Harness failures must not be charged to the proposal (mctl-agents#366)
+#
+# exit 46 means our own orchestration lost the implementer's work: the CLI
+# launched the sub-agent asynchronously and the run ended before it settled.
+# The findings were never actually attempted, so charging a MAX_REVIEW_ATTEMPTS
+# slot would let a healthy PR reach review-stuck without one genuine try.
+# ---------------------------------------------------------------------------
+def test_harness_code_is_not_in_the_deterministic_set() -> None:
+    """The classification is explicit, not emergent from an omission.
+
+    `is_transient` used to be computed as "not in deterministic_codes", so a new
+    code got the right behaviour by accident of not being listed. Assert both
+    memberships directly so a future edit cannot silently reclassify it.
+    """
+    deterministic, harness = run_shepherd._followup_code_sets()
+    assert run_implementer.EXIT_ORPHANED_SUBAGENT in harness
+    assert run_implementer.EXIT_ORPHANED_SUBAGENT not in deterministic
+    assert deterministic == frozenset({
+        run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
+        run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+        run_implementer.EXIT_OPERATION_TIMEOUT,
+    })
+
+
+def test_apply_followup_raises_harness_on_orphaned_subagent() -> None:
+    """returncode=46 -> transient (retry) but labelled `harness`."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_ORPHANED_SUBAGENT
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.transient is True
+    assert exc.value.kind == "harness"
+
+
+def test_apply_followup_labels_plain_failures_transient_not_harness() -> None:
+    """Guards the label from collapsing into "everything non-deterministic is
+    a harness failure" — only the sentinel earns that name."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = 1
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.transient is True
+    assert exc.value.kind == "transient"
+
+
+def test_apply_followup_still_labels_no_commits_deterministic() -> None:
+    """42/43/44 keep charging an attempt — #366 must not weaken #12's fix."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    for code in (
+        run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
+        run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+        run_implementer.EXIT_OPERATION_TIMEOUT,
+    ):
+        class _Result:
+            returncode = code
+
+        def fake_run(cmd, check=False, text=False, _r=_Result, **_kwargs):
+            return _r()
+
+        with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+             patch.object(run_shepherd.subprocess, "run", fake_run):
+            with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+                run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+        assert exc.value.transient is False, code
+        assert exc.value.kind == "deterministic", code
+
+
+def test_outer_loop_does_not_count_attempt_on_harness_failure(tmp_path, capsys) -> None:
+    """The whole point of #366: the counter and the on-disk status stay put."""
+    ref = make_ref(tmp_path, review_attempts=1)
+    pr = make_pr()
+    findings = [make_finding()]
+    review = CodexReview(has_responded=True, findings=findings)
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (46)",
+            kind="harness",
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["review_attempts"] == 1
+    assert final["status"] == "implemented"
+    assert ref.review_attempts == 1
+    assert ref.status == "implemented"
+    # Greppable operator-facing signal: a platform bug, not a flaky push.
+    assert "harness failure — not charging a review attempt" in capsys.readouterr().out
+
+
+def test_harness_failures_are_bounded_and_flip_to_review_stuck(tmp_path, capsys) -> None:
+    """Not charged is not the same as never terminating.
+
+    Exit 46 is reachable by stream exhaustion as well as by the drain deadline,
+    and that path has no damper — without a cap a structural orphan would
+    re-clone the repo and re-run a paid SDK call every tick forever. The cap is
+    its OWN counter so the proposal is still never charged a review attempt.
+    """
+    ref = make_ref(tmp_path, review_attempts=2)
+    ref.harness_failures = run_shepherd.MAX_HARNESS_FAILURES - 1
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (46)", kind="harness",
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "review-stuck"
+    final = read_status(ref)
+    assert final["status"] == "review-stuck"
+    assert final["harness_failures"] == run_shepherd.MAX_HARNESS_FAILURES
+    # The proposal was never blamed for the platform's own defect.
+    assert final["review_attempts"] == 2
+    assert "harness defect, not a problem with the proposal" in final["notes"]
+
+
+def test_harness_failure_counter_increments_below_the_cap(tmp_path) -> None:
+    ref = make_ref(tmp_path, review_attempts=1)
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError("exit 46", kind="harness")
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["harness_failures"] == 1
+    assert final["review_attempts"] == 1
+    assert final["status"] == "implemented"
+
+
+def test_followup_subprocess_error_cannot_contradict_itself() -> None:
+    """`transient` is derived from `kind`, so the two cannot disagree."""
+    assert run_shepherd.FollowupSubprocessError("x").transient is True
+    assert run_shepherd.FollowupSubprocessError("x", kind="harness").transient is True
+    assert run_shepherd.FollowupSubprocessError(
+        "x", kind="deterministic"
+    ).transient is False
+
+
+def test_reconcile_unstick_clears_both_counters(tmp_path) -> None:
+    """Un-sticking must hand back a fresh budget on BOTH axes.
+
+    The reconcile path clears `review_attempts`, and before this test it cleared
+    only that. A proposal driven to `review-stuck` by repeated harness failures
+    would then come back with `harness_failures` still at MAX and re-trip the cap
+    on the very next one — un-stuck in name only.
+    """
+    ref = make_ref(
+        tmp_path,
+        service="mctl-agents",
+        slug="stuck-on-harness",
+        status="review-stuck",
+    )
+    status = read_status(ref)
+    status["github"] = {
+        "state": "open",
+        "head_sha": HEAD_SHA,
+        "observed_at": "2026-04-29T12:00:00Z",
+    }
+    status["review_attempts"] = 5
+    status["harness_failures"] = run_shepherd.MAX_HARNESS_FAILURES
+    ref.status_path.write_text(
+        yaml.safe_dump(status, sort_keys=False), encoding="utf-8",
+    )
+
+    approved = make_pr(review_decision="APPROVED")
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=approved):
+        result = run_shepherd.reconcile_one(ref)
+
+    assert result.decision == "repair-open-pr"
+    final = read_status(ref)
+    assert final["status"] == "implemented"
+    assert "review_attempts" not in final
+    assert "harness_failures" not in final
+
+
+def test_harness_failures_round_trips_through_disk(tmp_path, monkeypatch) -> None:
+    """The counter must survive the tick boundary, or the cap means nothing.
+
+    Every tick is a fresh process, so `_discover_refs` reading the key back off
+    `.status.yaml` is the single link that makes `ref.harness_failures + 1`
+    cumulative. If it regressed — dropped in a refactor, or the key renamed on
+    one side — `ref.harness_failures` would be 0 on every tick, `new_failures`
+    would be 1 forever, MAX_HARNESS_FAILURES would never be reached, and the
+    unbounded paid retry loop it exists to stop would silently come back.
+
+    The cap tests deliberately do not cover this: they seed the counter in
+    memory or start from the default, so a read that always returned 0 would
+    pass them all.
+    """
+    proposal_dir = make_status_yaml(tmp_path, service="mctl-web", slug="harness-rt")
+    status_path = proposal_dir / ".status.yaml"
+    payload = yaml.safe_load(status_path.read_text(encoding="utf-8"))
+    payload["harness_failures"] = 2
+    status_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    refs = run_shepherd._discover_refs(tmp_path)
+
+    ref = next(r for r in refs if r.slug == "harness-rt")
+    assert ref.harness_failures == 2, (
+        "harness_failures did not survive the tick boundary; the cap is inert"
+    )
+    # And the absent-key case still defaults cleanly rather than raising.
+    plain = make_status_yaml(tmp_path, service="mctl-web", slug="no-harness-key")
+    assert plain.exists()
+    refs = run_shepherd._discover_refs(tmp_path)
+    assert next(r for r in refs if r.slug == "no-harness-key").harness_failures == 0
+
+
+def test_deterministic_failure_also_clears_the_harness_counter(tmp_path) -> None:
+    """"Consecutive" has to be true of every proof that the handoff works.
+
+    A deterministic 42/43/44 proves it as well as a success does: the child ran
+    to a terminal state and the driver adjudicated its output. Without clearing
+    here, the interleaving 46, 42, 46, 42, 46 reaches the cap and reports "the
+    platform lost the work 3 time(s) in a row" — false, and that counter is what
+    an operator reads to decide whether this is a platform incident.
+    """
+    ref = make_ref(tmp_path, review_attempts=0)
+    ref.harness_failures = 2
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (42)", kind="deterministic",
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        process_one(ref, skip_subprocess=True)
+
+    final = read_status(ref)
+    assert final["review_attempts"] == 1
+    assert "harness_failures" not in final
