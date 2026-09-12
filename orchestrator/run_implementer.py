@@ -238,6 +238,11 @@ class ImplementResult:
     # `skipped_reason` is still set alongside this so any consumer that
     # only reads the old channel keeps seeing a human-readable reason.
     blocked: str | None = None
+    # True only when the blocked marker was freshly written or changed on
+    # THIS tick (see `_mark_blocked`'s return value); False when an
+    # already-recorded, unchanged marker was merely re-observed. Lets
+    # `main()` avoid re-failing forever on a permanently blocked proposal.
+    blocked_is_new: bool = False
     counts_toward_limit: bool = True
 
 
@@ -1038,13 +1043,17 @@ def _approval_blocked_message(ref: ProposalRef) -> tuple[str, str]:
                 workflow_id = None
             if workflow_id:
                 remedy = (
-                    f"Signal DevLoopWorkflow {workflow_id} via "
-                    f"POST /api/v1/agents/dev-loop/{workflow_id}/approve, if "
-                    f"that execution is still running. {no_op_and_recovery}"
+                    f"{no_op_and_recovery} A DevLoopWorkflow {workflow_id} may "
+                    f"exist for this issue; only if that execution is still "
+                    f"running would signalling POST "
+                    f"/api/v1/agents/dev-loop/{workflow_id}/approve do "
+                    f"anything, and that signal is what is most likely to "
+                    f"have produced this exact blocked state, so treat it as "
+                    f"a secondary check, not the fix."
                 )
                 return message, remedy
 
-    remedy = f"No DevLoopWorkflow exists for this proposal. {no_op_and_recovery}"
+    remedy = f"{no_op_and_recovery} No DevLoopWorkflow exists for this proposal."
     return message, remedy
 
 
@@ -1245,14 +1254,18 @@ def _mark_blocked(
     code: str,
     message: str,
     remedy: str,
-) -> None:
+) -> bool:
     """Write (or refresh) the durable ``blocked`` marker exactly once.
 
     Reads the current file first: if ``code``, ``message`` and ``remedy``
-    are all unchanged, returns without writing, so a permanently blocked
-    proposal produces exactly one gitops commit and not one per tick. The
-    block carries no per-observation timestamp; ``since`` is set on first
-    write and preserved after that. ``status`` stays ``accepted``.
+    are all unchanged, returns ``False`` without writing, so a permanently
+    blocked proposal produces exactly one gitops commit and not one per
+    tick. The block carries no per-observation timestamp; ``since`` is set
+    on first write and preserved after that. ``status`` stays ``accepted``.
+
+    Returns ``True`` when it performed a write (a new marker, or a changed
+    one), ``False`` on the no-op path -- callers use this to tell a
+    freshly-detected block apart from one merely re-observed unchanged.
     """
     current = _load_status(ref.status_path).get("blocked")
     since = None
@@ -1262,7 +1275,7 @@ def _mark_blocked(
             and current.get("message") == message
             and current.get("remedy") == remedy
         ):
-            return
+            return False
         since = current.get("since")
     block = {
         "code": code,
@@ -1271,6 +1284,7 @@ def _mark_blocked(
         "remedy": remedy,
     }
     update_status_yaml(ref, "accepted", blocked=block)
+    return True
 
 
 def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
@@ -1297,8 +1311,9 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # rather than run the model, and make the refusal loud and durable.
     if not ref.approval_ok:
         message, remedy = _approval_blocked_message(ref)
+        blocked_is_new = False
         if not dry_run:
-            _mark_blocked(
+            blocked_is_new = _mark_blocked(
                 ref,
                 code=BLOCKED_APPROVAL_MISSING,
                 message=message,
@@ -1308,6 +1323,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=None,
             blocked=BLOCKED_APPROVAL_MISSING,
+            blocked_is_new=blocked_is_new,
             skipped_reason=message,
             counts_toward_limit=False,
         )
@@ -1750,8 +1766,20 @@ def main() -> None:
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also
     # succeeded exits 0 so real work is never reported red; --dry-run never
-    # writes the marker and never changes today's exit-code behaviour.
-    if outcome.blocked and not outcome.succeeded and not args.dry_run:
+    # writes the marker and never changes today's exit-code behaviour. This
+    # only fires on the tick that newly wrote or changed the marker
+    # (`blocked_is_new`); a subsequent tick that finds the identical,
+    # already-recorded block on disk returns 0 instead, so a permanently
+    # blocked proposal produces exactly one failed Argo run, not one every
+    # ~30 minutes forever. The durable `.status.yaml` marker and the
+    # `=== Blocked ===` summary above still make the state visible on every
+    # run regardless of exit code.
+    if (
+        outcome.blocked
+        and not outcome.succeeded
+        and not args.dry_run
+        and any(r.blocked_is_new for r in results)
+    ):
         sys.exit(EXIT_BLOCKED_ONLY)
 
 

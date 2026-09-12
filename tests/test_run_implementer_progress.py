@@ -101,6 +101,7 @@ def _blocked_result(slug: str) -> run_implementer.ImplementResult:
         ref=_ref(slug),
         pr_url=None,
         blocked=run_implementer.BLOCKED_APPROVAL_MISSING,
+        blocked_is_new=True,
         skipped_reason="requires_human_approval is set but no verified approval is recorded",
         counts_toward_limit=False,
     )
@@ -161,3 +162,20 @@ def test_dry_run_never_exits_45_even_when_blocked_only(monkeypatch, tmp_path) ->
     _run_main(
         monkeypatch, tmp_path, [_blocked_result("blocked-only")], extra_argv=["--dry-run"]
     )
+
+
+def test_main_does_not_exit_45_when_the_blocked_marker_is_unchanged(
+    monkeypatch, tmp_path
+) -> None:
+    unchanged = run_implementer.ImplementResult(
+        ref=_ref("blocked-again"),
+        pr_url=None,
+        blocked=run_implementer.BLOCKED_APPROVAL_MISSING,
+        blocked_is_new=False,
+        skipped_reason="requires_human_approval is set but no verified approval is recorded",
+        counts_toward_limit=False,
+    )
+    # main() returns normally (exit 0): the batch is blocked-only, but the
+    # marker was already recorded on a prior tick, so this tick must not
+    # re-fail forever.
+    _run_main(monkeypatch, tmp_path, [unchanged])
