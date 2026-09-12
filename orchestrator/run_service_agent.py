@@ -4,6 +4,7 @@ Usage:
     python -m orchestrator.run_service_agent mctl-web
 """
 import sys
+import traceback
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from typing import Any, cast
@@ -36,10 +37,45 @@ class ServiceAgentOrphanedSubagent(OrphanedSubagentError):
     `ResultMessage` throws the child's inbox entry or proposal away silently.
     mctl-agents#366.
 
-    Raised rather than swallowed so the loss is visible: `run_all._safe_run_service`
-    catches it, logs `warn: service-agent <svc> failed: ...` and moves on
-    without tearing down the sibling agents in the same task group.
+    Raised rather than returned so the loss is visible in the log — but it must
+    never be allowed to reach the process exit code, which is why every
+    entrypoint goes through `run_service_agent_tolerating_orphans` below.
     """
+
+
+async def run_service_agent_tolerating_orphans(service: str) -> None:
+    """Run one service agent, keeping an orphaned child from binning the parent's work.
+
+    An orphan is, by construction, a PARTIAL success: the parent already wrote
+    whatever it wrote — an inbox entry, a proposal triplet — to disk before the
+    turn ended, and only the delegated child's contribution is lost. The
+    workflow commits that directory in a later step, gated on this step's exit
+    status, so exiting non-zero here would discard the parent's work too. That
+    is strictly more loss than the pre-#366 behaviour it replaces, which at
+    least exited 0 and got the partial committed — the exact inversion of what
+    #366 is for.
+
+    So: log loudly, exit 0, let the commit step run. Same trade and same
+    rationale as `run_all._safe_run_service` ("the mentor reads whatever
+    proposals/ landed on disk, so partial success still produces a useful
+    digest"), which covers the RUN_MODE=full task group. This function covers
+    the two paths that guard did NOT: `run_all._single_service`, reached by the
+    declared `mctl-agents-single-service` operator operation, and `main()`
+    below — the `python -m orchestrator.run_service_agent <svc>` invocation
+    this module's own docstring documents. Both called the driver bare.
+
+    Deliberately narrow — ONLY the orphan, not `except Exception`. Every other
+    failure may mean zero real work happened, and swallowing those would report
+    a false green to Argo for a run that produced nothing, which is the bug
+    `_safe_run_incident_responder`'s McpNotConnectedError branch exists to
+    prevent. The orphan is the one failure mode where "there is something on
+    disk worth committing" is guaranteed rather than hoped for.
+    """
+    try:
+        await run_service_agent(service)
+    except ServiceAgentOrphanedSubagent as exc:
+        print(f"warn: service-agent {service}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
 
 
 PROMPT = """\
@@ -151,7 +187,7 @@ def main() -> None:
         sys.exit(1)
 
     ensure_auth_for_sdk()
-    anyio.run(run_service_agent, service)
+    anyio.run(run_service_agent_tolerating_orphans, service)
 
 
 if __name__ == "__main__":

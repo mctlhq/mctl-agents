@@ -1967,6 +1967,22 @@ def investigate(
         # agent broke on this issue". Nothing structured is added: this driver
         # reports through InvestigateResult.error, not exit codes, and
         # `rate_limited` stays the only flag any caller branches on.
+        #
+        # The trade this makes, stated because it is a CHOICE and not a
+        # consequence: returning an error here means the `finally` below
+        # rmtrees the staging directory, and the agent may have written a
+        # complete, perfectly good requirements/design/tasks triplet there
+        # before the child was orphaned. We discard it anyway. Staging exists
+        # precisely so a run's output is adjudicated as a whole (see the
+        # staleness note above, mctl-agents#246): an orphan means part of the
+        # work the proposal was supposed to contain never happened, so the
+        # triplet on disk is a document whose provenance we cannot vouch for --
+        # coherent-looking, silently missing whatever the child was doing.
+        # Publishing it would put exactly that into the pipeline with no marker,
+        # which is worse than re-investigating: the issue stays `proposed` and
+        # re-running is idempotent, so the cost of discarding is one more run,
+        # while the cost of publishing is a plausible proposal nobody knows is
+        # partial. Revisit only with a way to record the gap in the artifact.
         return InvestigateResult(
             service, slug, proposal_dir,
             error=(

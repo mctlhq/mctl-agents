@@ -23,7 +23,10 @@ from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.mcp_guard import McpNotConnectedError
 from orchestrator.run_incident_responder import run_incident_responder
 from orchestrator.run_mentor import run_mentor
-from orchestrator.run_service_agent import run_service_agent
+from orchestrator.run_service_agent import (
+    run_service_agent,
+    run_service_agent_tolerating_orphans,
+)
 
 # Distinct exit code so this specific failure mode is distinguishable in
 # logs; Argo's assert-attempt only checks whether the step status is
@@ -130,7 +133,12 @@ async def _single_service(service: str) -> None:
         )
         sys.exit(1)
     print(f"=== mode=single-service — only {service}, no mentor ===")
-    await run_service_agent(service)
+    # Not the bare driver: an orphaned sub-agent must not exit non-zero here.
+    # This path has no task group and so never had `_safe_run_service`'s guard,
+    # but it feeds the same commit-and-push step, which is gated on this step's
+    # status — so raising would discard the parent's already-written inbox entry
+    # and proposals. See run_service_agent_tolerating_orphans' docstring.
+    await run_service_agent_tolerating_orphans(service)
 
 
 async def main() -> None:

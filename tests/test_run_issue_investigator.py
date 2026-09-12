@@ -19,7 +19,7 @@ from pathlib import Path
 import anyio
 import pytest
 import yaml
-from claude_agent_sdk import ResultMessage, TaskUpdatedMessage
+from claude_agent_sdk import TaskUpdatedMessage
 
 from orchestrator import run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
@@ -44,6 +44,7 @@ from orchestrator.run_issue_investigator import (
 )
 from tests.conftest import (
     fake_mcp_client_factory,
+    result_message,
     task_notification_message,
     task_started_message,
     task_updated_message,
@@ -379,62 +380,12 @@ def test_issue_closing_line_rejects_incomplete_source(tmp_path, source):
 # ---------------------------------------------------------------------------
 # _run_agent — rate-limit exhaustion detection
 # ---------------------------------------------------------------------------
-def _result_message(*, is_error: bool, api_error_status: int | None, subtype: str = "success") -> ResultMessage:
-    return ResultMessage(
-        subtype=subtype,
-        duration_ms=1,
-        duration_api_ms=0,
-        is_error=is_error,
-        num_turns=1,
-        session_id="test-session",
-        api_error_status=api_error_status,
-    )
-
-
-class _FakeClient:
-    """Stands in for ClaudeSDKClient — no MCTL_TOKEN in the test env means
-    build_issue_investigator_options() returns mcp_servers={}, so
-    ensure_mctl_connected() is never called; only query()/receive_messages()
-    need faking here.
-
-    ``messages`` may be a plain sequence or a zero-argument callable returning
-    an async generator, so a test can make the stream block or record what the
-    driver actually consumed (mctl-agents#366).
-    """
-
-    def __init__(self, *, options, messages):
-        self._messages = messages
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def query(self, prompt):
-        pass
-
-    async def receive_messages(self):
-        if callable(self._messages):
-            async for m in self._messages():
-                yield m
-            return
-        for m in self._messages:
-            yield m
-
-
-def _fake_client_factory(messages):
-    def _factory(*, options):
-        return _FakeClient(options=options, messages=messages)
-    return _factory
-
-
 def test_run_agent_raises_on_429_result(tmp_path, monkeypatch):
     """A final ResultMessage with is_error + api_error_status=429 must raise
     RateLimitExhaustedError, not just be printed and swallowed."""
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([_result_message(is_error=True, api_error_status=429)]),
+        fake_mcp_client_factory(messages=[result_message(is_error=True, api_error_status=429)]),
     )
     with pytest.raises(RateLimitExhaustedError):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -445,7 +396,7 @@ def test_run_agent_does_not_raise_on_clean_success(tmp_path, monkeypatch):
     rate-limit exhaustion."""
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([_result_message(is_error=False, api_error_status=None)]),
+        fake_mcp_client_factory(messages=[result_message(is_error=False, api_error_status=None)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 
@@ -458,7 +409,7 @@ def test_run_agent_does_not_raise_on_non_ratelimit_error(tmp_path, monkeypatch):
     poll()'s rate_limited_failures."""
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([_result_message(is_error=True, api_error_status=500)]),
+        fake_mcp_client_factory(messages=[result_message(is_error=True, api_error_status=500)]),
     )
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)  # must not raise
 
@@ -3095,7 +3046,7 @@ def _stub_client_no_messages(monkeypatch):
     # _run_agent test here stubs it.
     monkeypatch.setattr(
         "claude_agent_sdk.ClaudeSDKClient",
-        _fake_client_factory([]),
+        fake_mcp_client_factory(messages=[]),
     )
 
 
@@ -3217,7 +3168,7 @@ def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
 # pinned once for every builder in tests/test_options.py rather than here.
 # ---------------------------------------------------------------------------
 def _ok_result():
-    return _result_message(is_error=False, api_error_status=None)
+    return result_message(is_error=False, api_error_status=None)
 
 
 def test_investigator_waits_for_async_launched_subagent(tmp_path, monkeypatch):
@@ -3234,7 +3185,7 @@ def test_investigator_waits_for_async_launched_subagent(tmp_path, monkeypatch):
             yield message
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
@@ -3257,7 +3208,7 @@ def test_investigator_returns_immediately_when_no_tasks_are_live(tmp_path, monke
             yield message
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
 
     anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
@@ -3272,7 +3223,7 @@ def test_investigator_raises_orphaned_when_task_never_settles(tmp_path, monkeypa
         await anyio.sleep(10)
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 0.05
@@ -3289,7 +3240,7 @@ def test_investigator_raises_orphaned_when_stream_ends_with_live_task(tmp_path, 
         yield _ok_result()
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
@@ -3307,7 +3258,7 @@ def test_investigator_does_not_orphan_on_failed_terminal_status(tmp_path, monkey
         yield task_notification_message(status="failed", summary="boom")
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
@@ -3324,10 +3275,10 @@ def test_investigator_rate_limit_still_wins_over_the_drain(tmp_path, monkeypatch
     a drain for a child an out-of-quota account never actually ran."""
     async def messages():
         yield task_started_message()
-        yield _result_message(is_error=True, api_error_status=429)
+        yield result_message(is_error=True, api_error_status=429)
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
@@ -3380,10 +3331,10 @@ def test_investigator_classifies_a_rate_limit_seen_during_the_drain(tmp_path, mo
         yield _ok_result()
         # Still live: the parent emits its limit verdict before the child
         # settles. This ordering was already observable in phase 1.
-        yield _result_message(is_error=True, api_error_status=429)
+        yield result_message(is_error=True, api_error_status=429)
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
@@ -3416,10 +3367,10 @@ def test_investigator_classifies_a_rate_limit_on_the_follow_up_turn(tmp_path, mo
         yield task_started_message()
         yield _ok_result()
         yield task_updated_message()
-        yield _result_message(is_error=True, api_error_status=429)
+        yield result_message(is_error=True, api_error_status=429)
 
     monkeypatch.setattr(
-        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+        "claude_agent_sdk.ClaudeSDKClient", fake_mcp_client_factory(messages=messages)
     )
     monkeypatch.setattr(
         "orchestrator.options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5

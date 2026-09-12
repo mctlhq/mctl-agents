@@ -64,15 +64,27 @@ class FakeMcpClient:
     async def query(self, prompt):
         self.queried_prompt = prompt
 
-    async def receive_response(self):
+    async def _iter_messages(self):
+        # `messages` may be a plain sequence or a zero-argument callable
+        # returning an async generator. The callable form is what the #366
+        # drain tests need: it lets a test block the stream, record what the
+        # driver actually consumed, or relaunch a task mid-drain.
+        if callable(self._messages):
+            async for message in self._messages():
+                yield message
+            return
         for message in self._messages:
             yield message
 
+    async def receive_response(self):
+        async for message in self._iter_messages():
+            yield message
+
     async def receive_messages(self):
-        # The implementer driver reads this one (mctl-agents#366): it must not
+        # The drivers converted for mctl-agents#366 read this one: it must not
         # stop at the first ResultMessage, or an async-launched sub-agent is
         # abandoned mid-flight.
-        for message in self._messages:
+        async for message in self._iter_messages():
             yield message
 
 

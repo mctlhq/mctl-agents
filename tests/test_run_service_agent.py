@@ -82,33 +82,6 @@ def test_mcp_not_configured_skips_status_check_entirely(monkeypatch):
 # when `sdk_mcp_servers or hooks` is truthy. That precondition is pinned once
 # for every builder in tests/test_options.py, not re-asserted here.
 # ---------------------------------------------------------------------------
-class _StreamingClient:
-    """Like conftest's FakeMcpClient, but `messages` is an async-generator
-    factory so a test can block the stream or record what was consumed."""
-
-    def __init__(self, *, options, messages):
-        self._messages = messages
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def query(self, prompt):
-        pass
-
-    async def receive_messages(self):
-        async for message in self._messages():
-            yield message
-
-
-def _streaming_factory(messages):
-    def _factory(*, options):
-        return _StreamingClient(options=options, messages=messages)
-    return _factory
-
-
 def test_service_agent_waits_for_async_launched_subagent(monkeypatch):
     """The headline regression: fails without the drain.
 
@@ -123,7 +96,7 @@ def test_service_agent_waits_for_async_launched_subagent(monkeypatch):
             consumed.append(message)
             yield message
 
-    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
 
     anyio.run(rsa.run_service_agent, "mctl-agent")
@@ -143,7 +116,7 @@ def test_service_agent_returns_immediately_when_no_tasks_are_live(monkeypatch):
             consumed.append(message)
             yield message
 
-    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
 
     anyio.run(rsa.run_service_agent, "mctl-agent")
 
@@ -158,7 +131,7 @@ def test_service_agent_raises_orphaned_when_task_never_settles(monkeypatch):
         yield result_message()
         await anyio.sleep(10)
 
-    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 0.05)
 
     with pytest.raises(rsa.ServiceAgentOrphanedSubagent, match=r"orphaned sub-agent:"):
@@ -173,7 +146,7 @@ def test_service_agent_raises_orphaned_when_stream_ends_with_live_task(monkeypat
         yield task_started_message()
         yield result_message()
 
-    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
 
     with pytest.raises(rsa.ServiceAgentOrphanedSubagent):
@@ -193,7 +166,7 @@ def test_service_agent_does_not_orphan_on_failed_terminal_status(monkeypatch, ca
         yield result_message()
         yield task_notification_message(status="failed", summary="boom")
 
-    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
 
     anyio.run(rsa.run_service_agent, "mctl-agent")
@@ -251,7 +224,7 @@ def test_service_agent_awaits_a_second_delegation(monkeypatch):
             consumed.append(message)
             yield message
 
-    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
     monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
 
     anyio.run(rsa.run_service_agent, "mctl-agent")
@@ -260,3 +233,94 @@ def test_service_agent_awaits_a_second_delegation(monkeypatch):
         isinstance(m, TaskUpdatedMessage) and m.task_id == "spec-writer"
         for m in consumed
     ), "driver abandoned the SECOND delegation"
+
+
+# ---------------------------------------------------------------------------
+# The unguarded entrypoints (claude P2, repeat, on #368).
+#
+# `run_all._safe_run_service` only covers the RUN_MODE=full task group.
+# `_single_service` — reached by the declared `mctl-agents-single-service`
+# operator operation — and `main()`'s `python -m orchestrator.run_service_agent
+# <svc>` both called the driver bare under anyio.run. On those paths raising
+# turned a silent exit-0 partial into a non-zero exit, so the workflow's
+# commit-and-push step never ran and the parent's ALREADY-WRITTEN inbox entry
+# and proposals were dropped: strictly more loss than before #366, which is the
+# inversion of what #366 is for.
+# ---------------------------------------------------------------------------
+def test_an_orphan_does_not_propagate_out_of_the_tolerating_wrapper(monkeypatch, capsys):
+    """The parent's work outlives the orphan: no raise, so the commit step runs."""
+    async def _orphan(service):
+        raise rsa.ServiceAgentOrphanedSubagent("orphaned sub-agent: t1 still live")
+
+    monkeypatch.setattr(rsa, "run_service_agent", _orphan)
+
+    anyio.run(rsa.run_service_agent_tolerating_orphans, "mctl-agent")  # must not raise
+
+    err = capsys.readouterr().err
+    assert "warn: service-agent mctl-agent" in err
+    assert "t1 still live" in err
+
+
+def test_single_service_mode_does_not_propagate_an_orphan(monkeypatch, capsys):
+    """`RUN_MODE=single-service` is real operator traffic, not theory.
+
+    Patches the driver rather than the wrapper, so this exercises the actual
+    `_single_service` -> wrapper -> driver wiring; patching the wrapper would
+    pass even if `_single_service` still called the bare driver.
+
+    `run_all` binds `run_service_agent` by name at import, so that binding is
+    ALSO stubbed — with a tripwire rather than the orphan. Without it, a
+    regression to the bare call reaches the real driver and a real
+    ClaudeSDKClient: the test then hangs on a subprocess instead of failing,
+    which is how a guard like this rots into a test nobody trusts. (Found the
+    hard way — the first version of this test did exactly that.)
+    """
+    from orchestrator import run_all
+
+    async def _orphan(service):
+        raise rsa.ServiceAgentOrphanedSubagent("orphaned sub-agent: t1 still live")
+
+    async def _bare_call_tripwire(service):
+        raise AssertionError(
+            "_single_service called the bare driver: an orphan there exits "
+            "non-zero and the commit step never runs (claude P2 on #368)"
+        )
+
+    monkeypatch.setattr(rsa, "run_service_agent", _orphan)
+    monkeypatch.setattr(run_all, "run_service_agent", _bare_call_tripwire)
+
+    anyio.run(run_all._single_service, "mctl-agent")  # must not raise
+
+    assert "warn: service-agent mctl-agent" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [RuntimeError("budget exhausted"), ValueError("boom")],
+)
+def test_the_wrapper_is_orphan_only_and_still_fails_loudly_otherwise(monkeypatch, exc):
+    """Deliberately NOT `except Exception`.
+
+    Every other failure may mean zero real work happened, and swallowing those
+    would report a false green to Argo for a run that produced nothing — the
+    bug `_safe_run_incident_responder`'s McpNotConnectedError branch exists to
+    prevent. Only the orphan is guaranteed to leave something on disk worth
+    committing.
+    """
+    async def _boom(service):
+        raise exc
+
+    monkeypatch.setattr(rsa, "run_service_agent", _boom)
+
+    with pytest.raises(type(exc)):
+        anyio.run(rsa.run_service_agent_tolerating_orphans, "mctl-agent")
+
+
+def test_the_module_entrypoint_goes_through_the_guard():
+    """`python -m orchestrator.run_service_agent <svc>` is what this module's
+    own docstring documents, so it must not be the one path left bare."""
+    import inspect
+
+    source = inspect.getsource(rsa.main)
+    assert "run_service_agent_tolerating_orphans" in source
+    assert "anyio.run(run_service_agent," not in source
