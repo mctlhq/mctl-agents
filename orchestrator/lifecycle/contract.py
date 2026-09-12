@@ -1,0 +1,181 @@
+"""Typed lifecycle-ownership contract.
+
+Frozen dataclasses co-located with their consumer, matching
+`orchestrator/resolver.py` — this repo has no pydantic and no `schemas/`
+package. Every field is defaulted so a value recorded before a field existed
+still deserializes out of Temporal history.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+# Entity kinds.
+KIND_DEVLOOP_PROPOSAL = "devloop-proposal"
+KIND_PULL_REQUEST = "pull-request"
+
+# Phases, typed per entity kind.
+PHASE_IMPLEMENT = "implement"
+PHASE_REVIEW_REMEDIATION = "review-remediation"
+
+# Ownership states. There is deliberately no "stale" and no "conflicted":
+# both are DERIVED on read, and storing them would need something to sweep and
+# write them, which is the scheduler this must not become.
+STATE_ACTIVE = "active"
+STATE_HANDING_OFF = "handing-off"
+STATE_RELEASED = "released"
+STATE_TERMINAL = "terminal"
+
+# Owner types. These name actors, never permissions: ownership grants neither
+# push nor merge authority (ADR-010 §6).
+OWNER_DEVLOOP_WORKFLOW = "devloop-workflow"
+OWNER_SHEPHERD = "shepherd"
+OWNER_PR_STEWARD = "pr-steward"
+OWNER_RECONCILER = "reconciler"
+OWNER_HUMAN_CODEOWNER = "human-codeowner"
+
+
+@dataclass(frozen=True)
+class EntityRef:
+    """The thing whose lifecycle is being advanced.
+
+    ``version`` is NOT part of the ownership key. It is recorded so a reader
+    can see which version the owner last observed, and becomes a precondition
+    on an execution claim (phase 2, #352) — never on ownership itself.
+    Ownership must survive a review-fix push, because a new head on the same
+    PR is the normal case rather than a handoff.
+    """
+
+    kind: str = ""
+    id: str = ""
+    version: str = ""
+
+    @staticmethod
+    def for_pull_request(repo: str, number: int, head_sha: str = "") -> EntityRef:
+        return EntityRef(kind=KIND_PULL_REQUEST, id=f"{repo}#{number}", version=head_sha)
+
+    @staticmethod
+    def for_proposal(service: str, slug: str, version: str = "") -> EntityRef:
+        return EntityRef(kind=KIND_DEVLOOP_PROPOSAL, id=f"{service}/{slug}", version=version)
+
+
+@dataclass(frozen=True)
+class Owner:
+    type: str = ""
+    id: str = ""
+
+
+@dataclass(frozen=True)
+class Ownership:
+    """One durable record: actor X holds responsibility for (entity, phase).
+
+    ``dead``, ``stuck`` and ``healthy`` are computed by mctl-api and carried
+    here rather than recomputed locally, so every consumer gets the same answer
+    instead of each re-implementing the bounds and drifting.
+    """
+
+    entity: EntityRef = field(default_factory=EntityRef)
+    phase: str = ""
+    owner: Owner = field(default_factory=Owner)
+    epoch: int = 0
+    state: str = ""
+    proposal_ref: str = ""
+    policy_ref: str = ""
+    handoff_to: Owner | None = None
+    handoff_from: Owner | None = None
+    last_seen_at: str = ""
+    last_progress_at: str = ""
+    progress_evidence: str = ""
+    temporal_workflow_id: str = ""
+    dead: bool = False
+    stuck: bool = False
+    healthy: bool = False
+
+    @staticmethod
+    def from_payload(data: dict[str, Any]) -> Ownership:
+        """Build from an mctl-api response, tolerating unknown keys.
+
+        Unknown keys are IGNORED rather than rejected: mctl-api may add a field
+        before this repo's image is rebuilt, and a client that hard-failed on
+        that would turn a routine API deploy into an ownership outage — and an
+        ownership outage now fails mutations closed.
+        """
+        ent = data.get("entity") or {}
+        own = data.get("owner") or {}
+
+        def _owner(raw: Any) -> Owner | None:
+            if not isinstance(raw, dict):
+                return None
+            return Owner(type=str(raw.get("type") or ""), id=str(raw.get("id") or ""))
+
+        return Ownership(
+            entity=EntityRef(
+                kind=str(ent.get("kind") or ""),
+                id=str(ent.get("id") or ""),
+                version=str(ent.get("version") or ""),
+            ),
+            phase=str(data.get("phase") or ""),
+            owner=Owner(type=str(own.get("type") or ""), id=str(own.get("id") or "")),
+            epoch=int(data.get("epoch") or 0),
+            state=str(data.get("state") or ""),
+            proposal_ref=str(data.get("proposal_ref") or ""),
+            policy_ref=str(data.get("policy_ref") or ""),
+            handoff_to=_owner(data.get("handoff_to")),
+            handoff_from=_owner(data.get("handoff_from")),
+            last_seen_at=str(data.get("last_seen_at") or ""),
+            last_progress_at=str(data.get("last_progress_at") or ""),
+            progress_evidence=str(data.get("progress_evidence") or ""),
+            temporal_workflow_id=str(data.get("temporal_workflow_id") or ""),
+            dead=bool(data.get("dead")),
+            stuck=bool(data.get("stuck")),
+            healthy=bool(data.get("healthy")),
+        )
+
+
+# The three answers to "is this entity owned?", and the reason this type
+# exists at all.
+#
+# `_dev_loop_owns` returns a bool, and every failure — a missing token, a 404,
+# a network error, a budget timeout — collapses into False, which the caller
+# reads as "not owned" and therefore "safe to act". So the system cannot tell
+# "nobody owns this" from "I could not find out", and acts identically on both.
+#
+# Three values make that impossible to express.
+OWNED_BY_OTHER = "owned-by-other"
+OWNED_BY_ME = "owned-by-me"
+UNOWNED = "unowned"
+UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class OwnershipAnswer:
+    """The result of asking who owns an entity phase.
+
+    ``verdict`` is one of the four constants above. ``UNKNOWN`` is the whole
+    point: it is what an unreachable or unconfigured store returns, and it is
+    NOT ``UNOWNED``. A caller that treats them the same has reintroduced the
+    defect this contract exists to remove.
+    """
+
+    verdict: str = UNKNOWN
+    ownership: Ownership | None = None
+    reason: str = ""
+
+    @property
+    def may_mutate(self) -> bool:
+        """Whether the asking actor may perform a mutating step.
+
+        UNKNOWN is False. An unreachable store must not license a second actor
+        to push or merge — that is the one behaviour inversion this contract
+        makes deliberately, and it is the reason the verdict is not a bool.
+        """
+        return self.verdict == OWNED_BY_ME
+
+    @property
+    def blocks_others(self) -> bool:
+        """Whether another actor must stand down.
+
+        UNKNOWN is True, for the same reason may_mutate is False: uncertainty
+        resolves toward "do not act", never toward "act".
+        """
+        return self.verdict in (OWNED_BY_OTHER, OWNED_BY_ME, UNKNOWN)
