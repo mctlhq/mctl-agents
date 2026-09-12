@@ -1356,9 +1356,10 @@ class DevLoopWorkflow:
                 # or one naming somebody else, which the arms above and below
                 # answer differently.
                 workflow.logger.info(
-                    "lifecycle: acquire for %s#%s was accepted with no record; "
-                    "no claim recorded this poll",
-                    repo, number,
+                    "lifecycle: acquire for %s#%s was accepted but told us "
+                    "nothing usable (state=%r, %s); no claim recorded this poll",
+                    repo, number, result.state,
+                    result.reason or "no reason given",
                 )
                 self._unknown_acquires += 1
             else:
@@ -1418,9 +1419,40 @@ class DevLoopWorkflow:
                 # moved for six hours — which its own landed writes disprove.
                 self._unknown_heartbeats = 0
                 return
+            if (
+                result is not None
+                and result.accepted
+                and result.verdict == UNKNOWN
+                and result.state
+            ):
+                # A record came back and its STATE is one this image does not
+                # recognise — the same shape the heartbeat block answers, and
+                # for two rounds this arm read it without the distinction.
+                #
+                # It must NOT advance the head and must NOT reset either
+                # counter. The reset was the live part: the give-up needs three
+                # heartbeats, the heartbeat fires every fourth poll, so a
+                # remediation loop that pushes at least once every ~6h zeroed
+                # the counter before it could reach the limit — and the claim
+                # was then held indefinitely, and invisibly, against a row
+                # another actor may hold in a state this loop cannot read.
+                # That is the very state the heartbeat split was added to
+                # remove, reached through the path it did not cover, in the
+                # case where a collision matters most: the loop is working.
+                self._unknown_heartbeats += 1
+                workflow.logger.warning(
+                    "lifecycle: progress on %s#%s came back in state %r, which "
+                    "this image does not recognise — %d consecutive; the claim "
+                    "is dropped at %d",
+                    repo, number, result.state, self._unknown_heartbeats,
+                    LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
+                )
+                self._give_up_claim_if_unanswered(repo, number)
+                return
             if result is not None and result.accepted and result.verdict == UNKNOWN:
-                # The write LANDED — mctl-api took it — but carried no record
-                # this module can classify, so the head must advance, and
+                # The write LANDED — mctl-api took it — and carried NO record
+                # at all (an empty state is the body-less 2xx), so the head
+                # must advance, and
                 # counting it as unanswered would be the opposite of what the
                 # gate is for.
                 #
@@ -1593,11 +1625,26 @@ class DevLoopWorkflow:
                 # the previous commit fixed one block up and this arm
                 # reintroduced. The unhealthy-own-record case is precisely the
                 # condition ADR-010 wants an operator to see.
-                workflow.logger.info(
-                    "lifecycle: heartbeat for %s#%s landed but told us nothing "
-                    "usable (verdict=%s, state=%r, healthy=%s) — the claim stands",
-                    repo, number, result.verdict, result.state, result.healthy,
-                )
+                if result.state and not result.healthy:
+                    # Our own record, read back unhealthy. ADR-010 §4 gives
+                    # `stuck` an ESCALATION — a human is told and ownership
+                    # does NOT move — so this is the condition an operator has
+                    # to be able to see. Sharing one info line with a routine
+                    # body-less 2xx, which fires on every heartbeat of a
+                    # healthy watch, buried it at the cadence of the harmless
+                    # case.
+                    workflow.logger.warning(
+                        "lifecycle: %s#%s reads back as OUR record, unhealthy "
+                        "(state=%r) — the claim stands and the reconciler "
+                        "escalates rather than taking it",
+                        repo, number, result.state,
+                    )
+                else:
+                    workflow.logger.info(
+                        "lifecycle: heartbeat for %s#%s landed but carried no "
+                        "record (verdict=%s) — the claim stands",
+                        repo, number, result.verdict,
+                    )
                 self._unknown_heartbeats = 0
                 return
             else:
@@ -1614,43 +1661,51 @@ class DevLoopWorkflow:
                     self._unknown_heartbeats,
                 )
 
-            if self._unknown_heartbeats >= LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT:
-                # Deliberately NOT a back-off. Skipping the heartbeat is the
-                # one thing that cannot help here — it is the write whose
-                # absence is the problem.
-                #
-                # What is wrong after this many consecutive failures is the
-                # BELIEF. At LIFECYCLE_HEARTBEAT_EVERY_POLLS x
-                # MERGE_POLL_INTERVAL per heartbeat, last_seen_at has not moved
-                # for about six hours in the failure case, or the record has
-                # come back that many times in a state this image cannot read.
-                # Either way the BELIEF is what is wrong. The reconciler will take
-                # the row at the 10h bound whatever this loop thinks — and the
-                # correction has to arrive BEFORE that, not after. A loop that
-                # goes on believing it owns an entity the store is about to
-                # hand to somebody else is the divergence this epic exists to
-                # remove. Dropping the claim
-                # makes the belief match the outcome, and returns the loop to
-                # the unclaimed path, which re-acquires under its own gate.
-                workflow.logger.warning(
-                    "lifecycle: giving up the claim on %s#%s after %d failed "
-                    "heartbeats — the sweeper keeps the PR",
-                    repo, number, self._unknown_heartbeats,
-                )
-                self._owned_entity_id = ""
-                self._owner_epoch = 0
-                self._owned_head_sha = ""
-                self._unknown_heartbeats = 0
-                self._unknown_progress = 0
-                # _unknown_progress too: it counts failures under the claim
-                # being dropped here, and carrying it forward would start the
-                # NEXT claim already throttled on a write path never tried
-                # under it.
-                #
-                # NOT _claim_refused: nobody said they own this. That flag is
-                # permanent and means "somebody else answered", which is the
-                # opposite of what just happened.
+            self._give_up_claim_if_unanswered(repo, number)
 
+
+    def _give_up_claim_if_unanswered(self, repo: str, number: int) -> None:
+        """Drop the claim once the store has stopped confirming it.
+
+        A method rather than a tail of the heartbeat block, because TWO paths
+        now count toward it: a heartbeat that did not land, and a progress
+        write that came back in a state this image cannot read. Leaving the
+        check inside the heartbeat meant the progress path could count forever
+        without ever reaching it, and calling it from both without extracting
+        it meant a poll that took both paths counted twice.
+        """
+        if self._unknown_heartbeats < LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT:
+            return
+        # Deliberately NOT a back-off. Skipping the heartbeat is the one thing
+        # that cannot help here — it is the write whose absence is the problem.
+        #
+        # What is wrong after this many is the BELIEF. At
+        # LIFECYCLE_HEARTBEAT_EVERY_POLLS x MERGE_POLL_INTERVAL per heartbeat,
+        # either last_seen_at has not moved for about six hours, or the record
+        # has come back that many times in a state this image cannot read.
+        # Either way the reconciler will take the row at the 10h bound whatever
+        # this loop thinks, and the correction has to arrive BEFORE that, not
+        # after. A loop that goes on believing it owns an entity the store is
+        # about to hand to somebody else is the divergence this epic exists to
+        # remove. Dropping the claim makes the belief match the outcome and
+        # returns the loop to the unclaimed path, which re-acquires under its
+        # own gate.
+        workflow.logger.warning(
+            "lifecycle: giving up the claim on %s#%s after %d unanswered "
+            "liveness writes — the sweeper keeps the PR",
+            repo, number, self._unknown_heartbeats,
+        )
+        self._owned_entity_id = ""
+        self._owner_epoch = 0
+        self._owned_head_sha = ""
+        self._unknown_heartbeats = 0
+        # _unknown_progress too: it counts failures under the claim being
+        # dropped here, and carrying it forward would start the NEXT claim
+        # already throttled on a write path never tried under it.
+        self._unknown_progress = 0
+        # NOT _claim_refused: nobody said they own this. That flag is permanent
+        # and means "somebody else answered", which is the opposite of what
+        # just happened.
     def _backed_off(self, unanswered: int) -> bool:
         """Whether an ownership write should be skipped on this poll.
 
