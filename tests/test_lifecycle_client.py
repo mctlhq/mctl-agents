@@ -740,6 +740,43 @@ def test_a_batch_value_that_is_not_a_mapping_does_not_kill_the_sweep(
         assert out["mctlhq/b#2"].verdict == OWNED_BY_ME, bad
 
 
+def test_only_release_and_terminal_may_answer_nobody_holds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The claiming/relinquishing list has to be closed on the FAIL-OPEN side.
+
+    The first version listed the claiming routes and treated everything else as
+    relinquishing, so a route this image does not recognise — mctl-api adds
+    one, or a base path gains a prefix — answered `blocks_others` False, i.e.
+    nobody holds the entity. It was also wrong about two routes that already
+    existed: `/progress` leaves the record active and owned by the caller, and
+    `/handoff/start` writes handing-off, a HOLDING state this file pins
+    elsewhere as blocking, so the same row answered True when read back and
+    False when the write that produced it returned 204.
+    """
+    empty = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    for call, name in (
+        (lambda c: c.progress(ENTITY, PHASE, ME, epoch=1, evidence="pushed"), "progress"),
+        (lambda c: c.handoff_start(ENTITY, PHASE, ME, epoch=1, to=OTHER, reason="x"), "handoff/start"),
+        (lambda c: c.handoff_complete(ENTITY, PHASE, ME), "handoff/complete"),
+        (lambda c: c.acquire(ENTITY, PHASE, ME), "acquire"),
+    ):
+        answer = call(_client(monkeypatch, empty))
+        assert answer.verdict == UNKNOWN, name
+        assert answer.blocks_others is True, name
+
+    # The two that genuinely leave the entity unheld keep the verdict it was
+    # made for — this is the direction the closed list must not break.
+    for call, name in (
+        (lambda c: c.release(ENTITY, PHASE, ME, epoch=1, reason="done"), "release"),
+        (lambda c: c.terminal(ENTITY, PHASE, ME, epoch=1, reason="merged"), "terminal"),
+    ):
+        answer = call(_client(monkeypatch, empty))
+        assert answer.verdict == WROTE_NO_RECORD, name
+        assert answer.blocks_others is False, name
+        assert answer.wrote is True, name
+
+
 def test_a_body_less_2xx_on_handoff_complete_is_not_a_claim_either(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -255,27 +255,33 @@ class OwnershipAnswer:
 # becomes a coin flip.
 
 
-# The routes that CLAIM an entity — the ones where the caller comes away as the
-# owner, and where a body-less 2xx therefore means the grant never arrived
-# rather than that a relinquishing write succeeded quietly.
+# The routes that RELINQUISH an entity — the only two whose body-less 2xx may
+# answer WROTE_NO_RECORD, because that verdict is `blocks_others` False and so
+# is literally the statement that nobody holds the entity now.
 #
-# BOTH of them. `/handoff/complete` is a claiming route by the same definition
-# as `/acquire`: the caller is the incoming owner (ADR-010 §10 path 2), and it
-# is the transition the ADR calls the deterministic unowned window — so
-# answering WROTE_NO_RECORD there, which is `blocks_others` False, says nobody
-# holds the entity at the exact instant a new owner took it. That is the
-# fail-open the acquire carve-out exists to prevent, arriving on the one
-# transition where a second actor moving in does the most damage.
+# CLOSED, and closed on this side deliberately. The first version listed the
+# CLAIMING routes and treated everything else as relinquishing, which left the
+# path vocabulary open on the FAIL-OPEN side: a named route this image does not
+# recognise — mctl-api adds one, or a base path gains a prefix — answered
+# "nobody holds it". Every other vocabulary in this module is closed on both
+# sides for exactly that reason (HOLDING_STATES and FREE_STATES are both
+# explicit, and a state in neither is UNKNOWN), and this one was the exception.
+#
+# It was also wrong about two routes that already existed. `/progress` leaves
+# the record active and owned by the caller, and `/handoff/start` writes
+# handing-off, a HOLDING state that test_handing_off_record_still_blocks pins
+# as blocking — so the same row answered `blocks_others` True when read back
+# and False when the write that produced it returned 204.
 #
 # Keyed on the request path rather than a parameter because both transports
 # already pass `path` and neither can forget to: a flag would be a third thing
 # the sync client and the Temporal activity have to agree about, which is
 # exactly the drift this module exists to stop.
-CLAIMING_PATH_SUFFIXES = ("/acquire", "/handoff/complete")
+RELINQUISHING_PATH_SUFFIXES = ("/release", "/terminal")
 
 
-def _claims_ownership(path: str) -> bool:
-    return path.endswith(CLAIMING_PATH_SUFFIXES)
+def _relinquishes_ownership(path: str) -> bool:
+    return path.endswith(RELINQUISHING_PATH_SUFFIXES)
 
 
 def _error_of(status: int, payload: dict[str, Any]) -> str:
@@ -401,7 +407,7 @@ def answer_from(
         # right one.
         own = record_of(payload)
         if own is None:
-            if not is_read and body_empty and path and not _claims_ownership(path):
+            if not is_read and body_empty and _relinquishes_ownership(path):
                 # A genuinely body-less 2xx on a RELINQUISHING write means it
                 # SUCCEEDED and told us nothing more. Reporting UNKNOWN would
                 # make it indistinguishable from a 503, and a caller gating its
@@ -412,17 +418,18 @@ def answer_from(
                 # a 200 carrying an HTML error page from a gateway is not a
                 # successful write, and body_empty is what separates them.
                 #
-                # And it must not reach here for a CLAIMING write. This verdict
-                # is the only one outside the three "somebody holds it" answers,
-                # so blocks_others is False — correct for a release, which is
-                # precisely the statement that nobody holds the entity now, and
-                # fail-open for an acquire, where it would tell every other
-                # actor the entity is free while this one also declines to act
-                # (may_mutate is False too, since the record naming us never
-                # arrived). A body-less 2xx on acquire is a protocol anomaly
-                # — mctl-api answers acquire with the record — so it is UNKNOWN,
-                # and an unknown path is treated the same way rather than
-                # guessed at.
+                # And it must not reach here for any write that LEAVES the
+                # entity held. This verdict is the only one outside the three
+                # "somebody holds it" answers, so blocks_others is False —
+                # correct for a release or a terminal, which is precisely the
+                # statement that nobody holds the entity now, and fail-open for
+                # every other route: acquire and handoff/complete leave the
+                # CALLER holding it, progress leaves the record active, and
+                # handoff/start writes handing-off, a HOLDING state. A
+                # body-less 2xx on any of those is a protocol anomaly —
+                # mctl-api answers them with the record — so it is UNKNOWN, and
+                # so is an unrecognised or empty path, because the list above is
+                # closed and this is its fail-CLOSED side.
                 return OwnershipAnswer(
                     verdict=WROTE_NO_RECORD,
                     reason=f"{status} with no body",
