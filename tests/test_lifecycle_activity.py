@@ -292,3 +292,33 @@ def test_progress_without_evidence_is_answered_here_not_by_a_400(
     assert result.verdict == "unknown"
     assert "evidence" in result.reason
     assert called == [], called
+
+
+def test_dead_and_stuck_survive_the_wire_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_result_from` kept `healthy` and dropped the two flags it is the
+    conjunction of.
+
+    ADR-010 §4 acts on them differently — `dead` licenses a takeover, `stuck`
+    licenses an escalation and ownership does NOT move — and the workflow's
+    give-up argues a takeover while its heartbeat arm argues an escalation. A
+    caller that can only see `healthy` cannot tell which it is looking at, and
+    `healthy` alone cannot be decomposed back into them.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(
+            _record(dead=False, stuck=True, healthy=False)
+        ).encode())
+
+    result = _run(monkeypatch, handler, _req(op="acquire"))
+    assert result.stuck is True
+    assert result.dead is False
+    assert result.healthy is False
+
+    def handler_dead(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=json.dumps(
+            _record(dead=True, stuck=False, healthy=False)
+        ).encode())
+
+    result = _run(monkeypatch, handler_dead, _req(op="acquire"))
+    assert result.dead is True
+    assert result.stuck is False

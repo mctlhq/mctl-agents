@@ -186,6 +186,11 @@ LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 # and only the reconciler resolves it.)
 LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
 
+# The owner type this workflow writes and reads back. Written once by
+# `_ownership` and compared in two arms; as three separate literals they had to
+# agree by inspection, and nothing failed if one of them changed.
+OWNER_TYPE = "devloop-workflow"
+
 # Consecutive failed HEARTBEATS before the loop stops believing it owns the
 # entity. A SEPARATE constant, and a smaller number, because it counts a
 # different thing.
@@ -1168,7 +1173,7 @@ class DevLoopWorkflow:
             entity_id=EntityRef.for_pull_request(repo, number, head_sha).id,
             phase="review-remediation",
             version=head_sha,
-            owner_type="devloop-workflow",
+            owner_type=OWNER_TYPE,
             owner_id=info.workflow_id,
             epoch=self._owner_epoch,
             evidence=evidence,
@@ -1518,10 +1523,19 @@ class DevLoopWorkflow:
                 result is not None
                 and result.accepted
                 and result.verdict == OWNED_BY_OTHER
-                and result.owner_type == "devloop-workflow"
+                and result.owner_type == OWNER_TYPE
             ):
                 # The owner TYPE too, because `_lost_to_someone_else` cannot
-                # carry this alone. `Ownership.from_payload` does not require
+                # carry this alone.
+                #
+                # It answers "is this owner TYPE ours", not "is this record
+                # ours", and under the same premise — mctl-api emitting an
+                # owner with no id — a record naming another DEVLOOP execution
+                # reads as ours here. Second order: two DevLoops on one PR is
+                # what this record exists to prevent, and with the id empty
+                # there is no better predicate available. Written down so the
+                # next reader does not have to re-derive that it is a known
+                # limit rather than an oversight. `Ownership.from_payload` does not require
                 # `owner.id`, so a 2xx carrying `owner: {"type": "pr-steward"}`
                 # parses, answers OWNED_BY_OTHER, and is declined as a loss by
                 # the `bool(result.owner_id)` guard — which exists for the
@@ -1702,7 +1716,7 @@ class DevLoopWorkflow:
                 and result.accepted
                 and (
                     result.verdict != OWNED_BY_OTHER
-                    or result.owner_type == "devloop-workflow"
+                    or result.owner_type == OWNER_TYPE
                 )
             ):
                 # The same competitor check the progress branch got, which this
@@ -1746,25 +1760,38 @@ class DevLoopWorkflow:
                 # the previous commit fixed one block up and this arm
                 # reintroduced. The unhealthy-own-record case is precisely the
                 # condition ADR-010 wants an operator to see.
-                if result.state and not result.healthy:
-                    # Our own record, read back unhealthy. ADR-010 §4 gives
-                    # `stuck` an ESCALATION — a human is told and ownership
-                    # does NOT move — so this is the condition an operator has
-                    # to be able to see. Sharing one info line with a routine
-                    # body-less 2xx, which fires on every heartbeat of a
-                    # healthy watch, buried it at the cadence of the harmless
-                    # case.
-                    workflow.logger.warning(
-                        "lifecycle: %s#%s reads back as OUR record, unhealthy "
-                        "(state=%r) — the claim stands and the reconciler "
-                        "escalates rather than taking it",
-                        repo, number, result.state,
-                    )
-                else:
+                if not result.state:
+                    # No record at all — the body-less 2xx. Routine on a
+                    # healthy watch, so info.
                     workflow.logger.info(
                         "lifecycle: heartbeat for %s#%s landed but carried no "
                         "record (verdict=%s) — the claim stands",
                         repo, number, result.verdict,
+                    )
+                elif not result.healthy:
+                    # Our own record, read back unhealthy — and WHICH kind
+                    # matters. ADR-010 §4 gives `stuck` an ESCALATION (a human
+                    # is told and ownership does NOT move) and only `dead` a
+                    # takeover, so an operator needs the distinction and not
+                    # merely "unhealthy". The wire type carries both now.
+                    workflow.logger.warning(
+                        "lifecycle: %s#%s reads back as OUR record, unhealthy "
+                        "(state=%r, dead=%s, stuck=%s) — the claim stands and "
+                        "the reconciler %s",
+                        repo, number, result.state, result.dead, result.stuck,
+                        "may take it" if result.dead else "escalates rather than taking it",
+                    )
+                else:
+                    # A record, healthy, our own owner TYPE — but not
+                    # owned_by_caller, so it named a different id, or none.
+                    # The arm above keeps the claim on the type alone and the
+                    # log said "carried no record" for a response that carried
+                    # one, which is the third shape neither branch described.
+                    workflow.logger.warning(
+                        "lifecycle: heartbeat for %s#%s came back as %s/%r in "
+                        "state %r — same owner type, different identity; the "
+                        "claim stands on the type alone",
+                        repo, number, result.owner_type, result.owner_id, result.state,
                     )
                 self._unknown_heartbeats = 0
                 return

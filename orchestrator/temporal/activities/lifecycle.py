@@ -86,6 +86,11 @@ class OwnershipResult:
     # result type was dropping it.
     accepted: bool = False
 
+    # See _result_from: these are NOT derivable from `healthy`, which is their
+    # conjunction, and ADR-010 §4 acts on them differently.
+    dead: bool = False
+    stuck: bool = False
+
     @property
     def owned_by_caller(self) -> bool:
         return self.verdict == OWNED_BY_ME
@@ -175,6 +180,14 @@ def _result_from(answer: OwnershipAnswer) -> OwnershipResult:
         owner_id=own.owner.id if own else "",
         state=own.state if own else "",
         healthy=own.healthy if own else False,
+        # dead and stuck SEPARATELY, not collapsed into healthy. ADR-010 §4
+        # gives them different consequences — `dead` licenses a takeover,
+        # `stuck` licenses an escalation and ownership does NOT move — and the
+        # workflow's give-up argues a takeover while its heartbeat arm argues
+        # an escalation. A caller that can only see `healthy` cannot tell the
+        # two apart, which is the one distinction this wire type has to carry.
+        dead=own.dead if own else False,
+        stuck=own.stuck if own else False,
         reason=answer.reason,
         accepted=answer.accepted,
     )

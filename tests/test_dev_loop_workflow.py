@@ -274,6 +274,11 @@ def _fake_activities(
                 epoch=1,
                 state="active",
                 healthy=False,
+                # `stuck`, not `dead`: ADR-010 §4 gives them different
+                # consequences and the wire type carries both, so a fixture
+                # that set neither would exercise the arm without exercising
+                # the distinction it now logs.
+                stuck=True,
                 accepted=True,
             )
         if ownership_terminal_fails and req.op == "terminal":
