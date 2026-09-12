@@ -73,6 +73,10 @@ AWAITED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 # fires first and returns cleanly rather than the outer one firing and charging.
 _OUTER_DEADLINE_MARGIN_S = 1.0
 
+# Below this, a grace is not worth entering: it would expire at once and report
+# itself as a real wait that found nothing.
+_MIN_USEFUL_GRACE_S = 0.5
+
 
 class OrphanedSubagentError(RuntimeError):
     """A run ended while a delegated sub-agent was still live.
@@ -269,12 +273,26 @@ async def drain_until_settled(
         # returns cleanly and lets `_has_new_commits` keep that commit.
         grace = timeout_s
         remaining = anyio.current_effective_deadline() - anyio.current_time()
+        available = math.inf
         if math.isfinite(remaining):
-            grace = min(grace, max(0.0, remaining - _OUTER_DEADLINE_MARGIN_S))
-        if grace <= 0:
+            available = max(0.0, remaining - _OUTER_DEADLINE_MARGIN_S)
+            grace = min(grace, available)
+        # The floor bounds the CLAMP, never the configured value: a caller that
+        # deliberately asks for a tiny grace gets it. What must not happen is
+        # entering a wait only because the outer budget whittled it down to
+        # nothing.
+        if available < min(timeout_s, _MIN_USEFUL_GRACE_S):
+            # A floor, not `<= 0`. Without it, `remaining = 1.05` yields
+            # `grace = 0.05`: we enter the wait, expire immediately, and log
+            # "no closing result frame within 0.05s of the sub-agent settling"
+            # -- reporting a real grace as spent when there was never enough
+            # budget to wait for anything. Same state as the branch here, told
+            # differently, which is how an operator learns to misread the log.
             print(
-                "warn: no outer budget left to await a closing result frame; "
-                "proceeding on what is already in the worktree"
+                f"warn: only {max(grace, 0.0):g}s of outer budget left, below "
+                f"the {_MIN_USEFUL_GRACE_S:g}s worth waiting on; not awaiting a "
+                f"closing result frame, proceeding on what is already in the "
+                f"worktree"
             )
             return
         # `as scope` + cancelled_caught, NOT a flag set before the `with`:

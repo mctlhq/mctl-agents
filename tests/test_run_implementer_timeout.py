@@ -427,3 +427,40 @@ def test_outer_timeout_with_a_live_child_is_an_orphan_even_before_the_drain(
 
     with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
         anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_outer_timeout_after_the_drain_keeps_the_work_instead_of_charging(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Once every child is awaited, an outer expiry must not bin the result.
+
+    After the drain returns, the caller is still inside `fail_after` and inside
+    `aclosing(stream)` plus the client's `__aexit__` — closing an SDK generator
+    and terminating a CLI that, on this path, is by construction still mid-turn,
+    on whatever the grace clamp left. If that teardown overruns, raising would
+    exit 44: charged, MAX_HARNESS_FAILURES bypassed, and `_has_new_commits` /
+    `_push_followup` never reached — so the commit the whole drain was spent
+    waiting for goes in the bin with the tmp clone.
+    """
+    async def messages():
+        yield _started()
+        yield _result()
+        yield _updated("t1", "completed")
+        yield _result()              # drain completes here
+
+    class _SlowTeardownClient(_FakeClient):
+        async def __aexit__(self, exc_type, exc, tb):
+            await anyio.sleep(10)    # teardown overruns the outer bound
+            return False
+
+    def _factory(*, options):
+        return _SlowTeardownClient(options=options, message_gen=messages)
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _factory)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 30)
+
+    # Must NOT raise: the work is on disk and _has_new_commits adjudicates.
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+    assert "after the sub-agent was awaited" in capsys.readouterr().out

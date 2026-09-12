@@ -444,8 +444,10 @@ def test_phase_two_grace_fits_inside_the_callers_remaining_budget(capsys) -> Non
         await anyio.sleep(30)
 
     async def run() -> str:
-        # Outer budget far SHORTER than the grace: the clamp must notice.
-        with anyio.fail_after(1.2):
+        # Outer budget far SHORTER than the grace, but still enough to be worth
+        # waiting on once the margin is taken off — so the clamp reduces the
+        # grace rather than skipping the wait, and OUR deadline is what fires.
+        with anyio.fail_after(1.6):
             await drain_until_settled(
                 parent_never_closes(), ledger, timeout_s=300,
                 on_message=lambda _m: None,
@@ -474,4 +476,4 @@ def test_phase_two_skips_the_wait_when_no_outer_budget_remains(capsys) -> None:
         return "returned cleanly"
 
     assert anyio.run(run) == "returned cleanly"
-    assert "no outer budget left" in capsys.readouterr().out
+    assert "of outer budget left, below" in capsys.readouterr().out

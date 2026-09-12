@@ -701,6 +701,10 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
     # The fail_after wraps the mctl connectivity check too — a wedged
     # handshake must not silently eat into the caller's own timeout budget.
     ledger = LiveTaskLedger()
+    # Set once every delegated child has been awaited to a terminal state. From
+    # that point on the work is on disk, so an outer expiry during teardown must
+    # not throw it away -- see the TimeoutError handler.
+    drain_completed = False
     try:
         with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
             async with ClaudeSDKClient(options=options) as client:
@@ -750,6 +754,7 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                             raise ImplementerOrphanedSubagent(
                                 f"orphaned sub-agent: {exc}"
                             ) from exc
+                        drain_completed = True
                     if not ledger.all_completed:
                         # Quiescent, so NOT an orphan: nothing is still mutating
                         # the worktree and _has_new_commits is the right
@@ -773,6 +778,22 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                 f"{IMPLEMENTER_TIMEOUT_SECONDS:g}s expired while awaiting "
                 f"{ledger.describe()}"
             ) from exc
+        if drain_completed:
+            # Every child was awaited to a terminal state before this fired, so
+            # whatever they produced is already in the worktree. What is left
+            # running is teardown -- closing the SDK generator and the client,
+            # which this branch by construction does with the CLI still mid-turn
+            # and, after the grace clamp, on very little clock. Raising here
+            # would exit 44: charged, MAX_HARNESS_FAILURES bypassed, and
+            # `_has_new_commits`/`_push_followup` never reached, so the commit we
+            # just spent the whole drain waiting for would go in the bin with the
+            # tmp clone. Return instead and let the git check adjudicate.
+            print(
+                f"warn: outer bound of {IMPLEMENTER_TIMEOUT_SECONDS:g}s expired "
+                f"after the sub-agent was awaited; proceeding on what is "
+                f"already in the worktree"
+            )
+            return
         raise ImplementerOperationTimeout(
             f"operation exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s "
             f"(model stream, client construction, or mctl connectivity check)"
