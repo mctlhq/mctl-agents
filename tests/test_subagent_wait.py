@@ -10,6 +10,7 @@ from __future__ import annotations
 import anyio
 import pytest
 from claude_agent_sdk import (
+    ResultMessage,
     TaskNotificationMessage,
     TaskStartedMessage,
     TaskUpdatedMessage,
@@ -46,6 +47,13 @@ def notified(task_id: str, status: str) -> TaskNotificationMessage:
         summary="done",
         uuid="u",
         session_id="s",
+    )
+
+
+def result_message() -> ResultMessage:
+    return ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+        num_turns=2, session_id="s", total_cost_usd=0.1,
     )
 
 
@@ -126,12 +134,23 @@ def test_describe_reports_nothing_outstanding_when_clean() -> None:
     assert LiveTaskLedger().describe() == "no outstanding tasks"
 
 
-def test_drain_returns_when_last_task_settles() -> None:
+def test_drain_returns_at_the_result_frame_not_when_the_child_settles() -> None:
+    """The stop condition is the SDK's own, and the difference is load-bearing.
+
+    A task completing WAKES the parent for a follow-up turn. Returning the
+    instant `ledger.live` empties abandons whatever the parent does after
+    delegating — for the implementer's review-feedback prompt that is steps
+    2-4, the commit among them. That is the #366 loss again, moved one actor
+    along, so the drain must read on to the result frame that arrives with
+    nothing in flight.
+    """
     ledger = LiveTaskLedger()
     ledger.observe(started("t1"))
 
     async def stream():
         yield updated("t1", "completed")
+        yield "parent's follow-up turn does the commit here"
+        yield result_message()
         yield "never read"
 
     seen: list[object] = []
@@ -141,7 +160,40 @@ def test_drain_returns_when_last_task_settles() -> None:
         )
     )
     assert ledger.live == set()
-    assert len(seen) == 1
+    assert len(seen) == 3, "drain stopped before the parent's closing frame"
+
+
+def test_drain_does_not_orphan_when_the_closing_frame_never_comes() -> None:
+    """Widening the stop condition must not turn successes into orphans.
+
+    If the parent never emits its closing frame, everything the child produced
+    is still in the worktree and nothing is outstanding — so a settled ledger
+    at the deadline or at stream exhaustion is a clean finish, not an orphan.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def exhausts():
+        yield updated("t1", "completed")
+
+    anyio.run(
+        lambda: drain_until_settled(
+            exhausts(), ledger, timeout_s=5, on_message=lambda _m: None,
+        )
+    )
+
+    ledger2 = LiveTaskLedger()
+    ledger2.observe(started("t1"))
+
+    async def goes_quiet():
+        yield updated("t1", "completed")
+        await anyio.sleep(10)
+
+    anyio.run(
+        lambda: drain_until_settled(
+            goes_quiet(), ledger2, timeout_s=0.05, on_message=lambda _m: None,
+        )
+    )
 
 
 def test_drain_raises_when_stream_ends_with_live_task() -> None:

@@ -92,6 +92,11 @@ class LiveTaskLedger:
     def __init__(self) -> None:
         self._live: set[str] = set()
         self._settled: dict[str, str] = {}
+        # Set by drain_until_settled. The caller's outer wall-clock bound can
+        # fire mid-drain, and it needs this to tell "a child we could not await"
+        # (a harness failure) from "the turn itself ran too long" (a genuine
+        # operation timeout) -- see run_implementer's TimeoutError handler.
+        self.draining = False
 
     @property
     def live(self) -> set[str]:
@@ -200,8 +205,12 @@ async def drain_until_settled(
     shepherd charges to the proposal, reintroducing mctl-agents#366 by another
     route.
 
-    Raises ``OrphanedSubagentError`` on the deadline OR on stream exhaustion
-    with a task still live (the CLI exited early).
+    Returns at the first ``ResultMessage`` that arrives with nothing in flight
+    -- the SDK's own "the run is over" condition -- not at the moment the last
+    child settles, because a settling child wakes the parent for another turn.
+
+    Raises ``OrphanedSubagentError`` only when a task is STILL live at the
+    deadline or at stream exhaustion (the CLI exited early).
     """
     if not ledger.live:
         # Nothing to wait for. Guarded here as well as at the call site so the
@@ -214,12 +223,30 @@ async def drain_until_settled(
             f"drain timeout must be positive, got {timeout_s!r}: a non-positive "
             f"deadline cancels before the first read and orphans every run"
         )
+    from claude_agent_sdk import ResultMessage  # deferred — see module docstring
+
+    ledger.draining = True
     with anyio.move_on_after(timeout_s):
         async for message in stream:
             on_message(message)
             ledger.observe(message)
-            if not ledger.live:
+            # Stop at a RESULT FRAME WITH NOTHING IN FLIGHT -- the same
+            # condition the SDK itself uses to close stdin -- not at the moment
+            # the child settles. Those are different instants: a task
+            # completing WAKES the parent for a follow-up turn, so returning on
+            # an empty ledger abandons whatever the parent does after
+            # delegating. For the implementer's review-feedback prompt that is
+            # steps 2-4, the commit among them, which is the very loss
+            # mctl-agents#366 is about -- just moved one actor along.
+            if isinstance(message, ResultMessage) and not ledger.live:
                 return
+    # Past the deadline, or the stream ended. Raise ONLY if something is still
+    # live: a settled ledger means nothing is outstanding and everything the
+    # child produced is already in the worktree, even if the parent never
+    # emitted its closing frame. Widening the stop condition above must not
+    # turn runs that used to succeed into orphans.
+    if not ledger.live:
+        return
     raise OrphanedSubagentError(
         f"sub-agent task(s) never reported a terminal status within "
         f"{timeout_s:g}s: {ledger.describe()}"

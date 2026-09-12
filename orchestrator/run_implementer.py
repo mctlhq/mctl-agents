@@ -701,13 +701,6 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
     # The fail_after wraps the mctl connectivity check too — a wedged
     # handshake must not silently eat into the caller's own timeout budget.
     ledger = LiveTaskLedger()
-    # Set once the drain begins. The nested drain deadline only reclassifies the
-    # orphan while the OUTER budget still has room: a turn that runs 650s of its
-    # 900s and then ends with a child live enters the drain with 250s left, so
-    # `fail_after` fires before `move_on_after` can, and without this flag the
-    # run would exit 44 -- deterministic, charged to the proposal. That is the
-    # #366 signature reached through the outer bound instead of the inner one.
-    draining = False
     try:
         with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
             async with ClaudeSDKClient(options=options) as client:
@@ -747,7 +740,6 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                             f"info: turn ended with {ledger.describe()}; "
                             f"awaiting terminal status"
                         )
-                        draining = True
                         try:
                             await drain_until_settled(
                                 stream,
@@ -765,7 +757,13 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                         # Logged so the distinction is visible in the Argo log.
                         print(f"warn: {ledger.describe()}")
     except TimeoutError as exc:
-        if draining and ledger.live:
+        # ledger.draining is set by drain_until_settled. The nested drain
+        # deadline only reclassifies the orphan while the OUTER budget still
+        # has room: a turn that runs 650s of its 900s and ends with a child
+        # live enters the drain with 250s left, so `fail_after` fires before
+        # `move_on_after` can. Without this the run would exit 44 --
+        # deterministic, charged to the proposal.
+        if ledger.draining and ledger.live:
             # The outer wall-clock bound, not the drain's own -- but the cause
             # is still a child we could not await, so it is charged to the
             # harness, not to the proposal.

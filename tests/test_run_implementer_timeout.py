@@ -368,3 +368,39 @@ def test_outer_timeout_orphan_maps_to_the_harness_exit_code(tmp_path) -> None:
         "orphaned sub-agent: outer timeout of 900s expired while awaiting "
         "1 task(s) still live: t1"
     ) == run_implementer.EXIT_ORPHANED_SUBAGENT
+
+
+def test_implementer_waits_for_the_parents_post_delegation_turn(tmp_path, monkeypatch) -> None:
+    """The child settling is not the end of the run — the parent wakes again.
+
+    The review-feedback prompt delegates the edit (step 1) but keeps steps 2-4,
+    the commit among them, for the top-level session. A drain that stopped the
+    instant `ledger.live` emptied would return before that turn ran and produce
+    the same empty `git log` as the original incident, one actor along.
+    """
+    consumed: list[object] = []
+
+    async def messages():
+        for message in (
+            _started(),
+            _result(),                       # turn 1 ends, child still live
+            _updated("t1", "completed"),     # child settles, parent wakes
+            "parent commits here",
+            _result(),                       # run is actually over
+            _updated("t2", "completed"),     # must never be read
+        ):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 5)
+
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+    texts = [m for m in consumed if isinstance(m, str)]
+    assert "parent commits here" in texts, (
+        "drain stopped when the child settled and skipped the parent's turn"
+    )
+    # ...and it stopped at the closing frame rather than draining the world.
+    assert len(consumed) == 5
