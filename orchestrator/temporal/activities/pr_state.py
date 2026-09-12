@@ -60,6 +60,12 @@ class PRState:
     # unrelated merge. Defaulted so results recorded before this field
     # existed still deserialize.
     merged_at: str | None = None
+    # Current head SHA. Lifecycle ownership pins its decisions to the version
+    # of the entity the owner actually observed, and a head change is the
+    # PR-shaped definition of "something was effected" (mctlhq/.github#57).
+    # Defaulted so results recorded before this field existed still
+    # deserialize, same as merged_at above.
+    head_sha: str | None = None
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -179,6 +185,7 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         merged=merged,
         merge_commit=data.get("merge_commit_sha") if merged else None,
         merged_at=data.get("merged_at") if merged else None,
+        head_sha=(data.get("head") or {}).get("sha") if isinstance(data.get("head"), dict) else None,
     )
     activity.logger.info(
         "pr_state service=%s slug=%s pr=%s#%s state=%s", service, slug, repo, number, state
