@@ -1239,6 +1239,21 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         for node in (pr.get("timelineItems") or {}).get("nodes") or []:
             if node.get("__typename") == "HeadRefForcePushedEvent":
                 head_pushed_at = node.get("createdAt")
+    # A future-dated push time is real: the committedDate fallback above comes
+    # from the author's clock, which can be skewed. Drop it here, once, so every
+    # consumer degrades together -- the settle window already guards itself, but
+    # the four freshness filters in read_codex_review would otherwise compare
+    # against a time nothing can ever be newer than, leaving head_verdict None
+    # forever. That is a wait with no counter behind it and no path to
+    # review-stuck: the PR wedges silently, which is the failure mode this whole
+    # change exists to remove.
+    if head_pushed_at and head_pushed_at > _now_iso():
+        print(
+            f"warn: {repo}#{number} reports a head pushed at {head_pushed_at}, "
+            f"which is in the future (skewed committedDate?); ignoring it, so "
+            f"review signals are anchor-filtered only"
+        )
+        head_pushed_at = None
 
     closed_unmerged = state == "CLOSED" and not merged
     close_comment_or_default = (

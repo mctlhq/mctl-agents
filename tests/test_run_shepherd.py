@@ -211,6 +211,38 @@ def test_decide_merge_future_dated_head() -> None:
     assert decide(pr, review, now=now) == ("merge", None)
 
 
+def test_a_future_dated_push_time_is_dropped_at_the_source() -> None:
+    """The verdict filters must not compare against a time nothing can beat.
+
+    A skewed author clock reaching `committedDate` makes every freshness check
+    in read_codex_review False forever, so `head_verdict` stays None and the PR
+    waits with no counter behind it and no path to review-stuck — wedged
+    silently, which is the failure mode this change exists to remove.
+
+    This pins it where the value is BUILT, because the sibling
+    `test_decide_merge_future_dated_head` passes `head_verdict` in directly and
+    therefore cannot reach the code that decides it. I neutered that test's
+    reach when adding verdicts to the fixtures; this is the half it lost.
+    """
+    future = "2099-01-01T00:00:00Z"
+    payload = {
+        "number": 42, "state": "OPEN", "merged": False, "isDraft": False,
+        "mergeStateStatus": "CLEAN", "reviewDecision": "", "headRefOid": HEAD_SHA,
+        "baseRefName": "main", "mergeCommit": None,
+        "commits": {"nodes": [{"commit": {
+            "oid": HEAD_SHA, "committedDate": future, "pushedDate": None,
+        }}]},
+        "timelineItems": {"nodes": []},
+        "statusCheckRollup": {"state": "SUCCESS"},
+    }
+    wrapped = {"data": {"repository": {"pullRequest": payload}}}
+    with patch.object(run_shepherd, "_gh_api_json", return_value=wrapped):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    assert snap.head_pushed_at is None, "a future push time must not survive"
+
+
 def test_settle_min_from_env_bad_value(monkeypatch) -> None:
     """A non-integer SHEPHERD_MERGE_SETTLE_MIN falls back to 15, not a crash."""
     monkeypatch.setenv("SHEPHERD_MERGE_SETTLE_MIN", "15m")
