@@ -42,6 +42,7 @@ pins the two sets together so an SDK bump cannot silently break the assumption.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -66,6 +67,11 @@ import anyio
 # Background *shells* are excluded on purpose, by the SDK and therefore by us:
 # they need not ever reach a terminal status, so awaiting one would hang.
 AWAITED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
+
+
+# Headroom left to the caller when clamping phase 2's grace, so OUR deadline
+# fires first and returns cleanly rather than the outer one firing and charging.
+_OUTER_DEADLINE_MARGIN_S = 1.0
 
 
 class OrphanedSubagentError(RuntimeError):
@@ -254,13 +260,30 @@ async def drain_until_settled(
         # the run ends, the stream ends, or the parent delegates again and we
         # go back to waiting for quiescence.
         relaunched = False
+        # Fit the grace inside what the CALLER has left, not just inside its own
+        # clock. The restarted timeout_s is what the parent deserves, but if
+        # less than that remains on the outer wall-clock bound then `fail_after`
+        # fires here first, with an empty ledger -- which falls through to a
+        # plain operation timeout, exit 44, a CHARGED attempt, and the child's
+        # commit discarded with the tmp clone. Expiring on OUR clock instead
+        # returns cleanly and lets `_has_new_commits` keep that commit.
+        grace = timeout_s
+        remaining = anyio.current_effective_deadline() - anyio.current_time()
+        if math.isfinite(remaining):
+            grace = min(grace, max(0.0, remaining - _OUTER_DEADLINE_MARGIN_S))
+        if grace <= 0:
+            print(
+                "warn: no outer budget left to await a closing result frame; "
+                "proceeding on what is already in the worktree"
+            )
+            return
         # `as scope` + cancelled_caught, NOT a flag set before the `with`:
         # move_on_after expiring cancels the `async for` with an exception, and
         # a `for ... else` does not run when the loop is left that way. A flag
         # pre-set to "exhausted" therefore made a grace expiry indistinguishable
         # from a clean stream end, and everything meant to happen on expiry --
         # the raise below, and the warn -- was dead code.
-        with anyio.move_on_after(timeout_s) as scope:
+        with anyio.move_on_after(grace) as scope:
             async for message in stream:
                 on_message(message)
                 ledger.observe(message)
@@ -280,13 +303,14 @@ async def drain_until_settled(
         # Expiring here must never charge the proposal for a frame the parent
         # simply never sent -- but it must SAY so, or a parent cut off mid
         # commit looks exactly like a clean finish in the log too.
-        if ledger.live:
-            raise OrphanedSubagentError(
-                f"sub-agent task(s) still live when the closing frame grace of "
-                f"{timeout_s:g}s expired: {ledger.describe()}"
-            )
+        # No `if ledger.live: raise` here: phase 2 breaks the instant observe()
+        # makes the ledger non-empty, and there is no await between that call
+        # and the check (on_message is a plain Callable and cannot suspend), so
+        # a cancellation can only be delivered at the `__anext__` await -- a
+        # point where the ledger is provably empty. Same unreachability the
+        # previous commit deleted phase 1's `if not settled` for.
         print(
-            f"warn: no closing result frame within {timeout_s:g}s of the "
+            f"warn: no closing result frame within {grace:g}s of the "
             f"sub-agent settling; proceeding on what is already in the worktree"
         )
         return

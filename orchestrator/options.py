@@ -110,7 +110,16 @@ IMPLEMENTER_TIMEOUT_SECONDS = float(
 # liveness -- the outer bound already provides that -- but for classification: a
 # wedged child that ate the whole remaining budget would surface as a plain
 # operation timeout, which the shepherd charges to the proposal's review-attempt
-# budget, which is the very bug #366 is about. See orchestrator/subagent_wait.py.
+# budget, which is the very bug #366 is about.
+#
+# NOT a single spend. drain_until_settled loops: it allows this much for the
+# child to go quiescent, then this much AGAIN for the parent's closing frame,
+# and a second delegation observed while waiting for that frame sends it back
+# round on a fresh clock. So the worst case inside the drain is
+# 2 x N x this value for N delegations -- capped, because phase 2's grace is
+# clamped to what is left of IMPLEMENTER_TIMEOUT_SECONDS and phase 1 raises
+# rather than looping forever. Read it as "how long one wait may take", not as
+# "how long the drain may take". See orchestrator/subagent_wait.py.
 IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
     "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", default=300.0
 )

@@ -425,3 +425,53 @@ def test_a_second_delegation_that_never_settles_is_an_orphan() -> None:
                 on_message=lambda _m: None,
             )
         )
+
+
+def test_phase_two_grace_fits_inside_the_callers_remaining_budget(capsys) -> None:
+    """OUR deadline must fire first, or the caller's does — and that charges.
+
+    The restarted grace is what the parent deserves, but if less than that
+    remains on the outer wall-clock bound then `fail_after` fires here with an
+    empty ledger: a plain operation timeout, exit 44, a charged attempt, and the
+    child's commit discarded with the tmp clone. Expiring on our own clock
+    instead returns cleanly and lets `_has_new_commits` keep that commit.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def parent_never_closes():
+        yield updated("t1", "completed")
+        await anyio.sleep(30)
+
+    async def run() -> str:
+        # Outer budget far SHORTER than the grace: the clamp must notice.
+        with anyio.fail_after(1.2):
+            await drain_until_settled(
+                parent_never_closes(), ledger, timeout_s=300,
+                on_message=lambda _m: None,
+            )
+        return "returned cleanly"
+
+    assert anyio.run(run) == "returned cleanly"
+    assert "no closing result frame" in capsys.readouterr().out
+
+
+def test_phase_two_skips_the_wait_when_no_outer_budget_remains(capsys) -> None:
+    """With nothing left to spend there is no point starting the wait at all."""
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def parent_never_closes():
+        yield updated("t1", "completed")
+        await anyio.sleep(30)
+
+    async def run() -> str:
+        with anyio.fail_after(0.4):   # less than the 1.0s margin
+            await drain_until_settled(
+                parent_never_closes(), ledger, timeout_s=300,
+                on_message=lambda _m: None,
+            )
+        return "returned cleanly"
+
+    assert anyio.run(run) == "returned cleanly"
+    assert "no outer budget left" in capsys.readouterr().out
