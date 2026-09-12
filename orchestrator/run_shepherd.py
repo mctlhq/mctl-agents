@@ -790,7 +790,11 @@ class CodexReview:
         anchored = self.findings_p1_p2(at)
         if since is None:
             return anchored
-        return [f for f in anchored if _iso_gt(f.created_at, since)]
+        # An undated finding is KEPT. `_iso_gt` returns False for a None
+        # timestamp rather than raising, so dropping it would be silent, and
+        # silently discarding a finding we cannot date is the wrong direction
+        # for a gate: unknown age is not evidence of staleness.
+        return [f for f in anchored if not f.created_at or _iso_gt(f.created_at, since)]
 
 
 @dataclass
@@ -1464,6 +1468,15 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             created_at = c.get("created_at")
             if "No P1/P2 findings" in body and _iso_gt(created_at, pr.head_pushed_at):
                 has_responded = True
+                # This IS a verdict, just not carried on a review object. It is
+                # one of the four documented ways this bot signals on a head
+                # (design.md L86-99), and gating the merge on formal reviews
+                # alone would wedge every PR approved this way -- trading
+                # mctl-agents#359's stall for a new one. Competes on time with
+                # the formal reviews above, so a later CHANGES_REQUESTED wins.
+                if (created_at or "") >= head_verdict_at:
+                    head_verdict = "APPROVED"
+                    head_verdict_at = created_at or ""
             sev = _extract_severity(body)
             if sev in ("P1", "P2") and _iso_gt(created_at, pr.head_pushed_at):
                 # Top-level issue comment — no commit_id; time-anchor only.
@@ -1512,6 +1525,13 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         for r in reactions:
             if (r.get("user") or {}).get("login") == REVIEW_BOT and r.get("content") == "+1":
                 has_responded = True
+                # Same reasoning as the "No P1/P2 findings" comment above: a
+                # thumbs-up on the trigger is a documented approval signal, so
+                # it has to reach decide() as one.
+                reacted_at = r.get("created_at") or latest_trigger.get("created_at") or ""
+                if reacted_at >= head_verdict_at:
+                    head_verdict = "APPROVED"
+                    head_verdict_at = reacted_at
                 break
 
     return CodexReview(

@@ -4473,3 +4473,95 @@ def test_an_unknown_push_time_degrades_to_the_anchor_filter() -> None:
 
     assert review.fresh_findings_p1_p2(at=pr.head_sha, since=None) == [f]
     assert decide(pr, review)[0] == "address-review"
+
+
+def test_a_no_findings_issue_comment_is_a_verdict_too() -> None:
+    """One of the four documented approval signals carries no review object.
+
+    Gating on formal reviews alone would wedge every PR approved this way —
+    trading #359's stall for a new one, on a path design.md L86-99 explicitly
+    supports. Found by agy on the first review of this change.
+    """
+    pr = make_pr(checks_green=True)
+    issue_comments = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "body": "No P1/P2 findings. Good to merge.",
+        "created_at": "2026-04-29T11:00:00Z",   # after HEAD_PUSHED_AT
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, issue_comments=issue_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is True
+    assert review.head_verdict == "APPROVED"
+    assert decide(pr, review)[0] == "merge"
+
+
+def test_a_thumbs_up_on_the_trigger_is_a_verdict_too() -> None:
+    """The fourth signal: a +1 reaction on the `@claude review` trigger."""
+    pr = make_pr(checks_green=True)
+    trigger = {
+        "id": 99, "user": {"login": "mashkovd"},
+        "body": "@claude review", "created_at": "2026-04-29T10:30:00Z",
+    }
+
+    def fake(args: list[str]):
+        endpoint = args[0]
+        if endpoint.endswith(f"/issues/{pr.number}/comments"):
+            return [trigger]
+        if endpoint.endswith("/reactions"):
+            return [{
+                "user": {"login": run_shepherd.REVIEW_BOT},
+                "content": "+1",
+                "created_at": "2026-04-29T10:35:00Z",
+            }]
+        return []
+
+    with patch.object(run_shepherd, "_gh_api_json", side_effect=fake):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is True
+    assert review.head_verdict == "APPROVED"
+    assert decide(pr, review)[0] == "merge"
+
+
+def test_a_later_changes_requested_beats_an_earlier_no_findings_comment() -> None:
+    """The synthesized verdicts compete on time with the formal ones, so a
+    reviewer that rules again after saying "clean" is not overridden."""
+    pr = make_pr(checks_green=True)
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "state": "CHANGES_REQUESTED",
+        "body": "",
+        "submitted_at": "2026-04-29T12:00:00Z",
+    }]
+    issue_comments = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "body": "No P1/P2 findings",
+        "created_at": "2026-04-29T11:00:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, issue_comments=issue_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.head_verdict == "CHANGES_REQUESTED"
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_an_undated_finding_is_kept_not_silently_dropped() -> None:
+    """`_iso_gt` returns False for a None timestamp rather than raising, so an
+    undated finding would vanish from the gate without a word. Unknown age is
+    not evidence of staleness."""
+    pr = make_pr(checks_green=True)
+    undated = make_finding(severity="P2", commit_id=pr.head_sha, created_at=None)
+    review = CodexReview(
+        has_responded=True, findings=[undated], head_verdict="APPROVED",
+    )
+
+    assert review.fresh_findings_p1_p2(at=pr.head_sha, since=pr.head_pushed_at) == [undated]
+    assert decide(pr, review)[0] == "address-review"
