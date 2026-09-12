@@ -717,3 +717,52 @@ def test_a_body_less_2xx_on_acquire_is_not_a_claim_and_frees_nothing(
     assert rel.verdict == WROTE_NO_RECORD
     assert rel.blocks_others is False
     assert rel.wrote is True
+
+
+def test_a_batch_value_that_is_not_a_mapping_does_not_kill_the_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_get_chunk` screens each per-id value for `None` and nothing else.
+
+    A batch answering a string, a list or a number for an id therefore reached
+    the unwrapper directly, where `.get` raised AttributeError and took down the
+    whole sweep tick — out of a module whose contract is that uncertainty is a
+    VALUE, never an exception. mypy cannot see it: that value is typed `Any`.
+    """
+    for bad in ("active", ["active"], 7, True):
+        out = _client(
+            monkeypatch, _ok({"ownership": {"mctlhq/a#1": bad, "mctlhq/b#2": _owned_payload(ME)}, "count": 2})
+        ).get_many(ENTITY.kind, PHASE, ["mctlhq/a#1", "mctlhq/b#2"], asking=ME)
+        assert out["mctlhq/a#1"].verdict == UNKNOWN, bad
+        assert out["mctlhq/a#1"].blocks_others is True, bad
+        # And the well-formed sibling in the same response is still answered,
+        # which is the point of not raising.
+        assert out["mctlhq/b#2"].verdict == OWNED_BY_ME, bad
+
+
+def test_a_body_less_2xx_on_handoff_complete_is_not_a_claim_either(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/handoff/complete` is a claiming route by the same definition as
+    `/acquire`: the caller is the incoming owner (ADR-010 §10 path 2).
+
+    Answering WROTE_NO_RECORD there is `blocks_others` False — nobody holds the
+    entity — at the exact instant a new owner took it. That is the fail-open
+    the acquire carve-out was added to prevent, arriving on the transition the
+    ADR calls the deterministic unowned window, where a second actor moving in
+    does the most damage.
+    """
+    empty = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    answer = _client(monkeypatch, empty).handoff_complete(ENTITY, PHASE, ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
+    assert answer.blocks_others is True
+
+    # Unchanged for the relinquishing writes, which is what the verdict is for.
+    for call in (
+        lambda c: c.release(ENTITY, PHASE, ME, epoch=1, reason="done"),
+        lambda c: c.terminal(ENTITY, PHASE, ME, epoch=1, reason="merged"),
+    ):
+        rel = call(_client(monkeypatch, empty))
+        assert rel.verdict == WROTE_NO_RECORD
+        assert rel.blocks_others is False

@@ -172,7 +172,7 @@ class Ownership:
         )
 
 
-# The three answers to "is this entity owned?", and the reason this type
+# The five answers to "is this entity owned?", and the reason this type
 # exists at all.
 #
 # `_dev_loop_owns` returns a bool, and every failure — a missing token, a 404,
@@ -243,7 +243,10 @@ class OwnershipAnswer:
 #
 # These rules live in the CONTRACT module, not in a transport, because there
 # are two transports — a synchronous urllib client for CLI processes and an
-# async httpx activity for Temporal — and neither may carry its own copy.
+# async httpx activity for Temporal — and neither may carry its own copy. The
+# activity itself lands with mctlhq/mctl-agents#362; this module is written for
+# both transports from the start precisely so the second one cannot arrive
+# carrying its own answer.
 #
 # They already drifted once, in the direction that matters: the activity's copy
 # classified an unrecognised state as FREE after the client's had been fixed to
@@ -252,15 +255,27 @@ class OwnershipAnswer:
 # becomes a coin flip.
 
 
-# The one route that CLAIMS an entity. Keyed on the request path rather than a
-# parameter because both transports already pass `path` and neither can forget
-# to: a flag would be a third thing the sync client and the Temporal activity
-# have to agree about, which is exactly the drift this module exists to stop.
-ACQUIRE_PATH_SUFFIX = "/acquire"
+# The routes that CLAIM an entity — the ones where the caller comes away as the
+# owner, and where a body-less 2xx therefore means the grant never arrived
+# rather than that a relinquishing write succeeded quietly.
+#
+# BOTH of them. `/handoff/complete` is a claiming route by the same definition
+# as `/acquire`: the caller is the incoming owner (ADR-010 §10 path 2), and it
+# is the transition the ADR calls the deterministic unowned window — so
+# answering WROTE_NO_RECORD there, which is `blocks_others` False, says nobody
+# holds the entity at the exact instant a new owner took it. That is the
+# fail-open the acquire carve-out exists to prevent, arriving on the one
+# transition where a second actor moving in does the most damage.
+#
+# Keyed on the request path rather than a parameter because both transports
+# already pass `path` and neither can forget to: a flag would be a third thing
+# the sync client and the Temporal activity have to agree about, which is
+# exactly the drift this module exists to stop.
+CLAIMING_PATH_SUFFIXES = ("/acquire", "/handoff/complete")
 
 
 def _claims_ownership(path: str) -> bool:
-    return path.endswith(ACQUIRE_PATH_SUFFIX)
+    return path.endswith(CLAIMING_PATH_SUFFIXES)
 
 
 def _error_of(status: int, payload: dict[str, Any]) -> str:
@@ -279,6 +294,14 @@ def record_of(payload: dict[str, Any]) -> Ownership | None:
     contains nothing" — and on a read the same body was UNKNOWN for every
     entity in it.
     """
+    if not isinstance(payload, dict):
+        # The same guard from_payload carries, and for the same reason: this
+        # module's contract is that uncertainty is a VALUE, never an exception.
+        # `_get_chunk` passes each per-id value through screened only for None,
+        # so a batch answering {"ownership": {"mctlhq/a#1": "active"}} reaches
+        # here as a string — and .get would raise AttributeError and kill the
+        # whole sweep tick. mypy cannot see it: that value is typed Any.
+        return None
     own = Ownership.from_payload(payload)
     if own is not None:
         return own
@@ -301,7 +324,7 @@ def _looks_like_our_answer(payload: dict[str, Any]) -> bool:
 
 # The two states in which the record still holds the entity, and the two in
 # which it has let go. Both lists are CLOSED, and a state in neither is
-# deliberately not classified — see _verdict_for.
+# deliberately not classified — see verdict_for.
 HOLDING_STATES = frozenset({STATE_ACTIVE, STATE_HANDING_OFF})
 FREE_STATES = frozenset({STATE_RELEASED, STATE_TERMINAL})
 
@@ -362,6 +385,12 @@ def answer_from(
     # already applies this rule to 404s — believe the status only when the
     # envelope backs it — and a 2xx deserves the same, because the 2xx is the
     # one a caller acts on.
+    # `accepted` and `verdict` answer DIFFERENT questions, and on a body-less
+    # 2xx to a claiming route they deliberately disagree: `wrote` is True
+    # because mctl-api took the write, `verdict` is UNKNOWN because the record
+    # that would name us as owner never arrived. Callers gating a MUTATION must
+    # read `may_mutate`, never `wrote` — `wrote` says the request landed, not
+    # that the caller may act on it.
     accepted = False
     if not is_read and 200 <= status < 300:
         accepted = body_empty or _looks_like_our_answer(payload)
@@ -424,6 +453,16 @@ def answer_from(
             # apiserver a Status object. All parse non-empty. `error` is the
             # key _error_of already treats as the envelope, so it is the one
             # this must agree with.
+            #
+            # It agrees with the SERVER, not just with this file: mctl-api's
+            # lifecycle 404 goes through `writeError`
+            # (internal/api/handlers_read.go), which writes exactly
+            # {"error": message}. That matters more than the false-positive
+            # side — some intermediaries (Kong, OAuth-shaped proxies) do use
+            # `error`, and being wrong that way costs one UNOWNED read that
+            # should have been UNKNOWN. Being wrong the OTHER way, if mctl-api
+            # stopped sending the key, would stall every sweep closed forever.
+            # Changing that response shape is therefore a change to this gate.
             return OwnershipAnswer(
                 verdict=UNKNOWN, reason=f"404 with no error envelope from {path or 'a read'}"
             )

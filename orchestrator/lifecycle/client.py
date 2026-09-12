@@ -7,7 +7,8 @@ Two transports, because there are two callers with different constraints:
   the same https pin and no-redirect opener ``run_shepherd`` already applies
   to its dev-loop probe.
 The Temporal side does NOT use this module. Activities talk to the same
-endpoints over httpx in ``orchestrator/temporal/activities/lifecycle.py``,
+endpoints over httpx in ``orchestrator/temporal/activities/lifecycle.py``
+(which lands with mctlhq/mctl-agents#362),
 because an activity is async and this client is not — and workflow code must
 never call either one: network I/O inside ``@workflow.defn`` breaks determinism
 and replay, which is the property this whole contract depends on (ADR-010 §9).
