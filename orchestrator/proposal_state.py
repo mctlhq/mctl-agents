@@ -56,6 +56,10 @@ _ANONYMOUS_APPROVERS = {"", "unknown", "none", "null"}
 # read as consent.
 _FALSEY = {"false", "no", "0", "off", ""}
 
+# Stable code for the one way a proposal can be permanently unrunnable today:
+# accepted, with a real approval requirement, and no verified approver.
+BLOCKED_APPROVAL_MISSING = "approval-missing"
+
 
 def human_approval_satisfied(data: dict[str, Any]) -> bool:
     """Whether a proposal's recorded approval meets its own requirement.
@@ -112,6 +116,32 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
     return approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
 
 
+def unrunnable_reason(data: dict[str, Any]) -> str | None:
+    """Stable code when a proposal can never run as written, else ``None``.
+
+    ``accepted`` plus ``control.requires_human_approval`` with no verified
+    approval is a permanent deadlock (mctl-agents#349): no supported path
+    -- not the implementer, not `mctl-agents-approve` (a `proposed ->
+    accepted` flip only) -- can move it further. This is the predicate
+    both the durable ``blocked`` marker and the write-time guard below key
+    off of.
+    """
+    if data.get("status") != "accepted":
+        return None
+    return None if human_approval_satisfied(data) else BLOCKED_APPROVAL_MISSING
+
+
+class UnrunnableProposalError(RuntimeError):
+    """Raised when a write would mint a new permanently unrunnable proposal.
+
+    Scoped to writes that *introduce* the state: a payload whose merged
+    result is unrunnable but whose previous on-disk value was not. This
+    keeps annotating an already-broken proposal (the ``blocked`` marker)
+    legal -- the guard must never prevent diagnosing state it did not
+    create.
+    """
+
+
 def update_status_file(
     path: Path,
     new_status: str,
@@ -124,8 +154,15 @@ def update_status_file(
     Existing fields are preserved by default.  Passing ``None`` explicitly
     removes a field; omitting it leaves the on-disk value untouched.  ``UNSET``
     is accepted for callers that build keyword arguments programmatically.
+
+    Raises ``UnrunnableProposalError`` -- and leaves the file untouched --
+    when the merged payload would be ``accepted`` with no satisfied
+    approval AND the payload previously on disk was not already in that
+    state. Annotating a proposal that is already in that state (for
+    example the implementer's ``blocked`` marker) is unaffected.
     """
-    payload = dict(load_status(path))
+    previous = load_status(path)
+    payload = dict(previous)
     payload["status"] = new_status
     payload["updated_at"] = now_iso()
     payload["updated_by"] = actor
@@ -136,6 +173,15 @@ def update_status_file(
             payload.pop(key, None)
         else:
             payload[key] = value
+
+    if unrunnable_reason(payload) is not None and unrunnable_reason(previous) is None:
+        raise UnrunnableProposalError(
+            f"{path}: refusing to write status={new_status!r} -- "
+            "control.requires_human_approval is set with no verified "
+            "approval.approved_by, and no supported path can ever run "
+            "that combination (mctl-agents#349); re-publish the proposal "
+            "in 'proposed' status instead of writing 'accepted' directly"
+        )
 
     _write_status_atomic(path, payload)
     return payload

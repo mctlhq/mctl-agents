@@ -144,6 +144,19 @@ There is no unfiltered `--force` mode or automatic second-account retry.
 An operator retries by reviewing the failure and moving that one proposal
 from `needs-triage` back to `accepted`.
 
+An `accepted` proposal whose `control.requires_human_approval` is set but
+carries no verified `approval.approved_by` is neither retried nor treated
+as a plain skip: `mctl-agents-approve` only performs the `proposed ->
+accepted` flip, so it is a no-op on a proposal that is already `accepted`,
+and this combination can never run by any supported path
+(mctl-agents#349). The implementer classifies it `blocked` (code
+`approval-missing`), writes a durable `blocked: {code, since, message,
+remedy}` block to `.status.yaml` once (idempotent — unchanged runs leave
+the file byte-identical), and a batch whose only proposals are blocked
+exits `45` instead of `0` so the condition surfaces on the workflow. The
+supported recovery is to re-publish the proposal in `proposed` status,
+where the approve flip actually records an approver.
+
 The same module also implements `--review-feedback <path>`, used by
 the [Tier 3 shepherd](#tier-3--pr-shepherd) to address code review
 findings on an existing PR (no new branch, no new PR; pushes a

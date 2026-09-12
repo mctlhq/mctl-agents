@@ -50,6 +50,26 @@ Idempotency:
     move to `needs-triage`; an operator must explicitly move that proposal
     back to `accepted` before it can run again.
 
+    A THIRD outcome sits beside "succeeded" and "failed/skipped": an
+    `accepted` proposal whose `control.requires_human_approval` is set but
+    carries no verified `approval.approved_by` can never run as written --
+    `accepted` alone is not authorisation (gitops#986), and no supported
+    path records an approver on an already-accepted proposal
+    (mctl-agents#349). That proposal is classified `blocked` (stable code
+    `approval-missing`), never `skipped`: it never counts toward the run's
+    `--max-proposals` budget, and (outside `--dry-run`) the implementer
+    writes a durable top-level `blocked: {code, since, message, remedy}`
+    block to its `.status.yaml`, leaving `status: accepted` unchanged. The
+    write is idempotent -- unchanged `code`/`message`/`remedy` leave the
+    file byte-identical -- so a permanently blocked proposal produces
+    exactly one gitops commit, not one per tick. The block is cleared as
+    soon as the proposal clears the approval gate on a later run. A batch
+    whose only proposals are blocked exits `EXIT_BLOCKED_ONLY` (45) instead
+    of `0`, so the condition is visible on the workflow itself; a batch that
+    also produced a PR still exits `0` so that write is not put at risk.
+    `--dry-run` reports a blocked proposal in its summary but never writes
+    the marker and never changes the exit code.
+
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
@@ -91,11 +111,13 @@ from orchestrator.options import (
 )
 from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import (
+    BLOCKED_APPROVAL_MISSING,
     human_approval_satisfied,
     load_status,
     now_iso,
     update_status_file,
 )
+from orchestrator.temporal.issue_ref import workflow_id_for
 
 # ---------------------------------------------------------------------------
 # State directory resolution.
@@ -130,6 +152,20 @@ EXIT_GENERIC_FAILURE = 1
 EXIT_NO_FOLLOWUP_COMMITS = 42
 EXIT_BRANCH_MISSING_ON_ORIGIN = 43
 EXIT_OPERATION_TIMEOUT = 44
+# Batch-mode only (see `main()`); never returned from --review-feedback mode,
+# whose exit codes come from `_review_feedback_exit_code()` below.
+#
+# See mctlhq/mctl-gitops#1206 (filed as the required follow-up):
+# cwft-mctl-agents-approve.yaml should record approval.approved_by on an
+# already-accepted proposal, and cwft-mctl-agents-implement.yaml should not
+# treat EXIT_BLOCKED_ONLY as a retryable/quota failure -- today neither the
+# `implement-fallback` `when` gate nor `assert-attempt` looks at an exit
+# code, both compare Argo step status strings, so this exit makes
+# `implement` `Failed`, triggers a pointless account-2 retry, and blames the
+# Claude usage limit in `assert-attempt`'s stderr for an unapproved
+# proposal (mctl-agents#349). Tracked in mctl-gitops, not mctl-agents, since
+# both fixes are CWFT-side.
+EXIT_BLOCKED_ONLY = 45
 
 
 def _review_feedback_exit_code(error: str) -> int:
@@ -149,6 +185,11 @@ def _review_feedback_exit_code(error: str) -> int:
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
+
+    ``EXIT_BLOCKED_ONLY`` (45) is NOT reachable from here: it is a batch-mode
+    exit code from `main()`'s new-branch path, and `--review-feedback` mode
+    never evaluates the approval gate (it selects `{implemented,
+    review-fixing}` proposals, which are already past `accepted`).
     """
     if not error:
         return EXIT_OK
@@ -191,6 +232,18 @@ class ImplementResult:
     pr_url: str | None
     error: str | None = None
     skipped_reason: str | None = None
+    # Stable code (e.g. BLOCKED_APPROVAL_MISSING) when the proposal was
+    # never attempted because it is permanently unrunnable as written --
+    # distinct from both `error` (an attempt ran and failed) and a plain
+    # `skipped_reason` (still counted separately by `_batch_outcome()`).
+    # `skipped_reason` is still set alongside this so any consumer that
+    # only reads the old channel keeps seeing a human-readable reason.
+    blocked: str | None = None
+    # True only when the blocked marker was freshly written or changed on
+    # THIS tick (see `_mark_blocked`'s return value); False when an
+    # already-recorded, unchanged marker was merely re-observed. Lets
+    # `main()` avoid re-failing forever on a permanently blocked proposal.
+    blocked_is_new: bool = False
     counts_toward_limit: bool = True
 
 
@@ -199,6 +252,9 @@ class BatchOutcome:
     succeeded: int
     failed: int
     skipped: int
+    # Trailing and defaulted so existing positional/keyword constructions
+    # (e.g. BatchOutcome(succeeded=1, failed=1, skipped=1)) keep working.
+    blocked: int = 0
 
 
 @dataclass(frozen=True)
@@ -952,6 +1008,56 @@ def _issue_closing_line(ref: ProposalRef) -> str:
     return f"\n\nCloses {repo}#{issue}"
 
 
+def _approval_blocked_message(ref: ProposalRef) -> tuple[str, str]:
+    """Return ``(message, remedy)`` for a proposal blocked on missing approval.
+
+    ``message`` explains WHY the gate refused (used verbatim as
+    ``skipped_reason``). ``remedy`` names a route that actually applies to
+    THIS proposal, built from the same ``source`` block ``_issue_closing_line``
+    reads and ``workflow_id_for()`` (deliberately temporalio-free, so this
+    module can import it).
+
+    Never suggests hand-editing ``approval.approved_by`` -- that forges the
+    exact record the gate exists to require.
+    """
+    message = (
+        "requires_human_approval is set but no verified approval.approved_by "
+        "is recorded, and the proposal is already accepted; no supported "
+        "path can run it as written"
+    )
+    no_op_and_recovery = (
+        "mctl-agents-approve only performs the proposed -> accepted flip "
+        "and is a no-op on an already-accepted proposal; the supported "
+        "recovery is to re-publish the proposal in 'proposed' status, where "
+        "the flip actually records an approver. Never hand-edit "
+        "approval.approved_by."
+    )
+
+    source = _load_status(ref.status_path).get("source")
+    if isinstance(source, dict) and source.get("type") == "github_issue":
+        repo = source.get("repo")
+        issue = source.get("issue")
+        if repo and issue:
+            try:
+                workflow_id = workflow_id_for(f"https://github.com/{repo}/issues/{issue}")
+            except ValueError:
+                workflow_id = None
+            if workflow_id:
+                remedy = (
+                    f"{no_op_and_recovery} A DevLoopWorkflow {workflow_id} may "
+                    f"exist for this issue; only if that execution is still "
+                    f"running would signalling POST "
+                    f"/api/v1/agents/dev-loop/{workflow_id}/approve do "
+                    f"anything, and that signal is what is most likely to "
+                    f"have produced this exact blocked state, so treat it as "
+                    f"a secondary check, not the fix."
+                )
+                return message, remedy
+
+    remedy = f"{no_op_and_recovery} No DevLoopWorkflow exists for this proposal."
+    return message, remedy
+
+
 def _pr_title_and_body(ref: ProposalRef) -> tuple[str, str]:
     title = f"feat(agents): {ref.slug}"
     body = (
@@ -1143,6 +1249,45 @@ def _mark_needs_triage(
     update_status_yaml(ref, "needs-triage", **fields)
 
 
+def _mark_blocked(
+    ref: ProposalRef,
+    *,
+    code: str,
+    message: str,
+    remedy: str,
+) -> bool:
+    """Write (or refresh) the durable ``blocked`` marker exactly once.
+
+    Reads the current file first: if ``code``, ``message`` and ``remedy``
+    are all unchanged, returns ``False`` without writing, so a permanently
+    blocked proposal produces exactly one gitops commit and not one per
+    tick. The block carries no per-observation timestamp; ``since`` is set
+    on first write and preserved after that. ``status`` stays ``accepted``.
+
+    Returns ``True`` when it performed a write (a new marker, or a changed
+    one), ``False`` on the no-op path -- callers use this to tell a
+    freshly-detected block apart from one merely re-observed unchanged.
+    """
+    current = _load_status(ref.status_path).get("blocked")
+    since = None
+    if isinstance(current, dict):
+        if (
+            current.get("code") == code
+            and current.get("message") == message
+            and current.get("remedy") == remedy
+        ):
+            return False
+        since = current.get("since")
+    block = {
+        "code": code,
+        "since": since or _now_iso(),
+        "message": message,
+        "remedy": remedy,
+    }
+    update_status_yaml(ref, "accepted", blocked=block)
+    return True
+
+
 def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
     branch = f"feat/agents-{ref.slug}"
     _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
@@ -1162,16 +1307,25 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # requires human approval must carry an approval naming someone; without
     # it, a status flip committed by anything -- or by anyone with write
     # access to agents-state -- is indistinguishable from a real approval
-    # (gitops#986). Refuse rather than run the model.
+    # (gitops#986). This is a permanent deadlock, not a transient skip: no
+    # supported path can ever run it as written (mctl-agents#349). Refuse
+    # rather than run the model, and make the refusal loud and durable.
     if not ref.approval_ok:
+        message, remedy = _approval_blocked_message(ref)
+        blocked_is_new = False
+        if not dry_run:
+            blocked_is_new = _mark_blocked(
+                ref,
+                code=BLOCKED_APPROVAL_MISSING,
+                message=message,
+                remedy=remedy,
+            )
         return ImplementResult(
             ref=ref,
             pr_url=None,
-            skipped_reason=(
-                "requires_human_approval is set but no verified approval is "
-                "recorded; approve through the dev-loop endpoint, which takes "
-                "the approver from the authenticated caller"
-            ),
+            blocked=BLOCKED_APPROVAL_MISSING,
+            blocked_is_new=blocked_is_new,
+            skipped_reason=message,
             counts_toward_limit=False,
         )
 
@@ -1196,6 +1350,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             pr=existing.pr_url,
             github=_github_projection(existing),
             failure=None,
+            blocked=None,
             notes=None,
             attempt=None,
         )
@@ -1208,6 +1363,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             github=_github_projection(existing),
             merged_at=_now_iso(),
             failure=None,
+            blocked=None,
             notes=None,
             attempt=None,
         )
@@ -1220,6 +1376,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             github=_github_projection(existing),
             notes="GitHub PR was closed without merging.",
             failure=None,
+            blocked=None,
         )
         return ImplementResult(
             ref=ref,
@@ -1257,7 +1414,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
     # Mark in-progress only after GitHub proves there is no prior result.
-    update_status_yaml(ref, "in-progress", attempt=attempt, failure=None)
+    update_status_yaml(ref, "in-progress", attempt=attempt, failure=None, blocked=None)
 
     target = None
     result: ImplementResult | None = None
@@ -1414,6 +1571,8 @@ def _implement_refs(
             result = implement_one(ref, dry_run=dry_run)
             if result.error:
                 outcome = "failed"
+            elif result.blocked:
+                outcome = "blocked"
             elif result.skipped_reason:
                 outcome = "skipped"
             elif result.pr_url:
@@ -1434,18 +1593,26 @@ def _implement_refs(
 
 
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
-    """Classify every result; partial success must never mask a failure."""
-    succeeded = failed = skipped = 0
+    """Classify every result; partial success must never mask a failure.
+
+    Order matters: error -> blocked -> skipped_reason -> pr_url. A blocked
+    result also carries a `skipped_reason` (for readers of that channel
+    alone), so it must be classified before the `skipped_reason` branch or
+    it would inflate the skip count.
+    """
+    succeeded = failed = skipped = blocked = 0
     for result in results:
         if result.error:
             failed += 1
+        elif result.blocked:
+            blocked += 1
         elif result.skipped_reason:
             skipped += 1
         elif result.pr_url:
             succeeded += 1
         else:
             failed += 1
-    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped)
+    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped, blocked=blocked)
 
 
 def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
@@ -1571,21 +1738,50 @@ def main() -> None:
     for result in results:
         if result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
+        elif result.blocked:
+            print(f"  blocked {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
         elif result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
         elif result.pr_url:
             print(f"  ok   {result.ref.service}/{result.ref.slug} -> {result.pr_url}")
         else:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
+
+    blocked_results = [r for r in results if r.blocked]
+    if blocked_results:
+        print("\n=== Blocked ===")
+        for result in blocked_results:
+            print(f"  {result.ref.service}/{result.ref.slug}: {result.blocked}")
+
     outcome = _batch_outcome(results)
     print(
         "Totals: "
         f"{outcome.succeeded} succeeded, "
         f"{outcome.failed} failed, "
-        f"{outcome.skipped} skipped"
+        f"{outcome.skipped} skipped, "
+        f"{outcome.blocked} blocked"
     )
     if outcome.failed:
         sys.exit(1)
+    # A blocked-only run (no successful implementation to hand a durable
+    # .status.yaml -> PR write off to the commit step) is a louder signal
+    # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also
+    # succeeded exits 0 so real work is never reported red; --dry-run never
+    # writes the marker and never changes today's exit-code behaviour. This
+    # only fires on the tick that newly wrote or changed the marker
+    # (`blocked_is_new`); a subsequent tick that finds the identical,
+    # already-recorded block on disk returns 0 instead, so a permanently
+    # blocked proposal produces exactly one failed Argo run, not one every
+    # ~30 minutes forever. The durable `.status.yaml` marker and the
+    # `=== Blocked ===` summary above still make the state visible on every
+    # run regardless of exit code.
+    if (
+        outcome.blocked
+        and not outcome.succeeded
+        and not args.dry_run
+        and any(r.blocked_is_new for r in results)
+    ):
+        sys.exit(EXIT_BLOCKED_ONLY)
 
 
 if __name__ == "__main__":

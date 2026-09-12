@@ -317,6 +317,47 @@ def test_terminal_closed_projection_has_no_blocking_reason() -> None:
     assert "blocking_reason" not in projection
 
 
+def test_in_progress_transition_clears_a_stale_blocked_marker(tmp_path: Path) -> None:
+    ref = make_ref(tmp_path)
+    stale_blocked = {
+        "code": "approval-missing",
+        "since": "2026-01-01T00:00:00Z",
+        "message": "m",
+        "remedy": "r",
+    }
+    run_implementer.update_status_yaml(ref, "accepted", blocked=stale_blocked)
+    assert "blocked" in read_status(ref)
+
+    run_implementer.update_status_yaml(ref, "in-progress", attempt={}, failure=None, blocked=None)
+
+    assert "blocked" not in read_status(ref)
+
+
+def test_needs_triage_preserves_an_existing_blocked_marker(tmp_path: Path) -> None:
+    # A failed attempt is a different fact from "never attempted because
+    # blocked"; `_mark_needs_triage` must not erase the marker that already
+    # explains why an earlier tick never ran the model at all.
+    ref = make_ref(tmp_path)
+    stale_blocked = {
+        "code": "approval-missing",
+        "since": "2026-01-01T00:00:00Z",
+        "message": "m",
+        "remedy": "r",
+    }
+    run_implementer.update_status_yaml(ref, "accepted", blocked=stale_blocked)
+
+    run_implementer._mark_needs_triage(
+        ref,
+        code="no-commits",
+        stage="agent",
+        message="implementer produced no commits",
+    )
+
+    status = read_status(ref)
+    assert status["status"] == "needs-triage"
+    assert status["blocked"] == stale_blocked
+
+
 def test_mark_failure_quarantines_and_preserves_pr(tmp_path: Path) -> None:
     ref = make_ref(tmp_path)
     run_implementer._mark_needs_triage(

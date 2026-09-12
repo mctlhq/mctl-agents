@@ -16,12 +16,15 @@ import stat
 from pathlib import Path
 from unittest import mock
 
+import pytest
 import yaml
 
 from orchestrator import run_implementer
 from orchestrator.proposal_state import (
+    UnrunnableProposalError,
     human_approval_satisfied,
     load_status,
+    unrunnable_reason,
     update_status_file,
 )
 
@@ -159,6 +162,139 @@ def test_the_refusal_precedes_the_dry_run_shortcut(tmp_path: Path) -> None:
     ref = run_implementer.find_accepted_proposals(tmp_path)[0]
     result = run_implementer.implement_one(ref, dry_run=True)
     assert "requires_human_approval" in (result.skipped_reason or "")
+
+
+# --- unrunnable_reason: the predicate behind the blocked classification ----
+
+def test_unrunnable_reason_flags_only_accepted_and_unapproved() -> None:
+    assert unrunnable_reason(REQUIRES) == "approval-missing"
+    assert unrunnable_reason(
+        {**REQUIRES, "approval": {"approved_by": "mashkovd"}}
+    ) is None
+    assert unrunnable_reason({"status": "accepted"}) is None
+    for status in ("proposed", "in-progress", "implemented", "needs-triage"):
+        assert unrunnable_reason({**REQUIRES, "status": status}) is None
+
+
+# --- blocked: a refusal is its own outcome, not a plain skip ---------------
+
+def test_implement_one_classifies_the_refusal_as_blocked(tmp_path: Path) -> None:
+    write_proposal(tmp_path, "mctl-web", "issue-blocked", REQUIRES)
+    ref = run_implementer.find_accepted_proposals(tmp_path)[0]
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    assert result.blocked == run_implementer.BLOCKED_APPROVAL_MISSING
+    assert result.pr_url is None
+    assert result.counts_toward_limit is False
+    assert "requires_human_approval" in (result.skipped_reason or "")
+
+
+def test_dry_run_reports_blocked_but_writes_nothing(tmp_path: Path) -> None:
+    proposal_dir = write_proposal(tmp_path, "mctl-web", "issue-blocked-dry", REQUIRES)
+    status_path = proposal_dir / ".status.yaml"
+    before = status_path.read_bytes()
+    ref = run_implementer.find_accepted_proposals(tmp_path)[0]
+
+    result = run_implementer.implement_one(ref, dry_run=True)
+
+    assert result.blocked == run_implementer.BLOCKED_APPROVAL_MISSING
+    assert status_path.read_bytes() == before
+    assert "blocked" not in yaml.safe_load(status_path.read_text(encoding="utf-8"))
+
+
+def test_the_blocked_marker_is_written_exactly_once(tmp_path: Path) -> None:
+    write_proposal(tmp_path, "mctl-web", "issue-blocked-once", REQUIRES)
+    ref = run_implementer.find_accepted_proposals(tmp_path)[0]
+
+    run_implementer.implement_one(ref, dry_run=False)
+    first_bytes = ref.status_path.read_bytes()
+
+    # A second tick against the same unchanged proposal must not produce a
+    # second gitops write -- including `updated_at`, or a stuck proposal
+    # would still commit every tick.
+    run_implementer.implement_one(ref, dry_run=False)
+    second_bytes = ref.status_path.read_bytes()
+
+    assert first_bytes == second_bytes
+    data = yaml.safe_load(second_bytes)
+    assert data["status"] == "accepted"
+    assert data["blocked"]["code"] == "approval-missing"
+    assert "since" in data["blocked"]
+
+
+# --- the refusal message names a route that actually applies ---------------
+
+def test_blocked_remedy_names_the_devloop_workflow_for_a_github_issue(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        **REQUIRES,
+        "source": {"type": "github_issue", "repo": "mctlhq/mctl-design", "issue": 21},
+    }
+    write_proposal(tmp_path, "mctl-design", "issue-21-x", payload)
+    ref = run_implementer.find_accepted_proposals(tmp_path)[0]
+
+    message, remedy = run_implementer._approval_blocked_message(ref)
+
+    assert "requires_human_approval" in message
+    assert "dev-loop-mctlhq-mctl-design-21" in remedy
+    assert "/approve" in remedy
+    assert "if that execution is still running" in remedy
+    assert "no-op" in remedy
+    assert "proposed" in remedy
+    assert "approved_by:" not in remedy
+
+
+def test_blocked_remedy_names_no_devloop_workflow_without_a_source_block(
+    tmp_path: Path,
+) -> None:
+    write_proposal(tmp_path, "mctl-web", "issue-no-source", REQUIRES)
+    ref = run_implementer.find_accepted_proposals(tmp_path)[0]
+
+    message, remedy = run_implementer._approval_blocked_message(ref)
+
+    assert "requires_human_approval" in message
+    assert "dev-loop-" not in remedy
+    assert "/approve" not in remedy
+    assert "No DevLoopWorkflow exists" in remedy
+    assert "no-op" in remedy
+    assert "proposed" in remedy
+    assert "approved_by:" not in remedy
+
+
+# --- update_status_file refuses to mint a new unrunnable proposal ----------
+
+def test_update_status_file_refuses_a_clean_write_into_the_unrunnable_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".status.yaml"
+    with pytest.raises(UnrunnableProposalError):
+        update_status_file(path, "accepted", control={"requires_human_approval": True})
+    assert not path.exists()
+
+
+def test_update_status_file_permits_annotating_an_already_unrunnable_proposal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".status.yaml"
+    path.write_text(yaml.safe_dump(REQUIRES), encoding="utf-8")
+
+    # Same unrunnable shape -- the guard must not block this, or the
+    # `blocked` marker (task 5) could never be written.
+    update_status_file(path, "accepted", blocked={"code": "approval-missing"})
+
+    data = load_status(path)
+    assert data["blocked"]["code"] == "approval-missing"
+    assert data["control"] == {"requires_human_approval": True}
+
+
+def test_update_status_file_still_permits_the_incident_responder_shape(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".status.yaml"
+    update_status_file(path, "accepted")
+    assert load_status(path)["status"] == "accepted"
 
 
 # --- the approve command the investigator posts to real issues -------------
