@@ -182,6 +182,198 @@ EXIT_BLOCKED_ONLY = 45
 # 42/43/44 this says nothing about the proposal or the findings -- re-running is
 # the correct response and the shepherd must NOT charge a review attempt for it.
 EXIT_ORPHANED_SUBAGENT = 46
+# Deliberate no-op, NOT a failure: the agent read the findings, decided the
+# right move was to change nothing, and said so in a machine-readable marker
+# file (see REFUSAL_MARKER_FILENAME). Covers both "the finding is invalid or
+# already addressed" and "an explicit operator decision recorded on the PR
+# forbids this change" (mctl-agents#360). Re-running is pointless *for these
+# findings*, but the proposal did nothing wrong, so the shepherd must NOT
+# charge a review attempt: on portfolio#56 two correct refusals burned 2 of 5
+# attempts and forced a GitOps reset (mctl-gitops#1205).
+EXIT_DELIBERATE_NO_OP = 47
+
+# Machine-readable refusal marker, written by the agent in the root of the
+# cloned target repo. A file is deliberately chosen over scraping the final
+# message: the prompt already asks the agent to "STOP without committing and
+# explain why", but prose is unstable across model versions, and a regex over
+# it is one wording away from either missing a real refusal or — far worse —
+# reading a crash narration as one. Writing a named JSON file with an exact
+# shape is an act the agent cannot perform by accident while doing something
+# else.
+REFUSAL_MARKER_FILENAME = ".implementer-refusal.json"
+# Prefix on `ImplementResult.error` that `_review_feedback_exit_code()` maps to
+# EXIT_DELIBERATE_NO_OP. Same string-prefix style as the other sentinels.
+REFUSAL_ERROR_PREFIX = "deliberate no-op:"
+# The reason travels into a `.status.yaml` note and a summary line; cap it so a
+# verbose model cannot turn the durable projection into a transcript.
+MAX_REFUSAL_REASON_CHARS = 600
+# Refuse to READ a marker larger than this, rather than reading it and then
+# rejecting it. The file sits in a cloned target repo's worktree and is written
+# by an LLM holding a Bash tool: a redirect into the wrong path, a loop that
+# appends, or a stray `tee` is enough to make it enormous, with no malice
+# required. `Path.read_text()` would pull all of it into the orchestrator, and
+# an implementer OOM is the least diagnosable failure this platform has --
+# memory pressure there is a live issue, and an OOMKill does not appear in the
+# container's `last_terminated_reason`. Generous next to a legitimate marker,
+# whose `reason` is itself capped at MAX_REFUSAL_REASON_CHARS, so nothing
+# honest is anywhere near it.
+MAX_REFUSAL_MARKER_BYTES = 64 * 1024
+
+
+def _read_refusal_marker(repo_dir: Path) -> str | None:
+    """Return the refusal reason iff this run produced a valid refusal marker.
+
+    Every check below exists to make "the agent refused" something that cannot
+    be produced by accident:
+
+    - the file must be small enough to read at all
+      (``MAX_REFUSAL_MARKER_BYTES``). Enforced by a BOUNDED READ — one byte
+      past the cap, then a length test — not by ``stat()`` followed by
+      ``read_text()``. The marker lives in the agent's own workspace and the
+      agent holds a Bash tool, so a size established by an earlier syscall is
+      not a fact about the read that follows it: a background appender (a stray
+      loop, no malice needed) passes the check and then makes the read grow
+      without bound. A bounded read cannot be raced, needs no ``stat()``, and
+      the one extra byte distinguishes "exactly at the cap" from "over it"
+      without a second syscall. Over-cap is refused outright rather than
+      truncated: a truncated marker would fail the JSON check below and reach
+      the charged path for an accidental reason, hiding an operational problem
+      behind a correct outcome;
+    - the file must parse as a JSON object with ``refused`` exactly ``True``
+      and a non-empty string ``reason`` — a stray file, a truncated write or a
+      progress note does not qualify;
+    - the file must be UNTRACKED, *provably* so. A marker committed into a
+      target repo would otherwise make every future follow-up on that repo look
+      like a refusal and permanently exempt it from the attempt cap, so a
+      ``git ls-files`` invocation that fails to answer the question counts as a
+      no, not a yes.
+
+    Returns ``None`` (and logs why) for anything that does not qualify, so the
+    caller falls back to the ordinary "no follow-up commits" failure.
+
+    The handlers below are deliberately BROAD rather than a tuple of the
+    exception types we happened to think of. Enumerating them is the same class
+    of bug as a bound written ``value <= 0`` that misses ``nan``: deeply nested
+    JSON raises ``RecursionError`` (a ``RuntimeError``, so ``OSError |
+    ValueError`` misses it) from a payload that fits inside
+    ``MAX_REFUSAL_MARKER_BYTES`` — and an escape from here does not fail safe.
+    It surfaces as a bare ``Exception`` with no prefix
+    ``_review_feedback_exit_code`` recognises, exits 1, and the shepherd
+    classifies 1 as *transient* — the one arm with no counter at all, so it
+    retries a paid run every tick forever. Catching broadly is safe here
+    precisely because the fallback is the conservative, charged path: every
+    failure means "not a refusal", which costs one bounded attempt.
+    ``BaseException`` (KeyboardInterrupt, SystemExit) is deliberately not
+    caught.
+    """
+    path = repo_dir / REFUSAL_MARKER_FILENAME
+    if not path.is_file():
+        return None
+    # Bounded read, binary: `read(n)` on a text handle counts CHARACTERS, which
+    # would let a multi-byte payload pull up to 4n bytes past a cap named in
+    # bytes. Reading one byte past the cap makes the over-cap case detectable
+    # from the length alone, and nothing is decoded unless the whole file
+    # arrived under the cap, so a partial UTF-8 sequence is never in play.
+    try:
+        with path.open("rb") as fh:
+            raw = fh.read(MAX_REFUSAL_MARKER_BYTES + 1)
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
+        print(
+            f"warn: cannot read {REFUSAL_MARKER_FILENAME} "
+            f"({type(e).__name__}: {e}); ignoring"
+        )
+        return None
+    if len(raw) > MAX_REFUSAL_MARKER_BYTES:
+        print(
+            f"warn: {REFUSAL_MARKER_FILENAME} is over the "
+            f"{MAX_REFUSAL_MARKER_BYTES}-byte cap (the read stopped there); "
+            f"refusing it. A marker this size is not a considered no-op — "
+            f"treating the run as a plain no-commit failure"
+        )
+        return None
+    try:
+        tracked = _run(
+            ["git", "ls-files", "--error-unmatch", REFUSAL_MARKER_FILENAME],
+            cwd=repo_dir,
+            check=False,
+        )
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
+        # The last step in this function that could still throw past the
+        # caller. Deliberately swallows ImplementerOperationTimeout too: a slow
+        # `git ls-files` would otherwise reclassify the whole run as a timeout
+        # (44) when the honest statement is narrower — we could not establish
+        # whether the marker is tracked, so it is not a refusal (42). Both
+        # charge an attempt; only one of them is true.
+        print(
+            f"warn: could not check whether {REFUSAL_MARKER_FILENAME} is "
+            f"tracked ({type(e).__name__}: {e}); ignoring the marker"
+        )
+        return None
+    if tracked.returncode == 0:
+        print(
+            f"warn: {REFUSAL_MARKER_FILENAME} is tracked in {repo_dir.name}; "
+            f"ignoring it — only a marker written during this run counts"
+        )
+        return None
+    if tracked.returncode != 1:
+        # 0 is tracked, 1 is "no such path in the index". Anything else (a
+        # corrupt or absent index, an unexpected 128) means we could not
+        # establish the fact — and every other check in this function treats
+        # "could not establish" as "not a refusal". Erring the other way here
+        # would honour a marker precisely when the repository state is unknown.
+        #
+        # A missing `git` binary is NOT one of these: `subprocess.run` raises
+        # FileNotFoundError rather than returning, `check=False` or not, so it
+        # is the handler above — not this branch — that absorbs it.
+        print(
+            f"warn: could not determine whether {REFUSAL_MARKER_FILENAME} is "
+            f"tracked (git ls-files exited {tracked.returncode}); ignoring"
+        )
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
+        # RecursionError (nested JSON), UnicodeDecodeError (a binary file
+        # written to this path), MemoryError, and whatever the next one turns
+        # out to be all mean the same thing: we could not read a refusal here.
+        print(
+            f"warn: {REFUSAL_MARKER_FILENAME} is not readable JSON "
+            f"({type(e).__name__}: {e}); ignoring"
+        )
+        return None
+    if not isinstance(data, dict) or data.get("refused") is not True:
+        print(f"warn: {REFUSAL_MARKER_FILENAME} has no `refused: true`; ignoring")
+        return None
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        print(f"warn: {REFUSAL_MARKER_FILENAME} carries no reason; ignoring")
+        return None
+    return " ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS]
+
+
+def _write_refusal_out(path: Path, reason: str) -> None:
+    """Hand the refusal reason to the caller (the shepherd) as JSON.
+
+    Best-effort by design: the exit code alone already carries the decision
+    that matters (do not charge an attempt). Losing the prose must never turn
+    a correct refusal into a failed run, so an unwritable path is a warning.
+    """
+    try:
+        path.write_text(
+            json.dumps({"refused": True, "reason": reason}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001 — advisory write; see below
+        # Broad for the same reason as `_read_refusal_marker`, and with a
+        # sharper consequence: this runs immediately before `sys.exit(47)`, so
+        # an escape would replace a correctly-classified refusal with an
+        # uncaught traceback and exit 1 — the counter-less transient arm. The
+        # reason is advisory; the exit code is what matters.
+        print(
+            f"warn: could not write refusal reason to {path} "
+            f"({type(e).__name__}: {e}); the exit code still carries the decision",
+            file=sys.stderr,
+        )
 
 
 def _review_feedback_exit_code(error: str) -> int:
@@ -198,7 +390,14 @@ def _review_feedback_exit_code(error: str) -> int:
         bound. Re-running forever cannot make forward progress, so this
         consumes the shepherd's bounded review-attempt budget.
 
-    One code is deliberately NOT deterministic:
+    Two codes are deliberately NOT deterministic:
+
+      - 47: the agent deliberately changed nothing and recorded why in the
+        refusal marker (mctl-agents#360) — either the findings were already
+        addressed or an explicit operator decision on the PR forbade the
+        change. Re-running these same findings is pointless, but the proposal
+        is not at fault, so the shepherd records the reason and waits instead
+        of spending one of its bounded attempts.
 
       - 46: the CLI launched the sub-agent asynchronously and the run ended
         before it reported a terminal status (mctl-agents#366). The agent never
@@ -221,6 +420,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_NO_FOLLOWUP_COMMITS
     if error.startswith("branch ") and "not found on origin" in error:
         return EXIT_BRANCH_MISSING_ON_ORIGIN
+    if error.startswith(REFUSAL_ERROR_PREFIX):
+        return EXIT_DELIBERATE_NO_OP
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -488,6 +689,14 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
     ignore list) so even a broad `git add -A` from the sub-agent leaves
     it untouched. We deliberately avoid editing the repo's `.gitignore`
     because that would itself be an out-of-scope change.
+
+    The refusal marker (mctl-agents#360) is excluded for the same reason and
+    one more: `_read_refusal_marker` honours it only while it is UNTRACKED, so
+    a single `git add -A` that swept it into a follow-up commit would make
+    every later refusal on that branch fall back to exit 42 and charge an
+    attempt — the fix silently and permanently reverted for exactly the PR
+    that needed it. The exclude entry is the defence; the untracked check is
+    the backstop for the case where something committed it anyway.
     """
     src = AGENTS_DIR / service / ".claude" / "agents" / "implementer.md"
     if not src.exists():
@@ -508,18 +717,22 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
     dst_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst_dir / "implementer.md")
 
-    # Local-only ignore: keeps PRs scoped to the proposal's intent.
+    # Local-only ignore: keeps PRs scoped to the proposal's intent, and keeps
+    # the refusal marker honourable (see the docstring — a tracked marker is
+    # ignored forever after).
     exclude_path = target / ".git" / "info" / "exclude"
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = ".claude/agents/implementer.md"
+    entries = (".claude/agents/implementer.md", REFUSAL_MARKER_FILENAME)
     existing = ""
     if exclude_path.exists():
         existing = exclude_path.read_text(encoding="utf-8")
-    if entry not in existing.splitlines():
+    missing = [e for e in entries if e not in existing.splitlines()]
+    if missing:
         with exclude_path.open("a", encoding="utf-8") as f:
             if existing and not existing.endswith("\n"):
                 f.write("\n")
-            f.write(f"{entry}\n")
+            for entry in missing:
+                f.write(f"{entry}\n")
 
 
 def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
@@ -557,8 +770,25 @@ Workflow:
 4. DO NOT push and DO NOT open a PR — the orchestrator will push to the
    existing branch after you finish. The PR auto-updates because the
    head ref does not change.
-5. If a finding is invalid or already addressed, STOP without committing
-   and explain why in your final message.
+5. If a finding is invalid, is already addressed, or must NOT be acted on
+   because of an explicit operator decision recorded on the PR, do not
+   commit. Instead write the refusal marker file
+   `{REFUSAL_MARKER_FILENAME}` in the root of the current working
+   directory, with exactly this shape — one line, valid JSON:
+
+   {{"refused": true, "reason": "<what you declined, and why>"}}
+
+   In `reason`, give the evidence: quote the operator note, or the code
+   that already satisfies the finding. Explain the same reasoning in your
+   final message.
+
+   Write this file ONLY when you deliberately decided that changing nothing
+   is the correct outcome. Never write it next to a commit, never as a
+   progress note, and never with an empty or placeholder reason: the
+   orchestrator reads it as your statement that this run was a considered
+   no-op, and uses it to avoid spending one of this PR's bounded fix
+   attempts on you. Do not commit the marker file itself — a committed
+   marker is ignored.
 
 {feedback_md}
 
@@ -874,6 +1104,16 @@ def review_feedback_one(
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
         if not _has_new_commits(target, base=old_head):
+            # No commit is not automatically a failure: the agent may have
+            # decided, on the evidence, that changing nothing is correct.
+            # Only a valid marker separates the two (mctl-agents#360).
+            refusal = _read_refusal_marker(target)
+            if refusal:
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{REFUSAL_ERROR_PREFIX} {refusal}",
+                )
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
@@ -1804,6 +2044,19 @@ def main() -> None:
             "Requires --service AND --slug."
         ),
     )
+    ap.add_argument(
+        "--refusal-out",
+        default="",
+        metavar="PATH",
+        help=(
+            "Where to write the refusal reason as JSON when a "
+            "--review-feedback run ends in a deliberate no-op (exit "
+            f"{EXIT_DELIBERATE_NO_OP}). The Tier 3 shepherd passes a temp "
+            "path and reads the reason back into `.status.yaml` notes and "
+            "its run summary (mctl-agents#360). The reason is also printed, "
+            "so omitting this only costs the shepherd the structured copy."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
@@ -1848,7 +2101,13 @@ def main() -> None:
             # `_review_feedback_exit_code` docstring). Transient plumbing
             # errors continue to exit 1 so the shepherd's transient-failure
             # path is unchanged.
-            sys.exit(_review_feedback_exit_code(result.error))
+            code = _review_feedback_exit_code(result.error)
+            if code == EXIT_DELIBERATE_NO_OP and args.refusal_out:
+                _write_refusal_out(
+                    Path(args.refusal_out),
+                    result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
+                )
+            sys.exit(code)
         if result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
             return

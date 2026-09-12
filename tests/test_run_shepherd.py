@@ -3406,13 +3406,17 @@ def test_followup_subprocess_error_cannot_contradict_itself() -> None:
     ).transient is False
 
 
-def test_reconcile_unstick_clears_both_counters(tmp_path) -> None:
-    """Un-sticking must hand back a fresh budget on BOTH axes.
+def test_reconcile_unstick_clears_every_counter(tmp_path) -> None:
+    """Un-sticking must hand back a fresh budget on EVERY axis.
 
     The reconcile path clears `review_attempts`, and before this test it cleared
     only that. A proposal driven to `review-stuck` by repeated harness failures
     would then come back with `harness_failures` still at MAX and re-trip the cap
-    on the very next one — un-stuck in name only.
+    on the very next one — un-stuck in name only. The same argument covers
+    `refusals` and its head anchor (mctl-agents#360), which is why this test
+    names all of them: the invariant is "every counter that can flip a proposal
+    to review-stuck is cleared here", and it is worth failing on as a whole
+    rather than one instance at a time.
     """
     ref = make_ref(
         tmp_path,
@@ -3428,6 +3432,9 @@ def test_reconcile_unstick_clears_both_counters(tmp_path) -> None:
     }
     status["review_attempts"] = 5
     status["harness_failures"] = run_shepherd.MAX_HARNESS_FAILURES
+    status["refusals"] = run_shepherd.MAX_REFUSALS
+    # A cleared count with a stale head anchor would resume counting at the cap.
+    status["refusals_head"] = HEAD_SHA
     ref.status_path.write_text(
         yaml.safe_dump(status, sort_keys=False), encoding="utf-8",
     )
@@ -3441,40 +3448,55 @@ def test_reconcile_unstick_clears_both_counters(tmp_path) -> None:
     assert final["status"] == "implemented"
     assert "review_attempts" not in final
     assert "harness_failures" not in final
+    assert "refusals" not in final
+    assert "refusals_head" not in final
 
 
-def test_harness_failures_round_trips_through_disk(tmp_path, monkeypatch) -> None:
-    """The counter must survive the tick boundary, or the cap means nothing.
+def test_counters_round_trip_through_disk(tmp_path, monkeypatch) -> None:
+    """The counters must survive the tick boundary, or the caps mean nothing.
 
-    Every tick is a fresh process, so `_discover_refs` reading the key back off
-    `.status.yaml` is the single link that makes `ref.harness_failures + 1`
-    cumulative. If it regressed — dropped in a refactor, or the key renamed on
-    one side — `ref.harness_failures` would be 0 on every tick, `new_failures`
-    would be 1 forever, MAX_HARNESS_FAILURES would never be reached, and the
-    unbounded paid retry loop it exists to stop would silently come back.
+    Every tick is a fresh process, so `_discover_refs` reading the keys back off
+    `.status.yaml` is the single link that makes `ref.<counter> + 1` cumulative.
+    If it regressed — dropped in a refactor, or the key renamed on one side —
+    the counter would be 0 on every tick, the incremented value would be 1
+    forever, the cap would never be reached, and the unbounded paid retry loop
+    it exists to stop would silently come back.
 
     The cap tests deliberately do not cover this: they seed the counter in
     memory or start from the default, so a read that always returned 0 would
-    pass them all.
+    pass them all. One test over every counter, so a newly added one is a
+    failure here rather than a near-duplicate test nobody writes.
     """
-    proposal_dir = make_status_yaml(tmp_path, service="mctl-web", slug="harness-rt")
+    proposal_dir = make_status_yaml(tmp_path, service="mctl-web", slug="counters-rt")
     status_path = proposal_dir / ".status.yaml"
     payload = yaml.safe_load(status_path.read_text(encoding="utf-8"))
+    payload["review_attempts"] = 3
     payload["harness_failures"] = 2
+    payload["refusals"] = 2
+    payload["refusals_head"] = HEAD_SHA
     status_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
     monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
     refs = run_shepherd._discover_refs(tmp_path)
 
-    ref = next(r for r in refs if r.slug == "harness-rt")
-    assert ref.harness_failures == 2, (
-        "harness_failures did not survive the tick boundary; the cap is inert"
-    )
+    ref = next(r for r in refs if r.slug == "counters-rt")
+    for field, expected in (
+        ("review_attempts", 3),
+        ("harness_failures", 2),
+        ("refusals", 2),
+        ("refusals_head", HEAD_SHA),
+    ):
+        assert getattr(ref, field) == expected, (
+            f"{field} did not survive the tick boundary; its cap is inert"
+        )
     # And the absent-key case still defaults cleanly rather than raising.
-    plain = make_status_yaml(tmp_path, service="mctl-web", slug="no-harness-key")
+    plain = make_status_yaml(tmp_path, service="mctl-web", slug="no-counter-keys")
     assert plain.exists()
     refs = run_shepherd._discover_refs(tmp_path)
-    assert next(r for r in refs if r.slug == "no-harness-key").harness_failures == 0
+    bare = next(r for r in refs if r.slug == "no-counter-keys")
+    assert bare.harness_failures == 0
+    assert bare.refusals == 0
+    assert bare.refusals_head is None
 
 
 def test_deterministic_failure_also_clears_the_harness_counter(tmp_path) -> None:
@@ -3506,3 +3528,769 @@ def test_deterministic_failure_also_clears_the_harness_counter(tmp_path) -> None
     final = read_status(ref)
     assert final["review_attempts"] == 1
     assert "harness_failures" not in final
+
+
+# ---------------------------------------------------------------------------
+# A principled refusal is not a failure (mctl-agents#360)
+#
+# exit 47 means the implementer read the findings and deliberately changed
+# nothing — they were already addressed, or an explicit operator decision on
+# the PR forbade the change. On portfolio#56 two such refusals were charged as
+# deterministic failures, took 2 of 5 attempts, and forced a GitOps reset
+# (mctl-gitops#1205). The attempt cap exists to stop unproductive loops, not to
+# punish an agent for correctly declining to act.
+# ---------------------------------------------------------------------------
+def _fake_run_writing_refusal(reason, *, returncode):
+    """subprocess.run stand-in that plays the implementer's side of exit 47.
+
+    Writes the reason to whatever path the shepherd passed in --refusal-out,
+    so the test exercises the real plumbing rather than a patched reader.
+    """
+    class _Result:
+        pass
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        path = cmd[cmd.index("--refusal-out") + 1]
+        Path(path).write_text(
+            json.dumps({"refused": True, "reason": reason}), encoding="utf-8",
+        )
+        result = _Result()
+        result.returncode = returncode
+        return result
+
+    return fake_run
+
+
+def _refuse(reason="out of scope by explicit operator decision on the PR"):
+    def refuse(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (47)",
+            kind="refused",
+            reason=reason,
+        )
+    return refuse
+
+
+def _drive(ref, side_effect):
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=side_effect):
+        return process_one(ref, skip_subprocess=True)
+
+
+def test_refusal_code_is_classified_on_its_own() -> None:
+    """47 is neither deterministic nor harness — it is its own outcome.
+
+    Asserted by membership, not by absence, so a future edit cannot quietly
+    fold a refusal back into "charge an attempt" (or into the harness label,
+    which would misreport a correct decision as a platform bug).
+    """
+    deterministic, harness = run_shepherd._followup_code_sets()
+    refused = run_shepherd._refusal_codes()
+    assert run_implementer.EXIT_DELIBERATE_NO_OP in refused
+    assert run_implementer.EXIT_DELIBERATE_NO_OP not in deterministic
+    assert run_implementer.EXIT_DELIBERATE_NO_OP not in harness
+    assert refused == frozenset({47})
+
+
+def test_refused_is_not_charged_an_attempt() -> None:
+    """`transient` is derived from `kind`; a refusal must land on the free side."""
+    exc = run_shepherd.FollowupSubprocessError("x", kind="refused")
+    assert exc.transient is True
+    assert exc.reason is None
+
+
+def test_apply_followup_raises_refused_and_carries_the_reason() -> None:
+    """returncode=47 -> kind="refused", with the agent's own words attached."""
+    findings = [make_finding()]
+    reason = (
+        "Findings 2 and 3 are out of scope by explicit operator decision "
+        "recorded on the PR; not applying."
+    )
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(
+             run_shepherd.subprocess, "run",
+             _fake_run_writing_refusal(
+                 reason, returncode=run_implementer.EXIT_DELIBERATE_NO_OP,
+             ),
+         ):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "refused"
+    assert exc.value.transient is True
+    assert exc.value.reason == reason
+
+
+def test_apply_followup_refusal_survives_a_missing_reason_file() -> None:
+    """The exit code alone decides; the prose is advisory.
+
+    A child that dies after deciding but before writing must still not be
+    charged an attempt — otherwise the fix would depend on a best-effort file.
+    """
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_DELIBERATE_NO_OP
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        # Deliberately writes nothing to --refusal-out.
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "refused"
+    assert exc.value.reason is None
+
+
+def test_apply_followup_cleans_up_the_refusal_temp_file() -> None:
+    """The temp path must not outlive the call on any exit path."""
+    findings = [make_finding()]
+    seen = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_DELIBERATE_NO_OP
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        seen.append(cmd[cmd.index("--refusal-out") + 1])
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError):
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert seen and not Path(seen[0]).exists()
+
+
+def test_outer_loop_does_not_charge_an_attempt_on_refusal(tmp_path, capsys) -> None:
+    """The whole point of #360: the attempt budget and the status stay put."""
+    ref = make_ref(tmp_path, review_attempts=3)
+    reason = "out of scope by explicit operator decision recorded on the PR"
+
+    result = _drive(ref, _refuse(reason))
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["review_attempts"] == 3
+    assert final["status"] == "implemented"
+    assert ref.review_attempts == 3
+    assert ref.status == "implemented"
+    # The reason is durable and reaches the run summary, not just the log.
+    assert reason in final["notes"]
+    assert result.notes and reason in result.notes
+    out = capsys.readouterr().out
+    assert "declined to act — not charging a review attempt" in out
+    assert reason in out
+
+
+def test_refusals_are_bounded_and_flip_to_review_stuck(tmp_path) -> None:
+    """Not charged is not the same as never terminating.
+
+    A refusal leaves the head SHA unmoved and re-triggers no review, so the
+    next tick pays for the identical answer. An indefinite series is a standoff
+    between the reviewer and an operator decision that only a human can settle
+    — but on its OWN counter, so `review_attempts` is still never charged.
+    """
+    ref = make_ref(tmp_path, review_attempts=2)
+    ref.refusals = run_shepherd.MAX_REFUSALS - 1
+
+    result = _drive(ref, _refuse())
+
+    assert result.decision == "review-stuck"
+    final = read_status(ref)
+    assert final["status"] == "review-stuck"
+    assert final["refusals"] == run_shepherd.MAX_REFUSALS
+    assert final["review_attempts"] == 2
+    assert "not at fault" in final["notes"]
+
+
+def test_refusal_counter_increments_below_the_cap(tmp_path) -> None:
+    ref = make_ref(tmp_path, review_attempts=1)
+
+    result = _drive(ref, _refuse())
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["refusals"] == 1
+    assert final["review_attempts"] == 1
+    assert final["status"] == "implemented"
+
+
+def test_refusal_note_is_bounded(tmp_path) -> None:
+    """An agent-authored string must not bloat the durable projection.
+
+    The bound is on the AGENT's text, not on the finished note: our own framing
+    is fixed-size and reconstructible, so charging it against the same budget
+    would spend the evidence's room on boilerplate. A fixed prefix plus a
+    bounded reason is still bounded, which is what the second assertion pins.
+    """
+    ref = make_ref(tmp_path)
+
+    result = _drive(ref, _refuse("x" * 5000))
+
+    notes = read_status(ref)["notes"]
+    assert notes.count("x") == run_shepherd.MAX_NOTES_CHARS
+    assert len(notes) < 2 * run_shepherd.MAX_NOTES_CHARS
+    assert result.decision == "wait"
+
+
+def test_refusal_without_a_reason_still_waits_without_charging(tmp_path) -> None:
+    """No prose must not degrade into "count it as a failure"."""
+    ref = make_ref(tmp_path, review_attempts=2)
+
+    result = _drive(ref, _refuse(None))
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["review_attempts"] == 2
+    assert "no reason recorded" in final["notes"]
+
+
+def test_42_43_44_still_charge_an_attempt_end_to_end(tmp_path) -> None:
+    """#360 must not weaken the #12 fix.
+
+    Drives the real classification in `apply_followup` for each deterministic
+    sentinel and feeds the resulting exception to `process_one`, so the chain
+    exit code -> kind -> charged attempt is asserted whole rather than at two
+    disconnected points.
+    """
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    for code in (
+        run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
+        run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
+        run_implementer.EXIT_OPERATION_TIMEOUT,
+    ):
+        class _Result:
+            returncode = code
+
+        def fake_run(cmd, check=False, text=False, _r=_Result, **_kwargs):
+            return _r()
+
+        with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+             patch.object(run_shepherd.subprocess, "run", fake_run):
+            with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+                run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+        assert exc.value.kind == "deterministic", code
+        assert exc.value.transient is False, code
+
+        real_error = exc.value
+        ref = make_ref(tmp_path / f"charge-{code}", review_attempts=1)
+
+        def boom(*_a, _e=real_error, **_kw):
+            raise _e
+
+        result = _drive(ref, boom)
+
+        assert result.decision == "wait", code
+        final = read_status(ref)
+        assert final["review_attempts"] == 2, code
+        assert final.get("refusals", 0) == 0, code
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 on #369: the counter's lifecycle
+#
+# The round-trip read and the un-stick clear are asserted by
+# test_counters_round_trip_through_disk and
+# test_reconcile_unstick_clears_every_counter above, both widened to cover
+# `refusals` rather than duplicated per counter.
+# ---------------------------------------------------------------------------
+def test_refusals_accumulate_while_the_head_is_unchanged(tmp_path) -> None:
+    ref = make_ref(tmp_path)
+    ref.refusals = 1
+    ref.refusals_head = HEAD_SHA
+
+    result = _drive(ref, _refuse())
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["refusals"] == 2
+    assert final["refusals_head"] == HEAD_SHA
+
+
+def test_refusals_reset_when_the_branch_moves(tmp_path) -> None:
+    """The bound's premise is "same bundle, same answer" — a push voids it.
+
+    Without this the counter would be lifetime-per-PR: refusals recorded
+    against a long-superseded bundle would still count, and a refusal on
+    genuinely new code could flip a healthy PR to `review-stuck` — a milder
+    replay of the #360 failure this PR exists to fix.
+    """
+    ref = make_ref(tmp_path)
+    ref.refusals = run_shepherd.MAX_REFUSALS - 1
+    ref.refusals_head = OLD_SHA
+
+    result = _drive(ref, _refuse())
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["refusals"] == 1
+    assert final["refusals_head"] == HEAD_SHA
+    assert final["status"] == "implemented"
+
+
+def test_read_refusal_reason_caps_at_the_trust_boundary(tmp_path) -> None:
+    """Cap where agent text enters, not at each consumer.
+
+    Applied per call site, the cap is one new log line away from being
+    incomplete; applied here it is terminal for every consumer.
+    """
+    path = tmp_path / "refusal.json"
+    path.write_text(
+        json.dumps({"refused": True, "reason": "y" * 9000}), encoding="utf-8",
+    )
+    reason = run_shepherd._read_refusal_reason(str(path))
+    assert reason is not None
+    assert len(reason) == run_shepherd.MAX_NOTES_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 on #369: one table for the whole counter contract
+#
+# Two rules, mirrored:
+#   - any outcome proving the HANDOFF worked clears `harness_failures`;
+#   - any outcome proving the AGENT ENGAGED with the findings clears
+#     `refusals` (and its head anchor).
+#
+# The mirror is deliberately incomplete in one place: a harness failure clears
+# neither. The child never reached a terminal state, so it proves nothing about
+# the findings — and since a refusal clears the harness counter, a 46/47
+# alternation that also cleared `refusals` would trip neither cap and run as an
+# unbounded paid loop, which is the one outcome both counters exist to prevent.
+#
+# One table rather than four near-duplicate tests: a new outcome kind is then a
+# missing row here, not a test nobody thought to write.
+# ---------------------------------------------------------------------------
+COUNTER_CONTRACT = (
+    # kind, review_attempts, harness_failures, refusals, refusals_head
+    ("success", 2, 0, 0, None),
+    ("deterministic", 2, 0, 0, None),
+    ("refused", 1, 0, 2, HEAD_SHA),
+    ("harness", 1, 2, 1, HEAD_SHA),
+)
+
+
+@pytest.mark.parametrize(
+    ("kind", "attempts", "harness", "refusals", "refusals_head"),
+    COUNTER_CONTRACT,
+    ids=[row[0] for row in COUNTER_CONTRACT],
+)
+def test_counter_contract_across_outcomes(
+    tmp_path, kind, attempts, harness, refusals, refusals_head,
+) -> None:
+    ref = make_ref(tmp_path / kind, review_attempts=1)
+    # Seeded on disk as well as in memory: "untouched" is only observable in
+    # the file, and the harness arm writes only its own counter.
+    seeded = read_status(ref)
+    seeded["harness_failures"] = ref.harness_failures = 1
+    seeded["refusals"] = ref.refusals = 1
+    seeded["refusals_head"] = ref.refusals_head = HEAD_SHA
+    ref.status_path.write_text(
+        yaml.safe_dump(seeded, sort_keys=False), encoding="utf-8",
+    )
+
+    if kind == "success":
+        side_effect = None
+    else:
+        def side_effect(*_a, _k=kind, **_kw):
+            raise run_shepherd.FollowupSubprocessError(
+                f"implementer follow-up exited non-zero ({_k})",
+                kind=_k,
+                reason="declined" if _k == "refused" else None,
+            )
+
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "trigger_review"), \
+         patch.object(run_shepherd, "apply_followup", side_effect=side_effect):
+        process_one(ref, skip_subprocess=True)
+
+    final = read_status(ref)
+    assert final.get("review_attempts", 0) == attempts, kind
+    assert final.get("harness_failures", 0) == harness, kind
+    assert final.get("refusals", 0) == refusals, kind
+    assert final.get("refusals_head") == refusals_head, kind
+
+
+def test_alternating_harness_and_refusal_reaches_the_refusal_cap(tmp_path) -> None:
+    """The sequence the contract above exists to get right.
+
+    46, 47, 46, 47, 46 used to reach MAX_HARNESS_FAILURES and tell the operator
+    the platform had lost the work three times in a row — false, with two clean
+    terminal runs in between, and it pointed at #366 instead of at the standoff.
+    It must converge on the refusal cap instead, with the note that says the
+    proposal is not at fault.
+    """
+    ref = make_ref(tmp_path, review_attempts=0)
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def raiser(kind):
+        def _raise(*_a, **_kw):
+            raise run_shepherd.FollowupSubprocessError(
+                f"exit ({kind})",
+                kind=kind,
+                reason="operator decision" if kind == "refused" else None,
+            )
+        return _raise
+
+    decisions = []
+    for kind in ("harness", "refused", "harness", "refused", "harness", "refused"):
+        with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+             patch.object(run_shepherd, "read_codex_review", return_value=review), \
+             patch.object(run_shepherd, "read_copilot_review",
+                          return_value=run_shepherd.CopilotReview(False, 0)), \
+             patch.object(run_shepherd, "apply_followup", side_effect=raiser(kind)):
+            decisions.append(process_one(ref, skip_subprocess=True).decision)
+
+    assert decisions == ["wait"] * 5 + ["review-stuck"]
+    final = read_status(ref)
+    assert final["refusals"] == run_shepherd.MAX_REFUSALS
+    assert final["review_attempts"] == 0
+    assert "not at fault" in final["notes"]
+    assert "harness defect" not in final["notes"]
+
+
+def test_oversized_refusal_reason_file_is_refused(tmp_path) -> None:
+    """Mirror of the implementer-side cap (agy P2 on #369)."""
+    path = tmp_path / "refusal.json"
+    path.write_bytes(b"z" * (run_shepherd.MAX_REFUSAL_FILE_BYTES * 4))
+    assert run_shepherd._read_refusal_reason(str(path)) is None
+
+
+def test_the_shepherd_read_is_bounded_too(tmp_path, monkeypatch) -> None:
+    """Same shape, same fix — even though this caller is not the exposed one.
+
+    The file is an orchestrator-managed temp path outside the agent's
+    workspace, so the append race that motivates the bound in the implementer
+    is not reachable here. It is fixed anyway because an unsafe reading pattern
+    kept "because this caller is fine" is how it ends up copied somewhere that
+    is not.
+    """
+    path = tmp_path / "refusal.json"
+    path.write_text(json.dumps({"refused": True, "reason": "r"}), encoding="utf-8")
+    cap = run_shepherd.MAX_REFUSAL_FILE_BYTES
+    requested = []
+    real_open = Path.open
+
+    class _CountingHandle:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def read(self, size=-1):
+            requested.append(size)
+            return self._fh.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self._fh.close()
+            return False
+
+    def counting_open(self, *a, **kw):
+        return _CountingHandle(real_open(self, *a, **kw))
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    assert run_shepherd._read_refusal_reason(str(path)) == "r"
+    assert requested == [cap + 1]
+
+
+def test_refusal_cap_note_keeps_the_reason(tmp_path) -> None:
+    """End to end: a long reason survives into `.status.yaml` at the cap."""
+    ref = make_ref(tmp_path)
+    ref.refusals = run_shepherd.MAX_REFUSALS - 1
+    ref.refusals_head = HEAD_SHA
+    reason = "operator deferred this to a separate issue. " + ("D" * 500)
+
+    result = _drive(ref, _refuse(reason))
+
+    assert result.decision == "review-stuck"
+    notes = read_status(ref)["notes"]
+    # Whole, not merely present: a reason the trust boundary admits is never
+    # clipped by the framing wrapped around it.
+    assert reason in notes
+    assert notes.count("D") == 500
+
+
+def test_nested_refusal_reason_file_does_not_escape(tmp_path) -> None:
+    """Mirror of the implementer-side hole (agy's second P2 on #369).
+
+    `RecursionError` is not an `OSError` or a `ValueError`, and an escape here
+    propagates out of `apply_followup`, past `process_one`'s
+    `except FollowupSubprocessError`, and aborts the whole tick — every other
+    proposal in it included. Losing the prose is the designed degradation.
+    """
+    path = tmp_path / "refusal.json"
+    depth = 20_000
+    path.write_text(
+        '{"refused": true, "reason": ' + "[" * depth + "]" * depth + "}",
+        encoding="utf-8",
+    )
+    assert path.stat().st_size < run_shepherd.MAX_REFUSAL_FILE_BYTES
+
+    assert run_shepherd._read_refusal_reason(str(path)) is None
+
+
+def test_refusal_is_still_classified_when_the_reason_cannot_be_read() -> None:
+    """End to end: an unreadable reason must not cost the classification.
+
+    The exit code carries the decision; the file is advisory. This is the
+    property that keeps a malformed reason out of the counter-less arm.
+    """
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    depth = 20_000
+    nested = '{"refused": true, "reason": ' + "[" * depth + "]" * depth + "}"
+
+    class _Result:
+        returncode = run_implementer.EXIT_DELIBERATE_NO_OP
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(cmd[cmd.index("--refusal-out") + 1]).write_text(nested, encoding="utf-8")
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "refused"
+    assert exc.value.reason is None
+
+
+def test_the_duplicated_byte_cap_matches_the_implementers() -> None:
+    """Duplicated for the #149 deferred import, not because they may differ.
+
+    The shepherd's is the OUTER bound: raising the implementer's and leaving
+    this one behind would honour a marker whose reason the shepherd then
+    refuses to read, losing the evidence for exactly the oversized case the
+    bound exists to make visible.
+    """
+    assert (
+        run_shepherd.MAX_REFUSAL_FILE_BYTES
+        == run_implementer.MAX_REFUSAL_MARKER_BYTES
+    )
+
+
+def test_stuck_note_gives_the_whole_budget_to_the_evidence(tmp_path) -> None:
+    """Fails against `(prose + reason)[:MAX_NOTES_CHARS]`, which is the point.
+
+    The previous version of this test asserted `len(note) == MAX_NOTES_CHARS`
+    and a trailing run of the reason — both true of the plain slice it was
+    written to rule out, so it passed against the implementation it existed to
+    forbid. The property that actually distinguishes them is how much of the
+    AGENT's text survives: the slice spends ~210 characters of the reason's
+    budget on our own boilerplate.
+    """
+    reason = "E" * 4000
+    note = run_shepherd._stuck_note(3, reason)
+
+    assert note.count("E") == run_shepherd.MAX_NOTES_CHARS
+    assert len(note) > run_shepherd.MAX_NOTES_CHARS  # the framing sits outside it
+    assert "not at fault" in note
+
+
+def test_declined_note_gives_the_whole_budget_to_the_evidence() -> None:
+    """Same rule for the non-terminal note — one rule, not two."""
+    reason = "E" * 4000
+    note = run_shepherd._declined_note(reason)
+
+    assert note.count("E") == run_shepherd.MAX_NOTES_CHARS
+    assert note.startswith("implementer declined to act: ")
+
+
+def test_a_boundary_capped_reason_survives_whole_in_both_notes() -> None:
+    """The realistic case: nothing the trust boundary admits is ever clipped."""
+    reason = "R" * run_shepherd.MAX_NOTES_CHARS
+
+    assert reason in run_shepherd._stuck_note(3, reason)
+    assert reason in run_shepherd._declined_note(reason)
+
+
+def test_apply_followup_cleans_up_a_failure_before_the_subprocess(monkeypatch) -> None:
+    """The temp files must not outlive a failure BEFORE the subprocess call.
+
+    Everything between `mkstemp` and the fork can raise — notably the deferred
+    `run_implementer` import, the one this repo expects to be absent in some
+    environments (#149). Simulated here by the `Path(state_dir)` conversion two
+    lines later, which falls in the same window: with the `try` starting at the
+    fork, both /tmp files survived, on a process that ticks on a schedule.
+    """
+    findings = [make_finding()]
+    created = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    real_mkstemp = run_shepherd.tempfile.mkstemp
+
+    def tracking_mkstemp(*a, **kw):
+        fd, path = real_mkstemp(*a, **kw)
+        created.append(path)
+        return fd, path
+
+    monkeypatch.setattr(run_shepherd.tempfile, "mkstemp", tracking_mkstemp)
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         pytest.raises(TypeError):
+        run_shepherd.apply_followup(
+            "mctl-web", "test-slug", findings, state_dir=object(),
+        )
+
+    assert created, "the refusal temp file was never created"
+    for path in created:
+        assert not Path(path).exists(), f"{path} leaked"
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 on #369: what a HEALTHY run prints is part of the contract
+#
+# `_read_refusal_reason` was called unconditionally on a file `mkstemp` creates
+# empty, so every non-refusal tick parsed zero bytes and warned. A `warn:` on
+# 100% of healthy runs destroys the greppable signal this feature exists to
+# produce and buries a real refusal warning under one from every success.
+#
+# No test covered what a non-refusal run prints, which is how it got through.
+# That gap is worth more than the bug: this asserts the whole class.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "returncode",
+    [
+        0,
+        42,  # EXIT_NO_FOLLOWUP_COMMITS
+        43,  # EXIT_BRANCH_MISSING_ON_ORIGIN
+        44,  # EXIT_OPERATION_TIMEOUT
+        46,  # EXIT_ORPHANED_SUBAGENT
+        1,   # generic / transient
+        137,  # SIGKILL — not a sentinel at all
+    ],
+    ids=["success", "42", "43", "44", "46", "transient", "sigkill"],
+)
+def test_a_non_refusal_run_prints_no_warning(capsys, returncode) -> None:
+    """Silence on the healthy paths is what makes a warning mean something."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        pass
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        # The child writes nothing: mkstemp already left the file empty, which
+        # is exactly the state that used to produce a JSONDecodeError warning.
+        result = _Result()
+        result.returncode = returncode
+        return result
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        if returncode == 0:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+        else:
+            with pytest.raises(run_shepherd.FollowupSubprocessError):
+                run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    out = capsys.readouterr().out
+    assert "warn:" not in out, f"a returncode={returncode} run must print no warning"
+    assert "could not read refusal reason" not in out
+
+
+def test_the_empty_marker_file_is_only_read_on_a_refusal(capsys) -> None:
+    """The gate, stated directly: a refusal reads it, everything else does not."""
+    findings = [make_finding()]
+    seen = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    real_reader = run_shepherd._read_refusal_reason
+
+    def tracking_reader(path):
+        seen.append(path)
+        return real_reader(path)
+
+    class _Result:
+        returncode = run_implementer.EXIT_DELIBERATE_NO_OP
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(cmd[cmd.index("--refusal-out") + 1]).write_text(
+            json.dumps({"refused": True, "reason": "operator decision"}),
+            encoding="utf-8",
+        )
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd, "_read_refusal_reason", tracking_reader), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert len(seen) == 1
+    assert exc.value.reason == "operator decision"
+    assert "warn:" not in capsys.readouterr().out
+
+
+def test_bundle_is_cleaned_up_when_mkstemp_itself_fails(monkeypatch) -> None:
+    """`mkstemp` raising (out of fds or inodes) must not strand the bundle.
+
+    With the `try` starting at `mkstemp` rather than above it, `bundle_path`
+    was already on disk and the `finally` was never entered.
+    """
+    findings = [make_finding()]
+    created = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    real_named = run_shepherd.tempfile.NamedTemporaryFile
+
+    def tracking_named(*a, **kw):
+        fh = real_named(*a, **kw)
+        created.append(fh.name)
+        return fh
+
+    def boom(*_a, **_kw):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(run_shepherd.tempfile, "NamedTemporaryFile", tracking_named)
+    monkeypatch.setattr(run_shepherd.tempfile, "mkstemp", boom)
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         pytest.raises(OSError, match="Too many open files"):
+        run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert created, "the bundle temp file was never created"
+    for path in created:
+        assert not Path(path).exists(), f"{path} leaked"

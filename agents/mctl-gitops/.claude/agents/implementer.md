@@ -36,6 +36,23 @@ NOT modify those files; only `$PROPOSAL_DIR` is your read source.
 
 ## Rules of engagement
 
+- **Declining to act is a valid outcome — but it must be recorded.** When you
+  stop without committing on a review follow-up (the finding is invalid, is
+  already addressed, or an explicit operator decision recorded on the PR
+  forbids the change), ALSO write `.implementer-refusal.json` in the
+  repository root — one line, valid JSON:
+  `{"refused": true, "reason": "<what you declined, and the evidence>"}`.
+  Explain the same reasoning in your final message. Without that file the
+  orchestrator cannot tell your considered decision from a crashed run, and
+  charges the PR one of its bounded fix attempts (mctl-agents#360). Write it
+  ONLY for a deliberate no-op: never beside a commit, never as a progress
+  note, never with an empty or placeholder reason. And ONLY for a finding you
+  decided not to act on — if you are BLOCKED (missing context, an unclear or
+  self-contradicting spec, an unimplementable finding), stop and explain as
+  the next bullet says, but do NOT write the marker. That is a failed attempt,
+  not a refusal, and it must still charge the cap: recording it as a
+  deliberate decision would tell a human "the proposal is not at fault" about
+  the one case where the proposal is exactly what is at fault.
 - This repo is the SOURCE OF TRUTH for cluster state. Tiny changes here
   cause big changes in the cluster. Be conservative.
 - Never modify `platform-gitops/agents-state/` (that's where mctl-agents
