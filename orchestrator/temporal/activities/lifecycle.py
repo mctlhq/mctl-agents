@@ -25,14 +25,10 @@ from temporalio import activity
 
 from orchestrator.lifecycle.contract import (
     OWNED_BY_ME,
-    OWNED_BY_OTHER,
-    STATE_ACTIVE,
-    STATE_HANDING_OFF,
     UNKNOWN,
-    UNOWNED,
-    EntityRef,
     Owner,
-    Ownership,
+    OwnershipAnswer,
+    answer_from,
 )
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
@@ -123,35 +119,27 @@ def _payload(req: OwnershipRequest) -> dict[str, Any]:
     return body
 
 
-def _result_from(payload: dict[str, Any], req: OwnershipRequest) -> OwnershipResult:
-    own = Ownership.from_payload(payload)
-    if own is None:
-        # A 200 whose body is not an ownership record. Reading it as one would
-        # produce a confident OWNED_BY_OTHER built from an empty record — a
-        # wrong answer stated as firmly as a right one.
-        return OwnershipResult(verdict=UNKNOWN, reason="unrecognised payload")
-    asking = Owner(type=req.owner_type, id=req.owner_id)
-    if own.state and own.state not in (STATE_ACTIVE, STATE_HANDING_OFF):
-        # Released or terminal: the row still names an owner, but nobody holds
-        # the entity. Answering OWNED_BY_OTHER here would make the next actor
-        # stand down on a PR that was explicitly handed back.
-        return OwnershipResult(
-            verdict=UNOWNED,
-            epoch=own.epoch,
-            owner_type=own.owner.type,
-            owner_id=own.owner.id,
-            state=own.state,
-            raw=payload,
-        )
-    verdict = OWNED_BY_ME if (own.owner == asking and own.healthy) else OWNED_BY_OTHER
+def _result_from(answer: OwnershipAnswer) -> OwnershipResult:
+    """Flatten a shared OwnershipAnswer into the activity's wire type.
+
+    The CLASSIFICATION is not done here. It used to be, and this module's copy
+    drifted from the client's twice over — an unrecognised state fell into the
+    free bucket after the client had been fixed to fail closed, and only an
+    exact 200 counted as success where the client accepts the 2xx range, so a
+    201 acquire would have silently no-opped the whole writer half.
+
+    Two implementations of one safety decision is how that decision becomes a
+    coin flip, so there is one: contract.answer_from.
+    """
+    own = answer.ownership
     return OwnershipResult(
-        verdict=verdict,
-        epoch=own.epoch,
-        owner_type=own.owner.type,
-        owner_id=own.owner.id,
-        state=own.state,
-        healthy=own.healthy,
-        raw=payload,
+        verdict=answer.verdict,
+        epoch=own.epoch if own else 0,
+        owner_type=own.owner.type if own else "",
+        owner_id=own.owner.id if own else "",
+        state=own.state if own else "",
+        healthy=own.healthy if own else False,
+        reason=answer.reason,
     )
 
 
@@ -159,10 +147,9 @@ def _result_from(payload: dict[str, Any], req: OwnershipRequest) -> OwnershipRes
 async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
     """Perform one ownership operation against mctl-api.
 
-    Returns an `unknown` verdict rather than raising on any failure. The
-    activity is registered with a retry policy by the workflow; a persistent
-    failure must still leave the loop running, because the cron sweeper is
-    the fallback owner and it only stands down for a positive claim.
+    Returns an `unknown` verdict rather than raising on any failure. A
+    persistent failure must still leave the loop running, because the cron
+    sweeper is the fallback owner and it only stands down for a positive claim.
     """
     path = _PATHS.get(req.op)
     if path is None:
@@ -170,7 +157,7 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
 
     try:
         headers = auth_headers()
-    except Exception as exc:  # noqa: BLE001 — auth_headers raises on missing token
+    except Exception as exc:  # noqa: BLE001 — auth_headers raises on a missing token
         return OwnershipResult(verdict=UNKNOWN, reason=f"auth: {exc}")
 
     try:
@@ -182,10 +169,7 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
         activity.logger.warning("lifecycle %s unreachable: %s", req.op, exc)
         return OwnershipResult(verdict=UNKNOWN, reason=str(exc))
 
-    # Parse ONCE, before branching on status. A 200 carrying an HTML error page
-    # from a gateway or proxy is not rarer than a malformed error body, and
-    # leaving the success path unguarded made the one status that matters most
-    # the only one that could crash the activity.
+    raw = resp.content
     body: dict[str, Any] = {}
     try:
         parsed = resp.json()
@@ -194,39 +178,19 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
     except Exception:  # noqa: BLE001 — a non-JSON body is still a response
         body = {}
 
-    if resp.status_code == 200:
-        if not body:
-            return OwnershipResult(verdict=UNKNOWN, reason="non-JSON 200 body")
-        return _result_from(body, req)
-
-    if resp.status_code == 409:
-        raw = body.get("ownership")
-        own = Ownership.from_payload(raw) if isinstance(raw, dict) else None
-        if own is not None:
-            return OwnershipResult(
-                verdict=OWNED_BY_OTHER,
-                epoch=own.epoch,
-                owner_type=own.owner.type,
-                owner_id=own.owner.id,
-                state=own.state,
-                healthy=own.healthy,
-                reason=str(body.get("error") or "owned by another actor"),
-                raw=raw,
-            )
-        return OwnershipResult(verdict=OWNED_BY_OTHER, reason=str(body.get("error") or "owned"))
-
-    if resp.status_code == 404:
-        return OwnershipResult(verdict=UNOWNED, reason="no record")
-
-    # 412, 503, 5xx, 401/403 — none of these establish ownership, and none of
-    # them may read as "free". 412 in particular means the record moved
-    # underneath the caller, which is the strongest reason not to act.
-    return OwnershipResult(
-        verdict=UNKNOWN, reason=str(body.get("error") or f"HTTP {resp.status_code}")
+    # Every call this activity makes is a MUTATION, so is_read stays False:
+    # a 404 here is a missing route or a wrong base path, never "no such row".
+    return _result_from(
+        answer_from(
+            resp.status_code,
+            body,
+            Owner(type=req.owner_type, id=req.owner_id),
+            is_read=False,
+            path=path,
+            # Only a genuinely empty body can be a no-content success. An HTML
+            # error page from a gateway parses to {} as well, and reading that
+            # as a completed write would drop the caller's claim on a write
+            # that never reached the store.
+            body_empty=not raw,
+        )
     )
-
-
-def entity_for_pr(repo: str, number: int, head_sha: str = "") -> EntityRef:
-    """Convenience mirror of `EntityRef.for_pull_request` for callers that
-    already import this module."""
-    return EntityRef.for_pull_request(repo, number, head_sha)

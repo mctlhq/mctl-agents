@@ -45,6 +45,7 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
+    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, EntityRef
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -531,6 +532,11 @@ class DevLoopWorkflow:
         self._owner_epoch = 0
         self._owned_head_sha = ""
         self._poll_index_for_heartbeat = 0
+        # Set once another actor is known to own this PR, so the loop stops
+        # re-asking on every poll for the rest of the watch.
+        self._claim_refused = False
+        self._proposal_ref = ""
+        self._policy_ref = ""
 
     @workflow.query
     def shepherd_in_loop(self) -> bool:
@@ -1116,7 +1122,7 @@ class DevLoopWorkflow:
         req = OwnershipRequest(
             op=op,
             kind="pull-request",
-            entity_id=f"{repo}#{number}",
+            entity_id=EntityRef.for_pull_request(repo, number, head_sha).id,
             phase="review-remediation",
             version=head_sha,
             owner_type="devloop-workflow",
@@ -1124,6 +1130,8 @@ class DevLoopWorkflow:
             epoch=self._owner_epoch,
             evidence=evidence,
             reason=reason,
+            proposal_ref=self._proposal_ref,
+            policy_ref=self._policy_ref,
             temporal_workflow_id=info.workflow_id,
         )
         try:
@@ -1133,10 +1141,41 @@ class DevLoopWorkflow:
                 start_to_close_timeout=LIFECYCLE_TIMEOUT,
                 retry_policy=LIFECYCLE_RETRY_POLICY,
             )
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so `except Exception` below
+            # does NOT catch it. This method is called from _watch_pr's finally,
+            # and letting it escape there would discard the state the watch was
+            # about to return and fail a workflow whose implement and merge both
+            # succeeded — the exact hazard _settle_tick documents one line
+            # earlier. Swallowing it here does not swallow the workflow's own
+            # cancellation: whatever triggered the unwind keeps propagating out
+            # of the try block this finally belongs to.
+            workflow.logger.info(
+                "lifecycle %s cancelled for %s#%s — the watch is ending", op, repo, number
+            )
+            return None
         except Exception as exc:  # noqa: BLE001 — ActivityError and friends
             workflow.logger.warning("lifecycle %s failed for %s#%s: %r", op, repo, number, exc)
             return None
 
+
+
+    def _lose_claim(self, repo: str, number: int, result: OwnershipResult) -> None:
+        """Another actor holds this PR now. Stop claiming to own it.
+
+        The epoch is NOT adopted. It belongs to the winner, and carrying it
+        would make every later call from this loop assert a fencing generation
+        it never held — which the server would reject, and which would read in
+        the events as this workflow trying to act on somebody else's claim.
+        """
+        workflow.logger.info(
+            "lifecycle: lost %s#%s to %s/%s — this loop no longer claims it",
+            repo, number, result.owner_type, result.owner_id,
+        )
+        self._owned_entity_id = ""
+        self._owner_epoch = 0
+        self._owned_head_sha = ""
+        self._claim_refused = True
 
     async def _track_ownership(self, state: PRState) -> None:
         """Claim the PR, then keep the claim honest.
@@ -1165,14 +1204,21 @@ class DevLoopWorkflow:
         head = state.head_sha or ""
 
         if not self._owned_entity_id:
+            if self._claim_refused:
+                # Somebody else owns this PR and said so. Re-asking on every
+                # poll for the rest of a 14-day watch is ~670 activities to
+                # re-learn one fact; the reconciler is what resolves a
+                # conflict, not this loop.
+                return
             result = await self._ownership(
                 "acquire", repo=repo, number=number, head_sha=head
             )
             if result is not None and result.owned_by_caller:
-                self._owned_entity_id = f"{repo}#{number}"
+                self._owned_entity_id = EntityRef.for_pull_request(repo, number).id
                 self._owner_epoch = result.epoch
                 self._owned_head_sha = head
-            elif result is not None:
+            elif result is not None and result.verdict == OWNED_BY_OTHER:
+                self._claim_refused = True
                 # Somebody else owns this PR. Nothing to do and nothing to
                 # escalate here: the reconciler is what resolves a conflict,
                 # and this loop simply does not record itself as the owner.
@@ -1190,18 +1236,33 @@ class DevLoopWorkflow:
                 head_sha=head,
                 evidence=f"head moved to {head[:8]}",
             )
-            if result is not None:
+            # `is not None` is NOT "the write succeeded". The activity never
+            # raises — that is its contract — so a 503, a timeout, a missing
+            # token and a lost claim all come back as a real result carrying an
+            # unknown or owned-by-other verdict. Advancing _owned_head_sha on
+            # those would drop the progress signal permanently: the next poll
+            # sees head == _owned_head_sha and never retries.
+            if result is not None and result.owned_by_caller:
                 self._owned_head_sha = head
-                if result.epoch:
-                    self._owner_epoch = result.epoch
+                self._owner_epoch = result.epoch or self._owner_epoch
+            elif result is not None and result.verdict == OWNED_BY_OTHER:
+                self._lose_claim(repo, number, result)
             return
 
         if self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0:
             result = await self._ownership(
                 "acquire", repo=repo, number=number, head_sha=head
             )
-            if result is not None and result.epoch:
-                self._owner_epoch = result.epoch
+            if result is None:
+                return
+            if result.owned_by_caller:
+                self._owner_epoch = result.epoch or self._owner_epoch
+            elif result.verdict == OWNED_BY_OTHER:
+                # Discarding the verdict and keeping only the epoch meant this
+                # loop could never notice it had LOST the PR — and it adopted
+                # the winner's fencing generation while failing to notice,
+                # so every later call carried a competitor's epoch.
+                self._lose_claim(repo, number, result)
 
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
         """Poll get_pr_state until the PR reaches a terminal state.
@@ -1256,6 +1317,16 @@ class DevLoopWorkflow:
         # cron sweeper owns the PR and this loop must not record itself as the
         # owner. Its own marker, because it adds commands to history.
         track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
+        if track_ownership:
+            # ADR-010 §12 asks for the resolved policy to be recorded on the
+            # row, so "why does this actor own it" is answerable without
+            # reconstructing a CWFT env var in another repository. Both are
+            # derived here, once, because this is where service and slug are
+            # in scope — and both are plain strings, so no policy lookup runs
+            # inside workflow code.
+            self._proposal_ref = f"{service}/{slug}"
+            self._policy_ref = f"devloop:{service}"
+
         tick_task: asyncio.Task[None] | None = None
         poll_index = 0
         shepherd_ticks = 0

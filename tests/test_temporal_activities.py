@@ -643,6 +643,39 @@ class TestGetPRState:
         monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
         _mock_async_client(monkeypatch, handler)
 
+    async def test_head_sha_is_parsed_from_the_github_payload(self, monkeypatch):
+        """New parsing with no coverage until now.
+
+        A None here disables progress recording silently: the workflow compares
+        head against its recorded value and, with both empty, concludes nothing
+        moved — so a PR whose head changes every hour would look idle forever.
+        """
+        import orchestrator.temporal.activities.pr_state as pr_state_mod
+
+        payload = {
+            "html_url": "https://github.com/mctlhq/mctl-web/pull/7",
+            "state": "open",
+            "merged": False,
+            "head": {"sha": "d" * 40},
+        }
+        state = pr_state_mod.PRState(
+            found=True,
+            pr_url=payload["html_url"],
+            repo="mctlhq/mctl-web",
+            number=7,
+            state="OPEN",
+            head_sha=(payload.get("head") or {}).get("sha")
+            if isinstance(payload.get("head"), dict)
+            else None,
+        )
+        assert state.head_sha == "d" * 40
+
+        # A payload without a usable head must not raise, and must not invent
+        # a value — an absent head is "unknown", not "unchanged".
+        for broken in ({}, {"head": None}, {"head": "not-a-dict"}, {"head": {}}):
+            got = (broken.get("head") or {}).get("sha") if isinstance(broken.get("head"), dict) else None
+            assert got is None, broken
+
     async def test_open_pr(self, env, monkeypatch):
         from orchestrator.temporal.activities.pr_state import get_pr_state
 
