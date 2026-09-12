@@ -4171,3 +4171,126 @@ def test_apply_followup_cleans_up_a_failure_before_the_subprocess(monkeypatch) -
     assert created, "the refusal temp file was never created"
     for path in created:
         assert not Path(path).exists(), f"{path} leaked"
+
+
+# ---------------------------------------------------------------------------
+# Review round 5 on #369: what a HEALTHY run prints is part of the contract
+#
+# `_read_refusal_reason` was called unconditionally on a file `mkstemp` creates
+# empty, so every non-refusal tick parsed zero bytes and warned. A `warn:` on
+# 100% of healthy runs destroys the greppable signal this feature exists to
+# produce and buries a real refusal warning under one from every success.
+#
+# No test covered what a non-refusal run prints, which is how it got through.
+# That gap is worth more than the bug: this asserts the whole class.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "returncode",
+    [
+        0,
+        42,  # EXIT_NO_FOLLOWUP_COMMITS
+        43,  # EXIT_BRANCH_MISSING_ON_ORIGIN
+        44,  # EXIT_OPERATION_TIMEOUT
+        46,  # EXIT_ORPHANED_SUBAGENT
+        1,   # generic / transient
+        137,  # SIGKILL — not a sentinel at all
+    ],
+    ids=["success", "42", "43", "44", "46", "transient", "sigkill"],
+)
+def test_a_non_refusal_run_prints_no_warning(capsys, returncode) -> None:
+    """Silence on the healthy paths is what makes a warning mean something."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        pass
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        # The child writes nothing: mkstemp already left the file empty, which
+        # is exactly the state that used to produce a JSONDecodeError warning.
+        result = _Result()
+        result.returncode = returncode
+        return result
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        if returncode == 0:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+        else:
+            with pytest.raises(run_shepherd.FollowupSubprocessError):
+                run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    out = capsys.readouterr().out
+    assert "warn:" not in out, f"a returncode={returncode} run must print no warning"
+    assert "could not read refusal reason" not in out
+
+
+def test_the_empty_marker_file_is_only_read_on_a_refusal(capsys) -> None:
+    """The gate, stated directly: a refusal reads it, everything else does not."""
+    findings = [make_finding()]
+    seen = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    real_reader = run_shepherd._read_refusal_reason
+
+    def tracking_reader(path):
+        seen.append(path)
+        return real_reader(path)
+
+    class _Result:
+        returncode = run_implementer.EXIT_DELIBERATE_NO_OP
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(cmd[cmd.index("--refusal-out") + 1]).write_text(
+            json.dumps({"refused": True, "reason": "operator decision"}),
+            encoding="utf-8",
+        )
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd, "_read_refusal_reason", tracking_reader), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert len(seen) == 1
+    assert exc.value.reason == "operator decision"
+    assert "warn:" not in capsys.readouterr().out
+
+
+def test_bundle_is_cleaned_up_when_mkstemp_itself_fails(monkeypatch) -> None:
+    """`mkstemp` raising (out of fds or inodes) must not strand the bundle.
+
+    With the `try` starting at `mkstemp` rather than above it, `bundle_path`
+    was already on disk and the `finally` was never entered.
+    """
+    findings = [make_finding()]
+    created = []
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    real_named = run_shepherd.tempfile.NamedTemporaryFile
+
+    def tracking_named(*a, **kw):
+        fh = real_named(*a, **kw)
+        created.append(fh.name)
+        return fh
+
+    def boom(*_a, **_kw):
+        raise OSError(24, "Too many open files")
+
+    monkeypatch.setattr(run_shepherd.tempfile, "NamedTemporaryFile", tracking_named)
+    monkeypatch.setattr(run_shepherd.tempfile, "mkstemp", boom)
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         pytest.raises(OSError, match="Too many open files"):
+        run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert created, "the bundle temp file was never created"
+    for path in created:
+        assert not Path(path).exists(), f"{path} leaked"

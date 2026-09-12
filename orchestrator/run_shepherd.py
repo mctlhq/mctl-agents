@@ -1800,20 +1800,27 @@ def apply_followup(
         json.dump(bundle, fh, ensure_ascii=False, indent=2)
         bundle_path = fh.name
 
-    # Where the implementer writes its reason if this run ends in a deliberate
-    # no-op (mctl-agents#360). Created here, not by the child, so a child that
-    # dies before writing leaves an empty file rather than an ambiguous absence.
-    refusal_fd, refusal_path = tempfile.mkstemp(
-        suffix=".json", prefix=f"shepherd-refusal-{service}-{slug}-",
-    )
-    os.close(refusal_fd)
-
-    # The `try` starts HERE, not at the subprocess call: everything below can
-    # raise — notably the deferred `run_implementer` import, which this repo
-    # deliberately expects to be absent in some environments (#149) — and the
-    # `finally` must cover the paths' whole lifetime, not just the fork. A
-    # shepherd that ticks on a schedule leaks two /tmp files per tick otherwise.
+    # The `try` starts HERE, above `mkstemp`, not at the subprocess call:
+    # everything below can raise — `mkstemp` itself (out of fds or inodes), and
+    # the deferred `run_implementer` import, which this repo deliberately
+    # expects to be absent in some environments (#149). The `finally` must
+    # cover the whole lifetime of every path created above it, `bundle_path`
+    # included; a shepherd that ticks on a schedule leaks otherwise.
+    refusal_path: str | None = None
     try:
+        # Where the implementer writes its reason if this run ends in a
+        # deliberate no-op (mctl-agents#360). `mkstemp` rather than composing a
+        # name: it is the only stdlib call that reserves a unique path for a
+        # child process atomically (`mktemp` is racy and deprecated), and the
+        # empty file it leaves behind is inert now that the read below is gated
+        # on the refusal exit codes. It is NOT pre-created for the child's
+        # benefit — the implementer's `_write_refusal_out` creates the file if
+        # it is missing.
+        refusal_fd, refusal_path = tempfile.mkstemp(
+            suffix=".json", prefix=f"shepherd-refusal-{service}-{slug}-",
+        )
+        os.close(refusal_fd)
+
         cmd = [
             sys.executable, "-m", "orchestrator.run_implementer",
             "--service", service,
@@ -1830,9 +1837,21 @@ def apply_followup(
             cmd.extend(["--state-dir", str(state_dir)])
         print(f"$ {' '.join(cmd)}")
         proc = subprocess.run(cmd, check=False, text=True)  # noqa: S603 — cmd is list[str], built above
-        refusal_reason = _read_refusal_reason(refusal_path)
+        # Gated on the refusal codes, NOT read unconditionally. `mkstemp`
+        # leaves the file empty, so reading it on every tick parsed zero bytes
+        # and warned on 100% of healthy runs — destroying the greppable signal
+        # this feature exists to produce, and burying a real refusal warning
+        # under one from every success. The reason is only meaningful when the
+        # child exited on a refusal sentinel anyway.
+        refusal_reason = (
+            _read_refusal_reason(refusal_path)
+            if proc.returncode in _refusal_codes()
+            else None
+        )
     finally:
         for path in (bundle_path, refusal_path):
+            if path is None:
+                continue  # mkstemp itself failed; nothing to remove
             try:
                 os.unlink(path)
             except FileNotFoundError:

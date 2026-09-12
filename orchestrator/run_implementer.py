@@ -291,11 +291,24 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
             f"treating the run as a plain no-commit failure"
         )
         return None
-    tracked = _run(
-        ["git", "ls-files", "--error-unmatch", REFUSAL_MARKER_FILENAME],
-        cwd=repo_dir,
-        check=False,
-    )
+    try:
+        tracked = _run(
+            ["git", "ls-files", "--error-unmatch", REFUSAL_MARKER_FILENAME],
+            cwd=repo_dir,
+            check=False,
+        )
+    except Exception as e:  # noqa: BLE001 — see the docstring: broad on purpose
+        # The last step in this function that could still throw past the
+        # caller. Deliberately swallows ImplementerOperationTimeout too: a slow
+        # `git ls-files` would otherwise reclassify the whole run as a timeout
+        # (44) when the honest statement is narrower — we could not establish
+        # whether the marker is tracked, so it is not a refusal (42). Both
+        # charge an attempt; only one of them is true.
+        print(
+            f"warn: could not check whether {REFUSAL_MARKER_FILENAME} is "
+            f"tracked ({type(e).__name__}: {e}); ignoring the marker"
+        )
+        return None
     if tracked.returncode == 0:
         print(
             f"warn: {REFUSAL_MARKER_FILENAME} is tracked in {repo_dir.name}; "
