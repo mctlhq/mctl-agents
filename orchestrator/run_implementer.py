@@ -155,7 +155,7 @@ EXIT_OPERATION_TIMEOUT = 44
 # Batch-mode only (see `main()`); never returned from --review-feedback mode,
 # whose exit codes come from `_review_feedback_exit_code()` below.
 #
-# See mctlhq/mctl-gitops follow-up (not filed by this change):
+# See mctlhq/mctl-gitops#1206 (filed as the required follow-up):
 # cwft-mctl-agents-approve.yaml should record approval.approved_by on an
 # already-accepted proposal, and cwft-mctl-agents-implement.yaml should not
 # treat EXIT_BLOCKED_ONLY as a retryable/quota failure -- today neither the
@@ -163,7 +163,8 @@ EXIT_OPERATION_TIMEOUT = 44
 # code, both compare Argo step status strings, so this exit makes
 # `implement` `Failed`, triggers a pointless account-2 retry, and blames the
 # Claude usage limit in `assert-attempt`'s stderr for an unapproved
-# proposal (mctl-agents#349).
+# proposal (mctl-agents#349). Tracked in mctl-gitops, not mctl-agents, since
+# both fixes are CWFT-side.
 EXIT_BLOCKED_ONLY = 45
 
 
