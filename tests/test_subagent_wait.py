@@ -370,3 +370,50 @@ def test_untracked_type_warns_once_per_type_not_once_per_task(capsys) -> None:
     assert out.count("of untracked type 'bash'") == 1
     assert "remote_agent" in out
     assert ledger.live == set()
+
+
+def test_a_second_delegation_after_the_first_settles_is_also_awaited() -> None:
+    """The parent may delegate AGAIN in the turn its first child woke.
+
+    Documentation, not a guard: when the closing frame does arrive, a straight
+    phase-1-then-phase-2 pass behaves identically here, so this test passes
+    either way. The guard is the sibling below, where the second child never
+    settles — that is where abandoning it becomes visible.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+    seen: list[object] = []
+
+    async def two_rounds():
+        yield updated("t1", "completed")
+        yield started("t2")              # parent delegates again
+        yield updated("t2", "completed")
+        yield "second child's work"
+        yield result_message()
+
+    anyio.run(
+        lambda: drain_until_settled(
+            two_rounds(), ledger, timeout_s=5, on_message=seen.append,
+        )
+    )
+    assert ledger.live == set()
+    assert "second child's work" in [m for m in seen if isinstance(m, str)]
+
+
+def test_a_second_delegation_that_never_settles_is_an_orphan() -> None:
+    """And abandoning it silently is exactly what must not happen."""
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def relaunch_then_hang():
+        yield updated("t1", "completed")
+        yield started("t2")
+        await anyio.sleep(10)
+
+    with pytest.raises(OrphanedSubagentError, match=r"t2"):
+        anyio.run(
+            lambda: drain_until_settled(
+                relaunch_then_hang(), ledger, timeout_s=0.05,
+                on_message=lambda _m: None,
+            )
+        )

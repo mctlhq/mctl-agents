@@ -224,52 +224,66 @@ async def drain_until_settled(
         )
     from claude_agent_sdk import ResultMessage  # deferred — see module docstring
 
-    # PHASE 1, bounded by timeout_s: wait for the delegated child to go
-    # quiescent. This is the only thing the sub-deadline was ever meant to
-    # bound, and it is still how options.py documents it.
-    settled = False
-    with anyio.move_on_after(timeout_s):
-        async for message in stream:
-            on_message(message)
-            ledger.observe(message)
-            if not ledger.live:
-                settled = True
-                break
-    if ledger.live:
-        raise OrphanedSubagentError(
-            f"sub-agent task(s) never reported a terminal status within "
-            f"{timeout_s:g}s: {ledger.describe()}"
-        )
-    if not settled:
-        # The stream ended with nothing live. Nothing more is coming.
-        return
+    # Two alternating waits, looped, because the parent may delegate AGAIN in
+    # the turn its first child woke. A straight phase-1-then-phase-2 pass sees
+    # that second launch only as "the ledger is non-empty again" and, having no
+    # raise of its own in phase 2, abandons it -- the #366 loss once more, now
+    # on the second delegation instead of the first.
+    while True:
+        if ledger.live:
+            # WAIT FOR QUIESCENCE, bounded. A child that never reports is the
+            # orphan this whole module exists to catch.
+            settled = False
+            with anyio.move_on_after(timeout_s):
+                async for message in stream:
+                    on_message(message)
+                    ledger.observe(message)
+                    if not ledger.live:
+                        settled = True
+                        break
+            if ledger.live:
+                raise OrphanedSubagentError(
+                    f"sub-agent task(s) never reported a terminal status within "
+                    f"{timeout_s:g}s: {ledger.describe()}"
+                )
+            if not settled:
+                return  # stream ended with nothing live; nothing more is coming
 
-    # PHASE 2, its own restarted grace deadline: wait for the closing result
-    # frame. A settling child wakes the parent, and the parent's remaining
-    # steps are real work -- for the implementer's review-feedback prompt, the
-    # `git commit` itself -- so this must NOT run on the phase-1 clock, which a
-    # slow child may have nearly exhausted.
-    #
-    # But it must not be unbounded either, and the reason is asymmetric with
-    # phase 1. That frame may never arrive: the parent can end without one, and
-    # if this waited on the CALLER's outer bound instead, `fail_after` would
-    # fire here with an empty ledger, fall through to a plain operation timeout
-    # -> exit 44 -> a CHARGED attempt, and the child's commit would be thrown
-    # away with the tmp clone. The whole point of #366 is not charging the
-    # proposal for work the platform mislaid.
-    #
-    # So expiry here is a RETURN, not a raise: nothing is outstanding, whatever
-    # the child produced is already in the worktree, and `_has_new_commits` is
-    # the right adjudicator. Loud, because a run that regularly reaches this is
-    # telling us the parent is slower than the grace period.
-    with anyio.move_on_after(timeout_s):
-        async for message in stream:
-            on_message(message)
-            ledger.observe(message)
-            if isinstance(message, ResultMessage) and not ledger.live:
-                return
+        # WAIT FOR THE CLOSING FRAME, on a RESTARTED clock -- a slow child must
+        # not silently truncate the parent's commit window. Three ways out:
+        # the run ends, the stream ends, or the parent delegates again and we
+        # go back to waiting for quiescence.
+        relaunched = False
+        exhausted = True
+        with anyio.move_on_after(timeout_s):
+            async for message in stream:
+                on_message(message)
+                ledger.observe(message)
+                if ledger.live:
+                    relaunched = True
+                    exhausted = False
+                    break
+                if isinstance(message, ResultMessage):
+                    return
+            else:
+                exhausted = True
+        if relaunched:
+            continue
+        if exhausted:
+            return
+        # Grace expired. If something is live we raced a launch we cannot see
+        # settle -- that is an orphan. Otherwise nothing is outstanding:
+        # whatever the child produced is already in the worktree and
+        # `_has_new_commits` adjudicates, so this is a RETURN, not a raise.
+        # Expiring here must never charge the proposal for a frame the parent
+        # simply never sent.
+        if ledger.live:
+            raise OrphanedSubagentError(
+                f"sub-agent task(s) still live when the closing frame grace of "
+                f"{timeout_s:g}s expired: {ledger.describe()}"
+            )
+        print(
+            f"warn: no closing result frame within {timeout_s:g}s of the "
+            f"sub-agent settling; proceeding on what is already in the worktree"
+        )
         return
-    print(
-        f"warn: no closing result frame within {timeout_s:g}s of the sub-agent "
-        f"settling; proceeding on what is already in the worktree"
-    )
