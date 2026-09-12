@@ -36,6 +36,17 @@ skills → Claude API → PRs to mctl-gitops). Do not confuse with `mctl-agents`
 
 ## Rules of engagement
 
+- **Declining to act is a valid outcome — but it must be recorded.** When you
+  stop without committing on a review follow-up (the finding is invalid, is
+  already addressed, or an explicit operator decision recorded on the PR
+  forbids the change), ALSO write `.implementer-refusal.json` in the
+  repository root — one line, valid JSON:
+  `{"refused": true, "reason": "<what you declined, and the evidence>"}`.
+  Explain the same reasoning in your final message. Without that file the
+  orchestrator cannot tell your considered decision from a crashed run, and
+  charges the PR one of its bounded fix attempts (mctl-agents#360). Write it
+  ONLY for a deliberate no-op: never beside a commit, never as a progress
+  note, never with an empty or placeholder reason.
 - One to three small commits.
 - New Go dependency? `go get` + `go mod tidy`.
 - If unclear or self-contradicting — STOP, explain in final message.

@@ -37,6 +37,17 @@ viable code change in this repository (the cwd is a fresh clone of
 
 ## Rules of engagement
 
+- **Declining to act is a valid outcome — but it must be recorded.** When you
+  stop without committing on a review follow-up (the finding is invalid, is
+  already addressed, or an explicit operator decision recorded on the PR
+  forbids the change), ALSO write `.implementer-refusal.json` in the
+  repository root — one line, valid JSON:
+  `{"refused": true, "reason": "<what you declined, and the evidence>"}`.
+  Explain the same reasoning in your final message. Without that file the
+  orchestrator cannot tell your considered decision from a crashed run, and
+  charges the PR one of its bounded fix attempts (mctl-agents#360). Write it
+  ONLY for a deliberate no-op: never beside a commit, never as a progress
+  note, never with an empty or placeholder reason.
 - Keep the change small and self-contained.
 - If the proposal is unclear, STOP and explain in your final message.
 - New TypeScript dependency? `yarn workspace <pkg> add ...`. Don't

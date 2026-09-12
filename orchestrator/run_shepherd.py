@@ -305,6 +305,10 @@ RECONCILE_INPUT_STATUSES = {
 # something new on the fix itself. This does not address #342 (attempts
 # spent on a finding the approved proposal already excluded).
 MAX_REVIEW_ATTEMPTS = 5
+# Upper bound on a note written into `.status.yaml`. The implementer already
+# caps the refusal reason it emits; this is the shepherd-side backstop so no
+# agent-authored prose can bloat the durable projection (mctl-agents#360).
+MAX_NOTES_CHARS = 700
 
 # Separate, much smaller cap on consecutive HARNESS failures (exit 46: our own
 # orchestration lost the implementer's work — mctl-agents#366). Deliberately not
@@ -317,6 +321,22 @@ MAX_REVIEW_ATTEMPTS = 5
 # #366 that situation at least converged to `review-stuck` via the attempt cap.
 # Low, because a repeating harness failure is structural and wants a human.
 MAX_HARNESS_FAILURES = 3
+
+# Bound on deliberate no-ops, for the same reason and on the same shape as
+# MAX_HARNESS_FAILURES — a separate counter, never `review_attempts`
+# (mctl-agents#360). A refusal is the correct outcome, but it changes nothing
+# on the PR: the head SHA is unmoved, the findings stand, and no review is
+# re-triggered, so the next tick hands the agent the identical bundle and pays
+# for the identical answer. One or two of those is the system working (the
+# operator note is honoured while a human reconciles the findings); an
+# indefinite series is a standoff between a reviewer and an operator decision
+# that only a human can settle, so it converges to `review-stuck` with the
+# proposal explicitly marked blameless.
+#
+# Counted per HEAD SHA (`ProposalRef.refusals_head`), not per PR lifetime: the
+# premise is "the same bundle produces the same answer", which stops holding
+# the moment the branch moves.
+MAX_REFUSALS = 3
 
 # mergeStateStatus values that are safe to merge per design.md L143-154.
 # CLEAN = nothing in the way. HAS_HOOKS = pre-receive hooks (org-level
@@ -486,7 +506,51 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
 # to neither counter, no terminal state -- precisely the unbounded paid loop
 # MAX_HARNESS_FAILURES exists to make unreachable, one letter away. mypy runs
 # over orchestrator/, so a Literal catches all three assignment sites for free.
-FollowupKind = Literal["transient", "deterministic", "harness"]
+# `"refused"` (mctl-agents#360) is in the same position: it is bounded by
+# MAX_REFUSALS, and a typo would fall through to the counter-less arm.
+FollowupKind = Literal["transient", "deterministic", "harness", "refused"]
+
+
+def _refusal_codes() -> frozenset[int]:
+    """Exit codes that mean "the agent deliberately changed nothing".
+
+    Kept separate from ``_followup_code_sets()`` rather than widening its
+    tuple: a refusal is neither of those two things. It is not deterministic
+    (the proposal is not at fault, so it must not be charged) and it is not a
+    harness failure (nothing was lost — the agent ran, reasoned, and declined).
+    A third set also keeps the existing two-tuple's callers untouched.
+
+    Same deferred ``run_implementer`` import as ``_followup_code_sets``: the
+    Temporal worker must not pull in the Claude agent SDK (#149, guarded by
+    tests/test_worker_isolation.py).
+    """
+    from orchestrator import run_implementer  # deferred — see apply_followup
+
+    return frozenset({run_implementer.EXIT_DELIBERATE_NO_OP})
+
+
+def _read_refusal_reason(path: str) -> str | None:
+    """Read the reason the implementer wrote to its ``--refusal-out`` path.
+
+    Advisory: the exit code already carries the decision not to charge an
+    attempt, so a missing or malformed file only costs the operator the prose.
+
+    Capped HERE, at the trust boundary, rather than at each consumer: this is
+    the point where agent-authored text enters the shepherd, and a cap applied
+    per call site is one new log line away from being incomplete. The
+    implementer caps too (``MAX_REFUSAL_REASON_CHARS``); this is the backstop
+    for anything that writes the file some other way.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return " ".join(reason.split())[:MAX_NOTES_CHARS]
 
 
 class FollowupSubprocessError(RuntimeError):
@@ -510,12 +574,27 @@ class FollowupSubprocessError(RuntimeError):
     the existing non-charging one. But "don't charge" must not be reachable by
     omission from ``deterministic_codes``, so the label carries the intent
     explicitly, drives a distinct operator-facing log line, and is directly
-    assertable in tests. Values: ``"transient" | "deterministic" | "harness"``.
+    assertable in tests. Values:
+    ``"transient" | "deterministic" | "harness" | "refused"``.
+
+    ``"refused"`` (mctl-agents#360) is the fourth label and the only one that
+    is not a failure at all: the agent read the findings and decided that
+    changing nothing was correct — because they were already addressed, or
+    because an explicit operator decision on the PR forbade the change. It
+    shares the non-charging behaviour, and carries ``reason``, the agent's own
+    explanation, so the operator sees *why* the tick did nothing.
     """
 
-    def __init__(self, message: str, *, kind: FollowupKind = "transient") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: FollowupKind = "transient",
+        reason: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.kind = kind
+        self.reason = reason
 
     @property
     def transient(self) -> bool:
@@ -544,6 +623,12 @@ class ProposalRef:
     status: str
     review_attempts: int = 0
     harness_failures: int = 0
+    refusals: int = 0
+    # Head SHA the refusals above were counted against. The bound's whole
+    # premise is "the same bundle produces the same answer", which only holds
+    # while the branch has not moved, so a refusal on a NEW head starts the
+    # count over instead of inheriting a budget spent on different code.
+    refusals_head: str | None = None
     pr_url: str | None = None
     mode: str = FULL
     status_path: Path = field(init=False)
@@ -670,10 +755,14 @@ def update_status(
     # two disagreed for the rest of the tick. Harmless while the only consumer
     # of the returned ref is the summary line, but the harness arm made these
     # refs carry state that a later reader would reasonably trust.
-    for _field in ("review_attempts", "harness_failures"):
+    for _field in ("review_attempts", "harness_failures", "refusals"):
         if _field in fields:
             _value = fields[_field]
             setattr(ref, _field, 0 if _value is None else int(_value))
+    # Same rule, string-valued: cleared to None rather than 0 (mctl-agents#360).
+    if "refusals_head" in fields:
+        _head = fields["refusals_head"]
+        ref.refusals_head = str(_head) if _head else None
 
 
 # ---------------------------------------------------------------------------
@@ -776,6 +865,8 @@ def _discover_refs(
                     status=status,
                     review_attempts=int(data.get("review_attempts", 0) or 0),
                     harness_failures=int(data.get("harness_failures", 0) or 0),
+                    refusals=int(data.get("refusals", 0) or 0),
+                    refusals_head=(data.get("refusals_head") or None),
                     pr_url=pr_url,
                     mode=mode,
                 )
@@ -1632,11 +1723,20 @@ def apply_followup(
         json.dump(bundle, fh, ensure_ascii=False, indent=2)
         bundle_path = fh.name
 
+    # Where the implementer writes its reason if this run ends in a deliberate
+    # no-op (mctl-agents#360). Created here, not by the child, so a child that
+    # dies before writing leaves an empty file rather than an ambiguous absence.
+    refusal_fd, refusal_path = tempfile.mkstemp(
+        suffix=".json", prefix=f"shepherd-refusal-{service}-{slug}-",
+    )
+    os.close(refusal_fd)
+
     cmd = [
         sys.executable, "-m", "orchestrator.run_implementer",
         "--service", service,
         "--slug", slug,
         "--review-feedback", bundle_path,
+        "--refusal-out", refusal_path,
     ]
     # Forward --state-dir only when it differs from the implementer's
     # own DEFAULT_STATE_DIR. The implementer's argparse default is the
@@ -1648,11 +1748,13 @@ def apply_followup(
     print(f"$ {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, check=False, text=True)  # noqa: S603 — cmd is list[str], built above
+        refusal_reason = _read_refusal_reason(refusal_path)
     finally:
-        try:
-            os.unlink(bundle_path)
-        except FileNotFoundError:
-            pass  # already gone — that's fine
+        for path in (bundle_path, refusal_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass  # already gone — that's fine
     if proc.returncode != 0:
         # Surface as a typed exception so the outer state machine can
         # tell a transient subprocess failure (auth/network/branch
@@ -1673,9 +1775,19 @@ def apply_followup(
         # retried like a transient but named distinctly (mctl-agents#366).
         # Anything else (1, 137, 2, ...) is treated as transient — we
         # cannot tell the kind from the code alone.
+        #
+        # `EXIT_DELIBERATE_NO_OP` = 47 is the fourth kind and the only one that
+        # is not a failure: the agent declined to act and said why
+        # (mctl-agents#360). Charging it would punish the agent for honouring
+        # an operator decision, which is what exhausted the budget on
+        # portfolio#56.
         deterministic_codes, harness_codes = _followup_code_sets()
         kind: FollowupKind
-        if proc.returncode in harness_codes:
+        reason = None
+        if proc.returncode in _refusal_codes():
+            kind = "refused"
+            reason = refusal_reason
+        elif proc.returncode in harness_codes:
             kind = "harness"
         elif proc.returncode in deterministic_codes:
             kind = "deterministic"
@@ -1685,6 +1797,7 @@ def apply_followup(
             f"implementer follow-up exited non-zero "
             f"({proc.returncode}) for {service}/{slug}",
             kind=kind,
+            reason=reason,
         )
     return bundle
 
@@ -1852,6 +1965,8 @@ def process_one(
             merge_commit=payload,
             review_attempts=None,  # clear it so terminal status is clean
             harness_failures=None,
+            refusals=None,
+            refusals_head=None,
             merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
@@ -1863,6 +1978,8 @@ def process_one(
             notes=payload or "PR was closed without merging.",
             review_attempts=None,
             harness_failures=None,
+            refusals=None,
+            refusals_head=None,
             merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
@@ -1920,6 +2037,59 @@ def process_one(
                 state_dir=state_dir,
             )
         except FollowupSubprocessError as e:
+            if e.kind == "refused":
+                # Not a failure: the implementer read the findings and decided
+                # that changing nothing was the correct outcome
+                # (mctl-agents#360). The attempt budget exists to stop
+                # unproductive loops, not to punish an agent for correctly
+                # declining to act, so the counter and the status stay put and
+                # a later tick can act on new information. The reason is
+                # durable — it is the only record of why this tick was a no-op.
+                reason = e.reason or "no reason recorded by the implementer"
+                note = f"implementer declined to act: {reason}"[:MAX_NOTES_CHARS]
+                # Consecutive on ONE head: a push moves the branch, so the
+                # next bundle is about different code and deserves a fresh
+                # budget. Without this the counter would be lifetime-per-PR and
+                # a refusal recorded against a long-superseded bundle could
+                # flip a healthy PR to review-stuck — a milder replay of the
+                # #360 failure itself.
+                same_head = ref.refusals_head in (None, pr.head_sha)
+                new_refusals = ref.refusals + 1 if same_head else 1
+                print(
+                    f"info: {ref.service}/{ref.slug}: implementer declined to "
+                    f"act — not charging a review attempt; leaving "
+                    f"review_attempts={ref.review_attempts}, "
+                    f"refusals {ref.refusals} -> {new_refusals} "
+                    f"on head {pr.head_sha[:7]}. Reason: {reason}"
+                )
+                if new_refusals >= MAX_REFUSALS:
+                    update_status(
+                        ref,
+                        "review-stuck",
+                        refusals=new_refusals,
+                        refusals_head=pr.head_sha,
+                        notes=(
+                            f"The implementer declined to act {new_refusals} "
+                            f"time(s) and the findings still stand. "
+                            f"review_attempts was never charged — the proposal "
+                            f"is not at fault; a human must reconcile the "
+                            f"review with the operator decision. Last reason: "
+                            f"{reason}"
+                        )[:MAX_NOTES_CHARS],
+                    )
+                    return ShepherdResult(
+                        ref=ref,
+                        decision="review-stuck",
+                        notes=f"repeated refusal; proposal not at fault ({reason})",
+                    )
+                update_status(
+                    ref,
+                    ref.status,
+                    refusals=new_refusals,
+                    refusals_head=pr.head_sha,
+                    notes=note,
+                )
+                return ShepherdResult(ref=ref, decision="wait", notes=note)
             if e.kind == "harness":
                 # The implementer never got its attempt — our own orchestration
                 # dropped the work (mctl-agents#366). review_attempts is NOT
@@ -2035,6 +2205,8 @@ def process_one(
             # A successful follow-up proves the handoff works again — the
             # harness cap counts CONSECUTIVE losses, not lifetime ones.
             harness_failures=None,
+            refusals=None,
+            refusals_head=None,
         )
         update_status(ref, "implemented")
         return ShepherdResult(ref=ref, decision="address-review")
@@ -2070,6 +2242,8 @@ def process_one(
             merge_commit=merge_commit,
             review_attempts=None,
             harness_failures=None,
+            refusals=None,
+            refusals_head=None,
             merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="merge")
@@ -2358,6 +2532,8 @@ def reconcile_one(
             merge_commit=pr.merge_commit,
             review_attempts=None,
             harness_failures=None,
+            refusals=None,
+            refusals_head=None,
             failure=None,
             merge_owner=None,
         )
@@ -2372,6 +2548,8 @@ def reconcile_one(
             notes=pr.close_comment_or_default or "PR was closed without merging.",
             review_attempts=None,
             harness_failures=None,
+            refusals=None,
+            refusals_head=None,
             failure=None,
             merge_owner=None,
         )
@@ -2455,11 +2633,16 @@ def reconcile_one(
         repair_fields["attempt"] = _finished_attempt(ref)
         if ref.status == "review-stuck":
             repair_fields["review_attempts"] = None
-            # Both counters, or the un-stick hands back a proposal with no
+            # EVERY counter, or the un-stick hands back a proposal with no
             # budget: a proposal driven to review-stuck by repeated harness
             # failures would come back at harness_failures == MAX and re-trip
-            # the cap on the very next one. Caught by the #366 sweep.
+            # the cap on the very next one. Caught by the #366 sweep. The same
+            # argument applies to `refusals` (mctl-agents#360) — un-stuck on
+            # one axis only is un-stuck in name only. Any future counter that
+            # can flip a proposal to review-stuck belongs here too.
             repair_fields["harness_failures"] = None
+            repair_fields["refusals"] = None
+            repair_fields["refusals_head"] = None
     changed = _update_status_if_changed(
         ref,
         target_status,
