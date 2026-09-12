@@ -4565,3 +4565,62 @@ def test_an_undated_finding_is_kept_not_silently_dropped() -> None:
 
     assert review.fresh_findings_p1_p2(at=pr.head_sha, since=pr.head_pushed_at) == [undated]
     assert decide(pr, review)[0] == "address-review"
+
+
+def test_a_force_push_of_the_same_sha_resets_the_verdict_too() -> None:
+    """All four verdict sources must reset on a push, or the gate is bypassable.
+
+    Force-pushing the SAME sha moves `head_pushed_at` without moving
+    `head_sha`. With only the findings time-filtered, a second reviewer's P1 on
+    that identical code is dropped as "stale" while the primary reviewer's
+    APPROVAL of it survives — and the PR merges straight past the block. Found
+    by agy on this PR; the asymmetry was mine.
+    """
+    # Head pushed at 12:00; both the approval and the connector's P1 predate it.
+    pr = make_pr(checks_green=True, head_pushed_at="2026-04-29T12:00:00Z")
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "state": "APPROVED",
+        "body": "",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    review_comments = [{
+        "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+        "commit_id": HEAD_SHA,
+        "path": "src/app.py",
+        "line": 7,
+        "body": "![P1 Badge] Command injection here.",
+        "created_at": "2026-04-29T11:30:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    # The finding is dropped as stale — that part is intended.
+    assert review.fresh_findings_p1_p2(at=pr.head_sha, since=pr.head_pushed_at) == []
+    # So the approval MUST be dropped with it. Otherwise this merges.
+    assert review.head_verdict is None
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_an_unknown_push_time_does_not_wedge_the_verdict() -> None:
+    """No push time means no filter, not no verdict — the same degradation the
+    findings filter makes, for the same reason."""
+    pr = make_pr(checks_green=True, head_pushed_at=None)
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "state": "APPROVED",
+        "body": "",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json", side_effect=_route_gh(pr, reviews=reviews),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.head_verdict == "APPROVED"
+    assert decide(pr, review)[0] == "merge"

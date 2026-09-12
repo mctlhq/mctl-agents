@@ -1395,7 +1395,22 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             # not keep gating. Newest wins.
             state = (r.get("state") or "").upper()
             submitted_at = r.get("submitted_at") or ""
-            if state in VERDICT_STATES and submitted_at >= head_verdict_at:
+            # Time-filtered like the findings and like the two synthesized
+            # verdicts below -- all four sources must reset together on a push,
+            # or the asymmetry is exploitable. A force-push of the SAME sha
+            # moves head_pushed_at without moving head_sha, which would drop a
+            # second reviewer's finding as "stale" while keeping the primary
+            # reviewer's approval of that identical code, and the PR would merge
+            # straight past the block. A push invalidates prior review state; it
+            # must do so for every kind of prior review state.
+            #
+            # head_pushed_at unknown means no filter rather than no verdict --
+            # otherwise an unparseable push time wedges the PR forever.
+            fresh_enough = (
+                pr.head_pushed_at is None
+                or _iso_gt(submitted_at, pr.head_pushed_at)
+            )
+            if state in VERDICT_STATES and fresh_enough and submitted_at >= head_verdict_at:
                 head_verdict = state
                 head_verdict_at = submitted_at
         # Top-level review body can carry findings too.
