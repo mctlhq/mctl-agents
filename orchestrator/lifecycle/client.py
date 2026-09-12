@@ -6,10 +6,11 @@ Two transports, because there are two callers with different constraints:
   implementer, which are ordinary CLI processes inside an Argo pod. It reuses
   the same https pin and no-redirect opener ``run_shepherd`` already applies
   to its dev-loop probe.
-- ``AsyncOwnershipClient`` is httpx, for Temporal ACTIVITIES. It must never be
-  called from workflow code: network I/O inside ``@workflow.defn`` breaks
-  determinism and replay, which is the property this whole contract depends on
-  (ADR-010 §9).
+The Temporal side does NOT use this module. Activities talk to the same
+endpoints over httpx in ``orchestrator/temporal/activities/lifecycle.py``,
+because an activity is async and this client is not — and workflow code must
+never call either one: network I/O inside ``@workflow.defn`` breaks determinism
+and replay, which is the property this whole contract depends on (ADR-010 §9).
 
 A denial is data, not an exception. ``acquire`` returning "someone else owns
 this" is the system working, so it comes back as an ``OwnershipAnswer`` rather
@@ -27,6 +28,8 @@ from typing import Any
 from orchestrator.lifecycle.contract import (
     OWNED_BY_ME,
     OWNED_BY_OTHER,
+    STATE_ACTIVE,
+    STATE_HANDING_OFF,
     UNKNOWN,
     UNOWNED,
     EntityRef,
@@ -36,6 +39,16 @@ from orchestrator.lifecycle.contract import (
 )
 
 DEFAULT_TIMEOUT_S = 10
+
+# Ids per batch request.
+#
+# The URL carries one `id=` parameter per entity, so an unbounded sweep builds
+# an unbounded query string and eventually earns a 414 or 431 — at which point
+# EVERY id in that sweep turns UNKNOWN and the whole pass halts, in a way
+# indistinguishable from the store being down. Chunking keeps one oversized
+# sweep from looking like an outage. 100 ids is roughly 4 KB of query string
+# against the server's own 500-id cap.
+BATCH_CHUNK_SIZE = 100
 
 # When true, an unreachable store blocks mutating steps instead of letting the
 # old mechanism decide. Documented break-glass: set false to restore
@@ -105,12 +118,16 @@ class OwnershipClient:
             with self._opener.open(req, timeout=self._timeout) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
-            body = exc.read()
+            # exc.read() is a SECOND network read, on a connection that has
+            # already produced an error status. It can time out or reset, and
+            # that exception would escape this handler entirely — the adjacent
+            # `except Exception` is a sibling, not a wrapper. A client whose
+            # contract is "uncertainty is a value" must not raise here.
             try:
-                parsed = json.loads(body or b"{}")
-            except ValueError:
-                parsed = {}
-            return _HTTPResult(status=exc.code, payload=parsed)
+                parsed_any = json.loads(exc.read() or b"{}")
+            except Exception:  # noqa: BLE001 — a failed error-body read is still just an error
+                parsed_any = {}
+            return _HTTPResult(status=exc.code, payload=parsed_any)
         except Exception as exc:
             raise OwnershipUnavailable(str(exc)) from exc
         try:
@@ -145,6 +162,14 @@ class OwnershipClient:
         """
         if not ids:
             return {}
+        out: dict[str, OwnershipAnswer] = {}
+        for chunk in _chunks(ids, BATCH_CHUNK_SIZE):
+            out.update(self._get_chunk(kind, phase, chunk, asking))
+        return out
+
+    def _get_chunk(
+        self, kind: str, phase: str, ids: list[str], asking: Owner | None
+    ) -> dict[str, OwnershipAnswer]:
         query = f"/api/v1/lifecycle/ownership/batch?kind={_q(kind)}&phase={_q(phase)}"
         query += "".join(f"&id={_q(i)}" for i in ids)
         try:
@@ -154,14 +179,25 @@ class OwnershipClient:
         if res.status != 200:
             reason = _error_of(res)
             return {i: OwnershipAnswer(verdict=UNKNOWN, reason=reason) for i in ids}
-        found = res.payload.get("ownership") or {}
+        raw_found = res.payload.get("ownership")
+        if not isinstance(raw_found, dict):
+            # A 200 without the envelope this endpoint documents is a surprise.
+            # Reading it as "no records" would report every id UNOWNED, which
+            # is the one wrong answer that licenses action.
+            return {
+                i: OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised batch payload")
+                for i in ids
+            }
         out: dict[str, OwnershipAnswer] = {}
         for i in ids:
-            raw = found.get(i)
+            raw = raw_found.get(i)
             if raw is None:
                 out[i] = OwnershipAnswer(verdict=UNOWNED)
                 continue
             own = Ownership.from_payload(raw)
+            if own is None:
+                out[i] = OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised record")
+                continue
             out[i] = OwnershipAnswer(verdict=_verdict_for(own, asking), ownership=own)
         return out
 
@@ -245,6 +281,10 @@ class _HTTPResult:
         self.payload = payload if isinstance(payload, dict) else {}
 
 
+def _chunks(items: list[str], size: int) -> list[list[str]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
 def _q(value: str) -> str:
     from urllib.parse import quote
 
@@ -255,7 +295,24 @@ def _error_of(res: _HTTPResult) -> str:
     return str(res.payload.get("error") or f"HTTP {res.status}")
 
 
+# States in which the record still holds the entity. Anything else means the
+# previous owner let go, and the entity is free.
+_HOLDING_STATES = frozenset({STATE_ACTIVE, STATE_HANDING_OFF})
+
+
 def _verdict_for(own: Ownership, asking: Owner | None) -> str:
+    """Turn a record into an answer.
+
+    ``state`` is load-bearing and was missing from the first version of this
+    function. A released or terminal row still names an owner, so ignoring the
+    state answered OWNED_BY_OTHER for an entity that had been explicitly handed
+    back — and since UNKNOWN and OWNED_BY_OTHER both set ``blocks_others``, the
+    next actor would have stood down forever on a PR nobody owned. That is the
+    zero-owner gap this package exists to close, reintroduced from the other
+    side.
+    """
+    if own.state and own.state not in _HOLDING_STATES:
+        return UNOWNED
     if asking is not None and own.owner == asking and own.healthy:
         return OWNED_BY_ME
     return OWNED_BY_OTHER
@@ -263,7 +320,13 @@ def _verdict_for(own: Ownership, asking: Owner | None) -> str:
 
 def _answer(res: _HTTPResult, asking: Owner | None) -> OwnershipAnswer:
     if res.status == 200:
+        # A 200 whose body is not an ownership record is a surprise, not an
+        # answer. Parsing it into an all-empty record would produce a confident
+        # OWNED_BY_OTHER with no reason — a wrong answer stated as firmly as a
+        # right one.
         own = Ownership.from_payload(res.payload)
+        if own is None:
+            return OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised 200 payload")
         return OwnershipAnswer(verdict=_verdict_for(own, asking), ownership=own)
     if res.status == 404:
         return OwnershipAnswer(verdict=UNOWNED, reason="no record")

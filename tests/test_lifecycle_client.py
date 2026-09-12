@@ -209,3 +209,88 @@ def test_ownership_required_break_glass(monkeypatch: pytest.MonkeyPatch) -> None
     # direction, not the spelled one.
     monkeypatch.setenv("LIFECYCLE_OWNERSHIP_REQUIRED", "maybe")
     assert lifecycle_client.ownership_required() is True
+
+
+def test_released_record_is_unowned_not_owned_by_other(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`state` is load-bearing, and the first version of the client ignored it.
+
+    A released or terminal row still NAMES an owner. Reading it as
+    `owned-by-other` blocks the next actor — and since both that verdict and
+    `unknown` set `blocks_others`, it blocks them forever on a PR nobody owns.
+    That is the zero-owner gap this package exists to close, reintroduced from
+    the other side.
+    """
+    for state in ("released", "terminal"):
+        payload = _owned_payload(OTHER)
+        payload["state"] = state
+        payload["healthy"] = False
+        answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
+        assert answer.verdict == UNOWNED, state
+        assert answer.blocks_others is False, state
+
+
+def test_handing_off_record_still_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Handing off is not unowned: something still holds it, and a third actor
+    must not walk in mid-handoff."""
+    payload = _owned_payload(OTHER)
+    payload["state"] = "handing-off"
+    answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
+    assert answer.verdict == OWNED_BY_OTHER
+    assert answer.blocks_others is True
+
+
+def test_malformed_200_is_unknown_not_a_confident_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 200 whose body is not a record must not parse into an all-empty one.
+
+    An empty record carries an empty owner and `healthy=False`, which reads as
+    a confident "somebody else owns this" — a wrong answer stated with the same
+    confidence as a right one.
+    """
+    for payload in ({}, {"unexpected": "envelope"}, {"entity": "not-a-dict", "owner": ["x"]}):
+        answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
+        assert answer.verdict == UNKNOWN, payload
+        assert answer.may_mutate is False
+
+
+def test_error_body_read_failure_does_not_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`HTTPError.read()` is a second network read on an already-failed
+    connection, and it can time out. That exception would escape the handler —
+    the adjacent `except Exception` is a sibling, not a wrapper — and crash a
+    caller whose contract is that uncertainty is a value."""
+
+    class _ExplodingHTTPError(urllib.error.HTTPError):
+        def read(self, *args: Any, **kwargs: Any) -> bytes:
+            raise TimeoutError("connection reset while reading the error body")
+
+    def _raise(req: Any) -> Any:
+        raise _ExplodingHTTPError(req.full_url, 503, "err", {}, None)
+
+    answer = _client(monkeypatch, _raise).get(ENTITY, PHASE, asking=ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
+
+
+def test_batch_is_chunked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One `id=` per entity means an unbounded sweep builds an unbounded query
+    string and eventually earns a 414 — at which point every id turns UNKNOWN
+    and the whole pass halts, indistinguishable from an outage."""
+    seen: list[int] = []
+
+    def _handler(req: Any) -> Any:
+        seen.append(req.full_url.count("&id="))
+        return _FakeResponse(json.dumps({"ownership": {}, "count": 0}).encode())
+
+    ids = [f"mctlhq/repo#{i}" for i in range(250)]
+    out = _client(monkeypatch, _handler).get_many(ENTITY.kind, PHASE, ids, asking=ME)
+    assert len(out) == 250
+    assert len(seen) == 3, f"expected 3 chunks of <=100, got {seen}"
+    assert max(seen) <= lifecycle_client.BATCH_CHUNK_SIZE
+
+
+def test_batch_unrecognised_payload_is_unknown_not_unowned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reading a surprise 200 as "no records" would report every id UNOWNED,
+    which is the one wrong answer that licenses action."""
+    out = _client(monkeypatch, _ok({"totally": "different"})).get_many(
+        ENTITY.kind, PHASE, ["mctlhq/a#1", "mctlhq/b#2"], asking=ME
+    )
+    assert all(a.verdict == UNKNOWN for a in out.values())

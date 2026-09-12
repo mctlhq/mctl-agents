@@ -12,6 +12,8 @@ This package is a client and a policy resolver. It owns no state.
 from orchestrator.lifecycle.contract import (  # noqa: F401
     KIND_DEVLOOP_PROPOSAL,
     KIND_PULL_REQUEST,
+    OWNED_BY_ME,
+    OWNED_BY_OTHER,
     OWNER_DEVLOOP_WORKFLOW,
     OWNER_HUMAN_CODEOWNER,
     OWNER_PR_STEWARD,
@@ -23,6 +25,8 @@ from orchestrator.lifecycle.contract import (  # noqa: F401
     STATE_HANDING_OFF,
     STATE_RELEASED,
     STATE_TERMINAL,
+    UNKNOWN,
+    UNOWNED,
     EntityRef,
     Owner,
     Ownership,

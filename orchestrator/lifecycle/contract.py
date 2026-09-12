@@ -92,21 +92,47 @@ class Ownership:
     healthy: bool = False
 
     @staticmethod
-    def from_payload(data: dict[str, Any]) -> Ownership:
-        """Build from an mctl-api response, tolerating unknown keys.
+    def from_payload(data: dict[str, Any]) -> Ownership | None:
+        """Build from an mctl-api response, or return None if it is not one.
 
-        Unknown keys are IGNORED rather than rejected: mctl-api may add a field
-        before this repo's image is rebuilt, and a client that hard-failed on
-        that would turn a routine API deploy into an ownership outage — and an
-        ownership outage now fails mutations closed.
+        Two rules, and both exist because this module's whole contract is that
+        uncertainty is a VALUE and never an exception.
+
+        Unknown keys are IGNORED: mctl-api may add a field before this repo's
+        image is rebuilt, and a client that hard-failed on that would turn a
+        routine API deploy into an ownership outage — which now fails mutations
+        closed.
+
+        A MALFORMED payload returns None rather than raising or, worse,
+        parsing into an all-empty record. An empty record would carry
+        ``owner=Owner("","")`` and ``healthy=False``, which reads downstream as
+        a confident "somebody else owns this" — a wrong answer stated with the
+        same confidence as a right one. None becomes UNKNOWN at the call site.
         """
-        ent = data.get("entity") or {}
-        own = data.get("owner") or {}
+        if not isinstance(data, dict):
+            return None
+
+        def _mapping(raw: Any) -> dict[str, Any]:
+            return raw if isinstance(raw, dict) else {}
 
         def _owner(raw: Any) -> Owner | None:
             if not isinstance(raw, dict):
                 return None
             return Owner(type=str(raw.get("type") or ""), id=str(raw.get("id") or ""))
+
+        def _int(raw: Any) -> int:
+            try:
+                return int(raw or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        ent = _mapping(data.get("entity"))
+        own = _mapping(data.get("owner"))
+        # A record with no phase and no owner type is not a record. Every real
+        # response carries both, so this is the cheapest way to tell an
+        # ownership payload from an error envelope that happened to be 200.
+        if not data.get("phase") or not own.get("type"):
+            return None
 
         return Ownership(
             entity=EntityRef(
@@ -116,7 +142,7 @@ class Ownership:
             ),
             phase=str(data.get("phase") or ""),
             owner=Owner(type=str(own.get("type") or ""), id=str(own.get("id") or "")),
-            epoch=int(data.get("epoch") or 0),
+            epoch=_int(data.get("epoch")),
             state=str(data.get("state") or ""),
             proposal_ref=str(data.get("proposal_ref") or ""),
             policy_ref=str(data.get("policy_ref") or ""),
