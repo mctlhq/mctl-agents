@@ -149,7 +149,7 @@ different things than this needs.
 
 | Forbidden | What the ownership store does |
 |---|---|
-| a second **scheduler** (epic invariant 9) | no timer, no queue, no `due_at`, no `next_action`, no background sweep. It never calls GitHub, never submits Argo, never signals Temporal. `stale` is **derived on read** by the caller's existing tick (§4), never materialised — materialising it is precisely what would make it a scheduler. |
+| a second **scheduler** (epic invariant 9) | no timer, no queue, no `due_at`, no `next_action`, no background sweep. It never calls GitHub, never submits Argo, never signals Temporal. `dead` and `stuck` are **derived on read** by the caller's existing tick (§4), never materialised — materialising either is precisely what would make it a scheduler. |
 | a competing **lifecycle database** (`mctl-api#293`) | stores no proposal status, no PR state, no review finding, no merge decision. It stores one fact that exists nowhere today: *actor X holds responsibility for (entity, phase) at epoch N*. It duplicates nothing, so there is nothing to diverge from. |
 
 This shape is already in production: `agent_executions`
@@ -519,7 +519,8 @@ Per-mechanism migration:
 
 Shipped with the store rather than retrofitted: `owner_acquire`,
 `ownership_conflict`, `store_unknown`, `divergence`, `claim_fenced`, `handoff`,
-`stale_owner`, `orphan_adopted`. The soak gate is read from `store_unknown` and
+`stale_owner` (counting `dead`, since that is the one that licenses a takeover),
+`orphan_adopted`. The soak gate is read from `store_unknown` and
 `divergence`; a rollout whose safety criterion has no metric behind it is a
 rollout judged by anecdote.
 
