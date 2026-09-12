@@ -65,3 +65,14 @@ def test_policy_ref_records_why(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-design"}))
     monkeypatch.setattr(run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset())
     assert policy.policy_ref_for("mctl-design") == "service-mode:mctl-design=skip"
+
+
+def test_unknown_merge_owner_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A third value added to _merge_owner_for must not fold silently into
+    pr-steward: that would attribute merge authority to an actor the other
+    repository never named, which is the class of mistake #344 is about."""
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"mctl-design"}))
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset())
+    monkeypatch.setattr(run_shepherd, "_merge_owner_for", lambda _s: "some-new-actor")
+    with pytest.raises(ValueError, match="some-new-actor"):
+        policy.merge_authority_for("mctl-design")

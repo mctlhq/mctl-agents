@@ -138,6 +138,15 @@ class Ownership:
         # change rather than a malformed body.
         if not data.get("phase") or not own.get("type") or not data.get("state"):
             return None
+        if "healthy" not in data:
+            # Required as hard as `state`, and for the same reason: the verdict
+            # derives from it. A write response that omitted the computed
+            # `healthy` would default it to False, and the acquirer would answer
+            # OWNED_BY_OTHER for the record it had just created — may_mutate
+            # False for the owner, blocks_others True for everyone else, and an
+            # empty reason. Tests would stay green, because every fixture sets
+            # it.
+            return None
 
         return Ownership(
             entity=EntityRef(
@@ -176,6 +185,10 @@ OWNED_BY_OTHER = "owned-by-other"
 OWNED_BY_ME = "owned-by-me"
 UNOWNED = "unowned"
 UNKNOWN = "unknown"
+# A mutating call that succeeded and returned no record. Distinct from UNKNOWN,
+# which means the call may not have happened at all: a caller gating local state
+# on a successful release must be able to tell the two apart.
+WROTE_NO_RECORD = "wrote-no-record"
 
 
 @dataclass(frozen=True)
@@ -191,6 +204,15 @@ class OwnershipAnswer:
     verdict: str = UNKNOWN
     ownership: Ownership | None = None
     reason: str = ""
+
+    @property
+    def wrote(self) -> bool:
+        """Whether a mutating call is known to have succeeded.
+
+        OWNED_BY_ME covers the usual case, where the server returned the record
+        it wrote. WROTE_NO_RECORD covers a 2xx with no body.
+        """
+        return self.verdict in (OWNED_BY_ME, WROTE_NO_RECORD)
 
     @property
     def may_mutate(self) -> bool:

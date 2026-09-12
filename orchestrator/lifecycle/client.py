@@ -34,6 +34,7 @@ from orchestrator.lifecycle.contract import (
     STATE_TERMINAL,
     UNKNOWN,
     UNOWNED,
+    WROTE_NO_RECORD,
     EntityRef,
     Owner,
     Ownership,
@@ -133,11 +134,11 @@ class OwnershipClient:
                 parsed_any = json.loads(exc.read() or b"{}")
             except Exception:  # noqa: BLE001 — a failed error-body read is still just an error
                 parsed_any = {}
-            return _HTTPResult(status=exc.code, payload=parsed_any)
+            return _HTTPResult(status=exc.code, payload=parsed_any, status_path=path)
         except Exception as exc:
             raise OwnershipUnavailable(str(exc)) from exc
         try:
-            return _HTTPResult(status=status, payload=json.loads(body or b"{}"))
+            return _HTTPResult(status=status, payload=json.loads(body or b"{}"), status_path=path)
         except ValueError as exc:
             raise OwnershipUnavailable(f"malformed response: {exc}") from exc
 
@@ -151,7 +152,7 @@ class OwnershipClient:
             )
         except OwnershipUnavailable as exc:
             return OwnershipAnswer(verdict=UNKNOWN, reason=str(exc))
-        return _answer(res, asking)
+        return _answer(res, asking, is_read=True)
 
     def get_many(
         self, kind: str, phase: str, ids: list[str], asking: Owner | None = None
@@ -229,7 +230,9 @@ class OwnershipClient:
             temporal_workflow_id=temporal_workflow_id,
         )
 
-    def progress(self, entity: EntityRef, phase: str, owner: Owner, epoch: int, evidence: str) -> OwnershipAnswer:
+    def progress(
+        self, entity: EntityRef, phase: str, owner: Owner, epoch: int, evidence: str
+    ) -> OwnershipAnswer:
         """Record that something was EFFECTED.
 
         Callers must not call this for a poll that observed nothing. Liveness
@@ -237,7 +240,15 @@ class OwnershipClient:
         says the work moved, and a heartbeat writing it would let an owner prove
         usefulness forever while achieving nothing.
         """
-        return self._write("/api/v1/lifecycle/ownership/progress", entity, phase, owner, epoch=epoch, evidence=evidence)
+        if not evidence:
+            # _write filters empty strings out of the payload, so an empty
+            # evidence would be dropped and the server would answer 400 with a
+            # message the caller never sees. Fail here, where it is legible.
+            raise ValueError("progress requires evidence: say what changed")
+        return self._write(
+            "/api/v1/lifecycle/ownership/progress", entity, phase, owner,
+            epoch=epoch, evidence=evidence,
+        )
 
     def handoff_start(
         self, entity: EntityRef, phase: str, owner: Owner, epoch: int, to: Owner, reason: str = ""
@@ -280,11 +291,14 @@ class OwnershipClient:
 
 
 class _HTTPResult:
-    __slots__ = ("payload", "status")
+    __slots__ = ("payload", "status", "status_path")
 
-    def __init__(self, status: int, payload: Any) -> None:
+    def __init__(self, status: int, payload: Any, status_path: str = "") -> None:
         self.status = status
         self.payload = payload if isinstance(payload, dict) else {}
+        # The path is carried so a 404 can say WHICH endpoint produced it — the
+        # difference between "no such row" and "no such route".
+        self.status_path = status_path
 
 
 def _chunks(items: list[str], size: int) -> list[list[str]]:
@@ -340,7 +354,7 @@ def _verdict_for(own: Ownership, asking: Owner | None) -> str:
     return OWNED_BY_OTHER
 
 
-def _answer(res: _HTTPResult, asking: Owner | None) -> OwnershipAnswer:
+def _answer(res: _HTTPResult, asking: Owner | None, *, is_read: bool = False) -> OwnershipAnswer:
     if 200 <= res.status < 300:
         # A 200 whose body is not an ownership record is a surprise, not an
         # answer. Parsing it into an all-empty record would produce a confident
@@ -348,16 +362,29 @@ def _answer(res: _HTTPResult, asking: Owner | None) -> OwnershipAnswer:
         # right one.
         own = Ownership.from_payload(res.payload)
         if own is None:
-            # The status is in the message because it is not always 200: a
-            # mutating call that answers 204 carries no record either, and
-            # reporting that as a malformed 200 would send a reader looking for
-            # a bug that is not there.
+            if not is_read and not res.payload:
+                # A body-less 2xx on a mutating call means the write SUCCEEDED
+                # and told us nothing more. Reporting UNKNOWN would make it
+                # indistinguishable from a 503, and a caller gating its local
+                # state on the result could never record a successful release.
+                return OwnershipAnswer(
+                    verdict=WROTE_NO_RECORD, reason=f"{res.status} with no body"
+                )
             return OwnershipAnswer(
                 verdict=UNKNOWN, reason=f"no ownership record in a {res.status} response"
             )
-        return OwnershipAnswer(verdict=_verdict_for(own, asking), ownership=own)
-    if res.status == 404:
+        verdict = _verdict_for(own, asking)
+        reason = "" if verdict != UNKNOWN else f"unrecognised ownership state {own.state!r}"
+        return OwnershipAnswer(verdict=verdict, ownership=own, reason=reason)
+    if res.status == 404 and is_read:
         return OwnershipAnswer(verdict=UNOWNED, reason="no record")
+    if res.status == 404:
+        # On a WRITE a 404 is not "no such row". POST /acquire has no
+        # not-found semantics, so a 404 there is a missing route, a wrong base
+        # path, or an ingress answering for something else — and answering
+        # UNOWNED would set blocks_others False for EVERY entity asked. That is
+        # fail-open, in the one place in this module that can produce it.
+        return OwnershipAnswer(verdict=UNKNOWN, reason=f"404 from {res.status_path or 'a write'}")
     if res.status == 409:
         raw = res.payload.get("ownership")
         own = Ownership.from_payload(raw) if isinstance(raw, dict) else None

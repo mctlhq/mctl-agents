@@ -21,6 +21,7 @@ from orchestrator.lifecycle.contract import (
     OWNED_BY_OTHER,
     UNKNOWN,
     UNOWNED,
+    WROTE_NO_RECORD,
     EntityRef,
     Owner,
 )
@@ -348,14 +349,121 @@ def test_owner_liveness_is_visible_even_when_it_is_not_actionable(
     assert answer.ownership.healthy is False
 
 
-def test_no_content_success_is_not_read_as_an_unrecognised_body(
+def test_body_less_2xx_write_is_a_success_not_an_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The status is read from the response, not assumed to be 200, so a 2xx
-    with no body is a success rather than a confusing UNKNOWN."""
+    """A mutating call that answers 2xx with no body SUCCEEDED.
+
+    Reporting UNKNOWN there made it indistinguishable from a 503, so a caller
+    gating its local state on the result could never record a successful
+    release — and an earlier version of this test asserted UNKNOWN while its
+    own docstring claimed the opposite.
+    """
     handler = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
     answer = _client(monkeypatch, handler).release(ENTITY, PHASE, ME, epoch=1, reason="done")
-    # An empty 204 body carries no record, so there is nothing to classify —
-    # but it must not be reported as a malformed 200.
-    assert answer.verdict == UNKNOWN
+    assert answer.verdict == WROTE_NO_RECORD
+    assert answer.wrote is True
+    # It is still not a claim: nothing was learned about who owns the entity.
+    assert answer.may_mutate is False
     assert "204" in answer.reason
+
+
+def test_a_503_is_not_a_successful_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the distinction above."""
+    c = _client(monkeypatch, _http_error(503, {"error": "store down"}))
+    answer = c.release(ENTITY, PHASE, ME, epoch=1, reason="done")
+    assert answer.verdict == UNKNOWN
+    assert answer.wrote is False
+
+
+def test_404_on_a_write_is_unknown_not_unowned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POST /acquire has no not-found semantics.
+
+    A 404 there is a missing route, a wrong base path, or an ingress answering
+    for something else — and answering UNOWNED would set blocks_others False
+    for EVERY entity asked. That is fail-open, in the one place in the module
+    that can produce it.
+    """
+    c = _client(monkeypatch, _http_error(404, {"error": "not found"}))
+    answer = c.acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.blocks_others is True
+    assert answer.may_mutate is False
+
+
+def test_404_on_a_read_is_still_unowned(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On a GET it genuinely means "no record", which is the one case where
+    UNOWNED is the right answer."""
+    c = _client(monkeypatch, _http_error(404, {"error": "no ownership record"}))
+    answer = c.get(ENTITY, PHASE, asking=ME)
+    assert answer.verdict == UNOWNED
+    assert answer.blocks_others is False
+
+
+def test_handoff_and_terminal_send_the_fields_the_server_needs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These three writers had no test at all.
+
+    The assertion that matters is the payload: an empty-string filter in
+    _write silently drops a field the server requires, and the failure would
+    surface as a 400 in production rather than here.
+    """
+    sent: list[dict[str, Any]] = []
+
+    def _handler(req: Any) -> Any:
+        sent.append(json.loads(req.data.decode()))
+        return _FakeResponse(json.dumps(_owned_payload(ME)).encode())
+
+    c = _client(monkeypatch, _handler)
+    c.handoff_start(ENTITY, PHASE, ME, epoch=2, to=OTHER, reason="exiting")
+    c.handoff_complete(ENTITY, PHASE, OTHER)
+    c.terminal(ENTITY, PHASE, ME, epoch=2, reason="merged")
+
+    start, complete, terminal = sent
+    assert start["to_owner_type"] == OTHER.type
+    assert start["to_owner_id"] == OTHER.id
+    assert start["epoch"] == 2
+    # The INCOMING owner names itself on complete; the server matches it
+    # against the recorded handoff target.
+    assert complete["owner_type"] == OTHER.type
+    assert complete["owner_id"] == OTHER.id
+    assert terminal["reason"] == "merged"
+
+
+def test_progress_without_evidence_is_not_silently_stripped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_write filters empty strings, which would drop `evidence` — a field the
+    server requires and rejects with a 400. Better to fail here, where the
+    caller can see why, than to send a request that cannot succeed."""
+    with pytest.raises(ValueError, match="evidence"):
+        _client(monkeypatch, _ok(_owned_payload(ME))).progress(
+            ENTITY, PHASE, ME, epoch=1, evidence=""
+        )
+
+
+def test_missing_healthy_is_not_a_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`healthy` is required as hard as `state`, because the verdict derives
+    from it just as directly.
+
+    Defaulting it to False made the acquirer answer OWNED_BY_OTHER for the
+    record it had just created: may_mutate False for the actual owner,
+    blocks_others True for everyone else, and an empty reason. Every fixture
+    sets it, so the tests stayed green.
+    """
+    payload = _owned_payload(ME)
+    del payload["healthy"]
+    answer = _client(monkeypatch, _ok(payload)).acquire(ENTITY, PHASE, ME)
+    assert answer.verdict == UNKNOWN
+    assert answer.may_mutate is False
+
+
+def test_unrecognised_state_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It was the only verdict reaching a caller with an empty reason, which
+    is the one case where the caller most needs to know what happened."""
+    payload = _owned_payload(OTHER)
+    payload["state"] = "quarantined"
+    answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
+    assert answer.verdict == UNKNOWN
+    assert "quarantined" in answer.reason

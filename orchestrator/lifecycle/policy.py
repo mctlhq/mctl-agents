@@ -68,7 +68,17 @@ def merge_authority_for(service: str) -> str:
     if run_shepherd._service_mode(service) == run_shepherd.FULL:
         return OWNER_SHEPHERD
     owner = run_shepherd._merge_owner_for(service)
-    return OWNER_HUMAN_CODEOWNER if owner == "human-codeowner" else OWNER_PR_STEWARD
+    known = {
+        "human-codeowner": OWNER_HUMAN_CODEOWNER,
+        "pr-steward": OWNER_PR_STEWARD,
+    }
+    if owner not in known:
+        # A third value added to _merge_owner_for must not be silently folded
+        # into pr-steward: that would attribute merge authority to an actor the
+        # other repository never named, which is the class of mistake #344 is
+        # about. Fail loudly instead — this is a closed vocabulary.
+        raise ValueError(f"unknown merge owner {owner!r} for service {service!r}")
+    return known[owner]
 
 
 def policy_ref_for(service: str) -> str:
