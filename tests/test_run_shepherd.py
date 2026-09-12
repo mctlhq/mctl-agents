@@ -167,7 +167,7 @@ def read_status(ref: ProposalRef) -> dict:
 def test_decide_merge() -> None:
     """T1: clean review + green CI -> merge."""
     pr = make_pr(merged=False, checks_green=True, merge_state_status="CLEAN")
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     # Pin now well after HEAD_PUSHED_AT so the settling window does not apply;
     # makes the test independent of wall-clock time and the fixture's date.
     now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=UTC)
@@ -194,7 +194,7 @@ def test_decide_merge_after_settle_window() -> None:
     """
     now = datetime(2026, 4, 29, 10, 30, 0, tzinfo=UTC)
     pr = make_pr(head_pushed_at="2026-04-29T10:00:00Z")
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     assert decide(pr, review, now=now) == ("merge", None)
 
 
@@ -207,7 +207,7 @@ def test_decide_merge_future_dated_head() -> None:
     """
     now = datetime(2026, 4, 29, 10, 0, 0, tzinfo=UTC)
     pr = make_pr(head_pushed_at="2026-04-29T10:30:00Z")  # 30 min in the future
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     assert decide(pr, review, now=now) == ("merge", None)
 
 
@@ -340,7 +340,7 @@ def test_discover_force_fix_only_overrides_skip_list(tmp_path, monkeypatch) -> N
 def test_decide_defer_merge_in_fix_only() -> None:
     """T6: the clean-green-settled fixture with fix_only=True defers instead of merging."""
     pr = make_pr(merged=False, checks_green=True, merge_state_status="CLEAN")
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     now = datetime(2026, 4, 29, 11, 0, 0, tzinfo=UTC)
     assert decide(pr, review, now=now, fix_only=True) == ("defer-merge", None)
     assert decide(pr, review, now=now, fix_only=False) == ("merge", None)
@@ -369,7 +369,7 @@ def test_process_one_defer_merge_writes_merge_owner_once(tmp_path) -> None:
     ref = make_ref(tmp_path, service="mctl-telegram")
     ref.mode = run_shepherd.FIX_ONLY
     pr = make_pr(checks_green=True)
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
          patch.object(run_shepherd, "read_codex_review", return_value=review), \
@@ -405,7 +405,7 @@ def test_process_one_defer_merge_never_merge_service_owner_is_not_steward(
     ref = make_ref(tmp_path, service="mctl-academy")
     ref.mode = run_shepherd.FIX_ONLY
     pr = make_pr(checks_green=True)
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
          patch.object(run_shepherd, "read_codex_review", return_value=review), \
@@ -501,7 +501,7 @@ def test_decide_never_returns_merge_for_academy() -> None:
         make_pr(checks_green=True, merge_state_status="UNSTABLE"),
         make_pr(head_pushed_at="2026-04-29T10:00:00Z"),  # after settle window
     ]
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     for pr in mergeable_fixtures:
         # Sanity: this fixture would merge for a FULL-mode service.
         assert decide(pr, review, now=now, fix_only=False) == ("merge", None)
@@ -1351,7 +1351,7 @@ def test_decide_findings_anchored_to_head_sha() -> None:
     """
     pr = make_pr()
     stale = make_finding(severity="P1", commit_id=OLD_SHA)
-    review = CodexReview(has_responded=True, findings=[stale])
+    review = CodexReview(has_responded=True, findings=[stale], head_verdict="APPROVED")
 
     # Sanity: anchored filter drops the stale finding.
     assert review.findings_p1_p2(at=pr.head_sha) == []
@@ -1370,7 +1370,7 @@ def test_decide_merge_with_unstable_merge_state() -> None:
     PRs to leave the wait loop.
     """
     pr = make_pr(merge_state_status="UNSTABLE", checks_green=True)
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     assert decide(pr, review) == ("merge", None)
 
 
@@ -1439,7 +1439,7 @@ def test_checks_green_no_rollup_clean_merge_state(monkeypatch) -> None:
     # Unit-level: decide() merges when the snapshot reports
     # checks_green=True from a CLEAN merge state with no rollup.
     pr = make_pr(merge_state_status="CLEAN", checks_green=True)
-    review = CodexReview(has_responded=True, findings=[])
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     assert decide(pr, review) == ("merge", None)
 
     # End-to-end through _fetch_pr_snapshot: an empty rollup must yield
@@ -1595,6 +1595,10 @@ def test_connector_inline_finding_gates_merge() -> None:
     reviews = [{
         "user": {"login": run_shepherd.REVIEW_BOT},
         "commit_id": HEAD_SHA,
+        # The verdict is what gates the merge now (mctl-agents#359); a fixture
+        # that omits it is modelling a reviewer that never ruled, which is a
+        # different scenario from the one these tests mean.
+        "state": "APPROVED",
         "body": "LGTM",
         "submitted_at": "2026-04-29T11:00:00Z",
     }]
@@ -1627,6 +1631,10 @@ def test_connector_stale_commit_finding_does_not_gate() -> None:
     reviews = [{
         "user": {"login": run_shepherd.REVIEW_BOT},
         "commit_id": HEAD_SHA,
+        # The verdict is what gates the merge now (mctl-agents#359); a fixture
+        # that omits it is modelling a reviewer that never ruled, which is a
+        # different scenario from the one these tests mean.
+        "state": "APPROVED",
         "body": "LGTM",
         "submitted_at": "2026-04-29T11:00:00Z",
     }]
@@ -1677,6 +1685,10 @@ def test_connector_issue_comment_finding_time_anchored() -> None:
     reviews = [{
         "user": {"login": run_shepherd.REVIEW_BOT},
         "commit_id": HEAD_SHA,
+        # The verdict is what gates the merge now (mctl-agents#359); a fixture
+        # that omits it is modelling a reviewer that never ruled, which is a
+        # different scenario from the one these tests mean.
+        "state": "APPROVED",
         "body": "LGTM",
         "submitted_at": "2026-04-29T11:00:00Z",
     }]
@@ -1797,7 +1809,7 @@ def test_happy_path_clean_review_to_merge(tmp_path) -> None:
     review_pending = CodexReview(has_responded=False, findings=[])
 
     pr_clean = make_pr(checks_green=True)
-    review_clean = CodexReview(has_responded=True, findings=[])
+    review_clean = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
 
     # First tick: codex pending.
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr_pending), \
@@ -1843,6 +1855,7 @@ def test_loop_path_p1_then_followup_then_merge(tmp_path) -> None:
     review_t1 = CodexReview(
         has_responded=True,
         findings=[make_finding(severity="P1", commit_id=HEAD_SHA)],
+        head_verdict="CHANGES_REQUESTED",
     )
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
@@ -1890,7 +1903,7 @@ def test_loop_path_p1_then_followup_then_merge(tmp_path) -> None:
 
     # Tick 3: codex re-reviewed clean on new head -> merge.
     pr_t3 = make_pr(head_sha=new_head_sha, checks_green=True)
-    review_t3 = CodexReview(has_responded=True, findings=[])
+    review_t3 = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr_t3), \
          patch.object(run_shepherd, "read_codex_review", return_value=review_t3), \
          patch.object(run_shepherd, "read_copilot_review",
@@ -4294,3 +4307,169 @@ def test_bundle_is_cleaned_up_when_mkstemp_itself_fails(monkeypatch) -> None:
     assert created, "the bundle temp file was never created"
     for path in created:
         assert not Path(path).exists(), f"{path} leaked"
+
+
+# ---------------------------------------------------------------------------
+# Re-anchored inline comments must not gate the merge (mctl-agents#359)
+#
+# GitHub rewrites a surviving inline comment's `commit_id` to the current head
+# on every push, so the anchor cannot tell a finding written against this code
+# from one written five commits ago. `created_at` can: re-anchoring changes
+# where a comment points, never when it was written.
+# ---------------------------------------------------------------------------
+def test_a_re_anchored_finding_does_not_block_an_approved_head() -> None:
+    """The portfolio#56 repro: 14 "findings" against a head APPROVED 0 P1 0 P2.
+
+    Every one of them carried the current head's `commit_id`, because GitHub had
+    re-anchored them, so `findings_p1_p2` kept them all and `decide()` returned
+    address-review on every tick until the attempt cap flipped the proposal to
+    review-stuck. It had to be merged by hand.
+    """
+    pr = make_pr(checks_green=True)
+    stale = [
+        make_finding(
+            severity="P2",
+            commit_id=pr.head_sha,          # re-anchored onto the current head
+            created_at="2026-04-29T08:00:00Z",  # ...but written before it existed
+        )
+        for _ in range(14)
+    ]
+    review = CodexReview(
+        has_responded=True, findings=stale, head_verdict="APPROVED",
+    )
+
+    # The anchor filter alone keeps every one of them — that is the bug.
+    assert len(review.findings_p1_p2(at=pr.head_sha)) == 14
+    # The time filter drops them all.
+    assert review.fresh_findings_p1_p2(at=pr.head_sha, since=pr.head_pushed_at) == []
+
+    decision, _ = decide(pr, review)
+    assert decision == "merge"
+
+
+def test_a_finding_raised_after_the_push_still_blocks_an_approval() -> None:
+    """#67 must survive the #359 fix: an approval is not a licence to ignore a
+    second reviewer. The connector posts a real inline P2 two minutes after
+    claude approves, and that still routes to address-review."""
+    pr = make_pr(checks_green=True)
+    fresh = make_finding(
+        severity="P2",
+        commit_id=pr.head_sha,
+        created_at="2026-04-29T10:02:00Z",   # after HEAD_PUSHED_AT
+    )
+    review = CodexReview(
+        has_responded=True, findings=[fresh], head_verdict="APPROVED",
+    )
+
+    decision, payload = decide(pr, review)
+    assert decision == "address-review"
+    assert payload == [fresh]
+
+
+def test_no_verdict_on_this_head_is_a_wait_not_a_merge() -> None:
+    """Silence is not approval. A reviewer that responded but never ruled on
+    this head leaves nothing to merge on."""
+    pr = make_pr(checks_green=True)
+    review = CodexReview(has_responded=True, findings=[], head_verdict=None)
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_changes_requested_with_nothing_fresh_left_is_a_wait() -> None:
+    """Ruled against, findings answered, verdict not yet revised — not ours to
+    merge, and nothing to hand the implementer either."""
+    pr = make_pr(checks_green=True)
+    review = CodexReview(
+        has_responded=True, findings=[], head_verdict="CHANGES_REQUESTED",
+    )
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_a_dismissed_approval_does_not_gate() -> None:
+    """A push dismisses a stale approval; a DISMISSED review is a withdrawn
+    ruling and must not be read as one."""
+    pr = make_pr(checks_green=True)
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,
+        "state": "DISMISSED",
+        "body": "LGTM",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json", side_effect=_route_gh(pr, reviews=reviews),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.head_verdict is None
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_the_newest_verdict_at_the_head_wins() -> None:
+    """Several rounds can rule on one head; the last one is the ruling."""
+    pr = make_pr(checks_green=True)
+    reviews = [
+        {
+            "user": {"login": run_shepherd.REVIEW_BOT}, "commit_id": HEAD_SHA,
+            "state": "CHANGES_REQUESTED", "body": "", "submitted_at": "2026-04-29T11:00:00Z",
+        },
+        {
+            "user": {"login": run_shepherd.REVIEW_BOT}, "commit_id": HEAD_SHA,
+            "state": "COMMENTED", "body": "", "submitted_at": "2026-04-29T11:30:00Z",
+        },
+        {
+            "user": {"login": run_shepherd.REVIEW_BOT}, "commit_id": HEAD_SHA,
+            "state": "APPROVED", "body": "", "submitted_at": "2026-04-29T12:00:00Z",
+        },
+    ]
+    with patch.object(
+        run_shepherd, "_gh_api_json", side_effect=_route_gh(pr, reviews=reviews),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.head_verdict == "APPROVED"
+
+
+def test_a_verdict_on_an_earlier_head_does_not_carry_over() -> None:
+    """An approval of previous code says nothing about the code now.
+
+    The inline comment at the head is load-bearing: without it `has_responded`
+    is False and `decide()` returns wait before reaching the verdict at all, so
+    the test would pass against an implementation with no verdict gate. It has
+    to isolate the thing it claims to pin.
+    """
+    pr = make_pr(checks_green=True)
+    reviews = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": "b" * 40,          # approved the PREVIOUS head
+        "state": "APPROVED",
+        "body": "",
+        "submitted_at": "2026-04-29T11:00:00Z",
+    }]
+    review_comments = [{
+        "user": {"login": run_shepherd.REVIEW_BOT},
+        "commit_id": HEAD_SHA,          # ...but did respond on this one
+        "path": "src/app.py",
+        "line": 7,
+        "body": "nit, not a finding",
+        "created_at": "2026-04-29T11:05:00Z",
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, reviews=reviews, review_comments=review_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert review.has_responded is True, "otherwise this test pins nothing"
+    assert review.head_verdict is None
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_an_unknown_push_time_degrades_to_the_anchor_filter() -> None:
+    """With no head_pushed_at there is nothing to compare against; keep the
+    anchored findings rather than silently dropping every one of them."""
+    pr = make_pr(checks_green=True, head_pushed_at=None)
+    f = make_finding(severity="P2", commit_id=pr.head_sha, created_at="2020-01-01T00:00:00Z")
+    review = CodexReview(has_responded=True, findings=[f], head_verdict="APPROVED")
+
+    assert review.fresh_findings_p1_p2(at=pr.head_sha, since=None) == [f]
+    assert decide(pr, review)[0] == "address-review"

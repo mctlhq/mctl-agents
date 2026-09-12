@@ -110,6 +110,12 @@ REVIEW_BOT = "claude[bot]"
 CODEX_CONNECTOR_BOT = "chatgpt-codex-connector[bot]"
 GATING_BOTS = (REVIEW_BOT, CODEX_CONNECTOR_BOT)
 
+# Review states that count as a ruling on the head. COMMENTED is a container
+# for inline notes (the bot submits several per round) and DISMISSED is a
+# verdict GitHub has withdrawn -- a push dismisses a stale approval -- so
+# neither may gate. See decide() and mctl-agents#359.
+VERDICT_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED"})
+
 # Sweeper ownership (#213 / ADR-006 §6.1): a proposal whose DevLoopWorkflow
 # is still Running drives its own review loop in-workflow; the cron sweep
 # must not double-drive it. Liveness is read through mctl-api's describe
@@ -745,20 +751,46 @@ class CodexReview:
 
     has_responded: bool
     findings: list[CodexFinding]
+    # State of the newest APPROVED/CHANGES_REQUESTED review the primary bot
+    # submitted against the CURRENT head, or None if it has not ruled on this
+    # head yet. This -- not a count of inline comments -- is what gates the
+    # merge; see decide() and mctl-agents#359.
+    head_verdict: str | None = None
 
     def findings_p1_p2(self, at: str) -> list[CodexFinding]:
-        """Return findings anchored to the given head SHA only.
+        """Return findings that belong to the given head SHA.
 
-        Drops any finding whose commit_id is set but != at. Top-level
-        issue comments without a commit_id are kept (they were already
-        time-filtered against head_pushed_at upstream in
-        read_codex_review).
+        The `commit_id` filter here is NOT sufficient on its own and never was:
+        GitHub RE-ANCHORS a surviving inline comment onto each new head, so a
+        P2 written five commits ago comes back with `commit_id` equal to the
+        current head and is indistinguishable from a fresh one (mctl-agents#359,
+        and #336 for the same mechanism seen from the other side). Observed live
+        on mctl-agents#367: a P2 from round 10, fixed two commits later, was
+        still returned anchored to the APPROVED head.
+
+        `created_at`, by contrast, is stable — re-anchoring rewrites where a
+        comment points, not when it was written — so the time filter is the one
+        that actually discriminates. It is applied in read_codex_review for
+        issue comments already; `fresh_only` extends it to the anchored ones.
         """
         out: list[CodexFinding] = []
         for f in self.findings:
             if f.commit_id is None or f.commit_id == at:
                 out.append(f)
         return out
+
+    def fresh_findings_p1_p2(self, at: str, since: str | None) -> list[CodexFinding]:
+        """`findings_p1_p2`, minus anything written before the head existed.
+
+        `since` is the head commit's push time. A finding older than that was
+        written against earlier code, whatever GitHub now says it is anchored
+        to. With `since` unknown, degrade to the anchor-only filter rather than
+        dropping everything.
+        """
+        anchored = self.findings_p1_p2(at)
+        if since is None:
+            return anchored
+        return [f for f in anchored if _iso_gt(f.created_at, since)]
 
 
 @dataclass
@@ -1330,6 +1362,9 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
     """
     has_responded = False
     findings: list[CodexFinding] = []
+    # (submitted_at, state) of the newest verdict review at the current head.
+    head_verdict: str | None = None
+    head_verdict_at: str = ""
 
     # 1. Reviews — `gh api repos/<owner>/<repo>/pulls/<n>/reviews`.
     try:
@@ -1349,6 +1384,16 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
         # best-effort and must not be waited on (see GATING_BOTS note).
         if login == REVIEW_BOT and commit_id and commit_id == pr.head_sha:
             has_responded = True
+            # A COMMENTED review is a container for inline notes, not a ruling
+            # -- this bot submits several per round. Only APPROVED and
+            # CHANGES_REQUESTED are verdicts, and DISMISSED is one that has
+            # been withdrawn (a push dismisses a stale approval), so it must
+            # not keep gating. Newest wins.
+            state = (r.get("state") or "").upper()
+            submitted_at = r.get("submitted_at") or ""
+            if state in VERDICT_STATES and submitted_at >= head_verdict_at:
+                head_verdict = state
+                head_verdict_at = submitted_at
         # Top-level review body can carry findings too.
         body = r.get("body") or ""
         sev = _extract_severity(body)
@@ -1469,7 +1514,11 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                 has_responded = True
                 break
 
-    return CodexReview(has_responded=has_responded, findings=findings)
+    return CodexReview(
+        has_responded=has_responded,
+        findings=findings,
+        head_verdict=head_verdict,
+    )
 
 
 def read_copilot_review(pr: PRSnapshot) -> CopilotReview:
@@ -1540,9 +1589,40 @@ def decide(
     if not codex_review.has_responded:
         # Codex still parsing the PR head.
         return ("wait", None)
-    findings = codex_review.findings_p1_p2(at=pr.head_sha)
+    # Two gates, and the order matters.
+    #
+    # FIRST, anything raised against THIS head still blocks, whoever raised it
+    # and whatever the primary reviewer concluded. #67 (mctl-gitops#626) is the
+    # case: claude approves clean, the connector posts a real inline P2 two
+    # minutes later. An approval is a statement about what its author read, not
+    # a licence to ignore a second reviewer.
+    #
+    # The filter that makes this safe is `created_at`, not the anchor. GitHub
+    # RE-ANCHORS surviving inline comments onto every new head, so a P2 written
+    # five commits ago comes back pointing at the current one: on portfolio#56
+    # that reported 14 "findings" against a head the same reviewer had just
+    # APPROVED with 0 P1 and 0 P2, and the shepherd burned every tick on
+    # address-review until the cap flipped it to review-stuck. It had to be
+    # merged by hand. Re-anchoring rewrites WHERE a comment points, never WHEN
+    # it was written, so the time filter is the one that discriminates.
+    # mctl-agents#359, and #336 for the same mechanism from the other side.
+    findings = codex_review.fresh_findings_p1_p2(at=pr.head_sha, since=pr.head_pushed_at)
     if findings:
         return ("address-review", findings)
+
+    # SECOND, with nothing outstanding, merge on the primary reviewer's ruling
+    # for this head rather than on the absence of comments. A verdict review is
+    # anchored to the commit it judged and is never rewritten afterwards, which
+    # is exactly the property the inline anchor lacks.
+    if codex_review.head_verdict == "CHANGES_REQUESTED":
+        # Ruled against, with nothing fresh left to quote: the findings were
+        # answered but the verdict has not been revised. Not ours to merge.
+        return ("wait", None)
+    if codex_review.head_verdict is None:
+        # Responded on this head but never ruled on it. Some reviewers only
+        # ever post findings -- the connector is one -- so this is a normal
+        # resting state, not an error.
+        return ("wait", None)
     if pr.merge_state_status not in MERGEABLE_STATES:
         # BLOCKED, BEHIND, DIRTY, UNKNOWN, DRAFT — retry next tick.
         return ("wait", None)
