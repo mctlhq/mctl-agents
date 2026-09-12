@@ -87,7 +87,20 @@ removed, `_service_mode` would resolve it to `fix-only`, because the code
 constant `NEVER_MERGE_SERVICES` caps it there. The two are deliberately
 belt-and-braces — configuration decides whether the shepherd discovers it at
 all, and the constant guarantees that no environment value can ever resolve it
-to `full`. See
+to `full`.
+
+`mctl-gitops` was added to `NEVER_MERGE_SERVICES` for the same reason and a
+different risk (2026-09-12, raised as a P1 by agy on `mctlhq/mctl-gitops#1202`).
+Merging that repository is deployment: ArgoCD reconciles it into the cluster, so
+a merge there is a live cluster change rather than a change awaiting a release.
+Three separate things already stop an agent merging it — the shepherd defers
+under fix-only, the pr-steward's config sets `merge_mode: "never"` for it, and
+`auto-merge.yml` fires only on `claude/` head branches while agent PRs are
+`feat/agents-*` — but all three are configuration, one edit away from changing,
+and the blast radius is the whole platform. The constant is the guarantee that
+does not depend on any of them. Its deferred `merge_owner` is
+`human-codeowner`, which is also simply accurate: the steward was never going
+to merge it. See
 `agents-state/mctl-agents/proposals/issue-292-fix-lifecycle-steward-owned-repos-have-n/`
 for the full design.
 

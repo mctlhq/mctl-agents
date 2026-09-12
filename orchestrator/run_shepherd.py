@@ -32,8 +32,8 @@ Ownership is split per-service into three modes (`_service_mode`):
     - skip     — discover nothing (SHEPHERD_SKIP_SERVICES).
 A service in both SHEPHERD_FIX_ONLY_SERVICES and SHEPHERD_SKIP_SERVICES
 resolves to fix-only. NEVER_MERGE_SERVICES (a code constant, currently
-{"mctl-academy"}) never resolves to full and merge_pr() independently
-refuses to merge those repos, regardless of env or --fix-only.
+{"mctl-academy", "mctl-gitops"}) never resolves to full and merge_pr()
+independently refuses to merge those repos, regardless of env or --fix-only.
 
 The Claude SDK is used for one specific decision: parsing review
 findings into "merge-ready vs. needs-fix" and shaping the followup
@@ -363,11 +363,29 @@ def _skip_services_from_env() -> frozenset[str]:
 SHEPHERD_SKIP_SERVICES = _service_set_from_env("SHEPHERD_SKIP_SERVICES")
 SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
 
-# Merge is content publication for these repos and is gated on a human
-# CODEOWNER by design. No environment value may grant an agent the merge
-# decision for a service listed here, regardless of SHEPHERD_SKIP_SERVICES,
-# SHEPHERD_FIX_ONLY_SERVICES, or --fix-only.
-NEVER_MERGE_SERVICES = frozenset({"mctl-academy"})
+# Merge for these repos is gated on a human CODEOWNER by design. No
+# environment value may grant an agent the merge decision for a service listed
+# here, regardless of SHEPHERD_SKIP_SERVICES, SHEPHERD_FIX_ONLY_SERVICES, or
+# --fix-only: _service_mode caps them at fix-only and merge_pr refuses
+# independently.
+#
+# The two entries are here for different reasons.
+#
+#   mctl-academy — merge is content publication. Its clean-room policy makes
+#   human CODEOWNER approval the last check before a question publishes, and an
+#   agent merging its own content PR would defeat the gate.
+#
+#   mctl-gitops — merge is deployment. ArgoCD reconciles this repository into
+#   the cluster, so a merge here is not a code change awaiting a release, it is
+#   a live cluster change. Nothing auto-merges it today: the shepherd defers
+#   (fix-only), the pr-steward's config sets merge_mode "never" for it, and
+#   .github/workflows/auto-merge.yml only fires on `claude/` head branches
+#   while agent PRs are `feat/agents-*`. But all three of those are
+#   CONFIGURATION, one edit away from changing, and the blast radius is the
+#   whole platform. Raised as a P1 by agy on mctlhq/mctl-gitops#1202; the chain
+#   it described does not close today, and this is the code-level guarantee
+#   that keeps it from closing later.
+NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops"})
 
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
 # but never merges (merge is owned by another PR lifecycle, e.g. pr-steward);
@@ -383,6 +401,15 @@ def _merge_owner_for(service: str) -> str:
     there is gated on a human CODEOWNER by design — so recording
     ``pr-steward`` for them would misattribute ownership to an actor that
     has no role in the repo.
+
+    For ``mctl-gitops`` that correction is not hypothetical: the steward's
+    own config sets ``merge_mode: "never"`` for it (inventory and escalation
+    only), so recording ``pr-steward`` named an actor that was never going to
+    merge it. ``human-codeowner`` is what actually happens.
+
+    This is descriptive routing metadata, NOT an authorization or readiness
+    signal — see mctlhq/mctl-agents#344, where a reviewer read the field as a
+    merge authorization. Nothing in this repository reads it.
     """
     return "human-codeowner" if service in NEVER_MERGE_SERVICES else "pr-steward"
 

@@ -175,13 +175,16 @@ agents:
       never discovered; SHEPHERD_FIX_ONLY_SERVICES services (and any run
       started with --fix-only) are discovered, reviewed and fixed but never
       merged — decide() returns defer-merge instead, leaving merge to another
-      PR lifecycle (e.g. mctl-claude-remote's pr-steward). mctl-academy is
-      never mergeable by an agent, regardless of environment: it is a code
-      constant (NEVER_MERGE_SERVICES) consulted in _service_mode(), which
-      caps the service at fix-only so no environment value can resolve it to
-      full, and re-checked in merge_pr() at the merge boundary. decide() does
-      NOT consult it — decide() is pure and sees only the fix_only bool its
-      caller passes.
+      PR lifecycle (e.g. mctl-claude-remote's pr-steward). mctl-academy and
+      mctl-gitops are never mergeable by an agent, regardless of environment:
+      they are a code constant (NEVER_MERGE_SERVICES) consulted in
+      _service_mode(), which caps those services at fix-only so no environment
+      value can resolve them to full, and re-checked in merge_pr() at the merge
+      boundary. decide() does NOT consult it — decide() is pure and sees only
+      the fix_only bool its caller passes. The two are listed for different
+      reasons: for mctl-academy a merge is content publication, for mctl-gitops
+      a merge is deployment, since ArgoCD reconciles that repository into the
+      cluster.
 
   - name: incident-responder
     driver: orchestrator/run_incident_responder.py
