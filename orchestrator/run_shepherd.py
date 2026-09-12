@@ -80,7 +80,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 
@@ -480,6 +480,15 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
     return deterministic, harness
 
 
+# Constrained so a typo cannot silently pick the one arm with no counter.
+# `kind="harnes"` would derive transient=True, skip the harness branch in
+# process_one, and land in the plain transient arm: retried every tick, charged
+# to neither counter, no terminal state -- precisely the unbounded paid loop
+# MAX_HARNESS_FAILURES exists to make unreachable, one letter away. mypy runs
+# over orchestrator/, so a Literal catches all three assignment sites for free.
+FollowupKind = Literal["transient", "deterministic", "harness"]
+
+
 class FollowupSubprocessError(RuntimeError):
     """Raised when ``apply_followup`` cannot push a new commit.
 
@@ -504,7 +513,7 @@ class FollowupSubprocessError(RuntimeError):
     assertable in tests. Values: ``"transient" | "deterministic" | "harness"``.
     """
 
-    def __init__(self, message: str, *, kind: str = "transient") -> None:
+    def __init__(self, message: str, *, kind: FollowupKind = "transient") -> None:
         super().__init__(message)
         self.kind = kind
 
@@ -1659,6 +1668,7 @@ def apply_followup(
         # Anything else (1, 137, 2, ...) is treated as transient — we
         # cannot tell the kind from the code alone.
         deterministic_codes, harness_codes = _followup_code_sets()
+        kind: FollowupKind
         if proc.returncode in harness_codes:
             kind = "harness"
         elif proc.returncode in deterministic_codes:

@@ -295,7 +295,11 @@ def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
     """
     import importlib
 
-    for bad in ("0", "-5", "not-a-number"):
+    # "nan" is the one that matters: `value <= 0` is False for nan, so a naive
+    # guard passes it straight to move_on_after(), whose deadline is then nan,
+    # whose every `deadline <= now` test is False — the scope never cancels and
+    # the sub-deadline is silently gone. inf disables it the same way.
+    for bad in ("0", "-5", "not-a-number", "nan", "inf", "-inf"):
         monkeypatch.setenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", bad)
         reloaded = importlib.reload(options)
         try:

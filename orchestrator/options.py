@@ -1,4 +1,5 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
+import math
 import os
 import sys
 from pathlib import Path
@@ -82,8 +83,14 @@ def _positive_seconds(name: str, *, default: float) -> float:
     except ValueError:
         print(f"warn: {name}={raw!r} is not a number; using {default:g}s", file=sys.stderr)
         return default
-    if value <= 0:
-        print(f"warn: {name}={value:g} is not positive; using {default:g}s", file=sys.stderr)
+    # `not (value > 0)` rather than `value <= 0`: BOTH comparisons are False for
+    # nan, so the naive form lets nan through to anyio.move_on_after(), whose
+    # deadline is then nan, whose every `deadline <= now` test is False, so the
+    # scope never cancels and the sub-deadline is silently gone. A guard whose
+    # entire job is rejecting values that break move_on_after has to cover the
+    # one value that breaks it quietly.
+    if not (value > 0) or math.isinf(value):
+        print(f"warn: {name}={raw!r} is not a positive finite number; using {default:g}s", file=sys.stderr)
         return default
     return value
 
