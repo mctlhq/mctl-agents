@@ -95,6 +95,7 @@ def _fake_activities(
     ownership_unavailable: bool = False,
     ownership_unavailable_op: str | None = None,
     ownership_owner: tuple[str, str] | None = None,
+    ownership_owner_after: int | None = None,
     ownership_lost_after: int | None = None,
     ownership_self_unhealthy_after: int | None = None,
     ownership_progress_fails: bool = False,
@@ -354,7 +355,9 @@ def _fake_activities(
             # The store is down. The activity's own contract is to report
             # `unknown` rather than raise, and the loop must survive it.
             return OwnershipResult(verdict="unknown", reason="store down")
-        if ownership_owner is not None:
+        if ownership_owner is not None and (
+            ownership_owner_after is None or len(ownership_ops) > ownership_owner_after
+        ):
             return OwnershipResult(
                 verdict="owned-by-other",
                 owner_type=ownership_owner[0],
@@ -1645,6 +1648,47 @@ class TestDevLoopWorkflow:
             f"{[o.op for o in ops]}"
         )
 
+    async def test_a_competitor_without_an_id_does_not_read_as_our_own_record(self, env):
+        """`_lost_to_someone_else` cannot carry the owner question alone.
+
+        `Ownership.from_payload` requires `phase`, `owner.type`, `state` and
+        `healthy` — but NOT `owner.id`. So a 2xx carrying
+        `owner: {"type": "pr-steward"}` with `state: "active"` parses, answers
+        OWNED_BY_OTHER, and is declined as a loss by the `bool(result.owner_id)`
+        guard, which exists for the `lost … to /` case and is right to be
+        there. Without an owner-TYPE conjunct such a record landed on the arm
+        whose comment says "our OWN record read back unhealthy", which keeps
+        the claim and advances the head — against a row a real competitor
+        holds.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        heads = [_pr(f"{i:040d}") for i in range(1, 25)]
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=935,
+            ownership_owner=("pr-steward", ""),
+            ownership_owner_after=1,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        # The head must NOT have been advanced on every poll as though the
+        # record were ours: an unowned-by-us answer falls through, so the
+        # back-off gate closes and the writes are throttled.
+        ceiling = (
+            LIFECYCLE_UNKNOWN_WRITE_LIMIT
+            + len(heads) // LIFECYCLE_HEARTBEAT_EVERY_POLLS
+            + 2
+        )
+        assert len(progress) <= ceiling, (
+            "a competitor with no id was treated as our own record: "
+            f"{len(progress)} progress writes of {len(heads)} polls"
+        )
+
     async def test_a_refusal_naming_nobody_does_not_refuse_the_claim(self, env):
         """`_lose_claim` compared ids, and a 409 whose body is not a record
         answers OWNED_BY_OTHER with `owner_id=""`.
@@ -2122,7 +2166,6 @@ class TestDevLoopWorkflow:
             "the heartbeat was starved by the progress branch, so a released "
             f"row was never re-acquired: {[(o.op, o.epoch) for o in ops]}"
         )
-
 
     async def test_an_activity_failure_does_not_wedge_the_loop(self, env):
         """`_ownership` returns None when the activity fails outright.

@@ -1474,11 +1474,6 @@ class DevLoopWorkflow:
                 # The write LANDED — mctl-api took it — and carried NO record
                 # at all (an empty state is the body-less 2xx), so the head
                 # must advance, and
-                #
-                # `not result.state` is explicit rather than implied by the arm
-                # above, which no longer returns: a record whose state this
-                # image cannot read must not fall out of that arm and into this
-                # one, where the head would advance after all.
                 # counting it as unanswered would be the opposite of what the
                 # gate is for.
                 #
@@ -1502,6 +1497,11 @@ class DevLoopWorkflow:
                 # hours clears a stuck bound just as well as one every thirty
                 # seconds.
                 #
+                # `not result.state` is explicit rather than implied by the
+                # arm above, which no longer returns: a record whose state this
+                # image cannot read must not fall out of that arm and into this
+                # one, where the head would advance after all.
+                #
                 # No epoch came back, so the caller keeps the one it had.
                 self._owned_head_sha = head
                 self._unknown_progress = 0
@@ -1518,7 +1518,20 @@ class DevLoopWorkflow:
                 result is not None
                 and result.accepted
                 and result.verdict == OWNED_BY_OTHER
+                and result.owner_type == "devloop-workflow"
             ):
+                # The owner TYPE too, because `_lost_to_someone_else` cannot
+                # carry this alone. `Ownership.from_payload` does not require
+                # `owner.id`, so a 2xx carrying `owner: {"type": "pr-steward"}`
+                # parses, answers OWNED_BY_OTHER, and is declined as a loss by
+                # the `bool(result.owner_id)` guard — which exists for the
+                # `lost … to /` case and is right to be there. Without this
+                # conjunct such a record landed on an arm whose comment says
+                # "our OWN record read back unhealthy", and the arm kept the
+                # claim and advanced the head against a row a real competitor
+                # holds. Narrow — it needs mctl-api to emit an owner with no id
+                # — but the arm should cover what its comment says it covers.
+                #
                 # BELOW the guard above, deliberately: a real competitor can
                 # answer with `accepted` True too, and must still reach
                 # _lose_claim.
@@ -1749,16 +1762,15 @@ class DevLoopWorkflow:
 
             self._give_up_claim_if_unanswered(repo, number)
 
-
     def _give_up_claim_if_unanswered(self, repo: str, number: int) -> None:
         """Drop the claim once the store has stopped confirming it.
 
-        A method rather than a tail of the heartbeat block, because TWO paths
-        now count toward it: a heartbeat that did not land, and a progress
-        write that came back in a state this image cannot read. Leaving the
-        check inside the heartbeat meant the progress path could count forever
-        without ever reaching it, and calling it from both without extracting
-        it meant a poll that took both paths counted twice.
+        One writer and one caller: the heartbeat block. It was extracted when
+        a second path briefly counted into `_unknown_heartbeats`, and that
+        path has since been removed — counting a per-POLL event into a
+        per-HEARTBEAT constant was the defect, not the location of the check.
+        The name is kept because the block is long enough to deserve one, not
+        because anything else calls it.
         """
         if self._unknown_heartbeats < LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT:
             return
@@ -1792,6 +1804,7 @@ class DevLoopWorkflow:
         # NOT _claim_refused: nobody said they own this. That flag is permanent
         # and means "somebody else answered", which is the opposite of what
         # just happened.
+
     def _backed_off(self, unanswered: int) -> bool:
         """Whether an ownership write should be skipped on this poll.
 
