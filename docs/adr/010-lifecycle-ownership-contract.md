@@ -1,4 +1,4 @@
-# ADR 009 — `EntityRef`, `LifecycleOwnership` and `ExecutionClaim` contract
+# ADR 010 — `EntityRef`, `LifecycleOwnership` and `ExecutionClaim` contract
 
 > **Status:** proposed
 > **Date:** 2026-09-12
@@ -206,9 +206,13 @@ phase on a pull request.
 | `devloop-proposal` | `implement` | the 130-minute `attempt` lease | 130 min |
 | `pull-request` | `review-remediation` | `_dev_loop_owns` + skip-lists + `merge_owner` | 6 h |
 
-Six hours is four times the in-loop tick cadence (`SHEPHERD_TICK_EVERY_POLLS = 8`
-at a 30-minute poll ≈ 4 h), so a single missed tick cannot make a healthy owner
-look stale.
+The in-loop tick cadence is `SHEPHERD_TICK_EVERY_POLLS = 8` against a
+30-minute `MERGE_POLL_INTERVAL`, so roughly **4 h**. Six hours is 1.5× that: it
+tolerates one missed tick and flags two. An earlier draft of this paragraph
+called 6 h "four times the cadence", which is simply wrong arithmetic — 4× would
+be 16 h, long enough that a dead owner would hold a PR for most of a day before
+anything noticed. The bound has to sit in the gap between one missed tick and
+two, and 6 h is the only round number there.
 
 `deploy-watch`, `investigate` and `await-approval` are **reserved and not
 implemented**. Naming them here without shipping them is deliberate — ADR-007
