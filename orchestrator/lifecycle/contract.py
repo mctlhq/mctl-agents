@@ -180,7 +180,7 @@ class Ownership:
 # reads as "not owned" and therefore "safe to act". So the system cannot tell
 # "nobody owns this" from "I could not find out", and acts identically on both.
 #
-# Three values make that impossible to express.
+# A closed vocabulary makes that impossible to express.
 OWNED_BY_OTHER = "owned-by-other"
 OWNED_BY_ME = "owned-by-me"
 UNOWNED = "unowned"
@@ -195,7 +195,7 @@ WROTE_NO_RECORD = "wrote-no-record"
 class OwnershipAnswer:
     """The result of asking who owns an entity phase.
 
-    ``verdict`` is one of the four constants above. ``UNKNOWN`` is the whole
+    ``verdict`` is one of the five constants above. ``UNKNOWN`` is the whole
     point: it is what an unreachable or unconfigured store returns, and it is
     NOT ``UNOWNED``. A caller that treats them the same has reintroduced the
     defect this contract exists to remove.
@@ -205,14 +205,19 @@ class OwnershipAnswer:
     ownership: Ownership | None = None
     reason: str = ""
 
+    # Set by answer_from when a MUTATING call got a 2xx. It is deliberately not
+    # derived from the verdict: a successful release() or terminal() returns the
+    # record it just wrote, whose state is released/terminal, which verdict_for
+    # correctly maps to UNOWNED — a verdict in neither arm of any "did it work"
+    # test built from verdicts alone. A caller gating local state on that could
+    # never record a release the server had accepted, which is the
+    # `result is not None` defect arriving from the opposite direction.
+    accepted: bool = False
+
     @property
     def wrote(self) -> bool:
-        """Whether a mutating call is known to have succeeded.
-
-        OWNED_BY_ME covers the usual case, where the server returned the record
-        it wrote. WROTE_NO_RECORD covers a 2xx with no body.
-        """
-        return self.verdict in (OWNED_BY_ME, WROTE_NO_RECORD)
+        """Whether a mutating call is known to have succeeded."""
+        return self.accepted
 
     @property
     def may_mutate(self) -> bool:
@@ -306,6 +311,7 @@ def answer_from(
     reads an HTML error page served with a 200 — a gateway answering for the
     API — as a successful write.
     """
+    accepted = not is_read
     if 200 <= status < 300:
         # A 200 whose body is not an ownership record is a surprise, not an
         # answer. Parsing it into an all-empty record would produce a confident
@@ -324,15 +330,32 @@ def answer_from(
                 # a 200 carrying an HTML error page from a gateway is not a
                 # successful write, and body_empty is what separates them.
                 return OwnershipAnswer(
-                    verdict=WROTE_NO_RECORD, reason=f"{status} with no body"
+                    verdict=WROTE_NO_RECORD,
+                    reason=f"{status} with no body",
+                    accepted=accepted,
                 )
+            # A 2xx the server accepted whose body we cannot read is still an
+            # accepted write; we simply learned nothing about ownership.
             return OwnershipAnswer(
-                verdict=UNKNOWN, reason=f"no ownership record in a {status} response"
+                verdict=UNKNOWN,
+                reason=f"no ownership record in a {status} response",
+                accepted=accepted,
             )
         verdict = verdict_for(own, asking)
         reason = "" if verdict != UNKNOWN else f"unrecognised ownership state {own.state!r}"
-        return OwnershipAnswer(verdict=verdict, ownership=own, reason=reason)
+        return OwnershipAnswer(
+            verdict=verdict, ownership=own, reason=reason, accepted=accepted
+        )
     if status == 404 and is_read:
+        if not payload:
+            # A 404 with no readable JSON envelope did not come from mctl-api:
+            # an ingress rule that stopped matching, a wrong base path, or a
+            # proxy's HTML page all look like this, and answering UNOWNED would
+            # free EVERY entity asked. The write half of this was fixed first;
+            # the read half frees more.
+            return OwnershipAnswer(
+                verdict=UNKNOWN, reason=f"404 with no error envelope from {path or 'a read'}"
+            )
         return OwnershipAnswer(verdict=UNOWNED, reason="no record")
     if status == 404:
         # On a WRITE a 404 is not "no such row". POST /acquire has no

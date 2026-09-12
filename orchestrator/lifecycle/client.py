@@ -30,10 +30,8 @@ from orchestrator.lifecycle.contract import (
     UNOWNED,
     EntityRef,
     Owner,
-    Ownership,
     OwnershipAnswer,
     answer_from,
-    verdict_for,
 )
 
 DEFAULT_TIMEOUT_S = 10
@@ -204,11 +202,10 @@ class OwnershipClient:
             if raw is None:
                 out[i] = OwnershipAnswer(verdict=UNOWNED)
                 continue
-            own = Ownership.from_payload(raw)
-            if own is None:
-                out[i] = OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised record")
-                continue
-            out[i] = OwnershipAnswer(verdict=verdict_for(own, asking), ownership=own)
+            # Through the SHARED classifier, not a local copy: this was the
+            # one path still deciding for itself, so every reason-string and
+            # state fix made elsewhere stopped at the sweep's door.
+            out[i] = answer_from(200, raw, asking, is_read=True, path=query)
         return out
 
     # -- writes ---------------------------------------------------------

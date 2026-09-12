@@ -27,6 +27,7 @@ from orchestrator.lifecycle.contract import (  # noqa: F401
     STATE_TERMINAL,
     UNKNOWN,
     UNOWNED,
+    WROTE_NO_RECORD,
     EntityRef,
     Owner,
     Ownership,
