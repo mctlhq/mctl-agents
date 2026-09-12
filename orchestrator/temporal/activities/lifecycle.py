@@ -165,6 +165,10 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
     try:
         headers = auth_headers()
     except Exception as exc:  # noqa: BLE001 — auth_headers raises on a missing token
+        # The only failure here that was silent. A missing token looks exactly
+        # like an unreachable store to the caller, and an operator reading the
+        # logs would find nothing at all.
+        activity.logger.warning("lifecycle %s has no usable credentials: %s", req.op, exc)
         return OwnershipResult(verdict=UNKNOWN, reason=f"auth: {exc}")
 
     try:

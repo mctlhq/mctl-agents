@@ -92,6 +92,7 @@ def _fake_activities(
     ownership_lost_after: int | None = None,
     ownership_progress_fails: bool = False,
     ownership_terminal_fails: bool = False,
+    ownership_raises: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -227,6 +228,11 @@ def _fake_activities(
     @activity.defn(name="lifecycle_ownership")
     async def fake_lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
         ownership_ops.append(req)
+        if ownership_raises:
+            # The activity itself failing — an old worker with no
+            # lifecycle_ownership registered, or retries exhausted. _ownership
+            # returns None here, and nothing may dereference it.
+            raise ApplicationError("activity not registered", non_retryable=True)
         if ownership_lost_after is not None and len(ownership_ops) > ownership_lost_after:
             return OwnershipResult(
                 verdict="owned-by-other",
@@ -981,7 +987,13 @@ class TestDevLoopWorkflow:
             with anyio.fail_after(10):
                 await investigate_ran.wait()
             await handle.signal(DevLoopWorkflow.approve)
-            result = await handle.result()
+            # Bounded on purpose. A workflow-code AttributeError is not a
+            # FailureError: the workflow TASK fails and, because replay is
+            # deterministic, keeps failing the same way forever. Without a
+            # deadline the test for that would hang rather than fail, which is
+            # the least useful way to report the most severe failure mode here.
+            with anyio.fail_after(30):
+                result = await handle.result()
         return result, ownership_ops
 
     async def test_ownership_claimed_on_first_resolved_pr_and_terminal_on_merge(self, env):
@@ -1132,6 +1144,29 @@ class TestDevLoopWorkflow:
         assert all(o.version == "b" * 40 for o in progress)
 
 
+    async def test_an_activity_failure_does_not_wedge_the_loop(self, env):
+        """`_ownership` returns None when the activity fails outright.
+
+        Dereferencing it would raise AttributeError inside workflow code, which
+        is not a FailureError: the workflow task fails, and because replay is
+        deterministic it fails the same way forever — wedged until somebody
+        terminates it. The likeliest trigger is this change's own rollout, when
+        a control worker on the previous image has no `lifecycle_ownership`
+        registered.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, open_pr, MERGED_PR], issue=912,
+            ownership_raises=True,
+        )
+        # The loop completed normally and still reported the merge.
+        assert result.pr is not None and result.pr.state == "MERGED"
+        # It tried, held no claim, and never terminalised anything it did not own.
+        assert ops and all(o.op == "acquire" for o in ops), [o.op for o in ops]
+
     async def test_a_failed_terminal_leaves_the_claim_for_the_reconciler(self, env):
         """Clearing the claim on a terminal that did not land would leave the
         row active with nobody believing they own it — the zero-owner state,
@@ -1148,11 +1183,18 @@ class TestDevLoopWorkflow:
             env, pr_states=[open_pr, MERGED_PR], issue=911,
             ownership_terminal_fails=True,
         )
-        assert any(o.op == "terminal" for o in ops), [o.op for o in ops]
-        # The claim was NOT dropped, so the watch's finally attempts a release
-        # on the way out rather than silently forgetting the entity.
-        assert any(o.op == "release" for o in ops), (
+        terminals = [o for o in ops if o.op == "terminal"]
+        assert terminals, [o.op for o in ops]
+        # The claim was NOT dropped, so the finally tries again on the way out
+        # rather than silently forgetting the entity.
+        assert len(terminals) > 1, (
             f"a failed terminal dropped the claim: {[o.op for o in ops]}"
+        )
+        # And it retries TERMINAL, not release. The PR merged; marking a
+        # finished entity as "somebody must take this" is the one state this
+        # contract reserves for work that remains.
+        assert not any(o.op == "release" for o in ops), (
+            f"a merged PR was released: {[o.op for o in ops]}"
         )
 
     async def test_losing_the_claim_is_noticed_and_the_epoch_is_not_adopted(self, env):

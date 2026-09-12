@@ -54,14 +54,21 @@ def _record(**kw: Any) -> dict[str, Any]:
     return rec
 
 
+# Captured ONCE, at import. `act.httpx` is the same module object as the
+# `httpx` imported here, so patching act.httpx.AsyncClient patches it globally
+# — and a second _run in the same test that read the attribute back would wrap
+# the first fake instead of the real class, quietly serving the previous test
+# case's response. That cost one debugging round.
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
 def _run(monkeypatch: pytest.MonkeyPatch, handler: Any, req: act.OwnershipRequest | None = None):
     """Drive the activity with a faked transport."""
     monkeypatch.setattr(act, "auth_headers", lambda: {"Authorization": "Bearer test"})
-    real_client = httpx.AsyncClient
 
     def _factory(**kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = httpx.MockTransport(handler)
-        return real_client(**kwargs)
+        return _REAL_ASYNC_CLIENT(**kwargs)
 
     monkeypatch.setattr(act.httpx, "AsyncClient", _factory)
     return anyio.run(act.lifecycle_ownership, req or _req())
@@ -168,3 +175,27 @@ def test_result_defaults_are_conservative() -> None:
     empty = act.OwnershipResult()
     assert empty.verdict == UNKNOWN
     assert empty.owned_by_caller is False
+
+
+def test_accepted_is_carried_from_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every call this activity makes is a mutation, so `accepted` is what the
+    workflow reads to know the write landed.
+
+    Dropping it from _result_from keeps the whole suite green otherwise — the
+    workflow fakes bypass this function entirely — and a 204 terminal would
+    then keep the claim and release a merged PR.
+    """
+    # A 2xx carrying the record: accepted, and a claim.
+    owned = _run(monkeypatch, _respond(200, _record()))
+    assert owned.accepted is True
+    assert owned.owned_by_caller is True
+
+    # A body-less 2xx: accepted, but nothing learned about ownership.
+    empty = _run(monkeypatch, _respond(204, None))
+    assert empty.accepted is True
+    assert empty.owned_by_caller is False
+
+    # A failure is not accepted, whatever else it says.
+    for status in (409, 503, 404):
+        failed = _run(monkeypatch, _respond(status, {"error": "no"}))
+        assert failed.accepted is False, status
