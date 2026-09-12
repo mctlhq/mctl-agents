@@ -80,9 +80,14 @@ to another PR lifecycle, e.g. `mctl-claude-remote`'s pr-steward). Before this,
 at once: the cron sweeper stood down because the DevLoop claimed ownership,
 and the DevLoop's own in-loop ticks were silently discarded inside
 `_discover_refs` before `service_filter` ever ran. `mctl-academy` is the one
-exception left fully skipped, and is additionally hardened at the code level
-(`NEVER_MERGE_SERVICES`) so no environment configuration can make it
-agent-mergeable. See
+service left fully skipped *by configuration* — it is named in
+`SHEPHERD_SKIP_SERVICES` in the shepherd CWFT, so `_service_mode` resolves it
+to `skip`. That is a deployment fact, not a code one: with that env value
+removed, `_service_mode` would resolve it to `fix-only`, because the code
+constant `NEVER_MERGE_SERVICES` caps it there. The two are deliberately
+belt-and-braces — configuration decides whether the shepherd discovers it at
+all, and the constant guarantees that no environment value can ever resolve it
+to `full`. See
 `agents-state/mctl-agents/proposals/issue-292-fix-lifecycle-steward-owned-repos-have-n/`
 for the full design.
 

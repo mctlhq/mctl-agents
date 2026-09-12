@@ -177,8 +177,11 @@ agents:
       merged — decide() returns defer-merge instead, leaving merge to another
       PR lifecycle (e.g. mctl-claude-remote's pr-steward). mctl-academy is
       never mergeable by an agent, regardless of environment: it is a code
-      constant (NEVER_MERGE_SERVICES) checked independently in decide() and
-      merge_pr().
+      constant (NEVER_MERGE_SERVICES) consulted in _service_mode(), which
+      caps the service at fix-only so no environment value can resolve it to
+      full, and re-checked in merge_pr() at the merge boundary. decide() does
+      NOT consult it — decide() is pure and sees only the fix_only bool its
+      caller passes.
 
   - name: incident-responder
     driver: orchestrator/run_incident_responder.py
