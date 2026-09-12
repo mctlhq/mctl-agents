@@ -1302,11 +1302,37 @@ class DevLoopWorkflow:
             # those would drop the progress signal permanently: the next poll
             # sees head == _owned_head_sha and never retries.
             if result is not None and result.owned_by_caller:
+                # RecordProgress refreshes last_seen_at server-side, so a
+                # landed progress write IS this poll's heartbeat.
                 self._owned_head_sha = head
                 self._owner_epoch = result.epoch or self._owner_epoch
-            elif result is not None and result.verdict == OWNED_BY_OTHER:
+                return
+            if result is not None and result.verdict == OWNED_BY_OTHER:
                 self._lose_claim(repo, number, result)
-            return
+                return
+
+            # Everything else falls THROUGH to the heartbeat below, and the
+            # unconditional return that used to sit here was a liveness bug.
+            #
+            # A failed progress write correctly does not advance
+            # _owned_head_sha, so `head != _owned_head_sha` stays true on every
+            # later poll and control reaches this block every time. Returning
+            # here therefore made the heartbeat unreachable for the rest of the
+            # watch: a /progress answering 412 — the record moved, which is
+            # exactly what the fencing epoch is for — while `acquire` would
+            # still have succeeded stopped refreshing last_seen_at entirely.
+            # The 10h liveness bound then expires and the reconciler declares
+            # this owner dead and force-releases the row, while the workflow is
+            # alive, polling and shepherding the PR.
+            #
+            # UNOWNED had the mirror problem: progress against a row the
+            # reconciler already released matches neither branch above, so the
+            # claim was never dropped — and, because of the same return, never
+            # re-acquired either. The heartbeat's acquire re-establishes it.
+            #
+            # It also bounds the retries. This path has no back-off of its own,
+            # so a persistently failing progress write meant one unanswered
+            # call per poll for the whole watch with nothing else happening.
 
         if self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0:
             result = await self._ownership(

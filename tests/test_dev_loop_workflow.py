@@ -91,6 +91,7 @@ def _fake_activities(
     ownership_owner: tuple[str, str] | None = None,
     ownership_lost_after: int | None = None,
     ownership_progress_fails: bool = False,
+    ownership_progress_unowned: bool = False,
     ownership_terminal_fails: bool = False,
     ownership_raises: bool = False,
 ):
@@ -245,6 +246,12 @@ def _fake_activities(
             )
         if ownership_terminal_fails and req.op == "terminal":
             return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_progress_unowned and req.op == "progress":
+            # The reconciler already released the row underneath this loop, so
+            # the progress write lands on nothing. Neither owned-by-me nor
+            # owned-by-other: the verdict the progress branch used to match
+            # against no branch at all.
+            return OwnershipResult(verdict="unowned", reason="no record", accepted=True)
         if ownership_progress_fails and req.op == "progress":
             # The claim holds; only the progress write fails. This is the shape
             # the retry guard exists for, and the shape an earlier version of
@@ -1142,6 +1149,71 @@ class TestDevLoopWorkflow:
             f"a failed progress write was not retried: {[(o.op, o.version[:8]) for o in ops]}"
         )
         assert all(o.version == "b" * 40 for o in progress)
+
+    async def test_a_failing_progress_write_does_not_silence_the_heartbeat(self, env):
+        """The `return` at the end of the progress branch used to be
+        unconditional, and that made the heartbeat unreachable.
+
+        A failed progress write correctly does NOT advance the recorded head,
+        so `head != _owned_head_sha` stays true on every later poll and control
+        returns from the progress branch every time. The heartbeat `acquire`
+        below it therefore never ran again for the rest of the watch: a
+        `/progress` answering 412 — the record moved, which is exactly what the
+        fencing epoch is for — while `acquire` would still have succeeded
+        stopped refreshing `last_seen_at` entirely. The 10h liveness bound then
+        expires and the reconciler declares this owner dead and force-releases
+        the row, while the workflow is alive, polling and shepherding the PR.
+
+        The retry the sibling test pins is still correct and still happens; the
+        claim is that it must not be the ONLY thing that happens.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            issue=913,
+            ownership_progress_fails=True,
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        later = kinds[first_progress:]
+        assert "acquire" in later, (
+            f"the heartbeat never ran again after a failing progress write: {kinds}"
+        )
+        # And the retry the sibling test pins is unaffected.
+        assert kinds.count("progress") > 1, kinds
+
+    async def test_progress_against_a_released_row_re_acquires(self, env):
+        """UNOWNED is the mirror of the case above.
+
+        A progress write against a row the reconciler already released matched
+        neither branch, so the claim was never dropped — and, because of the
+        same unconditional return, never re-acquired either. The loop went on
+        believing it owned an entity the store says is free, for the rest of
+        the watch. Falling through to the heartbeat re-establishes it.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            issue=914,
+            ownership_progress_unowned=True,
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        assert "acquire" in kinds[first_progress:], (
+            f"a released row was never re-acquired: {kinds}"
+        )
 
 
     async def test_an_activity_failure_does_not_wedge_the_loop(self, env):
