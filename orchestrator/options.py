@@ -1,5 +1,6 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import os
+import sys
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -59,6 +60,34 @@ def _mctl_tool_globs() -> list[str]:
 
 SERVICE_AGENT_BUDGET_USD = float(os.getenv("SERVICE_AGENT_BUDGET_USD", "5.00"))
 MENTOR_BUDGET_USD = float(os.getenv("MENTOR_BUDGET_USD", "2.00"))
+def _positive_seconds(name: str, *, default: float) -> float:
+    """Read a wall-clock env var, falling back loudly on a non-positive value.
+
+    A floor rather than a raise, and it belongs here rather than at the point of
+    use. `anyio.move_on_after(0)` cancels before the first read, so a drain
+    deadline of 0 orphans every run that delegates -- but raising instead would
+    be worse: the error surfaces only once a sub-agent is actually launched, is
+    swallowed by the caller's catch-all into a generic exit 1, and the shepherd
+    then classifies it transient, which has NO counter. A typo in one env var
+    would re-clone the repo and re-run a paid SDK call every tick forever --
+    exactly the pathology MAX_HARNESS_FAILURES exists to prevent. Clamping at
+    config time makes a bad value loud and harmless instead of silent and
+    unbounded.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"warn: {name}={raw!r} is not a number; using {default:g}s", file=sys.stderr)
+        return default
+    if value <= 0:
+        print(f"warn: {name}={value:g} is not positive; using {default:g}s", file=sys.stderr)
+        return default
+    return value
+
+
 # Tier 2 implementer budget — soft cap per single proposal implementation.
 # A proposal touching one or two files usually finishes well under this.
 # No hard kill: the SDK stops sampling once the cap is exceeded but the
@@ -75,8 +104,8 @@ IMPLEMENTER_TIMEOUT_SECONDS = float(
 # wedged child that ate the whole remaining budget would surface as a plain
 # operation timeout, which the shepherd charges to the proposal's review-attempt
 # budget, which is the very bug #366 is about. See orchestrator/subagent_wait.py.
-IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = float(
-    os.getenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", "300")
+IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
+    "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", default=300.0
 )
 # Bound every synchronous git/gh command as well.  The model-stream timeout
 # above cannot interrupt a clone, fetch, or push that has stalled before or

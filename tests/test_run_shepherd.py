@@ -3441,3 +3441,68 @@ def test_reconcile_unstick_clears_both_counters(tmp_path) -> None:
     assert final["status"] == "implemented"
     assert "review_attempts" not in final
     assert "harness_failures" not in final
+
+
+def test_harness_failures_round_trips_through_disk(tmp_path, monkeypatch) -> None:
+    """The counter must survive the tick boundary, or the cap means nothing.
+
+    Every tick is a fresh process, so `_discover_refs` reading the key back off
+    `.status.yaml` is the single link that makes `ref.harness_failures + 1`
+    cumulative. If it regressed — dropped in a refactor, or the key renamed on
+    one side — `ref.harness_failures` would be 0 on every tick, `new_failures`
+    would be 1 forever, MAX_HARNESS_FAILURES would never be reached, and the
+    unbounded paid retry loop it exists to stop would silently come back.
+
+    The cap tests deliberately do not cover this: they seed the counter in
+    memory or start from the default, so a read that always returned 0 would
+    pass them all.
+    """
+    proposal_dir = make_status_yaml(tmp_path, service="mctl-web", slug="harness-rt")
+    status_path = proposal_dir / ".status.yaml"
+    payload = yaml.safe_load(status_path.read_text(encoding="utf-8"))
+    payload["harness_failures"] = 2
+    status_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    refs = run_shepherd._discover_refs(tmp_path)
+
+    ref = next(r for r in refs if r.slug == "harness-rt")
+    assert ref.harness_failures == 2, (
+        "harness_failures did not survive the tick boundary; the cap is inert"
+    )
+    # And the absent-key case still defaults cleanly rather than raising.
+    plain = make_status_yaml(tmp_path, service="mctl-web", slug="no-harness-key")
+    assert plain.exists()
+    refs = run_shepherd._discover_refs(tmp_path)
+    assert next(r for r in refs if r.slug == "no-harness-key").harness_failures == 0
+
+
+def test_deterministic_failure_also_clears_the_harness_counter(tmp_path) -> None:
+    """"Consecutive" has to be true of every proof that the handoff works.
+
+    A deterministic 42/43/44 proves it as well as a success does: the child ran
+    to a terminal state and the driver adjudicated its output. Without clearing
+    here, the interleaving 46, 42, 46, 42, 46 reaches the cap and reports "the
+    platform lost the work 3 time(s) in a row" — false, and that counter is what
+    an operator reads to decide whether this is a platform incident.
+    """
+    ref = make_ref(tmp_path, review_attempts=0)
+    ref.harness_failures = 2
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (42)", kind="deterministic",
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        process_one(ref, skip_subprocess=True)
+
+    final = read_status(ref)
+    assert final["review_attempts"] == 1
+    assert "harness_failures" not in final

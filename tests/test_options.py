@@ -280,3 +280,27 @@ def test_implementer_keeps_hooks_which_is_what_holds_stdin_open(tmp_path, monkey
         name for name, cfg in built.mcp_servers.items()
         if isinstance(cfg, dict) and cfg.get("type") == "sdk"
     ]
+
+
+def test_drain_timeout_clamps_a_non_positive_env_value(monkeypatch, capsys):
+    """A bad value must be loud and harmless, not silent and unbounded.
+
+    `move_on_after(0)` cancels before the first read, so a drain deadline of 0
+    orphans every delegating run. Raising at the point of use would be worse:
+    the error surfaces only once a sub-agent is launched, gets swallowed into a
+    generic exit 1, and the shepherd classifies that transient — the one arm
+    with no counter at all. A typo in one env var would then re-clone the repo
+    and re-run a paid SDK call every tick forever, which is precisely what
+    MAX_HARNESS_FAILURES exists to prevent.
+    """
+    import importlib
+
+    for bad in ("0", "-5", "not-a-number"):
+        monkeypatch.setenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", bad)
+        reloaded = importlib.reload(options)
+        try:
+            assert reloaded.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 300.0, bad
+            assert "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS" in capsys.readouterr().err
+        finally:
+            monkeypatch.delenv("IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", raising=False)
+            importlib.reload(options)

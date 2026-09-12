@@ -1983,6 +1983,14 @@ def process_one(
                 ref,
                 "review-fixing",
                 review_attempts=new_attempts,
+                # A deterministic failure proves the handoff works just as well
+                # as a success does: the child ran to a terminal state and the
+                # driver adjudicated its output. Without this, the interleaving
+                # 46, 42, 46, 42, 46 would reach the cap and report "the
+                # platform lost the work 3 time(s) in a row", which is false --
+                # and that counter is what an operator reads to decide whether
+                # this is a platform incident.
+                harness_failures=None,
             )
             update_status(ref, "implemented")
             return ShepherdResult(

@@ -290,22 +290,6 @@ def test_implementer_does_not_orphan_on_failed_terminal_status(tmp_path, monkeyp
     assert "warn:" in out and "failed" in out
 
 
-def test_outer_timeout_still_wins_over_drain(tmp_path, monkeypatch) -> None:
-    """Accepted ordering: if the outer bound fires first we get 44, not 46 —
-    it means the turn itself was already at the wall."""
-    async def messages():
-        yield _started()
-        yield _result()
-        await anyio.sleep(10)
-
-    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(messages))
-    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
-    monkeypatch.setattr(run_implementer, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 30)
-
-    with pytest.raises(run_implementer.ImplementerOperationTimeout):
-        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
-
-
 def test_orphaned_subagent_has_its_own_exit_code() -> None:
     assert run_implementer.EXIT_ORPHANED_SUBAGENT == 46
     assert run_implementer.EXIT_ORPHANED_SUBAGENT not in {
@@ -328,3 +312,59 @@ def test_orphaned_subagent_has_its_own_exit_code() -> None:
 
 def test_implementer_orphan_subclasses_the_shared_error() -> None:
     assert issubclass(run_implementer.ImplementerOrphanedSubagent, OrphanedSubagentError)
+
+
+def test_outer_timeout_during_the_drain_is_an_orphan_not_a_plain_timeout(
+    tmp_path, monkeypatch
+) -> None:
+    """The nested drain deadline only helps while the outer budget has room.
+
+    A long turn (not the 25.8s of the original incident) can end with a child
+    still live and less than the drain deadline left on the outer clock. Then
+    `fail_after` fires before `move_on_after` can, and without the drain flag
+    the run would exit 44 -- which is in the shepherd's deterministic set and
+    charges `review_attempts`. That is the #366 signature reached through the
+    outer bound instead of the inner one.
+    """
+    async def messages():
+        yield _started()
+        yield _result()
+        await anyio.sleep(10)
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(messages))
+    # Outer fires first: drain deadline is deliberately the LONGER of the two.
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 30)
+
+    with pytest.raises(
+        run_implementer.ImplementerOrphanedSubagent, match=r"outer timeout of"
+    ):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_outer_timeout_without_a_live_child_is_still_a_plain_timeout(
+    tmp_path, monkeypatch
+) -> None:
+    """The reclassification must be narrow: no live child, no orphan.
+
+    A turn that simply runs too long is a genuine operation timeout (44) and
+    should keep charging an attempt -- re-running it forever makes no progress.
+    """
+    async def messages():
+        yield "working"
+        await anyio.sleep(10)
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 30)
+
+    with pytest.raises(run_implementer.ImplementerOperationTimeout):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_outer_timeout_orphan_maps_to_the_harness_exit_code(tmp_path) -> None:
+    """And the reclassified message must actually reach code 46, not 44."""
+    assert run_implementer._review_feedback_exit_code(
+        "orphaned sub-agent: outer timeout of 900s expired while awaiting "
+        "1 task(s) still live: t1"
+    ) == run_implementer.EXIT_ORPHANED_SUBAGENT
