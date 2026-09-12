@@ -389,8 +389,13 @@ def _result_message(*, is_error: bool, api_error_status: int | None, subtype: st
 class _FakeClient:
     """Stands in for ClaudeSDKClient — no MCTL_TOKEN in the test env means
     build_issue_investigator_options() returns mcp_servers={}, so
-    ensure_mctl_connected() is never called; only query()/receive_response()
-    need faking here."""
+    ensure_mctl_connected() is never called; only query()/receive_messages()
+    need faking here.
+
+    ``messages`` may be a plain sequence or a zero-argument callable returning
+    an async generator, so a test can make the stream block or record what the
+    driver actually consumed (mctl-agents#366).
+    """
 
     def __init__(self, *, options, messages):
         self._messages = messages
@@ -404,7 +409,11 @@ class _FakeClient:
     async def query(self, prompt):
         pass
 
-    async def receive_response(self):
+    async def receive_messages(self):
+        if callable(self._messages):
+            async for m in self._messages():
+                yield m
+            return
         for m in self._messages:
             yield m
 
@@ -3182,3 +3191,214 @@ def test_an_empty_target_repo_is_named_not_a_bare_command_failure(tmp_path):
 
     with pytest.raises(RuntimeError, match="cannot pin target_repository_sha"):
         run_issue_investigator._target_repository_sha(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# _run_agent — awaiting an async-launched sub-agent (mctl-agents#366)
+#
+# `ResultMessage` ends one TURN, not the RUN. `receive_response()` returns at
+# the first one by contract, so the pre-#366 driver abandoned any sub-agent the
+# CLI had launched asynchronously (`isAsync: True`, `status: "async_launched"`).
+# For THIS driver that is the worst case of the family: an orphan here writes no
+# requirements/design/tasks triplet at all, so the entire downstream pipeline
+# gets nothing and the issue looks like it simply failed to investigate.
+#
+# The precondition that makes draining sound is the SDK's own: it keeps stdin
+# (and so the subprocess) open past the result frame while `_inflight_tasks` is
+# non-empty, but ONLY when `sdk_mcp_servers or hooks` is truthy.
+# `build_issue_investigator_options` and its `_from_plan` twin both pass
+# `hooks=_command_audit_hooks()` — pinned by the last test in this block,
+# because dropping those hooks would silently turn the drain into a wait for a
+# process nobody is keeping alive.
+# ---------------------------------------------------------------------------
+from claude_agent_sdk import (  # noqa: E402 — grouped with the tests that use them
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+)
+
+from orchestrator.run_issue_investigator import (  # noqa: E402
+    InvestigatorOrphanedSubagent,
+)
+
+
+def _task_started(task_id="t1", task_type="local_agent"):
+    return TaskStartedMessage(
+        subtype="task_started", data={}, task_id=task_id,
+        description="write the triplet", uuid="u", session_id="s",
+        task_type=task_type,
+    )
+
+
+def _task_updated(task_id="t1", status="completed"):
+    return TaskUpdatedMessage(
+        subtype="task_updated", data={}, task_id=task_id,
+        patch={"status": status}, status=status,
+    )
+
+
+def _ok_result():
+    return _result_message(is_error=False, api_error_status=None)
+
+
+def test_investigator_waits_for_async_launched_subagent(tmp_path, monkeypatch):
+    """The headline regression: fails without the drain.
+
+    `consumed` is the real assertion — returning normally is not enough, the
+    driver must have read *past* the ResultMessage to see the child settle.
+    """
+    consumed: list[object] = []
+
+    async def messages():
+        for message in (_task_started(), _ok_result(), _task_updated()):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    assert any(isinstance(m, TaskUpdatedMessage) for m in consumed), (
+        "driver stopped at the ResultMessage and abandoned the live sub-agent"
+    )
+
+
+def test_investigator_returns_immediately_when_no_tasks_are_live(tmp_path, monkeypatch):
+    """Runs without a delegated child must not pay for the drain."""
+    consumed: list[object] = []
+
+    async def messages():
+        for message in ("chatter", _ok_result(), _task_updated()):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    assert not any(isinstance(m, TaskUpdatedMessage) for m in consumed)
+
+
+def test_investigator_raises_orphaned_when_task_never_settles(tmp_path, monkeypatch):
+    async def messages():
+        yield _task_started()
+        yield _ok_result()
+        await anyio.sleep(10)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 0.05
+    )
+
+    with pytest.raises(InvestigatorOrphanedSubagent, match=r"orphaned sub-agent:"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_raises_orphaned_when_stream_ends_with_live_task(tmp_path, monkeypatch):
+    """The CLI exited while the child was still live."""
+    async def messages():
+        yield _task_started()
+        yield _ok_result()
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(InvestigatorOrphanedSubagent):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_does_not_orphan_on_failed_terminal_status(tmp_path, monkeypatch, capsys):
+    """A failed child is quiescent, not orphaned — warn, do not raise."""
+    async def messages():
+        yield _task_started()
+        yield _ok_result()
+        yield TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="t1", status="failed",
+            output_file="/dev/null", summary="boom", uuid="u", session_id="s",
+        )
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    out = capsys.readouterr().out
+    assert "warn:" in out and "failed" in out
+
+
+def test_investigator_rate_limit_still_wins_over_the_drain(tmp_path, monkeypatch):
+    """A 429 result must still raise RateLimitExhaustedError, not be masked by
+    a drain for a child an out-of-quota account never actually ran."""
+    async def messages():
+        yield _task_started()
+        yield _result_message(is_error=True, api_error_status=429)
+
+    monkeypatch.setattr(
+        "claude_agent_sdk.ClaudeSDKClient", _fake_client_factory(messages)
+    )
+    monkeypatch.setattr(
+        run_issue_investigator, "INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", 5
+    )
+
+    with pytest.raises(RateLimitExhaustedError):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_investigator_orphan_surfaces_as_a_named_harness_failure(tmp_path, monkeypatch):
+    """investigate() maps the orphan explicitly, ahead of its generic branch.
+
+    The wording matters: this driver reports through InvestigateResult.error,
+    not exit codes, and an orphan must not read as "the agent broke on this
+    issue" when what happened is that the platform threw the child's work away.
+    """
+    def orphaning_agent(repo_dir, prompt, proposal_dir):
+        raise InvestigatorOrphanedSubagent(
+            "orphaned sub-agent: sub-agent task(s) never reported a terminal "
+            "status within 300s: 1 task(s) still live: t1"
+        )
+
+    issue = _investigate_harness(tmp_path, monkeypatch, agent=orphaning_agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+
+    assert result.error is not None
+    assert "harness failure" in result.error
+    assert "still live" in result.error
+    assert result.rate_limited is False
+
+
+def test_investigator_options_keep_the_hooks_the_drain_depends_on():
+    """The precondition, pinned.
+
+    The SDK holds the CLI subprocess open past the result frame only when
+    `sdk_mcp_servers or hooks` is truthy. Every mctl MCP server this repo
+    configures is `type: "http"`, so `sdk_mcp_servers` is always empty and
+    `hooks` is the whole precondition. Drop them and the drain becomes a wait
+    for a child nobody is keeping alive.
+    """
+    from orchestrator.options import build_issue_investigator_options
+
+    options = build_issue_investigator_options(
+        Path("/tmp"), "claude-sonnet-4-5", Path("/tmp")
+    )
+    assert options.hooks, "issue-investigator lost the hooks the #366 drain relies on"
+    assert not any(
+        isinstance(cfg, dict) and cfg.get("type") == "sdk"
+        for cfg in (options.mcp_servers or {}).values()
+    ), "an SDK-MCP server would also satisfy the precondition — update this test"

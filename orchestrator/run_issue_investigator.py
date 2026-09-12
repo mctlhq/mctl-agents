@@ -55,9 +55,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import anyio
 import yaml
@@ -79,6 +82,21 @@ DEFAULT_STATE_DIR = Path(
     )
 )
 INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
+
+# Sub-deadline for awaiting a sub-agent the CLI launched asynchronously
+# (mctl-agents#366), nested inside whatever wall-clock bound the caller
+# imposes on the investigate step. Not needed for liveness -- the Argo step
+# deadline provides that -- but for classification: a wedged child that ate
+# the whole remaining budget would surface as a plain step timeout instead of
+# naming the handoff we lost.
+#
+# Declared here rather than beside its implementer twin in
+# orchestrator/options.py because of the import rule stated above: this module
+# must stay importable by the Temporal worker, and a function-local import
+# would put the value out of reach of the tests that shorten it.
+INVESTIGATOR_DRAIN_TIMEOUT_SECONDS = float(
+    os.getenv("ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", "300")
+)
 
 # mctlhq/mctl-agents#227 declarative resolver pilot. "legacy" (the default)
 # does not import or call orchestrator/resolver.py at all — today's
@@ -1249,6 +1267,27 @@ class RateLimitExhaustedError(RuntimeError):
     """
 
 
+class InvestigatorOrphanedSubagent(RuntimeError):
+    """The run ended while a delegated sub-agent was still live.
+
+    A harness failure, not a content failure. ``cwd`` is a fresh clone of the
+    target repository and ``setting_sources=["project"]`` loads whatever
+    ``.claude/agents/*.md`` that repository ships, so the CLI can launch one of
+    them asynchronously (``isAsync: True``); a run that returns at the first
+    ``ResultMessage`` then throws away the child's work. Here that means no
+    requirements/design/tasks triplet is written at all, and the whole
+    downstream pipeline gets nothing -- reported as an investigation failure
+    whose message names the lost handoff rather than blaming the issue.
+
+    Deliberately NOT a subclass of ``orchestrator.subagent_wait``'s shared
+    ``OrphanedSubagentError``: that module imports ``claude_agent_sdk`` at
+    module scope, and this one must stay importable by the long-lived Temporal
+    worker (see the import note at the top of this file and
+    tests/test_worker_isolation.py). ``_run_agent`` catches the shared error
+    behind its local import and re-raises this one.
+    """
+
+
 async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     from claude_agent_sdk import ClaudeSDKClient, ResultMessage
 
@@ -1264,6 +1303,11 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     from orchestrator.options import (
         build_issue_investigator_options,
         build_issue_investigator_options_from_plan,
+    )
+    from orchestrator.subagent_wait import (
+        LiveTaskLedger,
+        OrphanedSubagentError,
+        drain_until_settled,
     )
 
     mode = _resolver_mode()
@@ -1290,24 +1334,65 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
             # Read/Glob/Grep; mctl tools are supplementary, not required.
             await ensure_mctl_connected(client, fatal=False)
         await client.query(prompt)
-        async for message in client.receive_response():
-            print(message)
-            # The CLI's final message for a run that never got a completion —
-            # e.g. the account's five_hour/seven_day usage limit was already
-            # exhausted before the first turn — is a ResultMessage with
-            # is_error=True and api_error_status=429 (emitted since CLI
-            # v2.1.110), NOT a raised exception. Surface it as one here so the
-            # normal except-clause plumbing in investigate() below can tell it
-            # apart from an agent/tooling failure.
-            if (
-                isinstance(message, ResultMessage)
-                and message.is_error
-                and message.api_error_status == 429
-            ):
-                raise RateLimitExhaustedError(
-                    f"SDK reported api_error_status=429 (rate/usage limit "
-                    f"exhausted): {message.result!r}"
+        ledger = LiveTaskLedger()
+        # receive_messages(), NOT receive_response(): the latter returns at the
+        # first ResultMessage, and a ResultMessage ends one TURN, not the RUN.
+        # When the CLI launches a sub-agent asynchronously the top-level
+        # session ends its turn with the child still working, and returning
+        # here abandons it -- for this driver, silently producing no proposal
+        # triplet at all. mctl-agents#366.
+        #
+        # One generator for both phases: every receive_messages() call returns
+        # a fresh generator over the same underlying stream, so a second one
+        # would split the messages with the first.
+        # cast: receive_messages() is declared AsyncIterator but is an async
+        # generator, so it does have aclose(). aclosing() is what guarantees it
+        # is closed on the error paths below.
+        stream = cast("AsyncGenerator[Any, None]", client.receive_messages())
+        async with aclosing(stream):
+            async for message in stream:
+                print(message)
+                ledger.observe(message)
+                # Also stop on stream exhaustion (the `async for` ending on its
+                # own): that means the CLI exited.
+                if isinstance(message, ResultMessage):
+                    # The CLI's final message for a run that never got a
+                    # completion — e.g. the account's five_hour/seven_day usage
+                    # limit was already exhausted before the first turn — is a
+                    # ResultMessage with is_error=True and api_error_status=429
+                    # (emitted since CLI v2.1.110), NOT a raised exception.
+                    # Surface it as one here so the normal except-clause
+                    # plumbing in investigate() below can tell it apart from an
+                    # agent/tooling failure. Checked before the drain: an
+                    # out-of-quota account has no live child to wait for, and
+                    # the quota verdict is the one the caller must act on.
+                    if message.is_error and message.api_error_status == 429:
+                        raise RateLimitExhaustedError(
+                            f"SDK reported api_error_status=429 (rate/usage "
+                            f"limit exhausted): {message.result!r}"
+                        )
+                    break
+            if ledger.live:
+                print(
+                    f"info: turn ended with {ledger.describe()}; "
+                    f"awaiting terminal status"
                 )
+                try:
+                    await drain_until_settled(
+                        stream,
+                        ledger,
+                        timeout_s=INVESTIGATOR_DRAIN_TIMEOUT_SECONDS,
+                    )
+                except OrphanedSubagentError as exc:
+                    raise InvestigatorOrphanedSubagent(
+                        f"orphaned sub-agent: {exc}"
+                    ) from exc
+            if not ledger.all_completed:
+                # Quiescent, so NOT an orphan: nothing is still writing into
+                # the staging directory, and the triplet check in investigate()
+                # is the right adjudicator. Logged so the distinction is
+                # visible in the Argo log.
+                print(f"warn: {ledger.describe()}")
 
 
 @dataclass
@@ -1866,6 +1951,19 @@ def investigate(
         )
     except SystemExit as e:
         return InvestigateResult(service, slug, proposal_dir, error=f"SystemExit: {e}")
+    except InvestigatorOrphanedSubagent as e:
+        # Caught explicitly, ahead of the generic branch below, so the result
+        # message names a platform handoff we lost rather than reading as "the
+        # agent broke on this issue". Nothing structured is added: this driver
+        # reports through InvestigateResult.error, not exit codes, and
+        # `rate_limited` stays the only flag any caller branches on.
+        return InvestigateResult(
+            service, slug, proposal_dir,
+            error=(
+                f"harness failure — the run ended with a delegated sub-agent "
+                f"still live, so its work was discarded: {e}"
+            ),
+        )
     except RateLimitExhaustedError as e:
         # Must be caught before the generic Exception branch below — same
         # exception hierarchy, but this one carries a distinguishable

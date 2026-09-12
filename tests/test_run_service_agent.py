@@ -14,6 +14,13 @@ from __future__ import annotations
 import types
 
 import anyio
+import pytest
+from claude_agent_sdk import (
+    ResultMessage,
+    TaskNotificationMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
+)
 
 from orchestrator import run_service_agent as rsa
 from tests.conftest import fake_mcp_client_factory
@@ -56,3 +63,200 @@ def test_mcp_not_configured_skips_status_check_entirely(monkeypatch):
     _stub_build_options(monkeypatch, mcp_servers={})
     monkeypatch.setattr(rsa, "ClaudeSDKClient", fake_mcp_client_factory())
     anyio.run(rsa.run_service_agent, "mctl-agent")  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Awaiting an async-launched sub-agent (mctl-agents#366)
+#
+# `ResultMessage` ends one TURN, not the RUN. `receive_response()` returns at
+# the first one by contract, so the pre-#366 driver abandoned any sub-agent the
+# CLI had launched asynchronously (`isAsync: True`, `status: "async_launched"`).
+# This driver is exposed in practice, not just in principle: its prompt walks
+# four steps named after the `.claude/agents/{researcher,analyst,spec-writer}.md`
+# personas that `setting_sources=["project"]` loads from the agent's own cwd.
+#
+# Draining is sound here only because `build_service_agent_options` passes
+# `hooks=_command_audit_hooks()` — the SDK keeps stdin (and so the CLI
+# subprocess) open past the result frame while tasks are in flight, but ONLY
+# when `sdk_mcp_servers or hooks` is truthy. Pinned by the last test below.
+# ---------------------------------------------------------------------------
+class _StreamingClient:
+    """Like conftest's FakeMcpClient, but `messages` is an async-generator
+    factory so a test can block the stream or record what was consumed."""
+
+    def __init__(self, *, options, messages):
+        self._messages = messages
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def query(self, prompt):
+        pass
+
+    async def receive_messages(self):
+        async for message in self._messages():
+            yield message
+
+
+def _streaming_factory(messages):
+    def _factory(*, options):
+        return _StreamingClient(options=options, messages=messages)
+    return _factory
+
+
+def _task_started(task_id="t1", task_type="local_agent"):
+    return TaskStartedMessage(
+        subtype="task_started", data={}, task_id=task_id,
+        description="research deps", uuid="u", session_id="s",
+        task_type=task_type,
+    )
+
+
+def _task_updated(task_id="t1", status="completed"):
+    return TaskUpdatedMessage(
+        subtype="task_updated", data={}, task_id=task_id,
+        patch={"status": status}, status=status,
+    )
+
+
+def _result():
+    return ResultMessage(
+        subtype="success", duration_ms=1, duration_api_ms=0, is_error=False,
+        num_turns=4, session_id="s", total_cost_usd=0.1,
+    )
+
+
+def test_service_agent_waits_for_async_launched_subagent(monkeypatch):
+    """The headline regression: fails without the drain.
+
+    `consumed` is the real assertion — returning normally is not enough, the
+    driver must have read *past* the ResultMessage to see the child settle.
+    """
+    _stub_build_options(monkeypatch, mcp_servers={})
+    consumed: list[object] = []
+
+    async def messages():
+        for message in (_task_started(), _result(), _task_updated()):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
+
+    anyio.run(rsa.run_service_agent, "mctl-agent")
+
+    assert any(isinstance(m, TaskUpdatedMessage) for m in consumed), (
+        "driver stopped at the ResultMessage and abandoned the live sub-agent"
+    )
+
+
+def test_service_agent_returns_immediately_when_no_tasks_are_live(monkeypatch):
+    """Runs without a delegated child must not pay for the drain."""
+    _stub_build_options(monkeypatch, mcp_servers={})
+    consumed: list[object] = []
+
+    async def messages():
+        for message in ("chatter", _result(), _task_updated()):
+            consumed.append(message)
+            yield message
+
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+
+    anyio.run(rsa.run_service_agent, "mctl-agent")
+
+    assert not any(isinstance(m, TaskUpdatedMessage) for m in consumed)
+
+
+def test_service_agent_raises_orphaned_when_task_never_settles(monkeypatch):
+    _stub_build_options(monkeypatch, mcp_servers={})
+
+    async def messages():
+        yield _task_started()
+        yield _result()
+        await anyio.sleep(10)
+
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(rsa.ServiceAgentOrphanedSubagent, match=r"orphaned sub-agent:"):
+        anyio.run(rsa.run_service_agent, "mctl-agent")
+
+
+def test_service_agent_raises_orphaned_when_stream_ends_with_live_task(monkeypatch):
+    """The CLI exited while the child was still live."""
+    _stub_build_options(monkeypatch, mcp_servers={})
+
+    async def messages():
+        yield _task_started()
+        yield _result()
+
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
+
+    with pytest.raises(rsa.ServiceAgentOrphanedSubagent):
+        anyio.run(rsa.run_service_agent, "mctl-agent")
+
+
+def test_service_agent_does_not_orphan_on_failed_terminal_status(monkeypatch, capsys):
+    """A failed child is quiescent, not orphaned — warn, do not raise.
+
+    Whatever it wrote into inbox/ or proposals/ is on disk and the mentor will
+    read it; nothing is still mutating the agent directory.
+    """
+    _stub_build_options(monkeypatch, mcp_servers={})
+
+    async def messages():
+        yield _task_started()
+        yield _result()
+        yield TaskNotificationMessage(
+            subtype="task_notification", data={}, task_id="t1", status="failed",
+            output_file="/dev/null", summary="boom", uuid="u", session_id="s",
+        )
+
+    monkeypatch.setattr(rsa, "ClaudeSDKClient", _streaming_factory(messages))
+    monkeypatch.setattr(rsa, "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", 5)
+
+    anyio.run(rsa.run_service_agent, "mctl-agent")
+
+    out = capsys.readouterr().out
+    assert "warn:" in out and "failed" in out
+
+
+def test_orphan_does_not_tear_down_the_sibling_agents(monkeypatch, capsys):
+    """run_all's per-service guard must keep catching it.
+
+    ServiceAgentOrphanedSubagent subclasses RuntimeError, so `_safe_run_service`
+    logs and drops it — one orphaned agent must not cancel the other agents
+    sharing its task group, which is the failure mode that guard exists for.
+    """
+    from orchestrator import run_all
+
+    async def _boom(service):
+        raise rsa.ServiceAgentOrphanedSubagent("orphaned sub-agent: t1 still live")
+
+    monkeypatch.setattr(run_all, "run_service_agent", _boom)
+    anyio.run(run_all._safe_run_service, "mctl-agent")  # must not raise
+
+    assert "ServiceAgentOrphanedSubagent" in capsys.readouterr().err
+
+
+def test_service_agent_options_keep_the_hooks_the_drain_depends_on(tmp_path):
+    """The precondition, pinned.
+
+    The SDK holds the CLI subprocess open past the result frame only when
+    `sdk_mcp_servers or hooks` is truthy. Every mctl MCP server this repo
+    configures is `type: "http"`, so `sdk_mcp_servers` is always empty and
+    `hooks` is the whole precondition. Drop them and the drain becomes a wait
+    for a child nobody is keeping alive.
+    """
+    from orchestrator.options import build_service_agent_options
+
+    options = build_service_agent_options(tmp_path, "claude-sonnet-4-5")
+    assert options.hooks, "service-agent lost the hooks the #366 drain relies on"
+    assert not any(
+        isinstance(cfg, dict) and cfg.get("type") == "sdk"
+        for cfg in (options.mcp_servers or {}).values()
+    ), "an SDK-MCP server would also satisfy the precondition — update this test"

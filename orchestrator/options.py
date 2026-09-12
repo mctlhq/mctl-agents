@@ -123,6 +123,30 @@ IMPLEMENTER_TIMEOUT_SECONDS = float(
 IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
     "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", default=300.0
 )
+# The same sub-deadline for the other two drivers that drain (mctl-agents#368),
+# kept beside the implementer's so the family is read and changed together, and
+# read through the same clamp: a knob that documents itself as tunable while
+# silently doing nothing is bad in every mode, even where the blast radius is
+# smaller (neither of these goes through the shepherd's classification).
+#
+# Both modes have the precondition the drain rests on -- their builders below
+# pass `hooks=_command_audit_hooks()`, and the SDK holds the CLI subprocess
+# open past a result frame only when `sdk_mcp_servers or hooks` is truthy.
+#
+# service-agent: its prompt walks four steps named after the
+# `.claude/agents/{researcher,analyst,spec-writer}.md` personas that
+# setting_sources=["project"] loads from cwd, so there are real sub-agents to
+# delegate to.
+SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
+    "SERVICE_AGENT_DRAIN_TIMEOUT_SECONDS", default=300.0
+)
+# issue-investigator: cwd is a fresh clone of the TARGET repository, so
+# setting_sources=["project"] loads whatever `.claude/agents/*.md` that
+# repository ships. An orphan here writes no requirements/design/tasks triplet
+# at all, so the whole downstream pipeline gets nothing.
+ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
+    "ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS", default=300.0
+)
 # Bound every synchronous git/gh command as well.  The model-stream timeout
 # above cannot interrupt a clone, fetch, or push that has stalled before or
 # after the SDK call.
