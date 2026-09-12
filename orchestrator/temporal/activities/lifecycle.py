@@ -120,7 +120,25 @@ def _payload(req: OwnershipRequest) -> dict[str, Any]:
     ):
         if value:
             body[key] = value
-    if req.epoch:
+    if req.epoch and req.op != "acquire":
+        # NOT on acquire, matching LifecycleClient.acquire, which takes no
+        # epoch at all. The epoch is a fencing precondition on a write against
+        # an existing claim; an acquire asserting one is asking the server to
+        # refuse unless the caller's belief about the generation still holds.
+        #
+        # That is exactly wrong on the path DevLoopWorkflow now recovers by:
+        # an UNOWNED progress result falls through to the heartbeat acquire,
+        # which re-establishes the claim — asserting the epoch the reconciler
+        # already superseded turns that into a 412, no re-acquire happens, and
+        # because _owned_entity_id is not cleared on UNOWNED the loop stays on
+        # the claimed path, where the heartbeat acquire is the only liveness
+        # write. It then stops refreshing last_seen_at for the rest of the
+        # watch.
+        #
+        # This was the last place the two transports built the same request
+        # differently. `answer_from` normalises the RESPONSE and cannot see a
+        # divergence in the REQUEST, so it is the one axis the shared contract
+        # does not protect, and it needs a test comparing bodies.
         body["epoch"] = req.epoch
     return body
 

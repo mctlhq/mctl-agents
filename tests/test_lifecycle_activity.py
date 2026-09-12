@@ -199,3 +199,44 @@ def test_accepted_is_carried_from_the_answer(monkeypatch: pytest.MonkeyPatch) ->
     for status in (409, 503, 404):
         failed = _run(monkeypatch, _respond(status, {"error": "no"}))
         assert failed.accepted is False, status
+
+
+def test_acquire_sends_no_epoch_and_the_other_ops_do(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The last place the two transports built the same request differently.
+
+    `LifecycleClient.acquire` takes no epoch at all: the epoch is a fencing
+    precondition on a write against an EXISTING claim, and an acquire asserting
+    one asks the server to refuse unless the caller's belief about the
+    generation still holds.
+
+    That is wrong on the path the workflow now recovers by. An UNOWNED progress
+    result falls through to the heartbeat acquire, which re-establishes the
+    claim; asserting the epoch the reconciler already superseded turns it into
+    a 412, so no re-acquire happens — and since `_owned_entity_id` is not
+    cleared on UNOWNED the loop stays on the claimed path, where the heartbeat
+    acquire is the only liveness write, and stops refreshing `last_seen_at` for
+    the rest of the watch.
+
+    `answer_from` normalises the RESPONSE and cannot see a divergence in the
+    REQUEST, so this is the one axis the shared contract does not protect and
+    the only one that needs a test comparing bodies.
+    """
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen[request.url.path] = json.loads(request.content)
+        return httpx.Response(200, content=json.dumps(_record()).encode())
+
+    _run(monkeypatch, handler, _req(op="acquire", epoch=7))
+    assert "epoch" not in seen["/api/v1/lifecycle/ownership/acquire"]
+
+    # The other direction: every op for which the epoch IS the precondition
+    # still sends it, or the fence stops fencing.
+    for op, path in (
+        ("progress", "/api/v1/lifecycle/ownership/progress"),
+        ("release", "/api/v1/lifecycle/ownership/release"),
+        ("terminal", "/api/v1/lifecycle/ownership/terminal"),
+        ("handoff-start", "/api/v1/lifecycle/ownership/handoff/start"),
+    ):
+        _run(monkeypatch, handler, _req(op=op, epoch=7, evidence="x", to_owner_type="shepherd", to_owner_id="cron"))
+        assert seen[path].get("epoch") == 7, op

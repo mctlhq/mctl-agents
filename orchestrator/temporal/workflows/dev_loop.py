@@ -45,7 +45,7 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, EntityRef
+    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, WROTE_NO_RECORD, EntityRef
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -1263,12 +1263,24 @@ class DevLoopWorkflow:
                     repo, number, result.owner_type, result.owner_id,
                 )
                 self._claim_refused = True
-            elif result is not None and result.accepted:
+            elif result is not None and result.verdict == WROTE_NO_RECORD:
                 # The server took the write and told us nothing more (a
                 # body-less 2xx). It is not a claim — nothing is known about
                 # who owns the entity — but it is also not a failure, and
                 # silently taking neither branch is how a loop ends up never
                 # claiming and never backing off.
+                #
+                # On the VERDICT, not on `accepted`: accepted is also True
+                # for a 2xx that carried a released record, which is a
+                # different situation this arm would then claim to describe.
+                #
+                # Honestly: today the two predicates are behaviourally
+                # identical, because the else arm below increments the same
+                # counter, so the difference is only what the log says and no
+                # test can separate them. Written this way because the log line
+                # asserts "with no record", and because the next person to give
+                # either arm its own behaviour should find the accurate
+                # predicate already there rather than a coincidence.
                 workflow.logger.info(
                     "lifecycle: acquire for %s#%s was accepted with no record; "
                     "no claim recorded this poll",
@@ -1313,6 +1325,24 @@ class DevLoopWorkflow:
                 # landed progress write IS this poll's heartbeat.
                 self._owned_head_sha = head
                 self._owner_epoch = result.epoch or self._owner_epoch
+                self._unknown_progress = 0
+                return
+            if result is not None and result.verdict == WROTE_NO_RECORD:
+                # A body-less 2xx. The write LANDED — it simply carried no
+                # record — so the head must advance, and counting it as
+                # unanswered would be the opposite of what the gate is for.
+                #
+                # Without this arm the same evidence is re-sent for the rest of
+                # the watch, because _owned_head_sha never advances. That
+                # refreshes last_progress_at forever for a head that stopped
+                # moving, so the stuck bound can NEVER fire — the one property
+                # the liveness/progress split exists to provide. Throttling to
+                # the heartbeat cadence does not help: a refresh every two
+                # hours clears a stuck bound just as well as one every thirty
+                # seconds.
+                #
+                # No epoch came back, so the caller keeps the one it had.
+                self._owned_head_sha = head
                 self._unknown_progress = 0
                 return
             if result is not None and result.verdict == OWNED_BY_OTHER:

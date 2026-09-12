@@ -93,6 +93,7 @@ def _fake_activities(
     ownership_lost_after: int | None = None,
     ownership_progress_fails: bool = False,
     ownership_progress_unowned: bool = False,
+    ownership_body_less: str | None = None,
     ownership_terminal_fails: bool = False,
     ownership_raises: bool = False,
 ):
@@ -247,6 +248,12 @@ def _fake_activities(
             )
         if ownership_terminal_fails and req.op == "terminal":
             return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_body_less is not None and req.op == ownership_body_less:
+            # A body-less 2xx: mctl-api took the write and returned no record.
+            # `answer_from` answers WROTE_NO_RECORD for it, and no fake in this
+            # file produced that verdict, so neither branch that reads it had
+            # workflow-level cover.
+            return OwnershipResult(verdict="wrote-no-record", accepted=True)
         if ownership_progress_unowned and req.op == "progress":
             # The reconciler already released the row underneath this loop, so
             # the progress write lands on nothing. Neither owned-by-me nor
@@ -1176,6 +1183,67 @@ class TestDevLoopWorkflow:
         # liveness fix this back-off sits on top of must survive it.
         first = [o.op for o in ops].index("progress")
         assert "acquire" in [o.op for o in ops][first:], [o.op for o in ops]
+
+    async def test_a_body_less_2xx_on_progress_is_a_landed_write(self, env):
+        """`answer_from` answers WROTE_NO_RECORD for a body-less 2xx, and every
+        call on this path is a mutation — but the progress branch had no arm
+        for it, so a 204 landed on `_unknown_progress += 1`.
+
+        The write succeeded server-side while `_owned_head_sha` never advanced,
+        so the identical evidence was re-sent for the rest of the watch. That
+        refreshes `last_progress_at` forever for a head that stopped moving, so
+        the stuck bound can NEVER fire — the one property the liveness/progress
+        split exists to provide. Throttling to the heartbeat cadence does not
+        save it: a refresh every two hours clears a stuck bound as well as one
+        every thirty seconds. It also counted a successful write as an
+        unanswered one, the opposite of what the gate is for.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 12 + [MERGED_PR],
+            issue=918,
+            ownership_body_less="progress",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) == 1, (
+            "a landed progress write was re-sent for a head that never moved "
+            f"again: {[(o.op, o.version[:8]) for o in ops]}"
+        )
+
+    async def test_a_body_less_2xx_on_acquire_is_not_a_claim(self, env):
+        """A body-less acquire is not a claim.
+
+        Nothing is known about who owns the entity, and it must count toward
+        the back-off rather than silently taking no branch at all — which is
+        what this pins, and which no fake produced before.
+
+        It does NOT pin the choice of predicate. The arm reads
+        `verdict == WROTE_NO_RECORD` rather than `accepted`, which is the
+        accurate one, but the else arm increments the same counter, so the two
+        are behaviourally identical today and swapping them leaves this test
+        green. That is stated on the arm itself rather than asserted here.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 12 + [MERGED_PR],
+            issue=919,
+            ownership_body_less="acquire",
+        )
+        # No claim was recorded, so nothing but acquires was ever attempted...
+        assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
+        # ...and it counted toward the back-off rather than being ignored.
+        assert len(ops) < 12, f"a body-less acquire was never counted: {len(ops)}"
+        assert len(ops) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, len(ops)
 
     async def test_progress_is_recorded_only_when_the_head_moves(self, env):
         """A poll that observed nothing new must not write progress.
