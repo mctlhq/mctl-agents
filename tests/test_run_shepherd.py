@@ -510,6 +510,55 @@ def test_decide_never_returns_merge_for_academy() -> None:
         assert decision != "merge"
 
 
+def test_gitops_can_never_resolve_to_full_merge(monkeypatch, capsys) -> None:
+    """mctl-gitops is code-gated, not config-gated.
+
+    Raised as a P1 by agy on mctlhq/mctl-gitops#1202. The chain it described —
+    shepherd pushes a fix, something auto-merges it, ArgoCD applies it to the
+    cluster — does not close today, because three separate things stop it: the
+    shepherd defers (fix-only), the pr-steward's config sets merge_mode
+    "never" for this repo, and auto-merge.yml only fires on `claude/` head
+    branches while agent PRs are `feat/agents-*`.
+
+    All three are CONFIGURATION. This asserts the code-level guarantee that
+    survives any of them being edited: with BOTH env lists empty — the state a
+    careless gitops edit produces — mctl-gitops must still not resolve to FULL.
+    Merging this repository is deployment, not a change awaiting a release.
+    """
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset())
+
+    assert run_shepherd._service_mode("mctl-gitops") == run_shepherd.FIX_ONLY
+    # Even the operator escape hatch cannot widen it.
+    assert (
+        run_shepherd._service_mode("mctl-gitops", force_fix_only=True)
+        == run_shepherd.FIX_ONLY
+    )
+
+    # merge_pr refuses independently of mode, without spending a token or a
+    # subprocess — two guards, not one dressed up as two.
+    pr = make_pr()
+    pr.repo = "mctlhq/mctl-gitops"
+    with patch.object(run_shepherd, "subprocess") as mocked_subprocess, \
+         patch.object(run_shepherd, "refresh_github_token") as mocked_refresh:
+        result = run_shepherd.merge_pr(pr)
+    assert result == (False, None)
+    mocked_subprocess.run.assert_not_called()
+    mocked_refresh.assert_not_called()
+    assert "error:" in capsys.readouterr().out
+
+
+def test_gitops_deferred_merge_owner_is_human_not_steward() -> None:
+    """The steward's config sets merge_mode "never" for mctl-gitops, so
+    recording `pr-steward` as the deferred merge owner named an actor that was
+    never going to merge it. `human-codeowner` is what actually happens."""
+    assert run_shepherd._merge_owner_for("mctl-gitops") == "human-codeowner"
+    assert run_shepherd._merge_owner_for("mctl-academy") == "human-codeowner"
+    # Unchanged for the genuinely steward-owned repos.
+    assert run_shepherd._merge_owner_for("mctl-telegram") == "pr-steward"
+    assert run_shepherd._merge_owner_for("mctl-design") == "pr-steward"
+
+
 def test_main_rejects_fix_only_with_reconcile(tmp_path, monkeypatch) -> None:
     """T13: --fix-only --reconcile exits with code 2."""
     state_dir = tmp_path / "agents-state"
