@@ -26,19 +26,14 @@ import urllib.request
 from typing import Any
 
 from orchestrator.lifecycle.contract import (
-    OWNED_BY_ME,
-    OWNED_BY_OTHER,
-    STATE_ACTIVE,
-    STATE_HANDING_OFF,
-    STATE_RELEASED,
-    STATE_TERMINAL,
     UNKNOWN,
     UNOWNED,
-    WROTE_NO_RECORD,
     EntityRef,
     Owner,
     Ownership,
     OwnershipAnswer,
+    answer_from,
+    verdict_for,
 )
 
 DEFAULT_TIMEOUT_S = 10
@@ -152,7 +147,7 @@ class OwnershipClient:
             )
         except OwnershipUnavailable as exc:
             return OwnershipAnswer(verdict=UNKNOWN, reason=str(exc))
-        return _answer(res, asking, is_read=True)
+        return answer_from(res.status, res.payload, asking, is_read=True, path=res.status_path)
 
     def get_many(
         self, kind: str, phase: str, ids: list[str], asking: Owner | None = None
@@ -205,7 +200,7 @@ class OwnershipClient:
             if own is None:
                 out[i] = OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised record")
                 continue
-            out[i] = OwnershipAnswer(verdict=_verdict_for(own, asking), ownership=own)
+            out[i] = OwnershipAnswer(verdict=verdict_for(own, asking), ownership=own)
         return out
 
     # -- writes ---------------------------------------------------------
@@ -287,7 +282,7 @@ class OwnershipClient:
             res = self._request("POST", path, payload)
         except OwnershipUnavailable as exc:
             return OwnershipAnswer(verdict=UNKNOWN, reason=str(exc))
-        return _answer(res, owner)
+        return answer_from(res.status, res.payload, owner, path=res.status_path)
 
 
 class _HTTPResult:
@@ -315,82 +310,3 @@ def _error_of(res: _HTTPResult) -> str:
     return str(res.payload.get("error") or f"HTTP {res.status}")
 
 
-# The two states in which the record still holds the entity, and the two in
-# which it has let go. Both lists are CLOSED, and a state in neither is
-# deliberately not classified — see _verdict_for.
-_HOLDING_STATES = frozenset({STATE_ACTIVE, STATE_HANDING_OFF})
-_FREE_STATES = frozenset({STATE_RELEASED, STATE_TERMINAL})
-
-
-def _verdict_for(own: Ownership, asking: Owner | None) -> str:
-    """Turn a record into an answer.
-
-    ``state`` is load-bearing, and this function has had it wrong twice in
-    opposite directions.
-
-    First it ignored state entirely. A released or terminal row still names an
-    owner, so that answered OWNED_BY_OTHER for an entity explicitly handed
-    back — and since UNKNOWN and OWNED_BY_OTHER both set ``blocks_others``, the
-    next actor stood down forever on a PR nobody owned.
-
-    The fix classified anything *outside* the holding set as free, which fails
-    the other way: a holding state added server-side and unknown to this image
-    — this client is deployed in a container image that lags mctl-api by a
-    release — would read as UNOWNED, and a second actor would act alongside the
-    true owner. That is worse than the bug it replaced: the first mistake made
-    the system too timid, this one makes it act.
-
-    So both sets are closed and a state in neither is UNKNOWN. Uncertainty
-    resolves toward "do not act", which is the same rule the verdict itself
-    encodes — an unrecognised state is exactly as much of an unknown as an
-    unreachable store.
-    """
-    if own.state in _FREE_STATES:
-        return UNOWNED
-    if own.state not in _HOLDING_STATES:
-        return UNKNOWN
-    if asking is not None and own.owner == asking and own.healthy:
-        return OWNED_BY_ME
-    return OWNED_BY_OTHER
-
-
-def _answer(res: _HTTPResult, asking: Owner | None, *, is_read: bool = False) -> OwnershipAnswer:
-    if 200 <= res.status < 300:
-        # A 200 whose body is not an ownership record is a surprise, not an
-        # answer. Parsing it into an all-empty record would produce a confident
-        # OWNED_BY_OTHER with no reason — a wrong answer stated as firmly as a
-        # right one.
-        own = Ownership.from_payload(res.payload)
-        if own is None:
-            if not is_read and not res.payload:
-                # A body-less 2xx on a mutating call means the write SUCCEEDED
-                # and told us nothing more. Reporting UNKNOWN would make it
-                # indistinguishable from a 503, and a caller gating its local
-                # state on the result could never record a successful release.
-                return OwnershipAnswer(
-                    verdict=WROTE_NO_RECORD, reason=f"{res.status} with no body"
-                )
-            return OwnershipAnswer(
-                verdict=UNKNOWN, reason=f"no ownership record in a {res.status} response"
-            )
-        verdict = _verdict_for(own, asking)
-        reason = "" if verdict != UNKNOWN else f"unrecognised ownership state {own.state!r}"
-        return OwnershipAnswer(verdict=verdict, ownership=own, reason=reason)
-    if res.status == 404 and is_read:
-        return OwnershipAnswer(verdict=UNOWNED, reason="no record")
-    if res.status == 404:
-        # On a WRITE a 404 is not "no such row". POST /acquire has no
-        # not-found semantics, so a 404 there is a missing route, a wrong base
-        # path, or an ingress answering for something else — and answering
-        # UNOWNED would set blocks_others False for EVERY entity asked. That is
-        # fail-open, in the one place in this module that can produce it.
-        return OwnershipAnswer(verdict=UNKNOWN, reason=f"404 from {res.status_path or 'a write'}")
-    if res.status == 409:
-        raw = res.payload.get("ownership")
-        own = Ownership.from_payload(raw) if isinstance(raw, dict) else None
-        return OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=own, reason=_error_of(res))
-    # 412, 503, 5xx, 401/403 — every one of these means "I could not establish
-    # ownership", which is UNKNOWN and never UNOWNED. A 412 in particular means
-    # the record moved underneath the caller, which is the strongest possible
-    # reason not to act on a stale belief.
-    return OwnershipAnswer(verdict=UNKNOWN, reason=_error_of(res))
