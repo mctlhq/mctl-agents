@@ -57,11 +57,18 @@ def merge_authority_for(service: str) -> str:
     """
     from orchestrator import run_shepherd
 
-    if service in run_shepherd.NEVER_MERGE_SERVICES:
-        return OWNER_HUMAN_CODEOWNER
+    # Delegated, not re-derived. run_shepherd._merge_owner_for is the existing
+    # answer and this module's whole purpose is to stop there being two of
+    # them; a second copy of the NEVER_MERGE_SERVICES rule here would drift
+    # from the one merge_pr actually enforces.
+    #
+    # The one thing added on top is the FULL case, which that function does not
+    # express because it is only ever called on a deferred merge: a service the
+    # shepherd merges itself is owned by the shepherd, not handed anywhere.
     if run_shepherd._service_mode(service) == run_shepherd.FULL:
         return OWNER_SHEPHERD
-    return OWNER_PR_STEWARD
+    owner = run_shepherd._merge_owner_for(service)
+    return OWNER_HUMAN_CODEOWNER if owner == "human-codeowner" else OWNER_PR_STEWARD
 
 
 def policy_ref_for(service: str) -> str:

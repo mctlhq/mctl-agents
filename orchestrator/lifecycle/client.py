@@ -30,6 +30,8 @@ from orchestrator.lifecycle.contract import (
     OWNED_BY_OTHER,
     STATE_ACTIVE,
     STATE_HANDING_OFF,
+    STATE_RELEASED,
+    STATE_TERMINAL,
     UNKNOWN,
     UNOWNED,
     EntityRef,
@@ -117,6 +119,10 @@ class OwnershipClient:
         try:
             with self._opener.open(req, timeout=self._timeout) as resp:
                 body = resp.read()
+                # The real code, not a hardcoded 200: a 204 on a mutating call
+                # would otherwise parse as an empty body and be reported as an
+                # unrecognised 200.
+                status = resp.getcode() or 200
         except urllib.error.HTTPError as exc:
             # exc.read() is a SECOND network read, on a connection that has
             # already produced an error status. It can time out or reset, and
@@ -131,7 +137,7 @@ class OwnershipClient:
         except Exception as exc:
             raise OwnershipUnavailable(str(exc)) from exc
         try:
-            return _HTTPResult(status=200, payload=json.loads(body or b"{}"))
+            return _HTTPResult(status=status, payload=json.loads(body or b"{}"))
         except ValueError as exc:
             raise OwnershipUnavailable(f"malformed response: {exc}") from exc
 
@@ -150,7 +156,7 @@ class OwnershipClient:
     def get_many(
         self, kind: str, phase: str, ids: list[str], asking: Owner | None = None
     ) -> dict[str, OwnershipAnswer]:
-        """One round trip for the whole sweep.
+        """The whole sweep in as few round trips as the URL allows.
 
         The per-proposal fan-out this replaces needed a thread pool and a
         60-second wall-clock budget, and anything the budget did not answer was
@@ -176,7 +182,7 @@ class OwnershipClient:
             res = self._request("GET", query)
         except OwnershipUnavailable as exc:
             return {i: OwnershipAnswer(verdict=UNKNOWN, reason=str(exc)) for i in ids}
-        if res.status != 200:
+        if not (200 <= res.status < 300):
             reason = _error_of(res)
             return {i: OwnershipAnswer(verdict=UNKNOWN, reason=reason) for i in ids}
         raw_found = res.payload.get("ownership")
@@ -295,38 +301,60 @@ def _error_of(res: _HTTPResult) -> str:
     return str(res.payload.get("error") or f"HTTP {res.status}")
 
 
-# States in which the record still holds the entity. Anything else means the
-# previous owner let go, and the entity is free.
+# The two states in which the record still holds the entity, and the two in
+# which it has let go. Both lists are CLOSED, and a state in neither is
+# deliberately not classified — see _verdict_for.
 _HOLDING_STATES = frozenset({STATE_ACTIVE, STATE_HANDING_OFF})
+_FREE_STATES = frozenset({STATE_RELEASED, STATE_TERMINAL})
 
 
 def _verdict_for(own: Ownership, asking: Owner | None) -> str:
     """Turn a record into an answer.
 
-    ``state`` is load-bearing and was missing from the first version of this
-    function. A released or terminal row still names an owner, so ignoring the
-    state answered OWNED_BY_OTHER for an entity that had been explicitly handed
+    ``state`` is load-bearing, and this function has had it wrong twice in
+    opposite directions.
+
+    First it ignored state entirely. A released or terminal row still names an
+    owner, so that answered OWNED_BY_OTHER for an entity explicitly handed
     back — and since UNKNOWN and OWNED_BY_OTHER both set ``blocks_others``, the
-    next actor would have stood down forever on a PR nobody owned. That is the
-    zero-owner gap this package exists to close, reintroduced from the other
-    side.
+    next actor stood down forever on a PR nobody owned.
+
+    The fix classified anything *outside* the holding set as free, which fails
+    the other way: a holding state added server-side and unknown to this image
+    — this client is deployed in a container image that lags mctl-api by a
+    release — would read as UNOWNED, and a second actor would act alongside the
+    true owner. That is worse than the bug it replaced: the first mistake made
+    the system too timid, this one makes it act.
+
+    So both sets are closed and a state in neither is UNKNOWN. Uncertainty
+    resolves toward "do not act", which is the same rule the verdict itself
+    encodes — an unrecognised state is exactly as much of an unknown as an
+    unreachable store.
     """
-    if own.state and own.state not in _HOLDING_STATES:
+    if own.state in _FREE_STATES:
         return UNOWNED
+    if own.state not in _HOLDING_STATES:
+        return UNKNOWN
     if asking is not None and own.owner == asking and own.healthy:
         return OWNED_BY_ME
     return OWNED_BY_OTHER
 
 
 def _answer(res: _HTTPResult, asking: Owner | None) -> OwnershipAnswer:
-    if res.status == 200:
+    if 200 <= res.status < 300:
         # A 200 whose body is not an ownership record is a surprise, not an
         # answer. Parsing it into an all-empty record would produce a confident
         # OWNED_BY_OTHER with no reason — a wrong answer stated as firmly as a
         # right one.
         own = Ownership.from_payload(res.payload)
         if own is None:
-            return OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised 200 payload")
+            # The status is in the message because it is not always 200: a
+            # mutating call that answers 204 carries no record either, and
+            # reporting that as a malformed 200 would send a reader looking for
+            # a bug that is not there.
+            return OwnershipAnswer(
+                verdict=UNKNOWN, reason=f"no ownership record in a {res.status} response"
+            )
         return OwnershipAnswer(verdict=_verdict_for(own, asking), ownership=own)
     if res.status == 404:
         return OwnershipAnswer(verdict=UNOWNED, reason="no record")

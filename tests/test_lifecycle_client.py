@@ -32,6 +32,20 @@ OTHER = Owner(type="shepherd", id="cron")
 
 
 class _FakeResponse(io.BytesIO):
+    """Mimics the parts of a urllib response the client actually uses.
+
+    getcode() is one of them: the client reads the real status rather than
+    assuming 200, so a fake without it would make every success look like a
+    transport failure — and the test would pass for the wrong reason.
+    """
+
+    def __init__(self, data: bytes, status: int = 200) -> None:
+        super().__init__(data)
+        self._status = status
+
+    def getcode(self) -> int:
+        return self._status
+
     def __enter__(self) -> _FakeResponse:
         return self
 
@@ -294,3 +308,54 @@ def test_batch_unrecognised_payload_is_unknown_not_unowned(monkeypatch: pytest.M
         ENTITY.kind, PHASE, ["mctlhq/a#1", "mctlhq/b#2"], asking=ME
     )
     assert all(a.verdict == UNKNOWN for a in out.values())
+
+
+def test_unrecognised_state_is_unknown_not_free(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The direction this function got wrong the second time.
+
+    Classifying anything outside the holding set as free fails OPEN: a holding
+    state added server-side and unknown to this image — which lags mctl-api by
+    a release — would read as UNOWNED and a second actor would act alongside
+    the true owner. Worse than the bug it replaced, which only made the system
+    too timid.
+    """
+    for state in ("blocked", "pending", "paused", ""):
+        payload = _owned_payload(OTHER)
+        payload["state"] = state
+        answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
+        assert answer.verdict == UNKNOWN, state
+        assert answer.may_mutate is False, state
+        assert answer.blocks_others is True, state
+
+
+def test_owner_liveness_is_visible_even_when_it_is_not_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead owner still answers OWNED_BY_OTHER, because this client cannot
+    recover — that needs the guarded recovery surface (mctlhq/mctl-api#294) and
+    the reconciler that drives it (mctlhq/mctl-agents#353).
+
+    What it must not do is HIDE the fact, or a caller could never tell a
+    healthy owner from one worth escalating.
+    """
+    payload = _owned_payload(OTHER, healthy=False)
+    payload["dead"] = True
+    answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
+    assert answer.verdict == OWNED_BY_OTHER
+    assert answer.may_mutate is False
+    assert answer.ownership is not None
+    assert answer.ownership.dead is True
+    assert answer.ownership.healthy is False
+
+
+def test_no_content_success_is_not_read_as_an_unrecognised_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The status is read from the response, not assumed to be 200, so a 2xx
+    with no body is a success rather than a confusing UNKNOWN."""
+    handler = lambda req: _FakeResponse(b"", status=204)  # noqa: E731
+    answer = _client(monkeypatch, handler).release(ENTITY, PHASE, ME, epoch=1, reason="done")
+    # An empty 204 body carries no record, so there is nothing to classify —
+    # but it must not be reported as a malformed 200.
+    assert answer.verdict == UNKNOWN
+    assert "204" in answer.reason

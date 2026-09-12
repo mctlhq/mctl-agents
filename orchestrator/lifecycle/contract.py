@@ -128,10 +128,15 @@ class Ownership:
 
         ent = _mapping(data.get("entity"))
         own = _mapping(data.get("owner"))
-        # A record with no phase and no owner type is not a record. Every real
-        # response carries both, so this is the cheapest way to tell an
-        # ownership payload from an error envelope that happened to be 200.
-        if not data.get("phase") or not own.get("type"):
+        # A record with no phase, owner type or state is not a record. Every
+        # real response carries all three, and this is the cheapest way to tell
+        # an ownership payload from an error envelope that happened to be 200.
+        #
+        # `state` is required as hard as the other two on purpose: the verdict
+        # is derived from it, and a payload that omitted it would be classified
+        # as an unrecognised state — correct, but it would look like a server
+        # change rather than a malformed body.
+        if not data.get("phase") or not own.get("type") or not data.get("state"):
             return None
 
         return Ownership(
