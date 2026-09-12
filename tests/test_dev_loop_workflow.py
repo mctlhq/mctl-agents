@@ -90,6 +90,8 @@ def _fake_activities(
     ownership_unavailable: bool = False,
     ownership_owner: tuple[str, str] | None = None,
     ownership_lost_after: int | None = None,
+    ownership_progress_fails: bool = False,
+    ownership_terminal_fails: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -233,7 +235,15 @@ def _fake_activities(
                 epoch=77,
                 state="active",
                 healthy=True,
+                accepted=True,
             )
+        if ownership_terminal_fails and req.op == "terminal":
+            return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_progress_fails and req.op == "progress":
+            # The claim holds; only the progress write fails. This is the shape
+            # the retry guard exists for, and the shape an earlier version of
+            # its test never produced.
+            return OwnershipResult(verdict="unknown", reason="store down")
         if ownership_unavailable:
             # The store is down. The activity's own contract is to report
             # `unknown` rather than raise, and the loop must survive it.
@@ -246,6 +256,7 @@ def _fake_activities(
                 epoch=9,
                 state="active",
                 healthy=True,
+                accepted=True,
             )
         return OwnershipResult(
             verdict="owned-by-me",
@@ -254,6 +265,7 @@ def _fake_activities(
             epoch=1,
             state="active",
             healthy=True,
+            accepted=True,
         )
 
     activities = [
@@ -1085,10 +1097,16 @@ class TestDevLoopWorkflow:
     async def test_a_failed_progress_write_is_retried_not_dropped(self, env):
         """`is not None` is not "the write succeeded".
 
-        The activity never raises — that is its contract — so a 503 or a
-        timeout comes back as a real result carrying an `unknown` verdict.
-        Advancing the recorded head on that would drop the progress signal
-        permanently: the next poll sees head == recorded and never retries.
+        The activity never raises — that is its contract — so a 503 comes back
+        as a real result carrying an `unknown` verdict. Advancing the recorded
+        head on that drops the progress signal permanently: the next poll sees
+        head == recorded and never retries.
+
+        An earlier version of this test never reached the progress path at all
+        (its own comment said so), so relaxing the guard to
+        `result.verdict != OWNED_BY_OTHER` kept it green — the fix it is named
+        for had no regression guard. The claim now succeeds and only `progress`
+        fails, which is the shape that actually exercises it.
         """
         def _pr(sha: str) -> PRState:
             return PRState(
@@ -1098,15 +1116,44 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
-            issue=906,
-            ownership_unavailable=True,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            issue=910,
+            ownership_progress_fails=True,
         )
-        # Nothing was ever claimed, so no progress is attempted at all — but
-        # crucially the loop keeps trying to acquire rather than concluding it
-        # owns something it does not.
-        assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
-        assert len(ops) >= 2
+        progress = [o for o in ops if o.op == "progress"]
+        assert progress, f"the progress path was never reached: {[o.op for o in ops]}"
+        # The head moved once and every later poll sees the same head. If the
+        # failed write had been treated as success, _owned_head_sha would have
+        # advanced and there would be exactly one attempt; the retry is what
+        # makes more than one.
+        assert len(progress) > 1, (
+            f"a failed progress write was not retried: {[(o.op, o.version[:8]) for o in ops]}"
+        )
+        assert all(o.version == "b" * 40 for o in progress)
+
+
+    async def test_a_failed_terminal_leaves_the_claim_for_the_reconciler(self, env):
+        """Clearing the claim on a terminal that did not land would leave the
+        row active with nobody believing they own it — the zero-owner state,
+        produced by the cleanup written to prevent it.
+
+        The loop keeps the claim instead, and the reconciler's liveness bound
+        is what resolves it once this execution stops being seen.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, MERGED_PR], issue=911,
+            ownership_terminal_fails=True,
+        )
+        assert any(o.op == "terminal" for o in ops), [o.op for o in ops]
+        # The claim was NOT dropped, so the watch's finally attempts a release
+        # on the way out rather than silently forgetting the entity.
+        assert any(o.op == "release" for o in ops), (
+            f"a failed terminal dropped the claim: {[o.op for o in ops]}"
+        )
 
     async def test_losing_the_claim_is_noticed_and_the_epoch_is_not_adopted(self, env):
         """A worker pod that stalls past its liveness bound loses the PR.

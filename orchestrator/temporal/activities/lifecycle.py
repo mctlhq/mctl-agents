@@ -17,7 +17,7 @@ one, because the cron sweeper keeps any PR the loop does not positively claim.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -78,7 +78,13 @@ class OwnershipResult:
     state: str = ""
     healthy: bool = False
     reason: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
+    # Whether a MUTATING call was accepted by the server, independent of what
+    # the resulting record says about ownership. A body-less 2xx is neither
+    # owned_by_caller nor owned-by-other, so without this the workflow's
+    # acquire branch takes neither path: it never claims, never backs off, and
+    # logs nothing. The contract added WROTE_NO_RECORD for this caller and the
+    # result type was dropping it.
+    accepted: bool = False
 
     @property
     def owned_by_caller(self) -> bool:
@@ -140,6 +146,7 @@ def _result_from(answer: OwnershipAnswer) -> OwnershipResult:
         state=own.state if own else "",
         healthy=own.healthy if own else False,
         reason=answer.reason,
+        accepted=answer.accepted,
     )
 
 

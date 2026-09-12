@@ -167,6 +167,13 @@ SHEPHERD_TICKS_MAX = 12
 # looks dead.
 LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 
+# Consecutive acquires that answer neither "mine" nor "someone else's" before
+# the loop stops asking. The store being unreachable for six polls is three
+# hours; continuing to ask for the remaining fortnight is ~670 activities
+# against an endpoint that is not answering, and the cron sweeper owns the PR
+# throughout — the same outcome as before any of this existed.
+LIFECYCLE_UNKNOWN_ACQUIRE_LIMIT = 6
+
 # Activity bounds for ownership calls. Short and few: ownership is a
 # coordination signal, and a loop must never stall on it.
 LIFECYCLE_TIMEOUT = timedelta(seconds=30)
@@ -535,6 +542,7 @@ class DevLoopWorkflow:
         # Set once another actor is known to own this PR, so the loop stops
         # re-asking on every poll for the rest of the watch.
         self._claim_refused = False
+        self._unknown_acquires = 0
         self._proposal_ref = ""
         self._policy_ref = ""
 
@@ -1150,6 +1158,13 @@ class DevLoopWorkflow:
             # earlier. Swallowing it here does not swallow the workflow's own
             # cancellation: whatever triggered the unwind keeps propagating out
             # of the try block this finally belongs to.
+            #
+            # What this does NOT do is complete the write. On cancellation the
+            # activity never runs, so the row is left `active` and the
+            # reconciler's liveness bound is what recovers it once this
+            # execution stops being seen. The SDK offers no cancellation shield
+            # here, and pretending the release lands would be worse than saying
+            # it does not.
             workflow.logger.info(
                 "lifecycle %s cancelled for %s#%s — the watch is ending", op, repo, number
             )
@@ -1204,6 +1219,14 @@ class DevLoopWorkflow:
         head = state.head_sha or ""
 
         if not self._owned_entity_id:
+            if self._unknown_acquires >= LIFECYCLE_UNKNOWN_ACQUIRE_LIMIT:
+                # The store has been unreachable, or answering something
+                # unusable, for this many consecutive attempts. Re-asking on
+                # every poll for the rest of a 14-day watch is ~670 activities
+                # against an endpoint that is not answering; the sweeper owns
+                # the PR meanwhile, which is the same outcome as before any of
+                # this existed.
+                return
             if self._claim_refused:
                 # Somebody else owns this PR and said so. Re-asking on every
                 # poll for the rest of a 14-day watch is ~670 activities to
@@ -1217,8 +1240,23 @@ class DevLoopWorkflow:
                 self._owned_entity_id = EntityRef.for_pull_request(repo, number).id
                 self._owner_epoch = result.epoch
                 self._owned_head_sha = head
+                self._unknown_acquires = 0
             elif result is not None and result.verdict == OWNED_BY_OTHER:
                 self._claim_refused = True
+            elif result is not None and result.accepted:
+                # The server took the write and told us nothing more (a
+                # body-less 2xx). It is not a claim — nothing is known about
+                # who owns the entity — but it is also not a failure, and
+                # silently taking neither branch is how a loop ends up never
+                # claiming and never backing off.
+                workflow.logger.info(
+                    "lifecycle: acquire for %s#%s was accepted with no record; "
+                    "no claim recorded this poll",
+                    repo, number,
+                )
+                self._unknown_acquires += 1
+            else:
+                self._unknown_acquires += 1
                 # Somebody else owns this PR. Nothing to do and nothing to
                 # escalate here: the reconciler is what resolves a conflict,
                 # and this loop simply does not record itself as the owner.
@@ -1378,14 +1416,25 @@ class DevLoopWorkflow:
                         await self._track_ownership(state)
                     if state.state in ("MERGED", "CLOSED"):
                         if track_ownership and self._owned_entity_id:
-                            await self._ownership(
+                            done = await self._ownership(
                                 "terminal",
                                 repo=state.repo,
                                 number=state.number or 0,
                                 head_sha=state.head_sha or "",
                                 reason=f"pull request {state.state.lower()}",
                             )
-                            self._owned_entity_id = ""
+                            # Only drop the claim if the write landed. Clearing
+                            # it on a failed terminal would leave the row active
+                            # with nobody believing they own it — the zero-owner
+                            # state, produced by the cleanup meant to prevent it.
+                            if done is not None and done.accepted:
+                                self._owned_entity_id = ""
+                            else:
+                                workflow.logger.warning(
+                                    "lifecycle: terminal for %s#%s did not land; "
+                                    "leaving the claim for the reconciler",
+                                    state.repo, state.number,
+                                )
                         return state
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
