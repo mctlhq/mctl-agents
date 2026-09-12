@@ -1465,10 +1465,15 @@ class DevLoopWorkflow:
                         if track_ownership and self._owned_entity_id:
                             done = await self._ownership(
                                 "terminal",
-                                repo=state.repo,
+                                # `or ""` like the head_sha below: the fields
+                                # are Optional on PRState, and the block is
+                                # guarded by _owned_entity_id, which is only
+                                # set when repo was present. Narrowing it for
+                                # the type checker rather than for the reader.
+                                repo=state.repo or "",
                                 number=state.number or 0,
                                 head_sha=state.head_sha or "",
-                                reason=f"pull request {state.state.lower()}",
+                                reason=f"pull request {(state.state or '').lower()}",
                             )
                             # Only drop the claim if the write landed. Clearing
                             # it on a failed terminal would leave the row active
@@ -1575,7 +1580,7 @@ class DevLoopWorkflow:
                     repo=repo,
                     number=int(number) if number.isdigit() else 0,
                     reason=(
-                        f"pull request {last.state.lower()}"
+                        f"pull request {(last.state or '').lower()}"
                         if terminal_state and last is not None
                         else "merge watch ended without a terminal pull-request state"
                     ),
