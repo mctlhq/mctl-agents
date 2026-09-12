@@ -22,7 +22,6 @@ from temporalio.testing import WorkflowEnvironment
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
-from orchestrator.temporal.activities.lifecycle import OwnershipRequest, OwnershipResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
@@ -87,8 +86,6 @@ def _fake_activities(
     incidents: list[Incident] | None = None,
     incident_reads_fail: bool = False,
     incident_query: dict[str, str] | None = None,
-    ownership_unavailable: bool = False,
-    ownership_owner: tuple[str, str] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -121,7 +118,6 @@ def _fake_activities(
         return resolved.get(agent) if released else None
 
     calls: list[str] = []
-    ownership_ops: list[OwnershipRequest] = []
     investigate_ran = anyio.Event()
 
     @activity.defn(name="submit_and_wait")
@@ -221,31 +217,6 @@ def _fake_activities(
         poll_index["i"] += 1
         return sequence[i]
 
-    @activity.defn(name="lifecycle_ownership")
-    async def fake_lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
-        ownership_ops.append(req)
-        if ownership_unavailable:
-            # The store is down. The activity's own contract is to report
-            # `unknown` rather than raise, and the loop must survive it.
-            return OwnershipResult(verdict="unknown", reason="store down")
-        if ownership_owner is not None:
-            return OwnershipResult(
-                verdict="owned-by-other",
-                owner_type=ownership_owner[0],
-                owner_id=ownership_owner[1],
-                epoch=9,
-                state="active",
-                healthy=True,
-            )
-        return OwnershipResult(
-            verdict="owned-by-me",
-            owner_type=req.owner_type,
-            owner_id=req.owner_id,
-            epoch=1,
-            state="active",
-            healthy=True,
-        )
-
     activities = [
         fake_resolve_agent_release,
         fake_submit_and_wait,
@@ -256,14 +227,13 @@ def _fake_activities(
         fake_get_release_after,
         fake_get_deploy_status,
         fake_list_service_incidents,
-        fake_lifecycle_ownership,
     ]
-    return activities, calls, investigate_ran, ownership_ops
+    return activities, calls, investigate_ran
 
 
 class TestDevLoopWorkflow:
     async def test_investigate_then_wait_then_implement_after_approval(self, env):
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities, calls, investigate_ran = _fake_activities(released=True)
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
@@ -357,9 +327,7 @@ class TestDevLoopWorkflow:
         after review caught it being dropped as collateral of the A4
         rewrite rather than deliberately (claude P2 on #241).
         """
-        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
-            released=True, investigate_phase="Failed"
-        )
+        activities, calls, _investigate_ran = _fake_activities(released=True, investigate_phase="Failed")
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
@@ -569,7 +537,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, calls, investigate_ran = _fake_activities(
             released=True,
             unpinned={"shepherd"},
             pr_states=[open_pr, open_pr, MERGED_PR],
@@ -614,7 +582,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, calls, investigate_ran = _fake_activities(
             released=True,
             resolve_unavailable={"shepherd"},
             pr_states=[open_pr, open_pr, MERGED_PR],
@@ -914,7 +882,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr, open_pr, MERGED_PR]
         )
         async with Worker(
@@ -944,7 +912,7 @@ class TestDevLoopWorkflow:
         """A proposal whose .status.yaml never gains a pr: link stops the
         watch after the grace polls (result.pr is None), instead of polling
         for the full 14-day deadline."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[PRState(found=False)]
         )
         async with Worker(
@@ -978,7 +946,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr]
         )
         async with Worker(
@@ -1014,7 +982,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             pr_states=[open_pr],
             pr_state_raises_after=1,
@@ -1054,7 +1022,7 @@ class TestDevLoopWorkflow:
             repo="mctlhq/mctl-telegram",
             number=81,
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[vanished]
         )
         async with Worker(
@@ -1090,7 +1058,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr, PRState(found=False)]
         )
         async with Worker(
@@ -1126,7 +1094,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             pr_states=[open_pr],
             pr_state_raises_after=1,
@@ -1170,7 +1138,7 @@ class TestDevLoopWorkflow:
             repo=MERGED_PR.repo,
             number=MERGED_PR.number,
         )
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr, vanished_with_ref]
         )
         async with Worker(
@@ -1205,7 +1173,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr] * 8 + [MERGED_PR]
         )
         async with Worker(
@@ -1248,7 +1216,7 @@ class TestDevLoopWorkflow:
             state="OPEN",
         )
         seen: list[bool] = []
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr, open_pr, MERGED_PR]
         )
         async with Worker(
@@ -1288,7 +1256,7 @@ class TestDevLoopWorkflow:
 
     async def test_deploy_observed_healthy_on_the_released_tag(self, env):
         """Stage 6.2/6.3 happy path (#215): merged → release → Healthy."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities, _calls, investigate_ran = _fake_activities(released=True)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1307,7 +1275,7 @@ class TestDevLoopWorkflow:
         verified would call every rollout successful the instant it was
         asked, before the new tag ever reached the cluster.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(found=True, image_tag="9.9.8", health="Healthy", sync_status="Synced"),
@@ -1325,7 +1293,7 @@ class TestDevLoopWorkflow:
 
     async def test_deploy_unverified_when_it_never_goes_healthy(self, env):
         """The deadline passing is an observation, not a workflow failure."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(found=True, image_tag="9.9.9", health="Degraded", sync_status="Synced")
@@ -1346,7 +1314,7 @@ class TestDevLoopWorkflow:
 
     async def test_no_release_for_a_docs_only_merge(self, env):
         """release-please cutting nothing is normal, not a fault."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, release=None)
+        activities, _calls, investigate_ran = _fake_activities(released=True, release=None)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1361,7 +1329,7 @@ class TestDevLoopWorkflow:
         for the whole 20-minute lookup window would hide it behind a
         plausible-looking no-release.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, release_lookup_bug=True
         )
         async with Worker(
@@ -1376,7 +1344,7 @@ class TestDevLoopWorkflow:
         assert "non-transient" in (result.deploy.detail or "")
 
     async def test_a_bug_in_the_status_read_ends_the_verify_immediately(self, env):
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, deploy_status_bug=True
         )
         async with Worker(
@@ -1389,7 +1357,7 @@ class TestDevLoopWorkflow:
 
     async def test_no_target_when_the_repo_deploys_no_app(self, env):
         """A repo whose release only bumps cluster templates has nothing to verify."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, deploy_target=None)
+        activities, _calls, investigate_ran = _fake_activities(released=True, deploy_target=None)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1403,7 +1371,7 @@ class TestDevLoopWorkflow:
         mctl-api reports argocd health/sync but no imageTag for those, so
         waiting for a tag match would time out every such loop.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             deploy_statuses=[
                 # Stale: ArgoCD last synced BEFORE this release existed.
@@ -1439,7 +1407,7 @@ class TestDevLoopWorkflow:
         ArgoCD's updatedAt permanently older than the release, the rollout
         must never be reported as verified.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(
@@ -1465,7 +1433,7 @@ class TestDevLoopWorkflow:
         so a lexicographic compare would call a sync that happened half a
         second AFTER the release older than it — and never verify.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
             deploy_statuses=[
@@ -1492,7 +1460,7 @@ class TestDevLoopWorkflow:
         workflow task Temporal retries forever on identical input. An
         offset-less timestamp must simply be read as UTC.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
             deploy_statuses=[
@@ -1514,7 +1482,7 @@ class TestDevLoopWorkflow:
 
     async def test_a_new_argocd_application_is_waited_for(self, env):
         """A release can introduce the app; ArgoCD registers it a bit later."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(found=False),
@@ -1531,7 +1499,7 @@ class TestDevLoopWorkflow:
 
     async def test_unknown_argocd_application_gives_up_after_the_grace(self, env):
         """Past the grace polls, a name resolving to nothing is a wrong name."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, deploy_statuses=[DeployStatus(found=False)]
         )  # repeated for every poll — the grace runs out and the watch gives up
         async with Worker(
@@ -1544,7 +1512,7 @@ class TestDevLoopWorkflow:
 
     async def test_incident_watch_reports_a_clean_window(self, env):
         """Stage 6.4 (#216): a healthy rollout with no incidents."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities, _calls, investigate_ran = _fake_activities(released=True)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1564,7 +1532,7 @@ class TestDevLoopWorkflow:
         therefore predate the deploy stage, not follow it.
         """
         query: dict[str, str] = {}
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             incident_query=query,
             deploy_statuses=[
@@ -1594,7 +1562,7 @@ class TestDevLoopWorkflow:
         The fake returns the same incident on every poll — reporting it
         once per poll would make a single alert look like a storm.
         """
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True,
             incidents=[Incident(id="alert-1", title="pods crashlooping", severity="critical")],
         )
@@ -1611,7 +1579,7 @@ class TestDevLoopWorkflow:
 
     async def test_incident_read_failure_does_not_end_the_watch(self, env):
         """A failing incident store must not discard the stage's result."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, _calls, investigate_ran = _fake_activities(
             released=True, incident_reads_fail=True
         )
         async with Worker(
@@ -1625,7 +1593,7 @@ class TestDevLoopWorkflow:
 
     async def test_no_incident_watch_when_nothing_was_released(self, env):
         """no-release means nothing shipped — the window would be someone else's news."""
-        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, release=None)
+        activities, _calls, investigate_ran = _fake_activities(released=True, release=None)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1644,7 +1612,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, calls, investigate_ran = _fake_activities(
             released=True,
             pr_states=[open_pr] * 8 + [MERGED_PR],
             shepherd_fails=True,
@@ -1689,7 +1657,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, calls, investigate_ran = _fake_activities(
             released=True,
             pr_states=[open_pr] * 8 + [MERGED_PR],
             pr_state_raises_at={7},
@@ -1732,7 +1700,7 @@ class TestDevLoopWorkflow:
             state="OPEN",
         )
         polls = SHEPHERD_TICK_EVERY_POLLS * (SHEPHERD_TICKS_MAX + 1)
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+        activities, calls, investigate_ran = _fake_activities(
             released=True, pr_states=[open_pr] * polls + [MERGED_PR]
         )
         async with Worker(

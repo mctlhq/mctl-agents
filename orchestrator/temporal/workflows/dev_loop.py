@@ -59,11 +59,6 @@ with workflow.unsafe.imports_passed_through():
         IncidentQueryResult,
         list_service_incidents,
     )
-    from orchestrator.temporal.activities.lifecycle import (
-        OwnershipRequest,
-        OwnershipResult,
-        lifecycle_ownership,
-    )
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
@@ -150,26 +145,6 @@ PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 # 4 h for two weeks.
 SHEPHERD_TICK_EVERY_POLLS = 8
 SHEPHERD_TICKS_MAX = 12
-
-# Ownership liveness is refreshed every 4th poll (~2 h at MERGE_POLL_INTERVAL),
-# on its OWN cadence rather than riding the shepherd tick boundary.
-#
-# It cannot ride the ticks: those stop after SHEPHERD_TICKS_MAX (~48 h) while
-# the watch runs up to MERGE_WATCH_DEADLINE (14 days), so a loop that is
-# healthily watching a long-lived PR would stop proving liveness after two days
-# and start reading as a crashed owner.
-#
-# It is not every poll either: a 14-day watch is ~672 polls, and one extra
-# activity per poll doubles the history of the longest-lived workflow in the
-# system to record something that changes nothing. At 2 h against the 10 h
-# liveness bound, four consecutive heartbeats can be lost before the owner
-# looks dead.
-LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
-
-# Activity bounds for ownership calls. Short and few: ownership is a
-# coordination signal, and a loop must never stall on it.
-LIFECYCLE_TIMEOUT = timedelta(seconds=30)
-LIFECYCLE_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
 # Stages 6.2/6.3 (ADR-006, #215). After the PR merges, release-please cuts
 # a release on the app repo, that dispatches mctl-gitops release-deploy,
@@ -524,13 +499,6 @@ class DevLoopWorkflow:
         self._approved = False
         self._approver: str | None = None
         self._shepherd_in_loop = False
-        # Lifecycle ownership (mctlhq/.github#57). Set once the PR is known
-        # and this execution has positively claimed it; empty means this loop
-        # owns nothing and the cron sweeper is the owner.
-        self._owned_entity_id = ""
-        self._owner_epoch = 0
-        self._owned_head_sha = ""
-        self._poll_index_for_heartbeat = 0
 
     @workflow.query
     def shepherd_in_loop(self) -> bool:
@@ -1098,111 +1066,6 @@ class DevLoopWorkflow:
                 "in-flight shepherd tick for %s/%s ended with %r", service, slug, exc
             )
 
-
-    async def _ownership(self, op: str, *, repo: str, number: int, head_sha: str = "",
-                         evidence: str = "", reason: str = "") -> OwnershipResult | None:
-        """Run one ownership operation as an ACTIVITY.
-
-        Never raises. Ownership is a coordination signal, not the work: a
-        workflow that died because it could not reach the ownership store
-        would trade a bookkeeping outage for a delivery outage, and the loop
-        has already produced a PR by this point.
-
-        A failure returns None, which every caller treats as "no claim" — the
-        conservative direction, since the cron sweeper only stands down for a
-        positive claim.
-        """
-        info = workflow.info()
-        req = OwnershipRequest(
-            op=op,
-            kind="pull-request",
-            entity_id=f"{repo}#{number}",
-            phase="review-remediation",
-            version=head_sha,
-            owner_type="devloop-workflow",
-            owner_id=info.workflow_id,
-            epoch=self._owner_epoch,
-            evidence=evidence,
-            reason=reason,
-            temporal_workflow_id=info.workflow_id,
-        )
-        try:
-            return await workflow.execute_activity(
-                lifecycle_ownership,
-                req,
-                start_to_close_timeout=LIFECYCLE_TIMEOUT,
-                retry_policy=LIFECYCLE_RETRY_POLICY,
-            )
-        except Exception as exc:  # noqa: BLE001 — ActivityError and friends
-            workflow.logger.warning("lifecycle %s failed for %s#%s: %r", op, repo, number, exc)
-            return None
-
-
-    async def _track_ownership(self, state: PRState) -> None:
-        """Claim the PR, then keep the claim honest.
-
-        Three distinct things, deliberately not collapsed into one call:
-
-        - **Claim.** The first successful poll that resolves a PR acquires
-          ownership. It cannot happen earlier: until then this loop knows a
-          service and a slug, and the entity ownership attaches to is the pull
-          request.
-        - **Liveness.** Every LIFECYCLE_HEARTBEAT_EVERY_POLLS-th poll
-          re-acquires, which is idempotent and refreshes ``last_seen_at``
-          without touching the epoch or the progress timestamp. It says "this
-          owner still exists", which is all a heartbeat is evidence of.
-        - **Progress.** Only when the head SHA actually moved. A poll that
-          observed nothing new must not write progress: the whole point of
-          separating the two timestamps is that an owner cannot prove
-          usefulness by continuing to breathe.
-
-        A failed call leaves ``_owned_entity_id`` empty, so the loop simply
-        holds no claim and the cron sweeper keeps the PR — the same
-        fail-toward-the-sweeper direction the shepherd claim already takes.
-        """
-        repo = state.repo or ""
-        number = state.number or 0
-        head = state.head_sha or ""
-
-        if not self._owned_entity_id:
-            result = await self._ownership(
-                "acquire", repo=repo, number=number, head_sha=head
-            )
-            if result is not None and result.owned_by_caller:
-                self._owned_entity_id = f"{repo}#{number}"
-                self._owner_epoch = result.epoch
-                self._owned_head_sha = head
-            elif result is not None:
-                # Somebody else owns this PR. Nothing to do and nothing to
-                # escalate here: the reconciler is what resolves a conflict,
-                # and this loop simply does not record itself as the owner.
-                workflow.logger.info(
-                    "lifecycle: %s#%s is owned by %s/%s — this loop holds no claim",
-                    repo, number, result.owner_type, result.owner_id,
-                )
-            return
-
-        if head and head != self._owned_head_sha:
-            result = await self._ownership(
-                "progress",
-                repo=repo,
-                number=number,
-                head_sha=head,
-                evidence=f"head moved to {head[:8]}",
-            )
-            if result is not None:
-                self._owned_head_sha = head
-                if result.epoch:
-                    self._owner_epoch = result.epoch
-            return
-
-        if self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0:
-            result = await self._ownership(
-                "acquire", repo=repo, number=number, head_sha=head
-            )
-            if result is not None and result.epoch:
-                self._owner_epoch = result.epoch
-
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
         """Poll get_pr_state until the PR reaches a terminal state.
 
@@ -1251,11 +1114,6 @@ class DevLoopWorkflow:
         # commands in history: executions that already recorded a
         # sequential tick must keep replaying one.
         concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
-        # Lifecycle ownership (mctlhq/.github#57). Gated on the same claim as
-        # the in-loop shepherd: if this execution declined to shepherd, the
-        # cron sweeper owns the PR and this loop must not record itself as the
-        # owner. Its own marker, because it adds commands to history.
-        track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
         tick_task: asyncio.Task[None] | None = None
         poll_index = 0
         shepherd_ticks = 0
@@ -1302,19 +1160,7 @@ class DevLoopWorkflow:
                 if state.found:
                     last = state
                     polls_without_pr = 0
-                    if track_ownership and state.repo and state.number is not None:
-                        self._poll_index_for_heartbeat += 1
-                        await self._track_ownership(state)
                     if state.state in ("MERGED", "CLOSED"):
-                        if track_ownership and self._owned_entity_id:
-                            await self._ownership(
-                                "terminal",
-                                repo=state.repo,
-                                number=state.number or 0,
-                                head_sha=state.head_sha or "",
-                                reason=f"pull request {state.state.lower()}",
-                            )
-                            self._owned_entity_id = ""
                         return state
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
@@ -1389,18 +1235,4 @@ class DevLoopWorkflow:
                 await workflow.sleep(MERGE_POLL_INTERVAL)
         finally:
             await self._settle_tick(tick_task, service, slug)
-            if track_ownership and self._owned_entity_id:
-                # The watch ended without the PR reaching a terminal state —
-                # the deadline expired, or the PR stopped resolving. RELEASE,
-                # not terminal: the work remains and somebody must be able to
-                # pick it up, which is precisely the zero-owner gap #239
-                # describes. Released is the state Acquire can take.
-                repo, _, number = self._owned_entity_id.partition("#")
-                await self._ownership(
-                    "release",
-                    repo=repo,
-                    number=int(number) if number.isdigit() else 0,
-                    reason="merge watch ended without a terminal pull-request state",
-                )
-                self._owned_entity_id = ""
         return last

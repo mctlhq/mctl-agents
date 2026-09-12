@@ -43,7 +43,6 @@ from orchestrator.temporal.activities.deploy_state import (
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
-from orchestrator.temporal.activities.lifecycle import lifecycle_ownership
 from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.pr_state import get_pr_state
 from orchestrator.temporal.activities.proposals import find_proposal_slug
@@ -449,7 +448,6 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
     short_activities: list[Callable[..., Any]] = [
         resolve_agent_release,
         record_execution,
-        lifecycle_ownership,
         find_proposal_slug,
         get_pr_state,
         resolve_deploy_target,
