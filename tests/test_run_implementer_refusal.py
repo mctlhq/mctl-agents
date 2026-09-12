@@ -616,3 +616,44 @@ def test_a_failing_refusal_write_still_exits_47(tmp_path, monkeypatch) -> None:
         run_implementer.main()
 
     assert exc.value.code == run_implementer.EXIT_DELIBERATE_NO_OP
+
+
+def test_a_missing_git_binary_is_not_a_refusal(repo, monkeypatch) -> None:
+    """`FileNotFoundError` from a missing binary is not a return code.
+
+    `subprocess.run(["git", ...])` raises rather than returning when the binary
+    is absent, `check=False` or not — so the returncode branches never see it.
+    Unwrapped, it left `_read_refusal_marker` entirely, landed on
+    `review_feedback_one`'s trailing `except Exception`, matched no prefix, and
+    exited 1: the counter-less transient arm.
+    """
+    _write_marker(repo, {"refused": True, "reason": "r"})
+    real_run = run_implementer._run
+
+    def no_git(cmd, *args, **kwargs):
+        if cmd[:1] == ["git"]:
+            raise FileNotFoundError(2, "No such file or directory: 'git'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "_run", no_git)
+    assert run_implementer._read_refusal_marker(repo) is None
+
+
+def test_a_slow_ls_files_is_not_a_refusal_either(repo, monkeypatch) -> None:
+    """A timeout inside the marker check must not reclassify the whole run.
+
+    `ImplementerOperationTimeout` would otherwise escape and make this a 44,
+    asserting that the implementer timed out when what actually happened is
+    narrower: we could not establish whether the marker is tracked, so it is
+    not a refusal (42). Both charge an attempt; only one of them is true.
+    """
+    _write_marker(repo, {"refused": True, "reason": "r"})
+    real_run = run_implementer._run
+
+    def slow(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "ls-files"]:
+            raise run_implementer.ImplementerOperationTimeout("command exceeded 600s")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "_run", slow)
+    assert run_implementer._read_refusal_marker(repo) is None

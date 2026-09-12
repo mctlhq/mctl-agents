@@ -316,12 +316,15 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
         )
         return None
     if tracked.returncode != 1:
-        # 0 is tracked, 1 is "no such path in the index". Anything else (git
-        # missing from PATH, a corrupt or absent index, an unexpected 128) means
-        # we could not establish the fact — and every other check in this
-        # function treats "could not establish" as "not a refusal". Erring the
-        # other way here would honour a marker precisely when the repository
-        # state is unknown.
+        # 0 is tracked, 1 is "no such path in the index". Anything else (a
+        # corrupt or absent index, an unexpected 128) means we could not
+        # establish the fact — and every other check in this function treats
+        # "could not establish" as "not a refusal". Erring the other way here
+        # would honour a marker precisely when the repository state is unknown.
+        #
+        # A missing `git` binary is NOT one of these: `subprocess.run` raises
+        # FileNotFoundError rather than returning, `check=False` or not, so it
+        # is the handler above — not this branch — that absorbs it.
         print(
             f"warn: could not determine whether {REFUSAL_MARKER_FILENAME} is "
             f"tracked (git ls-files exited {tracked.returncode}); ignoring"
