@@ -306,6 +306,18 @@ RECONCILE_INPUT_STATUSES = {
 # spent on a finding the approved proposal already excluded).
 MAX_REVIEW_ATTEMPTS = 5
 
+# Separate, much smaller cap on consecutive HARNESS failures (exit 46: our own
+# orchestration lost the implementer's work — mctl-agents#366). Deliberately not
+# the same counter as MAX_REVIEW_ATTEMPTS: the proposal is blameless, so it must
+# not be charged an attempt. But "not charged" must not mean "never terminates".
+# Exit 46 is reachable by stream exhaustion as well as by the drain deadline, and
+# the exhaustion path has no damper: if the SDK ever stops holding stdin open past
+# the result frame, every tick would re-clone the target repo, run a full paid SDK
+# call, orphan almost immediately, and leave a tmp clone behind — forever. Before
+# #366 that situation at least converged to `review-stuck` via the attempt cap.
+# Low, because a repeating harness failure is structural and wants a human.
+MAX_HARNESS_FAILURES = 3
+
 # mergeStateStatus values that are safe to merge per design.md L143-154.
 # CLEAN = nothing in the way. HAS_HOOKS = pre-receive hooks (org-level
 # branch protection, secret scanning) — GitHub still considers the PR
@@ -478,7 +490,7 @@ class FollowupSubprocessError(RuntimeError):
     every retry, so they MUST consume a slot and eventually flip the
     proposal to ``review-stuck`` for human triage).
 
-    Default ``transient=True`` keeps backward compatibility with callers
+    Default ``kind="transient"`` keeps backward compatibility with callers
     that raise without specifying — they are assumed safe-to-retry.
     Deterministic failures are surfaced via sentinel exit codes from
     ``run_implementer`` (see ``run_implementer._review_feedback_exit_code``).
@@ -492,16 +504,22 @@ class FollowupSubprocessError(RuntimeError):
     assertable in tests. Values: ``"transient" | "deterministic" | "harness"``.
     """
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        transient: bool = True,
-        kind: str = "transient",
-    ) -> None:
+    def __init__(self, message: str, *, kind: str = "transient") -> None:
         super().__init__(message)
-        self.transient = transient
         self.kind = kind
+
+    @property
+    def transient(self) -> bool:
+        """Derived, never stored: only a deterministic failure consumes a slot.
+
+        Taking both as constructor arguments let them contradict each other --
+        ``transient=False`` with the default ``kind="transient"``, or
+        ``kind="harness"`` with ``transient=False``. The label exists precisely
+        so "do not charge an attempt" is explicit rather than reachable by
+        omission; that argument applies to the pairing too, so there is one
+        source of truth and the other is computed from it.
+        """
+        return self.kind != "deterministic"
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +534,7 @@ class ProposalRef:
     proposal_dir: Path
     status: str
     review_attempts: int = 0
+    harness_failures: int = 0
     pr_url: str | None = None
     mode: str = FULL
     status_path: Path = field(init=False)
@@ -638,6 +657,8 @@ def update_status(
     ref.status = new_status
     if "review_attempts" in fields and fields["review_attempts"] is not None:
         ref.review_attempts = int(fields["review_attempts"])
+    if "harness_failures" in fields and fields["harness_failures"] is not None:
+        ref.harness_failures = int(fields["harness_failures"])
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +760,7 @@ def _discover_refs(
                     proposal_dir=proposal_dir,
                     status=status,
                     review_attempts=int(data.get("review_attempts", 0) or 0),
+                    harness_failures=int(data.get("harness_failures", 0) or 0),
                     pr_url=pr_url,
                     mode=mode,
                 )
@@ -1638,15 +1660,14 @@ def apply_followup(
         # cannot tell the kind from the code alone.
         deterministic_codes, harness_codes = _followup_code_sets()
         if proc.returncode in harness_codes:
-            kind, is_transient = "harness", True
+            kind = "harness"
         elif proc.returncode in deterministic_codes:
-            kind, is_transient = "deterministic", False
+            kind = "deterministic"
         else:
-            kind, is_transient = "transient", True
+            kind = "transient"
         raise FollowupSubprocessError(
             f"implementer follow-up exited non-zero "
             f"({proc.returncode}) for {service}/{slug}",
-            transient=is_transient,
             kind=kind,
         )
     return bundle
@@ -1814,6 +1835,7 @@ def process_one(
             merged_at=_now_iso(),
             merge_commit=payload,
             review_attempts=None,  # clear it so terminal status is clean
+            harness_failures=None,
             merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
@@ -1824,6 +1846,7 @@ def process_one(
             "rejected",
             notes=payload or "PR was closed without merging.",
             review_attempts=None,
+            harness_failures=None,
             merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
@@ -1883,15 +1906,38 @@ def process_one(
         except FollowupSubprocessError as e:
             if e.kind == "harness":
                 # The implementer never got its attempt — our own orchestration
-                # dropped the work (mctl-agents#366). Same behaviour as a
-                # transient failure, but named so the operator can tell a
-                # platform bug from a flaky push in the run log.
+                # dropped the work (mctl-agents#366). review_attempts is NOT
+                # charged: the proposal is blameless. But the retry is still
+                # bounded, on its own counter, because a structural orphan
+                # (e.g. the SDK no longer holding stdin open) would otherwise
+                # re-clone the repo and re-run a paid SDK call every tick with
+                # no terminal state.
+                new_failures = ref.harness_failures + 1
                 print(
                     f"warn: {ref.service}/{ref.slug}: harness failure — not "
                     f"charging a review attempt ({e}); leaving "
-                    f"review_attempts={ref.review_attempts} and "
-                    f"status={ref.status} for retry next tick"
+                    f"review_attempts={ref.review_attempts}, "
+                    f"harness_failures {ref.harness_failures} -> {new_failures}"
                 )
+                if new_failures >= MAX_HARNESS_FAILURES:
+                    update_status(
+                        ref,
+                        "review-stuck",
+                        harness_failures=new_failures,
+                        notes=(
+                            f"The platform lost the implementer's work "
+                            f"{new_failures} time(s) in a row ({e}). This is a "
+                            f"harness defect, not a problem with the proposal — "
+                            f"review_attempts was never charged. Human triage "
+                            f"required; see mctl-agents#366."
+                        ),
+                    )
+                    return ShepherdResult(
+                        ref=ref,
+                        decision="review-stuck",
+                        notes="repeated harness failure; proposal not at fault",
+                    )
+                update_status(ref, ref.status, harness_failures=new_failures)
                 return ShepherdResult(
                     ref=ref,
                     decision="wait",
@@ -1962,6 +2008,9 @@ def process_one(
             ref,
             "review-fixing",
             review_attempts=ref.review_attempts + 1,
+            # A successful follow-up proves the handoff works again — the
+            # harness cap counts CONSECUTIVE losses, not lifetime ones.
+            harness_failures=None,
         )
         update_status(ref, "implemented")
         return ShepherdResult(ref=ref, decision="address-review")
@@ -1996,6 +2045,7 @@ def process_one(
             merged_at=_now_iso(),
             merge_commit=merge_commit,
             review_attempts=None,
+            harness_failures=None,
             merge_owner=None,
         )
         return ShepherdResult(ref=ref, decision="merge")
@@ -2283,6 +2333,7 @@ def reconcile_one(
             merged_at=existing_status.get("merged_at") or _now_iso(),
             merge_commit=pr.merge_commit,
             review_attempts=None,
+            harness_failures=None,
             failure=None,
             merge_owner=None,
         )
@@ -2296,6 +2347,7 @@ def reconcile_one(
             github=github,
             notes=pr.close_comment_or_default or "PR was closed without merging.",
             review_attempts=None,
+            harness_failures=None,
             failure=None,
             merge_owner=None,
         )

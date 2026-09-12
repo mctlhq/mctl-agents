@@ -2029,7 +2029,7 @@ def test_outer_loop_counts_attempt_on_deterministic_subprocess_failure(tmp_path)
     def boom(*_a, **_kw):
         raise run_shepherd.FollowupSubprocessError(
             "implementer follow-up exited non-zero (42)",
-            transient=False,
+            kind="deterministic",
         )
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
@@ -2064,7 +2064,7 @@ def test_outer_loop_flips_to_review_stuck_on_deterministic_at_cap(tmp_path) -> N
     def boom(*_a, **_kw):
         raise run_shepherd.FollowupSubprocessError(
             "implementer follow-up exited non-zero (43)",
-            transient=False,
+            kind="deterministic",
         )
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
@@ -2696,7 +2696,7 @@ def test_process_one_does_not_trigger_review_on_followup_failure(tmp_path) -> No
     trigger_calls: list = []
 
     def boom(*args, **kwargs):
-        raise run_shepherd.FollowupSubprocessError("transient", transient=True)
+        raise run_shepherd.FollowupSubprocessError("transient", kind="transient")
 
     with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
          patch.object(run_shepherd, "read_codex_review", return_value=review), \
@@ -3321,7 +3321,6 @@ def test_outer_loop_does_not_count_attempt_on_harness_failure(tmp_path, capsys) 
     def boom(*_a, **_kw):
         raise run_shepherd.FollowupSubprocessError(
             "implementer follow-up exited non-zero (46)",
-            transient=True,
             kind="harness",
         )
 
@@ -3340,3 +3339,68 @@ def test_outer_loop_does_not_count_attempt_on_harness_failure(tmp_path, capsys) 
     assert ref.status == "implemented"
     # Greppable operator-facing signal: a platform bug, not a flaky push.
     assert "harness failure — not charging a review attempt" in capsys.readouterr().out
+
+
+def test_harness_failures_are_bounded_and_flip_to_review_stuck(tmp_path, capsys) -> None:
+    """Not charged is not the same as never terminating.
+
+    Exit 46 is reachable by stream exhaustion as well as by the drain deadline,
+    and that path has no damper — without a cap a structural orphan would
+    re-clone the repo and re-run a paid SDK call every tick forever. The cap is
+    its OWN counter so the proposal is still never charged a review attempt.
+    """
+    ref = make_ref(tmp_path, review_attempts=2)
+    ref.harness_failures = run_shepherd.MAX_HARNESS_FAILURES - 1
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (46)", kind="harness",
+        )
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "review-stuck"
+    final = read_status(ref)
+    assert final["status"] == "review-stuck"
+    assert final["harness_failures"] == run_shepherd.MAX_HARNESS_FAILURES
+    # The proposal was never blamed for the platform's own defect.
+    assert final["review_attempts"] == 2
+    assert "harness defect, not a problem with the proposal" in final["notes"]
+
+
+def test_harness_failure_counter_increments_below_the_cap(tmp_path) -> None:
+    ref = make_ref(tmp_path, review_attempts=1)
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def boom(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError("exit 46", kind="harness")
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=boom):
+        result = process_one(ref, skip_subprocess=True)
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["harness_failures"] == 1
+    assert final["review_attempts"] == 1
+    assert final["status"] == "implemented"
+
+
+def test_followup_subprocess_error_cannot_contradict_itself() -> None:
+    """`transient` is derived from `kind`, so the two cannot disagree."""
+    assert run_shepherd.FollowupSubprocessError("x").transient is True
+    assert run_shepherd.FollowupSubprocessError("x", kind="harness").transient is True
+    assert run_shepherd.FollowupSubprocessError(
+        "x", kind="deterministic"
+    ).transient is False

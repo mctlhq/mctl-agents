@@ -187,3 +187,70 @@ def test_drain_defaults_to_printing_each_message(capsys) -> None:
     anyio.run(lambda: drain_until_settled(stream(), ledger, timeout_s=5))
     assert "task_updated" in capsys.readouterr().out
     assert subagent_wait.drain_until_settled.__doc__
+
+
+def test_untracked_task_type_is_logged_not_dropped_silently(capsys) -> None:
+    """The filter is the one assumption the whole fix rests on.
+
+    A delegated launch arriving with a new SDK task_type (or None) would leave
+    the ledger empty, skip the drain, and reproduce #366 exactly — with every
+    test in this module still green, since they all build `local_agent`. Only
+    production can reveal that, so the skip has to be greppable in the log.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t9", task_type="remote_agent"))
+    assert ledger.live == set()
+    out = capsys.readouterr().out
+    assert "not awaiting task t9" in out and "remote_agent" in out
+
+
+def test_untracked_task_type_none_is_also_logged(capsys) -> None:
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t9", task_type=None))
+    assert "not awaiting task t9" in capsys.readouterr().out
+
+
+def test_settle_ignores_tasks_the_ledger_never_adopted() -> None:
+    """A background shell ending `failed` must not flip all_completed.
+
+    Notifications arrive for every task the CLI runs, including the types
+    AWAITED_TASK_TYPES deliberately excludes. Folding those in would print
+    `warn: <id> ended 'failed'` for work the driver never waited on — in exactly
+    the log an operator reads after an incident.
+    """
+    ledger = LiveTaskLedger()
+    ledger.observe(started("shell1", task_type="bash"))
+    ledger.observe(notified("shell1", "failed"))
+    assert ledger.all_completed is True
+    assert ledger.describe() == "no outstanding tasks"
+
+
+def test_drain_returns_early_when_nothing_is_live() -> None:
+    """Otherwise it raises the self-contradicting "never reported a terminal
+    status ... no outstanding tasks"."""
+    async def stream():
+        return
+        yield  # pragma: no cover — makes this an async generator
+
+    anyio.run(
+        lambda: drain_until_settled(
+            stream(), LiveTaskLedger(), timeout_s=5, on_message=lambda _m: None,
+        )
+    )
+
+
+def test_drain_rejects_a_non_positive_timeout() -> None:
+    """Reachable via IMPLEMENTER_DRAIN_TIMEOUT_SECONDS=0, which would make
+    move_on_after cancel before the first read and orphan every single run."""
+    ledger = LiveTaskLedger()
+    ledger.observe(started("t1"))
+
+    async def stream():
+        yield updated("t1", "completed")
+
+    with pytest.raises(ValueError, match=r"must be positive"):
+        anyio.run(
+            lambda: drain_until_settled(
+                stream(), ledger, timeout_s=0, on_message=lambda _m: None,
+            )
+        )

@@ -117,6 +117,19 @@ class LiveTaskLedger:
             # to wait for.
             if message.task_type in AWAITED_TASK_TYPES:
                 self._live.add(message.task_id)
+            else:
+                # Say so out loud. This filter is the single assumption the
+                # whole fix rests on: a delegated launch arriving with a new
+                # SDK task_type (or None) would leave the ledger empty, skip
+                # the drain, and reproduce mctl-agents#366 exactly -- with
+                # every test still green, since they all construct
+                # task_type="local_agent". The Argo log was the only forensic
+                # trail the original incident left, so make the skip greppable
+                # rather than silent.
+                print(
+                    f"warn: not awaiting task {message.task_id} of untracked "
+                    f"type {message.task_type!r}"
+                )
             return
         if isinstance(message, TaskNotificationMessage):
             self._settle(message.task_id, message.status)
@@ -131,7 +144,15 @@ class LiveTaskLedger:
             self._settle(message.task_id, status)
 
     def _settle(self, task_id: str, status: str | None) -> None:
-        if not task_id or status not in TERMINAL_TASK_STATUSES:
+        # Only tasks this ledger actually adopted. Notifications arrive for
+        # every task the CLI runs, including the background shells
+        # AWAITED_TASK_TYPES deliberately excludes -- folding those in would
+        # flip `all_completed` and print `warn: <id> ended 'failed'` for work
+        # the driver never waited on, in exactly the log an operator reads
+        # after an incident.
+        if task_id not in self._live:
+            return
+        if status not in TERMINAL_TASK_STATUSES:
             return
         self._live.discard(task_id)
         self._settled[task_id] = status
@@ -162,6 +183,17 @@ async def drain_until_settled(
     Raises ``OrphanedSubagentError`` on the deadline OR on stream exhaustion
     with a task still live (the CLI exited early).
     """
+    if not ledger.live:
+        # Nothing to wait for. Guarded here as well as at the call site so the
+        # helper states its own precondition -- otherwise it falls through and
+        # raises the self-contradicting "never reported a terminal status ...
+        # no outstanding tasks".
+        return
+    if timeout_s <= 0:
+        raise ValueError(
+            f"drain timeout must be positive, got {timeout_s!r}: a non-positive "
+            f"deadline cancels before the first read and orphans every run"
+        )
     with anyio.move_on_after(timeout_s):
         async for message in stream:
             on_message(message)
