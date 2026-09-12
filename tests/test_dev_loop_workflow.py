@@ -89,6 +89,7 @@ def _fake_activities(
     incident_reads_fail: bool = False,
     incident_query: dict[str, str] | None = None,
     ownership_unavailable: bool = False,
+    ownership_unavailable_op: str | None = None,
     ownership_owner: tuple[str, str] | None = None,
     ownership_lost_after: int | None = None,
     ownership_progress_fails: bool = False,
@@ -248,6 +249,15 @@ def _fake_activities(
             )
         if ownership_terminal_fails and req.op == "terminal":
             return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_unavailable_op is not None and req.op == ownership_unavailable_op:
+            # Scoped to ONE op, and only AFTER that op has succeeded once, so
+            # the claim lands and then the heartbeat stops working. That is the
+            # shape the heartbeat block had no cover for: `ownership_unavailable`
+            # fails the claiming acquire too, so the loop never reaches the
+            # heartbeat at all.
+            done = [o for o in ownership_ops[:-1] if o.op == ownership_unavailable_op]
+            if done:
+                return OwnershipResult(verdict="unknown", reason="store down")
         if ownership_body_less is not None and req.op == ownership_body_less:
             # A body-less 2xx: mctl-api took the write and returned no record.
             # `answer_from` answers WROTE_NO_RECORD for it, and no fake in this
@@ -1244,6 +1254,55 @@ class TestDevLoopWorkflow:
         # ...and it counted toward the back-off rather than being ignored.
         assert len(ops) < 12, f"a body-less acquire was never counted: {len(ops)}"
         assert len(ops) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, len(ops)
+
+    async def test_a_failing_heartbeat_is_reported_and_eventually_drops_the_claim(self, env):
+        """The heartbeat was the one ownership write whose failure was neither
+        logged, nor counted, nor tested.
+
+        The claim path has four arms and a counter and the progress path now has
+        four arms and a counter; this block had two, and UNKNOWN, UNOWNED,
+        WROTE_NO_RECORD and a `None` result all fell off the end in silence.
+        It is where silence costs most: once the head stops moving the heartbeat
+        is the ONLY liveness write a claimed loop makes, so an /acquire that
+        503s stops refreshing `last_seen_at` with no signal at all, and the
+        reconciler force-releases the row at the 10h bound while the workflow is
+        alive and polling.
+
+        No existing fixture could reach it — `ownership_unavailable` fails the
+        claim so the loop never gets here, `ownership_progress_fails` leaves
+        acquire healthy, and `ownership_lost_after` covers only the
+        OWNED_BY_OTHER arm. Deleting the whole block left the suite green.
+
+        What the loop does after the limit is give up the CLAIM, not the
+        heartbeat: skipping the write whose absence is the problem cannot help,
+        and after this many failures what is wrong is the belief. The row will
+        be taken at the bound whatever this loop thinks.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # The claim lands on poll 1 (head "a"), the head moves once so progress
+        # succeeds, and from then on only the heartbeat is attempted — and only
+        # the heartbeat fails.
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40)] + [_pr("b" * 40)] * 30 + [MERGED_PR],
+            issue=920,
+            ownership_unavailable_op="acquire",
+        )
+        kinds = [o.op for o in ops]
+        # The claim was dropped, so the loop went back to the unclaimed path and
+        # tried to acquire again — which is only reachable through the give-up.
+        first_progress = kinds.index("progress")
+        later_acquires = [k for k in kinds[first_progress:] if k == "acquire"]
+        assert len(later_acquires) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"the heartbeat never gave up a claim it could not refresh: {kinds}"
+        )
+        # And it never terminalised a PR whose ownership it had given up.
+        assert "terminal" not in kinds[first_progress:], kinds
 
     async def test_progress_is_recorded_only_when_the_head_moves(self, env):
         """A poll that observed nothing new must not write progress.

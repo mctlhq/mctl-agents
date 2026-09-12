@@ -556,6 +556,7 @@ class DevLoopWorkflow:
         self._claim_refused = False
         self._unknown_acquires = 0
         self._unknown_progress = 0
+        self._unknown_heartbeats = 0
         self._proposal_ref = ""
         self._policy_ref = ""
 
@@ -1383,16 +1384,62 @@ class DevLoopWorkflow:
             result = await self._ownership(
                 "acquire", repo=repo, number=number, head_sha=head
             )
-            if result is None:
-                return
-            if result.owned_by_caller:
+            if result is not None and result.owned_by_caller:
                 self._owner_epoch = result.epoch or self._owner_epoch
-            elif result.verdict == OWNED_BY_OTHER:
+                self._unknown_heartbeats = 0
+                return
+            if result is not None and result.verdict == OWNED_BY_OTHER:
                 # Discarding the verdict and keeping only the epoch meant this
                 # loop could never notice it had LOST the PR — and it adopted
                 # the winner's fencing generation while failing to notice,
                 # so every later call carried a competitor's epoch.
                 self._lose_claim(repo, number, result)
+                return
+
+            # Everything else: UNKNOWN, UNOWNED, WROTE_NO_RECORD, and a None
+            # result all used to fall off the end of this block in silence.
+            #
+            # This is the path where silence costs most. Once the head stops
+            # moving, the heartbeat is the ONLY liveness write a claimed loop
+            # makes, so an /acquire answering 503 — or a worker that lost
+            # MCTL_TOKEN, or a 404 from a wrong ingress path, each of which
+            # `answer_from` gives its own reason — stopped refreshing
+            # last_seen_at with zero log lines and zero history signal, and the
+            # reconciler force-released the row at the 10h bound while the
+            # workflow was alive and polling.
+            self._unknown_heartbeats += 1
+            workflow.logger.warning(
+                "lifecycle: heartbeat for %s#%s did not land (%s) — "
+                "%d consecutive, last_seen_at is not being refreshed",
+                repo, number,
+                result.reason if result is not None else "the activity failed outright",
+                self._unknown_heartbeats,
+            )
+            if self._unknown_heartbeats >= LIFECYCLE_UNKNOWN_WRITE_LIMIT:
+                # Deliberately NOT a back-off. Skipping the heartbeat is the
+                # one thing that cannot help here — it is the write whose
+                # absence is the problem.
+                #
+                # What is wrong after this many consecutive failures is the
+                # BELIEF. last_seen_at has not moved for about three hours, so
+                # the reconciler will take the row at the 10h bound whatever
+                # this loop thinks; a loop that goes on believing it owns an
+                # entity the store is about to hand to somebody else is the
+                # divergence this epic exists to remove. Dropping the claim
+                # makes the belief match the outcome, and returns the loop to
+                # the unclaimed path, which re-acquires under its own gate.
+                workflow.logger.warning(
+                    "lifecycle: giving up the claim on %s#%s after %d failed "
+                    "heartbeats — the sweeper keeps the PR",
+                    repo, number, self._unknown_heartbeats,
+                )
+                self._owned_entity_id = ""
+                self._owner_epoch = 0
+                self._owned_head_sha = ""
+                self._unknown_heartbeats = 0
+                # NOT _claim_refused: nobody said they own this. That flag is
+                # permanent and means "somebody else answered", which is the
+                # opposite of what just happened.
 
     def _backed_off(self, unanswered: int) -> bool:
         """Whether an ownership write should be skipped on this poll.
