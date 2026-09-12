@@ -165,7 +165,7 @@ running in mctl-api supply the semantics verbatim:
 | Requirement | Precedent in mctl-api |
 |---|---|
 | at most one active owner per (entity, phase) | partial unique index, `internal/alerts/store.go` |
-| atomic acquire, loser learns the winner | `INSERT … ON CONFLICT DO NOTHING RETURNING` |
+| atomic acquire | `INSERT … ON CONFLICT DO UPDATE … WHERE` on the existing row's state; a conflicting acquire matches no row, returns none, and re-reads to name the winner. **Not** `DO NOTHING RETURNING`, which yields zero rows and tells the loser nothing |
 | atomic multi-statement transition | `pg_advisory_xact_lock(hashtext($1))`, `internal/agentregistry/store.go` |
 | retry/replay idempotency | `UNIQUE (…)` + `ON CONFLICT DO UPDATE`, same file |
 
@@ -201,18 +201,48 @@ Answering #350's explicit question: per kind, with a closed server-side registry
 of legal `(kind, phase)` pairs. Global typing would make `investigate` a legal
 phase on a pull request.
 
-| kind | phase | replaces | staleness bound |
-|---|---|---|---|
-| `devloop-proposal` | `implement` | the 130-minute `attempt` lease | 130 min |
-| `pull-request` | `review-remediation` | `_dev_loop_owns` + skip-lists + `merge_owner` | 6 h |
+| kind | phase | replaces | liveness bound | progress bound |
+|---|---|---|---|---|
+| `devloop-proposal` | `implement` | the 130-minute `attempt` lease | 130 min | 130 min |
+| `pull-request` | `review-remediation` | `_dev_loop_owns` + skip-lists + `merge_owner` | 10 h | 48 h |
 
-The in-loop tick cadence is `SHEPHERD_TICK_EVERY_POLLS = 8` against a
-30-minute `MERGE_POLL_INTERVAL`, so roughly **4 h**. Six hours is 1.5× that: it
-tolerates one missed tick and flags two. An earlier draft of this paragraph
-called 6 h "four times the cadence", which is simply wrong arithmetic — 4× would
-be 16 h, long enough that a dead owner would hold a PR for most of a day before
-anything noticed. The bound has to sit in the gap between one missed tick and
-two, and 6 h is the only round number there.
+**Two bounds, because there are two different questions**, and an earlier draft
+of this ADR collapsed them into one — which was wrong twice over (agy P2 ×2 on
+`mctl-agents#356`).
+
+*Liveness* asks: is the owner still there? It is answered by `last_seen_at`,
+which **any** tick refreshes, including a poll that found nothing to do. Losing
+this is what licenses another actor to take over.
+
+*Progress* asks: is the work moving? It is answered by `last_progress_at`,
+which only an effected change refreshes. Losing this licenses an **escalation**
+and never a takeover.
+
+Collapsing them produced two failures that the single 6 h bound made
+unavoidable:
+
+1. **It could not tolerate a missed tick.** Progress at T=0, ticks at T=4h and
+   T=8h. If the T=4h tick is lost to a pod restart, the next opportunity is
+   T=8h — but a 6 h bound declares the owner stale at T=6h. A bound that must
+   survive one missed tick has to exceed the interval to the tick *after* the
+   missed one, i.e. `2 × cadence`, not `1.5 ×`. Hence 10 h.
+2. **A healthy owner on a quiet PR looked dead.** A PR waiting on human review
+   or a slow CI run produces no state changes for hours by design, and this
+   ADR forbids writing progress for a poll that observed nothing. So the
+   correct behaviour of a healthy owner was indistinguishable from a crashed
+   one, and the reconciler would take the PR away every 6 h from an owner that
+   was working perfectly — thrashing the epoch and fencing the original worker
+   out the moment the review finally landed.
+
+The original concern that produced the single-bound design still holds and is
+still honoured: **a heartbeat must not prove useful progress indefinitely.** The
+resolution is that it no longer has to. A heartbeat proves the owner is alive,
+which is all it was ever evidence of; the absence of progress is a separate
+signal with a separate and much longer bound, and its remedy is to tell a human
+rather than to hand the entity to another machine that will be just as stuck.
+
+The cadence itself: `SHEPHERD_TICK_EVERY_POLLS = 8` against a 30-minute
+`MERGE_POLL_INTERVAL`, so roughly **4 h**.
 
 `deploy-watch`, `investigate` and `await-approval` are **reserved and not
 implemented**. Naming them here without shipping them is deliberate — ADR-007
@@ -227,7 +257,10 @@ LifecycleOwnership
   owner {type, id}        devloop-workflow | shepherd | pr-steward | reconciler | human-codeowner
   epoch                   fencing generation; increments on handoff and recovery
   state                   active | handing-off | released | terminal
-  acquired_at, last_progress_at, progress_evidence
+  acquired_at
+  last_seen_at            any tick refreshes this; proves the owner exists
+  last_progress_at        only an effected change refreshes this
+  progress_evidence
   entity_version          last observed head (informational on this row)
   proposal_ref            "" for proposal-less PRs
   policy_ref              which policy granted this ownership
@@ -245,23 +278,29 @@ ExecutionClaim            (phase 2 — mctl-agents#352, not #351)
   state                   active | released | expired | fenced
 ```
 
-**`stale` and `conflicted` are not stored.** Both are derived on read:
+**Nothing derived is stored.** All of it is computed on read:
 
 ```text
-stale      := state = 'active' AND now() - last_progress_at > bound(kind, phase)
+dead       := state = 'active' AND now() - last_seen_at     > liveness_bound(kind, phase)
+stuck      := state = 'active' AND now() - last_progress_at > progress_bound(kind, phase)
 conflicted := an active claim whose owner_epoch <> the current epoch,
               or whose entity_version <> the current head
 ```
+
+Only `dead` licenses a takeover. `stuck` licenses an escalation — a human is
+told, and ownership does not move, because handing a stuck entity to another
+machine produces a second stuck machine and an epoch bump.
 
 A second active owner is not in that list because it is impossible: the partial
 unique index makes "at most one active owner" a property of the database rather
 than of the code that writes to it.
 
 **Progress means an effected state change, not a heartbeat.** A poll that
-observes nothing new writes no progress, and `progress_evidence` records what
-counted. #350 requires that a heartbeat alone must not prove useful progress
-indefinitely; a liveness ping that refreshed `last_progress_at` would do exactly
-that.
+observes nothing new refreshes `last_seen_at` but writes no progress, and
+`progress_evidence` records what counted. #350 requires that a heartbeat alone
+must not prove useful progress indefinitely — which is satisfied by the
+heartbeat feeding a different field with a different consequence, rather than by
+refusing to record liveness at all.
 
 ### 5. State machine
 
@@ -281,10 +320,10 @@ that.
 `merged` / `rejected` / `review-stuck`.
 
 **Recovery is the only path that takes ownership from a live row**:
-`acquire(force_if_stale=true, expected_epoch=N, evidence=…)` re-checks staleness
-*server-side* under the advisory lock, bumps the epoch, and writes a `recovered`
-event. A client may not assert staleness; it may only ask the server to
-re-evaluate it.
+`acquire(force_if_dead=true, expected_epoch=N, evidence=…)` re-checks
+**liveness** — not progress — *server-side* under the advisory lock, bumps the
+epoch, and writes a `recovered` event. A client may not assert that an owner is
+dead; it may only ask the server to re-evaluate it.
 
 ### 6. The fencing rule, and where it is enforced
 
@@ -295,12 +334,25 @@ re-evaluate it.
 > head. Otherwise it returns **409 FENCED** and the worker **aborts without
 > mutating**.
 
-The enforcement *point* matters more than the rule. A validity check far from
-the mutation is decoration, so re-validation happens at exactly two boundaries
-and nowhere else:
+**The epoch check is an early filter, not the fence.** This is the correction
+agy raised as a P2 on `mctl-agents#356`, and it is load-bearing enough to state
+plainly rather than bury: asking mctl-api "am I still the owner?" and then
+pushing to GitHub is a time-of-check/time-of-use race. Worker A validates,
+stalls on a GC pause, its ownership moves, worker B acquires and pushes, and
+A's delayed push still lands on top. No amount of checking *earlier* fixes
+that, because the check and the mutation are against different systems.
 
-- immediately before the `git push` in `apply_followup`;
-- immediately before `gh pr merge` in `merge_pr`.
+So fencing has two layers, and only the second is authoritative:
+
+| layer | mechanism | what it buys |
+|---|---|---|
+| early filter | epoch + claim validity via mctl-api, immediately before the mutation | a fenced worker stops before doing expensive or noisy work |
+| **authoritative CAS** | the target system's own precondition — `git push --force-with-lease=<branch>:<expected sha>` for `apply_followup`, `gh pr merge --match-head-commit` for `merge_pr` | the mutation itself fails if the world moved, whatever the worker believed |
+
+`merge_pr` already uses `--match-head-commit` today, for exactly this reason;
+`apply_followup` currently pushes without a lease and must gain one. The
+ownership epoch's real job is to arbitrate *responsibility*, and it can never be
+the last word on a mutation in a system it does not control.
 
 A fenced claim aborts **before** invoking git, and does **not** consume a
 `review_attempts` slot — the existing transient/deterministic distinction in
@@ -508,7 +560,10 @@ ship in #351; the existing 130-minute `attempt` lease is untouched until #352.
    lifecycle store's fixtures must clean up scoped to their own keys rather than
    issuing unscoped deletes.
 2. A pre-handoff executor cannot mutate after the epoch increments.
-3. A claim pinned to head A cannot mutate once head B is current.
+3. A claim pinned to head A cannot mutate once head B is current — enforced by
+   the target system's own precondition (`--force-with-lease`,
+   `--match-head-commit`), not only by the epoch check, so a worker that stalls
+   between checking and pushing still fails.
 4. Retry, replay and pod restart do not duplicate an effective mutation.
 5. No lifecycle HTTP call originates in workflow code.
 6. The `.status.yaml` projection can be made to contradict Postgres without
