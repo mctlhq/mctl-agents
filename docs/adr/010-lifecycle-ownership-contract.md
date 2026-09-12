@@ -507,9 +507,11 @@ Per-mechanism migration:
   60-second budget disappear with it, because a single batched read needs no
   budget.
 - **the `shepherd_in_loop` query stays** — demoted from *the* ownership answer
-  to one input to owner liveness, which §5's recovery rule needs: staleness must
-  be judged on progress evidence and health, not on whether a process name
-  exists.
+  to one input to the `dead` predicate in §4. It corroborates `last_seen_at`:
+  an execution that Temporal still reports Running is evidence the owner exists,
+  which is a liveness question and has nothing to do with `stuck`. Only `dead`
+  licenses the recovery path in §5, so this query can no longer, by itself,
+  decide that anyone may act.
 - **`merge_owner` is retained, still unread, and documented as descriptive**
   (#344 item 1). The canonical answer is `merge_authority_for`.
 
@@ -555,10 +557,12 @@ ship in #351; the existing 130-minute `attempt` lease is untouched until #352.
    that the database *produces* one. mctl-api CI already provides this: the
    `test` job in `.github/workflows/validate.yml` runs a `postgres:16` service
    and sets `TEST_DATABASE_URL`, so the store tests that skip on a developer
-   laptop do run on every PR. It runs `go test -p 1 ./...` deliberately, because
-   packages sharing that database wipe each other's rows in parallel — so the
-   lifecycle store's fixtures must clean up scoped to their own keys rather than
-   issuing unscoped deletes.
+   laptop do run on every PR. It runs `go test -p 1 ./...` deliberately:
+   *without* it, packages sharing that one database would wipe each other's
+   rows, because several of them clean up with unscoped deletes. The lifecycle
+   store's fixtures therefore scope their cleanup to their own keys, so that
+   serialisation is not the only thing standing between them and the same
+   problem from a new direction.
 2. A pre-handoff executor cannot mutate after the epoch increments.
 3. A claim pinned to head A cannot mutate once head B is current — enforced by
    the target system's own precondition (`--force-with-lease`,
@@ -572,8 +576,14 @@ ship in #351; the existing 130-minute `attempt` lease is untouched until #352.
 8. Each of the four rollout modes behaves per the table — including the
    `enforce` case where old says free, new says owned, and nothing mutates.
 9. Ownership survives worker and pod death, and does not depend on a heartbeat.
-10. A stale owner is not replaced on a delayed heartbeat alone; staleness
-    requires progress evidence.
+10. A takeover is licensed by **liveness alone** — an owner unseen past its
+    liveness bound — and never by lack of progress. An owner that is alive but
+    has effected nothing is `stuck`: it is escalated to a human and keeps the
+    entity. The earlier single-bound model said the opposite ("staleness
+    requires progress evidence"), which is what made a PR waiting on human
+    review indistinguishable from a crashed worker.
+11. One fully missed tick does not make a live owner look dead; the liveness
+    bound exceeds two cadences for exactly that reason.
 
 Every guard is proved by mutation in both directions. A guard that can only pass
 is not a guard.
