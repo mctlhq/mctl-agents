@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import timedelta
 
 import anyio
 import pytest
@@ -19,15 +20,20 @@ from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
+from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
+from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest, OwnershipResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
+    LIFECYCLE_HEARTBEAT_EVERY_POLLS,
+    LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
+    LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
     DevLoopWorkflow,
@@ -86,6 +92,20 @@ def _fake_activities(
     incidents: list[Incident] | None = None,
     incident_reads_fail: bool = False,
     incident_query: dict[str, str] | None = None,
+    ownership_unavailable: bool = False,
+    ownership_unavailable_op: str | None = None,
+    ownership_owner: tuple[str, str] | None = None,
+    ownership_owner_after: int | None = None,
+    ownership_lost_after: int | None = None,
+    ownership_self_unhealthy_after: int | None = None,
+    ownership_progress_fails: bool = False,
+    ownership_progress_unowned: bool = False,
+    ownership_unowned_op: str | None = None,
+    ownership_unknown_state: str | None = None,
+    ownership_unknown_state_op: str = "acquire",
+    ownership_body_less: str | None = None,
+    ownership_terminal_fails: bool = False,
+    ownership_raises: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -118,6 +138,7 @@ def _fake_activities(
         return resolved.get(agent) if released else None
 
     calls: list[str] = []
+    ownership_ops: list[OwnershipRequest] = []
     investigate_ran = anyio.Event()
 
     @activity.defn(name="submit_and_wait")
@@ -217,6 +238,150 @@ def _fake_activities(
         poll_index["i"] += 1
         return sequence[i]
 
+    @activity.defn(name="lifecycle_ownership")
+    async def fake_lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
+        ownership_ops.append(req)
+        if ownership_raises:
+            # The activity itself failing — an old worker with no
+            # lifecycle_ownership registered, or retries exhausted. _ownership
+            # returns None here, and nothing may dereference it.
+            raise ApplicationError("activity not registered", non_retryable=True)
+        if ownership_lost_after is not None and len(ownership_ops) > ownership_lost_after:
+            return OwnershipResult(
+                verdict="owned-by-other",
+                owner_type="pr-steward",
+                owner_id="steward",
+                epoch=77,
+                state="active",
+                healthy=True,
+                accepted=True,
+            )
+        if (
+            ownership_self_unhealthy_after is not None
+            and len(ownership_ops) > ownership_self_unhealthy_after
+        ):
+            # OUR OWN record, read back unhealthy. `verdict_for` answers
+            # OWNED_BY_OTHER for an active record whose owner IS the caller
+            # whenever `healthy` is False, so the verdict names this very
+            # workflow. Reachable after a ~10h gap — a pod restart, or an
+            # /acquire outage — and after a 48h quiet PR if `healthy` also
+            # excludes `stuck`. No fake produced it, and the arms reading
+            # OWNED_BY_OTHER could not tell it from a competitor.
+            return OwnershipResult(
+                verdict="owned-by-other",
+                owner_type=req.owner_type,
+                owner_id=req.owner_id,
+                epoch=1,
+                state="active",
+                healthy=False,
+                # `stuck`, not `dead`: ADR-010 §4 gives them different
+                # consequences and the wire type carries both, so a fixture
+                # that set neither would exercise the arm without exercising
+                # the distinction it now logs.
+                stuck=True,
+                accepted=True,
+            )
+        if ownership_terminal_fails and req.op == "terminal":
+            return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_unavailable_op is not None and req.op == ownership_unavailable_op:
+            # Scoped to ONE op, and only AFTER that op has succeeded once, so
+            # the claim lands and then the heartbeat stops working. That is the
+            # shape the heartbeat block had no cover for: `ownership_unavailable`
+            # fails the claiming acquire too, so the loop never reaches the
+            # heartbeat at all.
+            done = [o for o in ownership_ops[:-1] if o.op == ownership_unavailable_op]
+            if done:
+                return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_body_less is not None and req.op == ownership_body_less:
+            # A body-less 2xx: mctl-api took the write and returned no record.
+            #
+            # Built by running the REAL classification over the REAL route for
+            # this op, not hand-written. The hand-written version returned
+            # `wrote-no-record` for whatever op it was handed, and that is a
+            # verdict `answer_from` reserves for /release and /terminal —
+            # RELINQUISHING_PATH_SUFFIXES is closed on those two precisely
+            # because /progress and /acquire leave the entity HELD. So the fake
+            # produced a shape the transport cannot, the arms reading it were
+            # unreachable, and the tests pinning them were false guards. Going
+            # through answer_from means the fake cannot drift from the contract
+            # again without the contract's own tests catching it.
+            answer = answer_from(
+                204, {}, Owner(type=req.owner_type, id=req.owner_id),
+                path=_PATHS[req.op], body_empty=True,
+            )
+            return OwnershipResult(
+                verdict=answer.verdict, reason=answer.reason, accepted=answer.accepted
+            )
+        if ownership_unowned_op is not None and req.op == ownership_unowned_op:
+            # A released record answered to any op, not just progress. The
+            # heartbeat's UNOWNED arm has to sit ABOVE the accepted arm,
+            # because a released record arrives in a 2xx with accepted True —
+            # and the only `unowned` fixture was gated on progress, so no test
+            # had ever produced an unowned ACQUIRE.
+            #
+            # Only AFTER the op has succeeded once, like ownership_unavailable_op
+            # and for the same reason: answering it to the CLAIMING acquire
+            # means no claim ever lands, the heartbeat block is never reached,
+            # and every later op carries epoch 0 — which makes an assertion
+            # about the claim being dropped trivially true.
+            if [o for o in ownership_ops[:-1] if o.op == ownership_unowned_op]:
+                return OwnershipResult(
+                    verdict="unowned", state="released", reason="no record", accepted=True
+                )
+        if ownership_unknown_state is not None and req.op == ownership_unknown_state_op:
+            # A 2xx carrying a holding state this image does not know. This
+            # container lags mctl-api by a release, so `verdict_for` answers
+            # UNKNOWN against its two CLOSED sets rather than guessing — and
+            # the row may be held by somebody else in that state.
+            #
+            # An EMPTY state is the body-less 2xx: accepted, verdict UNKNOWN,
+            # no record at all. It is the other side of the `result.state`
+            # conjunct, and the shape the claim must SURVIVE.
+            #
+            # After the CLAIM — not after this op has succeeded once, because
+            # for a progress op the claiming acquire is a different op and has
+            # already landed. Keyed on the acquire either way.
+            if [o for o in ownership_ops[:-1] if o.op == "acquire"]:
+                return OwnershipResult(
+                    verdict="unknown", state=ownership_unknown_state, accepted=True
+                )
+        if ownership_progress_unowned and req.op == "progress":
+            # The reconciler already released the row underneath this loop, so
+            # the progress write lands on nothing. Neither owned-by-me nor
+            # owned-by-other: the verdict the progress branch used to match
+            # against no branch at all.
+            return OwnershipResult(verdict="unowned", reason="no record", accepted=True)
+        if ownership_progress_fails and req.op == "progress":
+            # The claim holds; only the progress write fails. This is the shape
+            # the retry guard exists for, and the shape an earlier version of
+            # its test never produced.
+            return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_unavailable:
+            # The store is down. The activity's own contract is to report
+            # `unknown` rather than raise, and the loop must survive it.
+            return OwnershipResult(verdict="unknown", reason="store down")
+        if ownership_owner is not None and (
+            ownership_owner_after is None or len(ownership_ops) > ownership_owner_after
+        ):
+            return OwnershipResult(
+                verdict="owned-by-other",
+                owner_type=ownership_owner[0],
+                owner_id=ownership_owner[1],
+                epoch=9,
+                state="active",
+                healthy=True,
+                accepted=True,
+            )
+        return OwnershipResult(
+            verdict="owned-by-me",
+            owner_type=req.owner_type,
+            owner_id=req.owner_id,
+            epoch=1,
+            state="active",
+            healthy=True,
+            accepted=True,
+        )
+
     activities = [
         fake_resolve_agent_release,
         fake_submit_and_wait,
@@ -227,13 +392,14 @@ def _fake_activities(
         fake_get_release_after,
         fake_get_deploy_status,
         fake_list_service_incidents,
+        fake_lifecycle_ownership,
     ]
-    return activities, calls, investigate_ran
+    return activities, calls, investigate_ran, ownership_ops
 
 
 class TestDevLoopWorkflow:
     async def test_investigate_then_wait_then_implement_after_approval(self, env):
-        activities, calls, investigate_ran = _fake_activities(released=True)
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
@@ -327,7 +493,9 @@ class TestDevLoopWorkflow:
         after review caught it being dropped as collateral of the A4
         rewrite rather than deliberately (claude P2 on #241).
         """
-        activities, calls, _investigate_ran = _fake_activities(released=True, investigate_phase="Failed")
+        activities, calls, _investigate_ran, _ownership_ops = _fake_activities(
+            released=True, investigate_phase="Failed"
+        )
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
@@ -537,7 +705,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran = _fake_activities(
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             unpinned={"shepherd"},
             pr_states=[open_pr, open_pr, MERGED_PR],
@@ -582,7 +750,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran = _fake_activities(
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             resolve_unavailable={"shepherd"},
             pr_states=[open_pr, open_pr, MERGED_PR],
@@ -882,7 +1050,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr, open_pr, MERGED_PR]
         )
         async with Worker(
@@ -908,11 +1076,1236 @@ class TestDevLoopWorkflow:
         assert result.pr.merged is True
         assert result.pr.merge_commit == "cafe1234"
 
+    async def _run_ownership_loop(self, env, *, pr_states, issue: int, **kwargs):
+        activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True, pr_states=pr_states, **kwargs
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            # Bounded on purpose. A workflow-code AttributeError is not a
+            # FailureError: the workflow TASK fails and, because replay is
+            # deterministic, keeps failing the same way forever. Without a
+            # deadline the test for that would hang rather than fail, which is
+            # the least useful way to report the most severe failure mode here.
+            with anyio.fail_after(30):
+                result = await handle.result()
+        return result, ownership_ops
+
+    async def test_ownership_claimed_on_first_resolved_pr_and_terminal_on_merge(self, env):
+        """The loop records itself as the owner of the PR it is watching, and
+        records a terminal state when the PR reaches one.
+
+        It cannot claim any earlier than the first resolved poll: until then
+        this execution knows a service and a slug, and the entity ownership
+        attaches to is the pull request.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, open_pr, MERGED_PR], issue=901
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+
+        assert ops, "the loop recorded no ownership at all"
+        first = ops[0]
+        assert first.op == "acquire"
+        assert first.kind == "pull-request"
+        assert first.entity_id == f"{MERGED_PR.repo}#{MERGED_PR.number}"
+        assert first.phase == "review-remediation"
+        assert first.owner_type == "devloop-workflow"
+        assert first.owner_id.startswith("dev-loop-test-")
+
+        assert ops[-1].op == "terminal", [o.op for o in ops]
+        # A merged PR is finished, not handed back: nothing should pick it up.
+        assert "release" not in [o.op for o in ops]
+
+    async def test_ownership_released_when_the_watch_ends_without_a_terminal_pr(self, env):
+        """The watch gave up without the PR reaching MERGED or CLOSED, so the
+        work REMAINS and somebody must be able to take it.
+
+        Release, not terminal: terminal would mean finished, and a reconciler
+        would leave it alone forever — which is the zero-owner gap #239
+        describes, arrived at from the other direction.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        # Resolves once, then the link stops resolving until the grace polls
+        # run out.
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] + [PRState(found=False)] * 6,
+            issue=902,
+        )
+        assert ops[0].op == "acquire"
+        assert ops[-1].op == "release", [o.op for o in ops]
+        assert "terminal" not in [o.op for o in ops]
+        # And it carries the head this watch last saw. `_payload` sends
+        # `version` unconditionally, so omitting it made the LAST write of the
+        # watch the only one carrying an empty one — and the version is what
+        # the row records about the entity it is letting go of.
+        assert ops[-1].version == "a" * 40, (
+            f"the final release carried no version: {ops[-1].version!r}"
+        )
+
+    async def test_ownership_store_outage_does_not_fail_the_loop(self, env):
+        """Ownership is a coordination signal, not the work.
+
+        A loop that died because it could not reach the ownership store would
+        trade a bookkeeping outage for a delivery outage — after investigate,
+        approve and implement had all succeeded. It holds no claim instead, and
+        the cron sweeper keeps the PR exactly as it did before.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, open_pr, MERGED_PR], issue=903,
+            ownership_unavailable=True,
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        # It kept trying to acquire and never recorded a claim, so it never
+        # reached terminal either — there was nothing to terminalise.
+        assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
+
+    async def test_loop_holds_no_claim_when_somebody_else_owns_the_pr(self, env):
+        """Another actor owns it. Nothing to escalate here — the reconciler
+        resolves conflicts — so this loop simply does not record itself."""
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, open_pr, MERGED_PR], issue=904,
+            ownership_owner=("pr-steward", "steward"),
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
+
+    async def test_a_refused_claim_is_asked_about_once_not_every_poll(self, env):
+        """`_claim_refused` is permanent, and nothing pinned that it exists.
+
+        The sibling test above asserts only `all(op == "acquire")`, which is as
+        true of one acquire as of six hundred — so deleting the early return
+        left it green through three review rounds. "Somebody else owns this" is
+        an ANSWER, not a failure to answer: re-asking for the remaining
+        fortnight is ~670 activities to re-learn one fact, and the reconciler
+        is what resolves a conflict, not this loop.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 12 + [MERGED_PR],
+            issue=915,
+            ownership_owner=("pr-steward", "steward"),
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        assert len(acquires) == 1, (
+            f"a refused claim was re-asked {len(acquires)} times over 12 polls"
+        )
+
+    async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(
+        self, env
+    ):
+        """The unclaimed back-off is a DECAY, and both halves of that need cover.
+
+        Every ownership test drives at most four tracked polls against a limit
+        of six, so neither half was reachable: reverting the decay to the
+        previous permanent give-up stayed green, and deleting the gate stayed
+        green too. Twelve polls separates all three behaviours.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 12 + [MERGED_PR],
+            issue=916,
+            ownership_unavailable=True,
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        # Throttled: fewer than one per poll.
+        assert len(acquires) < 12, f"the gate never engaged: {len(acquires)} acquires"
+        # But NOT a permanent give-up: asking resumes on heartbeat boundaries
+        # after the limit, which is the whole difference from the behaviour
+        # this replaced.
+        assert len(acquires) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"the loop gave up permanently at the limit: {len(acquires)} acquires"
+        )
+
+    async def test_a_failing_progress_write_is_throttled_too(self, env):
+        """The commit that made the progress branch fall through claimed it
+        bounded the retries. It did not.
+
+        `LIFECYCLE_UNKNOWN_WRITE_LIMIT` was read and written only inside the
+        unclaimed branch, so a claimed loop whose /progress 500s from poll two
+        onward paid one activity per poll for the rest of the watch — the exact
+        history cost the constant exists to refuse, arriving by the path that
+        falling through created.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 12 + [MERGED_PR],
+            issue=917,
+            ownership_progress_fails=True,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert progress, f"the progress path was never reached: {[o.op for o in ops]}"
+        assert len(progress) < 12, f"the progress write was never throttled: {len(progress)}"
+        # And the heartbeat still runs while progress is throttled — the
+        # liveness fix this back-off sits on top of must survive it.
+        first = [o.op for o in ops].index("progress")
+        assert "acquire" in [o.op for o in ops][first:], [o.op for o in ops]
+
+    async def test_a_body_less_2xx_on_progress_is_a_landed_write(self, env):
+        """A body-less 2xx on /progress is a write that LANDED, and the branch
+        had no arm for it, so a 204 landed on `_unknown_progress += 1`.
+
+        This test was a false guard for two rounds. The arm it covers read
+        `verdict == WROTE_NO_RECORD`, and `answer_from` never answers that for
+        /progress: RELINQUISHING_PATH_SUFFIXES is closed on ("/release",
+        "/terminal") because /progress leaves the record active and owned by
+        the caller. The arm was unreachable and the defect below was still
+        live — the test passed only because the fake hand-built that verdict
+        for whatever op it was handed. The fake now runs the real
+        classification over the real route, which is what makes the shape here
+        the one the transport can actually produce: `accepted` True with
+        verdict UNKNOWN. Both halves of the predicate are load-bearing and each
+        is killed by its own mutation.
+
+        The write succeeded server-side while `_owned_head_sha` never advanced,
+        so the identical evidence was re-sent for the rest of the watch. That
+        refreshes `last_progress_at` forever for a head that stopped moving, so
+        the stuck bound can NEVER fire — the one property the liveness/progress
+        split exists to provide. Throttling to the heartbeat cadence does not
+        save it: a refresh every two hours clears a stuck bound as well as one
+        every thirty seconds. It also counted a successful write as an
+        unanswered one, the opposite of what the gate is for.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 12 + [MERGED_PR],
+            issue=918,
+            ownership_body_less="progress",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) == 1, (
+            "a landed progress write was re-sent for a head that never moved "
+            f"again: {[(o.op, o.version[:8]) for o in ops]}"
+        )
+        # And the shape the fake produced is the one the transport produces —
+        # not the verdict the arm used to read. If RELINQUISHING_PATH_SUFFIXES
+        # ever grows /progress this assertion fails and the arm above has to be
+        # re-derived rather than silently going dead again.
+        landed = answer_from(
+            204, {}, Owner(type="devloop-workflow", id="w"),
+            path=_PATHS["progress"], body_empty=True,
+        )
+        assert landed.accepted is True and landed.verdict == "unknown", landed
+
+    async def test_a_body_less_2xx_on_acquire_is_not_a_claim(self, env):
+        """A body-less acquire is not a claim.
+
+        Nothing is known about who owns the entity, and it must count toward
+        the back-off rather than silently taking no branch at all — which is
+        what this pins, and which no fake produced before.
+
+        It still does not pin the choice of predicate — the else arm increments
+        the same counter, so the two remain behaviourally identical and no
+        assertion here can separate them. What changed is that the predicate is
+        now a REACHABLE one: the arm read `verdict == WROTE_NO_RECORD`, which
+        `answer_from` reserves for /release and /terminal, so it was dead code
+        that this test could not have detected. The reachability is asserted
+        directly below, against the real route.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 12 + [MERGED_PR],
+            issue=919,
+            ownership_body_less="acquire",
+        )
+        # No claim was recorded, so nothing but acquires was ever attempted...
+        assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
+        # ...and it counted toward the back-off rather than being ignored.
+        assert len(ops) < 12, f"a body-less acquire was never counted: {len(ops)}"
+        assert len(ops) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, len(ops)
+        # The arm's predicate is reachable for this route, which is the thing
+        # the previous version of this test could not see.
+        landed = answer_from(
+            204, {}, Owner(type="devloop-workflow", id="w"),
+            path=_PATHS["acquire"], body_empty=True,
+        )
+        assert landed.accepted is True and landed.verdict == "unknown", landed
+
+    async def test_a_failing_heartbeat_is_reported_and_eventually_drops_the_claim(self, env):
+        """The heartbeat was the one ownership write whose failure was neither
+        logged, nor counted, nor tested.
+
+        The claim path has four arms and a counter and the progress path now has
+        four arms and a counter; this block had two, and UNKNOWN, UNOWNED,
+        WROTE_NO_RECORD and a `None` result all fell off the end in silence.
+        It is where silence costs most: once the head stops moving the heartbeat
+        is the ONLY liveness write a claimed loop makes, so an /acquire that
+        503s stops refreshing `last_seen_at` with no signal at all, and the
+        reconciler force-releases the row at the 10h bound while the workflow is
+        alive and polling.
+
+        No existing fixture could reach it — `ownership_unavailable` fails the
+        claim so the loop never gets here, `ownership_progress_fails` leaves
+        acquire healthy, and `ownership_lost_after` covers only the
+        OWNED_BY_OTHER arm. Deleting the whole block left the suite green.
+
+        What the loop does after the limit is give up the CLAIM, not the
+        heartbeat: skipping the write whose absence is the problem cannot help,
+        and after this many failures what is wrong is the belief. The row will
+        be taken at the bound whatever this loop thinks.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # The claim lands on poll 1 (head "a"), the head moves once so progress
+        # succeeds, and from then on only the heartbeat is attempted — and only
+        # the heartbeat fails.
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40)] + [_pr("b" * 40)] * 30 + [MERGED_PR],
+            issue=920,
+            ownership_unavailable_op="acquire",
+        )
+        kinds = [o.op for o in ops]
+        # The claim was dropped, so the loop went back to the unclaimed path and
+        # tried to acquire again — which is only reachable through the give-up.
+        first_progress = kinds.index("progress")
+        later_acquires = [k for k in kinds[first_progress:] if k == "acquire"]
+        assert len(later_acquires) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"the heartbeat never gave up a claim it could not refresh: {kinds}"
+        )
+        # And it never terminalised a PR whose ownership it had given up.
+        assert "terminal" not in kinds[first_progress:], kinds
+
+    async def test_an_unhealthy_record_naming_this_loop_is_not_a_lost_claim(self, env):
+        """`OWNED_BY_OTHER` can name US, and treating that as a competitor set
+        the one permanent flag on the path.
+
+        `verdict_for` returns OWNED_BY_OTHER for an `active` record whose owner
+        IS the caller whenever `healthy` is False:
+
+            if asking is not None and own.owner == asking and own.healthy:
+                return OWNED_BY_ME
+            return OWNED_BY_OTHER
+
+        and both `_lose_claim` callers sit on the CLAIMED path, which is exactly
+        where the owner named back is us. The log then read "lost … to
+        devloop-workflow/<this workflow_id>", and `_claim_refused = True` ended
+        every ownership call for the remaining watch INCLUDING the heartbeat —
+        the write whose absence made the row unhealthy. One unhealthy read of
+        our own row permanently stopped the write that would have restored it.
+
+        The case does not depend on how mctl-api defines `healthy`: after a
+        ~10h gap the row is dead and the first call that reaches the store
+        returns our own record unhealthy.
+
+        What must happen instead is the give-up the heartbeat already
+        implements — drop the claim, do NOT refuse it — so the loop returns to
+        the unclaimed path and keeps trying under its own gate.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=921,
+            ownership_self_unhealthy_after=1,
+        )
+        kinds = [o.op for o in ops]
+        # Nobody else ever claimed this PR, so the loop must not have stood
+        # down permanently. With _claim_refused set, everything after the first
+        # unhealthy read is a single terminal at the end.
+        assert len(kinds) > LIFECYCLE_UNKNOWN_WRITE_LIMIT + 2, (
+            f"an unhealthy record naming this loop was read as a lost claim: {kinds}"
+        )
+        # And it never adopted a competitor's epoch, because there is none: the
+        # record is ours, so the writes keep going out under the claim's epoch
+        # or under none at all — never under somebody else's.
+        assert all(o.epoch in (0, 1) for o in ops), [(o.op, o.epoch) for o in ops]
+
+    async def test_the_heartbeat_gives_up_inside_the_liveness_bound(self, env):
+        """The give-up threshold counts HEARTBEATS, not polls.
+
+        `_unknown_heartbeats` advances inside the
+        `% LIFECYCLE_HEARTBEAT_EVERY_POLLS` block, so reusing
+        LIFECYCLE_UNKNOWN_WRITE_LIMIT (six, sized for once-per-poll counters)
+        made it six heartbeats — 24 polls, about twelve hours, past the 10h
+        liveness bound the correction exists to arrive before. The reconciler
+        force-releases at the bound and the loop went on believing it owned the
+        row for another two hours.
+
+        Pinned as a count of heartbeats rather than as a constant comparison,
+        so raising the constant back to six fails here rather than silently
+        restoring the twelve-hour window.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=922,
+            ownership_unavailable_op="acquire",
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        # Heartbeats and re-claims are both `acquire`, so the op name cannot
+        # separate them — the EPOCH can. A heartbeat goes out under the claim's
+        # epoch; the give-up clears it, so every acquire after it carries 0.
+        under_claim = 0
+        for op in ops[first_progress + 1:]:
+            if op.epoch == 0:
+                break
+            under_claim += 1
+        assert under_claim == LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT, (
+            "the heartbeat gave up after the wrong number of failures: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+        # And the threshold has to be inside the bound it exists to beat:
+        # 10h, derived in ADR-010 as 2 x the reconciler cadence.
+        held_without_liveness = (
+            LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT
+            * LIFECYCLE_HEARTBEAT_EVERY_POLLS
+            * dev_loop.MERGE_POLL_INTERVAL
+        )
+        assert held_without_liveness < timedelta(hours=10), held_without_liveness
+
+    async def test_a_heartbeat_the_store_accepted_is_not_a_missed_heartbeat(self, env):
+        """The heartbeat was the only one of the three write paths with no
+        `accepted` arm, so a liveness write mctl-api TOOK was counted as one
+        that did not land.
+
+        Three shapes reach it, all with `accepted` True: a body-less 2xx on
+        /ownership/acquire (the exact pair the claim and progress arms were
+        rewritten to read — the heartbeat IS an acquire and got neither), our
+        own record read back unhealthy, and a 2xx carrying a state this image
+        does not recognise. In all three `last_seen_at` was refreshed and the
+        warning said the opposite.
+
+        Three of them then dropped a claim the loop still held, after which it
+        writes no progress, writes no terminal when the PR merges, and the
+        finally releases nothing — the zero-owner state this epic exists to
+        remove.
+
+        Pinned on the EPOCH, which is what the give-up clears: the sibling test
+        uses the same instrument in the other direction.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # ownership_body_less is op-scoped, so the claiming acquire answers
+        # body-less too and no claim lands. Drive it through the record-naming-
+        # us shape instead, which is the one that reaches a CLAIMED loop.
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=923,
+            ownership_self_unhealthy_after=1,
+        )
+        after_claim = [o for o in ops[1:] if o.op != "terminal"]
+        assert after_claim, [o.op for o in ops]
+        assert all(o.epoch != 0 for o in after_claim), (
+            "a heartbeat the store accepted dropped a claim the loop held: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_a_landed_progress_write_is_also_this_polls_heartbeat(self, env):
+        """`_unknown_heartbeats` is read as a count of CONSECUTIVE missed
+        heartbeats, and a landed progress write did not reset it.
+
+        Both landed progress arms `return`, which skips the heartbeat block on
+        that poll, so the counter neither advanced nor decayed across a write
+        that refreshed `last_seen_at` server-side — which the line above it
+        says it does, and ADR-010 §3 agrees (`last_seen_at` is refreshed by ANY
+        tick).
+
+        The failure is the actively-working loop this PR is built for:
+        /ownership/acquire answering 503 while /ownership/progress stays
+        healthy — the mirror of the case the give-up was added for. Every
+        progress write lands, the heartbeat fails on every fourth poll, and the
+        claim is dropped on the premise that liveness stopped, which its own
+        landed writes disprove. The give-up then clears `_owned_head_sha`, so
+        the progress writes stop too: the one path that was working is silenced
+        and only then does the row genuinely go stale.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # The head must REPEAT on the heartbeat polls and move on the others.
+        # A head that moves on every poll makes the progress branch return
+        # before the heartbeat block is ever reached, so the counter never
+        # advances and the test passes with or without the fix — which is
+        # exactly how the first version of this test was a false guard.
+        heads = []
+        for i in range(1, 25):
+            if i % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0 and heads:
+                heads.append(heads[-1])
+            else:
+                heads.append(_pr(chr(ord("a") + i) * 40))
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=924,
+            ownership_unavailable_op="acquire",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) > LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT + 2, (
+            f"the progress path stopped: {[(o.op, o.epoch) for o in ops]}"
+        )
+        # Every op AFTER the claim, not just the progress writes: the give-up
+        # clears the epoch, so an op carrying 0 is the claim having been
+        # dropped. Asserting only on the progress ops cannot see it, because
+        # the twelve that landed BEFORE the give-up already satisfy the count
+        # above — which is how the first version of this assertion passed under
+        # its own mutation.
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a claim was dropped although its own progress writes were landing: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_the_unclaimed_path_also_refuses_to_lose_to_itself(self, env):
+        """The second call site of the guard, and the one the give-up lands on.
+
+        After the heartbeat give-up the loop returns to the UNCLAIMED path —
+        deliberately, since the give-up does not set `_claim_refused` — while
+        the store is still returning our own active row with `healthy` False,
+        which is why it gave up. Without the guard there, that answer sets
+        `_claim_refused = True` and the loop stops making ownership calls of
+        any kind for the remaining thirteen days, having refused a claim nobody
+        else ever held.
+
+        Every other test passes `ownership_self_unhealthy_after=1`, so `ops[0]`
+        — the claiming acquire — is always a normal answer and this site is
+        never exercised. `0` makes the very first call self-naming.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 20 + [MERGED_PR],
+            issue=925,
+            ownership_self_unhealthy_after=0,
+        )
+        # _claim_refused would stop every ownership call after the first.
+        assert len([o for o in ops if o.op == "acquire"]) > 1, (
+            "a record naming this loop refused its own claim permanently: "
+            f"{[o.op for o in ops]}"
+        )
+
+    async def test_a_competitor_without_an_id_does_not_read_as_our_own_record(self, env):
+        """`_lost_to_someone_else` cannot carry the owner question alone.
+
+        `Ownership.from_payload` requires `phase`, `owner.type`, `state` and
+        `healthy` — but NOT `owner.id`. So a 2xx carrying
+        `owner: {"type": "pr-steward"}` with `state: "active"` parses, answers
+        OWNED_BY_OTHER, and is declined as a loss by the `bool(result.owner_id)`
+        guard, which exists for the `lost … to /` case and is right to be
+        there. Without an owner-TYPE conjunct such a record landed on the arm
+        whose comment says "our OWN record read back unhealthy", which keeps
+        the claim and advances the head — against a row a real competitor
+        holds.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        heads = [_pr(f"{i:040d}") for i in range(1, 25)]
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=935,
+            ownership_owner=("pr-steward", ""),
+            ownership_owner_after=1,
+        )
+        # The HEARTBEAT must not read it as our own refresh either. That arm
+        # had the same hole one branch over, where it is worse: `accepted` is
+        # True, so the loop reset `_unknown_heartbeats` on a COMPETITOR's
+        # record and kept the claim alive indefinitely against a row it does
+        # not hold — the give-up could never fire. Observable as the claim
+        # eventually being dropped, which only happens if the heartbeat counts
+        # these answers.
+        assert any(o.epoch == 0 for o in ops[1:]), (
+            "a competitor with no id was read as our own heartbeat, so the "
+            f"claim was never given up: {[(o.op, o.epoch) for o in ops]}"
+        )
+
+        progress = [o for o in ops if o.op == "progress"]
+        # The head must NOT have been advanced on every poll as though the
+        # record were ours: an unowned-by-us answer falls through, so the
+        # back-off gate closes and the writes are throttled.
+        ceiling = (
+            LIFECYCLE_UNKNOWN_WRITE_LIMIT
+            + len(heads) // LIFECYCLE_HEARTBEAT_EVERY_POLLS
+            + 2
+        )
+        assert len(progress) <= ceiling, (
+            "a competitor with no id was treated as our own record: "
+            f"{len(progress)} progress writes of {len(heads)} polls"
+        )
+
+    async def test_a_refusal_naming_nobody_does_not_refuse_the_claim(self, env):
+        """`_lose_claim` compared ids, and a 409 whose body is not a record
+        answers OWNED_BY_OTHER with `owner_id=""`.
+
+        `"" != workflow_id`, so that reached `_lose_claim`, logged `lost … to
+        /`, and set the one PERMANENT flag on the path naming nobody — from a
+        refused write that may well have been refused because of this loop's
+        own stale belief. `answer_from` produces exactly this shape from its
+        `record_of(payload) is None` branch on a 409.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * 20 + [MERGED_PR],
+            issue=926,
+            ownership_owner=("", ""),
+        )
+        assert len([o for o in ops if o.op == "acquire"]) > 1, (
+            "a refusal naming nobody refused the claim permanently: "
+            f"{[o.op for o in ops]}"
+        )
+
+    async def test_a_state_this_image_cannot_read_still_drops_the_claim(self, env):
+        """The one `accepted` shape that must COUNT rather than reset.
+
+        mctl-api adds a holding state and hands the row to another actor in it.
+        `verdict_for` classifies against two CLOSED sets and answers UNKNOWN
+        rather than guessing, because this container lags mctl-api by a
+        release; `accepted` is True because a record came back. An arm that
+        zeroed the counter on every such heartbeat made the give-up
+        UNFIREABLE — the loop would hold its claim indefinitely, and invisibly,
+        against a row somebody else owns.
+
+        Liveness is not the question here: the write landed. What is wrong
+        after this many of them is the BELIEF, and uncertainty resolves toward
+        dropping the claim — the same direction `verdict_for` itself takes.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=927,
+            ownership_unknown_state="quiescing",
+        )
+        # The claim was dropped, which is only reachable through the give-up:
+        # every op after it carries epoch 0.
+        assert any(o.epoch == 0 for o in ops[1:]), (
+            "a heartbeat in an unreadable state never dropped the claim: "
+            f"{[(o.op, o.epoch, o.version[:2]) for o in ops]}"
+        )
+
+    async def test_our_own_unhealthy_record_is_still_a_landed_progress_write(self, env):
+        """The progress branch matched none of its guards on the shape the
+        heartbeat has enumerated since the accepted arm was added.
+
+        `verdict_for` answers OWNED_BY_OTHER for an active row whose owner IS
+        the caller whenever `healthy` is False; `_lost_to_someone_else`
+        declines to call that a loss; and `accepted` is True because a 2xx
+        carried a record. The heartbeat logs it, resets and keeps the claim.
+        The progress branch fell to `_unknown_progress += 1`, so it counted a
+        write mctl-api TOOK, never advanced the head — re-sending the identical
+        evidence for the rest of the watch, every send landing, so
+        last_progress_at was refreshed forever for a head that stopped moving
+        and the stuck bound could never fire — and said nothing.
+
+        The fixture already produced this: `ownership_self_unhealthy_after` is
+        not op-scoped, so the sibling tests ran the defect on every poll while
+        asserting only on `epoch`, which the heartbeat keeps alive. This
+        asserts on the throttle instead, which is what the counter drives.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # A head that moves on every poll, so every poll SHOULD produce a
+        # progress write. Under the defect `_unknown_progress` reaches
+        # LIFECYCLE_UNKNOWN_WRITE_LIMIT and `_backed_off` throttles the path to
+        # the heartbeat cadence, so most of them never happen.
+        heads = [_pr(chr(ord("a") + i) * 40) for i in range(1, 25)]
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=933,
+            ownership_self_unhealthy_after=1,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        # Nearly every poll, not merely more than the limit: `_backed_off`
+        # still lets one through on each heartbeat boundary, so the throttled
+        # count is ~LIMIT + polls/HEARTBEAT_EVERY — which a threshold just
+        # above the limit does not separate from the healthy one. That is how
+        # the first version of this assertion survived its own mutation.
+        assert len(progress) >= len(heads) - 2, (
+            "landed progress writes were counted as failures and throttled: "
+            f"{len(progress)} of {len(heads)} polls — {[o.op for o in ops]}"
+        )
+        # And the head really advanced each time, rather than the same
+        # evidence being re-sent.
+        versions = [o.version for o in progress]
+        assert len(set(versions)) == len(versions), (
+            f"the same head was re-sent: {[v[:2] for v in versions]}"
+        )
+
+    async def test_an_unreadable_state_on_progress_backs_off_without_dropping_the_claim(self, env):
+        """A progress write that comes back in a state this image cannot read
+        must not advance the head, must back off, and must NOT decide on its
+        own that the claim is gone.
+
+        `verdict_for` classifies against two CLOSED sets and answers UNKNOWN
+        rather than guessing, because this container lags mctl-api by a
+        release. The head therefore must not advance — the row may be held by
+        somebody else in that state, so the evidence has to be re-sent rather
+        than treated as recorded — and `_unknown_progress` has to count it, or
+        the re-send happens once per poll forever.
+
+        What it must NOT do is drive the give-up. An earlier version
+        incremented `_unknown_heartbeats` here and returned, which inverted the
+        constant: that counter is documented as three HEARTBEATS, about six
+        hours and inside the 10h liveness bound, and this arm runs once per
+        POLL — so the limit was reached in three polls, about ninety minutes,
+        and the claim was dropped four times sooner than the bound it precedes.
+        (Found by agy, not by this suite.)
+
+        This test therefore pins the fall-through, not the arm: the arm is now
+        a log line, and deleting it leaves this green. What it cannot be
+        deleted from is the body-less arm below, which must keep requiring an
+        empty state or an unreadable record advances the head after all.
+
+        Falling through keeps the arithmetic honest, and it also gives the
+        right answer here: /acquire still says the row is ours, so the claim
+        stands. The case where the row really has moved is covered by
+        test_a_state_this_image_cannot_read_still_drops_the_claim, where the
+        heartbeat's own acquire answers the same way and counts at the
+        heartbeat cadence.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        # A head that moves on every poll, so every poll would issue a progress
+        # write if nothing throttled it.
+        heads = [_pr(f"{i:040d}") for i in range(1, 41)]
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=931,
+            ownership_unknown_state="quiescing",
+            ownership_unknown_state_op="progress",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert progress, [o.op for o in ops]
+        # Throttled by the SHARED fall-through at the end of the block, not by
+        # anything this arm does: `_backed_off` closes the gate once
+        # `_unknown_progress` passes the limit.
+        ceiling = (
+            LIFECYCLE_UNKNOWN_WRITE_LIMIT
+            + len(heads) // LIFECYCLE_HEARTBEAT_EVERY_POLLS
+            + 2
+        )
+        assert len(progress) <= ceiling, (
+            "an unreadable state on progress was re-sent every poll: "
+            f"{len(progress)} of {len(heads)} polls, ceiling {ceiling}"
+        )
+        # The head never advanced, so the evidence really is being re-sent
+        # rather than treated as recorded: every progress write carries the
+        # head of its own poll, and none of them is repeated.
+        assert len({o.version for o in progress}) == len(progress), (
+            f"the same head was re-sent: {[o.version[-3:] for o in progress]}"
+        )
+        # And the claim stands, because /acquire still says the row is ours.
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "the progress arm dropped a claim /acquire was still confirming: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_a_body_less_progress_write_still_keeps_the_claim(self, env):
+        """The other side of the same conjunct, on the progress path.
+
+        An EMPTY state is the body-less 2xx: accepted, no record, nothing
+        suggesting the row moved. The head must advance and the claim must
+        stand — otherwise a store answering 204 to every progress write, which
+        is legal, drops a healthy claim.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        heads = []
+        for i in range(1, 30):
+            if i % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0 and heads:
+                heads.append(heads[-1])
+            else:
+                heads.append(_pr(chr(ord("a") + i) * 40))
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=932,
+            ownership_unknown_state="",
+            ownership_unknown_state_op="progress",
+        )
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a body-less progress write dropped a claim nothing said had moved: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_a_body_less_heartbeat_keeps_the_claim(self, env):
+        """The other side of the `result.state` conjunct.
+
+        A body-less 2xx on the heartbeat is accepted with verdict UNKNOWN and
+        NO record, so nothing suggests the row moved: `last_seen_at` was
+        refreshed and the claim must stand. Only a record whose STATE this
+        image cannot classify is a reason to stop believing, because only that
+        one says somebody may hold the row in a state we cannot read.
+
+        Without the conjunct both collapse into "count it", and a store
+        answering 204 to every heartbeat — legal, and what a body-less 2xx IS —
+        drops a healthy claim every six hours.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            issue=930,
+            ownership_unknown_state="",
+        )
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a body-less heartbeat dropped a claim nothing said had moved: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_an_unowned_heartbeat_drops_the_claim_rather_than_keeping_it(self, env):
+        """The UNOWNED arm's POSITION is load-bearing and nothing tested it.
+
+        It must sit above the `accepted` arm, because a released record arrives
+        in a 2xx with `accepted=True`. Below it, an UNOWNED heartbeat resets the
+        counter and returns, so the loop keeps a claim on a row the store says
+        is free — forever, with no re-acquire, and a `finally` writing against a
+        claim it does not hold.
+
+        The only `unowned` fixture was gated on `req.op == "progress"`, so no
+        test had ever produced an unowned ACQUIRE, which is what a heartbeat is.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 20 + [MERGED_PR],
+            issue=928,
+            ownership_unowned_op="acquire",
+        )
+        # The claiming acquire is normal; from the first heartbeat on the row
+        # reads as released, and the claim must not survive it.
+        assert any(o.epoch == 0 for o in ops[1:]), (
+            "an unowned heartbeat kept a claim on a row the store says is free: "
+            f"{[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_a_body_less_progress_write_is_also_this_polls_heartbeat(self, env):
+        """The second landed-progress arm, which had the same fix and no test.
+
+        `ownership_unavailable_op` is checked before `ownership_body_less` in
+        the fake, so the two compose: every acquire after the claim fails while
+        every progress write lands with a body-less 2xx. Without the reset the
+        heartbeat counter climbs across writes that refreshed `last_seen_at`
+        and the claim is dropped — the behaviour this commit exists to remove,
+        reached through the arm that had no cover.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        heads = []
+        for i in range(1, 25):
+            if i % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0 and heads:
+                heads.append(heads[-1])
+            else:
+                heads.append(_pr(chr(ord("a") + i) * 40))
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*heads, MERGED_PR],
+            issue=929,
+            ownership_unavailable_op="acquire",
+            ownership_body_less="progress",
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) > LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT + 2, (
+            f"the progress path stopped: {[(o.op, o.epoch) for o in ops]}"
+        )
+        assert all(o.epoch != 0 for o in ops[1:]), (
+            "a claim was dropped although its own body-less progress writes "
+            f"were landing: {[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_progress_is_recorded_only_when_the_head_moves(self, env):
+        """A poll that observed nothing new must not write progress.
+
+        The whole reason liveness and progress are separate fields is that an
+        owner must not be able to prove usefulness by continuing to breathe.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("a" * 40), _pr("b" * 40), MERGED_PR],
+            issue=905,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert len(progress) == 1, [o.op for o in ops]
+        assert progress[0].version == "b" * 40
+        assert "bbbbbbbb" in progress[0].evidence
+
+    async def test_a_failed_progress_write_is_retried_not_dropped(self, env):
+        """`is not None` is not "the write succeeded".
+
+        The activity never raises — that is its contract — so a 503 comes back
+        as a real result carrying an `unknown` verdict. Advancing the recorded
+        head on that drops the progress signal permanently: the next poll sees
+        head == recorded and never retries.
+
+        An earlier version of this test never reached the progress path at all
+        (its own comment said so), so relaxing the guard to
+        `result.verdict != OWNED_BY_OTHER` kept it green — the fix it is named
+        for had no regression guard. The claim now succeeds and only `progress`
+        fails, which is the shape that actually exercises it.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            issue=910,
+            ownership_progress_fails=True,
+        )
+        progress = [o for o in ops if o.op == "progress"]
+        assert progress, f"the progress path was never reached: {[o.op for o in ops]}"
+        # The head moved once and every later poll sees the same head. If the
+        # failed write had been treated as success, _owned_head_sha would have
+        # advanced and there would be exactly one attempt; the retry is what
+        # makes more than one.
+        assert len(progress) > 1, (
+            f"a failed progress write was not retried: {[(o.op, o.version[:8]) for o in ops]}"
+        )
+        assert all(o.version == "b" * 40 for o in progress)
+
+    async def test_a_failing_progress_write_does_not_silence_the_heartbeat(self, env):
+        """The `return` at the end of the progress branch used to be
+        unconditional, and that made the heartbeat unreachable.
+
+        A failed progress write correctly does NOT advance the recorded head,
+        so `head != _owned_head_sha` stays true on every later poll and control
+        returns from the progress branch every time. The heartbeat `acquire`
+        below it therefore never ran again for the rest of the watch: a
+        `/progress` answering 412 — the record moved, which is exactly what the
+        fencing epoch is for — while `acquire` would still have succeeded
+        stopped refreshing `last_seen_at` entirely. The 10h liveness bound then
+        expires and the reconciler declares this owner dead and force-releases
+        the row, while the workflow is alive, polling and shepherding the PR.
+
+        The retry the sibling test pins is still correct and still happens; the
+        claim is that it must not be the ONLY thing that happens.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            issue=913,
+            ownership_progress_fails=True,
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        later = kinds[first_progress:]
+        assert "acquire" in later, (
+            f"the heartbeat never ran again after a failing progress write: {kinds}"
+        )
+        # And the retry the sibling test pins is unaffected.
+        assert kinds.count("progress") > 1, kinds
+
+    async def test_progress_against_a_released_row_re_acquires(self, env):
+        """UNOWNED is the mirror of the case above.
+
+        A progress write against a row the reconciler already released matched
+        neither branch, so the claim was never dropped — and, because of the
+        same unconditional return, never re-acquired either. The loop went on
+        believing it owned an entity the store says is free, for the rest of
+        the watch. Falling through to the heartbeat re-establishes it.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            issue=914,
+            ownership_progress_unowned=True,
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        assert "acquire" in kinds[first_progress:], (
+            f"a released row was never re-acquired: {kinds}"
+        )
+
+    async def test_a_released_row_re_acquires_even_while_the_head_keeps_moving(self, env):
+        """The dangerous half of the case above, which had no test — and whose
+        absence let an arm intercept UNOWNED silently.
+
+        `test_progress_against_a_released_row_re_acquires` lets the head stop
+        moving after poll 2, so the `acquire` its assertion finds is the
+        routine heartbeat rather than a recovery: any behaviour that keeps
+        heart-beating satisfies it. With the head moving on EVERY poll the
+        progress branch is entered every poll, so an arm that answers UNOWNED
+        and returns starves the heartbeat entirely.
+
+        That is the §5 recovery this epic is built on: the pod stalls past the
+        liveness bound, the reconciler force-releases the row, the pod resumes
+        pushing fixes. The loop must REACH the heartbeat at all: its acquire
+        is what re-establishes the claim, and under the defect no acquire
+        happens after the first progress for the rest of the watch.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[*[_pr(chr(ord("a") + i) * 40) for i in range(1, 13)], MERGED_PR],
+            issue=934,
+            ownership_unowned_op="progress",
+        )
+        kinds = [o.op for o in ops]
+        first_progress = kinds.index("progress")
+        after = ops[first_progress:]
+        assert any(o.op == "acquire" for o in after), (
+            "the heartbeat was starved by the progress branch, so a released "
+            f"row was never re-acquired: {[(o.op, o.epoch) for o in ops]}"
+        )
+
+    async def test_an_activity_failure_does_not_wedge_the_loop(self, env):
+        """`_ownership` returns None when the activity fails outright.
+
+        Dereferencing it would raise AttributeError inside workflow code, which
+        is not a FailureError: the workflow task fails, and because replay is
+        deterministic it fails the same way forever — wedged until somebody
+        terminates it. The likeliest trigger is this change's own rollout, when
+        a control worker on the previous image has no `lifecycle_ownership`
+        registered.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, open_pr, MERGED_PR], issue=912,
+            ownership_raises=True,
+        )
+        # The loop completed normally and still reported the merge.
+        assert result.pr is not None and result.pr.state == "MERGED"
+        # It tried, held no claim, and never terminalised anything it did not own.
+        assert ops and all(o.op == "acquire" for o in ops), [o.op for o in ops]
+
+    async def test_a_failed_terminal_leaves_the_claim_for_the_reconciler(self, env):
+        """Clearing the claim on a terminal that did not land would leave the
+        row active with nobody believing they own it — the zero-owner state,
+        produced by the cleanup written to prevent it.
+
+        The loop keeps the claim instead, and the reconciler's liveness bound
+        is what resolves it once this execution stops being seen.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, MERGED_PR], issue=911,
+            ownership_terminal_fails=True,
+        )
+        terminals = [o for o in ops if o.op == "terminal"]
+        assert terminals, [o.op for o in ops]
+        # The claim was NOT dropped, so the finally tries again on the way out
+        # rather than silently forgetting the entity.
+        assert len(terminals) > 1, (
+            f"a failed terminal dropped the claim: {[o.op for o in ops]}"
+        )
+        # And it retries TERMINAL, not release. The PR merged; marking a
+        # finished entity as "somebody must take this" is the one state this
+        # contract reserves for work that remains.
+        assert not any(o.op == "release" for o in ops), (
+            f"a merged PR was released: {[o.op for o in ops]}"
+        )
+
+    async def test_losing_the_claim_is_noticed_and_the_epoch_is_not_adopted(self, env):
+        """A worker pod that stalls past its liveness bound loses the PR.
+
+        The loop must notice, and must NOT adopt the winner's fencing
+        generation: carrying it would make every later call assert an epoch it
+        never held, which the server rejects and which reads in the events as
+        this workflow acting on somebody else's claim.
+        """
+        def _pr(sha: str) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=sha,
+            )
+
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("c" * 40), MERGED_PR],
+            issue=907,
+            ownership_lost_after=1,
+        )
+        # The first call claims; everything after is refused. No call may ever
+        # carry the winner's epoch of 77.
+        assert ops[0].op == "acquire"
+        assert all(o.epoch != 77 for o in ops), [(o.op, o.epoch) for o in ops]
+        # And once refused, the loop stops re-asking every poll.
+        assert len(ops) <= 3, [o.op for o in ops]
+
+    async def test_the_heartbeat_notices_a_lost_claim_too(self, env):
+        """The heartbeat path, not the progress path.
+
+        With an unchanged head the loop reaches the every-4th-poll re-acquire
+        instead of `progress`, and an earlier version discarded that verdict and
+        kept only the epoch — so this loop could never notice it had lost the PR
+        through the one call it makes most often, and adopted the winner's
+        fencing generation while failing to notice.
+        """
+        same = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[same, same, same, same, same, MERGED_PR],
+            issue=909,
+            ownership_lost_after=1,
+        )
+        heartbeats = [o for o in ops if o.op == "acquire"][1:]
+        assert heartbeats, f"the heartbeat path was never reached: {[o.op for o in ops]}"
+        assert all(o.epoch != 77 for o in ops), [(o.op, o.epoch) for o in ops]
+
+    async def test_ownership_rows_record_why_this_actor_owns_them(self, env):
+        """ADR-010 §12: the row must answer "why does this actor own it"
+        without reconstructing a CWFT env var in another repository."""
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        _result, ops = await self._run_ownership_loop(
+            env, pr_states=[open_pr, MERGED_PR], issue=908
+        )
+        assert ops[0].proposal_ref, "no proposal correlation recorded"
+        assert ops[0].policy_ref, "no policy reason recorded"
+        assert "mctl-telegram" in ops[0].proposal_ref
+
     async def test_merge_detection_gives_up_when_pr_link_never_appears(self, env):
         """A proposal whose .status.yaml never gains a pr: link stops the
         watch after the grace polls (result.pr is None), instead of polling
         for the full 14-day deadline."""
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[PRState(found=False)]
         )
         async with Worker(
@@ -946,7 +2339,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr]
         )
         async with Worker(
@@ -982,7 +2375,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             pr_states=[open_pr],
             pr_state_raises_after=1,
@@ -1022,7 +2415,7 @@ class TestDevLoopWorkflow:
             repo="mctlhq/mctl-telegram",
             number=81,
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[vanished]
         )
         async with Worker(
@@ -1058,7 +2451,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr, PRState(found=False)]
         )
         async with Worker(
@@ -1094,7 +2487,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             pr_states=[open_pr],
             pr_state_raises_after=1,
@@ -1138,7 +2531,7 @@ class TestDevLoopWorkflow:
             repo=MERGED_PR.repo,
             number=MERGED_PR.number,
         )
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr, vanished_with_ref]
         )
         async with Worker(
@@ -1173,7 +2566,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran = _fake_activities(
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr] * 8 + [MERGED_PR]
         )
         async with Worker(
@@ -1216,7 +2609,7 @@ class TestDevLoopWorkflow:
             state="OPEN",
         )
         seen: list[bool] = []
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr, open_pr, MERGED_PR]
         )
         async with Worker(
@@ -1256,7 +2649,7 @@ class TestDevLoopWorkflow:
 
     async def test_deploy_observed_healthy_on_the_released_tag(self, env):
         """Stage 6.2/6.3 happy path (#215): merged → release → Healthy."""
-        activities, _calls, investigate_ran = _fake_activities(released=True)
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1275,7 +2668,7 @@ class TestDevLoopWorkflow:
         verified would call every rollout successful the instant it was
         asked, before the new tag ever reached the cluster.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(found=True, image_tag="9.9.8", health="Healthy", sync_status="Synced"),
@@ -1293,7 +2686,7 @@ class TestDevLoopWorkflow:
 
     async def test_deploy_unverified_when_it_never_goes_healthy(self, env):
         """The deadline passing is an observation, not a workflow failure."""
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(found=True, image_tag="9.9.9", health="Degraded", sync_status="Synced")
@@ -1314,7 +2707,7 @@ class TestDevLoopWorkflow:
 
     async def test_no_release_for_a_docs_only_merge(self, env):
         """release-please cutting nothing is normal, not a fault."""
-        activities, _calls, investigate_ran = _fake_activities(released=True, release=None)
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, release=None)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1329,7 +2722,7 @@ class TestDevLoopWorkflow:
         for the whole 20-minute lookup window would hide it behind a
         plausible-looking no-release.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, release_lookup_bug=True
         )
         async with Worker(
@@ -1344,7 +2737,7 @@ class TestDevLoopWorkflow:
         assert "non-transient" in (result.deploy.detail or "")
 
     async def test_a_bug_in_the_status_read_ends_the_verify_immediately(self, env):
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, deploy_status_bug=True
         )
         async with Worker(
@@ -1357,7 +2750,7 @@ class TestDevLoopWorkflow:
 
     async def test_no_target_when_the_repo_deploys_no_app(self, env):
         """A repo whose release only bumps cluster templates has nothing to verify."""
-        activities, _calls, investigate_ran = _fake_activities(released=True, deploy_target=None)
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, deploy_target=None)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1371,7 +2764,7 @@ class TestDevLoopWorkflow:
         mctl-api reports argocd health/sync but no imageTag for those, so
         waiting for a tag match would time out every such loop.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             deploy_statuses=[
                 # Stale: ArgoCD last synced BEFORE this release existed.
@@ -1407,7 +2800,7 @@ class TestDevLoopWorkflow:
         ArgoCD's updatedAt permanently older than the release, the rollout
         must never be reported as verified.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(
@@ -1433,7 +2826,7 @@ class TestDevLoopWorkflow:
         so a lexicographic compare would call a sync that happened half a
         second AFTER the release older than it — and never verify.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
             deploy_statuses=[
@@ -1460,7 +2853,7 @@ class TestDevLoopWorkflow:
         workflow task Temporal retries forever on identical input. An
         offset-less timestamp must simply be read as UTC.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             release=ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z"),
             deploy_statuses=[
@@ -1482,7 +2875,7 @@ class TestDevLoopWorkflow:
 
     async def test_a_new_argocd_application_is_waited_for(self, env):
         """A release can introduce the app; ArgoCD registers it a bit later."""
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             deploy_statuses=[
                 DeployStatus(found=False),
@@ -1499,7 +2892,7 @@ class TestDevLoopWorkflow:
 
     async def test_unknown_argocd_application_gives_up_after_the_grace(self, env):
         """Past the grace polls, a name resolving to nothing is a wrong name."""
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, deploy_statuses=[DeployStatus(found=False)]
         )  # repeated for every poll — the grace runs out and the watch gives up
         async with Worker(
@@ -1512,7 +2905,7 @@ class TestDevLoopWorkflow:
 
     async def test_incident_watch_reports_a_clean_window(self, env):
         """Stage 6.4 (#216): a healthy rollout with no incidents."""
-        activities, _calls, investigate_ran = _fake_activities(released=True)
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1532,7 +2925,7 @@ class TestDevLoopWorkflow:
         therefore predate the deploy stage, not follow it.
         """
         query: dict[str, str] = {}
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             incident_query=query,
             deploy_statuses=[
@@ -1562,7 +2955,7 @@ class TestDevLoopWorkflow:
         The fake returns the same incident on every poll — reporting it
         once per poll would make a single alert look like a storm.
         """
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             incidents=[Incident(id="alert-1", title="pods crashlooping", severity="critical")],
         )
@@ -1579,7 +2972,7 @@ class TestDevLoopWorkflow:
 
     async def test_incident_read_failure_does_not_end_the_watch(self, env):
         """A failing incident store must not discard the stage's result."""
-        activities, _calls, investigate_ran = _fake_activities(
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, incident_reads_fail=True
         )
         async with Worker(
@@ -1593,7 +2986,7 @@ class TestDevLoopWorkflow:
 
     async def test_no_incident_watch_when_nothing_was_released(self, env):
         """no-release means nothing shipped — the window would be someone else's news."""
-        activities, _calls, investigate_ran = _fake_activities(released=True, release=None)
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True, release=None)
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
         ):
@@ -1612,7 +3005,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran = _fake_activities(
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             pr_states=[open_pr] * 8 + [MERGED_PR],
             shepherd_fails=True,
@@ -1657,7 +3050,7 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        activities, calls, investigate_ran = _fake_activities(
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
             pr_states=[open_pr] * 8 + [MERGED_PR],
             pr_state_raises_at={7},
@@ -1700,7 +3093,7 @@ class TestDevLoopWorkflow:
             state="OPEN",
         )
         polls = SHEPHERD_TICK_EVERY_POLLS * (SHEPHERD_TICKS_MAX + 1)
-        activities, calls, investigate_ran = _fake_activities(
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr] * polls + [MERGED_PR]
         )
         async with Worker(

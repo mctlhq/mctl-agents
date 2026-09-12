@@ -45,6 +45,7 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
+    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, UNKNOWN, UNOWNED, EntityRef
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -58,6 +59,11 @@ with workflow.unsafe.imports_passed_through():
         Incident,
         IncidentQueryResult,
         list_service_incidents,
+    )
+    from orchestrator.temporal.activities.lifecycle import (
+        OwnershipRequest,
+        OwnershipResult,
+        lifecycle_ownership,
     )
     from orchestrator.temporal.activities.pr_state import PRState, get_pr_state
     from orchestrator.temporal.activities.proposals import find_proposal_slug
@@ -145,6 +151,69 @@ PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 # 4 h for two weeks.
 SHEPHERD_TICK_EVERY_POLLS = 8
 SHEPHERD_TICKS_MAX = 12
+
+# Ownership liveness is refreshed every 4th poll (~2 h at MERGE_POLL_INTERVAL),
+# on its OWN cadence rather than riding the shepherd tick boundary.
+#
+# It cannot ride the ticks: those stop after SHEPHERD_TICKS_MAX (~48 h) while
+# the watch runs up to MERGE_WATCH_DEADLINE (14 days), so a loop that is
+# healthily watching a long-lived PR would stop proving liveness after two days
+# and start reading as a crashed owner.
+#
+# It is not every poll either: a 14-day watch is ~672 polls, and one extra
+# activity per poll doubles the history of the longest-lived workflow in the
+# system to record something that changes nothing. At 2 h against the 10 h
+# liveness bound, four consecutive heartbeats can be lost before the owner
+# looks dead.
+LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
+
+# Consecutive ownership WRITES that answer neither "mine" nor "someone else's"
+# before the loop drops back to the heartbeat cadence.
+#
+# Not a permanent give-up. A store that is down for three hours is usually back
+# later in a fourteen-day watch, and a loop that stopped forever would hold no
+# claim for the rest of it; retrying on the heartbeat boundary is the cheaper
+# answer. Six polls is about three hours, and continuing to ask every poll for
+# the remaining fortnight is ~670 activities against an endpoint that is not
+# answering, with the cron sweeper owning the PR throughout — the same outcome
+# as before any of this existed.
+#
+# It applies to the acquire AND to the progress write. They are counted
+# separately because they fail separately: a claimed loop whose /progress 500s
+# still has a working acquire, and throttling one must not throttle the other.
+# (Contrast `_claim_refused` a few lines into _track_ownership, which IS
+# permanent: "somebody else owns this" is an answer, not a failure to answer,
+# and only the reconciler resolves it.)
+LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
+
+# The owner type this workflow writes and reads back. Written once by
+# `_ownership` and compared in two arms; as three separate literals they had to
+# agree by inspection, and nothing failed if one of them changed.
+OWNER_TYPE = "devloop-workflow"
+
+# Consecutive failed HEARTBEATS before the loop stops believing it owns the
+# entity. A SEPARATE constant, and a smaller number, because it counts a
+# different thing.
+#
+# LIFECYCLE_UNKNOWN_WRITE_LIMIT's two counters advance once per POLL (30 min),
+# so six of them is about three hours. `_unknown_heartbeats` advances inside
+# the `% LIFECYCLE_HEARTBEAT_EVERY_POLLS` block, so it advances once per four
+# polls (~2 h) — and six of THOSE is twelve hours, past the very bound the
+# give-up exists to beat. Reusing the constant made the correction arrive after
+# the event it is meant to precede: the reconciler force-releases at the 10 h
+# liveness bound, and the loop went on believing it owned the row for another
+# two.
+#
+# Three is the value the bound implies. ADR-010 derives 10 h as 2 x cadence —
+# one missed tick survived — so three consecutive misses (~6 h) is inside it
+# with room for the store to come back, and four (~8 h) is the last value that
+# still is.
+LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT = 3
+
+# Activity bounds for ownership calls. Short and few: ownership is a
+# coordination signal, and a loop must never stall on it.
+LIFECYCLE_TIMEOUT = timedelta(seconds=30)
+LIFECYCLE_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
 # Stages 6.2/6.3 (ADR-006, #215). After the PR merges, release-please cuts
 # a release on the app repo, that dispatches mctl-gitops release-deploy,
@@ -499,6 +568,21 @@ class DevLoopWorkflow:
         self._approved = False
         self._approver: str | None = None
         self._shepherd_in_loop = False
+        # Lifecycle ownership (mctlhq/.github#57). Set once the PR is known
+        # and this execution has positively claimed it; empty means this loop
+        # owns nothing and the cron sweeper is the owner.
+        self._owned_entity_id = ""
+        self._owner_epoch = 0
+        self._owned_head_sha = ""
+        self._poll_index_for_heartbeat = 0
+        # Set once another actor is known to own this PR, so the loop stops
+        # re-asking on every poll for the rest of the watch.
+        self._claim_refused = False
+        self._unknown_acquires = 0
+        self._unknown_progress = 0
+        self._unknown_heartbeats = 0
+        self._proposal_ref = ""
+        self._policy_ref = ""
 
     @workflow.query
     def shepherd_in_loop(self) -> bool:
@@ -1066,6 +1150,725 @@ class DevLoopWorkflow:
                 "in-flight shepherd tick for %s/%s ended with %r", service, slug, exc
             )
 
+    async def _ownership(self, op: str, *, repo: str, number: int, head_sha: str = "",
+                         evidence: str = "", reason: str = "") -> OwnershipResult | None:
+        """Run one ownership operation as an ACTIVITY.
+
+        Never raises. Ownership is a coordination signal, not the work: a
+        workflow that died because it could not reach the ownership store
+        would trade a bookkeeping outage for a delivery outage, and the loop
+        has already produced a PR by this point.
+
+        A failure returns None. On the unclaimed path that means "no claim" —
+        the conservative direction, since the cron sweeper only stands down for
+        a positive claim. On the two CLAIMED paths (progress, heartbeat) it
+        means "this write did not land": the claim is kept, the counter
+        advances, and the give-up below is what eventually drops it. Collapsing
+        the two readings is how a transient 503 used to cost a claim.
+        """
+        info = workflow.info()
+        req = OwnershipRequest(
+            op=op,
+            kind="pull-request",
+            entity_id=EntityRef.for_pull_request(repo, number, head_sha).id,
+            phase="review-remediation",
+            version=head_sha,
+            owner_type=OWNER_TYPE,
+            owner_id=info.workflow_id,
+            epoch=self._owner_epoch,
+            evidence=evidence,
+            reason=reason,
+            proposal_ref=self._proposal_ref,
+            policy_ref=self._policy_ref,
+            temporal_workflow_id=info.workflow_id,
+        )
+        try:
+            return await workflow.execute_activity(
+                lifecycle_ownership,
+                req,
+                start_to_close_timeout=LIFECYCLE_TIMEOUT,
+                retry_policy=LIFECYCLE_RETRY_POLICY,
+            )
+        except asyncio.CancelledError:
+            # CancelledError is a BaseException, so `except Exception` below
+            # does NOT catch it. This method is called from _watch_pr's finally,
+            # and letting it escape there would discard the state the watch was
+            # about to return and fail a workflow whose implement and merge both
+            # succeeded — the exact hazard _settle_tick documents one line
+            # earlier. Swallowing it here does not swallow the workflow's own
+            # cancellation: whatever triggered the unwind keeps propagating out
+            # of the try block this finally belongs to.
+            #
+            # What this does NOT do is complete the write. On cancellation the
+            # activity never runs, so the row is left `active` and the
+            # reconciler's liveness bound is what recovers it once this
+            # execution stops being seen. Shielding it is possible in principle
+            # (asyncio.shield applies), and deliberately not done: it would
+            # hold a cancelling workflow open on a store that may itself be why
+            # the unwind started. Pretending the release lands would be worse
+            # than saying it does not.
+            workflow.logger.info(
+                "lifecycle %s cancelled for %s#%s — the watch is ending", op, repo, number
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001 — ActivityError and friends
+            workflow.logger.warning("lifecycle %s failed for %s#%s: %r", op, repo, number, exc)
+            return None
+
+
+    def _lost_to_someone_else(self, result: OwnershipResult) -> bool:
+        """Is the OWNED_BY_OTHER record naming somebody other than this loop?
+
+        It can name US. `verdict_for` answers OWNED_BY_OTHER for an `active`
+        record whose owner IS the caller whenever `healthy` is False:
+
+            if asking is not None and own.owner == asking and own.healthy:
+                return OWNED_BY_ME
+            return OWNED_BY_OTHER
+
+        and both callers of `_lose_claim` sit on the CLAIMED path, which is
+        precisely where the owner named back is us. Without this check the log
+        read "lost mctlhq/mctl-web#99 to devloop-workflow/dev-loop-…-99" — this
+        loop's own workflow_id — and `_claim_refused` then ended every
+        ownership call for the remaining watch INCLUDING the heartbeat, which
+        is the write whose absence made the row unhealthy in the first place.
+        One unhealthy read of our own row permanently stopped the write that
+        would have restored it.
+
+        The reachable case does not depend on how mctl-api defines `healthy`:
+        after a ~10 h gap — a pod restart, or the /acquire outage the heartbeat
+        give-up below handles — the row is dead, and the first call that does
+        reach the store returns OUR OWN record unhealthy. If `healthy` also
+        excludes `stuck`, every PR quiet for longer than the 48 h progress
+        bound trips it too, which ADR-010 §4 note 2 calls the correct
+        behaviour of a healthy owner.
+
+        Our own row read back unhealthy is handled where it belongs: the
+        heartbeat block counts it, logs it, and gives up the claim WITHOUT
+        setting the permanent flag, so the loop re-acquires under its own gate.
+        """
+        # A non-empty id is half the question. A 409 whose body is not a
+        # record answers OWNED_BY_OTHER with `owner_id=""` (answer_from's
+        # `record_of(payload) is None` branch), and "" != our workflow_id — so
+        # that reached _lose_claim, logged `lost … to /`, and set the permanent
+        # flag naming nobody, on a refusal that may well have been caused by
+        # this loop's own stale belief.
+        return bool(result.owner_id) and result.owner_id != workflow.info().workflow_id
+
+    def _lose_claim(self, repo: str, number: int, result: OwnershipResult) -> None:
+        """Another actor holds this PR now. Stop claiming to own it.
+
+        Callers MUST gate on `_lost_to_someone_else` — the verdict alone does
+        not mean a competitor, only that the record is not usable as ours.
+
+        The epoch is NOT adopted. It belongs to the winner, and carrying it
+        would make every later call from this loop assert a fencing generation
+        it never held — which the server would reject, and which would read in
+        the events as this workflow trying to act on somebody else's claim.
+        """
+        workflow.logger.info(
+            "lifecycle: lost %s#%s to %s/%s — this loop no longer claims it",
+            repo, number, result.owner_type, result.owner_id,
+        )
+        self._owned_entity_id = ""
+        self._owner_epoch = 0
+        self._owned_head_sha = ""
+        self._unknown_progress = 0
+        self._claim_refused = True
+
+    async def _track_ownership(self, state: PRState) -> None:
+        """Claim the PR, then keep the claim honest.
+
+        Three distinct things, deliberately not collapsed into one call:
+
+        - **Claim.** The first successful poll that resolves a PR acquires
+          ownership. It cannot happen earlier: until then this loop knows a
+          service and a slug, and the entity ownership attaches to is the pull
+          request.
+        - **Liveness.** Every LIFECYCLE_HEARTBEAT_EVERY_POLLS-th poll
+          re-acquires, which is idempotent and refreshes ``last_seen_at``
+          without touching the epoch or the progress timestamp. It says "this
+          owner still exists", which is all a heartbeat is evidence of.
+        - **Progress.** Only when the head SHA actually moved. A poll that
+          observed nothing new must not write progress: the whole point of
+          separating the two timestamps is that an owner cannot prove
+          usefulness by continuing to breathe.
+
+        A failed call leaves ``_owned_entity_id`` empty, so the loop simply
+        holds no claim and the cron sweeper keeps the PR — the same
+        fail-toward-the-sweeper direction the shepherd claim already takes.
+        """
+        repo = state.repo or ""
+        number = state.number or 0
+        head = state.head_sha or ""
+
+        if not self._owned_entity_id:
+            if self._backed_off(self._unknown_acquires):
+                # The store has been unreachable, or answering something
+                # unusable, for this many consecutive attempts. Re-asking on
+                # every poll for the rest of a 14-day watch is ~670 activities
+                # against an endpoint that is not answering; the sweeper owns
+                # the PR meanwhile, which is the same outcome as before any of
+                # this existed.
+                return
+            if self._claim_refused:
+                # Somebody else owns this PR and said so. Re-asking on every
+                # poll for the rest of a 14-day watch is ~670 activities to
+                # re-learn one fact; the reconciler is what resolves a
+                # conflict, not this loop.
+                return
+            result = await self._ownership(
+                "acquire", repo=repo, number=number, head_sha=head
+            )
+            if result is not None and result.owned_by_caller:
+                self._owned_entity_id = EntityRef.for_pull_request(repo, number).id
+                self._owner_epoch = result.epoch
+                self._owned_head_sha = head
+                self._unknown_acquires = 0
+            elif (
+                result is not None
+                and result.verdict == OWNED_BY_OTHER
+                and self._lost_to_someone_else(result)
+            ):
+                # Somebody else owns this PR. Nothing to escalate here: the
+                # reconciler is what resolves a conflict, and this loop simply
+                # does not record itself as the owner.
+                workflow.logger.info(
+                    "lifecycle: %s#%s is owned by %s/%s — this loop holds no claim",
+                    repo, number, result.owner_type, result.owner_id,
+                )
+                self._claim_refused = True
+            elif result is not None and result.accepted and result.verdict == UNKNOWN:
+                # The server took the write and told us nothing more. It is not
+                # a claim — no epoch came back, and a claim without an epoch is
+                # a fencing generation this loop cannot assert — but it is also
+                # not a failure, and silently taking neither branch is how a
+                # loop ends up never claiming and never backing off.
+                #
+                # NOT on `verdict == WROTE_NO_RECORD`, which is what this arm
+                # used to read. That verdict is UNREACHABLE from here:
+                # `answer_from` answers it only for a RELINQUISHING route, and
+                # `RELINQUISHING_PATH_SUFFIXES` is closed on ("/release",
+                # "/terminal") — deliberately, because the verdict's
+                # `blocks_others` is False and an acquire leaves the CALLER
+                # holding the entity. A body-less 2xx on /acquire arrives here
+                # as UNKNOWN with `accepted` True.
+                #
+                # So the predicate is the pair: `accepted` is the contract's
+                # "mctl-api took the write", `verdict == UNKNOWN` is "and told
+                # us nothing usable". Both halves are load-bearing — accepted
+                # alone also covers a 2xx carrying a released record (UNOWNED)
+                # or one naming somebody else, which the arms above and below
+                # answer differently.
+                workflow.logger.info(
+                    "lifecycle: acquire for %s#%s was accepted but told us "
+                    "nothing usable (state=%r, %s); no claim recorded this poll",
+                    repo, number, result.state,
+                    result.reason or "no reason given",
+                )
+                self._unknown_acquires += 1
+            else:
+                # A None result — the activity failed outright, or was
+                # cancelled — OR a real result this loop cannot use: an UNKNOWN
+                # the server did not accept (503, 412, a 404 on the route, a
+                # missing MCTL_TOKEN, an unrecognised state) and UNOWNED, which
+                # is the common case and is why the log names `result.reason`
+                # when there is one. Dereferencing a None would raise
+                # AttributeError INSIDE
+                # workflow code, which is not a FailureError: the workflow task
+                # fails, and because replay is deterministic it fails the same
+                # way forever, wedging the loop until somebody terminates it.
+                #
+                # The likeliest trigger is this change's own rollout: a control
+                # worker on the previous image has no lifecycle_ownership
+                # registered, the activity retries out, and execute_activity
+                # raises. The fakes never raise, so no test reached it.
+                self._unknown_acquires += 1
+                workflow.logger.warning(
+                    "lifecycle: could not establish ownership of %s#%s (%s) — "
+                    "this loop holds no claim and the sweeper keeps the PR",
+                    repo, number,
+                    result.reason if result is not None else "the activity failed outright",
+                )
+            return
+
+        if head and head != self._owned_head_sha and not self._backed_off(self._unknown_progress):
+            result = await self._ownership(
+                "progress",
+                repo=repo,
+                number=number,
+                head_sha=head,
+                evidence=f"head moved to {head[:8]}",
+            )
+            # `is not None` is NOT "the write succeeded". The activity never
+            # raises — that is its contract — so a 503, a timeout, a missing
+            # token and a lost claim all come back as a real result carrying an
+            # unknown or owned-by-other verdict. Advancing _owned_head_sha on
+            # those would drop the progress signal permanently: the next poll
+            # sees head == _owned_head_sha and never retries.
+            if result is not None and result.owned_by_caller:
+                # RecordProgress refreshes last_seen_at server-side, so a
+                # landed progress write IS this poll's heartbeat.
+                self._owned_head_sha = head
+                self._owner_epoch = result.epoch or self._owner_epoch
+                self._unknown_progress = 0
+                # ...so it resets the HEARTBEAT counter too. Both landed arms
+                # return, which skips the heartbeat block on this poll, so the
+                # counter neither advanced nor decayed across a write that
+                # refreshed last_seen_at — and the give-up reads it as a count
+                # of CONSECUTIVE missed heartbeats. With /acquire answering 503
+                # while /progress stays healthy (the mirror of the case this
+                # loop already handles) every progress write would land, the
+                # heartbeat would fail on every fourth poll, and the claim
+                # would be dropped on the premise that last_seen_at had not
+                # moved for six hours — which its own landed writes disprove.
+                self._unknown_heartbeats = 0
+                return
+            if (
+                result is not None
+                and result.accepted
+                and result.verdict == UNKNOWN
+                and result.state
+            ):
+                # A record came back and its STATE is one this image does not
+                # recognise — `verdict_for` classifies against two CLOSED sets
+                # and answers UNKNOWN rather than guessing, because this
+                # container lags mctl-api by a release.
+                #
+                # This arm is a LOG, and nothing else. Deleting it leaves every
+                # test green, because the fall-through below produces exactly
+                # the behaviour it wants: the head is not advanced, so the
+                # evidence is re-sent rather than treated as recorded, and
+                # `_unknown_progress` closes the `_backed_off` gate so the
+                # re-sends drop to the heartbeat cadence. Said here rather than
+                # asserted, because a predicate no test can turn red is not a
+                # guard — and the reason to keep it is that an unrecognised
+                # state is otherwise completely silent on this path, while the
+                # heartbeat names it.
+                #
+                # Two earlier versions of this arm did have behaviour and both
+                # were wrong. The first advanced the head, which is the
+                # body-less arm's behaviour applied to a record that says
+                # somebody may hold the row. The second incremented
+                # `_unknown_heartbeats` and returned, which inverted the
+                # constant it counted into: that counter is three HEARTBEATS —
+                # about six hours, inside the 10h liveness bound — and this arm
+                # runs once per POLL, so the claim was dropped after three
+                # polls, about ninety minutes. (Found by agy, not by this
+                # suite.)
+                #
+                # Falling through also gives the right answer, not merely a
+                # safe one. If the row really has moved to a state this image
+                # cannot read, the heartbeat's own /acquire answers the same
+                # way and counts it at the heartbeat cadence, where the
+                # give-up's number means what it says. If only /progress is
+                # answering strangely while /acquire still says the row is
+                # ours, then it is ours and the claim should stand.
+                workflow.logger.warning(
+                    "lifecycle: progress on %s#%s came back in state %r, which "
+                    "this image does not recognise — the head is not advanced "
+                    "and the evidence will be re-sent",
+                    repo, number, result.state,
+                )
+            if (
+                result is not None
+                and result.accepted
+                and result.verdict == UNKNOWN
+                and not result.state
+            ):
+                # The write LANDED — mctl-api took it — and carried NO record
+                # at all (an empty state is the body-less 2xx), so the head
+                # must advance, and
+                # counting it as unanswered would be the opposite of what the
+                # gate is for.
+                #
+                # This arm read `verdict == WROTE_NO_RECORD` for two rounds,
+                # and that predicate is UNREACHABLE for /progress: `answer_from`
+                # answers WROTE_NO_RECORD only for a route in
+                # `RELINQUISHING_PATH_SUFFIXES`, and that list is closed on
+                # ("/release", "/terminal") — with /progress named in its own
+                # comment as one of the two routes an earlier version got
+                # wrong, because /progress leaves the record active and owned
+                # by the caller. So the defect below was still live and the
+                # test that claimed to pin it was a false guard: the fake
+                # hand-built the verdict for whatever op it was handed.
+                #
+                # Without this arm the same evidence is re-sent for the rest of
+                # the watch, because _owned_head_sha never advances. That
+                # refreshes last_progress_at forever for a head that stopped
+                # moving, so the stuck bound can NEVER fire — the one property
+                # the liveness/progress split exists to provide. Throttling to
+                # the heartbeat cadence does not help: a refresh every two
+                # hours clears a stuck bound just as well as one every thirty
+                # seconds.
+                #
+                # `not result.state` is explicit rather than implied by the
+                # arm above, which no longer returns: a record whose state this
+                # image cannot read must not fall out of that arm and into this
+                # one, where the head would advance after all.
+                #
+                # No epoch came back, so the caller keeps the one it had.
+                self._owned_head_sha = head
+                self._unknown_progress = 0
+                self._unknown_heartbeats = 0
+                return
+            if (
+                result is not None
+                and result.verdict == OWNED_BY_OTHER
+                and self._lost_to_someone_else(result)
+            ):
+                self._lose_claim(repo, number, result)
+                return
+            if (
+                result is not None
+                and result.accepted
+                and result.verdict == OWNED_BY_OTHER
+                and result.owner_type == OWNER_TYPE
+            ):
+                # The owner TYPE too, because `_lost_to_someone_else` cannot
+                # carry this alone.
+                #
+                # It answers "is this owner TYPE ours", not "is this record
+                # ours", and under the same premise — mctl-api emitting an
+                # owner with no id — a record naming another DEVLOOP execution
+                # reads as ours here. Second order: two DevLoops on one PR is
+                # what this record exists to prevent, and with the id empty
+                # there is no better predicate available. Written down so the
+                # next reader does not have to re-derive that it is a known
+                # limit rather than an oversight. `Ownership.from_payload` does not require
+                # `owner.id`, so a 2xx carrying `owner: {"type": "pr-steward"}`
+                # parses, answers OWNED_BY_OTHER, and is declined as a loss by
+                # the `bool(result.owner_id)` guard — which exists for the
+                # `lost … to /` case and is right to be there. Without this
+                # conjunct such a record landed on an arm whose comment says
+                # "our OWN record read back unhealthy", and the arm kept the
+                # claim and advanced the head against a row a real competitor
+                # holds. Narrow — it needs mctl-api to emit an owner with no id
+                # — but the arm should cover what its comment says it covers.
+                #
+                # BELOW the guard above, deliberately: a real competitor can
+                # answer with `accepted` True too, and must still reach
+                # _lose_claim.
+                #
+                # And narrowed to OWNED_BY_OTHER, which is the only verdict
+                # this arm's reasoning covers. Gated on `accepted` alone it
+                # also caught UNOWNED — a 2xx carrying a RELEASED record has
+                # `accepted` True — and then did the opposite of what the
+                # fall-through below documents for exactly that verdict:
+                # it kept the claim, so the unclaimed re-acquire path stayed
+                # unreachable; advanced the head, so the progress signal was
+                # treated as recorded although it landed on a row this loop
+                # does not hold; and returned, so neither _backed_off nor the
+                # give-up could ever fire. The heartbeat block puts its UNOWNED
+                # arm ABOVE its accepted arm for this reason, and the two
+                # blocks then answered the same wire shape in opposite ways.
+                #
+                # The cost was the §5 recovery this epic is built on: the pod
+                # stalls past the liveness bound, the reconciler force-releases
+                # the row, the pod resumes pushing fixes, and because every
+                # poll moves the head every poll takes this arm and returns —
+                # the heartbeat is never reached, which is the starvation shape
+                # an earlier commit removed. A live worker and a zero-owner row
+                # is the #239 gap this PR closes, reached from inside it.
+                #
+                # What is left here is our OWN record read back unhealthy.
+                # `verdict_for` answers OWNED_BY_OTHER for an active row whose
+                # owner IS the caller whenever `healthy` is False, and
+                # `_lost_to_someone_else` correctly declines to call that a
+                # loss — but mctl-api still TOOK the write, and the heartbeat
+                # block has enumerated this shape since 089cb6a while this
+                # branch matched none of its guards on it and fell to the
+                # counter.
+                #
+                # Three costs, and the second is the one this PR exists to
+                # prevent: `_unknown_progress` counted a write the store
+                # accepted, which is the defect 089cb6a removed from the
+                # heartbeat; `_owned_head_sha` never advanced, so the identical
+                # evidence was re-sent for the rest of the watch, every send
+                # landed, and last_progress_at was refreshed forever for a head
+                # that stopped moving — so the stuck bound could never fire,
+                # which is the argument already written on the body-less arm
+                # above, reached by the shape that arm does not cover; and it
+                # was silent, where the heartbeat gives this same record a
+                # warning because ADR-010 §4 makes `stuck` an escalation.
+                workflow.logger.warning(
+                    "lifecycle: progress on %s#%s landed but the record is not "
+                    "usable as ours (verdict=%s, state=%r, healthy=%s) — the "
+                    "claim stands and the head advances",
+                    repo, number, result.verdict, result.state, result.healthy,
+                )
+                self._owned_head_sha = head
+                self._unknown_progress = 0
+                self._unknown_heartbeats = 0
+                return
+            self._unknown_progress += 1
+
+            # Everything else falls THROUGH to the heartbeat below, and the
+            # unconditional return that used to sit here was a liveness bug.
+            #
+            # A failed progress write correctly does not advance
+            # _owned_head_sha, so `head != _owned_head_sha` stays true on every
+            # later poll and control reaches this block every time. Returning
+            # here therefore made the heartbeat unreachable for the rest of the
+            # watch: a /progress answering 412 — the record moved, which is
+            # exactly what the fencing epoch is for — while `acquire` would
+            # still have succeeded stopped refreshing last_seen_at entirely.
+            # The 10h liveness bound then expires and the reconciler declares
+            # this owner dead and force-releases the row, while the workflow is
+            # alive, polling and shepherding the PR.
+            #
+            # UNOWNED had the mirror problem: progress against a row the
+            # reconciler already released matches neither branch above, so the
+            # claim was never dropped — and, because of the same return, never
+            # re-acquired either. The heartbeat's acquire re-establishes it.
+            #
+            # The retries are bounded by _backed_off on the way IN, with the
+            # counter this arm advances. Without it a /progress that 500s from
+            # poll 2 onward costs one activity per poll for the remaining ~670
+            # polls of a fourteen-day watch — precisely the history cost
+            # LIFECYCLE_UNKNOWN_WRITE_LIMIT exists to refuse, arriving by the
+            # path that falling through created. An earlier version of this
+            # comment claimed the existing counter already covered it; it did
+            # not, because that counter is only read and only written inside
+            # the unclaimed branch.
+
+        if self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0:
+            result = await self._ownership(
+                "acquire", repo=repo, number=number, head_sha=head
+            )
+            if result is not None and result.owned_by_caller:
+                self._owner_epoch = result.epoch or self._owner_epoch
+                self._unknown_heartbeats = 0
+                return
+            if (
+                result is not None
+                and result.verdict == OWNED_BY_OTHER
+                and self._lost_to_someone_else(result)
+            ):
+                # Discarding the verdict and keeping only the epoch meant this
+                # loop could never notice it had LOST the PR — and it adopted
+                # the winner's fencing generation while failing to notice,
+                # so every later call carried a competitor's epoch.
+                self._lose_claim(repo, number, result)
+                return
+
+            # Everything else: an UNKNOWN this loop cannot read as a landed
+            # write, UNOWNED, and a None result all used to fall off the end of
+            # this block in silence. (WROTE_NO_RECORD is not among them:
+            # `answer_from` reserves it for /release and /terminal.)
+            #
+            # This is the path where silence costs most. Once the head stops
+            # moving, the heartbeat is the ONLY liveness write a claimed loop
+            # makes, so an /acquire answering 503 — or a worker that lost
+            # MCTL_TOKEN, or a 404 from a wrong ingress path, each of which
+            # `answer_from` gives its own reason — stopped refreshing
+            # last_seen_at with zero log lines and zero history signal, and the
+            # reconciler force-released the row at the 10h bound while the
+            # workflow was alive and polling.
+            if result is not None and result.verdict == UNOWNED:
+                # The row this loop believed it held names nobody — the
+                # reconciler released it, or it was never written. The acquire
+                # did NOT take it (an acquire that took it would answer
+                # owned-by-caller), so this is not a refreshed heartbeat.
+                #
+                # Drop the claim rather than counting toward the give-up: the
+                # unclaimed path re-acquires on the next poll, which is the
+                # recovery the progress branch's UNOWNED note already names.
+                # NOT _claim_refused — nobody said they own this.
+                workflow.logger.info(
+                    "lifecycle: %s#%s is owned by nobody — this loop drops its "
+                    "stale claim and re-acquires",
+                    repo, number,
+                )
+                self._owned_entity_id = ""
+                self._owner_epoch = 0
+                self._owned_head_sha = ""
+                self._unknown_heartbeats = 0
+                self._unknown_progress = 0
+                return
+
+            if result is not None and result.accepted and result.verdict == UNKNOWN and result.state:
+                # A record came back in a 2xx and its STATE is one this image
+                # does not recognise — `verdict_for` classifies against two
+                # CLOSED sets and answers UNKNOWN rather than guessing, because
+                # this container lags mctl-api by a release.
+                #
+                # Counted, NOT reset, and it is the one accepted shape that
+                # must be. mctl-api took the write, so liveness is refreshed —
+                # but liveness is not the question here. A holding state added
+                # server-side means the row may now be held by somebody else in
+                # a state this image cannot read, and an arm that zeroed the
+                # counter on every such heartbeat made the give-up UNFIREABLE:
+                # the loop would hold its claim indefinitely, and invisibly,
+                # against a row another actor owns. Uncertainty resolves toward
+                # dropping the claim, the same direction `verdict_for` itself
+                # takes.
+                self._unknown_heartbeats += 1
+                workflow.logger.warning(
+                    "lifecycle: heartbeat for %s#%s came back in state %r, which "
+                    "this image does not recognise — %d consecutive; the claim is "
+                    "dropped at %d",
+                    repo, number, result.state, self._unknown_heartbeats,
+                    LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
+                )
+            elif (
+                result is not None
+                and result.accepted
+                and (
+                    result.verdict != OWNED_BY_OTHER
+                    or result.owner_type == OWNER_TYPE
+                )
+            ):
+                # The same competitor check the progress branch got, which this
+                # block was missing — one branch over, which is where every
+                # defect in this PR has turned out to live.
+                #
+                # `Ownership.from_payload` does not require `owner.id`, so a
+                # 2xx carrying `owner: {"type": "pr-steward"}` answers
+                # OWNED_BY_OTHER, is declined as a loss by
+                # `_lost_to_someone_else`'s `bool(result.owner_id)` guard, and
+                # then landed HERE — where `accepted` is True, so the loop read
+                # a COMPETITOR's record as a successful refresh of its own
+                # claim, reset `_unknown_heartbeats`, and kept the claim alive
+                # indefinitely against a row it does not hold. The give-up
+                # could never fire, which is the state this whole block exists
+                # to prevent. (Found by agy.)
+                #
+                # mctl-api TOOK the write, so last_seen_at IS refreshed; this
+                # loop simply learned nothing usable from the record that came
+                # back. That is not a missed heartbeat, and counting it toward
+                # a give-up whose entire premise is "liveness stopped" was the
+                # opposite of what the gate is for.
+                #
+                # Two shapes, and neither is a reason to stop claiming: a
+                # body-less 2xx on /ownership/acquire (the pair the claim and
+                # progress arms were rewritten to read — the heartbeat IS an
+                # acquire and got neither), which carries no record at all; and
+                # our own record read back unhealthy, which
+                # `_lost_to_someone_else` correctly declines to treat as a loss
+                # and which the give-up must not act on either, since ADR-010
+                # §4 gives `stuck` an ESCALATION and only `dead` a takeover.
+                #
+                # Getting this wrong was not cosmetic. Three of them dropped a
+                # claim the loop still held, after which it writes no progress,
+                # writes no terminal when the PR merges, and the finally
+                # releases nothing — the zero-owner state this epic exists to
+                # remove — on the strength of a warning that said liveness had
+                # stopped when it had not.
+                #
+                # Logged rather than returning in silence, which is the defect
+                # the previous commit fixed one block up and this arm
+                # reintroduced. The unhealthy-own-record case is precisely the
+                # condition ADR-010 wants an operator to see.
+                if not result.state:
+                    # No record at all — the body-less 2xx. Routine on a
+                    # healthy watch, so info.
+                    workflow.logger.info(
+                        "lifecycle: heartbeat for %s#%s landed but carried no "
+                        "record (verdict=%s) — the claim stands",
+                        repo, number, result.verdict,
+                    )
+                elif not result.healthy:
+                    # Our own record, read back unhealthy — and WHICH kind
+                    # matters. ADR-010 §4 gives `stuck` an ESCALATION (a human
+                    # is told and ownership does NOT move) and only `dead` a
+                    # takeover, so an operator needs the distinction and not
+                    # merely "unhealthy". The wire type carries both now.
+                    workflow.logger.warning(
+                        "lifecycle: %s#%s reads back as OUR record, unhealthy "
+                        "(state=%r, dead=%s, stuck=%s) — the claim stands and "
+                        "the reconciler %s",
+                        repo, number, result.state, result.dead, result.stuck,
+                        "may take it" if result.dead else "escalates rather than taking it",
+                    )
+                else:
+                    # A record, healthy, our own owner TYPE — but not
+                    # owned_by_caller, so it named a different id, or none.
+                    # The arm above keeps the claim on the type alone and the
+                    # log said "carried no record" for a response that carried
+                    # one, which is the third shape neither branch described.
+                    workflow.logger.warning(
+                        "lifecycle: heartbeat for %s#%s came back as %s/%r in "
+                        "state %r — same owner type, different identity; the "
+                        "claim stands on the type alone",
+                        repo, number, result.owner_type, result.owner_id, result.state,
+                    )
+                self._unknown_heartbeats = 0
+                return
+            else:
+                self._unknown_heartbeats += 1
+                workflow.logger.warning(
+                    "lifecycle: heartbeat for %s#%s did not land (verdict=%s, %s) — "
+                    "%d consecutive, last_seen_at is not being refreshed",
+                    repo, number,
+                    result.verdict if result is not None else "none",
+                    # `reason` is "" for every 2xx that carried a record, so the
+                    # verdict above is what makes those cases self-describing.
+                    (result.reason or "no reason given") if result is not None
+                    else "the activity failed outright",
+                    self._unknown_heartbeats,
+                )
+
+            self._give_up_claim_if_unanswered(repo, number)
+
+    def _give_up_claim_if_unanswered(self, repo: str, number: int) -> None:
+        """Drop the claim once the store has stopped confirming it.
+
+        One writer and one caller: the heartbeat block. It was extracted when
+        a second path briefly counted into `_unknown_heartbeats`, and that
+        path has since been removed — counting a per-POLL event into a
+        per-HEARTBEAT constant was the defect, not the location of the check.
+        The name is kept because the block is long enough to deserve one, not
+        because anything else calls it.
+        """
+        if self._unknown_heartbeats < LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT:
+            return
+        # Deliberately NOT a back-off. Skipping the heartbeat is the one thing
+        # that cannot help here — it is the write whose absence is the problem.
+        #
+        # What is wrong after this many is the BELIEF. At
+        # LIFECYCLE_HEARTBEAT_EVERY_POLLS x MERGE_POLL_INTERVAL per heartbeat,
+        # either last_seen_at has not moved for about six hours, or the record
+        # has come back that many times in a state this image cannot read.
+        # Either way the reconciler will take the row at the 10h bound whatever
+        # this loop thinks, and the correction has to arrive BEFORE that, not
+        # after. A loop that goes on believing it owns an entity the store is
+        # about to hand to somebody else is the divergence this epic exists to
+        # remove. Dropping the claim makes the belief match the outcome and
+        # returns the loop to the unclaimed path, which re-acquires under its
+        # own gate.
+        workflow.logger.warning(
+            "lifecycle: giving up the claim on %s#%s after %d unanswered "
+            "liveness writes — the sweeper keeps the PR",
+            repo, number, self._unknown_heartbeats,
+        )
+        self._owned_entity_id = ""
+        self._owner_epoch = 0
+        self._owned_head_sha = ""
+        self._unknown_heartbeats = 0
+        # _unknown_progress too: it counts failures under the claim being
+        # dropped here, and carrying it forward would start the NEXT claim
+        # already throttled on a write path never tried under it.
+        self._unknown_progress = 0
+        # NOT _claim_refused: nobody said they own this. That flag is permanent
+        # and means "somebody else answered", which is the opposite of what
+        # just happened.
+
+    def _backed_off(self, unanswered: int) -> bool:
+        """Whether an ownership write should be skipped on this poll.
+
+        The store has answered neither "mine" nor "someone else's" this many
+        times running. Asking again on every remaining poll is the history cost
+        LIFECYCLE_UNKNOWN_WRITE_LIMIT refuses; asking on the heartbeat boundary
+        keeps the loop recovering when the store comes back. Deliberately not a
+        give-up, and deliberately evaluated per counter so a failing /progress
+        does not throttle the acquire that is still working.
+        """
+        return (
+            unanswered >= LIFECYCLE_UNKNOWN_WRITE_LIMIT
+            and self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS != 0
+        )
+
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
         """Poll get_pr_state until the PR reaches a terminal state.
 
@@ -1114,6 +1917,21 @@ class DevLoopWorkflow:
         # commands in history: executions that already recorded a
         # sequential tick must keep replaying one.
         concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
+        # Lifecycle ownership (mctlhq/.github#57). Gated on the same claim as
+        # the in-loop shepherd: if this execution declined to shepherd, the
+        # cron sweeper owns the PR and this loop must not record itself as the
+        # owner. Its own marker, because it adds commands to history.
+        track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
+        if track_ownership:
+            # ADR-010 §12 asks for the resolved policy to be recorded on the
+            # row, so "why does this actor own it" is answerable without
+            # reconstructing a CWFT env var in another repository. Both are
+            # derived here, once, because this is where service and slug are
+            # in scope — and both are plain strings, so no policy lookup runs
+            # inside workflow code.
+            self._proposal_ref = f"{service}/{slug}"
+            self._policy_ref = f"devloop:{service}"
+
         tick_task: asyncio.Task[None] | None = None
         poll_index = 0
         shepherd_ticks = 0
@@ -1160,7 +1978,35 @@ class DevLoopWorkflow:
                 if state.found:
                     last = state
                     polls_without_pr = 0
+                    if track_ownership and state.repo and state.number is not None:
+                        self._poll_index_for_heartbeat += 1
+                        await self._track_ownership(state)
                     if state.state in ("MERGED", "CLOSED"):
+                        if track_ownership and self._owned_entity_id:
+                            done = await self._ownership(
+                                "terminal",
+                                # `or ""` like the head_sha below: the fields
+                                # are Optional on PRState, and the block is
+                                # guarded by _owned_entity_id, which is only
+                                # set when repo was present. Narrowing it for
+                                # the type checker rather than for the reader.
+                                repo=state.repo or "",
+                                number=state.number or 0,
+                                head_sha=state.head_sha or "",
+                                reason=f"pull request {(state.state or '').lower()}",
+                            )
+                            # Only drop the claim if the write landed. Clearing
+                            # it on a failed terminal would leave the row active
+                            # with nobody believing they own it — the zero-owner
+                            # state, produced by the cleanup meant to prevent it.
+                            if done is not None and done.accepted:
+                                self._owned_entity_id = ""
+                            else:
+                                workflow.logger.warning(
+                                    "lifecycle: terminal for %s#%s did not land; "
+                                    "leaving the claim for the reconciler",
+                                    state.repo, state.number,
+                                )
                         return state
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
@@ -1235,4 +2081,56 @@ class DevLoopWorkflow:
                 await workflow.sleep(MERGE_POLL_INTERVAL)
         finally:
             await self._settle_tick(tick_task, service, slug)
+            if track_ownership and self._owned_entity_id:
+                # The watch ended without the PR reaching a terminal state —
+                # the deadline expired, or the PR stopped resolving. RELEASE,
+                # not terminal: the work remains and somebody must be able to
+                # pick it up, which is precisely the zero-owner gap #239
+                # describes. Released is the state Acquire can take.
+                repo, _, number = self._owned_entity_id.partition("#")
+                # Pick the op from what the PR actually reached. A terminal
+                # write that failed leaves the claim behind deliberately (the
+                # branch above says so), and the watch then ends on a MERGED
+                # PR — releasing it here would mark a finished entity as
+                # "somebody must take this", which is the one state this
+                # contract defines as work remaining.
+                terminal_state = last is not None and last.state in ("MERGED", "CLOSED")
+                done = await self._ownership(
+                    "terminal" if terminal_state else "release",
+                    repo=repo,
+                    number=int(number) if number.isdigit() else 0,
+                    # The head this watch last saw. `_payload` sends `version`
+                    # unconditionally, so omitting it made the LAST write of
+                    # the watch the only one carrying an empty one — and the
+                    # version is what the row records about the entity it is
+                    # letting go of.
+                    head_sha=(last.head_sha or "") if last is not None else "",
+                    reason=(
+                        f"pull request {(last.state or '').lower()}"
+                        if terminal_state and last is not None
+                        else "merge watch ended without a terminal pull-request state"
+                    ),
+                )
+                # The same distinction the in-loop terminal path makes, which
+                # this one discarded: clearing the claim on a write that did
+                # not land says the loop let go of a row the store still shows
+                # as active — the zero-owner state, written into the record by
+                # the cleanup meant to prevent it.
+                #
+                # Honestly: no test can turn this red. The workflow returns on
+                # the next line, `_owned_entity_id` is never read again, and
+                # the only difference is the log. It is here because the
+                # abandonment should be legible to whoever reads the history
+                # after the reconciler reaps the row, and because the two
+                # adjacent paths should not state opposite policies about the
+                # same one-way door.
+                if done is not None and done.accepted:
+                    self._owned_entity_id = ""
+                else:
+                    workflow.logger.warning(
+                        "lifecycle: the final %s for %s#%s did not land — the "
+                        "claim is abandoned and the reconciler reaps the row "
+                        "at the liveness bound",
+                        "terminal" if terminal_state else "release", repo, number,
+                    )
         return last
