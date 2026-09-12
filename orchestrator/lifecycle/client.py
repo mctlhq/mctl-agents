@@ -133,7 +133,12 @@ class OwnershipClient:
         except Exception as exc:
             raise OwnershipUnavailable(str(exc)) from exc
         try:
-            return _HTTPResult(status=status, payload=json.loads(body or b"{}"), status_path=path)
+            return _HTTPResult(
+                status=status,
+                payload=json.loads(body or b"{}"),
+                status_path=path,
+                body_empty=not body,
+            )
         except ValueError as exc:
             raise OwnershipUnavailable(f"malformed response: {exc}") from exc
 
@@ -147,7 +152,10 @@ class OwnershipClient:
             )
         except OwnershipUnavailable as exc:
             return OwnershipAnswer(verdict=UNKNOWN, reason=str(exc))
-        return answer_from(res.status, res.payload, asking, is_read=True, path=res.status_path)
+        return answer_from(
+            res.status, res.payload, asking, is_read=True, path=res.status_path,
+            body_empty=res.body_empty,
+        )
 
     def get_many(
         self, kind: str, phase: str, ids: list[str], asking: Owner | None = None
@@ -282,14 +290,17 @@ class OwnershipClient:
             res = self._request("POST", path, payload)
         except OwnershipUnavailable as exc:
             return OwnershipAnswer(verdict=UNKNOWN, reason=str(exc))
-        return answer_from(res.status, res.payload, owner, path=res.status_path)
+        return answer_from(
+            res.status, res.payload, owner, path=res.status_path, body_empty=res.body_empty
+        )
 
 
 class _HTTPResult:
-    __slots__ = ("payload", "status", "status_path")
+    __slots__ = ("body_empty", "payload", "status", "status_path")
 
-    def __init__(self, status: int, payload: Any, status_path: str = "") -> None:
+    def __init__(self, status: int, payload: Any, status_path: str = "", body_empty: bool = False) -> None:
         self.status = status
+        self.body_empty = body_empty
         self.payload = payload if isinstance(payload, dict) else {}
         # The path is carried so a 404 can say WHICH endpoint produced it — the
         # difference between "no such row" and "no such route".

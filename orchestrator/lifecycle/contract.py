@@ -297,7 +297,15 @@ def answer_from(
     *,
     is_read: bool = False,
     path: str = "",
+    body_empty: bool = False,
 ) -> OwnershipAnswer:
+    """Turn one HTTP response into an answer. The only implementation.
+
+    ``body_empty`` separates a genuine no-content success from a body that
+    failed to parse. Both reach here as an empty mapping, and collapsing them
+    reads an HTML error page served with a 200 — a gateway answering for the
+    API — as a successful write.
+    """
     if 200 <= status < 300:
         # A 200 whose body is not an ownership record is a surprise, not an
         # answer. Parsing it into an all-empty record would produce a confident
@@ -305,11 +313,16 @@ def answer_from(
         # right one.
         own = Ownership.from_payload(payload)
         if own is None:
-            if not is_read and not payload:
-                # A body-less 2xx on a mutating call means the write SUCCEEDED
-                # and told us nothing more. Reporting UNKNOWN would make it
-                # indistinguishable from a 503, and a caller gating its local
-                # state on the result could never record a successful release.
+            if not is_read and body_empty:
+                # A genuinely body-less 2xx on a mutating call means the write
+                # SUCCEEDED and told us nothing more. Reporting UNKNOWN would
+                # make it indistinguishable from a 503, and a caller gating its
+                # local state on the result could never record a successful
+                # release.
+                #
+                # An empty PARSE is a different thing and must not reach here:
+                # a 200 carrying an HTML error page from a gateway is not a
+                # successful write, and body_empty is what separates them.
                 return OwnershipAnswer(
                     verdict=WROTE_NO_RECORD, reason=f"{status} with no body"
                 )

@@ -467,3 +467,18 @@ def test_unrecognised_state_says_why(monkeypatch: pytest.MonkeyPatch) -> None:
     answer = _client(monkeypatch, _ok(payload)).get(ENTITY, PHASE, asking=ME)
     assert answer.verdict == UNKNOWN
     assert "quarantined" in answer.reason
+
+
+def test_a_200_with_an_unparseable_body_is_not_a_successful_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway or proxy answering for the API serves HTML with a 200.
+
+    That parses to an empty mapping, exactly like a genuine 204, so collapsing
+    the two would report a page-not-found as a completed release. `body_empty`
+    is what separates them.
+    """
+    handler = lambda req: _FakeResponse(b"<html>502 Bad Gateway</html>", status=200)  # noqa: E731
+    answer = _client(monkeypatch, handler).release(ENTITY, PHASE, ME, epoch=1, reason="done")
+    assert answer.verdict == UNKNOWN
+    assert answer.wrote is False
