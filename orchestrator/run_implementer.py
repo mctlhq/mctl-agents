@@ -218,9 +218,11 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
     - the file must parse as a JSON object with ``refused`` exactly ``True``
       and a non-empty string ``reason`` — a stray file, a truncated write or a
       progress note does not qualify;
-    - the file must be UNTRACKED. A marker committed into a target repo would
-      otherwise make every future follow-up on that repo look like a refusal
-      and permanently exempt it from the attempt cap.
+    - the file must be UNTRACKED, *provably* so. A marker committed into a
+      target repo would otherwise make every future follow-up on that repo look
+      like a refusal and permanently exempt it from the attempt cap, so a
+      ``git ls-files`` invocation that fails to answer the question counts as a
+      no, not a yes.
 
     Returns ``None`` (and logs why) for anything that does not qualify, so the
     caller falls back to the ordinary "no follow-up commits" failure.
@@ -237,6 +239,18 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
         print(
             f"warn: {REFUSAL_MARKER_FILENAME} is tracked in {repo_dir.name}; "
             f"ignoring it — only a marker written during this run counts"
+        )
+        return None
+    if tracked.returncode != 1:
+        # 0 is tracked, 1 is "no such path in the index". Anything else (git
+        # missing from PATH, a corrupt or absent index, an unexpected 128) means
+        # we could not establish the fact — and every other check in this
+        # function treats "could not establish" as "not a refusal". Erring the
+        # other way here would honour a marker precisely when the repository
+        # state is unknown.
+        print(
+            f"warn: could not determine whether {REFUSAL_MARKER_FILENAME} is "
+            f"tracked (git ls-files exited {tracked.returncode}); ignoring"
         )
         return None
     try:

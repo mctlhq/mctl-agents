@@ -2040,7 +2040,23 @@ def process_one(
             if e.kind == "refused":
                 # Not a failure: the implementer read the findings and decided
                 # that changing nothing was the correct outcome
-                # (mctl-agents#360). The attempt budget exists to stop
+                # (mctl-agents#360).
+                #
+                # Two counters move here, in opposite directions. `refusals`
+                # goes up. `harness_failures` is CLEARED: exit 47 is the
+                # strongest proof in the set that the handoff works — the child
+                # ran, reasoned, wrote a marker, exited on a sentinel, and the
+                # driver read the reason back out of the real file. Without the
+                # clear, an alternating 46, 47, 46, 47, 46 reaches
+                # MAX_HARNESS_FAILURES and tells the operator "the platform lost
+                # the work 3 time(s) in a row", which is false, and points at
+                # #366 instead of at the standoff MAX_REFUSALS exists to
+                # surface. The mirror does NOT hold: a harness failure must not
+                # clear `refusals`, because the agent never reached a terminal
+                # state and so proved nothing about the findings — and because,
+                # with 47 clearing the harness counter, a 46/47 alternation that
+                # also cleared `refusals` would trip neither cap and run as an
+                # unbounded paid loop. The attempt budget exists to stop
                 # unproductive loops, not to punish an agent for correctly
                 # declining to act, so the counter and the status stay put and
                 # a later tick can act on new information. The reason is
@@ -2068,6 +2084,12 @@ def process_one(
                         "review-stuck",
                         refusals=new_refusals,
                         refusals_head=pr.head_sha,
+                        # See the arm's opening comment: 47 is proof of a
+                        # working handoff. Leaving a stale count here would
+                        # also contradict this very note, which tells the
+                        # operator the standoff — not the platform — is the
+                        # thing to look at.
+                        harness_failures=None,
                         notes=(
                             f"The implementer declined to act {new_refusals} "
                             f"time(s) and the findings still stand. "
@@ -2087,6 +2109,7 @@ def process_one(
                     ref.status,
                     refusals=new_refusals,
                     refusals_head=pr.head_sha,
+                    harness_failures=None,
                     notes=note,
                 )
                 return ShepherdResult(ref=ref, decision="wait", notes=note)
@@ -2177,6 +2200,13 @@ def process_one(
                 # and that counter is what an operator reads to decide whether
                 # this is a platform incident.
                 harness_failures=None,
+                # Same argument, mirrored (mctl-agents#360): the child engaged
+                # with the findings and the driver adjudicated the result, so
+                # any run of refusals before it is no longer consecutive. This
+                # attempt is charged to `review_attempts` instead, which is the
+                # cap that bounds the sequence from here.
+                refusals=None,
+                refusals_head=None,
             )
             update_status(ref, "implemented")
             return ShepherdResult(

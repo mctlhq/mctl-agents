@@ -367,3 +367,59 @@ def test_subagent_definitions_carry_the_marker_contract() -> None:
     for path in definitions:
         body = path.read_text(encoding="utf-8")
         assert run_implementer.REFUSAL_MARKER_FILENAME in body, path
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 on #369
+# ---------------------------------------------------------------------------
+def test_unknown_ls_files_result_is_not_treated_as_untracked(repo, monkeypatch) -> None:
+    """"Could not establish the fact" must read as "not a refusal".
+
+    Every other check in `_read_refusal_marker` errs that way; this one used to
+    invert it, treating any non-zero `git ls-files` result as untracked. Exit 1
+    is the real "not in the index" answer — 128, a missing git, or a corrupt
+    index are not answers at all, and honouring a marker exactly when the
+    repository state is unknown is the wrong direction for this design.
+    """
+    _write_marker(repo, {"refused": True, "reason": "r"})
+    real_run = run_implementer._run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "ls-files"]:
+            return subprocess.CompletedProcess(cmd, 128, "", "fatal: not a git repository")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "_run", fake_run)
+    assert run_implementer._read_refusal_marker(repo) is None
+
+
+def test_exit_one_is_still_honoured_as_untracked(repo, monkeypatch) -> None:
+    """The narrowing must not break the ordinary case it guards."""
+    _write_marker(repo, {"refused": True, "reason": "r"})
+    real_run = run_implementer._run
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:2] == ["git", "ls-files"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "did not match any file(s)")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "_run", fake_run)
+    assert run_implementer._read_refusal_marker(repo) == "r"
+
+
+def test_subagent_definitions_exclude_the_blocked_case() -> None:
+    """A blocked run is a failed attempt, not a refusal.
+
+    The marker bullet sits directly above "if the proposal is unclear, STOP and
+    explain", so without an explicit exclusion an agent could record a genuine
+    failure as a deliberate no-op — converting the one case that must charge the
+    cap into one that does not, and landing a human on a `review-stuck` note
+    asserting "the proposal is not at fault" about a faulty proposal.
+    """
+    agents_dir = Path(run_implementer.AGENTS_DIR)
+    definitions = sorted(agents_dir.glob("*/.claude/agents/implementer.md"))
+    assert definitions, "no implementer sub-agent definitions found"
+    for path in definitions:
+        body = path.read_text(encoding="utf-8")
+        assert "BLOCKED" in body, path
+        assert "do NOT write the marker" in body, path

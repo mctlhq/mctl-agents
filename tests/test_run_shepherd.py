@@ -3857,3 +3857,114 @@ def test_read_refusal_reason_caps_at_the_trust_boundary(tmp_path) -> None:
     reason = run_shepherd._read_refusal_reason(str(path))
     assert reason is not None
     assert len(reason) == run_shepherd.MAX_NOTES_CHARS
+
+
+# ---------------------------------------------------------------------------
+# Review round 2 on #369: one table for the whole counter contract
+#
+# Two rules, mirrored:
+#   - any outcome proving the HANDOFF worked clears `harness_failures`;
+#   - any outcome proving the AGENT ENGAGED with the findings clears
+#     `refusals` (and its head anchor).
+#
+# The mirror is deliberately incomplete in one place: a harness failure clears
+# neither. The child never reached a terminal state, so it proves nothing about
+# the findings — and since a refusal clears the harness counter, a 46/47
+# alternation that also cleared `refusals` would trip neither cap and run as an
+# unbounded paid loop, which is the one outcome both counters exist to prevent.
+#
+# One table rather than four near-duplicate tests: a new outcome kind is then a
+# missing row here, not a test nobody thought to write.
+# ---------------------------------------------------------------------------
+COUNTER_CONTRACT = (
+    # kind, review_attempts, harness_failures, refusals, refusals_head
+    ("success", 2, 0, 0, None),
+    ("deterministic", 2, 0, 0, None),
+    ("refused", 1, 0, 2, HEAD_SHA),
+    ("harness", 1, 2, 1, HEAD_SHA),
+)
+
+
+@pytest.mark.parametrize(
+    ("kind", "attempts", "harness", "refusals", "refusals_head"),
+    COUNTER_CONTRACT,
+    ids=[row[0] for row in COUNTER_CONTRACT],
+)
+def test_counter_contract_across_outcomes(
+    tmp_path, kind, attempts, harness, refusals, refusals_head,
+) -> None:
+    ref = make_ref(tmp_path / kind, review_attempts=1)
+    # Seeded on disk as well as in memory: "untouched" is only observable in
+    # the file, and the harness arm writes only its own counter.
+    seeded = read_status(ref)
+    seeded["harness_failures"] = ref.harness_failures = 1
+    seeded["refusals"] = ref.refusals = 1
+    seeded["refusals_head"] = ref.refusals_head = HEAD_SHA
+    ref.status_path.write_text(
+        yaml.safe_dump(seeded, sort_keys=False), encoding="utf-8",
+    )
+
+    if kind == "success":
+        side_effect = None
+    else:
+        def side_effect(*_a, _k=kind, **_kw):
+            raise run_shepherd.FollowupSubprocessError(
+                f"implementer follow-up exited non-zero ({_k})",
+                kind=_k,
+                reason="declined" if _k == "refused" else None,
+            )
+
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "trigger_review"), \
+         patch.object(run_shepherd, "apply_followup", side_effect=side_effect):
+        process_one(ref, skip_subprocess=True)
+
+    final = read_status(ref)
+    assert final.get("review_attempts", 0) == attempts, kind
+    assert final.get("harness_failures", 0) == harness, kind
+    assert final.get("refusals", 0) == refusals, kind
+    assert final.get("refusals_head") == refusals_head, kind
+
+
+def test_alternating_harness_and_refusal_reaches_the_refusal_cap(tmp_path) -> None:
+    """The sequence the contract above exists to get right.
+
+    46, 47, 46, 47, 46 used to reach MAX_HARNESS_FAILURES and tell the operator
+    the platform had lost the work three times in a row — false, with two clean
+    terminal runs in between, and it pointed at #366 instead of at the standoff.
+    It must converge on the refusal cap instead, with the note that says the
+    proposal is not at fault.
+    """
+    ref = make_ref(tmp_path, review_attempts=0)
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    def raiser(kind):
+        def _raise(*_a, **_kw):
+            raise run_shepherd.FollowupSubprocessError(
+                f"exit ({kind})",
+                kind=kind,
+                reason="operator decision" if kind == "refused" else None,
+            )
+        return _raise
+
+    decisions = []
+    for kind in ("harness", "refused", "harness", "refused", "harness", "refused"):
+        with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+             patch.object(run_shepherd, "read_codex_review", return_value=review), \
+             patch.object(run_shepherd, "read_copilot_review",
+                          return_value=run_shepherd.CopilotReview(False, 0)), \
+             patch.object(run_shepherd, "apply_followup", side_effect=raiser(kind)):
+            decisions.append(process_one(ref, skip_subprocess=True).decision)
+
+    assert decisions == ["wait"] * 5 + ["review-stuck"]
+    final = read_status(ref)
+    assert final["refusals"] == run_shepherd.MAX_REFUSALS
+    assert final["review_attempts"] == 0
+    assert "not at fault" in final["notes"]
+    assert "harness defect" not in final["notes"]
