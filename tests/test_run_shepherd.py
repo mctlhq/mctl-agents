@@ -4656,3 +4656,62 @@ def test_an_unknown_push_time_does_not_wedge_the_verdict() -> None:
 
     assert review.head_verdict == "APPROVED"
     assert decide(pr, review)[0] == "merge"
+
+
+def test_an_undatable_push_keeps_findings_but_still_drops_approvals() -> None:
+    """Both directions fail closed, and the asymmetry is the point.
+
+    With `head_pushed_at` unknown — no commit node, or the skew guard having
+    dropped a future-dated one — a stale "No P1/P2 findings" must NOT merge
+    code it never saw, while a connector P1 must NOT vanish because we cannot
+    date it. Found by agy: the fix for the future-dated push time made this
+    reachable, and the pre-existing issue-comment filter dropped findings and
+    approvals alike.
+    """
+    pr = make_pr(checks_green=True, head_pushed_at=None)
+    issue_comments = [
+        {
+            "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+            "body": "![P1 Badge] Command injection in the new handler.",
+            "created_at": "2026-04-29T09:00:00Z",
+        },
+        {
+            "user": {"login": run_shepherd.REVIEW_BOT},
+            "body": "No P1/P2 findings",
+            "created_at": "2026-04-29T09:30:00Z",
+        },
+    ]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, issue_comments=issue_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    # The finding survives...
+    assert len(review.findings) == 1
+    assert review.findings[0].severity == "P1"
+    # ...and the undatable approval does not become a verdict.
+    assert review.head_verdict is None
+    # decide() says wait, not address-review: a connector finding deliberately
+    # never sets has_responded, so the primary reviewer still has to speak on
+    # this head. The point of this test is that the finding is PRESENT to gate
+    # with once it does — before the fix it had already been thrown away.
+    assert review.has_responded is False
+    assert decide(pr, review) == ("wait", None)
+
+
+def test_a_finding_without_a_timestamp_survives_a_known_push_time() -> None:
+    """Same rule with the push time known: an undated finding is kept."""
+    pr = make_pr(checks_green=True)
+    issue_comments = [{
+        "user": {"login": run_shepherd.CODEX_CONNECTOR_BOT},
+        "body": "![P2 Badge] Undated, but real.",
+        "created_at": None,
+    }]
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_gh(pr, issue_comments=issue_comments),
+    ):
+        review = run_shepherd.read_codex_review(pr)
+
+    assert len(review.findings) == 1

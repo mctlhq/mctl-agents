@@ -1359,6 +1359,28 @@ def _extract_severity(body: str) -> str | None:
     return None
 
 
+def _is_fresh_finding(created_at: str | None, head_pushed_at: str | None) -> bool:
+    """Whether a finding belongs to the current head, failing CLOSED.
+
+    Deliberately asymmetric with the approval signals, and the asymmetry is the
+    point: both directions fail closed.
+
+    - An APPROVAL we cannot date is DROPPED. A stale "No P1/P2 findings" must
+      never merge code it never saw.
+    - A FINDING we cannot date is KEPT. Unknown age is not evidence of
+      staleness, and silently discarding a P1 because its timestamp is missing
+      -- or because the push time was unusable -- merges past a block.
+
+    `head_pushed_at` is None in two real cases: the GraphQL probe returned no
+    commit or force-push node, and (since the skew guard in _fetch_pr_snapshot)
+    a future-dated committedDate. Both mean "we do not know when this head
+    appeared", not "everything is stale".
+    """
+    if head_pushed_at is None:
+        return True
+    return _iso_gt(created_at, head_pushed_at) or not created_at
+
+
 def read_codex_review(pr: PRSnapshot) -> CodexReview:
     """Build a CodexReview anchored to pr.head_sha.
 
@@ -1508,7 +1530,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
                     head_verdict = "APPROVED"
                     head_verdict_at = created_at or ""
             sev = _extract_severity(body)
-            if sev in ("P1", "P2") and _iso_gt(created_at, pr.head_pushed_at):
+            if sev in ("P1", "P2") and _is_fresh_finding(created_at, pr.head_pushed_at):
                 # Top-level issue comment — no commit_id; time-anchor only.
                 # A finding posted as an issue comment is itself proof the bot
                 # responded; set the flag so decide() routes to address-review
@@ -1530,7 +1552,7 @@ def read_codex_review(pr: PRSnapshot) -> CodexReview:
             # PR must not wait on a reviewer that may never come.
             created_at = c.get("created_at")
             sev = _extract_severity(body)
-            if sev in ("P1", "P2") and _iso_gt(created_at, pr.head_pushed_at):
+            if sev in ("P1", "P2") and _is_fresh_finding(created_at, pr.head_pushed_at):
                 findings.append(CodexFinding(
                     body=body,
                     path=None,
