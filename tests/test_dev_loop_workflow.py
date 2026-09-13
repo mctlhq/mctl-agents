@@ -1352,35 +1352,67 @@ class TestDevLoopWorkflow:
     async def test_a_refusal_is_throttled_for_the_whole_backoff(self, env):
         """The expiry must not turn the throttle back into per-poll asking.
 
-        The refusal above expires once; what must NOT happen is the loop
-        re-testing on every poll after that. LIFECYCLE_REFUSAL_BACKOFF_POLLS is
-        the liveness bound precisely so a re-test costs one activity per bound,
-        not one per thirty minutes.
+        `ownership_owner` refuses EVERY op from the first call, so the claiming
+        acquire never lands and this drives the UNCLAIMED path throughout: one
+        refusal, a full backoff of silence, one re-test, and so on.
+        LIFECYCLE_REFUSAL_BACKOFF_POLLS is the liveness bound precisely so a
+        re-test costs one activity per bound rather than one per thirty
+        minutes.
+
+        (An earlier version also passed `ownership_refuses_progress_once`,
+        which was dead: with every acquire refused the loop never holds a
+        claim, so it never reaches the progress branch at all.)
         """
-        head_a = "a" * 40
-        head_b = "b" * 40
-        open_a = PRState(
+        open_pr = PRState(
             found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
-            number=MERGED_PR.number, state="OPEN", head_sha=head_a,
-        )
-        open_b = PRState(
-            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
-            number=MERGED_PR.number, state="OPEN", head_sha=head_b,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
         )
         polls = LIFECYCLE_REFUSAL_BACKOFF_POLLS + 8
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[open_a] + [open_b] * polls + [MERGED_PR],
+            pr_states=[open_pr] * polls + [MERGED_PR],
             issue=919,
-            # Refuses EVERY acquire, so the refusal is re-recorded on each
-            # re-test and the backoff restarts — the competitor-is-working case.
             ownership_owner=("pr-steward", "steward"),
-            ownership_refuses_progress_once=True,
         )
         acquires = [o for o in ops if o.op == "acquire"]
         # One claim attempt per backoff window at most, not one per poll.
         assert len(acquires) <= polls // LIFECYCLE_REFUSAL_BACKOFF_POLLS + 2, (
             f"the refusal stopped throttling: {len(acquires)} acquires over {polls} polls"
+        )
+
+    async def test_the_give_up_branch_actually_fires(self, env):
+        """The positive case: one unchanging owner eventually ends the asking.
+
+        Every other test here pins a direction the counter must NOT trip in —
+        reset on recovery, reset on identity change, no accumulation across
+        episodes. None of them drives it to the limit, so the branch that makes
+        the refusal permanent again had no cover at all, and deleting it would
+        have left the suite green.
+
+        LIFECYCLE_REFUSAL_GIVE_UP counts refusals INCLUDING the first, so the
+        loop asks GIVE_UP times in total and then stops: the initial claim
+        attempt plus GIVE_UP-1 re-tests, each one backoff apart.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        # Enough polls for one more re-test than the limit allows, so an
+        # off-by-one in the branch shows up as an extra acquire rather than as
+        # a test that simply ran out of polls.
+        polls = LIFECYCLE_REFUSAL_BACKOFF_POLLS * (LIFECYCLE_REFUSAL_GIVE_UP + 1) + 4
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_pr] * polls + [MERGED_PR],
+            issue=923,
+            # The same owner, every time: the continuous hold the permanent
+            # give-up is meant to describe.
+            ownership_owner=("pr-steward", "steward"),
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        assert len(acquires) == LIFECYCLE_REFUSAL_GIVE_UP, (
+            f"the give-up branch did not fire: {len(acquires)} acquires over "
+            f"{polls} polls, expected exactly {LIFECYCLE_REFUSAL_GIVE_UP}"
         )
 
     def test_a_successful_reacquire_ends_the_refusal_streak(self) -> None:

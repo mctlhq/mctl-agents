@@ -202,15 +202,21 @@ LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
 # activities re-learning a fact that cannot yet have changed.
 LIFECYCLE_REFUSAL_BACKOFF_POLLS = 20
 
-# Consecutive re-tests naming THE SAME owner before the loop stops asking for
+# Consecutive REFUSALS naming THE SAME owner before the loop stops asking for
 # good.
 #
-# Three re-tests is 30 h of one competitor continuously holding and refreshing
-# the row — not a reaped owner this loop could inherit, but a live actor doing
-# its job. That is the case the original permanent flag described correctly,
-# and the reconciler is what resolves it. The owner identity is part of the
-# condition: three refusals from three DIFFERENT owners is a busy entity, not a
-# settled one, and restarts the count.
+# Refusals, not re-tests, and the distinction is the whole arithmetic:
+# `_refuse_claim` counts the FIRST refusal too, so three of them is the initial
+# refusal plus two re-tests — the loop asks twice more and then stops.
+#
+# Two re-tests is 20 h at LIFECYCLE_REFUSAL_BACKOFF_POLLS, i.e. two full
+# liveness bounds during which one competitor kept holding and refreshing the
+# row. That is not a reaped owner this loop could inherit; it is a live actor
+# doing its job, which is the case the original permanent flag described
+# correctly, and the reconciler is what resolves it.
+#
+# The owner identity is part of the condition: three refusals from three
+# DIFFERENT owners is a busy entity, not a settled one, and restarts the count.
 LIFECYCLE_REFUSAL_GIVE_UP = 3
 
 # The owner type this workflow writes and reads back. Written once by
