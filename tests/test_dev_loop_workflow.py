@@ -109,6 +109,7 @@ def _fake_activities(
     ownership_unknown_state_op: str = "acquire",
     ownership_body_less: str | None = None,
     ownership_terminal_fails: bool = False,
+    ownership_terminal_fails_once: bool = False,
     ownership_raises: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
@@ -144,6 +145,7 @@ def _fake_activities(
     calls: list[str] = []
     ownership_ops: list[OwnershipRequest] = []
     _refused_once: list[bool] = []
+    _terminal_failed: list[bool] = []
     investigate_ran = anyio.Event()
 
     @activity.defn(name="submit_and_wait")
@@ -319,6 +321,12 @@ def _fake_activities(
                 healthy=True,
                 accepted=True,
             )
+        if ownership_terminal_fails_once and req.op == "terminal" and not _terminal_failed:
+            # Exactly one failure: the in-loop write on the MERGED poll.
+            # The cleanup in the finally then retries and lands, which is
+            # the sequence that exposes a sticky abandonment flag.
+            _terminal_failed.append(True)
+            return OwnershipResult(verdict="unknown", reason="store down")
         if ownership_terminal_fails and req.op == "terminal":
             return OwnershipResult(verdict="unknown", reason="store down")
         if ownership_unavailable_op is not None and req.op == ownership_unavailable_op:
@@ -1598,6 +1606,37 @@ class TestDevLoopWorkflow:
         assert claim.last_op == "terminal"
         assert claim.last_op_landed is False
         assert claim.abandoned is True
+
+    async def test_a_retry_that_lands_clears_the_abandonment(self, env):
+        """abandoned reflects the LAST write, not "ever failed".
+
+        The in-loop terminal fires on a MERGED poll and can fail; the cleanup
+        in the finally then issues its own relinquishing write, which may land.
+        A sticky flag would report abandoned=True beside entity_id="" and
+        last_op_landed=True — three fields disagreeing about one fact, in the
+        query introduced to make that fact checkable.
+
+        The fixture fails the terminal ONCE: the in-loop write is refused, the
+        watch ends on a merged PR, and the finally's retry succeeds.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        claim, ops = await self._run_ownership_loop_with_claim(
+            env,
+            pr_states=[open_pr, open_pr, MERGED_PR],
+            issue=924,
+            ownership_terminal_fails_once=True,
+        )
+        assert [o.op for o in ops].count("terminal") >= 2, (
+            f"the retry never happened: {[o.op for o in ops]}"
+        )
+        assert claim.last_op_landed is True
+        assert claim.entity_id == ""
+        assert claim.abandoned is False, (
+            f"a landed retry still reports the claim abandoned: {claim}"
+        )
 
     async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(
         self, env

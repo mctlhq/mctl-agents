@@ -1393,10 +1393,15 @@ class DevLoopWorkflow:
         landed = result is not None and result.accepted
         self._last_lifecycle_op = op
         self._last_lifecycle_op_landed = landed
+        # Reflects the LAST write, not "ever failed". The in-loop terminal can
+        # fail and the cleanup's retry then land — at which point the claim is
+        # not abandoned, and a sticky flag would report abandoned=True beside
+        # entity_id="" and last_op_landed=True, contradicting the invariant
+        # this query exists to make checkable.
+        self._claim_abandoned = not landed
         if landed:
             self._owned_entity_id = ""
             return
-        self._claim_abandoned = True
         # Stable prefix so this is countable in production, not only assertable
         # in a test: the worker's namespace is already inside the Promtail
         # metrics-stage selector, so one regex turns it into a counter.
