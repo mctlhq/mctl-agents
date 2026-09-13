@@ -333,6 +333,33 @@ class IncidentWatch:
 
 
 @dataclass(frozen=True)
+class LifecycleClaim:
+    """What this execution believes about the ownership row it held.
+
+    Exists to give `_owned_entity_id` a reader OUTSIDE `_watch_pr`. The
+    cleanup in that method's `finally` refuses to clear the claim when its own
+    terminal/release write failed — correctly, because clearing it would record
+    that the loop let go of a row the store still shows as active. But the
+    workflow returns on the next line and the field is never read again, so no
+    test could turn that guard red, and the code said so in a comment. A guard
+    that can only pass by not running is not a guard.
+
+    Temporal serves queries against COMPLETED executions, so the terminal value
+    of these fields is observable after the watch ends — which is exactly when
+    the question "did this loop abandon a live row?" is asked.
+    """
+
+    entity_id: str = ""
+    epoch: int = 0
+    #: The last relinquishing write attempted: "terminal", "release", or "".
+    last_op: str = ""
+    #: Whether that write landed. False with a non-empty `last_op` is the
+    #: abandonment: the store still shows the row active and this loop is gone.
+    last_op_landed: bool = False
+    abandoned: bool = False
+
+
+@dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
     # None if approval was never signalled, investigate failed, or the
@@ -625,6 +652,11 @@ class DevLoopWorkflow:
         self._unknown_heartbeats = 0
         self._proposal_ref = ""
         self._policy_ref = ""
+        # The last relinquishing write and whether it landed, so the
+        # abandonment branch in _watch_pr's finally has a reader.
+        self._last_lifecycle_op = ""
+        self._last_lifecycle_op_landed = False
+        self._claim_abandoned = False
 
     @workflow.query
     def shepherd_in_loop(self) -> bool:
@@ -638,6 +670,27 @@ class DevLoopWorkflow:
         marker this workflow actually recorded — not its status.
         """
         return self._shepherd_in_loop
+
+    @workflow.query
+    def lifecycle_claim(self) -> LifecycleClaim:
+        """The ownership row this execution holds, or abandoned.
+
+        `entity_id` non-empty after the watch ended means the loop did NOT let
+        go: either it never reached the cleanup, or the cleanup's own write
+        failed and it deliberately kept the claim so the record does not show a
+        row nobody believes they own.
+
+        This is the reader that makes the cleanup's guard falsifiable. It is
+        also useful on its own — the reconciler and an operator both need to
+        know which live execution, if any, still asserts a row.
+        """
+        return LifecycleClaim(
+            entity_id=self._owned_entity_id,
+            epoch=self._owner_epoch,
+            last_op=self._last_lifecycle_op,
+            last_op_landed=self._last_lifecycle_op_landed,
+            abandoned=self._claim_abandoned,
+        )
 
     @workflow.signal
     def approve(self, *args: object) -> None:
@@ -1318,6 +1371,42 @@ class DevLoopWorkflow:
         self._claim_refused = True
         self._claim_refused_until_poll = (
             self._poll_index_for_heartbeat + LIFECYCLE_REFUSAL_BACKOFF_POLLS
+        )
+
+    def _finish_claim(
+        self, op: str, result: OwnershipResult | None, repo: str, number: int
+    ) -> None:
+        """Let go of the claim, but only if the relinquishing write landed.
+
+        One writer for both relinquishing paths — the in-loop terminal on a
+        MERGED/CLOSED poll, and the cleanup in _watch_pr's finally. They stated
+        the same policy in two places and phrased it differently, which is how
+        one of them came to clear the claim on a failed write while the other
+        did not.
+
+        Clearing on a write that did not land records that this loop let go of
+        a row the store still shows as ACTIVE: the zero-owner state, produced
+        by the cleanup meant to prevent it. Keeping the claim instead leaves
+        the row to the reconciler's liveness bound, which is the mechanism that
+        exists for it.
+        """
+        landed = result is not None and result.accepted
+        self._last_lifecycle_op = op
+        self._last_lifecycle_op_landed = landed
+        if landed:
+            self._owned_entity_id = ""
+            return
+        self._claim_abandoned = True
+        # Stable prefix so this is countable in production, not only assertable
+        # in a test: the worker's namespace is already inside the Promtail
+        # metrics-stage selector, so one regex turns it into a counter.
+        workflow.logger.warning(
+            "LIFECYCLE-CLAIM-ABANDONED entity=%s#%s op=%s reason=%s",
+            repo,
+            number,
+            op,
+            "the relinquishing write did not land; the reconciler reaps the "
+            "row at the liveness bound",
         )
 
     def _forget_refusal(self) -> None:
@@ -2122,18 +2211,9 @@ class DevLoopWorkflow:
                                 head_sha=state.head_sha or "",
                                 reason=f"pull request {(state.state or '').lower()}",
                             )
-                            # Only drop the claim if the write landed. Clearing
-                            # it on a failed terminal would leave the row active
-                            # with nobody believing they own it — the zero-owner
-                            # state, produced by the cleanup meant to prevent it.
-                            if done is not None and done.accepted:
-                                self._owned_entity_id = ""
-                            else:
-                                workflow.logger.warning(
-                                    "lifecycle: terminal for %s#%s did not land; "
-                                    "leaving the claim for the reconciler",
-                                    state.repo, state.number,
-                                )
+                            self._finish_claim(
+                                "terminal", done, state.repo or "", state.number or 0
+                            )
                         return state
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
@@ -2238,26 +2318,17 @@ class DevLoopWorkflow:
                         else "merge watch ended without a terminal pull-request state"
                     ),
                 )
-                # The same distinction the in-loop terminal path makes, which
-                # this one discarded: clearing the claim on a write that did
-                # not land says the loop let go of a row the store still shows
-                # as active — the zero-owner state, written into the record by
-                # the cleanup meant to prevent it.
+                # Same policy as the in-loop terminal path, and now the same
+                # code: two phrasings of one rule is how they came to disagree.
                 #
-                # Honestly: no test can turn this red. The workflow returns on
-                # the next line, `_owned_entity_id` is never read again, and
-                # the only difference is the log. It is here because the
-                # abandonment should be legible to whoever reads the history
-                # after the reconciler reaps the row, and because the two
-                # adjacent paths should not state opposite policies about the
-                # same one-way door.
-                if done is not None and done.accepted:
-                    self._owned_entity_id = ""
-                else:
-                    workflow.logger.warning(
-                        "lifecycle: the final %s for %s#%s did not land — the "
-                        "claim is abandoned and the reconciler reaps the row "
-                        "at the liveness bound",
-                        "terminal" if terminal_state else "release", repo, number,
-                    )
+                # The guard used to be unfalsifiable — the workflow returns on
+                # the next line and `_owned_entity_id` was never read again, so
+                # no test could turn it red, and the comment here said so. The
+                # `lifecycle_claim` query is the reader that fixes that:
+                # Temporal serves queries against completed executions, so the
+                # terminal value of these fields is observable exactly when the
+                # question is asked.
+                self._finish_claim(
+                    "terminal" if terminal_state else "release", done, repo, number
+                )
         return last

@@ -1114,6 +1114,40 @@ class TestDevLoopWorkflow:
         assert result.pr.merged is True
         assert result.pr.merge_commit == "cafe1234"
 
+    async def _run_ownership_loop_with_claim(
+        self, env, *, pr_states, issue: int, **kwargs
+    ):
+        """Like _run_ownership_loop, but also returns the terminal value of the
+        `lifecycle_claim` query.
+
+        Queried AFTER the workflow completes, deliberately: the guard under
+        test runs in _watch_pr's `finally`, and its whole difficulty is that
+        nothing reads the field afterwards. Temporal answering queries against
+        completed executions is what turns that into an assertion.
+        """
+        activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True, pr_states=pr_states, **kwargs
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(30):
+                await handle.result()
+            claim = await handle.query(DevLoopWorkflow.lifecycle_claim)
+        return claim, ownership_ops
+
     async def _run_ownership_loop(self, env, *, pr_states, issue: int, **kwargs):
         activities, _calls, investigate_ran, ownership_ops = _fake_activities(
             released=True, pr_states=pr_states, **kwargs
@@ -1514,6 +1548,56 @@ class TestDevLoopWorkflow:
             "separate recovered episodes accumulated into the permanent "
             f"give-up: {[o.op for o in ops][-8:]}"
         )
+
+    async def test_a_landed_terminal_releases_the_claim(self, env):
+        """The happy half of the guard: the write landed, so the loop lets go.
+
+        Asserted through the query rather than through the ops list, because
+        the ops list shows that a terminal was ATTEMPTED — which is equally
+        true when the loop keeps a claim it should have dropped.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        claim, ops = await self._run_ownership_loop_with_claim(
+            env, pr_states=[open_pr, open_pr, MERGED_PR], issue=921
+        )
+        assert ops[-1].op == "terminal"
+        assert claim.entity_id == "", f"the claim was kept on a landed write: {claim}"
+        assert claim.last_op == "terminal"
+        assert claim.last_op_landed is True
+        assert claim.abandoned is False
+
+    async def test_a_failed_terminal_keeps_the_claim_and_says_so(self, env):
+        """The half that had no reader at all.
+
+        A terminal write that does not land must NOT clear the claim: clearing
+        it records that this loop let go of a row the store still shows as
+        active — the zero-owner state, produced by the cleanup meant to prevent
+        it. The code did the right thing and carried a comment admitting no
+        test could turn it red, because the workflow returns on the next line
+        and the field is never read again.
+
+        Deleting the `landed` guard in `_finish_claim` turns this red.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        claim, ops = await self._run_ownership_loop_with_claim(
+            env,
+            pr_states=[open_pr, open_pr, MERGED_PR],
+            issue=922,
+            ownership_terminal_fails=True,
+        )
+        assert ops[-1].op == "terminal"
+        assert claim.entity_id == f"{MERGED_PR.repo}#{MERGED_PR.number}", (
+            f"the claim was dropped on a write that did not land: {claim}"
+        )
+        assert claim.last_op == "terminal"
+        assert claim.last_op_landed is False
+        assert claim.abandoned is True
 
     async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(
         self, env
