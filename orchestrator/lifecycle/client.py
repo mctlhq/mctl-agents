@@ -147,7 +147,14 @@ class OwnershipClient:
         try:
             res = self._request(
                 "GET",
-                f"/api/v1/lifecycle/ownership?kind={_q(entity.kind)}&id={_q(entity.id)}&phase={_q(phase)}",
+                # `/record`, not `/ownership?id=`: the list path answered a
+                # single-entity read with a bare record and a filtered read
+                # with an {"ownership": [...], "count": N} envelope, so the
+                # TYPE of the reply depended on which arguments were sent
+                # (mctl-api#302 item 7). `?id` still delegates for one
+                # release; this moves before that grace window closes.
+                f"/api/v1/lifecycle/ownership/record"
+                f"?kind={_q(entity.kind)}&id={_q(entity.id)}&phase={_q(phase)}",
             )
         except OwnershipUnavailable as exc:
             return OwnershipAnswer(verdict=UNKNOWN, reason=str(exc))

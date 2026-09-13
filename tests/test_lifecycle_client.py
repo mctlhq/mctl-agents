@@ -803,3 +803,38 @@ def test_a_body_less_2xx_on_handoff_complete_is_not_a_claim_either(
         rel = call(_client(monkeypatch, empty))
         assert rel.verdict == WROTE_NO_RECORD
         assert rel.blocks_others is False
+
+
+def test_single_read_uses_the_record_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The single-entity read must not go back to the list path.
+
+    `GET /lifecycle/ownership?id=` answered a single-entity read with a bare
+    record and a filtered read with an {"ownership": [...], "count": N}
+    envelope, so the shape of the reply depended on which arguments were sent
+    (mctl-api#302 item 7). `?id` is deprecated and delegates for one release
+    only; after that it is a 400, and a silent revert to it would turn every
+    single-entity read UNKNOWN — the verdict that blocks mutations in enforce.
+
+    Pinned as a string because that is what actually breaks: the verdict logic
+    is identical on both paths, so nothing else in this file would go red.
+    """
+    seen: list[str] = []
+
+    def _handler(req: Any) -> Any:
+        seen.append(req.full_url)
+        # A real 404 arrives as an HTTPError, not as a response carrying the
+        # status — the client reads the raised form, so a fake that returns it
+        # would exercise the wrong arm.
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "err", {}, io.BytesIO(b'{"error": "no ownership record"}')
+        )
+
+    out = _client(monkeypatch, _handler).get(ENTITY, PHASE, asking=ME)
+    assert out.verdict == UNOWNED
+    assert len(seen) == 1
+    path = seen[0].split("https://api.example.test", 1)[1]
+    assert path.startswith("/api/v1/lifecycle/ownership/record?"), path
+    # The selector still travels in the query string: entity ids carry `/` and
+    # `#` (`mctlhq/mctl-web#42`), so they cannot become path segments.
+    for arg in ("kind=", "id=", "phase="):
+        assert arg in path, f"{arg} missing from {path}"
