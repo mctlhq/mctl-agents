@@ -26,7 +26,7 @@ requires-python = ">=3.12,<3.13"
 # claude-agent-sdk/mcp) to a direct, deliberately-pinned one because
 # orchestrator/temporal/activities/* now import it directly to call mctl-api.
 dependencies = [
-    "claude-agent-sdk==0.2.136",
+    "claude-agent-sdk==0.2.148",
     "anyio==4.14.2",
     "python-dotenv==1.2.2",
     "PyYAML==6.0.3",
