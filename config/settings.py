@@ -47,6 +47,17 @@ AGENTS_DIR = REPO_ROOT / "agents"
 # enter ROTATING_SERVICES — the rotation would fail immediately without a
 # scaffold. Its intake is human-labelled `agents:intake` issues, dispatched
 # by run_issue_poller.py.
+#
+# `.github` is the org-profile repo, and since #69 it also holds the roadmap
+# control plane (`roadmap/`, EpicDefinition) plus the org-wide reusable
+# workflows every other repo calls. It is DevLoop-driven the same way
+# `portfolio` is: human-labelled `agents:intake` issues, no
+# `agents/.github/` scaffold, so it must not enter ROTATING_SERVICES. Two
+# things about this repo that the others do not have: a change under
+# `.github/workflows/` is org-wide CI, and the agents-state directory for it
+# is a dotted path (`agents-state/.github/`) — every consumer reaches it
+# through `Path.iterdir()` or a git `:(glob)` pathspec, both of which match a
+# leading dot, but a shell glob would not.
 SERVICES = [
     "mctl-web",
     "mctl-openclaw",
@@ -62,6 +73,7 @@ SERVICES = [
     "mctl-academy",
     "seerrsense",
     "portfolio",
+    ".github",
     # "upwork-mcp",
 ]
 
@@ -75,6 +87,7 @@ NON_ROTATING_SERVICES = {
     "mctl-academy",
     "seerrsense",
     "portfolio",
+    ".github",
 }
 
 # Subset of SERVICES that the proactive R&D rotation analyzes via

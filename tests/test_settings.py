@@ -30,3 +30,32 @@ def test_non_rotating_services_are_all_registered():
 def test_services_has_no_duplicates():
     """A duplicated entry in SERVICES silently double-counts a service in derived sets."""
     assert len(SERVICES) == len(set(SERVICES))
+
+
+def test_dot_github_is_a_registered_service():
+    """mctlhq/.github must be a valid implementer/investigator target.
+
+    Before this entry the poller saw its `agents:intake` issues, refused to
+    dispatch them ("not a known service") and kept the label, so an issue
+    sat untouched with no proposal and no comment (mctlhq/.github#67).
+    """
+    assert ".github" in SERVICES
+
+
+def test_dot_github_is_non_rotating():
+    """.github has no agents/.github/ scaffold, so it must stay out of the rotation."""
+    assert ".github" in NON_ROTATING_SERVICES
+    assert ".github" not in ROTATING_SERVICES
+
+
+def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
+    """A service name becomes a path segment under agents-state/.
+
+    A leading dot is supported — every consumer walks that tree with
+    `Path.iterdir()` or a git `:(glob)` pathspec, both of which match it.
+    A path separator or an upward traversal is not: it would let a service
+    name escape its own state directory.
+    """
+    for name in SERVICES:
+        assert "/" not in name, name
+        assert name not in {".", ".."}, name
