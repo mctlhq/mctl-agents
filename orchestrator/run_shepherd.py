@@ -425,7 +425,7 @@ SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
 # --fix-only: _service_mode caps them at fix-only and merge_pr refuses
 # independently.
 #
-# The two entries are here for different reasons.
+# The three entries are here for different reasons.
 #
 #   mctl-academy — merge is content publication. Its clean-room policy makes
 #   human CODEOWNER approval the last check before a question publishes, and an
@@ -441,7 +441,17 @@ SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
 #   whole platform. Raised as a P1 by agy on mctlhq/mctl-gitops#1202; the chain
 #   it described does not close today, and this is the code-level guarantee
 #   that keeps it from closing later.
-NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops"})
+#
+#   .github — merge is org-wide CI. This repository holds the reusable
+#   workflows every other mctlhq repository calls (claude-review, agy-review,
+#   pr-review), so a merge here changes the CI of all 16 at once, and a
+#   workflow merged into it runs with the org's Actions secrets. Its branch
+#   protection requires zero approving reviews and has no CODEOWNERS, so
+#   GitHub itself would not stop an agent-authored merge — this constant is
+#   the only gate. Raised as a P1 by agy on mctlhq/mctl-api#313 when the repo
+#   was registered as a DevLoop service; registering it is what makes the
+#   fix-only default load-bearing rather than theoretical.
+NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops", ".github"})
 
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
 # but never merges (merge is owned by another PR lifecycle, e.g. pr-steward);
