@@ -2294,7 +2294,13 @@ class DevLoopWorkflow:
                 # not terminal: the work remains and somebody must be able to
                 # pick it up, which is precisely the zero-owner gap #239
                 # describes. Released is the state Acquire can take.
-                repo, _, number = self._owned_entity_id.partition("#")
+                repo, _, raw_number = self._owned_entity_id.partition("#")
+                # Parsed once. The entity id is this loop's own construction
+                # (`EntityRef.for_pull_request`), so the digits are there — but
+                # the conversion used to sit inline in the _ownership call and
+                # the raw string went on to the log, which is how the two
+                # readings of `number` in this block drifted apart.
+                number = int(raw_number) if raw_number.isdigit() else 0
                 # Pick the op from what the PR actually reached. A terminal
                 # write that failed leaves the claim behind deliberately (the
                 # branch above says so), and the watch then ends on a MERGED
@@ -2305,7 +2311,7 @@ class DevLoopWorkflow:
                 done = await self._ownership(
                     "terminal" if terminal_state else "release",
                     repo=repo,
-                    number=int(number) if number.isdigit() else 0,
+                    number=number,
                     # The head this watch last saw. `_payload` sends `version`
                     # unconditionally, so omitting it made the LAST write of
                     # the watch the only one carrying an empty one — and the
