@@ -33,6 +33,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
     LIFECYCLE_REFUSAL_BACKOFF_POLLS,
+    LIFECYCLE_REFUSAL_GIVE_UP,
     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
@@ -101,6 +102,7 @@ def _fake_activities(
     ownership_self_unhealthy_after: int | None = None,
     ownership_progress_fails: bool = False,
     ownership_refuses_progress_once: bool = False,
+    ownership_refuses_progress_always: bool = False,
     ownership_progress_unowned: bool = False,
     ownership_unowned_op: str | None = None,
     ownership_unknown_state: str | None = None,
@@ -282,6 +284,20 @@ def _fake_activities(
                 # that set neither would exercise the arm without exercising
                 # the distinction it now logs.
                 stuck=True,
+                accepted=True,
+            )
+        if ownership_refuses_progress_always and req.op == "progress":
+            # One refusal per EPISODE: the head moves, the progress write is
+            # refused, the backoff expires, the acquire succeeds again. Three
+            # of those in one watch is the shape that distinguishes "one
+            # competitor held it throughout" from "three separate episodes".
+            return OwnershipResult(
+                verdict="owned-by-other",
+                owner_type="pr-steward",
+                owner_id="steward",
+                epoch=77,
+                state="active",
+                healthy=True,
                 accepted=True,
             )
         if ownership_refuses_progress_once and req.op == "progress" and not _refused_once:
@@ -1365,6 +1381,106 @@ class TestDevLoopWorkflow:
         # One claim attempt per backoff window at most, not one per poll.
         assert len(acquires) <= polls // LIFECYCLE_REFUSAL_BACKOFF_POLLS + 2, (
             f"the refusal stopped throttling: {len(acquires)} acquires over {polls} polls"
+        )
+
+    def test_a_successful_reacquire_ends_the_refusal_streak(self) -> None:
+        """LIFECYCLE_REFUSAL_GIVE_UP counts ONE continuous hold, not a lifetime
+        tally.
+
+        The streak state survived a successful re-acquire, so a fixed-identity
+        actor — a steward, a sweeper — refusing this loop once per episode
+        across three SEPARATE episodes, each interrupted by a genuine recovery,
+        tripped the permanent give-up that is meant to describe a single
+        unbroken hold. Holding the entity ourselves is proof the run ended.
+
+        Driven directly rather than through the workflow: three full backoff
+        windows is 60+ polls of fixture, and the defect is arithmetic on these
+        four fields, which is what this asserts.
+        """
+        w = DevLoopWorkflow()
+        steward = OwnershipResult(
+            verdict="owned-by-other", owner_type="pr-steward", owner_id="steward",
+            epoch=77, state="active", healthy=True, accepted=True,
+        )
+
+        w._refuse_claim(steward)
+        assert w._refusals_observed == 1
+        # Same owner, no recovery in between: this is the continuous hold the
+        # give-up exists for, so it accumulates.
+        w._refuse_claim(steward)
+        assert w._refusals_observed == 2
+
+        # A genuine recovery: the backoff expired, the owner had been
+        # force-released, and this loop took the entity.
+        w._forget_refusal()
+        assert w._refusals_observed == 0
+        assert w._claim_refused is False
+        assert w._claim_refused_until_poll == 0
+
+        # The SAME owner refuses again in a later episode. The streak restarts:
+        # two plus one is not three when a recovery sits between them.
+        w._refuse_claim(steward)
+        assert w._refusals_observed == 1, (
+            "the streak survived a recovery — separate episodes accumulate into "
+            "the permanent give-up"
+        )
+
+    def test_a_different_owner_restarts_the_refusal_streak(self) -> None:
+        """Three refusals from three different owners is a busy entity, not a
+        settled one. Only one actor holding it across the whole window is the
+        case the permanent give-up describes."""
+        w = DevLoopWorkflow()
+
+        def refusal(owner_id: str) -> OwnershipResult:
+            return OwnershipResult(
+                verdict="owned-by-other", owner_type="shepherd", owner_id=owner_id,
+                epoch=1, state="active", healthy=True, accepted=True,
+            )
+
+        w._refuse_claim(refusal("cron-a"))
+        w._refuse_claim(refusal("cron-a"))
+        assert w._refusals_observed == 2
+        w._refuse_claim(refusal("cron-b"))
+        assert w._refusals_observed == 1
+
+    async def test_recovery_between_episodes_does_not_accumulate_toward_give_up(
+        self, env
+    ):
+        """The reset must happen AT THE CALL SITE, not merely be available.
+
+        The streak-arithmetic tests above drive `_forget_refusal` directly, so
+        they stay green with the call removed — a guard that can only pass by
+        not running. This one goes through the workflow: a fixed-identity
+        actor refuses one progress write per episode, and each backoff expires
+        into a genuine re-acquire.
+
+        LIFECYCLE_REFUSAL_GIVE_UP episodes of that is a loop that recovered
+        every single time, which is the opposite of the one continuous hold
+        the permanent give-up describes. Without the reset the counter reaches
+        the limit, the refusal becomes permanent, and the loop is not the owner
+        when the PR merges.
+        """
+        heads = ["a", "b", "c", "d"]
+        def at(i: int) -> PRState:
+            return PRState(
+                found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+                number=MERGED_PR.number, state="OPEN", head_sha=heads[i] * 40,
+            )
+
+        # One episode per head move, each a full backoff window long.
+        window = LIFECYCLE_REFUSAL_BACKOFF_POLLS + 4
+        states: list[PRState] = []
+        for i in range(LIFECYCLE_REFUSAL_GIVE_UP + 1):
+            states += [at(i)] * window
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=states + [MERGED_PR],
+            issue=920,
+            ownership_refuses_progress_always=True,
+        )
+        assert ops[-1].op == "terminal", (
+            "separate recovered episodes accumulated into the permanent "
+            f"give-up: {[o.op for o in ops][-8:]}"
         )
 
     async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(

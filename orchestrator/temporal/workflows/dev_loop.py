@@ -1314,6 +1314,19 @@ class DevLoopWorkflow:
             self._poll_index_for_heartbeat + LIFECYCLE_REFUSAL_BACKOFF_POLLS
         )
 
+    def _forget_refusal(self) -> None:
+        """Clear the refusal and its streak.
+
+        Called when this loop positively holds the entity: the streak counts
+        one continuous hold by one competitor, and holding the entity ourselves
+        ends any such run by definition.
+        """
+        self._claim_refused = False
+        self._claim_refused_until_poll = 0
+        self._refused_by_type = ""
+        self._refused_by_id = ""
+        self._refusals_observed = 0
+
     def _refusal_still_holds(self) -> bool:
         """Should the acquire be skipped because somebody else owns this?
 
@@ -1418,6 +1431,21 @@ class DevLoopWorkflow:
                 self._owner_epoch = result.epoch
                 self._owned_head_sha = head
                 self._unknown_acquires = 0
+                # The refusal EPISODE is over, so its streak ends with it.
+                #
+                # LIFECYCLE_REFUSAL_GIVE_UP counts CONSECUTIVE re-tests that
+                # keep naming the same owner — one competitor holding the
+                # entity across the whole window. A successful acquire in
+                # between is proof of the opposite: this loop got the entity,
+                # so whatever the earlier refusals were, they were not one
+                # unbroken hold.
+                #
+                # Without this reset the counter survives the recovery, and a
+                # fixed-identity actor (a steward, a sweeper) refusing this
+                # loop once per episode across three SEPARATE episodes — each
+                # interrupted by a genuine re-acquire — trips the permanent
+                # give-up that is meant to describe a single continuous one.
+                self._forget_refusal()
             elif (
                 result is not None
                 and result.verdict == OWNED_BY_OTHER
