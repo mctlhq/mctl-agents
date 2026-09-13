@@ -50,6 +50,11 @@ BATCH_CHUNK_SIZE = 100
 # When true, an unreachable store blocks mutating steps instead of letting the
 # old mechanism decide. Documented break-glass: set false to restore
 # fail-open behaviour during an mctl-api outage.
+#
+# Read ONLY through `rollout.blocks_on_unknown()`. Below `enforce` it has no
+# effect, because below `enforce` the new answer does not decide anything — and
+# a caller reading it directly would turn the break-glass into a second rollout
+# switch competing with LIFECYCLE_ROLLOUT_MODE.
 def ownership_required() -> bool:
     return os.environ.get("LIFECYCLE_OWNERSHIP_REQUIRED", "true").strip().lower() not in {
         "false",
