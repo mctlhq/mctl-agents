@@ -1474,7 +1474,7 @@ class TestDevLoopWorkflow:
             states += [at(i)] * window
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=states + [MERGED_PR],
+            pr_states=[*states, MERGED_PR],
             issue=920,
             ownership_refuses_progress_always=True,
         )
