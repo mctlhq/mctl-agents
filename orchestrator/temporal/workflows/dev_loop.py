@@ -1401,6 +1401,13 @@ class DevLoopWorkflow:
         self._claim_abandoned = not landed
         if landed:
             self._owned_entity_id = ""
+            # The epoch goes with it, as at every other site that drops the
+            # claim (_lose_claim, the heartbeat's UNOWNED arm, the give-up).
+            # It is a fencing generation for a row this loop no longer holds,
+            # and `lifecycle_claim` exposes it — so leaving it set reports a
+            # live epoch beside an empty entity_id, in the query added to make
+            # that pair legible.
+            self._owner_epoch = 0
             return
         # Stable prefix so this is countable in production, not only assertable
         # in a test: the worker's namespace is already inside the Promtail

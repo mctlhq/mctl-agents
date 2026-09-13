@@ -1573,6 +1573,10 @@ class TestDevLoopWorkflow:
         )
         assert ops[-1].op == "terminal"
         assert claim.entity_id == "", f"the claim was kept on a landed write: {claim}"
+        # The epoch goes with the claim. It is a fencing generation for a row
+        # this loop no longer holds, and the query exposes it, so a stale
+        # nonzero epoch beside an empty entity_id is two fields disagreeing.
+        assert claim.epoch == 0, f"a stale epoch survived the release: {claim}"
         assert claim.last_op == "terminal"
         assert claim.last_op_landed is True
         assert claim.abandoned is False
