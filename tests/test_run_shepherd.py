@@ -4715,3 +4715,44 @@ def test_a_finding_without_a_timestamp_survives_a_known_push_time() -> None:
         review = run_shepherd.read_codex_review(pr)
 
     assert len(review.findings) == 1
+
+
+def test_dot_github_can_never_resolve_to_full_merge(monkeypatch, capsys) -> None:
+    """.github is code-gated, like mctl-gitops and for a larger blast radius.
+
+    Raised as a P1 by agy on mctlhq/mctl-api#313, against the PR that
+    registered `.github` as a DevLoop service. Merging there is org-wide CI:
+    the repository holds the reusable workflows all 16 mctlhq repositories
+    call, and a workflow merged into it runs with the org's Actions secrets.
+
+    GitHub is not the backstop here — that branch's protection requires zero
+    approving reviews and the repository has no CODEOWNERS — so this asserts
+    the code-level guarantee with BOTH env lists empty, the state a careless
+    gitops edit produces.
+    """
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset())
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_FIX_ONLY_SERVICES", frozenset())
+
+    assert run_shepherd._service_mode(".github") == run_shepherd.FIX_ONLY
+    # Even the operator escape hatch cannot widen it.
+    assert (
+        run_shepherd._service_mode(".github", force_fix_only=True)
+        == run_shepherd.FIX_ONLY
+    )
+
+    # merge_pr refuses independently of mode, and the dotted repo name must
+    # still resolve to the service through `pr.repo.split("/")[-1]`.
+    pr = make_pr()
+    pr.repo = "mctlhq/.github"
+    with patch.object(run_shepherd, "subprocess") as mocked_subprocess, \
+         patch.object(run_shepherd, "refresh_github_token") as mocked_refresh:
+        result = run_shepherd.merge_pr(pr)
+    assert result == (False, None)
+    mocked_subprocess.run.assert_not_called()
+    mocked_refresh.assert_not_called()
+    assert "error:" in capsys.readouterr().out
+
+
+def test_dot_github_deferred_merge_owner_is_human_not_steward() -> None:
+    """pr-steward has no role in .github; naming it would misattribute the merge."""
+    assert run_shepherd._merge_owner_for(".github") == "human-codeowner"
