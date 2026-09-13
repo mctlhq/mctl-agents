@@ -181,10 +181,43 @@ LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 # It applies to the acquire AND to the progress write. They are counted
 # separately because they fail separately: a claimed loop whose /progress 500s
 # still has a working acquire, and throttling one must not throttle the other.
-# (Contrast `_claim_refused` a few lines into _track_ownership, which IS
-# permanent: "somebody else owns this" is an answer, not a failure to answer,
-# and only the reconciler resolves it.)
+# (Contrast the refusal a few lines into _track_ownership: "somebody else owns
+# this" is an answer, not a failure to answer, so it is believed for far longer
+# — LIFECYCLE_REFUSAL_BACKOFF_POLLS rather than one heartbeat boundary. It is
+# not believed forever, though; see that constant for why.)
 LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
+
+# Polls a refusal is believed for before the loop asks again.
+#
+# "Somebody else owns this" IS an answer, unlike the unanswered writes above —
+# but it is an answer with an expiry date, and treating it as permanent is what
+# this constant fixes. ADR-010 §5 force-releases a row whose owner stopped
+# proving liveness, so the named owner can be reaped and the entity become
+# claimable again inside the same watch. A loop holding a permanent refusal
+# never finds out.
+#
+# 20 polls is 10 h at MERGE_POLL_INTERVAL, which is the liveness bound itself:
+# a refusal must be re-tested at most one bound later, because past that point
+# the owner it names may already be gone. Re-testing sooner would spend
+# activities re-learning a fact that cannot yet have changed.
+LIFECYCLE_REFUSAL_BACKOFF_POLLS = 20
+
+# Consecutive REFUSALS naming THE SAME owner before the loop stops asking for
+# good.
+#
+# Refusals, not re-tests, and the distinction is the whole arithmetic:
+# `_refuse_claim` counts the FIRST refusal too, so three of them is the initial
+# refusal plus two re-tests — the loop asks twice more and then stops.
+#
+# Two re-tests is 20 h at LIFECYCLE_REFUSAL_BACKOFF_POLLS, i.e. two full
+# liveness bounds during which one competitor kept holding and refreshing the
+# row. That is not a reaped owner this loop could inherit; it is a live actor
+# doing its job, which is the case the original permanent flag described
+# correctly, and the reconciler is what resolves it.
+#
+# The owner identity is part of the condition: three refusals from three
+# DIFFERENT owners is a busy entity, not a settled one, and restarts the count.
+LIFECYCLE_REFUSAL_GIVE_UP = 3
 
 # The owner type this workflow writes and reads back. Written once by
 # `_ownership` and compared in two arms; as three separate literals they had to
@@ -576,8 +609,17 @@ class DevLoopWorkflow:
         self._owned_head_sha = ""
         self._poll_index_for_heartbeat = 0
         # Set once another actor is known to own this PR, so the loop stops
-        # re-asking on every poll for the rest of the watch.
+        # re-asking on every poll. Believed until `_claim_refused_until_poll`
+        # rather than forever: the named owner can be force-released inside
+        # this watch (ADR-010 §5), after which the entity is claimable again.
         self._claim_refused = False
+        self._claim_refused_until_poll = 0
+        # Who refused, and how many consecutive re-tests have named them. The
+        # identity is what separates "a competitor is working" from "a row I
+        # could have inherited three times over".
+        self._refused_by_type = ""
+        self._refused_by_id = ""
+        self._refusals_observed = 0
         self._unknown_acquires = 0
         self._unknown_progress = 0
         self._unknown_heartbeats = 0
@@ -1229,7 +1271,7 @@ class DevLoopWorkflow:
         and both callers of `_lose_claim` sit on the CLAIMED path, which is
         precisely where the owner named back is us. Without this check the log
         read "lost mctlhq/mctl-web#99 to devloop-workflow/dev-loop-…-99" — this
-        loop's own workflow_id — and `_claim_refused` then ended every
+        loop's own workflow_id — and the refusal then ended every
         ownership call for the remaining watch INCLUDING the heartbeat, which
         is the write whose absence made the row unhealthy in the first place.
         One unhealthy read of our own row permanently stopped the write that
@@ -1245,15 +1287,81 @@ class DevLoopWorkflow:
 
         Our own row read back unhealthy is handled where it belongs: the
         heartbeat block counts it, logs it, and gives up the claim WITHOUT
-        setting the permanent flag, so the loop re-acquires under its own gate.
+        recording a refusal, so the loop re-acquires under its own gate.
         """
         # A non-empty id is half the question. A 409 whose body is not a
         # record answers OWNED_BY_OTHER with `owner_id=""` (answer_from's
         # `record_of(payload) is None` branch), and "" != our workflow_id — so
-        # that reached _lose_claim, logged `lost … to /`, and set the permanent
-        # flag naming nobody, on a refusal that may well have been caused by
+        # that reached _lose_claim, logged `lost … to /`, and recorded a
+        # refusal naming nobody, on a refusal that may well have been caused by
         # this loop's own stale belief.
         return bool(result.owner_id) and result.owner_id != workflow.info().workflow_id
+
+    def _refuse_claim(self, result: OwnershipResult) -> None:
+        """Record that a named owner refused this loop's claim, with an expiry.
+
+        The expiry is the whole point. A refusal used to be permanent, and the
+        flag was reachable from the PROGRESS branch — so a single
+        OWNED_BY_OTHER on one /progress write ended every later ownership call
+        for the rest of the watch, the liveness heartbeat included. The owner
+        that refused could then be force-released at the 10 h bound (ADR-010
+        §5) and the entity sit claimable for thirteen days with a live loop
+        beside it that had stopped asking.
+        """
+        same_owner = (
+            result.owner_type == self._refused_by_type
+            and result.owner_id == self._refused_by_id
+        )
+        self._refusals_observed = self._refusals_observed + 1 if same_owner else 1
+        self._refused_by_type = result.owner_type
+        self._refused_by_id = result.owner_id
+        self._claim_refused = True
+        self._claim_refused_until_poll = (
+            self._poll_index_for_heartbeat + LIFECYCLE_REFUSAL_BACKOFF_POLLS
+        )
+
+    def _forget_refusal(self) -> None:
+        """Clear the refusal and its streak.
+
+        Called when this loop positively holds the entity: the streak counts
+        one continuous hold by one competitor, and holding the entity ourselves
+        ends any such run by definition.
+        """
+        self._claim_refused = False
+        self._claim_refused_until_poll = 0
+        self._refused_by_type = ""
+        self._refused_by_id = ""
+        self._refusals_observed = 0
+
+    def _refusal_still_holds(self) -> bool:
+        """Should the acquire be skipped because somebody else owns this?
+
+        Returns False — i.e. ask again — once the backoff expires, which is how
+        a force-released row is ever reclaimed by a loop that was refused once.
+        """
+        if not self._claim_refused:
+            return False
+        if not workflow.patched("lifecycle-refusal-backoff"):
+            # Executions that started before this patch replay the refusal as
+            # permanent. Not a policy choice: re-testing schedules an activity
+            # their history does not contain.
+            return True
+        if self._refusals_observed >= LIFECYCLE_REFUSAL_GIVE_UP:
+            # The same owner has held it across every re-test. This is the case
+            # the permanent flag described correctly.
+            return True
+        if self._poll_index_for_heartbeat < self._claim_refused_until_poll:
+            return True
+        workflow.logger.info(
+            "lifecycle: re-testing the claim refused by %s/%s (refusal %d of %d) "
+            "— the owner may have been force-released since",
+            self._refused_by_type or "<unnamed>",
+            self._refused_by_id or "<unnamed>",
+            self._refusals_observed,
+            LIFECYCLE_REFUSAL_GIVE_UP,
+        )
+        self._claim_refused = False
+        return False
 
     def _lose_claim(self, repo: str, number: int, result: OwnershipResult) -> None:
         """Another actor holds this PR now. Stop claiming to own it.
@@ -1274,7 +1382,7 @@ class DevLoopWorkflow:
         self._owner_epoch = 0
         self._owned_head_sha = ""
         self._unknown_progress = 0
-        self._claim_refused = True
+        self._refuse_claim(result)
 
     async def _track_ownership(self, state: PRState) -> None:
         """Claim the PR, then keep the claim honest.
@@ -1311,11 +1419,15 @@ class DevLoopWorkflow:
                 # the PR meanwhile, which is the same outcome as before any of
                 # this existed.
                 return
-            if self._claim_refused:
+            if self._refusal_still_holds():
                 # Somebody else owns this PR and said so. Re-asking on every
                 # poll for the rest of a 14-day watch is ~670 activities to
                 # re-learn one fact; the reconciler is what resolves a
                 # conflict, not this loop.
+                #
+                # Believed for LIFECYCLE_REFUSAL_BACKOFF_POLLS, not forever:
+                # the owner named in the refusal can be force-released inside
+                # this watch, and a loop that never asks again cannot notice.
                 return
             result = await self._ownership(
                 "acquire", repo=repo, number=number, head_sha=head
@@ -1325,6 +1437,21 @@ class DevLoopWorkflow:
                 self._owner_epoch = result.epoch
                 self._owned_head_sha = head
                 self._unknown_acquires = 0
+                # The refusal EPISODE is over, so its streak ends with it.
+                #
+                # LIFECYCLE_REFUSAL_GIVE_UP counts CONSECUTIVE re-tests that
+                # keep naming the same owner — one competitor holding the
+                # entity across the whole window. A successful acquire in
+                # between is proof of the opposite: this loop got the entity,
+                # so whatever the earlier refusals were, they were not one
+                # unbroken hold.
+                #
+                # Without this reset the counter survives the recovery, and a
+                # fixed-identity actor (a steward, a sweeper) refusing this
+                # loop once per episode across three SEPARATE episodes — each
+                # interrupted by a genuine re-acquire — trips the permanent
+                # give-up that is meant to describe a single continuous one.
+                self._forget_refusal()
             elif (
                 result is not None
                 and result.verdict == OWNED_BY_OTHER
@@ -1337,7 +1464,7 @@ class DevLoopWorkflow:
                     "lifecycle: %s#%s is owned by %s/%s — this loop holds no claim",
                     repo, number, result.owner_type, result.owner_id,
                 )
-                self._claim_refused = True
+                self._refuse_claim(result)
             elif result is not None and result.accepted and result.verdict == UNKNOWN:
                 # The server took the write and told us nothing more. It is not
                 # a claim — no epoch came back, and a claim without an epoch is
@@ -1674,7 +1801,7 @@ class DevLoopWorkflow:
                 # Drop the claim rather than counting toward the give-up: the
                 # unclaimed path re-acquires on the next poll, which is the
                 # recovery the progress branch's UNOWNED note already names.
-                # NOT _claim_refused — nobody said they own this.
+                # NOT a refusal — nobody said they own this.
                 workflow.logger.info(
                     "lifecycle: %s#%s is owned by nobody — this loop drops its "
                     "stale claim and re-acquires",
@@ -1850,9 +1977,9 @@ class DevLoopWorkflow:
         # dropped here, and carrying it forward would start the NEXT claim
         # already throttled on a write path never tried under it.
         self._unknown_progress = 0
-        # NOT _claim_refused: nobody said they own this. That flag is permanent
-        # and means "somebody else answered", which is the opposite of what
-        # just happened.
+        # NOT a refusal: nobody said they own this. A refusal means "somebody
+        # else answered", which is the opposite of what just happened — and it
+        # carries an owner identity this path has none of.
 
     def _backed_off(self, unanswered: int) -> bool:
         """Whether an ownership write should be skipped on this poll.
