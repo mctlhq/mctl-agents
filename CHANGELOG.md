@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.44.0](https://github.com/mctlhq/mctl-agents/compare/1.43.0...1.44.0) (2026-09-13)
+
+
+### Features
+
+* **config:** register .github as a non-rotating DevLoop service ([aa4d336](https://github.com/mctlhq/mctl-agents/commit/aa4d3368b4cf494391dbc4adde0db1ad6bb05a58))
+* **config:** register .github as a non-rotating DevLoop service ([5f1210b](https://github.com/mctlhq/mctl-agents/commit/5f1210b40dad093111e45534608b6a3f7693d172))
+
+
+### Bug Fixes
+
+* **shepherd:** never auto-merge .github — a merge there is org-wide CI ([a3efb08](https://github.com/mctlhq/mctl-agents/commit/a3efb084055ad60e216d77289edb20bcc08afd8c))
+
 ## [1.43.0](https://github.com/mctlhq/mctl-agents/compare/1.42.0...1.43.0) (2026-09-13)
 
 
