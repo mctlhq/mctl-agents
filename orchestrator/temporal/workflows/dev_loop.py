@@ -1409,14 +1409,40 @@ class DevLoopWorkflow:
             # that pair legible.
             self._owner_epoch = 0
             return
+        # NOT the stable metric prefix. This call may not be the last one: the
+        # in-loop terminal can fail here and the cleanup in _watch_pr's finally
+        # then retries the same write. Counting an abandonment per failed
+        # ATTEMPT would report one for an entity the retry goes on to release
+        # — a false positive in the soak — and two for one that is genuinely
+        # abandoned. The metric is emitted once, at the end of the watch, by
+        # _report_claim_abandonment.
+        workflow.logger.warning(
+            "lifecycle: %s for %s#%s did not land; the claim is kept for now",
+            op,
+            repo,
+            number,
+        )
+
+    def _report_claim_abandonment(self) -> None:
+        """Emit the abandonment metric ONCE, after the last relinquishing write.
+
+        Separate from _finish_claim because that runs per attempt and this
+        counts entities. `lifecycle_claim_abandoned_total` is built from this
+        prefix, and a counter that advances per retry answers a different
+        question from the one an operator is asking.
+
+        Called at the very end of the watch, where `_claim_abandoned` has its
+        terminal value — the same point the query reads.
+        """
+        if not self._claim_abandoned:
+            return
         # Stable prefix so this is countable in production, not only assertable
         # in a test: the worker's namespace is already inside the Promtail
         # metrics-stage selector, so one regex turns it into a counter.
         workflow.logger.warning(
-            "LIFECYCLE-CLAIM-ABANDONED entity=%s#%s op=%s reason=%s",
-            repo,
-            number,
-            op,
+            "LIFECYCLE-CLAIM-ABANDONED entity=%s op=%s reason=%s",
+            self._owned_entity_id or "<unknown>",
+            self._last_lifecycle_op or "<none>",
             "the relinquishing write did not land; the reconciler reaps the "
             "row at the liveness bound",
         )
@@ -2349,4 +2375,9 @@ class DevLoopWorkflow:
                 self._finish_claim(
                     "terminal" if terminal_state else "release", done, repo, number
                 )
+            # After the LAST relinquishing write of this watch, whichever path
+            # made it. One metric line per abandoned entity, not per failed
+            # attempt — see _report_claim_abandonment.
+            if track_ownership:
+                self._report_claim_abandonment()
         return last

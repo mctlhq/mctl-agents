@@ -1122,6 +1122,27 @@ class TestDevLoopWorkflow:
         assert result.pr.merged is True
         assert result.pr.merge_commit == "cafe1234"
 
+    async def _run_ownership_loop_with_logs(
+        self, env, *, pr_states, issue: int, caplog, **kwargs
+    ):
+        """Like _run_ownership_loop_with_claim, but also returns the workflow
+        log lines.
+
+        The abandonment METRIC is a log line — `lifecycle_claim_abandoned_total`
+        is built from its prefix by a Promtail metrics stage — so asserting on
+        the query alone leaves the production counter untested. That is exactly
+        how a counter came to advance per failed attempt rather than per
+        abandoned entity.
+        """
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="temporalio.workflow"):
+            claim, ops = await self._run_ownership_loop_with_claim(
+                env, pr_states=pr_states, issue=issue, **kwargs
+            )
+        lines = [r.getMessage() for r in caplog.records]
+        return claim, ops, lines
+
     async def _run_ownership_loop_with_claim(
         self, env, *, pr_states, issue: int, **kwargs
     ):
@@ -1641,6 +1662,68 @@ class TestDevLoopWorkflow:
         assert claim.abandoned is False, (
             f"a landed retry still reports the claim abandoned: {claim}"
         )
+
+    async def test_a_retry_that_lands_emits_no_abandonment_metric(self, env, caplog):
+        """The counter counts ABANDONED ENTITIES, not failed attempts.
+
+        The in-loop terminal fires on a MERGED poll and can fail; the cleanup
+        in the finally retries the same write and may land. Emitting the
+        stable-prefixed line per failed call would record an abandonment for an
+        entity that was then released — a false positive in the soak, on the
+        one signal the rollout's alerting is built from — and two lines for an
+        entity genuinely abandoned.
+
+        The query already reports this correctly; nothing asserted on the log,
+        which is why the metric could disagree with it.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        claim, ops, lines = await self._run_ownership_loop_with_logs(
+            env,
+            pr_states=[open_pr, open_pr, MERGED_PR],
+            issue=925,
+            caplog=caplog,
+            ownership_terminal_fails_once=True,
+        )
+        assert [o.op for o in ops].count("terminal") >= 2, [o.op for o in ops]
+        assert claim.abandoned is False
+        emitted = [ln for ln in lines if "LIFECYCLE-CLAIM-ABANDONED" in ln]
+        assert emitted == [], (
+            f"the metric fired for a claim the retry released: {emitted}"
+        )
+
+    async def test_a_genuinely_abandoned_claim_is_counted_exactly_once(
+        self, env, caplog
+    ):
+        """And the other direction: it must still fire, once, when the claim
+        really is abandoned.
+
+        Both writes fail — the in-loop terminal and the cleanup's retry — so
+        the store still shows the row active with nobody claiming it. One line,
+        not two: an entity counted twice is as wrong as one counted zero times,
+        and the retry is what makes two the easy mistake.
+        """
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha="a" * 40,
+        )
+        claim, _ops, lines = await self._run_ownership_loop_with_logs(
+            env,
+            pr_states=[open_pr, open_pr, MERGED_PR],
+            issue=926,
+            caplog=caplog,
+            ownership_terminal_fails=True,
+        )
+        assert claim.abandoned is True
+        emitted = [ln for ln in lines if "LIFECYCLE-CLAIM-ABANDONED" in ln]
+        assert len(emitted) == 1, (
+            f"expected exactly one abandonment line, got {len(emitted)}: {emitted}"
+        )
+        # The entity has to be in it, or the counter says something was
+        # abandoned without saying what.
+        assert f"{MERGED_PR.repo}#{MERGED_PR.number}" in emitted[0], emitted[0]
 
     async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(
         self, env
