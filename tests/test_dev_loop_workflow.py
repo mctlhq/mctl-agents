@@ -32,6 +32,7 @@ from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
+    LIFECYCLE_REFUSAL_BACKOFF_POLLS,
     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
@@ -99,6 +100,7 @@ def _fake_activities(
     ownership_lost_after: int | None = None,
     ownership_self_unhealthy_after: int | None = None,
     ownership_progress_fails: bool = False,
+    ownership_refuses_progress_once: bool = False,
     ownership_progress_unowned: bool = False,
     ownership_unowned_op: str | None = None,
     ownership_unknown_state: str | None = None,
@@ -139,6 +141,7 @@ def _fake_activities(
 
     calls: list[str] = []
     ownership_ops: list[OwnershipRequest] = []
+    _refused_once: list[bool] = []
     investigate_ran = anyio.Event()
 
     @activity.defn(name="submit_and_wait")
@@ -279,6 +282,25 @@ def _fake_activities(
                 # that set neither would exercise the arm without exercising
                 # the distinction it now logs.
                 stuck=True,
+                accepted=True,
+            )
+        if ownership_refuses_progress_once and req.op == "progress" and not _refused_once:
+            # ONE competitor refusal, on the progress write, and then the store
+            # behaves normally again — the shape ADR-010 §5 makes ordinary: the
+            # named owner is force-released at its liveness bound and the row
+            # becomes claimable while this watch is still running.
+            #
+            # Every existing refusal fixture refuses forever (`ownership_owner`,
+            # `ownership_lost_after`), so no test could tell "stopped asking
+            # because somebody owns it" from "stopped asking, full stop".
+            _refused_once.append(True)
+            return OwnershipResult(
+                verdict="owned-by-other",
+                owner_type="pr-steward",
+                owner_id="steward",
+                epoch=77,
+                state="active",
+                healthy=True,
                 accepted=True,
             )
         if ownership_terminal_fails and req.op == "terminal":
@@ -1200,7 +1222,7 @@ class TestDevLoopWorkflow:
         assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
 
     async def test_a_refused_claim_is_asked_about_once_not_every_poll(self, env):
-        """`_claim_refused` is permanent, and nothing pinned that it exists.
+        """A refusal throttles the acquire, and nothing pinned that it exists.
 
         The sibling test above asserts only `all(op == "acquire")`, which is as
         true of one acquire as of six hundred — so deleting the early return
@@ -1208,6 +1230,11 @@ class TestDevLoopWorkflow:
         an ANSWER, not a failure to answer: re-asking for the remaining
         fortnight is ~670 activities to re-learn one fact, and the reconciler
         is what resolves a conflict, not this loop.
+
+        Twelve polls is inside LIFECYCLE_REFUSAL_BACKOFF_POLLS, so this pins
+        the throttle only. That the throttle EXPIRES is the sibling test below,
+        and the two are separate because a backoff that never expires passes
+        this one perfectly.
         """
         open_pr = PRState(
             found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
@@ -1222,6 +1249,122 @@ class TestDevLoopWorkflow:
         acquires = [o for o in ops if o.op == "acquire"]
         assert len(acquires) == 1, (
             f"a refused claim was re-asked {len(acquires)} times over 12 polls"
+        )
+
+    async def test_a_refusal_on_progress_does_not_silence_the_heartbeat(self, env):
+        """The load-bearing one. A single OWNED_BY_OTHER on a /progress write
+        used to end EVERY later ownership call for the rest of the watch.
+
+        `_lose_claim` is reachable from the progress branch, and it set a
+        PERMANENT refusal. So a claimed loop that lost one progress write
+        stopped acquiring, stopped progressing, and — the part that matters —
+        stopped sending the liveness heartbeat, for up to fourteen days. The
+        row it had been refreshing then went stale, and the reconciler read a
+        live, polling workflow as a dead owner.
+
+        The refusal is legitimate when it happens. It is not legitimate
+        forever: ADR-010 §5 force-releases the named owner at its liveness
+        bound, after which the entity is claimable again — and the loop beside
+        it has to be able to find that out.
+        """
+        head_a = "a" * 40
+        head_b = "b" * 40
+        open_a = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha=head_a,
+        )
+        # The head moves once, which is what makes the loop attempt a
+        # /progress write at all; everything after stays on the new head.
+        open_b = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha=head_b,
+        )
+        polls = LIFECYCLE_REFUSAL_BACKOFF_POLLS + 8
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_a] + [open_b] * polls + [MERGED_PR],
+            issue=917,
+            ownership_refuses_progress_once=True,
+        )
+
+        refused_at = next(
+            (i for i, o in enumerate(ops) if o.op == "progress"), None
+        )
+        assert refused_at is not None, [o.op for o in ops]
+        after = ops[refused_at + 1:]
+        assert after, (
+            "one refused /progress ended every ownership call for the rest of "
+            "the watch — including the liveness heartbeat"
+        )
+        # Specifically the heartbeat: the acquire is the liveness write once
+        # the head stops moving, so its absence is what makes a live owner
+        # read as dead.
+        assert any(o.op == "acquire" for o in after), (
+            f"the loop never acquired again after one refusal: {[o.op for o in after]}"
+        )
+
+    async def test_a_refusal_expires_and_the_entity_can_be_reclaimed(self, env):
+        """The other half: the re-test must actually re-claim.
+
+        A backoff that expires into an acquire this loop then discards would
+        satisfy the test above and still leave the entity unowned. Here the
+        store answers the re-test normally, so a loop that asks again ends the
+        watch holding the claim — and records a terminal state on the merge,
+        which only an owner does.
+        """
+        head_a = "a" * 40
+        head_b = "b" * 40
+        open_a = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha=head_a,
+        )
+        open_b = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha=head_b,
+        )
+        polls = LIFECYCLE_REFUSAL_BACKOFF_POLLS + 8
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_a] + [open_b] * polls + [MERGED_PR],
+            issue=918,
+            ownership_refuses_progress_once=True,
+        )
+        assert ops[-1].op == "terminal", (
+            f"the loop did not own the PR when it merged: {[o.op for o in ops]}"
+        )
+
+    async def test_a_refusal_is_throttled_for_the_whole_backoff(self, env):
+        """The expiry must not turn the throttle back into per-poll asking.
+
+        The refusal above expires once; what must NOT happen is the loop
+        re-testing on every poll after that. LIFECYCLE_REFUSAL_BACKOFF_POLLS is
+        the liveness bound precisely so a re-test costs one activity per bound,
+        not one per thirty minutes.
+        """
+        head_a = "a" * 40
+        head_b = "b" * 40
+        open_a = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha=head_a,
+        )
+        open_b = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN", head_sha=head_b,
+        )
+        polls = LIFECYCLE_REFUSAL_BACKOFF_POLLS + 8
+        _result, ops = await self._run_ownership_loop(
+            env,
+            pr_states=[open_a] + [open_b] * polls + [MERGED_PR],
+            issue=919,
+            # Refuses EVERY acquire, so the refusal is re-recorded on each
+            # re-test and the backoff restarts — the competitor-is-working case.
+            ownership_owner=("pr-steward", "steward"),
+            ownership_refuses_progress_once=True,
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        # One claim attempt per backoff window at most, not one per poll.
+        assert len(acquires) <= polls // LIFECYCLE_REFUSAL_BACKOFF_POLLS + 2, (
+            f"the refusal stopped throttling: {len(acquires)} acquires over {polls} polls"
         )
 
     async def test_an_unanswering_store_is_retried_on_the_heartbeat_not_every_poll(
