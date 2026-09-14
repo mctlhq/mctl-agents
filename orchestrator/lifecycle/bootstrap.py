@@ -1243,29 +1243,6 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
         return 1
 
-    # ONE readability answer, BEFORE the `--apply` refusal, and its result is
-    # what the `--service` branch filters against.
-    #
-    # It was hoisted here, then moved back inside that branch as redundant --
-    # correctly, on its stated reason: the traceback it was written against is
-    # caught by the walk's guard now. Moving it re-created the asymmetry two
-    # rounds earlier had closed. With the refusal in front of the walk, an
-    # unreadable mount answered differently on either side of one flag:
-    # `--apply --service X` reported the mount, `--apply` fleet-wide hit the
-    # refusal first and was told the build does not write and to re-run without
-    # the flag, with nothing about the mount at all.
-    #
-    # So it is here for ORDERING, not for the retired traceback, and it is not
-    # a second walk: the `--service` branch reads this listing rather than
-    # taking its own.
-    from orchestrator.run_shepherd import discover_services
-
-    try:
-        present = discover_services(args.state_dir)
-    except OSError as exc:
-        _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
-        return 1
-
     if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
@@ -1314,6 +1291,21 @@ def main(argv: list[str] | None = None) -> int:
         # the report as an output parameter cannot tell from the deliberate
         # `--apply` refusal below -- whose entire design note is that exit 2
         # with no report is the one outcome a log cannot interpret.
+        # Read HERE, where the `; found: ...` listing it supplies is used.
+        # This is an ARGUMENT check -- it answers "did you name something
+        # this checkout has" -- so it belongs with the argument, and its own
+        # OSError arm covers a state dir that cannot be listed at the root.
+        # Every deeper read is the walk's, and the walk's guard is what
+        # answers for it.
+        from orchestrator.run_shepherd import discover_services
+
+        try:
+            present = discover_services(args.state_dir)
+        except OSError as exc:
+            _print_report(
+                Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}")
+            )
+            return 1
         named_is_dir = (args.state_dir / args.service).is_dir()
         if args.service not in present and not named_is_dir:
             _print_report(
@@ -1325,115 +1317,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
-
-    # Read ONCE. `rollout.mode()` maps an unrecognised value to OFF and warns
-    # as a side effect, so evaluating it four times in the refusal both printed
-    # the warning four times -- onto the report's own stdout channel -- and
-    # produced a message naming `'off'` for an operator who had actually typed
-    # `obserev`. The one exit whose entire job is to be diagnostic must not
-    # rename the mistake it is diagnosing.
-    configured = rollout.mode()
-    # From `rollout`, not `os.environ`: the switch table in that module says
-    # LIFECYCLE_ROLLOUT_MODE is "read in this module and nowhere else", and a
-    # second read site here would also normalise differently -- `mode()` strips
-    # and lowercases, so ` Observe ` reads as valid there and as a typo in a
-    # message that re-read the variable itself. That difference is the exact
-    # thing naming the raw value exists to surface.
-    raw_mode = rollout.raw_mode()
-    if args.apply and args.assume_tracked_ownership and not args.service:
-        # UNDER --apply only. The override licenses nothing on a dry run --
-        # nothing is written for it to license -- so refusing one that carries
-        # it costs the operator the very report they need and gives back no
-        # safety. An earlier version was deliberately independent of --apply as
-        # "the conservative direction"; conservative about a posture that
-        # writes nothing is just a report withheld, and this module's stronger
-        # invariant is that a dry run always produces one.
-        #
-        # The override requires `--service`, and this is the only place scope
-        # carries weight. It is not a gate of its own: narrowing a run does not
-        # make an unheartbeated row safe, it just makes fewer of them, and an
-        # earlier version of this refusal let a scope alone license the write --
-        # a bypass of `may_apply`'s capability clause wearing the shape of a
-        # gate.
-        #
-        # What it is for HERE is that the override's claim is "I checked these
-        # entities in Temporal by hand", and that claim is only checkable, and
-        # only honest, about a set the operator can enumerate.
-        #
-        # `--service`, NOT "--service or --slug". `_discover_refs` applies
-        # `slug_filter` INSIDE the per-service walk, so `--slug issue-7-x`
-        # alone matches that slug in every service -- which
-        # `test_slug_narrows_across_services` pins as deliberate behaviour.
-        # Accepting it as the named set made two tests in one file assert
-        # opposite things about the same flag. `--slug` still narrows further;
-        # it just does not bound the set on its own.
-        _print_report(
-            Report(
-                aborted=(
-                    "refused --assume-tracked-ownership without --service: the "
-                    "override asserts these entities were checked in Temporal by hand, "
-                    "which is a claim about a named set. --slug alone is not one: "
-                    "_discover_refs applies it inside the per-service walk, so it "
-                    "matches that slug in every service. Add --service (--slug may "
-                    "narrow further)."
-                ),
-                rollout_mode=configured,
-                applied=args.apply,
-                ownership_override=args.assume_tracked_ownership,
-            )
-        )
-        return 2
-
-    if args.apply and configured != rollout.OBSERVE:
-        # The one switch every other writer in this package honours. At `off`
-        # the DevLoopWorkflow's own ownership activity short-circuits, so a row
-        # this tool writes for a devloop-workflow owner is never heartbeated,
-        # progressed or released by the workflow it names: it sits `active`
-        # until its liveness bound expires, held by an owner that does not know
-        # it holds anything.
-        #
-        # So the order is: flip the WORKER to observe (the writer goes live),
-        # then bootstrap, then flip the SHEPHERD (the comparison starts against
-        # a populated store). Writing first and flipping after fills the store
-        # with rows nobody refreshes.
-        #
-        # EXACTLY observe, not records_writes(), which is at_least(OBSERVE) and
-        # so also true at enforce and only. That is a SECOND hazard: at enforce
-        # the shepherd is already CONSUMING the store, so a bulk import races a
-        # live reader and bypasses the staged order above. A pre-soak migration
-        # has no business running after the soak.
-        #
-        # THE LIMIT OF THIS GATE, stated because it is not obvious: the mode is
-        # read from THIS process's environment, and the orphan hazard belongs
-        # to the TEMPORAL WORKER, which this process cannot see. It is an
-        # operator ATTESTATION, not a verification -- the WorkflowTemplate
-        # makes it an explicit parameter for that reason, and the mode is
-        # echoed into the report so the claim sits beside what it licensed.
-        #
-        # A report on this path too. The marker exists so a consumer can always
-        # find the report by grepping for it, and an Argo step reading it as an
-        # output parameter gets nothing if this is the one exit that prints
-        # none — a different failure from "the report says it refused". The
-        # mode IS the answer here, which is what rollout_mode is for.
-        _print_report(
-            Report(
-                aborted=(
-                    f"refused --apply: {rollout.ENV_VAR} is "
-                    f"{'unset' if raw_mode is None else repr(raw_mode)} and reads as "
-                    f"{configured!r}, expected {rollout.OBSERVE!r}. Below it the owners "
-                    "these rows name are not heartbeating; above it the shepherd is "
-                    "already reading the store and a bulk import races it."
-                ),
-                rollout_mode=configured,
-                applied=args.apply,
-                # On this path too. The field's whole rationale is that a claim
-                # licensing durable writes sits next to what it licensed, and
-                # an operator who passed one and was refused for a different
-                # reason still made the claim.
-                ownership_override=args.assume_tracked_ownership,
-            )
-        )
-        return 2
 
     from orchestrator import run_shepherd
     from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
@@ -1516,6 +1399,135 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 1
+    # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
+    #
+    # "There is no readable checkout" outranks "this build does not write":
+    # the second is about what this run may do, the first about whether there
+    # is anything to do it to, and an operator sent away with the policy
+    # answer learns about the broken volume only on a second run.
+    #
+    # It was in front, with a cheap readability probe hoisted above it to keep
+    # the ordering true. That held for a mount broken AT THE ROOT and not one
+    # directory down: `discover_services` admits a service on a `stat` of its
+    # `proposals/`, so a `proposals/` at 0o111 passed the probe, hit the
+    # refusal, and answered `--apply` and a fleet-wide run differently for one
+    # permission bit. A guard that covers a depth is not a guard that covers
+    # the class.
+    #
+    # Discovery is where the whole class is answered, so the refusals moved
+    # behind it rather than the guard moving forward again. Discovery writes
+    # nothing -- `dry_run=True` unconditionally -- so nothing is risked by
+    # doing it first; what it costs is that a wrong mode is reported after the
+    # walk instead of before it.
+
+    # Read ONCE. `rollout.mode()` maps an unrecognised value to OFF and warns
+    # as a side effect, so evaluating it four times in the refusal both printed
+    # the warning four times -- onto the report's own stdout channel -- and
+    # produced a message naming `'off'` for an operator who had actually typed
+    # `obserev`. The one exit whose entire job is to be diagnostic must not
+    # rename the mistake it is diagnosing.
+    configured = rollout.mode()
+    # From `rollout`, not `os.environ`: the switch table in that module says
+    # LIFECYCLE_ROLLOUT_MODE is "read in this module and nowhere else", and a
+    # second read site here would also normalise differently -- `mode()` strips
+    # and lowercases, so ` Observe ` reads as valid there and as a typo in a
+    # message that re-read the variable itself. That difference is the exact
+    # thing naming the raw value exists to surface.
+    raw_mode = rollout.raw_mode()
+    if args.apply and args.assume_tracked_ownership and not args.service:
+        # UNDER --apply only. The override licenses nothing on a dry run --
+        # nothing is written for it to license -- so refusing one that carries
+        # it costs the operator the very report they need and gives back no
+        # safety. An earlier version was deliberately independent of --apply as
+        # "the conservative direction"; conservative about a posture that
+        # writes nothing is just a report withheld, and this module's stronger
+        # invariant is that a dry run always produces one.
+        #
+        # The override requires `--service`, and this is the only place scope
+        # carries weight. It is not a gate of its own: narrowing a run does not
+        # make an unheartbeated row safe, it just makes fewer of them, and an
+        # earlier version of this refusal let a scope alone license the write --
+        # a bypass of `may_apply`'s capability clause wearing the shape of a
+        # gate.
+        #
+        # What it is for HERE is that the override's claim is "I checked these
+        # entities in Temporal by hand", and that claim is only checkable, and
+        # only honest, about a set the operator can enumerate.
+        #
+        # `--service`, NOT "--service or --slug". `_discover_refs` applies
+        # `slug_filter` INSIDE the per-service walk, so `--slug issue-7-x`
+        # alone matches that slug in every service -- which
+        # `test_slug_narrows_across_services` pins as deliberate behaviour.
+        # Accepting it as the named set made two tests in one file assert
+        # opposite things about the same flag. `--slug` still narrows further;
+        # it just does not bound the set on its own.
+        _print_report(
+            Report(
+                aborted=(
+                    "refused --assume-tracked-ownership without --service: the "
+                    "override asserts these entities were checked in Temporal by hand, "
+                    "which is a claim about a named set. --slug alone is not one: "
+                    "_discover_refs applies it inside the per-service walk, so it "
+                    "matches that slug in every service. Add --service (--slug may "
+                    "narrow further)."
+                ),
+                rollout_mode=configured,
+                applied=args.apply,
+                ownership_override=args.assume_tracked_ownership,
+            )
+        )
+        return 2
+    if args.apply and configured != rollout.OBSERVE:
+        # The one switch every other writer in this package honours. At `off`
+        # the DevLoopWorkflow's own ownership activity short-circuits, so a row
+        # this tool writes for a devloop-workflow owner is never heartbeated,
+        # progressed or released by the workflow it names: it sits `active`
+        # until its liveness bound expires, held by an owner that does not know
+        # it holds anything.
+        #
+        # So the order is: flip the WORKER to observe (the writer goes live),
+        # then bootstrap, then flip the SHEPHERD (the comparison starts against
+        # a populated store). Writing first and flipping after fills the store
+        # with rows nobody refreshes.
+        #
+        # EXACTLY observe, not records_writes(), which is at_least(OBSERVE) and
+        # so also true at enforce and only. That is a SECOND hazard: at enforce
+        # the shepherd is already CONSUMING the store, so a bulk import races a
+        # live reader and bypasses the staged order above. A pre-soak migration
+        # has no business running after the soak.
+        #
+        # THE LIMIT OF THIS GATE, stated because it is not obvious: the mode is
+        # read from THIS process's environment, and the orphan hazard belongs
+        # to the TEMPORAL WORKER, which this process cannot see. It is an
+        # operator ATTESTATION, not a verification -- the WorkflowTemplate
+        # makes it an explicit parameter for that reason, and the mode is
+        # echoed into the report so the claim sits beside what it licensed.
+        #
+        # A report on this path too. The marker exists so a consumer can always
+        # find the report by grepping for it, and an Argo step reading it as an
+        # output parameter gets nothing if this is the one exit that prints
+        # none — a different failure from "the report says it refused". The
+        # mode IS the answer here, which is what rollout_mode is for.
+        _print_report(
+            Report(
+                aborted=(
+                    f"refused --apply: {rollout.ENV_VAR} is "
+                    f"{'unset' if raw_mode is None else repr(raw_mode)} and reads as "
+                    f"{configured!r}, expected {rollout.OBSERVE!r}. Below it the owners "
+                    "these rows name are not heartbeating; above it the shepherd is "
+                    "already reading the store and a bulk import races it."
+                ),
+                rollout_mode=configured,
+                applied=args.apply,
+                # On this path too. The field's whole rationale is that a claim
+                # licensing durable writes sits next to what it licensed, and
+                # an operator who passed one and was refused for a different
+                # reason still made the claim.
+                ownership_override=args.assume_tracked_ownership,
+            )
+        )
+        return 2
+
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
     report.rollout_mode = configured
