@@ -173,6 +173,26 @@ def _owns(answer: str) -> bool:
     return answer == LEGACY_OWNED
 
 
+def devloop_workflow_id(service: str, slug: str) -> str:
+    """The DevLoopWorkflow id for a proposal, or "" if it never had one.
+
+    Derived exactly the way start.py derives it. THE definition, not a copy:
+    the ownership bootstrap writes this value durably into a row's
+    temporal_workflow_id, and its guarantee — "the id recorded is the one the
+    probe just confirmed alive" — holds only while the two agree. A second
+    transcription of the regex is a second thing to keep in step.
+
+    `mctlhq` is hardcoded because a ProposalRef carries no repo owner — unlike
+    orphans.py, which derives one from `pr.repo`. Every proposal the shepherd
+    sweeps lives under this org today; a wrong owner would only produce a 404,
+    i.e. the fail-open "not owned" path.
+    """
+    m = re.match(r"issue-(\d+)-", slug)
+    if not m:
+        return ""
+    return f"dev-loop-mctlhq-{service}-{m.group(1)}"
+
+
 def _dev_loop_owns(service: str, slug: str) -> bool:
     """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
 
@@ -199,8 +219,8 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     Nothing about the bool's behaviour changes here. Every path that returned
     False still maps to a non-OWNED answer.
     """
-    m = re.match(r"issue-(\d+)-", slug)
-    if not m:
+    workflow_id = devloop_workflow_id(service, slug)
+    if not workflow_id:
         # Structural, not a failure: a slug with no issue-<N>- prefix
         # (incident-*, anything pre-Temporal) never had a DevLoop, so the old
         # mechanism genuinely answers "nobody drives this".
@@ -209,11 +229,6 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     if not token:
         # Never asked.
         return LEGACY_UNKNOWN
-    # `mctlhq` is hardcoded because a ProposalRef carries no repo owner —
-    # unlike orphans.py, which derives one from `pr.repo`. Every proposal the
-    # shepherd sweeps lives under this org today; a wrong owner would only
-    # produce a 404, i.e. the fail-open "not owned" path.
-    workflow_id = f"dev-loop-mctlhq-{service}-{m.group(1)}"
     url = f"{MCTL_API_URL}/api/v1/agents/dev-loop/{workflow_id}"
     if not url.startswith("https://"):
         # MCTL_API_URL is operator-provided env; refuse non-https schemes

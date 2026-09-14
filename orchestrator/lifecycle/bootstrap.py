@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from orchestrator.lifecycle import policy
+from orchestrator.lifecycle import policy, rollout
 from orchestrator.lifecycle.client import OwnershipClient
 from orchestrator.lifecycle.contract import (
     KIND_PULL_REQUEST,
@@ -37,7 +37,6 @@ from orchestrator.lifecycle.contract import (
     OWNER_SHEPHERD,
     PHASE_REVIEW_REMEDIATION,
     UNKNOWN,
-    UNOWNED,
     EntityRef,
     Owner,
     OwnershipAnswer,
@@ -85,6 +84,14 @@ class Plan:
             "owner_type": self.owner_type,
             "owner_id": self.owner_id,
             "reason": self.reason,
+            # The three provenance fields apply_report actually writes. The
+            # dry run is the deliverable and an operator reads it "against the
+            # store and live Temporal" — which needs policy_ref, the provenance
+            # policy.py exists to record, and temporal_workflow_id, the field
+            # that makes the Temporal half of that check possible at all.
+            "proposal_ref": self.proposal_ref,
+            "policy_ref": self.policy_ref,
+            "temporal_workflow_id": self.temporal_workflow_id,
         }
 
 
@@ -113,6 +120,21 @@ class Report:
         counts = dict.fromkeys(DECISIONS, 0)
         for plan in [*self.planned, *self.ambiguous]:
             counts[plan.decision] = counts.get(plan.decision, 0) + 1
+        if self.aborted:
+            # No counts at all on the abort path. build_report returns before
+            # the plan loop, so `ambiguous` holds only the pre-read entries and
+            # `total` would be a PARTIAL scan of a run that decided nothing —
+            # and `total` is the one number the soak's sample target is
+            # re-derived from. An operator scraping it out of an Argo log has
+            # no reason to check `aborted` first, so it must not be there.
+            return {
+                "aborted": self.aborted,
+                "counts": None,
+                "planned": [],
+                "ambiguous": [p.as_dict() for p in self.ambiguous],
+                "written": [],
+                "failed": [],
+            }
         return {
             "aborted": self.aborted,
             # `total` is the measured decision rate the soak's sample target is
@@ -199,7 +221,13 @@ def plan_for(
         return base
 
     if legacy_answer == LEGACY_OWNED:
-        workflow_id = _devloop_workflow_id(ref)
+        # run_shepherd.devloop_workflow_id, NOT a second transcription of the
+        # rule: this value is written durably into temporal_workflow_id, and
+        # "the id recorded is the one the probe just confirmed alive" holds
+        # only while the two agree.
+        from orchestrator.run_shepherd import devloop_workflow_id
+
+        workflow_id = devloop_workflow_id(ref.service, ref.slug)
         if not workflow_id:
             # Unreachable from the probe — a slug with no issue-<N>- prefix
             # answers LEGACY_FREE — but an empty owner id must never become a
@@ -241,23 +269,6 @@ def plan_for(
     return base
 
 
-def _devloop_workflow_id(ref) -> str:
-    """The workflow id a DevLoop would use for this proposal.
-
-    Derived the way start.py derives it, from the slug -- the same rule
-    run_shepherd's liveness probe applies, so the id recorded here is the one
-    the probe just confirmed alive.
-    """
-    import re
-
-    m = re.match(r"issue-(\d+)-", ref.slug)
-    if not m:
-        # Unreachable from the ladder: a slug without the prefix answers
-        # LEGACY_FREE from the probe and never reaches the DevLoop rung.
-        return ""
-    return f"dev-loop-mctlhq-{ref.service}-{m.group(1)}"
-
-
 def probe_all(refs, probe) -> dict[int, str]:
     """The DevLoop liveness answer for every ref, concurrently and bounded.
 
@@ -287,7 +298,17 @@ def probe_all(refs, probe) -> dict[int, str]:
         }
         try:
             for future in as_completed(futures, timeout=DEV_LOOP_LIVENESS_BUDGET_S):
-                answers[futures[future]] = future.result()
+                try:
+                    answers[futures[future]] = future.result()
+                except Exception as exc:  # noqa: BLE001 — see the docstring
+                    # `probe` is a PARAMETER, so its totality is the caller's
+                    # guarantee and not this function's. Letting a raise out
+                    # would take down build_report and main() with it, and the
+                    # operator would get a traceback instead of a report —
+                    # while the docstring above promises an unanswered ref
+                    # becomes LEGACY_UNKNOWN. Absent from the dict is exactly
+                    # that, through the caller's default.
+                    print(f"warn: dev-loop probe raised: {exc}")
         except FuturesTimeoutError:
             unanswered = sum(1 for f in futures if not f.done())
             print(
@@ -297,6 +318,18 @@ def probe_all(refs, probe) -> dict[int, str]:
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     return answers
+
+
+def _answers_in_order(answers: dict[int, str], count: int) -> list[str]:
+    """probe_all's index-keyed answers as a dense list.
+
+    Absent means the budget did not answer that ref, which is LEGACY_UNKNOWN —
+    read through this default rather than written anywhere, so the
+    budget-expired and never-started cases cannot drift apart.
+    """
+    from orchestrator.run_shepherd import LEGACY_UNKNOWN
+
+    return [answers.get(i, LEGACY_UNKNOWN) for i in range(count)]
 
 
 def build_report(refs, client: OwnershipClient, probe) -> Report:
@@ -361,16 +394,43 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
         )
         return report
 
-    # Probed AFTER the store read and all at once, so the read-then-decide gap
-    # is one budget rather than one timeout per proposal.
+    # Probed AFTER the store read, all at once, and ONLY for the entities whose
+    # decision depends on the answer.
+    #
+    # An entity the store already holds returns at rung 1 before the legacy
+    # answer is read, so probing it buys nothing — and the budget is shared
+    # wall-clock, not per-ref. On the idempotence path, where every entity is
+    # already-owned, the whole 60s would go to answers nobody reads; against a
+    # slow mctl-api those probes crowd out the undecided entities, which then
+    # fall to UNKNOWN and are reported ambiguous. Ambiguous means left UNOWNED,
+    # which is precisely the store-permits-old-forbids class this tool exists
+    # to remove.
     ordered = sorted(by_entity)
-    probe_refs = [by_entity[entity_id][0] for entity_id in ordered]
-    legacy = probe_all(probe_refs, probe)
+    undecided = [
+        entity_id
+        for entity_id in ordered
+        if answers[entity_id].verdict not in (OWNED_BY_OTHER, OWNED_BY_ME)
+    ]
+    legacy_by_entity = dict(
+        zip(
+            undecided,
+            _answers_in_order(
+                probe_all([by_entity[e][0] for e in undecided], probe), len(undecided)
+            ),
+            strict=True,
+        )
+    )
 
-    for i, entity_id in enumerate(ordered):
+    for entity_id in ordered:
         ref, repo = by_entity[entity_id]
-        answer = answers.get(entity_id) or OwnershipAnswer(verdict=UNOWNED)
-        plan = plan_for(ref, entity_id, answer, legacy.get(i, LEGACY_UNKNOWN), repo=repo)
+        # Indexed, not `.get(...) or UNOWNED`: an id missing from `answers`
+        # has already aborted the run above, so a default here would never
+        # fire while reading as a deliberate "treat a missing read as unowned"
+        # — the exact rule the abort exists to forbid.
+        answer = answers[entity_id]
+        plan = plan_for(
+            ref, entity_id, answer, legacy_by_entity.get(entity_id, LEGACY_UNKNOWN), repo=repo
+        )
         if plan.decision == DECISION_AMBIGUOUS:
             report.ambiguous.append(plan)
         else:
@@ -408,7 +468,33 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="write the planned rows. Without it nothing is written: a dry run is the default posture.",
     )
+    # Scoping exists so a first --apply does not have to be fleet-wide. It
+    # matters more here than on the shepherd: apply_report skips an entity the
+    # store already holds, so a row written wrongly cannot be corrected by
+    # re-running -- a mistake at fleet scale is a mistake to undo by hand.
+    parser.add_argument("--service", default=None, help="limit to one service")
+    parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
+
+    if args.apply and not rollout.records_writes():
+        # The one switch every other writer in this package honours. At `off`
+        # the DevLoopWorkflow's own ownership activity short-circuits, so a row
+        # this tool writes for a devloop-workflow owner is never heartbeated,
+        # progressed or released by the workflow it names: it sits `active`
+        # until its liveness bound expires, held by an owner that does not know
+        # it holds anything.
+        #
+        # So the order is: flip the WORKER to observe (the writer goes live),
+        # then bootstrap, then flip the SHEPHERD (the comparison starts against
+        # a populated store). Writing first and flipping after fills the store
+        # with rows nobody refreshes.
+        print(
+            f"refusing --apply: {rollout.ENV_VAR}={rollout.mode()}. "
+            "Rows written below `observe` are never heartbeated by the owners they name. "
+            "Set the worker to observe first, then re-run.",
+            file=sys.stderr,
+        )
+        return 2
 
     from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
 
@@ -426,7 +512,13 @@ def main(argv: list[str] | None = None) -> int:
     # would read 0 for a reason the report does not show. The override affects
     # DISCOVERY only: policy.default_owner_for re-reads the real service mode,
     # so a skipped service still answers pr-steward in the ladder.
-    refs = _discover_refs(args.state_dir, dry_run=True, fix_only=True)
+    refs = _discover_refs(
+        args.state_dir,
+        service_filter=args.service,
+        slug_filter=args.slug,
+        dry_run=True,
+        fix_only=True,
+    )
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
 
@@ -436,6 +528,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply:
         apply_report(report, client)
     print(json.dumps(report.as_dict(), indent=2))
+    # One line to stderr next to the report, so an Argo log tail answers "did
+    # this work" without parsing JSON. Ambiguous entities are the ones the
+    # store does not cover -- the store-permits-old-forbids condition this
+    # module opens by naming -- and they are the outcome the exit code alone
+    # is silent about.
+    print(
+        f"lifecycle-bootstrap: {len(report.planned)} planned, "
+        f"{len(report.ambiguous)} ambiguous, {len(report.written)} written, "
+        f"{len(report.failed)} failed",
+        file=sys.stderr,
+    )
     return 1 if report.failed else 0
 
 

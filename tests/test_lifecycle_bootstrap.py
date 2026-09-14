@@ -268,6 +268,15 @@ def _install_client(monkeypatch, client) -> None:
     monkeypatch.setattr(bootstrap, "OwnershipClient", lambda *a, **kw: client)
 
 
+def _writes_allowed(monkeypatch) -> None:
+    """--apply refuses below `observe`; every test that writes needs this.
+
+    Set through the environment rather than by patching rollout, so the tests
+    exercise the same read the deployment does.
+    """
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+
+
 def test_a_dry_run_does_not_touch_the_gitops_checkout(tmp_path, monkeypatch, capsys) -> None:
     """_discover_refs rewrites .status.yaml when it finds a PR by branch —
     flipping in-progress to implemented — and this tool writes ownership rows,
@@ -340,6 +349,8 @@ def test_the_counts_include_the_ambiguous_ones(tmp_path, monkeypatch, capsys) ->
 def test_apply_is_required_to_write(tmp_path, monkeypatch, capsys) -> None:
     from orchestrator import run_shepherd
 
+    _writes_allowed(monkeypatch)
+
     root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
     client = _Client()
@@ -356,6 +367,8 @@ def test_apply_is_required_to_write(tmp_path, monkeypatch, capsys) -> None:
 def test_an_unknown_read_aborts_with_a_nonzero_exit(tmp_path, monkeypatch, capsys) -> None:
     from orchestrator import run_shepherd
 
+    _writes_allowed(monkeypatch)
+
     root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
     client = _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN, reason="down")})
@@ -371,6 +384,8 @@ def test_the_devloop_row_carries_the_workflow_id(tmp_path, monkeypatch, capsys) 
     """The workflow's own acquire sets temporal_workflow_id; a row written here
     naming the same owner should carry the same field."""
     from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
 
     root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
@@ -402,3 +417,145 @@ def test_an_unanswered_probe_becomes_ambiguous_not_a_decision(monkeypatch) -> No
     assert answers.get(0) == LEGACY_FREE
     # Absent, read as LEGACY_UNKNOWN through the caller's default.
     assert 1 not in answers
+
+
+def test_apply_refuses_below_observe(tmp_path, monkeypatch, capsys) -> None:
+    """The one switch every other writer in this package honours.
+
+    At `off` the DevLoopWorkflow's ownership activity short-circuits, so a row
+    written here for a devloop-workflow owner is never heartbeated, progressed
+    or released by the workflow it names: it sits `active` until its liveness
+    bound expires, held by an owner that does not know it holds anything.
+    """
+    from orchestrator import run_shepherd
+
+    monkeypatch.delenv("LIFECYCLE_ROLLOUT_MODE", raising=False)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    assert client.acquires == []
+    assert "refusing --apply" in capsys.readouterr().err
+
+
+def test_a_dry_run_is_allowed_below_observe(tmp_path, monkeypatch, capsys) -> None:
+    """The refusal is about WRITING. A dry run is how an operator decides
+    whether to flip in the first place."""
+    from orchestrator import run_shepherd
+
+    monkeypatch.delenv("LIFECYCLE_ROLLOUT_MODE", raising=False)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    assert bootstrap.main(["--state-dir", str(root)]) == 0
+    assert _report_of(capsys.readouterr().out)["counts"]["shepherd"] == 1
+
+
+def test_the_scope_can_be_narrowed(tmp_path, monkeypatch, capsys) -> None:
+    """apply_report skips an entity the store already holds, so a row written
+    wrongly cannot be corrected by re-running. A first --apply must not have to
+    be fleet-wide."""
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    (root / "other-svc" / "proposals" / "issue-9-b").mkdir(parents=True)
+    (root / "other-svc" / "proposals" / "issue-9-b" / ".status.yaml").write_text(
+        "status: implemented\npr: https://github.com/mctlhq/other-svc/pull/9\n"
+    )
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    bootstrap.main(["--state-dir", str(root), "--service", "mctl-web"])
+    report = _report_of(capsys.readouterr().out)
+    assert [p["entity_id"] for p in report["planned"]] == ["mctlhq/mctl-web#42"]
+
+
+def test_a_refused_acquire_reaches_the_exit_code(tmp_path, monkeypatch, capsys) -> None:
+    """The Argo step has to fail. Without this, a refactor that moved
+    apply_report after the print, or dropped the `failed` check, passes the
+    whole suite."""
+    from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(
+        monkeypatch, _Client(acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409"))
+    )
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+
+
+def test_an_already_owned_entity_is_not_probed(tmp_path, monkeypatch, capsys) -> None:
+    """The budget is shared wall-clock. Probing entities whose answer rung 1
+    discards starves the undecided ones, which then fall to UNKNOWN and are
+    reported ambiguous -- left UNOWNED, the very class this tool removes."""
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    probed: list[str] = []
+
+    def _probe(service, slug):
+        probed.append(slug)
+        return LEGACY_FREE
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", _probe)
+    held = Ownership(
+        entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
+        phase="review-remediation",
+        owner=Owner(type="shepherd", id="shepherd:mctl-web"),
+        state="active",
+        healthy=True,
+        held=True,
+    )
+    _install_client(
+        monkeypatch,
+        _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=held)}),
+    )
+
+    bootstrap.main(["--state-dir", str(root)])
+    assert probed == [], "probed an entity the store already holds"
+
+
+def test_a_raising_probe_produces_a_report_not_a_traceback() -> None:
+    """`probe` is a parameter, so its totality is the caller's guarantee and
+    not probe_all's. A raise must become one unanswered ref, never no report."""
+
+    def _explodes(service, slug):
+        raise RuntimeError("anything at all")
+
+    assert bootstrap.probe_all([_ref()], _explodes) == {}
+
+
+def test_an_aborted_report_carries_no_counts() -> None:
+    """`total` is the number the soak's sample target is re-derived from, and
+    build_report returns before the plan loop on the abort path -- so any count
+    there is a partial scan of a run that decided nothing."""
+    client = _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN, reason="down")})
+    report = bootstrap.build_report([_ref()], client, _probe(LEGACY_FREE))
+    assert report.as_dict()["counts"] is None
+
+
+def test_the_report_carries_what_apply_writes() -> None:
+    """The dry run is read "against the store and live Temporal", which needs
+    policy_ref and temporal_workflow_id -- three of the six fields
+    apply_report writes were absent from it."""
+    report = bootstrap.build_report([_ref()], _Client(), _probe(LEGACY_OWNED))
+    row = report.as_dict()["planned"][0]
+    assert row["proposal_ref"] == "mctl-web/issue-7-a-thing"
+    assert row["policy_ref"].startswith("service-mode:")
+    assert row["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-web-7"
+
+
+def test_the_workflow_id_has_one_definition() -> None:
+    """The bootstrap writes this value DURABLY into temporal_workflow_id, and
+    its guarantee -- "the id recorded is the one the probe just confirmed
+    alive" -- holds only while the probe and this agree."""
+    from orchestrator import run_shepherd
+
+    report = bootstrap.build_report([_ref()], _Client(), _probe(LEGACY_OWNED))
+    assert report.planned[0].owner_id == run_shepherd.devloop_workflow_id(
+        "mctl-web", "issue-7-a-thing"
+    )
