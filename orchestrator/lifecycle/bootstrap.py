@@ -50,7 +50,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config.settings import SERVICES
 from orchestrator.lifecycle import rollout, shadow
 from orchestrator.lifecycle.client import OwnershipClient
 from orchestrator.lifecycle.contract import (
@@ -870,15 +869,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
 
-    if args.service is not None and args.service not in SERVICES:
-        # The shepherd's own CLI validates this (run_shepherd.py), and the
-        # reason applies harder here. An unknown --service matches no proposal
-        # directory, so the run discovers nothing -- and "discovered no
-        # proposals at all" exits 1 with a message about a checkout mounted one
-        # level off, sending the operator to look at the volume mount for a
-        # typo in their own argument. On the scoped FIRST apply, which is
-        # exactly when --service is used, that is the worst moment for it.
-        parser.error(f"unknown service {args.service!r}; one of: {', '.join(SERVICES)}")
+    if args.service is not None:
+        # Validated against the CHECKOUT, not `config.settings.SERVICES`.
+        #
+        # The shepherd's CLI validates against SERVICES, and copying that here
+        # would be wrong: discovery walks every directory under the state dir
+        # that does not begin with `_`, so a repository with proposals but no
+        # SERVICES entry -- mctl-claude-remote, whose pull requests another
+        # lifecycle drives -- is discoverable, and SERVICES would make it the
+        # one thing an operator cannot scope to. The authority for "is this a
+        # service" here is what the checkout contains.
+        #
+        # The protection the check exists for is unchanged: an unknown
+        # --service matches no proposal directory, so the run discovers nothing
+        # and "discovered no proposals at all" exits 1 with a message about a
+        # checkout mounted one level off -- sending the operator to inspect the
+        # volume mount for a typo in their own argument, on the scoped run,
+        # which is exactly when the flag is used.
+        present: list[str] = []
+        if args.state_dir.is_dir():
+            present = sorted(
+                d.name
+                for d in args.state_dir.iterdir()
+                if d.is_dir() and not d.name.startswith("_")
+            )
+        if args.service not in present:
+            parser.error(
+                f"no service directory {args.service!r} under {args.state_dir}"
+                + (f"; found: {', '.join(present)}" if present else "")
+            )
 
     if args.apply:
         # This module PLANS. There is no writer in it -- no `acquire` call

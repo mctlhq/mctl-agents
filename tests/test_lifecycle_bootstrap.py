@@ -816,7 +816,31 @@ def test_an_unknown_service_is_rejected_at_the_argument(tmp_path, capsys) -> Non
     with pytest.raises(SystemExit) as exc:
         bootstrap.main(["--state-dir", str(root), "--service", "mctl-wbe"])
     assert exc.value.code == 2
-    assert "unknown service 'mctl-wbe'" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "no service directory 'mctl-wbe'" in err
+    assert "found: mctl-web" in err
+
+
+def test_a_service_outside_SERVICES_is_still_addressable(tmp_path, monkeypatch, capsys) -> None:
+    """The checkout is the authority, not `config.settings.SERVICES`.
+
+    Discovery walks every directory under the state dir that does not begin
+    with `_`, so a repository with proposals but no SERVICES entry --
+    mctl-claude-remote, whose pull requests another lifecycle drives -- is
+    discoverable. Validating the flag against SERVICES would make it the one
+    thing an operator cannot scope to.
+    """
+    from config.settings import SERVICES
+    from orchestrator import run_shepherd
+
+    assert "mctl-claude-remote" not in SERVICES, "the premise of this test"
+
+    root = _state_dir(tmp_path, "mctl-claude-remote", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    assert bootstrap.main(["--state-dir", str(root), "--service", "mctl-claude-remote"]) == 0
+    assert _report_of(capsys.readouterr().out)["counts"]["total"] == 1
 
 
 def test_the_scope_can_be_narrowed(tmp_path, monkeypatch, capsys) -> None:
