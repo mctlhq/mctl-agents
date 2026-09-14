@@ -839,6 +839,27 @@ def test_a_service_with_no_proposals_dir_is_not_an_argument_error(tmp_path, caps
     assert "discovered no proposals at all" in captured.err
 
 
+def test_an_unreadable_state_dir_reports_on_a_fleet_wide_run(tmp_path, capsys) -> None:
+    """The shape an operator is most likely to run, and the one the check
+    originally skipped.
+
+    `is_dir()` stats and `iterdir()` lists, so a `--x` directory passes the
+    guard and raises `PermissionError` out of the walk. Handled only inside the
+    `--service` block, a fleet-wide run — which passes no service — never
+    reached it, and the exception left `main()` as a traceback: no report, no
+    marker, on the invocation the WorkflowTemplate actually makes.
+    """
+    root = tmp_path / "agents-state"
+    (root / "mctl-web" / "proposals").mkdir(parents=True)
+    root.chmod(0o111)  # traversable, not listable
+    try:
+        assert bootstrap.main(["--state-dir", str(root)]) == 1
+        report = _report_of(capsys.readouterr().out)
+        assert "cannot read the state dir" in report["aborted"]
+    finally:
+        root.chmod(0o755)
+
+
 def test_a_missing_state_dir_reports_rather_than_exiting_bare(tmp_path, capsys) -> None:
     """An infrastructure fault, answered with a REPORT.
 

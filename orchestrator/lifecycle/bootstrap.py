@@ -906,6 +906,24 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
         return 1
 
+    # UNCONDITIONAL, not inside the `--service` block where it started. A
+    # fleet-wide run never passes a service, so it skipped this entirely and
+    # `_discover_refs`'s own `iterdir()` raised `PermissionError` out of
+    # `main()` as a traceback -- no report, no marker, on the shape an operator
+    # is most likely to run. A mount the pod cannot list is an infrastructure
+    # fault whoever the caller is.
+    #
+    # `is_dir()` stats and `iterdir()` lists, and a `--x` directory passes the
+    # first and fails the second, which is why the guard above does not cover
+    # this.
+    from orchestrator.run_shepherd import discover_services
+
+    try:
+        _present = discover_services(args.state_dir)
+    except OSError as exc:
+        _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
+        return 1
+
     if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
@@ -943,8 +961,8 @@ def main(argv: list[str] | None = None) -> int:
         #     mistyped, so it falls through to "discovered no proposals at
         #     all", which exits 1 WITH a report;
         #   - the state dir is missing or unreadable -> an infrastructure
-        #     fault, not an argument error. Missing is answered above, before
-        #     this block; unreadable is the OSError arm below.
+        #     fault, not an argument error, and answered ABOVE this block for
+        #     every caller rather than only for one that passed --service.
         #
         # The distinction is which red an operator can act on, and it is why
         # this refusal prints a report rather than calling `parser.error`:
@@ -952,18 +970,8 @@ def main(argv: list[str] | None = None) -> int:
         # the report as an output parameter cannot tell from the deliberate
         # `--apply` refusal below -- whose entire design note is that exit 2
         # with no report is the one outcome a log cannot interpret.
-        from orchestrator.run_shepherd import discover_services
-
-        try:
-            present = discover_services(args.state_dir)
-            named_is_dir = (args.state_dir / args.service).is_dir()
-        except OSError as exc:
-            # Past the is_dir() guard, iterdir() can still raise -- a mount
-            # that went away mid-run, a permission the pod does not have.
-            # Reported, not a traceback, for the same reason as everything
-            # else on this path.
-            _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
-            return 1
+        present = _present
+        named_is_dir = (args.state_dir / args.service).is_dir()
         if args.service not in present and not named_is_dir:
             _print_report(
                 Report(
