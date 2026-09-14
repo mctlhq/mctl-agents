@@ -193,8 +193,16 @@ class Plan:
     #: `.status.yaml` is a slug that yields no workflow id, where the fix is
     #: renaming the proposal directory.
     #:
-    #: Only rung 2 is retryable. Every other producer is a data problem in the
-    #: checkout that the same run reproduces exactly.
+    #: Rung 2 is retryable WHEN the probe was actually asked and could not
+    #: answer. It is not when the probe could not be asked at all -- a service
+    #: directory that is not a usable repository name yields no workflow id, so
+    #: `_dev_loop_owns_answer` answers UNKNOWN without an HTTP call and the
+    #: next run over the same checkout does the same. That case arrives at rung
+    #: 2 too, which is why the field is set from `id_error` there rather than
+    #: unconditionally.
+    #:
+    #: Every other producer is a data problem in the checkout that the same run
+    #: reproduces exactly.
     retryable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -469,11 +477,22 @@ def plan_for(
         # ONLY path production takes for that input, so it is where the
         # permanence has to be named.
         base.retryable = not id_error
-        base.reason = (
-            f"the DevLoop liveness probe could not answer: {id_error}"
-            if id_error
-            else "the DevLoop liveness probe could not answer; owner undetermined"
-        )
+        # The REASON names the cause, not the messenger. The probe answered
+        # perfectly well; it answered UNKNOWN *because* the id could not be
+        # built, so a sentence whose subject is the probe makes the one detail
+        # that separates this from an ordinary timeout into a suffix on a claim
+        # that is not true of it. And the URL in `id_error` is one this process
+        # synthesised from a directory name, not anything in `.status.yaml`, so
+        # it is quoted as what it is rather than left to read as a recorded
+        # value the operator should go looking for.
+        if id_error:
+            base.reason = (
+                f"this proposal's service directory {ref.service!r} is not a usable "
+                "repository name, so no DevLoop workflow id exists for it; the probe "
+                "could not be asked. Rename the directory"
+            )
+        else:
+            base.reason = "the DevLoop liveness probe could not answer; owner undetermined"
         return base
 
     if legacy_answer == LEGACY_OWNED:
@@ -869,36 +888,64 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
 
-    if args.service is not None:
-        # Validated against `run_shepherd.discover_services`, which is also
-        # what `_discover_refs` iterates. ONE definition of "this checkout
-        # contains this service", so the filter and the discovery physically
-        # cannot disagree: a name this check admits is a name that loop
-        # accepts, and vice versa.
+    if args.service is not None and args.state_dir.is_dir():
+        # Validated against `run_shepherd.discover_services`, which is what
+        # `_discover_refs` iterates. ONE definition of "this checkout contains
+        # this service", so this filter and that loop cannot disagree about a
+        # name. (The shepherd's own CLI validates `--service` against
+        # `config.settings.SERVICES` and still does — a different question, for
+        # a sweep over a fixed fleet, and not this one.)
         #
-        # Not `config.settings.SERVICES` — a repository whose pull requests
-        # another lifecycle drives has proposals here and no SERVICES entry
+        # Not SERVICES here: a repository whose pull requests another lifecycle
+        # drives has proposals in this checkout and no SERVICES entry
         # (`mctl-claude-remote`), and SERVICES would make it the one service an
-        # operator cannot scope a run to. Not "every directory" either: a
-        # checkout holds things that are not services, and treating those as
-        # services is how a directory name that is not a valid repository name
-        # reaches an id builder — a failure this module has already had once.
-        # `discover_services` answers structurally: not `_`-prefixed, and has a
-        # `proposals/` directory.
+        # operator cannot scope a run to.
         #
-        # The protection the check exists for is unchanged: an unknown
-        # --service otherwise matches nothing, and "discovered no proposals at
-        # all" exits 1 with a message about a checkout mounted one level off —
-        # sending the operator to inspect the volume mount for a typo in their
-        # own argument, on the scoped run, which is when the flag is used.
+        # What this buys is a NAME an operator mistyped, nothing more. It is
+        # not what keeps a bad directory name out of an id builder -- discovery
+        # walks unfiltered and `devloop_workflow_id`'s own callers contain that
+        # -- and claiming otherwise would be a guard justified by a hazard it
+        # does not remove.
+        #
+        # THREE outcomes, and only one of them is this check's business:
+        #
+        #   - the name is not a directory at all -> a typo, refused below;
+        #   - the name IS a directory with no `proposals/` -> an ordinary
+        #     state, a service that never had a proposal or had its last one
+        #     archived. It falls through to "discovered no proposals at all",
+        #     which exits 1 WITH a report;
+        #   - the state dir is missing or unreadable -> an infrastructure
+        #     fault, not an argument error. Guarded above and below, so it
+        #     falls through to `_discover_refs`'s own `SystemExit`.
+        #
+        # The distinction is which red an operator can act on, and it is why
+        # this refusal prints a report rather than calling `parser.error`:
+        # argparse exits 2 with nothing on stdout, which an Argo step reading
+        # the report as an output parameter cannot tell from the deliberate
+        # `--apply` refusal below -- whose entire design note is that exit 2
+        # with no report is the one outcome a log cannot interpret.
         from orchestrator.run_shepherd import discover_services
 
-        present = discover_services(args.state_dir)
-        if args.service not in present:
-            parser.error(
-                f"no service state dir {args.service!r} under {args.state_dir}"
-                + (f"; found: {', '.join(sorted(present))}" if present else "")
+        try:
+            present = discover_services(args.state_dir)
+            named_is_dir = (args.state_dir / args.service).is_dir()
+        except OSError as exc:
+            # Past the is_dir() guard, iterdir() can still raise -- a mount
+            # that went away mid-run, a permission the pod does not have.
+            # Reported, not a traceback, for the same reason as everything
+            # else on this path.
+            _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
+            return 1
+        if args.service not in present and not named_is_dir:
+            _print_report(
+                Report(
+                    aborted=(
+                        f"no service state dir {args.service!r} under {args.state_dir}"
+                        + (f"; found: {', '.join(sorted(present))}" if present else "")
+                    )
+                )
             )
+            return 2
 
 
     if args.apply:

@@ -813,15 +813,47 @@ def test_an_unknown_service_is_rejected_at_the_argument(tmp_path, capsys) -> Non
     apply, which is the worst moment for that.
     """
     root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    assert bootstrap.main(["--state-dir", str(root), "--service", "mctl-wbe"]) == 2
+    # WITH a report. exit 2 and nothing on stdout is the one outcome an Argo
+    # step reading the report as an output parameter cannot interpret, and the
+    # --apply refusal below pays for a report specifically to avoid it.
+    report = _report_of(capsys.readouterr().out)
+    assert "no service state dir 'mctl-wbe'" in report["aborted"]
+    assert "found: mctl-web" in report["aborted"]
+
+
+def test_a_service_with_no_proposals_dir_is_not_an_argument_error(tmp_path, capsys) -> None:
+    """An ordinary state, not a typo.
+
+    A real service that never had a proposal, or had its last one archived,
+    has a state dir and no `proposals/`. Refusing it as an argument error would
+    exit 2 with no report for something nobody mistyped; it falls through to
+    "discovered no proposals at all", which exits 1 WITH one.
+    """
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    (root / "mctl-docs").mkdir()
+
+    assert bootstrap.main(["--state-dir", str(root), "--service", "mctl-docs"]) == 1
+    captured = capsys.readouterr()
+    assert _report_of(captured.out)["aborted"] == ""
+    assert "discovered no proposals at all" in captured.err
+
+
+def test_a_missing_state_dir_is_not_an_argument_error(tmp_path, capsys) -> None:
+    """An infrastructure fault, and it must not be answered as a typo.
+
+    `--apply --service mctl-web` in a pod whose gitops volume failed to mount
+    is not an argument error. Handled by `parser.error` it produced exit 2 with
+    nothing on stdout, byte-identical to the deliberate --apply refusal for an
+    Argo step reading the report as an output parameter.
+    """
     with pytest.raises(SystemExit) as exc:
-        bootstrap.main(["--state-dir", str(root), "--service", "mctl-wbe"])
-    assert exc.value.code == 2
-    err = capsys.readouterr().err
-    assert "no service state dir 'mctl-wbe'" in err
-    assert "found: mctl-web" in err
+        bootstrap.main(["--state-dir", str(tmp_path / "absent"), "--service", "mctl-web"])
+    assert exc.value.code != 2
+    assert "State dir not found" in str(exc.value)
 
 
-def test_the_filter_and_the_discovery_share_one_definition(tmp_path, monkeypatch) -> None:
+def test_the_filter_and_the_discovery_share_one_definition(tmp_path, monkeypatch, capsys) -> None:
     """A name the filter admits is a name discovery accepts, and vice versa.
 
     Two answers to "is this a service" is how a --service the loop never
@@ -843,9 +875,16 @@ def test_the_filter_and_the_discovery_share_one_definition(tmp_path, monkeypatch
 
     assert run_shepherd.discover_services(root) == frozenset({"mctl-web"})
 
+    # Moving the shared function moves DISCOVERY, which is the load-bearing
+    # half: the same run over the same checkout now finds nothing. A second
+    # definition on either side fails here while every value-level test stays
+    # green.
+    _install_client(monkeypatch, _Client())
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    assert bootstrap.main(["--state-dir", str(root), "--service", "mctl-web"]) == 0
+
     monkeypatch.setattr(run_shepherd, "discover_services", lambda d: frozenset())
-    with pytest.raises(SystemExit):
-        bootstrap.main(["--state-dir", str(root), "--service", "mctl-web"])
+    assert bootstrap.main(["--state-dir", str(root), "--service", "mctl-web"]) == 1
 
 
 def test_a_directory_that_is_not_a_service_is_not_one(tmp_path) -> None:
@@ -1405,7 +1444,10 @@ def test_this_module_and_the_shadow_compare_build_one_id(pr_url) -> None:
     from orchestrator.run_shepherd import _parse_pr_url
 
     ref = _ref()
-    object.__setattr__(ref, "pr_url", pr_url)
+    ref = ProposalRef(
+        service=ref.service, slug=ref.slug, proposal_dir=ref.proposal_dir,
+        status=ref.status, pr_url=pr_url,
+    )
     report = bootstrap.build_report([ref], _Client(), _probe(LEGACY_FREE))
 
     owner, repo, number = _parse_pr_url(pr_url)
@@ -1473,8 +1515,11 @@ def test_an_unrepresentable_service_through_the_real_probe(tmp_path, monkeypatch
     from orchestrator import run_shepherd
 
     monkeypatch.setenv("MCTL_TOKEN", "t")
+    # `_ref` already builds the matching pr_url from the service, so nothing
+    # needs overriding -- and `ProposalRef` is not frozen, so the
+    # `object.__setattr__` that used to be here implied a frozenness it does
+    # not have while doing nothing.
     ref = _ref(service="not a repo name")
-    object.__setattr__(ref, "pr_url", "https://github.com/mctlhq/not a repo name/pull/42")
 
     report = bootstrap.build_report([ref], _Client(), run_shepherd._dev_loop_owns_answer)
 
@@ -1483,6 +1528,10 @@ def test_an_unrepresentable_service_through_the_real_probe(tmp_path, monkeypatch
     assert report.planned == []
     plan = report.ambiguous[0]
     assert plan.undetermined is True
+    # The reason names the CAUSE, not the messenger: the probe answered fine,
+    # it answered UNKNOWN because there was no id to ask about.
+    assert "is not a usable repository name" in plan.reason
+    assert "Rename the directory" in plan.reason
     # PERMANENT. Retryable here sends an operator to re-run a directory name
     # the same checkout reproduces exactly, and `main()` counts it under
     # "retryable" in the summary that tells them which to do.
