@@ -11,14 +11,17 @@ rules need `.status.yaml` from the gitops checkout, `_service_mode` /
 mctl-api, and moving them there would put a second copy of the shepherd's
 policy in a repository that cannot see the state it applies to.
 
-Run as a one-shot Argo Workflow. **This module plans and reports; it writes
-nothing.** The report IS the deliverable, and an operator reads it against the
-store and live Temporal. The write path — the rollout gate, ``acquire``,
-idempotence and refusal semantics — is a separate change that takes a reviewed
-production dry run as its input. ``--apply`` is accepted and refused here
-rather than removed, so the WorkflowTemplate's contract does not change twice.
+Run as a one-shot Argo Workflow. A dry run is the default posture: the report
+is the deliverable, and an operator reads it against the store and live
+Temporal before anything is written.
 
 KNOWN LIMITS, written down rather than left to be rediscovered:
+
+- **The rollout gate is an attestation, not a verification.** ``--apply``
+  refuses outside ``observe``, but the mode it reads is THIS process's, while
+  the hazard is the Temporal worker's. Setting the variable here with the
+  worker still off passes the gate. The mode is echoed into the report so what
+  was claimed sits next to what it licensed.
 - **Only DevLoop rows are imported.** The shepherd and pr-steward rungs were
   here and are gone: ``shadow.classify`` has one owner-type arm, so importing
   those rows turns an *agreeing* entity into ``store-forbids-old-permits``
@@ -220,7 +223,7 @@ class Plan:
             "reason": self.reason,
             "undetermined": self.undetermined,
             "retryable": self.retryable,
-            # The three provenance fields a write would carry. The report is
+            # The three provenance fields apply_report writes. The dry run is
             # the deliverable and an operator reads it "against the store and
             # live Temporal" — which needs policy_ref, the provenance
             # policy.py exists to record, and temporal_workflow_id, the field
@@ -244,6 +247,8 @@ class Report:
     #: an unowned entity is one the old mechanism still drives, which is the
     #: status quo rather than a new risk.
     ambiguous: list[Plan] = field(default_factory=list)
+    written: list[str] = field(default_factory=list)
+    failed: list[dict[str, str]] = field(default_factory=list)
     aborted: str = ""
     #: The rollout mode this run attested to. On the record because the gate
     #: reads THIS process's environment and not the worker's.
@@ -278,6 +283,8 @@ class Report:
                 "counts": None,
                 "planned": [],
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
+                "written": [],
+                "failed": [],
             }
         counts = dict.fromkeys(DECISIONS, 0)
         for plan in [*self.planned, *self.ambiguous]:
@@ -295,6 +302,8 @@ class Report:
             "counts": {**counts, "total": len(self.planned) + len(self.ambiguous)},
             "planned": [p.as_dict() for p in self.planned],
             "ambiguous": [p.as_dict() for p in self.ambiguous],
+            "written": self.written,
+            "failed": self.failed,
         }
 
 
@@ -845,6 +854,51 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
     return report
 
 
+def apply_report(report: Report, client: OwnershipClient) -> Report:
+    """Write the rows the report plans. Only the writable decisions.
+
+    Idempotent on two legs, and both are load-bearing. `build_report`'s
+    read-first pass marks an entity the store HOLDS ALREADY_OWNED and this loop
+    skips it; and the owner ids are deterministic -- POLICY_REF and the
+    DevLoop's own workflow id, never a pod name -- so a re-run of the same
+    fleet asks for the same rows rather than a second set of them. Still true
+    after a takeover: a dead row this run replaced reads held=True on the next
+    one, so the second run skips what the first wrote.
+
+    SOME OF THESE ARE TAKEOVERS, not first writes. Rung 1 keys on
+    `derived.held`, so an entity whose record is `active` past its liveness
+    bound falls through the ladder and arrives here with a DevLoop owner. That
+    is the point -- it is the dangerous class -- and the same predicate that
+    let it through is the one mctl-api evaluates on the acquire. If the store
+    disagrees and refuses, the refusal lands in `failed` and the run goes red
+    rather than being retried or reasoned around here: a store that declines a
+    takeover is the authority on that entity.
+
+    Total on the ENTITY, not on the run: a refused acquire is recorded in
+    `failed` and the loop continues. A store that declines one row has told you
+    something about that row; the rest of the batch still has to be attempted,
+    and `main` carries the refusal out in the exit code.
+    """
+    for plan in report.planned:
+        if plan.decision in (DECISION_ALREADY_OWNED, DECISION_AMBIGUOUS):
+            continue
+        answer = client.acquire(
+            EntityRef(kind=KIND_PULL_REQUEST, id=plan.entity_id),
+            PHASE_REVIEW_REMEDIATION,
+            Owner(type=plan.owner_type, id=plan.owner_id),
+            proposal_ref=plan.proposal_ref,
+            policy_ref=plan.policy_ref,
+            temporal_workflow_id=plan.temporal_workflow_id,
+        )
+        if answer.wrote:
+            report.written.append(plan.entity_id)
+        else:
+            report.failed.append(
+                {"entity_id": plan.entity_id, "verdict": answer.verdict, "reason": answer.reason}
+            )
+    return report
+
+
 def _print_report(report: Report) -> None:
     """The report on stdout behind its marker, and a summary on stderr.
 
@@ -856,16 +910,15 @@ def _print_report(report: Report) -> None:
     if report.aborted:
         print(f"lifecycle-bootstrap: ABORTED: {report.aborted}", file=sys.stderr)
         return
-    # `already-owned` counted apart from the work. Both live in `planned`, and
-    # the entities the store already holds are the ones an apply would skip --
-    # so a second run against a populated store reads "0 to write, 312 already
-    # owned" rather than a bare "312 planned" that says nothing about whether
-    # anything is left to do.
+    # `already-owned` counted apart from the work. Both live in `planned` and
+    # apply_report skips the first, so the idempotent second run -- the one
+    # this tool sells as writing nothing -- printed "312 planned, 0 written",
+    # indistinguishable in a log tail from 312 rows the store refused.
     already = sum(1 for p in report.planned if p.decision == DECISION_ALREADY_OWNED)
     print(
         f"lifecycle-bootstrap: {len(report.planned) - already} to write, "
-        f"{already} already owned, {len(report.ambiguous)} ambiguous "
-        "(nothing written: this build plans only)",
+        f"{already} already owned, {len(report.ambiguous)} ambiguous, "
+        f"{len(report.written)} written, {len(report.failed)} failed",
         file=sys.stderr,
     )
 
@@ -873,21 +926,16 @@ def _print_report(report: Report) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
-    # Accepted, and refused. The flag is NOT dropped: the WorkflowTemplate on
-    # mctl-gitops main already passes it when dry_run=false, and a removed flag
-    # would fail there as argparse's "unrecognized arguments" -- exit 2 with no
-    # report, which an Argo log cannot tell from the deliberate refusal below.
-    # Keeping it means the contract changes once, when the writer lands.
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="refused in this build: the write path is a separate change. Nothing is written here.",
+        help="write the planned rows. Without it nothing is written: a dry run is the default posture.",
     )
-    # Scoping exists so a first apply does not have to be fleet-wide, and so a
-    # report can be reviewed one service at a time. It matters more here than
-    # on the shepherd: an apply skips an entity the store already holds, so a
-    # row written wrongly cannot be corrected by re-running -- a mistake at
-    # fleet scale is a mistake to undo by hand.
+    # Scoping exists so a first --apply does not have to be fleet-wide, and so
+    # a dry run can be reviewed one service at a time. It matters more here
+    # than on the shepherd: apply_report skips an entity the store already
+    # holds, so a row written wrongly cannot be corrected by re-running -- a
+    # mistake at fleet scale is a mistake to undo by hand.
     parser.add_argument("--service", default=None, help="limit to one service")
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
@@ -989,31 +1037,44 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    if args.apply:
-        # This module PLANS. There is no writer in it -- no `acquire` call
-        # exists to gate -- so the refusal is unconditional rather than a
-        # rollout check that would be theatre over a no-op.
+    if args.apply and rollout.mode() != rollout.OBSERVE:
+        # The one switch every other writer in this package honours. At `off`
+        # the DevLoopWorkflow's own ownership activity short-circuits, so a row
+        # this tool writes for a devloop-workflow owner is never heartbeated,
+        # progressed or released by the workflow it names: it sits `active`
+        # until its liveness bound expires, held by an owner that does not know
+        # it holds anything.
         #
-        # Exit 2 and a REPORT, not a bare argparse error, for the reason the
-        # marker exists: an Argo step reads the report as an output parameter,
-        # and the one exit that printed none would be the one an operator most
-        # needs to read. `aborted` says which build this is.
+        # So the order is: flip the WORKER to observe (the writer goes live),
+        # then bootstrap, then flip the SHEPHERD (the comparison starts against
+        # a populated store). Writing first and flipping after fills the store
+        # with rows nobody refreshes.
         #
-        # The gate this becomes is stated here so the order is not rediscovered
-        # when the writer lands: --apply will require EXACTLY `observe`. Below
-        # it the DevLoopWorkflow's own ownership activity short-circuits, so a
-        # row naming a devloop-workflow owner is never heartbeated, progressed
-        # or released by the workflow it names -- it sits `active` until its
-        # liveness bound expires, held by an owner that does not know it holds
-        # anything. Above it the shepherd is already CONSUMING the store, so a
-        # bulk import races a live reader. The order is: flip the WORKER to
-        # observe, then bootstrap, then flip the SHEPHERD.
+        # EXACTLY observe, not records_writes(), which is at_least(OBSERVE) and
+        # so also true at enforce and only. That is a SECOND hazard: at enforce
+        # the shepherd is already CONSUMING the store, so a bulk import races a
+        # live reader and bypasses the staged order above. A pre-soak migration
+        # has no business running after the soak.
+        #
+        # THE LIMIT OF THIS GATE, stated because it is not obvious: the mode is
+        # read from THIS process's environment, and the orphan hazard belongs
+        # to the TEMPORAL WORKER, which this process cannot see. It is an
+        # operator ATTESTATION, not a verification -- the WorkflowTemplate
+        # makes it an explicit parameter for that reason, and the mode is
+        # echoed into the report so the claim sits beside what it licensed.
+        #
+        # A report on this path too. The marker exists so a consumer can always
+        # find the report by grepping for it, and an Argo step reading it as an
+        # output parameter gets nothing if this is the one exit that prints
+        # none — a different failure from "the report says it refused". The
+        # mode IS the answer here, which is what rollout_mode is for.
         _print_report(
             Report(
                 aborted=(
-                    "refused --apply: this build plans and reports only; the write "
-                    "path (rollout gate, acquire, idempotence) is a separate change. "
-                    "Re-run without --apply for the report."
+                    f"refused --apply: {rollout.ENV_VAR}={rollout.mode()!r}, expected "
+                    f"{rollout.OBSERVE!r}. Below it the owners these rows name are not "
+                    "heartbeating; above it the shepherd is already reading the store "
+                    "and a bulk import races it."
                 ),
                 rollout_mode=rollout.mode(),
             )
@@ -1107,8 +1168,11 @@ def main(argv: list[str] | None = None) -> int:
     report.skip_services = ",".join(sorted(run_shepherd.SHEPHERD_SKIP_SERVICES))
     report.discovery_ignored_skip_set = discovery_ignores_skip_set
 
+    if not report.aborted and args.apply:
+        apply_report(report, client)
+
     _print_report(report)
-    if report.aborted:
+    if report.aborted or report.failed:
         return 1
     # Discovering NOTHING is not a successful import: a checkout mounted one
     # level off, or a state dir with no proposals in an actionable status,
