@@ -892,3 +892,63 @@ def test_the_whole_repo_must_match_the_service() -> None:
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.owner_id == ""
     assert "mctlhq/mctl-web" in plan.reason
+    # UNDETERMINED, and this is the load-bearing half: a live DevLoop is
+    # confirmed driving this entity and we decline to name it, so the store is
+    # left with no live owner while a DevLoop drives the PR -- the dangerous
+    # class, left in place by the run meant to remove it.
+    assert plan.undetermined is True
+
+
+def test_the_repo_check_is_case_insensitive() -> None:
+    """GitHub treats owner and repository names case-insensitively, so a `pr:`
+    spelled mctlhq/MCTL-Web names the same repository and must not be refused
+    over it."""
+    ref = _ref()
+    ref.pr_url = "https://github.com/mctlhq/MCTL-Web/pull/42"
+    plan = bootstrap.plan_for(
+        ref, "mctlhq/MCTL-Web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
+        repo="mctlhq/MCTL-Web",
+    )
+    assert plan.decision == bootstrap.DECISION_DEVLOOP
+    assert plan.owner_id == "dev-loop-mctlhq-mctl-web-7"
+
+
+def test_a_confirmed_devloop_we_cannot_name_fails_the_run(tmp_path, monkeypatch, capsys) -> None:
+    """Both of rung 3's refusals leave the DANGEROUS class in place.
+
+    LEGACY_OWNED means a live DevLoop is confirmed. Declining to record an
+    owner for it leaves the store with no live owner while a DevLoop drives the
+    pull request -- `store-permits-old-forbids`, which is the one thing this
+    import exists to remove. A run that hit it must be red, not quietly
+    ambiguous like "nobody drives this".
+    """
+    from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
+    root = tmp_path / "agents-state"
+    d = root / "mctl-web" / "proposals" / "issue-7-a-thing"
+    d.mkdir(parents=True)
+    # The PR is in another repository than the proposal's DevLoop id is built for.
+    (d / ".status.yaml").write_text(
+        "status: implemented\npr: https://github.com/mctlhq/something-else/pull/42\n"
+    )
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    assert client.acquires == []
+    assert "could not be determined" in capsys.readouterr().err
+
+
+def test_a_slug_with_no_workflow_id_under_a_live_devloop_is_undetermined() -> None:
+    plan = bootstrap.plan_for(
+        _ref(slug="incident-9-oom"),
+        "mctlhq/mctl-web#42",
+        OwnershipAnswer(verdict=UNOWNED),
+        LEGACY_OWNED,
+        repo="mctlhq/mctl-web",
+    )
+    assert plan.decision == bootstrap.DECISION_AMBIGUOUS
+    assert plan.undetermined is True
+    assert plan.owner_id == ""

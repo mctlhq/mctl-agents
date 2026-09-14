@@ -220,10 +220,17 @@ def plan_for(
          answer: no live DevLoop drives the entity, and the owner that would
          is one with no lifecycle writer yet. Left unowned on purpose.
 
+    Rung 3 has two refusals of its own -- a pull request outside the repo the
+    proposal's DevLoop id is built for, and a slug that yields no id. Both are
+    AMBIGUOUS and both are UNDETERMINED, because a live DevLoop is confirmed
+    and we are declining to name it: the store then holds no live owner for an
+    entity a DevLoop drives, which is the dangerous class this import exists
+    to remove.
+
     Rungs 2 and 4 both produce AMBIGUOUS and mean opposite things, which is
     why `Plan.undetermined` separates them: rung 4 is the ordinary outcome for
     most of the fleet and a run made entirely of it is a success, while rung 2
-    is the store or the probe having failed to speak.
+    and rung 3's refusals are the run failing to do its job on that entity.
 
     `legacy_answer` is the tri-state probe, not the bool. A probe that failed
     must not be read as "no DevLoop is driving this": rung 2 exists precisely
@@ -259,28 +266,35 @@ def plan_for(
         # only while the two agree.
         from orchestrator.run_shepherd import devloop_workflow_id
 
-        # `pr_org`, not `owner`: three other branches in this function bind
-        # `owner` to an Owner, and one name holding two types works only while
-        # the branches stay exclusive.
-        # The WHOLE repo, not just the org. devloop_workflow_id builds
-        # `dev-loop-mctlhq-{service}-{N}` from the proposal's service directory,
-        # which is only the DevLoop's id while the service name and the repo
-        # name are the same string. A proposal under agents-state/mctl-web
-        # whose `pr:` points at mctlhq/something-else would otherwise be
-        # imported as an owner naming a workflow for a different repository.
+        # The WHOLE repo, not just the org, and CASE-INSENSITIVELY. GitHub
+        # treats owner and repository names case-insensitively, so a `pr:`
+        # spelled mctlhq/MCTL-Web in .status.yaml names the same repository
+        # and must not be refused over it.
+        #
+        # devloop_workflow_id builds `dev-loop-mctlhq-{service}-{N}` from the
+        # proposal's service directory, which is the DevLoop's id only while
+        # the service name and the repo name are the same string. Checking the
+        # org alone let a proposal under agents-state/mctl-web whose `pr:`
+        # points at mctlhq/something-else be imported as an owner naming
+        # another repository's workflow.
         expected_repo = f"{DEVLOOP_WORKFLOW_OWNER}/{ref.service}"
-        if repo != expected_repo:
-            # devloop_workflow_id hardcodes the org, which is fail-open on the
-            # probe -- a wrong owner just 404s into "not owned". On THIS path
-            # the id becomes owner_id and temporal_workflow_id, so a wrong
-            # owner is a durable row naming a workflow that does not exist.
-            # The owner is in hand here, so check it rather than inherit a
-            # justification that holds only for the read.
+        if repo.casefold() != expected_repo.casefold():
+            # UNDETERMINED, and this is the important half. A live DevLoop is
+            # confirmed driving this entity — that is what LEGACY_OWNED means —
+            # and we are declining to record an owner for it. The store is then
+            # left with no live owner while a DevLoop drives the pull request,
+            # which is `store-permits-old-forbids`: the DANGEROUS class, and
+            # precisely the condition this import exists to remove.
+            #
+            # So it is not the benign ambiguity of "nobody drives this". It is
+            # the run failing to do its one job on this entity, and it makes
+            # the run red.
             base.decision = DECISION_AMBIGUOUS
+            base.undetermined = True
             base.reason = (
-                f"the pull request is in {repo}, but this proposal's DevLoop id "
-                f"is built for {expected_repo}; importing it would name another "
-                "repository's workflow"
+                f"a live DevLoop drives this, but the pull request is in {repo} "
+                f"while this proposal's DevLoop id is built for {expected_repo}; "
+                "importing it would name another repository's workflow"
             )
             return base
         workflow_id = devloop_workflow_id(ref.service, ref.slug)
@@ -290,7 +304,12 @@ def plan_for(
             # row. dev_loop.py guards on `bool(result.owner_id)` precisely
             # because a record owned by nobody withholds the entity from
             # everyone and names no one to ask.
+            # UNDETERMINED, same reasoning as the repo branch above: a live
+            # DevLoop is confirmed and we cannot name it, so the store keeps no
+            # live owner for an entity a DevLoop is driving — the dangerous
+            # class, left in place by the run that was supposed to remove it.
             base.decision = DECISION_AMBIGUOUS
+            base.undetermined = True
             base.reason = (
                 f"a live DevLoop is reported for {ref.slug!r}, whose slug yields no workflow id"
             )
