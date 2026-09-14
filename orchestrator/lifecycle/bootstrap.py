@@ -1319,7 +1319,31 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    # THE REFUSAL FIRST, because it is DETERMINISTIC and needs nothing.
+    # THE ORDERING RULE, in full, because two earlier versions of this comment
+    # each stated half of it and the halves contradict.
+    #
+    #   1. Every CHEAP, deterministic answer comes before the UNBOUNDED walk.
+    #   2. Among the cheap ones, an infrastructure fault outranks a policy
+    #      refusal -- "there is no checkout" is specific and actionable, while
+    #      "this flag does nothing here" is a property of the build that the
+    #      next run meets again.
+    #   3. A fault only the walk can see is reported by the walk's own guard,
+    #      which is after this refusal. So a REFUSED run does not learn about
+    #      it, and that is correct rather than tolerated: the run did nothing,
+    #      and "this flag does nothing in this build" is a complete answer to
+    #      what was asked. The re-run the refusal asks for is what finds it.
+    #
+    # Read off the code, that is: a missing state dir and an unreadable ROOT
+    # answer before this (they are a stat and one listing); an unreadable
+    # `proposals/` answers after it, because nothing cheaper than the walk can
+    # see it.
+    #
+    # THE COST is why (1) exists. There is no `acquire` in this module, so
+    # nothing discovery learns can change this answer -- while `_discover_refs`
+    # shells `gh pr list` for every proposal with no `pr:`, serially, on a
+    # branch gated on `reconcile` rather than `dry_run`. Behind the walk, the
+    # production invocation (`dry_run=false` -> `--apply`) walked the whole
+    # fleet and spent GitHub quota to print one sentence.
     #
     # There is no `acquire` in this module, so the answer does not depend on
     # anything discovery learns -- and discovery is the opposite of cheap:
@@ -1330,14 +1354,6 @@ def main(argv: list[str] | None = None) -> int:
     # fleet and spent GitHub quota per PR-less proposal before printing one
     # sentence of refusal.
     #
-    # It sat behind discovery for one commit, to make `an infrastructure fault
-    # outranks a policy refusal` true at every depth. The depth gap is closed
-    # by the WALK'S OWN GUARD, which is where it belongs and where it stays;
-    # the refusal's position was never what closed it. What moving the refusal
-    # bought was that a REFUSED run also learns about a broken mount -- and a
-    # refused run does nothing, so its complete and correct answer is `this
-    # flag does nothing in this build`. The mount is reported by the re-run
-    # the refusal asks for.
 
     # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
     #
