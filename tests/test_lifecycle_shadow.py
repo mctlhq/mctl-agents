@@ -506,3 +506,48 @@ def test_a_recorded_unowned_row_uses_the_servers_held() -> None:
     assert shadow.classify(answer, shadow.LEGACY_OWNED).divergence_class == (
         shadow.DIVERGE_STORE_UNKNOWN
     )
+
+
+def test_a_held_verdict_without_a_record_is_unknown() -> None:
+    """An absence, not a free entity. Reporting False here would classify a
+    driven entity as store-permits-old-forbids off a record nobody read."""
+    answer = OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=None)
+    assert shadow.held(answer) is None
+    assert shadow.classify(answer, shadow.LEGACY_OWNED).divergence_class == (
+        shadow.DIVERGE_STORE_UNKNOWN
+    )
+
+
+def test_a_failure_on_a_later_chunk_keeps_the_earlier_ones(monkeypatch, capsys) -> None:
+    """"Keeps whatever was already compared" has to hold ACROSS chunks, not
+    only within one: classifying after the whole read threw away the first
+    chunk's comparisons when the second failed."""
+    monkeypatch.setattr(shadow, "SHADOW_CHUNK_SIZE", 1)
+
+    class _FailsOnTheSecond:
+        def __init__(self):
+            self.calls = 0
+
+        def get_many(self, kind, phase, ids, asking=None):
+            self.calls += 1
+            if self.calls > 1:
+                raise RuntimeError("the store blew up mid-batch")
+            return {i: OwnershipAnswer(verdict=UNOWNED) for i in ids}
+
+    totals = shadow.compare_entities(
+        {"a#1": shadow.LEGACY_FREE, "a#2": shadow.LEGACY_FREE}, client=_FailsOnTheSecond()
+    )
+    assert totals.compared == 1
+    out = capsys.readouterr().out
+    assert out.count("lifecycle-shadow: divergence") == 1
+    assert out.count("tick totals") == 1
+
+
+def test_the_chunk_size_matches_the_clients_own() -> None:
+    """The budget can only stop the compare between chunks, and get_many
+    re-chunks internally — a larger value here would become several requests
+    inside one un-interruptible call, and the bound would be coarser than it
+    reads."""
+    from orchestrator.lifecycle.client import BATCH_CHUNK_SIZE
+
+    assert shadow.SHADOW_CHUNK_SIZE == BATCH_CHUNK_SIZE

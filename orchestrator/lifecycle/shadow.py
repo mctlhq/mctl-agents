@@ -23,9 +23,11 @@ import re
 import time
 from dataclasses import dataclass, field
 
-from orchestrator.lifecycle.client import OwnershipClient
+from orchestrator.lifecycle.client import BATCH_CHUNK_SIZE, OwnershipClient
 from orchestrator.lifecycle.contract import (
     KIND_PULL_REQUEST,
+    OWNED_BY_ME,
+    OWNED_BY_OTHER,
     OWNER_DEVLOOP_WORKFLOW,
     PHASE_REVIEW_REMEDIATION,
     UNKNOWN,
@@ -123,10 +125,13 @@ LOG_PREFIX = "lifecycle-shadow:"
 #: The batched read's own timeout, spent after the sweep's 60s pool budget.
 SHADOW_TIMEOUT_S = 10
 
-#: Ids per batched read. Below the server's 500 cap on purpose: the budget
-#: below can only stop the compare BETWEEN chunks, so the chunk size is also
-#: the granularity of that bound.
-SHADOW_CHUNK_SIZE = 100
+#: Ids per batched read, taken from the client's own chunk size rather than
+#: chosen here. The budget below can only stop the compare BETWEEN chunks, so
+#: the chunk size is the granularity of that bound — and get_many re-chunks
+#: internally, so a larger value here would silently become several requests
+#: inside one un-interruptible call and the bound would be coarser than it
+#: reads.
+SHADOW_CHUNK_SIZE = BATCH_CHUNK_SIZE
 
 #: Wall-clock budget for the whole comparison, spent after the sweep's own 60s
 #: liveness pool. The sweep runs every 5 minutes; an observer is not entitled
@@ -191,6 +196,12 @@ def held(answer: OwnershipAnswer) -> bool | None:
     re-derive the takeover predicate in a second language, and mctl-api's
     derive.go records that the first consumer to try got it wrong.
     """
+    if answer.verdict in (OWNED_BY_OTHER, OWNED_BY_ME) and answer.ownership is None:
+        # A held verdict with no record attached. contract.py produces this
+        # shape, and it is an absence, not a free entity: reporting False here
+        # would classify a driven entity as store-permits-old-forbids, the one
+        # dangerous class, off a record nobody read.
+        return None
     if answer.ownership is not None:
         # Whenever a record exists, the server's answer decides -- including
         # for UNOWNED, which answer_from returns for a released or terminal
@@ -348,32 +359,34 @@ def _compare_into(
     # totals rather than counted as store-unknown, because the store did not
     # fail to answer — it was never asked.
     deadline = time.monotonic() + SHADOW_BUDGET_S
-    answers: dict[str, OwnershipAnswer] = {}
-    compared_ids: list[str] = []
+    compared = 0
     for i in range(0, len(ids), SHADOW_CHUNK_SIZE):
-        if time.monotonic() >= deadline and compared_ids:
+        if time.monotonic() >= deadline and compared:
             print(
-                f"warn: {LOG_PREFIX} {len(ids) - len(compared_ids)} entit(ies) not "
-                f"compared: the {SHADOW_BUDGET_S}s shadow budget is spent",
+                f"warn: {LOG_PREFIX} {len(ids) - compared} entit(ies) not compared: "
+                f"the {SHADOW_BUDGET_S}s shadow budget is spent",
                 flush=True,
             )
-            break
+            return
         chunk = ids[i : i + SHADOW_CHUNK_SIZE]
         # asking=None: the comparison needs only `held` and the owner type, and
         # OWNED_BY_ME and OWNED_BY_OTHER both mean held. Supplying an identity
         # would buy nothing and would manufacture spurious OWNED_BY_ME the
         # moment the shepherd started writing rows.
-        answers.update(resolved.get_many(kind, phase, chunk, asking=None))
-        compared_ids.extend(chunk)
-
-    for entity_id in compared_ids:
-        legacy = legacy_by_entity[entity_id]
-        answer = answers.get(entity_id) or OwnershipAnswer(
-            verdict=UNKNOWN, reason="id absent from the batch response"
-        )
-        divergence = classify(answer, legacy)
-        totals.record(divergence)
-        _emit(log_line(entity_id, phase, legacy, divergence))
+        answers = resolved.get_many(kind, phase, chunk, asking=None)
+        # Classified and emitted CHUNK BY CHUNK, not after the whole read.
+        # Accumulating first meant a failure on the second chunk threw away the
+        # first one's comparisons too, so "keeps whatever was already compared"
+        # held only for a single-chunk sweep.
+        for entity_id in chunk:
+            legacy = legacy_by_entity[entity_id]
+            answer = answers.get(entity_id) or OwnershipAnswer(
+                verdict=UNKNOWN, reason="id absent from the batch response"
+            )
+            divergence = classify(answer, legacy)
+            totals.record(divergence)
+            _emit(log_line(entity_id, phase, legacy, divergence))
+        compared += len(chunk)
 
 
 def compare_entities(

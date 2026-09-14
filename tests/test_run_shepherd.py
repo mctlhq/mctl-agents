@@ -4939,27 +4939,38 @@ def test_a_failing_shadow_cannot_fail_the_sweep(monkeypatch, capsys) -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "setup", "expected"),
+    ("name", "setup", "expected", "want_bool"),
     [
-        ("no issue prefix", "slug", run_shepherd.LEGACY_FREE),
-        ("no token", "token", run_shepherd.LEGACY_UNKNOWN),
-        ("non-https url", "scheme", run_shepherd.LEGACY_UNKNOWN),
-        ("404", "notfound", run_shepherd.LEGACY_FREE),
-        ("500", "servererror", run_shepherd.LEGACY_UNKNOWN),
-        ("network error", "network", run_shepherd.LEGACY_UNKNOWN),
-        ("bad json", "badjson", run_shepherd.LEGACY_UNKNOWN),
-        ("payload is not a dict", "notadict", run_shepherd.LEGACY_UNKNOWN),
-        ("completed", "completed", run_shepherd.LEGACY_FREE),
-        ("running, field absent", "nofield", run_shepherd.LEGACY_UNKNOWN),
-        ("running, the query did not complete", "notknown", run_shepherd.LEGACY_UNKNOWN),
-        ("running, field false", "declines", run_shepherd.LEGACY_FREE),
-        ("running and shepherding", "owned", run_shepherd.LEGACY_OWNED),
+        ("no issue prefix", "slug", run_shepherd.LEGACY_FREE, False),
+        ("no token", "token", run_shepherd.LEGACY_UNKNOWN, False),
+        ("non-https url", "scheme", run_shepherd.LEGACY_UNKNOWN, False),
+        ("404", "notfound", run_shepherd.LEGACY_FREE, False),
+        ("500", "servererror", run_shepherd.LEGACY_UNKNOWN, False),
+        ("network error", "network", run_shepherd.LEGACY_UNKNOWN, False),
+        ("bad json", "badjson", run_shepherd.LEGACY_UNKNOWN, False),
+        ("payload is not a dict", "notadict", run_shepherd.LEGACY_UNKNOWN, False),
+        ("completed", "completed", run_shepherd.LEGACY_FREE, False),
+        ("running, field absent", "nofield", run_shepherd.LEGACY_UNKNOWN, False),
+        ("running, the query did not complete", "notknown", run_shepherd.LEGACY_UNKNOWN, False),
+        ("running, field false", "declines", run_shepherd.LEGACY_FREE, False),
+        ("running and shepherding", "owned", run_shepherd.LEGACY_OWNED, True),
+        # The pair mctl-api should never send, pinned because nothing in this
+        # repo can pin what it sends: `is True` is the only condition the
+        # pre-split bool ever answered True on, so it is tested FIRST and this
+        # row still sweeps nothing.
+        ("running, shepherding, query flagged unknown", "ownedbutnotknown",
+         run_shepherd.LEGACY_OWNED, True),
     ],
 )
-def test_the_tristate_probe_maps_every_path(monkeypatch, capsys, name, setup, expected) -> None:
-    """One row per failure path, and each asserts the tri-state AND the
-    unchanged bool. The bool is the sweep's decision: this file's older tests
-    pin it path by path, and none of them may move."""
+def test_the_tristate_probe_maps_every_path(
+    monkeypatch, capsys, name, setup, expected, want_bool
+) -> None:
+    """One row per path, asserting the tri-state AND the bool.
+
+    `want_bool` is written out rather than derived from `expected`: derived, it
+    would restate the wrapper's definition and pass however the wrapper was
+    changed. Spelled out, it is the pre-PR behaviour, which is what must not
+    move — the bool is the sweep's decision."""
     monkeypatch.setenv("MCTL_TOKEN", "tok")
     slug = "issue-10-test"
 
@@ -5012,8 +5023,13 @@ def test_the_tristate_probe_maps_every_path(monkeypatch, capsys, name, setup, ex
         monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
             lambda r, timeout=None: _FakeHTTPResponse(
                 b'{"status": "Running", "shepherd_in_loop": true}')))
+    elif setup == "ownedbutnotknown":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
+            lambda r, timeout=None: _FakeHTTPResponse(
+                b'{"status": "Running", "shepherd_in_loop": true,'
+                b' "shepherd_in_loop_known": false}')))
 
     assert run_shepherd._dev_loop_owns_answer("mctl-web", slug) == expected
     # The decision the sweep actually makes, unchanged in every case.
-    assert run_shepherd._dev_loop_owns("mctl-web", slug) is (expected == run_shepherd.LEGACY_OWNED)
+    assert run_shepherd._dev_loop_owns("mctl-web", slug) is want_bool
     capsys.readouterr()

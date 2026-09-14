@@ -262,9 +262,18 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     #    shepherd, which is a real "does not drive this".
     if "shepherd_in_loop" not in payload:
         return LEGACY_UNKNOWN
+    # `is True` FIRST, and the order is the invariant rather than a preference.
+    # It is the only condition the pre-split bool ever answered True on, so
+    # testing it before anything else makes "unchanged answer for every input"
+    # true by construction instead of by an assumption about which field
+    # combinations mctl-api can produce. A payload carrying true together with
+    # known=false -- which this repo pins nowhere -- would otherwise answer
+    # UNKNOWN, and the ref would be swept while a live DevLoop drives it.
+    if payload.get("shepherd_in_loop") is True:
+        return LEGACY_OWNED
     if payload.get("shepherd_in_loop_known") is False:
         return LEGACY_UNKNOWN
-    return LEGACY_OWNED if payload.get("shepherd_in_loop") is True else LEGACY_FREE
+    return LEGACY_FREE
 
 
 def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
