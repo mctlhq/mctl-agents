@@ -65,17 +65,6 @@ from orchestrator.lifecycle.contract import (
     OwnershipAnswer,
 )
 
-
-def _devloop_workflow_org() -> str:
-    """`run_shepherd.DEVLOOP_WORKFLOW_ORG`, imported the way this module
-    imports everything from there: inside a function. `run_shepherd` pulls in
-    the agent SDK at import time, and a module-level import here would make
-    that a cost of merely reading the report's vocabulary."""
-    from orchestrator.run_shepherd import DEVLOOP_WORKFLOW_ORG
-
-    return DEVLOOP_WORKFLOW_ORG
-
-
 #: The report's decision vocabulary. Closed, like every other vocabulary in
 #: this package: an operator reviewing a dry run must be able to enumerate what
 #: they might see.
@@ -83,16 +72,6 @@ DECISION_ALREADY_OWNED = "already-owned"
 DECISION_DEVLOOP = "devloop-workflow"
 DECISION_AMBIGUOUS = "ambiguous"
 
-#: The org devloop_workflow_id builds ids under. Checked before a bootstrap
-#: writes one, because that function's org is fail-open on a read and durable
-#: on a write.
-#:
-#: IMPORTED, not transcribed. A second "mctlhq" here would be a check that can
-#: disagree with the thing it checks -- and it would fail in the quiet
-#: direction, refusing every entity as "in another repository" rather than
-#: erroring, so the run would go red with a reason naming the wrong cause.
-#: Read at import time, which is fine: it is a module constant, not env.
-DEVLOOP_WORKFLOW_OWNER = _devloop_workflow_org()
 
 #: Prefix on the report line. stdout carries other things -- _discover_refs
 #: prints a skip notice per unowned service, and a probe thread past its budget
@@ -315,6 +294,7 @@ def plan_for(
     legacy_answer: str,
     *,
     repo: str,
+    held: bool | None,
 ) -> Plan:
     """The import ladder for one entity. Four rungs, in this order:
 
@@ -378,12 +358,16 @@ def plan_for(
     )
 
     if answer.verdict in (OWNED_BY_OTHER, OWNED_BY_ME):
-        # ONE predicate for "does the store withhold this entity", shared with
-        # the shadow compare. Re-deriving it here is the coupling every other
-        # module in this package refuses, and the two answers differ precisely
-        # on the dangerous shape -- see the docstring.
-        holds = shadow.held(answer)
-        if holds is None:
+        # `held` is PASSED IN, evaluated once by build_report, rather than
+        # computed here. Not tidiness: the first version of this fix keyed rung
+        # 1 on `shadow.held` and left build_report selecting the probe set on
+        # the VERDICT, so a dead row fell through rung 1 exactly as intended
+        # and arrived with LEGACY_UNKNOWN because it had never been probed --
+        # rung 3 unreachable for the dangerous class, and `retryable` claiming
+        # a probe that was never attempted. Two readings of one question is the
+        # same defect the fix was for, one function further out. One evaluation
+        # per entity, at the point that also decides who gets probed.
+        if held is None:
             # A held verdict whose held-ness cannot be read: either no record
             # came back with it, or the server predates `derived.held`. Both
             # are "the owner cannot be seen", which is the condition the
@@ -398,7 +382,7 @@ def plan_for(
                 "owner undetermined (mctl-api predates the derived block?)"
             )
             return base
-        if holds:
+        if held:
             base.decision = DECISION_ALREADY_OWNED
             owner = answer.ownership.owner if answer.ownership else Owner()
             base.owner_type, base.owner_id = owner.type, owner.id
@@ -421,7 +405,18 @@ def plan_for(
         # rule: this value is written durably into temporal_workflow_id, and
         # "the id recorded is the one the probe just confirmed alive" holds
         # only while the two agree.
-        from orchestrator.run_shepherd import devloop_workflow_id
+        # DEVLOOP_WORKFLOW_ORG comes from there too, rather than being spelled
+        # again here. `devloop_workflow_id` builds ids under it and this branch
+        # checks the pull request against it; two copies is a check that can
+        # disagree with the thing it checks, and it would fail quietly -- every
+        # entity refused as "in another repository", a red run whose reason
+        # names the wrong cause.
+        #
+        # Imported HERE rather than at module scope: `run_shepherd` pulls in
+        # the agent SDK at import time, and this module is imported by things
+        # that only want the report's vocabulary. Every other name from there
+        # is deferred the same way.
+        from orchestrator.run_shepherd import DEVLOOP_WORKFLOW_ORG, devloop_workflow_id
 
         # The WHOLE repo, not just the org, and CASE-INSENSITIVELY. GitHub
         # treats owner and repository names case-insensitively, so a `pr:`
@@ -434,7 +429,7 @@ def plan_for(
         # org alone let a proposal under agents-state/mctl-web whose `pr:`
         # points at mctlhq/something-else be imported as an owner naming
         # another repository's workflow.
-        expected_repo = f"{DEVLOOP_WORKFLOW_OWNER}/{ref.service}"
+        expected_repo = f"{DEVLOOP_WORKFLOW_ORG}/{ref.service}"
         if repo.casefold() != expected_repo.casefold():
             # UNDETERMINED, and this is the important half. A live DevLoop is
             # confirmed driving this entity — that is what LEGACY_OWNED means —
@@ -688,11 +683,21 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
     # which is precisely the store-permits-old-forbids class this tool exists
     # to remove.
     ordered = sorted(by_entity)
-    undecided = [
-        entity_id
-        for entity_id in ordered
-        if answers[entity_id].verdict not in (OWNED_BY_OTHER, OWNED_BY_ME)
-    ]
+    # ONE evaluation of "does the store withhold this entity", here, feeding
+    # both the probe set and rung 1. Keyed on the VERDICT this excluded a dead
+    # `active` row from the probe set -- it answers OWNED_BY_OTHER -- so the
+    # entity reached the ladder with LEGACY_UNKNOWN and stopped at rung 2,
+    # undetermined and wrongly `retryable`, with rung 3 unreachable for the one
+    # class this tool exists to remove.
+    #
+    # `is False`, not `is not True`: None is a record whose held-ness the
+    # server did not report, and rung 1 answers undetermined for it whatever
+    # the probe says. Probing it would spend the budget on entities already
+    # decided -- and against an mctl-api predating the `derived` block that is
+    # EVERY entity, turning a run that should fail fast into one that burns
+    # PROBE_BUDGET_S first.
+    held_by_entity = {entity_id: shadow.held(answers[entity_id]) for entity_id in ordered}
+    undecided = [entity_id for entity_id in ordered if held_by_entity[entity_id] is False]
     legacy_by_entity = dict(
         zip(
             undecided,
@@ -711,7 +716,12 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
         # — the exact rule the abort exists to forbid.
         answer = answers[entity_id]
         plan = plan_for(
-            ref, entity_id, answer, legacy_by_entity.get(entity_id, LEGACY_UNKNOWN), repo=repo
+            ref,
+            entity_id,
+            answer,
+            legacy_by_entity.get(entity_id, LEGACY_UNKNOWN),
+            repo=repo,
+            held=held_by_entity[entity_id],
         )
         if plan.decision == DECISION_AMBIGUOUS:
             report.ambiguous.append(plan)

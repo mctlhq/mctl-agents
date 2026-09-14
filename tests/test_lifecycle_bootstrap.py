@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.lifecycle import bootstrap
+from orchestrator.lifecycle import bootstrap, shadow
 from orchestrator.lifecycle.contract import (
     OWNED_BY_OTHER,
     UNKNOWN,
@@ -87,6 +87,7 @@ def test_any_unknown_aborts_the_whole_run_with_nothing_written() -> None:
 @pytest.mark.parametrize(
     (
         "verdict",
+        "held",
         "legacy",
         "want_decision",
         "want_owner_type",
@@ -96,40 +97,58 @@ def test_any_unknown_aborts_the_whole_run_with_nothing_written() -> None:
     [
         (
             OWNED_BY_OTHER,
+            True,
             LEGACY_FREE,
             bootstrap.DECISION_ALREADY_OWNED,
             "shepherd",
             False,
             False,
         ),
-        (UNOWNED, LEGACY_OWNED, bootstrap.DECISION_DEVLOOP, "devloop-workflow", False, False),
+        (
+            UNOWNED,
+            False,
+            LEGACY_OWNED,
+            bootstrap.DECISION_DEVLOOP,
+            "devloop-workflow",
+            False,
+            False,
+        ),
         # No live DevLoop: AMBIGUOUS, not a shepherd row. Importing one turns
         # an agreeing entity into store-forbids-old-permits for the length of
         # its liveness bound, and nothing heartbeats it. NOT undetermined --
         # this is the ordinary outcome and a run made of it is a success.
-        (UNOWNED, LEGACY_FREE, bootstrap.DECISION_AMBIGUOUS, "", False, False),
+        (UNOWNED, False, LEGACY_FREE, bootstrap.DECISION_AMBIGUOUS, "", False, False),
         # The probe could not answer. NOT "no DevLoop": falling through to the
         # shepherd rung would hand it a pull request another machine may be
         # pushing to -- the exact condition the store exists to prevent.
         #
         # The ONLY retryable rung: the probe is the one producer of
         # `undetermined` a re-run can plausibly answer differently.
-        (UNOWNED, LEGACY_UNKNOWN, bootstrap.DECISION_AMBIGUOUS, "", True, True),
+        (UNOWNED, False, LEGACY_UNKNOWN, bootstrap.DECISION_AMBIGUOUS, "", True, True),
     ],
 )
 def test_the_import_ladder(
-    verdict, legacy, want_decision, want_owner_type, want_undetermined, want_retryable
+    verdict, held, legacy, want_decision, want_owner_type, want_undetermined, want_retryable
 ) -> None:
-    held = Ownership(
+    # `held` is now an INPUT to the ladder, evaluated once by build_report and
+    # passed in, so it belongs in the table beside the verdict rather than
+    # being implied by the record. The two are independent: a holding verdict
+    # with held False is a record past its liveness bound, and that row lives
+    # in its own tests below.
+    record = Ownership(
         entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
         phase="review-remediation",
         owner=Owner(type="shepherd", id="shepherd:mctl-web"),
         state="active",
         healthy=True,
-        held=True,
+        held=held,
     )
-    answer = OwnershipAnswer(verdict=verdict, ownership=held if verdict == OWNED_BY_OTHER else None)
-    plan = bootstrap.plan_for(_ref(), "mctlhq/mctl-web#42", answer, legacy, repo="mctlhq/mctl-web")
+    answer = OwnershipAnswer(
+        verdict=verdict, ownership=record if verdict == OWNED_BY_OTHER else None
+    )
+    plan = bootstrap.plan_for(
+        _ref(), "mctlhq/mctl-web#42", answer, legacy, repo="mctlhq/mctl-web", held=held
+    )
     assert plan.decision == want_decision
     assert plan.owner_type == want_owner_type
     # The ladder table is the one place all rungs sit together, so it is where
@@ -185,6 +204,7 @@ def test_a_dead_record_does_not_stop_the_ladder() -> None:
         _holding(_record(held=False, healthy=False)),
         LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_DEVLOOP
     assert plan.owner_type == "devloop-workflow"
@@ -206,6 +226,7 @@ def test_a_live_record_still_stops_the_ladder() -> None:
         _holding(_record(held=True)),
         LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=True,
     )
     assert plan.decision == bootstrap.DECISION_ALREADY_OWNED
     assert plan.owner_id == "shepherd:mctl-web"
@@ -222,6 +243,7 @@ def test_a_dead_record_with_no_devloop_is_ordinary_ambiguity() -> None:
         _holding(_record(held=False, healthy=False)),
         LEGACY_FREE,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.owner_id == ""
@@ -247,6 +269,7 @@ def test_a_record_without_derived_held_is_undetermined_not_already_owned() -> No
         _holding(_record(held=None)),
         LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=None,
     )
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.undetermined is True
@@ -254,33 +277,63 @@ def test_a_record_without_derived_held_is_undetermined_not_already_owned() -> No
     assert "derived.held" in plan.reason
 
 
-def test_rung_one_uses_the_shadow_compares_own_predicate(monkeypatch) -> None:
-    """Not a second implementation of it.
+def test_held_ness_is_asked_once_and_decides_both(monkeypatch) -> None:
+    """The probe set and rung 1 must come from ONE evaluation.
 
-    The two answers differ on exactly the dangerous shape, so the guarantee
-    worth pinning is that there is ONE predicate rather than two that agree
-    today. Moving `shadow.held` has to move rung 1; if this module ever
-    re-derives held-ness, the other tests still pass and only this one fails.
+    This is where the first attempt at the dead-record fix went wrong. Rung 1
+    was moved onto `shadow.held` while `build_report` kept selecting the probe
+    set on the VERDICT, so a dead `active` row -- OWNED_BY_OTHER -- was never
+    probed, reached the ladder with LEGACY_UNKNOWN, fell through rung 1 exactly
+    as intended and stopped at rung 2: undetermined, `retryable` claiming a
+    probe that was never attempted, and rung 3 unreachable for the one class
+    the tool exists to remove. Two readings of one question, one function
+    further out than the defect being fixed.
 
-    The record says held=True, so a re-derivation from the record -- or from
-    the verdict -- would answer already-owned and the assertion below fails.
+    So the test drives it from `build_report` rather than `plan_for`, and moves
+    `shadow.held` under a record that says held=True. If anything re-derives
+    held-ness from the record or the verdict, the entity is not probed and the
+    decision is already-owned.
     """
-    consulted = []
+    from orchestrator import run_shepherd
 
-    def fake_held(answer):
-        consulted.append(answer)
-        return False
+    monkeypatch.setattr(shadow, "held", lambda answer: False)
+    probed = []
 
-    monkeypatch.setattr(bootstrap.shadow, "held", fake_held)
-    plan = bootstrap.plan_for(
-        _ref(),
-        "mctlhq/mctl-web#42",
-        _holding(_record(held=True)),
-        LEGACY_OWNED,
-        repo="mctlhq/mctl-web",
+    def probe(service, slug):
+        probed.append((service, slug))
+        return LEGACY_OWNED
+
+    client = _Client({"mctlhq/mctl-web#42": _holding(_record(held=True))})
+    report = bootstrap.build_report([_ref()], client, probe)
+
+    assert probed == [("mctl-web", "issue-7-a-thing")], "a held=False entity was not probed"
+    assert [p.decision for p in report.planned] == [bootstrap.DECISION_DEVLOOP]
+    assert report.planned[0].owner_id == run_shepherd.devloop_workflow_id(
+        "mctl-web", "issue-7-a-thing"
     )
-    assert consulted, "rung 1 did not consult shadow.held"
-    assert plan.decision == bootstrap.DECISION_DEVLOOP
+
+
+def test_a_record_the_server_cannot_report_held_for_is_not_probed(monkeypatch) -> None:
+    """`is False`, not `is not True`, and the difference is the budget.
+
+    Rung 1 answers undetermined for a None `held` whatever the probe says, so
+    probing it spends the budget on an entity already decided. Against an
+    mctl-api predating the `derived` block that is EVERY entity: a run that
+    should fail fast would burn PROBE_BUDGET_S first and then fail anyway.
+    """
+    probed = []
+
+    def probe(service, slug):
+        probed.append(slug)
+        return LEGACY_OWNED
+
+    client = _Client({"mctlhq/mctl-web#42": _holding(_record(held=None))})
+    report = bootstrap.build_report([_ref()], client, probe)
+
+    assert probed == [], "an undeterminable record was probed anyway"
+    assert report.planned == []
+    assert report.ambiguous[0].undetermined is True
+    assert report.ambiguous[0].retryable is False
 
 
 def test_a_skipped_service_is_not_imported_either(monkeypatch) -> None:
@@ -303,6 +356,7 @@ def test_a_skipped_service_is_not_imported_either(monkeypatch) -> None:
         OwnershipAnswer(verdict=UNOWNED),
         LEGACY_FREE,
         repo="mctlhq/mctl-claude-remote",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.owner_id == ""
@@ -320,6 +374,7 @@ def test_the_devloop_rung_names_the_workflow_the_probe_confirmed() -> None:
     plan = bootstrap.plan_for(
         _ref(), "mctlhq/mctl-web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert plan.owner_id == "dev-loop-mctlhq-mctl-web-7"
 
@@ -335,10 +390,12 @@ def test_owner_ids_are_deterministic() -> None:
     first = bootstrap.plan_for(
         _ref(), "mctlhq/mctl-web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     second = bootstrap.plan_for(
         _ref(), "mctlhq/mctl-web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert first.owner_id == second.owner_id
     assert first.owner_id == run_shepherd.devloop_workflow_id("mctl-web", "issue-7-a-thing")
@@ -770,7 +827,7 @@ def test_the_policy_ref_does_not_encode_this_pods_environment(monkeypatch) -> No
     assert refs == ["lifecycle-bootstrap:devloop-live"] * 3
 
 
-def test_the_devloop_org_has_one_definition() -> None:
+def test_the_devloop_org_has_one_definition(monkeypatch) -> None:
     """The check and the thing it checks must be the same string.
 
     `devloop_workflow_id` builds `dev-loop-{org}-{service}-{N}` and the
@@ -781,10 +838,35 @@ def test_the_devloop_org_has_one_definition() -> None:
     """
     from orchestrator import run_shepherd
 
-    assert bootstrap.DEVLOOP_WORKFLOW_OWNER == run_shepherd.DEVLOOP_WORKFLOW_ORG
-    assert run_shepherd.devloop_workflow_id("mctl-web", "issue-7-a").startswith(
-        f"dev-loop-{run_shepherd.DEVLOOP_WORKFLOW_ORG}-"
+    monkeypatch.setattr(run_shepherd, "DEVLOOP_WORKFLOW_ORG", "otherorg")
+
+    # The id builder moved...
+    assert run_shepherd.devloop_workflow_id("mctl-web", "issue-7-a") == (
+        "dev-loop-otherorg-mctl-web-7"
     )
+    # ...and so did the guard, in the same direction. Transcribed separately,
+    # this repo would now be refused as "in another repository".
+    accepted = bootstrap.plan_for(
+        _ref(service="mctl-web"),
+        "otherorg/mctl-web#42",
+        OwnershipAnswer(verdict=UNOWNED),
+        LEGACY_OWNED,
+        repo="otherorg/mctl-web",
+        held=False,
+    )
+    assert accepted.decision == bootstrap.DECISION_DEVLOOP
+    assert accepted.owner_id == "dev-loop-otherorg-mctl-web-7"
+
+    refused = bootstrap.plan_for(
+        _ref(service="mctl-web"),
+        "mctlhq/mctl-web#42",
+        OwnershipAnswer(verdict=UNOWNED),
+        LEGACY_OWNED,
+        repo="mctlhq/mctl-web",
+        held=False,
+    )
+    assert refused.decision == bootstrap.DECISION_AMBIGUOUS
+    assert refused.undetermined is True
 
 
 def test_the_workflow_id_has_one_definition() -> None:
@@ -863,6 +945,7 @@ def test_a_pr_outside_the_org_gets_no_devloop_row() -> None:
     plan = bootstrap.plan_for(
         ref, "someone/a-fork#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
         repo="someone/a-fork",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.owner_id == ""
@@ -905,12 +988,11 @@ def test_only_devloop_rows_are_imported() -> None:
     which is where a live DevLoop drives an entity the store has no live owner
     for.
     """
-    from orchestrator.lifecycle import shadow
-
     # What the import fixes.
     driven = bootstrap.plan_for(
         _ref(), "mctlhq/mctl-web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert driven.decision == bootstrap.DECISION_DEVLOOP
     before = shadow.classify(OwnershipAnswer(verdict=UNOWNED), shadow.LEGACY_OWNED)
@@ -921,6 +1003,7 @@ def test_only_devloop_rows_are_imported() -> None:
     undriven = bootstrap.plan_for(
         _ref(), "mctlhq/mctl-web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_FREE,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert undriven.decision == bootstrap.DECISION_AMBIGUOUS
     assert shadow.classify(
@@ -1076,6 +1159,7 @@ def test_the_whole_repo_must_match_the_service() -> None:
         OwnershipAnswer(verdict=UNOWNED),
         LEGACY_OWNED,
         repo="mctlhq/something-else",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.owner_id == ""
@@ -1097,6 +1181,7 @@ def test_the_repo_check_is_case_insensitive() -> None:
     plan = bootstrap.plan_for(
         ref, "mctlhq/MCTL-Web#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
         repo="mctlhq/MCTL-Web",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_DEVLOOP
     assert plan.owner_id == "dev-loop-mctlhq-mctl-web-7"
@@ -1137,6 +1222,7 @@ def test_a_slug_with_no_workflow_id_under_a_live_devloop_is_undetermined() -> No
         OwnershipAnswer(verdict=UNOWNED),
         LEGACY_OWNED,
         repo="mctlhq/mctl-web",
+        held=False,
     )
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.undetermined is True
