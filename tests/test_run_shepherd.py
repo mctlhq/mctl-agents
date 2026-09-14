@@ -5047,9 +5047,17 @@ def test_the_sweep_and_the_wrapper_share_one_predicate() -> None:
     import inspect
 
     source = inspect.getsource(run_shepherd._filter_dev_loop_owned)
+    # The load-bearing half: remove the call and this goes red.
     assert "_owns(answer)" in source
+    # The second half catches the OBVIOUS copy and nothing subtler. Swapped
+    # operands, `answer in (LEGACY_OWNED,)`, or a negation of the other two
+    # values all re-derive the predicate and leave it green. That is accepted
+    # rather than fixed with more string matching: a re-derivation that changed
+    # the decision fails a behavioural test instead — the kept list is pinned
+    # across all three answers in
+    # test_filter_decisions_are_identical_with_the_shadow_on_and_off.
     assert "== LEGACY_OWNED" not in source, (
-        "the sweep re-derives the predicate instead of calling _owns; "
+        "the sweep spells the predicate out instead of calling _owns; "
         "the bool tests then pin a function production does not use"
     )
     for answer, want in (
