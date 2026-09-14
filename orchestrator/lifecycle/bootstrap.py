@@ -1063,7 +1063,19 @@ def apply_report(report: Report, client: OwnershipClient, *, override: str = "")
         refusal = may_apply(plan, override=override)
         if refusal:
             if plan.decision == DECISION_DEVLOOP:
-                report.blocked.append({"entity_id": plan.entity_id, "reason": refusal})
+                # `proposal_ref` too. The field comment calls this list an
+                # action item for a human, and clause 2's reason names "the
+                # proposal's service directory" without saying WHICH -- so the
+                # list said a `.status.yaml` needs editing and not which one.
+                # It is already computed, and passed to `acquire` six lines
+                # down.
+                report.blocked.append(
+                    {
+                        "entity_id": plan.entity_id,
+                        "proposal_ref": plan.proposal_ref,
+                        "reason": refusal,
+                    }
+                )
             continue
         answer = client.acquire(
             EntityRef(kind=KIND_PULL_REQUEST, id=plan.entity_id),
@@ -1143,20 +1155,39 @@ def _print_report(report: Report) -> None:
     # this tool sells as writing nothing -- printed "312 planned, 0 written",
     # indistinguishable in a log tail from 312 rows the store refused.
     #
-    # Counted POSITIVELY, the same way apply_report selects: "to write" must
-    # mean "what a write would attempt", and `planned - already` means
-    # "everything else", which is only the same number while DECISIONS has
-    # three members. A fourth decision routed into `planned` would be counted
-    # here and never written -- a summary promising rows that cannot arrive.
+    # TWO numbers, because they answer two questions and they are not the same
+    # number any more.
+    #
+    # `importable` is the sizing number: how many entities this fleet has that
+    # the ladder would import. It is what `apply_report`'s docstring calls the
+    # bound on an apply, "which is what makes the reviewed dry run a
+    # precondition rather than a courtesy", so it must not shrink to whatever
+    # today's gates happen to allow.
+    #
+    # `writable` is the promise: how many a write would actually attempt. It
+    # asks `may_apply`, because that is what `apply_report` asks. Counting
+    # `decision == DECISION_DEVLOOP` was true when that was the whole
+    # predicate; `may_apply` then grew `entity_id_exact` and the capability
+    # clause, the predicate moved and the count did not follow, and a dry run
+    # over 312 live DevLoops printed "312 to write" for an apply that writes
+    # zero and blocks 312. The dry run cannot say so anywhere else: `blocked`
+    # is populated only by `apply_report`, which runs only under --apply.
+    #
+    # `ownership_override` off the REPORT, not from an argument: this function
+    # takes only a report, and the field exists precisely so a reader can see
+    # what the run claimed.
     already = sum(1 for p in report.planned if p.decision == DECISION_ALREADY_OWNED)
-    writable = sum(1 for p in report.planned if p.decision == DECISION_DEVLOOP)
+    importable = sum(1 for p in report.planned if p.decision == DECISION_DEVLOOP)
+    writable = sum(
+        1 for p in report.planned if not may_apply(p, override=report.ownership_override)
+    )
     # The posture on this channel too. It is the one the docstring says exists
     # to answer "did this work" from a log tail without parsing anything, and
     # without it a dry run and an apply that wrote nothing read identically
     # there -- which is the exact case `applied` was added to the JSON for.
     print(
-        f"lifecycle-bootstrap [{_posture(report)}]: {writable} to write, "
-        f"{already} already owned, {len(report.ambiguous)} ambiguous, "
+        f"lifecycle-bootstrap [{_posture(report)}]: {importable} importable, "
+        f"{writable} writable now, {already} already owned, {len(report.ambiguous)} ambiguous, "
         f"{len(report.written)} written, {len(report.blocked)} blocked, "
         f"{len(report.failed)} failed",
         file=sys.stderr,
@@ -1309,7 +1340,15 @@ def main(argv: list[str] | None = None) -> int:
     # message that re-read the variable itself. That difference is the exact
     # thing naming the raw value exists to surface.
     raw_mode = rollout.raw_mode()
-    if args.assume_tracked_ownership and not args.service:
+    if args.apply and args.assume_tracked_ownership and not args.service:
+        # UNDER --apply only. The override licenses nothing on a dry run --
+        # nothing is written for it to license -- so refusing one that carries
+        # it costs the operator the very report they need and gives back no
+        # safety. An earlier version was deliberately independent of --apply as
+        # "the conservative direction"; conservative about a posture that
+        # writes nothing is just a report withheld, and this module's stronger
+        # invariant is that a dry run always produces one.
+        #
         # The override requires `--service`, and this is the only place scope
         # carries weight. It is not a gate of its own: narrowing a run does not
         # make an unheartbeated row safe, it just makes fewer of them, and an
@@ -1379,7 +1418,8 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(
             Report(
                 aborted=(
-                    f"refused --apply: {rollout.ENV_VAR}={raw_mode!r} reads as "
+                    f"refused --apply: {rollout.ENV_VAR} is "
+                    f"{'unset' if raw_mode is None else repr(raw_mode)} and reads as "
                     f"{configured!r}, expected {rollout.OBSERVE!r}. Below it the owners "
                     "these rows name are not heartbeating; above it the shepherd is "
                     "already reading the store and a bulk import races it."

@@ -142,9 +142,19 @@ def test_raw_mode_answers_what_was_typed(monkeypatch) -> None:
     assert rollout.raw_mode() == " Observe "
 
 
-def test_raw_mode_is_empty_when_unset(monkeypatch) -> None:
-    """Empty, not OFF. This answers "what did the operator type", and for an
-    unset variable that is nothing; `mode()` is what turns nothing into OFF."""
+def test_raw_mode_separates_unset_from_empty(monkeypatch) -> None:
+    """`None` unset, `""` set-to-empty, and never the same value.
+
+    Collapsing them reports a never-set variable as
+    `LIFECYCLE_ROLLOUT_MODE=''` on the one exit built to be diagnostic — and
+    "set it to nothing" and "never set it" are different mistakes with
+    different fixes. This package insists elsewhere that ABSENT is not FALSE
+    for exactly this shape; the same rule applies to a string.
+    """
     monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    assert rollout.raw_mode() is None
+    assert rollout.mode() == rollout.OFF
+
+    monkeypatch.setenv(rollout.ENV_VAR, "")
     assert rollout.raw_mode() == ""
     assert rollout.mode() == rollout.OFF

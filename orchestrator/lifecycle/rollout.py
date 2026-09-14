@@ -79,7 +79,7 @@ def mode() -> str:
     return OFF
 
 
-def raw_mode() -> str:
+def raw_mode() -> str | None:
     """The variable as an operator set it, before normalisation.
 
     Exists so the invariant one table up — "``LIFECYCLE_ROLLOUT_MODE``: read in
@@ -91,11 +91,14 @@ def raw_mode() -> str:
     message naming the raw value exists to surface, so it must come from the
     same place the decision does.
 
-    Empty string when unset, rather than OFF: this answers "what did the
-    operator type", and the answer to that for an unset variable is nothing.
-    ``mode()`` is what turns nothing into OFF.
+    ``None`` when UNSET, and ``""`` when set to an empty value. Collapsing the
+    two would report a never-set variable as ``LIFECYCLE_ROLLOUT_MODE=''`` on
+    the one exit built to be diagnostic — "the operator set it to nothing" and
+    "the operator never set it" being different mistakes with different fixes,
+    and this package insists elsewhere that ABSENT is not FALSE for exactly
+    this shape. ``mode()`` is what turns either into OFF.
     """
-    return os.environ.get(ENV_VAR, "")
+    return os.environ.get(ENV_VAR)
 
 
 def at_least(stage: str) -> bool:

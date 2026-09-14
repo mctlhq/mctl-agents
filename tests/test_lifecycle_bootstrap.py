@@ -1514,7 +1514,7 @@ def test_the_summary_separates_already_owned_from_work(tmp_path, monkeypatch, ca
 
     bootstrap.main(["--state-dir", str(root)])
     err = capsys.readouterr().err
-    assert "0 to write, 1 already owned" in err
+    assert "0 importable, 0 writable now, 1 already owned" in err
 
 
 def test_a_pr_url_that_is_not_a_pull_request_is_rejected() -> None:
@@ -1979,27 +1979,44 @@ def test_one_refusal_does_not_stop_the_batch() -> None:
     assert [f["entity_id"] for f in report.failed] == ["mctlhq/mctl-web#43"]
 
 
-def test_to_write_counts_what_a_write_would_attempt(capsys) -> None:
-    """Positively, the way apply_report selects.
+def test_the_summary_separates_importable_from_writable(capsys) -> None:
+    """Two numbers, because they answer two questions.
 
-    `planned - already` means "everything else", which equals "what will be
-    written" only while DECISIONS has three members -- so the two expressions
-    agree on every input this code can currently produce, and a test built from
-    real reports cannot tell them apart. This one supplies the fourth decision
-    directly, which is the case the negative form gets wrong: a summary
-    promising rows that apply_report will skip.
+    `importable` is the sizing number an operator reads the dry run for — what
+    the ladder WOULD import, the bound `apply_report`'s docstring calls the
+    reason the reviewed dry run is a precondition. `writable` is the promise:
+    what a write would actually attempt, which asks `may_apply` because that is
+    what `apply_report` asks.
+
+    They diverge, and not hypothetically: with `OWNERSHIP_CAPABILITY_KNOWN`
+    False a dry run over 312 live DevLoops printed "312 to write" for an apply
+    that writes zero and blocks 312 — and the dry run cannot say so anywhere
+    else, since `blocked` is populated only under --apply.
+
+    The fourth decision is still here, because that is the case the ORIGINAL
+    negative count got wrong and it must not come back: a decision routed into
+    `planned` that no writer selects must be in neither number.
     """
     report = bootstrap.Report(
         planned=[
-            bootstrap.Plan(entity_id="a", decision=bootstrap.DECISION_DEVLOOP),
+            bootstrap.Plan(entity_id="a", decision=bootstrap.DECISION_DEVLOOP, entity_id_exact=True),
             bootstrap.Plan(entity_id="b", decision=bootstrap.DECISION_ALREADY_OWNED),
             bootstrap.Plan(entity_id="c", decision="some-future-decision"),
         ]
     )
     bootstrap._print_report(report)
     err = capsys.readouterr().err
-    assert "1 to write" in err, err
+    # Importable counts the ladder's answer; writable asks the gate, and with
+    # no override the capability clause refuses it.
+    assert "1 importable" in err, err
+    assert "0 writable now" in err, err
     assert "1 already owned" in err
+
+    report.ownership_override = "checked by hand"
+    bootstrap._print_report(report)
+    err = capsys.readouterr().err
+    assert "1 importable" in err, err
+    assert "1 writable now" in err, err
 
 
 def test_the_stderr_summary_carries_the_posture_too(tmp_path, monkeypatch, capsys) -> None:
@@ -2073,6 +2090,49 @@ def test_the_report_records_whether_it_was_asked_to_write(tmp_path, monkeypatch,
     assert {k: v for k, v in dry.items() if k != "applied"} == {
         k: v for k, v in applied.items() if k != "applied"
     }, "the two postures differ in no other field, which is why this one is needed"
+
+
+def test_an_unset_mode_is_named_as_unset(tmp_path, monkeypatch, capsys) -> None:
+    """Not `''`. A never-set variable and one set to an empty string are
+    different mistakes with different fixes, and this is the exit built to tell
+    an operator which one they made."""
+    from orchestrator import run_shepherd
+
+    monkeypatch.delenv("LIFECYCLE_ROLLOUT_MODE", raising=False)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    _install_client(monkeypatch, _Client())
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
+    aborted = _report_of(capsys.readouterr().out)["aborted"]
+    assert "LIFECYCLE_ROLLOUT_MODE is unset" in aborted
+    assert "is ''" not in aborted
+
+
+def test_a_dry_run_carrying_the_override_still_reports(tmp_path, monkeypatch, capsys) -> None:
+    """The override licenses nothing on a dry run, so refusing one that carries
+    it costs the report and buys no safety.
+
+    An earlier version refused it independently of --apply as "the
+    conservative direction". Conservative about a posture that writes nothing
+    is a report withheld, and this module's stronger invariant is that a dry
+    run always produces one.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert (
+        bootstrap.main(["--state-dir", str(root), "--assume-tracked-ownership", _OVERRIDE]) == 0
+    )
+    report = _report_of(capsys.readouterr().out)
+    assert report["aborted"] == ""
+    assert report["counts"]["devloop-workflow"] == 1
+    assert client.acquires == []
 
 
 def test_a_mistyped_mode_is_named_as_typed(tmp_path, monkeypatch, capsys) -> None:
