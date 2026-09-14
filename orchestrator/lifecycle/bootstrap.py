@@ -22,11 +22,13 @@ KNOWN LIMITS, written down rather than left to be rediscovered:
   hazard is the Temporal worker's. Setting the variable here with the worker
   still off passes the gate. The mode is echoed into the report so what was
   claimed sits next to what it licensed.
-- **``pr-steward:{owner}/{repo}`` is not a pinned contract.** The actual
-  pr-steward lives in another repository and nothing here fixes the id format
-  it reads or writes. If it claims rows under a different shape, these rows
-  name an owner it will not recognise — recoverable (the rows are takeable once
-  dead) but worth knowing before a fleet-wide apply.
+- **Only DevLoop rows are imported.** The shepherd and pr-steward rungs were
+  here and are gone: ``shadow.classify`` has one owner-type arm, so importing
+  those rows turns an *agreeing* entity into ``store-forbids-old-permits``
+  until the row dies at its liveness bound — and nothing in this repo
+  heartbeats, progresses or releases them, because there are exactly two
+  ownership writers and neither is theirs. They come back when their owners
+  have real lifecycle writers.
 - **A terminal pull request can be imported as active.** Discovery reads
   ``.status.yaml``, so a PR merged or closed out of band whose status still
   says ``implemented`` becomes an active row. It withholds the entity from
@@ -57,8 +59,6 @@ from orchestrator.lifecycle.contract import (
     OWNED_BY_ME,
     OWNED_BY_OTHER,
     OWNER_DEVLOOP_WORKFLOW,
-    OWNER_PR_STEWARD,
-    OWNER_SHEPHERD,
     PHASE_REVIEW_REMEDIATION,
     UNKNOWN,
     EntityRef,
@@ -71,8 +71,6 @@ from orchestrator.lifecycle.contract import (
 #: they might see.
 DECISION_ALREADY_OWNED = "already-owned"
 DECISION_DEVLOOP = "devloop-workflow"
-DECISION_PR_STEWARD = "pr-steward"
-DECISION_SHEPHERD = "shepherd"
 DECISION_AMBIGUOUS = "ambiguous"
 
 #: The org devloop_workflow_id builds ids under. Checked before a bootstrap
@@ -89,8 +87,6 @@ REPORT_MARKER = "lifecycle-bootstrap-report:"
 DECISIONS = (
     DECISION_ALREADY_OWNED,
     DECISION_DEVLOOP,
-    DECISION_PR_STEWARD,
-    DECISION_SHEPHERD,
     DECISION_AMBIGUOUS,
 )
 
@@ -192,27 +188,6 @@ class Report:
         }
 
 
-def owner_for(decision: str, *, service: str, repo: str) -> Owner:
-    """The owner a decision names.
-
-    Covers the two POLICY-derived owners only. The devloop-workflow owner is
-    built in `plan_for` instead, because its id comes from the slug rather than
-    from policy — the one thing this function cannot answer from `service` and
-    `repo` alone.
-
-    Ids are DETERMINISTIC -- `shepherd:{service}`, never a pod name or a
-    timestamp. Idempotence rests on two legs and this is the second one: the
-    read-first pass skips entities that already have a row, and a deterministic
-    id means a re-run that races that pass writes the same owner rather than
-    colliding with itself and answering 409 for every entity.
-    """
-    if decision == DECISION_PR_STEWARD:
-        return Owner(type=OWNER_PR_STEWARD, id=f"pr-steward:{repo}")
-    if decision == DECISION_SHEPHERD:
-        return Owner(type=OWNER_SHEPHERD, id=f"shepherd:{service}")
-    raise ValueError(f"decision {decision!r} names no policy-derived owner")
-
-
 def plan_for(
     ref,
     entity_id: str,
@@ -310,22 +285,35 @@ def plan_for(
         base.reason = "a live DevLoopWorkflow is driving this pull request"
         return base
 
-    if policy.default_owner_for(ref.service) == OWNER_PR_STEWARD:
-        base.decision = DECISION_PR_STEWARD
-        owner = owner_for(DECISION_PR_STEWARD, service=ref.service, repo=repo)
-        base.owner_type, base.owner_id = owner.type, owner.id
-        base.reason = f"{ref.service} is skipped by the shepherd; its PRs belong to pr-steward"
-        return base
-
-    if ref.proposal_dir is not None and ref.pr_url:
-        base.decision = DECISION_SHEPHERD
-        owner = owner_for(DECISION_SHEPHERD, service=ref.service, repo=repo)
-        base.owner_type, base.owner_id = owner.type, owner.id
-        base.reason = "a proposal with an open pull request and no live DevLoop"
-        return base
-
+    # NO shepherd or pr-steward rung. Both were here and both are gone, for two
+    # reasons that compound.
+    #
+    # They make the measurement WORSE. shadow.classify has one owner-type arm,
+    # and it is devloop-workflow. An entity the old mechanism does not drive
+    # reads `agree` today (no row, held False, legacy FREE). Import a shepherd
+    # row and the same entity reads `store-forbids-old-permits` — until the row
+    # dies at its liveness bound and it reads `agree` again, restored by the
+    # row rotting rather than by anything being right. Zero reduction in the
+    # dangerous class, manufactured volume in the conservative one.
+    #
+    # And nothing maintains them. This repo has exactly two ownership writers:
+    # DevLoopWorkflow's activity, and this function. Nothing acquires,
+    # progresses, heartbeats, releases or terminates a `shepherd:{service}` or
+    # `pr-steward:{repo}` row — run_shepherd only ever READS the store, through
+    # the shadow compare. Flipping the worker to observe makes the devloop rows
+    # live; it does nothing for these. They would be durable rows for owners
+    # with no lifecycle, and a re-run cannot correct them because already-owned
+    # is skipped.
+    #
+    # The dangerous class comes from entities a live DevLoop drives and the
+    # store has no live owner for. That is the rung above, and it is the whole
+    # job of a pre-soak import. These two come back when their owners have real
+    # writers — #57 phase 2, not this.
     base.decision = DECISION_AMBIGUOUS
-    base.reason = "no rule in the ladder applied"
+    base.reason = (
+        f"no live DevLoop drives this; {policy.default_owner_for(ref.service)} would own it, "
+        "and that owner type has no lifecycle writer yet"
+    )
     return base
 
 
@@ -531,10 +519,15 @@ def _print_report(report: Report) -> None:
     if report.aborted:
         print(f"lifecycle-bootstrap: ABORTED: {report.aborted}", file=sys.stderr)
         return
+    # `already-owned` counted apart from the work. Both live in `planned` and
+    # apply_report skips the first, so the idempotent second run -- the one
+    # this tool sells as writing nothing -- printed "312 planned, 0 written",
+    # indistinguishable in a log tail from 312 rows the store refused.
+    already = sum(1 for p in report.planned if p.decision == DECISION_ALREADY_OWNED)
     print(
-        f"lifecycle-bootstrap: {len(report.planned)} planned, "
-        f"{len(report.ambiguous)} ambiguous, {len(report.written)} written, "
-        f"{len(report.failed)} failed",
+        f"lifecycle-bootstrap: {len(report.planned) - already} to write, "
+        f"{already} already owned, {len(report.ambiguous)} ambiguous, "
+        f"{len(report.written)} written, {len(report.failed)} failed",
         file=sys.stderr,
     )
 
@@ -555,7 +548,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
 
-    if args.apply and not rollout.records_writes():
+    if args.apply and rollout.mode() != rollout.OBSERVE:
         # The one switch every other writer in this package honours. At `off`
         # the DevLoopWorkflow's own ownership activity short-circuits, so a row
         # this tool writes for a devloop-workflow owner is never heartbeated,
@@ -567,11 +560,34 @@ def main(argv: list[str] | None = None) -> int:
         # then bootstrap, then flip the SHEPHERD (the comparison starts against
         # a populated store). Writing first and flipping after fills the store
         # with rows nobody refreshes.
-        print(
-            f"refusing --apply: {rollout.ENV_VAR}={rollout.mode()}. "
-            "Rows written below `observe` are never heartbeated by the owners they name. "
-            "Set the worker to observe first, then re-run.",
-            file=sys.stderr,
+        #
+        # EXACTLY observe, not records_writes(), which is at_least(OBSERVE) and
+        # so also true at enforce and only. That is a SECOND hazard: at enforce
+        # the shepherd is already CONSUMING the store, so a bulk import races a
+        # live reader and bypasses the staged order above. A pre-soak migration
+        # has no business running after the soak.
+        #
+        # THE LIMIT OF THIS GATE, stated because it is not obvious: the mode is
+        # read from THIS process's environment, and the orphan hazard belongs
+        # to the TEMPORAL WORKER, which this process cannot see. It is an
+        # operator ATTESTATION, not a verification -- the WorkflowTemplate
+        # makes it an explicit parameter for that reason, and the mode is
+        # echoed into the report so the claim sits beside what it licensed.
+        # A report on this path too. The marker exists so a consumer can always
+        # find the report by grepping for it, and an Argo step reading it as an
+        # output parameter gets nothing if this is the one exit that prints
+        # none — a different failure from "the report says it refused". The
+        # mode IS the answer here, which is what rollout_mode is for.
+        _print_report(
+            Report(
+                aborted=(
+                    f"refused --apply: {rollout.ENV_VAR}={rollout.mode()!r}, expected "
+                    f"{rollout.OBSERVE!r}. Below it the owners these rows name are not "
+                    "heartbeating; above it the shepherd is already reading the store "
+                    "and a bulk import races it."
+                ),
+                rollout_mode=rollout.mode(),
+            )
         )
         return 2
 
@@ -606,9 +622,27 @@ def main(argv: list[str] | None = None) -> int:
         apply_report(report, client)
 
     _print_report(report)
-    if report.aborted:
+    if report.aborted or report.failed:
         return 1
-    return 1 if report.failed else 0
+    # A run that classified nothing, or an --apply that wrote nothing, must not
+    # look like a successful import.
+    #
+    # The likeliest way to import nothing is SILENT: with MCTL_TOKEN unset the
+    # probe answers LEGACY_UNKNOWN for every ref and prints nothing at all
+    # ("never asked"), so every plan is ambiguous, `planned` is empty, `failed`
+    # is empty, and the Argo step goes green having done nothing. A checkout
+    # mounted one level off reads the same.
+    if not report.planned and not report.ambiguous:
+        print("lifecycle-bootstrap: discovered no proposals at all", file=sys.stderr)
+        return 1
+    if args.apply and not report.planned:
+        print(
+            f"lifecycle-bootstrap: --apply had nothing to write; "
+            f"{len(report.ambiguous)} entit(ies) were ambiguous",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
