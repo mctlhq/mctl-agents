@@ -943,10 +943,11 @@ def main(argv: list[str] | None = None) -> int:
         #     mistyped, so it falls through to "discovered no proposals at
         #     all", which exits 1 WITH a report;
         #   - the state dir is missing or unreadable -> an infrastructure
-        #     fault, not an argument error. Both are answered ABOVE this block
-        #     and above the --apply refusal, so one broken mount reads the same
-        #     way whichever flags the run carried; the walk's own guard below
-        #     catches what happens after this instant.
+        #     fault, not an argument error. Missing is answered above this
+        #     block; unreadable AT THE ROOT by the arm just below, because that
+        #     is the read this check itself makes; and unreadable at any
+        #     greater depth by the walk's own guard, which is the only thing
+        #     that can see it.
         #
         # The distinction is which red an operator can act on, and it is why
         # this refusal prints a report rather than calling `parser.error`:
@@ -980,6 +981,57 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
+
+    # THE REFUSAL FIRST, because it is DETERMINISTIC and needs nothing.
+    #
+    # There is no `acquire` in this module, so the answer does not depend on
+    # anything discovery learns -- and discovery is the opposite of cheap:
+    # `_discover_refs` shells `gh pr list` for every proposal with no `pr:`,
+    # serially, gated on `reconcile` rather than on `dry_run`, so a dry run
+    # suppresses the `.status.yaml` rewrite and not the subprocess. Behind it,
+    # the production invocation (`dry_run=false` -> `--apply`) walked the whole
+    # fleet and spent GitHub quota per PR-less proposal before printing one
+    # sentence of refusal.
+    #
+    # It sat behind discovery for one commit, to make `an infrastructure fault
+    # outranks a policy refusal` true at every depth. The depth gap is closed
+    # by the WALK'S OWN GUARD, which is where it belongs and where it stays;
+    # the refusal's position was never what closed it. What moving the refusal
+    # bought was that a REFUSED run also learns about a broken mount -- and a
+    # refused run does nothing, so its complete and correct answer is `this
+    # flag does nothing in this build`. The mount is reported by the re-run
+    # the refusal asks for.
+
+    if args.apply:
+        # This module PLANS. There is no writer in it -- no `acquire` call
+        # exists to gate -- so the refusal is unconditional rather than a
+        # rollout check that would be theatre over a no-op.
+        #
+        # Exit 2 and a REPORT, not a bare argparse error, for the reason the
+        # marker exists: an Argo step reads the report as an output parameter,
+        # and the one exit that printed none would be the one an operator most
+        # needs to read. `aborted` says which build this is.
+        #
+        # The gate this becomes is stated here so the order is not rediscovered
+        # when the writer lands: --apply will require EXACTLY `observe`. Below
+        # it the DevLoopWorkflow's own ownership activity short-circuits, so a
+        # row naming a devloop-workflow owner is never heartbeated, progressed
+        # or released by the workflow it names -- it sits `active` until its
+        # liveness bound expires, held by an owner that does not know it holds
+        # anything. Above it the shepherd is already CONSUMING the store, so a
+        # bulk import races a live reader. The order is: flip the WORKER to
+        # observe, then bootstrap, then flip the SHEPHERD.
+        _print_report(
+            Report(
+                aborted=(
+                    "refused --apply: this build plans and reports only; the write "
+                    "path (rollout gate, acquire, idempotence) is a separate change. "
+                    "Re-run without --apply for the report."
+                ),
+                rollout_mode=rollout.mode(),
+            )
+        )
+        return 2
 
     from orchestrator import run_shepherd
     from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
@@ -1062,59 +1114,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 1
-    # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
-    #
-    # "There is no readable checkout" outranks "this build does not write":
-    # the second is about what this run may do, the first about whether there
-    # is anything to do it to, and an operator sent away with the policy
-    # answer learns about the broken volume only on a second run.
-    #
-    # It was in front, with a cheap readability probe hoisted above it to keep
-    # the ordering true. That held for a mount broken AT THE ROOT and not one
-    # directory down: `discover_services` admits a service on a `stat` of its
-    # `proposals/`, so a `proposals/` at 0o111 passed the probe, hit the
-    # refusal, and answered `--apply` and a fleet-wide run differently for one
-    # permission bit. A guard that covers a depth is not a guard that covers
-    # the class.
-    #
-    # Discovery is where the whole class is answered, so the refusals moved
-    # behind it rather than the guard moving forward again. Discovery writes
-    # nothing -- `dry_run=True` unconditionally -- so nothing is risked by
-    # doing it first; what it costs is that a wrong mode is reported after the
-    # walk instead of before it.
-
-    if args.apply:
-        # This module PLANS. There is no writer in it -- no `acquire` call
-        # exists to gate -- so the refusal is unconditional rather than a
-        # rollout check that would be theatre over a no-op.
-        #
-        # Exit 2 and a REPORT, not a bare argparse error, for the reason the
-        # marker exists: an Argo step reads the report as an output parameter,
-        # and the one exit that printed none would be the one an operator most
-        # needs to read. `aborted` says which build this is.
-        #
-        # The gate this becomes is stated here so the order is not rediscovered
-        # when the writer lands: --apply will require EXACTLY `observe`. Below
-        # it the DevLoopWorkflow's own ownership activity short-circuits, so a
-        # row naming a devloop-workflow owner is never heartbeated, progressed
-        # or released by the workflow it names -- it sits `active` until its
-        # liveness bound expires, held by an owner that does not know it holds
-        # anything. Above it the shepherd is already CONSUMING the store, so a
-        # bulk import races a live reader. The order is: flip the WORKER to
-        # observe, then bootstrap, then flip the SHEPHERD.
-        _print_report(
-            Report(
-                aborted=(
-                    "refused --apply: this build plans and reports only; the write "
-                    "path (rollout gate, acquire, idempotence) is a separate change. "
-                    "Re-run without --apply for the report."
-                ),
-                rollout_mode=rollout.mode(),
-            )
-        )
-        return 2
-
-
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
     report.rollout_mode = rollout.mode()
