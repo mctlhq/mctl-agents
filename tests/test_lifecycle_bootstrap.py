@@ -183,6 +183,58 @@ def _holding(record: Ownership) -> OwnershipAnswer:
     return OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=record)
 
 
+def test_an_already_owned_line_carries_the_records_provenance() -> None:
+    """Not this run's.
+
+    `base` is built with POLICY_REF and a proposal_ref derived from the ref
+    being imported -- what a row this run WROTE would say. On an already-owned
+    line those describe a row written by somebody else, at some other time,
+    under some other policy, and the operator reading the dry run line by line
+    cannot tell the two apart because every other field on the line is real.
+    """
+    record = Ownership(
+        entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
+        phase="review-remediation",
+        owner=Owner(type="shepherd", id="shepherd:mctl-web"),
+        state="active",
+        healthy=True,
+        held=True,
+        policy_ref="service-mode:mctl-web=full",
+        proposal_ref="mctl-web/issue-3-something-older",
+        temporal_workflow_id="dev-loop-mctlhq-mctl-web-3",
+    )
+
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        _holding(record),
+        LEGACY_FREE,
+        repo="mctlhq/mctl-web",
+        held=True,
+    )
+    assert plan.decision == bootstrap.DECISION_ALREADY_OWNED
+    assert plan.policy_ref == "service-mode:mctl-web=full"
+    assert plan.proposal_ref == "mctl-web/issue-3-something-older"
+    assert plan.temporal_workflow_id == "dev-loop-mctlhq-mctl-web-3"
+    assert plan.policy_ref != bootstrap.POLICY_REF
+
+
+def test_an_already_owned_line_with_no_record_says_nothing_rather_than_guessing() -> None:
+    """An absent value is readable as absent; a plausible wrong one is not."""
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        OwnershipAnswer(verdict=OWNED_BY_OTHER),
+        LEGACY_FREE,
+        repo="mctlhq/mctl-web",
+        held=True,
+    )
+    assert plan.decision == bootstrap.DECISION_ALREADY_OWNED
+    assert plan.policy_ref == ""
+    assert plan.proposal_ref == ""
+    assert plan.temporal_workflow_id == ""
+
+
 def test_a_dead_record_does_not_stop_the_ladder() -> None:
     """The one shape rung 1 has to get right, and the one the import exists for.
 
@@ -879,42 +931,68 @@ def test_the_policy_ref_does_not_encode_this_pods_environment(monkeypatch) -> No
     assert refs == ["lifecycle-bootstrap:devloop-live"] * 3
 
 
-def test_the_devloop_org_has_one_definition(monkeypatch) -> None:
-    """The check and the thing it checks must be the same string.
+def test_the_workflow_id_is_adapted_not_re_derived(monkeypatch) -> None:
+    """`dev-loop-{owner}-{repo}-{issue}` has ONE definition, and it is the one
+    Temporal starts executions with.
 
-    `devloop_workflow_id` builds `dev-loop-{org}-{service}-{N}` and the
-    bootstrap refuses a pull request whose repository is not `{org}/{service}`.
-    Written out on both sides, a change to one would make the guard refuse
-    every entity as "in another repository" -- red, with a reason naming the
-    wrong cause.
+    `issue_ref.workflow_id_for` is what `temporal.start` names the execution
+    with. `devloop_workflow_id` translates a proposal into the issue URL that
+    function takes; it does not re-derive the id. Transcribed here, a future
+    scheme or validation change would let the liveness probe -- and this
+    bootstrap, which writes the value DURABLY into temporal_workflow_id -- name
+    a workflow Temporal never started.
+
+    Moving `workflow_id_for` has to move the id. Re-deriving it from an
+    f-string would leave the value correct today and this test failing, which
+    is the point: the formats agreeing is not the property worth pinning.
     """
     from orchestrator import run_shepherd
 
-    monkeypatch.setattr(run_shepherd, "DEVLOOP_WORKFLOW_ORG", "otherorg")
-
-    # The id builder moved...
-    assert run_shepherd.devloop_workflow_id("mctl-web", "issue-7-a") == (
-        "dev-loop-otherorg-mctl-web-7"
+    monkeypatch.setattr(run_shepherd, "workflow_id_for", lambda url: f"moved::{url}")
+    assert run_shepherd.devloop_workflow_id("mctl-web", "issue-7-a-thing") == (
+        "moved::https://github.com/mctlhq/mctl-web/issues/7"
     )
-    # ...and so did the guard, in the same direction. Transcribed separately,
-    # this repo would now be refused as "in another repository".
+
+
+def test_the_devloop_org_has_one_definition() -> None:
+    """The check and the thing it checks must be the same string.
+
+    `issue_ref` owns the org: its URL regex is built from `ISSUE_URL_ORG`, and
+    `run_shepherd` re-exports rather than re-spells it. The bootstrap refuses a
+    pull request whose repository is not `{org}/{service}` before writing a row
+    naming that workflow, so a second spelling would be a check able to
+    disagree with the thing it checks -- and it would fail quietly, refusing
+    every entity as "in another repository", a red run whose reason names the
+    wrong cause.
+
+    Identity, not equality: two equal literals is exactly the state this is
+    against.
+    """
+    from orchestrator import run_shepherd
+    from orchestrator.temporal import issue_ref
+
+    assert run_shepherd.DEVLOOP_WORKFLOW_ORG is issue_ref.ISSUE_URL_ORG
+
+    # And the guard resolves through it rather than through a literal.
     accepted = bootstrap.plan_for(
+        _ref(service="mctl-web"),
+        f"{issue_ref.ISSUE_URL_ORG}/mctl-web#42",
+        OwnershipAnswer(verdict=UNOWNED),
+        LEGACY_OWNED,
+        repo=f"{issue_ref.ISSUE_URL_ORG}/mctl-web",
+        held=False,
+    )
+    assert accepted.decision == bootstrap.DECISION_DEVLOOP
+    assert accepted.owner_id == issue_ref.workflow_id_for(
+        f"https://github.com/{issue_ref.ISSUE_URL_ORG}/mctl-web/issues/7"
+    )
+
+    refused = bootstrap.plan_for(
         _ref(service="mctl-web"),
         "otherorg/mctl-web#42",
         OwnershipAnswer(verdict=UNOWNED),
         LEGACY_OWNED,
         repo="otherorg/mctl-web",
-        held=False,
-    )
-    assert accepted.decision == bootstrap.DECISION_DEVLOOP
-    assert accepted.owner_id == "dev-loop-otherorg-mctl-web-7"
-
-    refused = bootstrap.plan_for(
-        _ref(service="mctl-web"),
-        "mctlhq/mctl-web#42",
-        OwnershipAnswer(verdict=UNOWNED),
-        LEGACY_OWNED,
-        repo="mctlhq/mctl-web",
         held=False,
     )
     assert refused.decision == bootstrap.DECISION_AMBIGUOUS

@@ -90,6 +90,7 @@ from orchestrator.lifecycle import shadow
 from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.temporal.issue_ref import ISSUE_URL_ORG, workflow_id_for
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
 
 # ---------------------------------------------------------------------------
@@ -175,39 +176,38 @@ def _owns(answer: str) -> bool:
 
 #: The GitHub org DevLoop workflow ids are built under.
 #:
-#: A CONSTANT rather than a literal inside the f-string, because the ownership
-#: bootstrap has to check it: this function is fail-open on a read (a wrong org
-#: only 404s) and durable on a write (a wrong org becomes a row naming a
-#: workflow that does not exist), so the writer compares the pull request's
-#: repository against this before using an id. Transcribed on both sides, the
-#: check and the thing checked could disagree.
-DEVLOOP_WORKFLOW_ORG = "mctlhq"
+#: RE-EXPORTED from `issue_ref`, which owns both the org and the id format,
+#: rather than declared here. The ownership bootstrap checks a pull request's
+#: repository against this before writing a row that names a workflow, so a
+#: second spelling would be a check that can disagree with the thing it checks.
+DEVLOOP_WORKFLOW_ORG = ISSUE_URL_ORG
 
 
 def devloop_workflow_id(service: str, slug: str) -> str:
     """The DevLoopWorkflow id for a proposal, or "" if it never had one.
 
-    Derived exactly the way start.py derives it. THE definition, not a copy:
-    the ownership bootstrap writes this value durably into a row's
-    temporal_workflow_id, and its guarantee — "the id recorded is the one the
-    probe just confirmed alive" — holds only while the two agree. A second
-    transcription of the regex is a second thing to keep in step.
+    ADAPTS a proposal to `issue_ref.workflow_id_for`; it does not re-derive the
+    id. That function is what `temporal.start` names the execution with, so a
+    second transcription of `dev-loop-{owner}-{repo}-{issue}` here would let a
+    future scheme or validation change make the liveness probe — and the
+    ownership bootstrap, which writes this value DURABLY into a row's
+    temporal_workflow_id — name a workflow Temporal never started.
 
-    `mctlhq` is hardcoded because a ProposalRef carries no repo owner — unlike
-    orphans.py, which derives one from `pr.repo`.
+    The only thing this adds is the translation, which `workflow_id_for` cannot
+    do: a ProposalRef carries an `issue-<N>-` slug and a service directory
+    rather than an issue URL, and no repo owner at all — unlike orphans.py,
+    which derives one from `pr.repo`.
 
-    That is safe on a READ: every proposal the shepherd sweeps lives under this
-    org today, and a wrong owner would only produce a 404, i.e. the fail-open
-    "not owned" path. It is NOT safe on a write, where a wrong owner becomes a
-    durable row naming a workflow that does not exist. The one caller that
-    writes this value — the ownership bootstrap — checks the owner itself
-    before using it, rather than inheriting a justification that holds only for
-    the probe.
+    A slug with no `issue-<N>-` prefix answers "" rather than raising:
+    structurally that proposal never had a DevLoop, which is an answer. The
+    empty string must never become an owner id, and the bootstrap guards on
+    that; `workflow_id_for` raises for a genuinely malformed URL, which cannot
+    arise from a matched slug.
     """
     m = re.match(r"issue-(\d+)-", slug)
     if not m:
         return ""
-    return f"dev-loop-{DEVLOOP_WORKFLOW_ORG}-{service}-{m.group(1)}"
+    return workflow_id_for(f"https://github.com/{DEVLOOP_WORKFLOW_ORG}/{service}/issues/{m.group(1)}")
 
 
 def _dev_loop_owns(service: str, slug: str) -> bool:

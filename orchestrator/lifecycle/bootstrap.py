@@ -352,26 +352,28 @@ def plan_for(
     must not be read as "no DevLoop is driving this": rung 2 exists precisely
     so it cannot fall through to rung 4 and be counted as a measured absence.
 
-    RUNG 1 KEYS ON ``held``, NOT ON THE VERDICT, and the difference is the
-    whole point of the rung. ``verdict_for`` answers OWNED_BY_OTHER for any
-    record in a HOLDING state, healthy or not -- correctly, for its own
-    purpose, which is "may I act". ``shadow.held`` reads the server's
-    ``derived.held``, computed from the TAKEOVER PREDICATE. Those disagree on
-    exactly one shape, and it is the shape this tool exists for: a record left
-    `active` past its liveness bound. The soak sees held=False, and with a live
-    DevLoop reports ``store-permits-old-forbids`` -- the one dangerous class --
-    while a verdict-keyed rung 1 called the same entity already-owned and
-    returned. Rung 1 is terminal, so no re-run would ever revisit it: the
-    import would report a clean run over the very entities it was built to fix.
+    RUNG 1 TAKES BOTH THE VERDICT AND ``held``; see ``_rung_one_answers``,
+    which is the predicate and is shared with the probe set so the two cannot
+    drift. ``held`` is what makes it more than the verdict: ``verdict_for``
+    answers OWNED_BY_OTHER for any record in a HOLDING state, healthy or not --
+    correctly, for its own purpose, which is "may I act" -- while
+    ``shadow.held`` reads the server's ``derived.held``, computed from the
+    TAKEOVER PREDICATE. Those disagree on exactly the shape this tool exists
+    for: a record left `active` past its liveness bound. The soak sees
+    held=False and with a live DevLoop reports ``store-permits-old-forbids``,
+    the one dangerous class, while a verdict-only rung 1 called the same entity
+    already-owned and returned. Rung 1 is terminal, so no re-run would ever
+    revisit it: the import would report a clean run over the very entities it
+    was built to fix.
 
     So a record that holds nothing does not stop the ladder. It falls through,
     and a live DevLoop is recorded as the owner -- which is a TAKEOVER of a
     dead row, and legal for exactly the reason the row reads held=False.
 
     ``held`` unavailable is an ABSENCE, not a third reading. The server may
-    predate the ``derived`` block, in which case every entity answers None and
-    the whole run goes red rather than quietly classifying on a field that is
-    not there.
+    predate the ``derived`` block, in which case every entity under a holding
+    verdict answers None and the whole run goes red rather than quietly
+    classifying on a field that is not there.
     """
     from orchestrator.run_shepherd import LEGACY_OWNED, LEGACY_UNKNOWN
 
@@ -410,8 +412,22 @@ def plan_for(
             return base
         if held:
             base.decision = DECISION_ALREADY_OWNED
-            owner = answer.ownership.owner if answer.ownership else Owner()
+            record = answer.ownership
+            owner = record.owner if record else Owner()
             base.owner_type, base.owner_id = owner.type, owner.id
+            # THE RECORD'S provenance, not this run's. `base` carries
+            # POLICY_REF and a proposal_ref built from the ref being imported,
+            # which are what a row this run WROTE would say. On an
+            # already-owned line they would describe a row written by somebody
+            # else, at some other time, under some other policy -- and the
+            # operator reading the dry run line by line has no way to tell the
+            # two apart, because every other field on the line is real.
+            #
+            # Empty when the record did not come back. An absent value is
+            # readable as absent; a plausible wrong one is not.
+            base.policy_ref = record.policy_ref if record else ""
+            base.proposal_ref = record.proposal_ref if record else ""
+            base.temporal_workflow_id = record.temporal_workflow_id if record else ""
             base.reason = "the store already holds this entity phase"
             return base
         # held=False under a holding verdict: a record past its liveness bound.
