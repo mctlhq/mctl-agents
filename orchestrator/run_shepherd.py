@@ -183,9 +183,15 @@ def devloop_workflow_id(service: str, slug: str) -> str:
     transcription of the regex is a second thing to keep in step.
 
     `mctlhq` is hardcoded because a ProposalRef carries no repo owner — unlike
-    orphans.py, which derives one from `pr.repo`. Every proposal the shepherd
-    sweeps lives under this org today; a wrong owner would only produce a 404,
-    i.e. the fail-open "not owned" path.
+    orphans.py, which derives one from `pr.repo`.
+
+    That is safe on a READ: every proposal the shepherd sweeps lives under this
+    org today, and a wrong owner would only produce a 404, i.e. the fail-open
+    "not owned" path. It is NOT safe on a write, where a wrong owner becomes a
+    durable row naming a workflow that does not exist. The one caller that
+    writes this value — the ownership bootstrap — checks the owner itself
+    before using it, rather than inheriting a justification that holds only for
+    the probe.
     """
     m = re.match(r"issue-(\d+)-", slug)
     if not m:

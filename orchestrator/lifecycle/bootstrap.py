@@ -11,9 +11,33 @@ rules need `.status.yaml` from the gitops checkout, `_service_mode` /
 mctl-api, and moving them there would put a second copy of the shepherd's
 policy in a repository that cannot see the state it applies to.
 
-Run as a one-shot Argo Workflow. ``--dry-run`` is the default posture: the
-report is the deliverable, and an operator reads it against the store and live
+Run as a one-shot Argo Workflow. A dry run is the default posture: the report
+is the deliverable, and an operator reads it against the store and live
 Temporal before anything is written.
+
+KNOWN LIMITS, written down rather than left to be rediscovered:
+
+- **The rollout gate is an attestation, not a verification.** ``--apply``
+  refuses below ``observe``, but the mode it reads is THIS process's, while the
+  hazard is the Temporal worker's. Setting the variable here with the worker
+  still off passes the gate. The mode is echoed into the report so what was
+  claimed sits next to what it licensed.
+- **``pr-steward:{owner}/{repo}`` is not a pinned contract.** The actual
+  pr-steward lives in another repository and nothing here fixes the id format
+  it reads or writes. If it claims rows under a different shape, these rows
+  name an owner it will not recognise — recoverable (the rows are takeable once
+  dead) but worth knowing before a fleet-wide apply.
+- **A terminal pull request can be imported as active.** Discovery reads
+  ``.status.yaml``, so a PR merged or closed out of band whose status still
+  says ``implemented`` becomes an active row. It withholds the entity from
+  nobody who wants it and ages out at its liveness bound, but it inflates
+  ``store-forbids-old-permits`` during the soak. The reconcile pass is what
+  corrects the status; run it first if the counts matter.
+
+``EntityRef`` is sent with no ``version``, unlike DevLoopWorkflow's own
+acquire, which carries ``head_sha``. Deliberate: version is NOT part of the
+ownership key (see contract.py) — it records which version the owner last
+observed, and this process observed none.
 """
 from __future__ import annotations
 
@@ -50,6 +74,17 @@ DECISION_DEVLOOP = "devloop-workflow"
 DECISION_PR_STEWARD = "pr-steward"
 DECISION_SHEPHERD = "shepherd"
 DECISION_AMBIGUOUS = "ambiguous"
+
+#: The org devloop_workflow_id builds ids under. Checked before a bootstrap
+#: writes one, because that function's hardcoded org is fail-open on a read and
+#: durable on a write.
+DEVLOOP_WORKFLOW_OWNER = "mctlhq"
+
+#: Prefix on the report line. stdout carries other things -- _discover_refs
+#: prints a skip notice per unowned service, and a probe thread past its budget
+#: can print after the report -- so finding it must be a grep rather than a
+#: guess about brace positions.
+REPORT_MARKER = "lifecycle-bootstrap-report:"
 
 DECISIONS = (
     DECISION_ALREADY_OWNED,
@@ -111,15 +146,17 @@ class Report:
     written: list[str] = field(default_factory=list)
     failed: list[dict[str, str]] = field(default_factory=list)
     aborted: str = ""
+    #: The rollout mode this run attested to. On the record because the gate
+    #: reads THIS process's environment and not the worker's.
+    rollout_mode: str = ""
 
     def as_dict(self) -> dict[str, Any]:
+        # Computed only where it is used: on the abort path there is nothing
+        # to count, and a partial count is worse than none.
         # BOTH lists. Ambiguous plans land in `ambiguous` and never in
         # `planned`, so counting only the latter left counts["ambiguous"]
         # structurally 0 next to a populated list — and `total`, which the
         # soak's sample target is re-derived from, excluded them entirely.
-        counts = dict.fromkeys(DECISIONS, 0)
-        for plan in [*self.planned, *self.ambiguous]:
-            counts[plan.decision] = counts.get(plan.decision, 0) + 1
         if self.aborted:
             # No counts at all on the abort path. build_report returns before
             # the plan loop, so `ambiguous` holds only the pre-read entries and
@@ -129,14 +166,20 @@ class Report:
             # no reason to check `aborted` first, so it must not be there.
             return {
                 "aborted": self.aborted,
+                "rollout_mode": self.rollout_mode,
                 "counts": None,
                 "planned": [],
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
                 "written": [],
                 "failed": [],
             }
+        counts = dict.fromkeys(DECISIONS, 0)
+        for plan in [*self.planned, *self.ambiguous]:
+            counts[plan.decision] = counts.get(plan.decision, 0) + 1
         return {
             "aborted": self.aborted,
+            # The attestation, on the record next to what it licensed.
+            "rollout_mode": self.rollout_mode,
             # `total` is the measured decision rate the soak's sample target is
             # re-derived from: the ADR's floor of 200 comparisons is a floor on
             # the wrong axis, since the shepherd re-evaluates the same ref
@@ -227,6 +270,20 @@ def plan_for(
         # only while the two agree.
         from orchestrator.run_shepherd import devloop_workflow_id
 
+        owner = repo.split("/", 1)[0]
+        if owner != DEVLOOP_WORKFLOW_OWNER:
+            # devloop_workflow_id hardcodes the org, which is fail-open on the
+            # probe -- a wrong owner just 404s into "not owned". On THIS path
+            # the id becomes owner_id and temporal_workflow_id, so a wrong
+            # owner is a durable row naming a workflow that does not exist.
+            # The owner is in hand here, so check it rather than inherit a
+            # justification that holds only for the read.
+            base.decision = DECISION_AMBIGUOUS
+            base.reason = (
+                f"{repo} is not under {DEVLOOP_WORKFLOW_OWNER}; "
+                "the DevLoop workflow id would name another org's workflow"
+            )
+            return base
         workflow_id = devloop_workflow_id(ref.service, ref.slug)
         if not workflow_id:
             # Unreachable from the probe — a slug with no issue-<N>- prefix
@@ -460,6 +517,25 @@ def apply_report(report: Report, client: OwnershipClient) -> Report:
     return report
 
 
+def _print_report(report: Report) -> None:
+    """The report on stdout behind its marker, and a summary on stderr.
+
+    ONE LINE, prefixed: see REPORT_MARKER. The summary goes out on EVERY path
+    including the abort, which is the one outcome it exists for -- an Argo log
+    tail should answer "did this work" without parsing anything.
+    """
+    print(f"{REPORT_MARKER} {json.dumps(report.as_dict())}", flush=True)
+    if report.aborted:
+        print(f"lifecycle-bootstrap: ABORTED: {report.aborted}", file=sys.stderr)
+        return
+    print(
+        f"lifecycle-bootstrap: {len(report.planned)} planned, "
+        f"{len(report.ambiguous)} ambiguous, {len(report.written)} written, "
+        f"{len(report.failed)} failed",
+        file=sys.stderr,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
@@ -521,24 +597,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
+    report.rollout_mode = rollout.mode()
 
-    if report.aborted:
-        print(json.dumps(report.as_dict(), indent=2))
-        return 1
-    if args.apply:
+    if not report.aborted and args.apply:
         apply_report(report, client)
-    print(json.dumps(report.as_dict(), indent=2))
-    # One line to stderr next to the report, so an Argo log tail answers "did
-    # this work" without parsing JSON. Ambiguous entities are the ones the
-    # store does not cover -- the store-permits-old-forbids condition this
-    # module opens by naming -- and they are the outcome the exit code alone
-    # is silent about.
-    print(
-        f"lifecycle-bootstrap: {len(report.planned)} planned, "
-        f"{len(report.ambiguous)} ambiguous, {len(report.written)} written, "
-        f"{len(report.failed)} failed",
-        file=sys.stderr,
-    )
+
+    _print_report(report)
+    if report.aborted:
+        return 1
     return 1 if report.failed else 0
 
 

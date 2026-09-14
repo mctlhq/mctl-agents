@@ -255,13 +255,15 @@ def _state_dir(tmp_path: Path, service: str, slug: str, pr: int = 42) -> Path:
 
 
 def _report_of(out: str) -> dict:
-    """The JSON report, which main() prints after any discovery notices.
+    """The JSON report, found by its marker.
 
-    Extracted rather than assumed to be the whole of stdout: _discover_refs
-    prints skip notices, and an operator reads this from an Argo log where it
-    is mixed with everything else anyway.
+    Not "the first brace" and not "the last object": _discover_refs prints a
+    skip notice for every service the shepherd does not own, and a probe thread
+    that outlived the budget can print AFTER the report. The marker is the only
+    reliable handle, which is why it exists.
     """
-    return json.loads(out[out.index("{"):])
+    line = next(ln for ln in out.splitlines() if ln.startswith(bootstrap.REPORT_MARKER))
+    return json.loads(line[len(bootstrap.REPORT_MARKER):])
 
 
 def _install_client(monkeypatch, client) -> None:
@@ -559,3 +561,95 @@ def test_the_workflow_id_has_one_definition() -> None:
     assert report.planned[0].owner_id == run_shepherd.devloop_workflow_id(
         "mctl-web", "issue-7-a-thing"
     )
+
+
+def test_the_report_is_findable_among_other_output(tmp_path, monkeypatch, capsys) -> None:
+    """stdout is not ours alone. _discover_refs prints a skip notice per
+    unowned service, and a probe thread past its budget can print after the
+    report -- so neither the first brace nor the last object finds it."""
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    (root / "skipped-svc" / "proposals").mkdir(parents=True)
+    monkeypatch.setattr(
+        run_shepherd,
+        "_service_mode",
+        lambda svc, force_fix_only=False: (
+            run_shepherd.SKIP if svc == "skipped-svc" and not force_fix_only else run_shepherd.FULL
+        ),
+    )
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    bootstrap.main(["--state-dir", str(root)])
+    out = capsys.readouterr().out
+    assert out.count(bootstrap.REPORT_MARKER) == 1
+    assert _report_of(out)["counts"]["total"] == 1
+
+
+def test_the_report_records_the_attested_mode(tmp_path, monkeypatch, capsys) -> None:
+    """The gate reads THIS process's environment, not the worker's. It is an
+    operator attestation, not a verification, so what was claimed goes on the
+    record next to what it licensed."""
+    from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    bootstrap.main(["--state-dir", str(root), "--apply"])
+    assert _report_of(capsys.readouterr().out)["rollout_mode"] == "observe"
+
+
+def test_the_abort_path_still_summarises(tmp_path, monkeypatch, capsys) -> None:
+    """The one outcome the summary exists for was the one it skipped."""
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(
+        monkeypatch,
+        _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN, reason="down")}),
+    )
+    assert bootstrap.main(["--state-dir", str(root)]) == 1
+    assert "ABORTED" in capsys.readouterr().err
+
+
+def test_a_pr_outside_the_org_gets_no_devloop_row() -> None:
+    """devloop_workflow_id hardcodes the org, which is fail-open on the PROBE
+    -- a wrong owner just 404s into "not owned". On the write path the id
+    becomes owner_id and temporal_workflow_id, so a wrong owner is a durable
+    row naming a workflow that does not exist."""
+    ref = _ref()
+    ref.pr_url = "https://github.com/someone/a-fork/pull/42"
+    plan = bootstrap.plan_for(
+        ref, "someone/a-fork#42", OwnershipAnswer(verdict=UNOWNED), LEGACY_OWNED,
+        repo="someone/a-fork",
+    )
+    assert plan.decision == bootstrap.DECISION_AMBIGUOUS
+    assert plan.owner_id == ""
+    assert "someone/a-fork" in plan.reason
+
+
+def test_slug_narrows_across_services(tmp_path, monkeypatch, capsys) -> None:
+    """--slug without --service narrows across every service, matching
+    _discover_refs. Worth pinning: read as a per-service filter it looks like a
+    no-op when used alone."""
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    (root / "other-svc" / "proposals" / "issue-7-a-thing").mkdir(parents=True)
+    (root / "other-svc" / "proposals" / "issue-7-a-thing" / ".status.yaml").write_text(
+        "status: implemented\npr: https://github.com/mctlhq/other-svc/pull/9\n"
+    )
+    (root / "other-svc" / "proposals" / "issue-8-b").mkdir(parents=True)
+    (root / "other-svc" / "proposals" / "issue-8-b" / ".status.yaml").write_text(
+        "status: implemented\npr: https://github.com/mctlhq/other-svc/pull/8\n"
+    )
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    bootstrap.main(["--state-dir", str(root), "--slug", "issue-7-a-thing"])
+    planned = {p["entity_id"] for p in _report_of(capsys.readouterr().out)["planned"]}
+    assert planned == {"mctlhq/mctl-web#42", "mctlhq/other-svc#9"}
