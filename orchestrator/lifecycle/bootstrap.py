@@ -1243,6 +1243,29 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
         return 1
 
+    # RUNG 2 NEEDS THIS, and it needs it for every caller.
+    #
+    # A state dir at 0o111 is traversable and not listable, so `is_dir()` above
+    # passes and one `iterdir()` is what sees it. That listing lived inside the
+    # `--service` block, which a fleet-wide run skips -- so the same unreadable
+    # ROOT answered `cannot read the state dir` under `--apply --service X` and
+    # `refused --apply` one flag over, for a flag that changes nothing about
+    # the mount. And rung 3 does not excuse it: its justification is that
+    # nothing cheaper than the walk can SEE the fault, which is true of a
+    # `proposals/` and false of the root.
+    #
+    # It is one listing of one directory, which `_discover_refs` also makes.
+    # That duplication is the price of rung 2, and it is named rather than
+    # denied: the alternative is the rule being true for one invocation.
+    from orchestrator.run_shepherd import discover_services
+
+    try:
+        present = discover_services(args.state_dir)
+    except OSError as exc:
+        _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
+        return 1
+
+
     if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
@@ -1292,21 +1315,6 @@ def main(argv: list[str] | None = None) -> int:
         # the report as an output parameter cannot tell from the deliberate
         # `--apply` refusal below -- whose entire design note is that exit 2
         # with no report is the one outcome a log cannot interpret.
-        # Read HERE, where the `; found: ...` listing it supplies is used.
-        # This is an ARGUMENT check -- it answers "did you name something
-        # this checkout has" -- so it belongs with the argument, and its own
-        # OSError arm covers a state dir that cannot be listed at the root.
-        # Every deeper read is the walk's, and the walk's guard is what
-        # answers for it.
-        from orchestrator.run_shepherd import discover_services
-
-        try:
-            present = discover_services(args.state_dir)
-        except OSError as exc:
-            _print_report(
-                Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}")
-            )
-            return 1
         named_is_dir = (args.state_dir / args.service).is_dir()
         if args.service not in present and not named_is_dir:
             _print_report(
@@ -1338,22 +1346,14 @@ def main(argv: list[str] | None = None) -> int:
     # `proposals/` answers after it, because nothing cheaper than the walk can
     # see it.
     #
-    # THE COST is why (1) exists. There is no `acquire` in this module, so
-    # nothing discovery learns can change this answer -- while `_discover_refs`
-    # shells `gh pr list` for every proposal with no `pr:`, serially, on a
-    # branch gated on `reconcile` rather than `dry_run`. Behind the walk, the
-    # production invocation (`dry_run=false` -> `--apply`) walked the whole
-    # fleet and spent GitHub quota to print one sentence.
-    #
-    # There is no `acquire` in this module, so the answer does not depend on
-    # anything discovery learns -- and discovery is the opposite of cheap:
-    # `_discover_refs` shells `gh pr list` for every proposal with no `pr:`,
-    # serially, gated on `reconcile` rather than on `dry_run`, so a dry run
-    # suppresses the `.status.yaml` rewrite and not the subprocess. Behind it,
-    # the production invocation (`dry_run=false` -> `--apply`) walked the whole
-    # fleet and spent GitHub quota per PR-less proposal before printing one
-    # sentence of refusal.
-    #
+    # THE COST is why (1) exists. There is no `acquire` in this module, so the
+    # answer does not depend on anything discovery learns -- and discovery is
+    # the opposite of cheap: `_discover_refs` shells `gh pr list` for every
+    # proposal with no `pr:`, serially, gated on `reconcile` rather than on
+    # `dry_run`, so a dry run suppresses the `.status.yaml` rewrite and NOT the
+    # subprocess. Behind it, the production invocation (`dry_run=false` ->
+    # `--apply`) walked the whole fleet and spent GitHub quota per PR-less
+    # proposal before printing one sentence of refusal.
 
     # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
     #
