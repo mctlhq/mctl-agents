@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.46.0](https://github.com/mctlhq/mctl-agents/compare/1.45.0...1.46.0) (2026-09-14)
+
+
+### Features
+
+* **lifecycle:** compare the two ownership mechanisms in the shadow ([0ff54c2](https://github.com/mctlhq/mctl-agents/commit/0ff54c2279dd494204da134a82e36f22fc7a5477))
+* **lifecycle:** compare the two ownership mechanisms in the shadow ([45a254a](https://github.com/mctlhq/mctl-agents/commit/45a254a0b7ca56e584c81acd418f120cab551c17))
+
+
+### Bug Fixes
+
+* **lifecycle:** give the sweep and the wrapper one predicate ([0ba4677](https://github.com/mctlhq/mctl-agents/commit/0ba4677366fe94fdf5adc9f42c23ab3a34e5ba9f))
+* **lifecycle:** keep the bool an invariant, not an assumption ([960ff05](https://github.com/mctlhq/mctl-agents/commit/960ff055030c62be38a5d279c57420f650fff5a8))
+* **lifecycle:** make the shadow compare actually observable, and total ([2f119c8](https://github.com/mctlhq/mctl-agents/commit/2f119c84ad3253bb0d87ea8a6bfcf7ea9c8ec53a))
+* **lifecycle:** name the two store-unknown causes apart ([4b4b691](https://github.com/mctlhq/mctl-agents/commit/4b4b691320020a454848d688da117c25292b52ec))
+
 ## [1.45.0](https://github.com/mctlhq/mctl-agents/compare/1.44.0...1.45.0) (2026-09-13)
 
 
