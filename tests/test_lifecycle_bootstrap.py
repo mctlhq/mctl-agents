@@ -839,6 +839,28 @@ def test_a_service_with_no_proposals_dir_is_not_an_argument_error(tmp_path, caps
     assert "discovered no proposals at all" in captured.err
 
 
+def test_a_mount_lost_during_discovery_reports(tmp_path, capsys) -> None:
+    """The readability check is a snapshot; discovery is the walk.
+
+    `discover_services` proves the state dir listable at one instant, and
+    `_discover_refs` then descends into every `proposals/` and reads a
+    `.status.yaml` from each. A `proposals/` the pod cannot list, or a mount
+    that goes away between the two, raises from in there — and unguarded that
+    left `main()` as a traceback: no report, no marker, which is the outcome
+    this module's whole exit design is against.
+    """
+    root = tmp_path / "agents-state"
+    proposals = root / "mctl-web" / "proposals"
+    proposals.mkdir(parents=True)
+    proposals.chmod(0o111)  # passes discover_services, fails the walk
+    try:
+        assert bootstrap.main(["--state-dir", str(root)]) == 1
+        report = _report_of(capsys.readouterr().out)
+        assert "discovery failed" in report["aborted"]
+    finally:
+        proposals.chmod(0o755)
+
+
 def test_an_unreadable_state_dir_reports_on_a_fleet_wide_run(tmp_path, capsys) -> None:
     """The shape an operator is most likely to run, and the one the check
     originally skipped.

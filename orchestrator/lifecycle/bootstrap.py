@@ -1056,13 +1056,27 @@ def main(argv: list[str] | None = None) -> int:
     # claim had become false. A report field that cannot contradict the code it
     # describes documents an intention rather than a run.
     discovery_ignores_skip_set = True
-    refs = _discover_refs(
-        args.state_dir,
-        service_filter=args.service,
-        slug_filter=args.slug,
-        dry_run=True,
-        fix_only=discovery_ignores_skip_set,
-    )
+    # GUARDED, because the check above is a snapshot and this is the walk.
+    #
+    # `discover_services` proved the state dir listable at one instant;
+    # `_discover_refs` then descends into every `proposals/` and every proposal
+    # directory under it, and reads a `.status.yaml` from each. A mount that
+    # goes away between the two, or a `proposals/` the pod cannot list, raises
+    # from in here — and unguarded it left `main()` as a traceback: no report,
+    # no marker, which is the one outcome this module's whole exit design is
+    # against. `SystemExit` too, because that is how `_discover_refs` reports a
+    # missing state dir, and it carries a message rather than a report.
+    try:
+        refs = _discover_refs(
+            args.state_dir,
+            service_filter=args.service,
+            slug_filter=args.slug,
+            dry_run=True,
+            fix_only=discovery_ignores_skip_set,
+        )
+    except (OSError, SystemExit) as exc:
+        _print_report(Report(aborted=f"discovery failed under {args.state_dir}: {exc}"))
+        return 1
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
     report.rollout_mode = rollout.mode()
