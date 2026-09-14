@@ -142,6 +142,17 @@ class Plan:
     #: the ordinary outcome for most of the fleet, and a run made entirely of
     #: it wrote nothing because there was nothing to write.
     undetermined: bool = False
+    #: Whether a re-run could plausibly answer differently.
+    #:
+    #: A FIELD, not a substring of `reason`. Deriving it from the prose is what
+    #: `undetermined` itself was introduced to stop doing, and the prose is not
+    #: even a reliable source: the one refusal an operator cannot fix in
+    #: `.status.yaml` is a slug that yields no workflow id, where the fix is
+    #: renaming the proposal directory.
+    #:
+    #: Only rung 2 is retryable. Every other producer is a data problem in the
+    #: checkout that the same run reproduces exactly.
+    retryable: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +164,7 @@ class Plan:
             "owner_id": self.owner_id,
             "reason": self.reason,
             "undetermined": self.undetermined,
+            "retryable": self.retryable,
             # The three provenance fields apply_report actually writes. The
             # dry run is the deliverable and an operator reads it "against the
             # store and live Temporal" — which needs policy_ref, the provenance
@@ -183,6 +195,13 @@ class Report:
     #: The rollout mode this run attested to. On the record because the gate
     #: reads THIS process's environment and not the worker's.
     rollout_mode: str = ""
+    #: The skip set this pod saw, and whether discovery was made independent of
+    #: it. Recorded for the same reason as rollout_mode: both are load-bearing
+    #: inputs read from an environment the report's reader cannot see, and a
+    #: skip set wider than the shepherd's would silently drop entities a live
+    #: DevLoop drives.
+    skip_services: str = ""
+    discovery_ignored_skip_set: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         # Computed only where it is used: on the abort path there is nothing
@@ -201,6 +220,8 @@ class Report:
             return {
                 "aborted": self.aborted,
                 "rollout_mode": self.rollout_mode,
+                "skip_services": self.skip_services,
+                "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
                 "counts": None,
                 "planned": [],
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
@@ -214,6 +235,8 @@ class Report:
             "aborted": self.aborted,
             # The attestation, on the record next to what it licensed.
             "rollout_mode": self.rollout_mode,
+            "skip_services": self.skip_services,
+            "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
             # `total` is the measured decision rate the soak's sample target is
             # re-derived from: the ADR's floor of 200 comparisons is a floor on
             # the wrong axis, since the shepherd re-evaluates the same ref
@@ -283,6 +306,7 @@ def plan_for(
     if legacy_answer == LEGACY_UNKNOWN:
         base.decision = DECISION_AMBIGUOUS
         base.undetermined = True
+        base.retryable = True
         base.reason = "the DevLoop liveness probe could not answer; owner undetermined"
         return base
 
@@ -687,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    from orchestrator import run_shepherd
     from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
 
     # dry_run=True ALWAYS, including under --apply. _discover_refs rewrites
@@ -696,32 +721,42 @@ def main(argv: list[str] | None = None) -> int:
     # contradict every other guarantee here, the `aborted` path's "nothing was
     # written" included.
     #
-    # NO fix_only override. It existed solely to pull SHEPHERD_SKIP_SERVICES
-    # into discovery so the pr-steward rung was reachable; that rung is gone,
-    # so every entity in a skipped service can now only land in rung 4 and be
-    # left unowned.
+    # fix_only=True, and it is NOT about fix-only mode. It is the lever that
+    # short-circuits _service_mode before SHEPHERD_SKIP_SERVICES is read, which
+    # is what makes this import INDEPENDENT of the bootstrap pod's environment.
     #
-    # Discovering them anyway is not neutral: `counts.total` is the measured
-    # decision rate the soak's sample target is re-derived from, and padding it
-    # with entities this tool cannot act on makes that target wrong in the
-    # direction of "we measured more than we did".
+    # It was briefly removed, on the premise that a skipped service can only
+    # land in rung 4 and so only pads counts.total. That premise is false: a
+    # DevLoopWorkflow is started per ISSUE and knows nothing about
+    # SHEPHERD_SKIP_SERVICES, so a skipped service can perfectly well have a
+    # live DevLoop driving one of its pull requests — exactly the entity this
+    # import exists to record.
     #
-    # The cost, stated because it goes the other way: _discover_refs prints
-    # "shepherd: skipping <svc>" to stdout for every skipped service that has a
-    # proposals/ dir, and the override used to suppress that by making the SKIP
-    # branch unreachable. So the notice is now routine here, on a stream it
-    # shares with the report, and labelled with a component this is not. That
-    # is what REPORT_MARKER is for — the report is found by grepping, never by
-    # being the only thing on stdout.
+    # Removing it failed quietly in both directions. Unset here (the default,
+    # and the WorkflowTemplate was written against a caller that did not read
+    # this variable) nothing resolves to SKIP and the removal is a production
+    # no-op with no signal that it did not take effect. Set wider than the
+    # shepherd's, a service the sweep DOES compare is dropped at discovery: its
+    # live-DevLoop entities are never probed, never planned, never reported —
+    # and the store keeps no owner for an entity a DevLoop drives, which is
+    # store-permits-old-forbids left in place by a run that exits 0 with a
+    # clean report.
+    #
+    # The skip set is recorded in the report either way. It is load-bearing
+    # input read from this process's environment, the same shape of problem as
+    # the rollout mode, and it gets the same treatment.
     refs = _discover_refs(
         args.state_dir,
         service_filter=args.service,
         slug_filter=args.slug,
         dry_run=True,
+        fix_only=True,
     )
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
     report.rollout_mode = rollout.mode()
+    report.skip_services = ",".join(sorted(run_shepherd.SHEPHERD_SKIP_SERVICES))
+    report.discovery_ignored_skip_set = True
 
     if not report.aborted and args.apply:
         apply_report(report, client)
@@ -753,14 +788,19 @@ def main(argv: list[str] | None = None) -> int:
     # path.
     undetermined = [p for p in report.ambiguous if p.undetermined]
     if undetermined:
-        # Transient and permanent causes are counted apart, because they need
-        # opposite responses. A probe that could not answer, or a store read
-        # that came back empty for one id, is worth re-running. A malformed
-        # `pr:` or a pull request in the wrong repository is a data problem in
-        # the gitops checkout: the same run repeated produces the same refusal.
-        permanent = [p for p in undetermined if "probe could not answer" not in p.reason]
-        transient = len(undetermined) - len(permanent)
-        detail = f"{transient} transient, {len(permanent)} needing a fix in .status.yaml"
+        # Retryable and permanent causes counted apart, because they need
+        # opposite responses: a probe that could not answer clears on a re-run,
+        # while a malformed `pr:`, a pull request in the wrong repository, a
+        # slug that yields no workflow id or two proposals on one PR are data
+        # problems the same run reproduces exactly.
+        #
+        # Read off the FIELD. An earlier version grepped a substring of the
+        # human-readable reason, which is the thing `undetermined` exists to
+        # replace -- and it mislabelled the slug case as "fix .status.yaml",
+        # where the fix is renaming the proposal directory.
+        retryable = sum(1 for p in undetermined if p.retryable)
+        permanent = len(undetermined) - retryable
+        detail = f"{retryable} retryable, {permanent} needing a fix in the checkout"
         print(
             f"lifecycle-bootstrap: {len(undetermined)} entit(ies) could not be "
             f"determined ({detail}; first: "

@@ -327,17 +327,23 @@ def test_a_dry_run_does_not_touch_the_gitops_checkout(tmp_path, monkeypatch, cap
     assert status.read_text() == before, "the dry run rewrote .status.yaml"
 
 
-def test_a_skipped_service_is_not_discovered(tmp_path, monkeypatch, capsys) -> None:
-    """SHEPHERD_SKIP_SERVICES stays out of the import entirely.
+def test_a_skipped_service_is_still_discovered(tmp_path, monkeypatch, capsys) -> None:
+    """SHEPHERD_SKIP_SERVICES must not decide what this imports.
 
-    The fix_only override that pulled them in existed only to make the
-    pr-steward rung reachable; that rung is gone, so every entity in a skipped
-    service could now land only in rung 4 and be left unowned. Discovering them
-    anyway pads `counts.total` — the measured decision rate the soak's sample
-    target is re-derived from — with entities this tool cannot act on.
+    A DevLoopWorkflow is started per ISSUE and knows nothing about the skip
+    set, so a skipped service can have a live DevLoop driving one of its pull
+    requests -- exactly the entity this import exists to record. Dropping it at
+    discovery leaves the store with no owner for an entity a DevLoop drives:
+    store-permits-old-forbids, left in place by a run that exits 0 with a clean
+    report.
+
+    fix_only=True is the lever that short-circuits _service_mode before the
+    skip set is read, which is what makes the import independent of THIS pod's
+    environment.
     """
     from orchestrator import run_shepherd
 
+    _writes_allowed(monkeypatch)
     root = _state_dir(tmp_path, "mctl-claude-remote", "issue-7-a-thing")
     monkeypatch.setattr(
         run_shepherd,
@@ -347,18 +353,30 @@ def test_a_skipped_service_is_not_discovered(tmp_path, monkeypatch, capsys) -> N
         ),
     )
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 0
+    report = _report_of(capsys.readouterr().out)
+    assert report["counts"]["devloop-workflow"] == 1
+    assert report["written"] == ["mctlhq/mctl-claude-remote#42"]
+
+
+def test_the_report_records_the_discovery_inputs(tmp_path, monkeypatch, capsys) -> None:
+    """The skip set is load-bearing input read from this pod's environment, and
+    the report's reader cannot see that environment -- the same shape of
+    problem as the rollout mode, and it gets the same treatment."""
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_SKIP_SERVICES", frozenset({"a-svc", "b-svc"}))
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
     _install_client(monkeypatch, _Client())
 
     bootstrap.main(["--state-dir", str(root)])
-    out = capsys.readouterr().out
-    report = _report_of(out)
-    assert report["counts"]["total"] == 0
-    # The cost, pinned rather than wished away: dropping the override makes
-    # _discover_refs's skip notice ROUTINE on stdout, where the old behaviour
-    # suppressed it by never reaching the SKIP branch. The report is still
-    # findable, which is the whole reason the marker exists.
-    assert "shepherd: skipping" in out
-    assert out.count(bootstrap.REPORT_MARKER) == 1
+    report = _report_of(capsys.readouterr().out)
+    assert report["skip_services"] == "a-svc,b-svc"
+    assert report["discovery_ignored_skip_set"] is True
 
 
 def test_the_counts_include_the_ambiguous_ones(tmp_path, monkeypatch, capsys) -> None:
@@ -1002,7 +1020,7 @@ def test_the_summary_separates_transient_from_permanent(tmp_path, monkeypatch, c
 
     assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
     err = capsys.readouterr().err
-    assert "1 transient, 1 needing a fix in .status.yaml" in err
+    assert "1 retryable, 1 needing a fix in the checkout" in err
 
 
 def test_the_probe_budget_is_this_modules_own() -> None:
