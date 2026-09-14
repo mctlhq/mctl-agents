@@ -906,24 +906,6 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
         return 1
 
-    # UNCONDITIONAL, not inside the `--service` block where it started. A
-    # fleet-wide run never passes a service, so it skipped this entirely and
-    # `_discover_refs`'s own `iterdir()` raised `PermissionError` out of
-    # `main()` as a traceback -- no report, no marker, on the shape an operator
-    # is most likely to run. A mount the pod cannot list is an infrastructure
-    # fault whoever the caller is.
-    #
-    # `is_dir()` stats and `iterdir()` lists, and a `--x` directory passes the
-    # first and fails the second, which is why the guard above does not cover
-    # this.
-    from orchestrator.run_shepherd import discover_services
-
-    try:
-        _present = discover_services(args.state_dir)
-    except OSError as exc:
-        _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
-        return 1
-
     if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
@@ -970,7 +952,21 @@ def main(argv: list[str] | None = None) -> int:
         # the report as an output parameter cannot tell from the deliberate
         # `--apply` refusal below -- whose entire design note is that exit 2
         # with no report is the one outcome a log cannot interpret.
-        present = _present
+        # Read HERE, where the `; found: ...` listing it supplies is used.
+        #
+        # It spent one commit hoisted above this block, to cover a fleet-wide
+        # run whose `iterdir()` left `main()` as a traceback. Wrapping
+        # `_discover_refs` covers that and more -- it is where the walk is, at
+        # every depth -- so the hoist's own reason retired, and what it left
+        # behind was a full listing of the state dir that no fleet-wide run
+        # reads, followed by `_discover_refs` doing the same listing again.
+        from orchestrator.run_shepherd import discover_services
+
+        try:
+            present = discover_services(args.state_dir)
+        except OSError as exc:
+            _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
+            return 1
         named_is_dir = (args.state_dir / args.service).is_dir()
         if args.service not in present and not named_is_dir:
             _print_report(
@@ -982,7 +978,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
-
 
     if args.apply:
         # This module PLANS. There is no writer in it -- no `acquire` call
@@ -1056,16 +1051,28 @@ def main(argv: list[str] | None = None) -> int:
     # claim had become false. A report field that cannot contradict the code it
     # describes documents an intention rather than a run.
     discovery_ignores_skip_set = True
-    # GUARDED, because the check above is a snapshot and this is the walk.
+    # GUARDED, and this is where the invariant lives for EVERY caller: a
+    # `--service` run, a fleet-wide one, and every depth of the walk. Anything
+    # earlier is a snapshot, and a snapshot cannot answer for the read that
+    # follows it.
     #
-    # `discover_services` proved the state dir listable at one instant;
-    # `_discover_refs` then descends into every `proposals/` and every proposal
-    # directory under it, and reads a `.status.yaml` from each. A mount that
-    # goes away between the two, or a `proposals/` the pod cannot list, raises
-    # from in here — and unguarded it left `main()` as a traceback: no report,
-    # no marker, which is the one outcome this module's whole exit design is
-    # against. `SystemExit` too, because that is how `_discover_refs` reports a
-    # missing state dir, and it carries a message rather than a report.
+    # What raises out of the walk is the two listings —
+    # `sorted(state_dir.iterdir())` and `sorted(proposals_dir.iterdir())`. The
+    # per-file `.status.yaml` read does NOT: `_discover_refs` wraps that in its
+    # own `except Exception` and warns-and-skips, deliberately, so one
+    # malformed file anywhere in the fleet does not abort the run. Saying
+    # otherwise here would invite a later reader to delete that narrower
+    # handler as redundant with this one, which is the behaviour its `noqa`
+    # comment exists to prevent.
+    #
+    # `SystemExit` alongside `OSError`, because that is how `_discover_refs`
+    # reports a missing state dir: a message rather than a report.
+    #
+    # The domain is wider than the walk and the message says so — this also
+    # catches `gh` missing from PATH (a `FileNotFoundError`, hence an
+    # `OSError`) from the `pr:`-less branch lookup, and attributing that to the
+    # state dir alone would mislead on the one field an Argo step reads as its
+    # output parameter.
     try:
         refs = _discover_refs(
             args.state_dir,
@@ -1075,7 +1082,14 @@ def main(argv: list[str] | None = None) -> int:
             fix_only=discovery_ignores_skip_set,
         )
     except (OSError, SystemExit) as exc:
-        _print_report(Report(aborted=f"discovery failed under {args.state_dir}: {exc}"))
+        _print_report(
+            Report(
+                aborted=(
+                    f"discovery failed while walking {args.state_dir} "
+                    f"(or running a tool it needs): {exc}"
+                )
+            )
+        )
         return 1
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)

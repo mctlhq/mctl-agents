@@ -7,6 +7,7 @@ run writes nothing at all.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -839,6 +840,7 @@ def test_a_service_with_no_proposals_dir_is_not_an_argument_error(tmp_path, caps
     assert "discovered no proposals at all" in captured.err
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
 def test_a_mount_lost_during_discovery_reports(tmp_path, capsys) -> None:
     """The readability check is a snapshot; discovery is the walk.
 
@@ -861,6 +863,7 @@ def test_a_mount_lost_during_discovery_reports(tmp_path, capsys) -> None:
         proposals.chmod(0o755)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
 def test_an_unreadable_state_dir_reports_on_a_fleet_wide_run(tmp_path, capsys) -> None:
     """The shape an operator is most likely to run, and the one the check
     originally skipped.
@@ -877,7 +880,12 @@ def test_an_unreadable_state_dir_reports_on_a_fleet_wide_run(tmp_path, capsys) -
     try:
         assert bootstrap.main(["--state-dir", str(root)]) == 1
         report = _report_of(capsys.readouterr().out)
-        assert "cannot read the state dir" in report["aborted"]
+        # THE PROPERTY -- a report exists and says the run could not read the
+        # checkout -- not which arm wrote it. Asserting the exact wording
+        # pinned the message rather than the invariant, and the invariant is
+        # what must survive a guard moving.
+        assert report["aborted"], "a fleet-wide run over an unreadable mount carried no report"
+        assert str(root) in report["aborted"]
     finally:
         root.chmod(0o755)
 
@@ -897,11 +905,19 @@ def test_a_missing_state_dir_reports_rather_than_exiting_bare(tmp_path, capsys) 
     fail identically. The earlier version of this test asserted only the exit
     code, so it pinned the absence of the report rather than catching it.
     """
-    assert bootstrap.main(["--state-dir", str(tmp_path / "absent"), "--service", "mctl-web"]) == 1
+    argv = ["--state-dir", str(tmp_path / "absent"), "--service", "mctl-web"]
+    assert bootstrap.main(argv) == 1
     captured = capsys.readouterr()
     report = _report_of(captured.out)
     assert "state dir not found" in report["aborted"]
     assert "ABORTED" in captured.err
+
+    # AND under --apply, which is the invocation the docstring opens on and
+    # which no test passed. "There is no checkout" outranks "this build does
+    # not write", so it is exit 1 here rather than exit 2 at the --apply
+    # refusal — an ordering three commits have now changed and none pinned.
+    assert bootstrap.main([*argv, "--apply"]) == 1
+    assert "state dir not found" in _report_of(capsys.readouterr().out)["aborted"]
 
 
 def test_the_filter_and_the_discovery_share_one_definition(tmp_path, monkeypatch, capsys) -> None:

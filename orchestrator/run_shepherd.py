@@ -1056,9 +1056,15 @@ def discover_services(state_dir: Path) -> frozenset[str]:
 
     STRUCTURAL, not a name list: a directory under the state dir that does not
     begin with `_` and contains a `proposals/` directory. That is the same
-    shape `_discover_refs` globs, which is the point — this is the ONE source
-    both it and any caller validating a `--service` argument read, so the
-    filter and the discovery cannot disagree about what a service is.
+    shape `_discover_refs` globs, which is the point — the walk and anything
+    describing what the walk will find read one definition.
+
+    It is NOT the one source every `--service` validator reads, and claiming so
+    was wrong about both of them: `run_shepherd.main()` validates against
+    `config.settings.SERVICES`, and the ownership bootstrap's effective admit
+    test is `(state_dir / service).is_dir()`, deliberately wider so a service
+    with no proposals yet reads as an ordinary state rather than a typo. What
+    this gives that caller is the `; found: ...` listing.
 
     Not `config.settings.SERVICES`: a repository whose pull requests another
     lifecycle drives has proposals here and no SERVICES entry
