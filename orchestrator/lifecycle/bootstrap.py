@@ -878,9 +878,26 @@ def apply_report(report: Report, client: OwnershipClient) -> Report:
     `failed` and the loop continues. A store that declines one row has told you
     something about that row; the rest of the batch still has to be attempted,
     and `main` carries the refusal out in the exit code.
+
+    SERIAL, and unbudgeted, which is a deliberate pair. One HTTP call per
+    writable row, in the report's order, because these are writes against a
+    store the shepherd may already be reading and a one-shot migration is not
+    the place to multiply pressure on it -- PROBE_WORKERS is justified by the
+    probe being read-only, and that justification does not carry here. The cost
+    is that this is a third unbounded term inside the WorkflowTemplate's
+    activeDeadlineSeconds, after discovery and alongside the probe pass. It is
+    bounded in practice by `counts.devloop-workflow` in the dry run, which is
+    the number an operator reads BEFORE applying -- which is what makes the
+    reviewed dry run a precondition rather than a courtesy.
     """
     for plan in report.planned:
-        if plan.decision in (DECISION_ALREADY_OWNED, DECISION_AMBIGUOUS):
+        # POSITIVE, and closed. The earlier form skipped ALREADY_OWNED and
+        # AMBIGUOUS, which read as two guards and was one: `build_report` puts
+        # ambiguous plans in `report.ambiguous`, never in `planned`, so that arm
+        # could not fire. Worse than dead code -- a decision added to DECISIONS
+        # later would have been written by default, because the skip list was
+        # the thing that had to be remembered.
+        if plan.decision != DECISION_DEVLOOP:
             continue
         answer = client.acquire(
             EntityRef(kind=KIND_PULL_REQUEST, id=plan.entity_id),
@@ -890,7 +907,23 @@ def apply_report(report: Report, client: OwnershipClient) -> Report:
             policy_ref=plan.policy_ref,
             temporal_workflow_id=plan.temporal_workflow_id,
         )
-        if answer.wrote:
+        # `may_mutate`, NOT `wrote`. contract.py states the rule and the reason:
+        # on a body-less 2xx to a claiming route the two deliberately disagree
+        # -- `wrote` is True because mctl-api took the write, `verdict` is
+        # UNKNOWN because the record that would name us as owner never arrived.
+        #
+        # `written` is read by an operator as "the store now holds a row naming
+        # this owner", and gating it on `wrote` would put an unseen row in that
+        # list. This tool aborts a whole run over one id whose owner it could
+        # not see; recording an unconfirmed write as a success is the same
+        # claim from the other side.
+        #
+        # The direction of the mistake matters too. A write that landed but
+        # could not be confirmed goes to `failed`, the run exits 1, and a
+        # re-run reads the row as held and reports it already-owned -- a red
+        # run over a correct store. The opposite error reports a green run over
+        # a store nobody verified.
+        if answer.may_mutate:
             report.written.append(plan.entity_id)
         else:
             report.failed.append(

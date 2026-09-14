@@ -14,6 +14,7 @@ import pytest
 
 from orchestrator.lifecycle import bootstrap, shadow
 from orchestrator.lifecycle.contract import (
+    OWNED_BY_ME,
     OWNED_BY_OTHER,
     UNKNOWN,
     UNOWNED,
@@ -40,15 +41,42 @@ class _Client:
 
     def __init__(self, answers=None, acquire_answer=None):
         self._answers = answers or {}
-        self._acquire = acquire_answer or OwnershipAnswer(verdict=OWNED_BY_OTHER, accepted=True)
+        self._acquire = acquire_answer
         self.acquires: list[tuple] = []
 
     def get_many(self, kind, phase, ids, asking=None):
         return {i: self._answers.get(i, OwnershipAnswer(verdict=UNOWNED)) for i in ids}
 
     def acquire(self, entity, phase, owner, **kw):
+        """A successful acquire, built from the owner it was asked for.
+
+        The default USED to be `OwnershipAnswer(verdict=OWNED_BY_OTHER,
+        accepted=True)`, which is not a shape the real client can produce for a
+        success: OWNED_BY_OTHER says somebody else holds the entity while
+        `accepted` says our write landed. It passed only because the code under
+        test read `wrote` (i.e. `accepted`) -- so the fixture and the defect
+        agreed with each other, and the fixture was what made the defect
+        invisible.
+
+        `_write` passes the asking owner into `answer_from`, so a real success
+        comes back with the record naming that owner and `verdict_for`
+        answering OWNED_BY_ME. That is what this returns.
+        """
         self.acquires.append((entity.id, owner.type, owner.id, kw))
-        return self._acquire
+        if self._acquire is not None:
+            return self._acquire
+        return OwnershipAnswer(
+            verdict=OWNED_BY_ME,
+            accepted=True,
+            ownership=Ownership(
+                entity=entity,
+                phase=phase,
+                owner=owner,
+                state="active",
+                healthy=True,
+                held=True,
+            ),
+        )
 
 
 def _probe(answer):
@@ -1774,6 +1802,61 @@ def test_a_refused_acquire_is_reported_not_raised() -> None:
     bootstrap.apply_report(report, client)
     assert report.written == []
     assert report.failed[0]["entity_id"] == "mctlhq/mctl-web#42"
+
+
+def test_a_write_that_landed_but_could_not_be_confirmed_is_not_success() -> None:
+    """`may_mutate`, not `wrote`, and contract.py states the rule.
+
+    On a body-less 2xx to a claiming route the two deliberately disagree:
+    `wrote` is True because mctl-api took the write, `verdict` is UNKNOWN
+    because the record that would name us as owner never arrived. `written` is
+    read as "the store now holds a row naming this owner", so gating it on
+    `wrote` puts an unseen row in that list -- from a tool that aborts a whole
+    run over one id whose owner it could not see.
+
+    The direction is deliberate: this lands in `failed`, the run exits 1, and a
+    re-run reads the row as held and reports already-owned. A red run over a
+    correct store, rather than a green one over a store nobody verified.
+    """
+    client = _Client(acquire_answer=OwnershipAnswer(verdict=UNKNOWN, accepted=True))
+    report = bootstrap.build_report([_ref()], client, _probe(LEGACY_OWNED))
+    bootstrap.apply_report(report, client)
+
+    assert client.acquires, "the write was never attempted"
+    assert report.written == []
+    assert report.failed[0]["entity_id"] == "mctlhq/mctl-web#42"
+    assert report.failed[0]["verdict"] == UNKNOWN
+
+
+def test_one_refusal_does_not_stop_the_batch() -> None:
+    """The per-entity totality claim, on a MIXED batch.
+
+    Asserted only on a single refused row, "the loop continues" holds
+    vacuously: there is nothing after it to skip. A store that declines one row
+    has told you something about that row, and the rest still has to be
+    attempted -- otherwise one 409 early in the order silently shortens a
+    fleet-wide apply, with a report that looks like a smaller fleet.
+    """
+
+    class _Mixed(_Client):
+        def acquire(self, entity, phase, owner, **kw):
+            if entity.id == "mctlhq/mctl-web#43":
+                self.acquires.append((entity.id, owner.type, owner.id, kw))
+                return OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409")
+            return super().acquire(entity, phase, owner, **kw)
+
+    client = _Mixed()
+    refs = [_ref(), _ref(slug="issue-8-b", number=43), _ref(slug="issue-9-c", number=44)]
+    report = bootstrap.build_report(refs, client, _probe(LEGACY_OWNED))
+    bootstrap.apply_report(report, client)
+
+    assert [a[0] for a in client.acquires] == [
+        "mctlhq/mctl-web#42",
+        "mctlhq/mctl-web#43",
+        "mctlhq/mctl-web#44",
+    ], "the batch stopped at the refusal"
+    assert report.written == ["mctlhq/mctl-web#42", "mctlhq/mctl-web#44"]
+    assert [f["entity_id"] for f in report.failed] == ["mctlhq/mctl-web#43"]
 
 
 def test_apply_refuses_below_observe(tmp_path, monkeypatch, capsys) -> None:
