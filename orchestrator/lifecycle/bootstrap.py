@@ -11,14 +11,49 @@ rules need `.status.yaml` from the gitops checkout, `_service_mode` /
 mctl-api, and moving them there would put a second copy of the shepherd's
 policy in a repository that cannot see the state it applies to.
 
-Run as a one-shot Argo Workflow. **This module plans and reports; it writes
-nothing.** The report IS the deliverable, and an operator reads it against the
-store and live Temporal. The write path — the rollout gate, ``acquire``,
-idempotence and refusal semantics — is a separate change that takes a reviewed
-production dry run as its input. ``--apply`` is accepted and refused here
-rather than removed, so the WorkflowTemplate's contract does not change twice.
+Run as a one-shot Argo Workflow. A dry run is the default posture: the report
+is the deliverable, and an operator reads it against the store and live
+Temporal before anything is written.
 
 KNOWN LIMITS, written down rather than left to be rediscovered:
+
+- **The rollout gate is an attestation, not a verification.** ``--apply``
+  refuses outside ``observe``, but the mode it reads is THIS process's, while
+  the hazard is the Temporal worker's. Setting the variable here with the
+  worker still off passes the gate. The mode is echoed into the report so what
+  was claimed sits next to what it licensed.
+- **The probe cannot see the second patch marker.** ENFORCED, not described:
+  ``may_apply`` refuses every write while ``OWNERSHIP_CAPABILITY_KNOWN`` is
+  False, and the only way past it is an explicit, scoped
+  ``--assume-tracked-ownership REASON`` whose justification goes on the report.
+  ``LEGACY_OWNED`` means ``shepherd_in_loop is
+  True``, i.e. ``workflow.patched("shepherd-in-loop")`` plus the pinned-image
+  check. But ``dev_loop.py`` gates every ownership call on ``shepherd_in_loop
+  AND workflow.patched("lifecycle-ownership")`` — a SECOND, independent marker.
+  An execution recorded between the two replays the second as False forever:
+  it answers ``shepherd_in_loop=True`` to the probe, rung 3 plans a
+  ``devloop-workflow`` row, and ``_ownership()`` is never called for it. No
+  acquire, no heartbeat, no release — the orphan the rollout gate exists to
+  prevent, reached through the probe instead of the mode.
+
+  It is NOT the gap the bullet above describes. That one is operator-fixable:
+  flip the worker and it closes. A patch marker is per-execution history and
+  permanent for the life of that execution, and the cohort is largest exactly
+  when a pre-soak migration runs, against watches that stay Running up to
+  ``MERGE_WATCH_DEADLINE``.
+
+  The probe cannot distinguish it today: ``/api/v1/agents/dev-loop/{id}``
+  returns ``status``, ``shepherd_in_loop`` and ``shepherd_in_loop_known``, and
+  neither the ``lifecycle_claim`` query (``dev_loop.py``, the reader that
+  answers this directly) nor the execution's start time is exposed. So the fix
+  is an mctl-api field, and until it lands the writes are REFUSED rather than
+  discouraged. Scope is not what licenses one: narrowing a run does not make an
+  unheartbeated row safe, it makes fewer of them.
+
+  The dependency order, so it is not rediscovered: this module's planner
+  (mctlhq/mctl-agents#384), then the entity-id contract across all three
+  builders (#386), then the API capability (mctlhq/mctl-api#322), and only then
+  a fleet-wide apply.
 - **Only DevLoop rows are imported.** The shepherd and pr-steward rungs were
   here and are gone: ``shadow.classify`` has one owner-type arm, so importing
   those rows turns an *agreeing* entity into ``store-forbids-old-permits``
@@ -208,6 +243,20 @@ class Plan:
     #: Every other producer is a data problem in the checkout that the same run
     #: reproduces exactly.
     retryable: bool = False
+    #: Whether the entity id is the one every other component will build.
+    #:
+    #: A conjunct of `may_apply`, not a report ornament. Rung 3 compares the
+    #: pull request's repository with `casefold`, and `build_report` records
+    #: the `pr:` spelling verbatim -- as `PRState.repo` and
+    #: `shadow.entity_id_for_pr` also do, which is why they agree today. But
+    #: "agree today" is an accident, not a contract (mctlhq/mctl-agents#386),
+    #: and the entity this makes durable is precisely the one whose id was
+    #: hand-typed in a casing nothing else will reproduce.
+    #:
+    #: EXACT, not case-insensitive: the case-insensitive comparison is what
+    #: lets the entity through the ladder, and this is what stops a write
+    #: turning that tolerance into a row.
+    entity_id_exact: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -220,7 +269,8 @@ class Plan:
             "reason": self.reason,
             "undetermined": self.undetermined,
             "retryable": self.retryable,
-            # The three provenance fields a write would carry. The report is
+            "entity_id_exact": self.entity_id_exact,
+            # The three provenance fields apply_report writes. The dry run is
             # the deliverable and an operator reads it "against the store and
             # live Temporal" — which needs policy_ref, the provenance
             # policy.py exists to record, and temporal_workflow_id, the field
@@ -244,6 +294,23 @@ class Report:
     #: an unowned entity is one the old mechanism still drives, which is the
     #: status quo rather than a new risk.
     ambiguous: list[Plan] = field(default_factory=list)
+    written: list[str] = field(default_factory=list)
+    failed: list[dict[str, str]] = field(default_factory=list)
+    #: Writable plans `may_apply` refused, with the clause that refused them.
+    #:
+    #: Apart from `failed`, which is the store declining a write this tool
+    #: attempted. These were never attempted, and the distinction is the one an
+    #: operator acts on: a refusal here is a gate in this repository, fixed by
+    #: landing the issue it names, while a failure is the store's answer about
+    #: that entity.
+    blocked: list[dict[str, str]] = field(default_factory=list)
+    #: The operator's justification for overriding `may_apply`'s capability
+    #: clause, verbatim. Empty when none was given.
+    #:
+    #: On the record because an override is a claim — "I checked these in
+    #: Temporal by hand" — and a claim that licenses durable writes belongs
+    #: next to what it licensed, for the same reason `rollout_mode` does.
+    ownership_override: str = ""
     aborted: str = ""
     #: The rollout mode this run attested to. On the record because the gate
     #: reads THIS process's environment and not the worker's.
@@ -255,6 +322,17 @@ class Report:
     #: DevLoop drives.
     skip_services: str = ""
     discovery_ignored_skip_set: bool = False
+    #: Whether this run was asked to WRITE. The posture, not the outcome.
+    #:
+    #: The load-bearing process input this half adds, and it belongs beside
+    #: rollout_mode and skip_services for the identical reason: a reader of the
+    #: report cannot otherwise see it. Without it a dry run and an apply that
+    #: wrote nothing are byte-identical artifacts -- same `0 written, 0
+    #: failed`, same empty lists, same exit 0 -- so a regression in the
+    #: WorkflowTemplate's dry_run -> --apply plumbing is silent, and the
+    #: reviewed dry run the merge order depends on carries no field saying
+    #: which posture produced it.
+    applied: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         # Computed only where it is used: on the abort path there is nothing
@@ -275,9 +353,26 @@ class Report:
                 "rollout_mode": self.rollout_mode,
                 "skip_services": self.skip_services,
                 "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
+                "applied": self.applied,
                 "counts": None,
-                "planned": [],
+                # THE FIELD, not a literal. Empty today because build_report
+                # returns before the plan loop, but a literal is a field that
+                # cannot contradict the code, which is the one thing a report
+                # is for.
+                "planned": [p.as_dict() for p in self.planned],
+                # NOT empty, and never was: build_report appends the pre-read
+                # entries -- an unreadable `pr:`, a duplicate mapping -- before
+                # it can abort, which is what the comment above this branch
+                # says about `total`.
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
+                # Empty today -- `main` gates the write on `not
+                # report.aborted` -- but if a future path ever writes before
+                # aborting, the report must be able to say so rather than be
+                # structurally incapable of it.
+                "written": self.written,
+                "failed": self.failed,
+                "blocked": self.blocked,
+                "ownership_override": self.ownership_override,
             }
         counts = dict.fromkeys(DECISIONS, 0)
         for plan in [*self.planned, *self.ambiguous]:
@@ -288,6 +383,7 @@ class Report:
             "rollout_mode": self.rollout_mode,
             "skip_services": self.skip_services,
             "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
+            "applied": self.applied,
             # `total` is the measured decision rate the soak's sample target is
             # re-derived from: the ADR's floor of 200 comparisons is a floor on
             # the wrong axis, since the shepherd re-evaluates the same ref
@@ -295,6 +391,10 @@ class Report:
             "counts": {**counts, "total": len(self.planned) + len(self.ambiguous)},
             "planned": [p.as_dict() for p in self.planned],
             "ambiguous": [p.as_dict() for p in self.ambiguous],
+            "written": self.written,
+            "failed": self.failed,
+            "blocked": self.blocked,
+            "ownership_override": self.ownership_override,
         }
 
 
@@ -727,7 +827,7 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
     whoever actually holds it. Aborting costs a re-run; the alternative costs
     an entity.
     """
-    from orchestrator.run_shepherd import LEGACY_UNKNOWN, _parse_pr_url
+    from orchestrator.run_shepherd import DEVLOOP_WORKFLOW_ORG, LEGACY_UNKNOWN, _parse_pr_url
 
     report = Report()
     by_entity: dict[str, tuple[Any, str]] = {}
@@ -838,11 +938,202 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
             repo=repo,
             held=held_by_entity[entity_id],
         )
+        # Set here, not in `plan_for`: this is where the parsed spelling and
+        # the service directory are both in scope, and the comparison the
+        # ladder makes is deliberately case-INSENSITIVE. `may_apply` needs the
+        # exact answer, because the tolerance that admits the entity is what a
+        # write would turn into a durable id nothing else reproduces.
+        plan.entity_id_exact = repo == f"{DEVLOOP_WORKFLOW_ORG}/{ref.service}"
         if plan.decision == DECISION_AMBIGUOUS:
             report.ambiguous.append(plan)
         else:
             report.planned.append(plan)
     return report
+
+
+#: Whether mctl-api can say that a DevLoop execution tracks ownership.
+#:
+#: FALSE until mctlhq/mctl-api#322 lands. `/api/v1/agents/dev-loop/{id}`
+#: reports `shepherd_in_loop`, which is `workflow.patched("shepherd-in-loop")`
+#: plus the pinned-image check -- but every ownership call is gated on
+#: `shepherd_in_loop AND workflow.patched("lifecycle-ownership")`, a second,
+#: independent marker. An execution recorded between the two answers the probe
+#: True and replays the second as False forever: it never acquires, heartbeats
+#: or releases the row a write would create.
+#:
+#: A CONSTANT rather than a probe result, because there is nothing to probe:
+#: the field does not exist. When it does, this becomes a per-entity answer and
+#: the pair must repeat the `shepherd_in_loop`/`shepherd_in_loop_known`
+#: contract -- ABSENT is not FALSE, and unknown must BLOCK.
+OWNERSHIP_CAPABILITY_KNOWN = False
+
+
+def may_apply(plan: Plan, *, override: str = "") -> str:
+    """Whether this entity may be written. "" means yes; otherwise the reason.
+
+    THE predicate, and a conjunction — every clause must hold, and an UNKNOWN
+    clause blocks rather than passing or being retried:
+
+      1. the plan is a devloop-workflow import (the only writable decision);
+      2. the entity id is the one every other component will build;
+      3. mctl-api can report whether the execution tracks ownership, and
+         reports that it does.
+
+    IN THAT ORDER, which is the order they are evaluated, because the order
+    decides which reason a blocked entity carries. A miscased id reports #386
+    rather than #322 — the right answer, since the override cannot clear it and
+    an operator sent to wait for #322 would wait forever.
+
+    (3) is one constant today, `OWNERSHIP_CAPABILITY_KNOWN`, because the field
+    does not exist yet — so this refuses every write until mctlhq/mctl-api#322
+    lands, which is the honest reading of "unknown blocks".
+
+    A PREDICATE, not a comment. The limit was written into KNOWN LIMITS as a
+    blocker and enforced nowhere, and the first attempt to enforce it made a
+    NARROWER SCOPE the thing that licensed the write — which is a bypass of the
+    same gate rather than a gate: scoping a run does not make an unheartbeated
+    row safe, it just makes fewer of them.
+
+    `override` is the operator escape hatch, and it is explicit: a non-empty
+    justification, recorded on the report, asserting that these entities were
+    checked in Temporal by hand. It does not silently follow from `--service`.
+    """
+    if plan.decision != DECISION_DEVLOOP:
+        return f"not a writable decision ({plan.decision})"
+    if not plan.entity_id_exact:
+        return (
+            "the pull request's repository is spelled differently from the proposal's "
+            "service directory, so the id written here is not the one DevLoopWorkflow "
+            "and the shadow compare build (mctlhq/mctl-agents#386)"
+        )
+    if not OWNERSHIP_CAPABILITY_KNOWN and not override:
+        return (
+            "mctl-api cannot report whether this DevLoop execution tracks ownership "
+            "(mctlhq/mctl-api#322); the probe reads shepherd_in_loop, which is True for "
+            "executions recorded between the shepherd-in-loop and lifecycle-ownership "
+            "patch markers -- they answer it and never acquire, heartbeat or release"
+        )
+    return ""
+
+
+def apply_report(report: Report, client: OwnershipClient, *, override: str = "") -> Report:
+    """Write the rows the report plans. Only the writable decisions.
+
+    Idempotent on two legs, and both are load-bearing. `build_report`'s
+    read-first pass marks an entity the store HOLDS ALREADY_OWNED and this loop
+    skips it; and the owner ids are deterministic -- POLICY_REF and the
+    DevLoop's own workflow id, never a pod name -- so a re-run of the same
+    fleet asks for the same rows rather than a second set of them. Still true
+    after a takeover: a dead row this run replaced reads held=True on the next
+    one, so the second run skips what the first wrote.
+
+    SOME OF THESE ARE TAKEOVERS, not first writes. Rung 1 keys on
+    `derived.held`, so an entity whose record is `active` past its liveness
+    bound falls through the ladder and arrives here with a DevLoop owner. That
+    is the point -- it is the dangerous class -- and the same predicate that
+    let it through is the one mctl-api evaluates on the acquire. If the store
+    disagrees and refuses, the refusal lands in `failed` and the run goes red
+    rather than being retried or reasoned around here: a store that declines a
+    takeover is the authority on that entity.
+
+    Total on the ENTITY, not on the run: a refused acquire is recorded in
+    `failed` and the loop continues. A store that declines one row has told you
+    something about that row; the rest of the batch still has to be attempted,
+    and `main` carries the refusal out in the exit code.
+
+    SERIAL, and unbudgeted, which is a deliberate pair. One HTTP call per
+    writable row, in the report's order, because these are writes against a
+    store the shepherd may already be reading and a one-shot migration is not
+    the place to multiply pressure on it -- PROBE_WORKERS is justified by the
+    probe being read-only, and that justification does not carry here. The cost
+    is that this is a third unbounded term inside the WorkflowTemplate's
+    activeDeadlineSeconds, after discovery and alongside the probe pass. It is
+    bounded in practice by `counts.devloop-workflow` in the dry run, which is
+    the number an operator reads BEFORE applying -- which is what makes the
+    reviewed dry run a precondition rather than a courtesy.
+    """
+    for plan in report.planned:
+        # ONE predicate, and it is a conjunction where unknown BLOCKS. The
+        # decision check that used to live here is its first clause, so a
+        # decision added to DECISIONS later is still not written by default.
+        #
+        # A blocked entity is RECORDED, not skipped silently: "312 planned, 0
+        # written" with no reason is the artifact an operator cannot act on,
+        # and `blocked` is the field that says which gate refused and why.
+        refusal = may_apply(plan, override=override)
+        if refusal:
+            if plan.decision == DECISION_DEVLOOP:
+                # `proposal_ref` too. The field comment calls this list an
+                # action item for a human, and clause 2's reason names "the
+                # proposal's service directory" without saying WHICH -- so the
+                # list said a `.status.yaml` needs editing and not which one.
+                # It is already computed, and passed to `acquire` six lines
+                # down.
+                report.blocked.append(
+                    {
+                        "entity_id": plan.entity_id,
+                        "proposal_ref": plan.proposal_ref,
+                        "reason": refusal,
+                    }
+                )
+            continue
+        answer = client.acquire(
+            EntityRef(kind=KIND_PULL_REQUEST, id=plan.entity_id),
+            PHASE_REVIEW_REMEDIATION,
+            Owner(type=plan.owner_type, id=plan.owner_id),
+            proposal_ref=plan.proposal_ref,
+            policy_ref=plan.policy_ref,
+            temporal_workflow_id=plan.temporal_workflow_id,
+        )
+        # `may_mutate`, NOT `wrote`. contract.py states the rule and the reason:
+        # on a body-less 2xx to a claiming route the two deliberately disagree
+        # -- `wrote` is True because mctl-api took the write, `verdict` is
+        # UNKNOWN because the record that would name us as owner never arrived.
+        #
+        # `written` is read by an operator as "the store now holds a row naming
+        # this owner", and gating it on `wrote` would put an unseen row in that
+        # list. This tool aborts a whole run over one id whose owner it could
+        # not see; recording an unconfirmed write as a success is the same
+        # claim from the other side.
+        #
+        # The direction of the mistake matters too. A write that landed but
+        # could not be confirmed goes to `failed`, the run exits 1, and a
+        # re-run reads the row as held and reports it already-owned -- a red
+        # run over a correct store. The opposite error reports a green run over
+        # a store nobody verified.
+        if answer.may_mutate:
+            report.written.append(plan.entity_id)
+        else:
+            # The OWNER too, when the server attached a record. contract.py
+            # attaches it so "the caller can see what the server saw", and
+            # `reason` is empty for a 2xx naming another owner -- so a refusal
+            # could reach the report with nothing in it that explains the
+            # refusal, which is the one thing an operator reads it for.
+            record = answer.ownership
+            owner = record.owner if record else Owner()
+            report.failed.append(
+                {
+                    "entity_id": plan.entity_id,
+                    "verdict": answer.verdict,
+                    "reason": answer.reason,
+                    "held_by_type": owner.type,
+                    "held_by_id": owner.id,
+                    "held_state": record.state if record else "",
+                }
+            )
+    return report
+
+
+def _posture(report: Report) -> str:
+    """What the run was ASKED to do, in the tense the field is defined in.
+
+    `Report.applied` is "the posture, not the outcome", so the label must not
+    be past tense. `[applied]` read as a claim about what happened, and on the
+    one path where posture and outcome are guaranteed to disagree it printed
+    `lifecycle-bootstrap [applied]: ABORTED: refused --apply` for a run
+    asserted to have written nothing.
+    """
+    return "apply" if report.applied else "dry run"
 
 
 def _print_report(report: Report) -> None:
@@ -854,18 +1145,51 @@ def _print_report(report: Report) -> None:
     """
     print(f"{REPORT_MARKER} {json.dumps(report.as_dict())}", flush=True)
     if report.aborted:
-        print(f"lifecycle-bootstrap: ABORTED: {report.aborted}", file=sys.stderr)
+        print(
+            f"lifecycle-bootstrap [{_posture(report)}]: ABORTED: {report.aborted}",
+            file=sys.stderr,
+        )
         return
-    # `already-owned` counted apart from the work. Both live in `planned`, and
-    # the entities the store already holds are the ones an apply would skip --
-    # so a second run against a populated store reads "0 to write, 312 already
-    # owned" rather than a bare "312 planned" that says nothing about whether
-    # anything is left to do.
+    # `already-owned` counted apart from the work. Both live in `planned` and
+    # apply_report skips the first, so the idempotent second run -- the one
+    # this tool sells as writing nothing -- printed "312 planned, 0 written",
+    # indistinguishable in a log tail from 312 rows the store refused.
+    #
+    # TWO numbers, because they answer two questions and they are not the same
+    # number any more.
+    #
+    # `importable` is the sizing number: how many entities this fleet has that
+    # the ladder would import. It is what `apply_report`'s docstring calls the
+    # bound on an apply, "which is what makes the reviewed dry run a
+    # precondition rather than a courtesy", so it must not shrink to whatever
+    # today's gates happen to allow.
+    #
+    # `writable` is the promise: how many a write would actually attempt. It
+    # asks `may_apply`, because that is what `apply_report` asks. Counting
+    # `decision == DECISION_DEVLOOP` was true when that was the whole
+    # predicate; `may_apply` then grew `entity_id_exact` and the capability
+    # clause, the predicate moved and the count did not follow, and a dry run
+    # over 312 live DevLoops printed "312 to write" for an apply that writes
+    # zero and blocks 312. The dry run cannot say so anywhere else: `blocked`
+    # is populated only by `apply_report`, which runs only under --apply.
+    #
+    # `ownership_override` off the REPORT, not from an argument: this function
+    # takes only a report, and the field exists precisely so a reader can see
+    # what the run claimed.
     already = sum(1 for p in report.planned if p.decision == DECISION_ALREADY_OWNED)
+    importable = sum(1 for p in report.planned if p.decision == DECISION_DEVLOOP)
+    writable = sum(
+        1 for p in report.planned if not may_apply(p, override=report.ownership_override)
+    )
+    # The posture on this channel too. It is the one the docstring says exists
+    # to answer "did this work" from a log tail without parsing anything, and
+    # without it a dry run and an apply that wrote nothing read identically
+    # there -- which is the exact case `applied` was added to the JSON for.
     print(
-        f"lifecycle-bootstrap: {len(report.planned) - already} to write, "
-        f"{already} already owned, {len(report.ambiguous)} ambiguous "
-        "(nothing written: this build plans only)",
+        f"lifecycle-bootstrap [{_posture(report)}]: {importable} importable, "
+        f"{writable} writable now, {already} already owned, {len(report.ambiguous)} ambiguous, "
+        f"{len(report.written)} written, {len(report.blocked)} blocked, "
+        f"{len(report.failed)} failed",
         file=sys.stderr,
     )
 
@@ -873,23 +1197,36 @@ def _print_report(report: Report) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
-    # Accepted, and refused. The flag is NOT dropped: the WorkflowTemplate on
-    # mctl-gitops main already passes it when dry_run=false, and a removed flag
-    # would fail there as argparse's "unrecognized arguments" -- exit 2 with no
-    # report, which an Argo log cannot tell from the deliberate refusal below.
-    # Keeping it means the contract changes once, when the writer lands.
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="refused in this build: the write path is a separate change. Nothing is written here.",
+        help="write the planned rows. Without it nothing is written: a dry run is the default posture.",
     )
-    # Scoping exists so a first apply does not have to be fleet-wide, and so a
-    # report can be reviewed one service at a time. It matters more here than
-    # on the shepherd: an apply skips an entity the store already holds, so a
-    # row written wrongly cannot be corrected by re-running -- a mistake at
-    # fleet scale is a mistake to undo by hand.
+    # Scoping exists so a first --apply does not have to be fleet-wide, and so
+    # a dry run can be reviewed one service at a time. It matters more here
+    # than on the shepherd: apply_report skips an entity the store already
+    # holds, so a row written wrongly cannot be corrected by re-running -- a
+    # mistake at fleet scale is a mistake to undo by hand.
     parser.add_argument("--service", default=None, help="limit to one service")
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
+    # The override, and it is a JUSTIFICATION rather than a bare flag: it takes
+    # the operator's reason, which goes on the report verbatim. A claim that
+    # licenses durable writes belongs next to what it licensed.
+    #
+    # It exists because `may_apply`'s capability clause refuses every write
+    # until mctlhq/mctl-api#322 lands, and an emergency path that is real must
+    # be explicit rather than something a narrower scope quietly confers.
+    parser.add_argument(
+        "--assume-tracked-ownership",
+        default="",
+        metavar="REASON",
+        help=(
+            "override the mctl-api#322 capability block. Requires --service: "
+            "the flag asserts these entities were checked in Temporal by hand, "
+            "and --slug alone matches a slug in every service. "
+            "The reason is recorded on the report."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.state_dir.is_dir():
@@ -1018,33 +1355,130 @@ def main(argv: list[str] | None = None) -> int:
     # `--apply`) walked the whole fleet and spent GitHub quota per PR-less
     # proposal before printing one sentence of refusal.
 
-    if args.apply:
-        # This module PLANS. There is no writer in it -- no `acquire` call
-        # exists to gate -- so the refusal is unconditional rather than a
-        # rollout check that would be theatre over a no-op.
+    # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
+    #
+    # "There is no readable checkout" outranks "this build does not write":
+    # the second is about what this run may do, the first about whether there
+    # is anything to do it to, and an operator sent away with the policy
+    # answer learns about the broken volume only on a second run.
+    #
+    # It was in front, with a cheap readability probe hoisted above it to keep
+    # the ordering true. That held for a mount broken AT THE ROOT and not one
+    # directory down: `discover_services` admits a service on a `stat` of its
+    # `proposals/`, so a `proposals/` at 0o111 passed the probe, hit the
+    # refusal, and answered `--apply` and a fleet-wide run differently for one
+    # permission bit. A guard that covers a depth is not a guard that covers
+    # the class.
+    #
+    # Discovery is where the whole class is answered, so the refusals moved
+    # behind it rather than the guard moving forward again. Discovery writes
+    # nothing -- `dry_run=True` unconditionally -- so nothing is risked by
+    # doing it first; what it costs is that a wrong mode is reported after the
+    # walk instead of before it.
+    # Read ONCE. `rollout.mode()` maps an unrecognised value to OFF and warns
+    # as a side effect, so evaluating it four times in the refusal both printed
+    # the warning four times -- onto the report's own stdout channel -- and
+    # produced a message naming `'off'` for an operator who had actually typed
+    # `obserev`. The one exit whose entire job is to be diagnostic must not
+    # rename the mistake it is diagnosing.
+    configured = rollout.mode()
+    # From `rollout`, not `os.environ`: the switch table in that module says
+    # LIFECYCLE_ROLLOUT_MODE is "read in this module and nowhere else", and a
+    # second read site here would also normalise differently -- `mode()` strips
+    # and lowercases, so ` Observe ` reads as valid there and as a typo in a
+    # message that re-read the variable itself. That difference is the exact
+    # thing naming the raw value exists to surface.
+    raw_mode = rollout.raw_mode()
+    if args.apply and args.assume_tracked_ownership and not args.service:
+        # UNDER --apply only. The override licenses nothing on a dry run --
+        # nothing is written for it to license -- so refusing one that carries
+        # it costs the operator the very report they need and gives back no
+        # safety. An earlier version was deliberately independent of --apply as
+        # "the conservative direction"; conservative about a posture that
+        # writes nothing is just a report withheld, and this module's stronger
+        # invariant is that a dry run always produces one.
         #
-        # Exit 2 and a REPORT, not a bare argparse error, for the reason the
-        # marker exists: an Argo step reads the report as an output parameter,
-        # and the one exit that printed none would be the one an operator most
-        # needs to read. `aborted` says which build this is.
+        # The override requires `--service`, and this is the only place scope
+        # carries weight. It is not a gate of its own: narrowing a run does not
+        # make an unheartbeated row safe, it just makes fewer of them, and an
+        # earlier version of this refusal let a scope alone license the write --
+        # a bypass of `may_apply`'s capability clause wearing the shape of a
+        # gate.
         #
-        # The gate this becomes is stated here so the order is not rediscovered
-        # when the writer lands: --apply will require EXACTLY `observe`. Below
-        # it the DevLoopWorkflow's own ownership activity short-circuits, so a
-        # row naming a devloop-workflow owner is never heartbeated, progressed
-        # or released by the workflow it names -- it sits `active` until its
-        # liveness bound expires, held by an owner that does not know it holds
-        # anything. Above it the shepherd is already CONSUMING the store, so a
-        # bulk import races a live reader. The order is: flip the WORKER to
-        # observe, then bootstrap, then flip the SHEPHERD.
+        # What it is for HERE is that the override's claim is "I checked these
+        # entities in Temporal by hand", and that claim is only checkable, and
+        # only honest, about a set the operator can enumerate.
+        #
+        # `--service`, NOT "--service or --slug". `_discover_refs` applies
+        # `slug_filter` INSIDE the per-service walk, so `--slug issue-7-x`
+        # alone matches that slug in every service -- which
+        # `test_slug_narrows_across_services` pins as deliberate behaviour.
+        # Accepting it as the named set made two tests in one file assert
+        # opposite things about the same flag. `--slug` still narrows further;
+        # it just does not bound the set on its own.
         _print_report(
             Report(
                 aborted=(
-                    "refused --apply: this build plans and reports only; the write "
-                    "path (rollout gate, acquire, idempotence) is a separate change. "
-                    "Re-run without --apply for the report."
+                    "refused --assume-tracked-ownership without --service: the "
+                    "override asserts these entities were checked in Temporal by hand, "
+                    "which is a claim about a named set. --slug alone is not one: "
+                    "_discover_refs applies it inside the per-service walk, so it "
+                    "matches that slug in every service. Add --service (--slug may "
+                    "narrow further)."
                 ),
-                rollout_mode=rollout.mode(),
+                rollout_mode=configured,
+                applied=args.apply,
+                ownership_override=args.assume_tracked_ownership,
+            )
+        )
+        return 2
+    if args.apply and configured != rollout.OBSERVE:
+        # The one switch every other writer in this package honours. At `off`
+        # the DevLoopWorkflow's own ownership activity short-circuits, so a row
+        # this tool writes for a devloop-workflow owner is never heartbeated,
+        # progressed or released by the workflow it names: it sits `active`
+        # until its liveness bound expires, held by an owner that does not know
+        # it holds anything.
+        #
+        # So the order is: flip the WORKER to observe (the writer goes live),
+        # then bootstrap, then flip the SHEPHERD (the comparison starts against
+        # a populated store). Writing first and flipping after fills the store
+        # with rows nobody refreshes.
+        #
+        # EXACTLY observe, not records_writes(), which is at_least(OBSERVE) and
+        # so also true at enforce and only. That is a SECOND hazard: at enforce
+        # the shepherd is already CONSUMING the store, so a bulk import races a
+        # live reader and bypasses the staged order above. A pre-soak migration
+        # has no business running after the soak.
+        #
+        # THE LIMIT OF THIS GATE, stated because it is not obvious: the mode is
+        # read from THIS process's environment, and the orphan hazard belongs
+        # to the TEMPORAL WORKER, which this process cannot see. It is an
+        # operator ATTESTATION, not a verification -- the WorkflowTemplate
+        # makes it an explicit parameter for that reason, and the mode is
+        # echoed into the report so the claim sits beside what it licensed.
+        #
+        # A report on this path too. The marker exists so a consumer can always
+        # find the report by grepping for it, and an Argo step reading it as an
+        # output parameter gets nothing if this is the one exit that prints
+        # none — a different failure from "the report says it refused". The
+        # mode IS the answer here, which is what rollout_mode is for.
+        _print_report(
+            Report(
+                aborted=(
+                    f"refused --apply: {rollout.ENV_VAR} is "
+                    f"{'unset' if raw_mode is None else repr(raw_mode)} and reads as "
+                    f"{configured!r}, expected {rollout.OBSERVE!r}. Below it the owners "
+                    "these rows name are not heartbeating; above it the shepherd is "
+                    "already reading the store and a bulk import races it."
+                ),
+                rollout_mode=configured,
+                applied=args.apply,
+                # On this path too. The field's whole rationale is that a claim
+                # licensing durable writes sits next to what it licensed, and
+                # an operator who passed one and was refused for a different
+                # reason still made the claim.
+                ownership_override=args.assume_tracked_ownership,
             )
         )
         return 2
@@ -1132,12 +1566,36 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
-    report.rollout_mode = rollout.mode()
+    report.rollout_mode = configured
     report.skip_services = ",".join(sorted(run_shepherd.SHEPHERD_SKIP_SERVICES))
     report.discovery_ignored_skip_set = discovery_ignores_skip_set
+    report.applied = args.apply
+
+    report.ownership_override = args.assume_tracked_ownership
+    if not report.aborted and args.apply:
+        apply_report(report, client, override=args.assume_tracked_ownership)
 
     _print_report(report)
-    if report.aborted:
+    # `blocked` counts, and it is the shape a production apply has TODAY.
+    #
+    # With OWNERSHIP_CAPABILITY_KNOWN False and no override, every writable row
+    # is blocked -- and the WorkflowTemplate reaches that with one parameter,
+    # since dry_run=false already yields --apply. Exiting 0 with `written: []`
+    # is, in the coarsest channel an Argo step branches on, indistinguishable
+    # from a successful apply against a fleet with nothing to import -- which
+    # is the ORDINARY state of the fleet by this module's own account. That is
+    # the same collapse `applied` was added to the JSON to prevent, one level
+    # out.
+    #
+    # The mixed case is worse and survives the override:
+    # `--assume-tracked-ownership` answers the capability clause and not the id
+    # clause, so a batch where three of forty rows fail `entity_id_exact`
+    # writes thirty-seven, records three, and exits 0 -- a partial apply that
+    # silently skipped entities.
+    #
+    # No dry-run false positive to weigh against it: `apply_report` is the only
+    # writer of `blocked`, and it runs only under --apply.
+    if report.aborted or report.failed or report.blocked:
         return 1
     # Discovering NOTHING is not a successful import: a checkout mounted one
     # level off, or a state dir with no proposals in an actionable status,
