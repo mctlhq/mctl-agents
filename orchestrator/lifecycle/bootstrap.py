@@ -319,15 +319,20 @@ class Report:
                 "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
                 "applied": self.applied,
                 "counts": None,
-                # THE FIELD, for the same reason as the two below it: empty
-                # today because build_report returns before the plan loop, but
-                # a literal here is a field that cannot contradict the code.
+                # THE FIELD, not a literal. Empty today because build_report
+                # returns before the plan loop, but a literal is a field that
+                # cannot contradict the code, which is the one thing a report
+                # is for.
                 "planned": [p.as_dict() for p in self.planned],
-                # Likewise. Empty today -- `main` gates the write on `not
-                # report.aborted` -- but if a future path ever writes before
-                # aborting, the report must be able to say so rather than
-                # being structurally incapable of it.
+                # NOT empty, and never was: build_report appends the pre-read
+                # entries -- an unreadable `pr:`, a duplicate mapping -- before
+                # it can abort, which is what the comment above this branch
+                # says about `total`.
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
+                # Empty today -- `main` gates the write on `not
+                # report.aborted` -- but if a future path ever writes before
+                # aborting, the report must be able to say so rather than be
+                # structurally incapable of it.
                 "written": self.written,
                 "failed": self.failed,
             }
@@ -978,6 +983,18 @@ def apply_report(report: Report, client: OwnershipClient) -> Report:
     return report
 
 
+def _posture(report: Report) -> str:
+    """What the run was ASKED to do, in the tense the field is defined in.
+
+    `Report.applied` is "the posture, not the outcome", so the label must not
+    be past tense. `[applied]` read as a claim about what happened, and on the
+    one path where posture and outcome are guaranteed to disagree it printed
+    `lifecycle-bootstrap [applied]: ABORTED: refused --apply` for a run
+    asserted to have written nothing.
+    """
+    return "apply" if report.applied else "dry run"
+
+
 def _print_report(report: Report) -> None:
     """The report on stdout behind its marker, and a summary on stderr.
 
@@ -987,8 +1004,10 @@ def _print_report(report: Report) -> None:
     """
     print(f"{REPORT_MARKER} {json.dumps(report.as_dict())}", flush=True)
     if report.aborted:
-        posture = "applied" if report.applied else "dry run"
-        print(f"lifecycle-bootstrap [{posture}]: ABORTED: {report.aborted}", file=sys.stderr)
+        print(
+            f"lifecycle-bootstrap [{_posture(report)}]: ABORTED: {report.aborted}",
+            file=sys.stderr,
+        )
         return
     # `already-owned` counted apart from the work. Both live in `planned` and
     # apply_report skips the first, so the idempotent second run -- the one
@@ -1006,9 +1025,8 @@ def _print_report(report: Report) -> None:
     # to answer "did this work" from a log tail without parsing anything, and
     # without it a dry run and an apply that wrote nothing read identically
     # there -- which is the exact case `applied` was added to the JSON for.
-    posture = "applied" if report.applied else "dry run"
     print(
-        f"lifecycle-bootstrap [{posture}]: {writable} to write, "
+        f"lifecycle-bootstrap [{_posture(report)}]: {writable} to write, "
         f"{already} already owned, {len(report.ambiguous)} ambiguous, "
         f"{len(report.written)} written, {len(report.failed)} failed",
         file=sys.stderr,
@@ -1137,6 +1155,49 @@ def main(argv: list[str] | None = None) -> int:
     # rename the mistake it is diagnosing.
     configured = rollout.mode()
     raw_mode = os.environ.get(rollout.ENV_VAR, "")
+    if args.apply and not (args.service or args.slug):
+        # THE SECOND-MARKER BLOCKER, enforced rather than described. The KNOWN
+        # LIMITS entry says a fleet-wide --apply must not run before mctl-api
+        # can report whether an execution tracks ownership; stated only in
+        # prose, that is a blocker a caller reaches with one parameter. The
+        # WorkflowTemplate already turns dry_run=false into --apply, and
+        # whether it plumbs --service lives in another repository -- a rule
+        # enforced only there reads from here as unenforced.
+        #
+        # Why the SCOPE is the right shape for it: the probe cannot tell an
+        # execution that tracks ownership from one recorded between the
+        # `shepherd-in-loop` and `lifecycle-ownership` patch markers, which
+        # answers the probe True and will never acquire, heartbeat or release
+        # the row this would write. Scoped, the operator names the entities and
+        # can check them in Temporal by hand; unscoped, the whole cohort is
+        # written at once, and the cohort is largest exactly when a pre-soak
+        # migration runs.
+        #
+        # It also protects a claim this tool makes about itself. `apply_report`
+        # sells idempotence on already-owned, and for that cohort it is false:
+        # nothing heartbeats the row, it expires, rung 1 stops firing, and the
+        # next run writes it again -- so "re-run it" becomes a loop that
+        # manufactures store-permits-old-forbids rather than a recovery.
+        #
+        # Lifted when mctlhq/mctl-api#322 lands and the probe can ask the
+        # second question.
+        _print_report(
+            Report(
+                aborted=(
+                    "refused --apply without --service or --slug: a fleet-wide apply is "
+                    "blocked until mctl-api can report whether a DevLoop execution tracks "
+                    "ownership (mctlhq/mctl-api#322). The probe reads shepherd_in_loop, "
+                    "which is True for executions recorded between the shepherd-in-loop "
+                    "and lifecycle-ownership patch markers -- they answer it and never "
+                    "acquire, heartbeat or release the row. Scope the run to entities you "
+                    "have checked in Temporal."
+                ),
+                rollout_mode=configured,
+                applied=args.apply,
+            )
+        )
+        return 2
+
     if args.apply and configured != rollout.OBSERVE:
         # The one switch every other writer in this package honours. At `off`
         # the DevLoopWorkflow's own ownership activity short-circuits, so a row

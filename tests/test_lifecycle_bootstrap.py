@@ -125,7 +125,7 @@ def test_an_abort_reaches_no_writer_under_apply(tmp_path, monkeypatch, capsys) -
     client = _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN, reason="down")})
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
     report = _report_of(capsys.readouterr().out)
     assert report["aborted"]
     assert client.acquires == [], "an aborted run reached the writer under --apply"
@@ -698,7 +698,7 @@ def test_a_skipped_service_is_still_discovered(tmp_path, monkeypatch, capsys) ->
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 0
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-claude-remote"]) == 0
     report = _report_of(capsys.readouterr().out)
     assert report["counts"]["devloop-workflow"] == 1
     # WRITTEN, end to end. Dropped at discovery the entity appears nowhere and
@@ -762,7 +762,7 @@ def test_apply_is_required_to_write(tmp_path, monkeypatch, capsys) -> None:
     assert client.acquires == [], "a run without --apply wrote to the store"
     capsys.readouterr()
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 0
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 0
     assert [a[0] for a in client.acquires] == ["mctlhq/mctl-web#42"]
     assert _report_of(capsys.readouterr().out)["written"] == ["mctlhq/mctl-web#42"]
 
@@ -795,7 +795,7 @@ def test_the_devloop_row_carries_the_workflow_id(tmp_path, monkeypatch, capsys) 
     client = _Client()
     _install_client(monkeypatch, client)
 
-    bootstrap.main(["--state-dir", str(root), "--apply"])
+    bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"])
     assert client.acquires[0][3]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-web-7"
 
 
@@ -853,7 +853,7 @@ def test_an_unknown_service_is_rejected_at_the_argument(tmp_path, capsys) -> Non
     An unknown --service matches no proposal directory, so without this the run
     discovers nothing and exits 1 saying "discovered no proposals at all" --
     whose message sends the operator to check the volume mount for what is a
-    typo in their own argument. --service is used precisely on the scoped first
+    typo in their own argument. --service is used precisely on the scoped
     apply, which is the worst moment for that.
     """
     root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
@@ -1048,18 +1048,23 @@ def test_a_service_outside_SERVICES_is_still_addressable(tmp_path, monkeypatch, 
     with `_`, so a repository with proposals but no SERVICES entry --
     mctl-claude-remote, whose pull requests another lifecycle drives -- is
     discoverable. Validating the flag against SERVICES would make it the one
-    thing an operator cannot scope to.
+    thing an operator cannot scope to, and --apply now REQUIRES a scope, so
+    that would have made it unappliable rather than merely awkward.
     """
     from config.settings import SERVICES
     from orchestrator import run_shepherd
 
     assert "mctl-claude-remote" not in SERVICES, "the premise of this test"
 
+    _observe_env(monkeypatch)
     root = _state_dir(tmp_path, "mctl-claude-remote", "issue-7-a-thing")
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
     _install_client(monkeypatch, _Client())
 
-    assert bootstrap.main(["--state-dir", str(root), "--service", "mctl-claude-remote"]) == 0
+    assert (
+        bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-claude-remote"])
+        == 0
+    )
     assert _report_of(capsys.readouterr().out)["counts"]["total"] == 1
 
 
@@ -1924,8 +1929,8 @@ def test_the_stderr_summary_carries_the_posture_too(tmp_path, monkeypatch, capsy
     bootstrap.main(["--state-dir", str(root)])
     assert "[dry run]" in capsys.readouterr().err
 
-    bootstrap.main(["--state-dir", str(root), "--apply"])
-    assert "[applied]" in capsys.readouterr().err
+    bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"])
+    assert "[apply]" in capsys.readouterr().err
 
 
 def test_the_abort_summary_carries_the_posture(tmp_path, monkeypatch, capsys) -> None:
@@ -1940,9 +1945,12 @@ def test_the_abort_summary_carries_the_posture(tmp_path, monkeypatch, capsys) ->
         monkeypatch, _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN)})
     )
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
     err = capsys.readouterr().err
-    assert "[applied]" in err and "ABORTED" in err
+    assert "[apply]" in err and "ABORTED" in err
+    # Not past tense: `applied` is the posture, and this is the one path where
+    # posture and outcome are guaranteed to disagree.
+    assert "[applied]" not in err
 
 
 def test_the_report_records_whether_it_was_asked_to_write(tmp_path, monkeypatch, capsys) -> None:
@@ -1967,7 +1975,7 @@ def test_the_report_records_whether_it_was_asked_to_write(tmp_path, monkeypatch,
     assert bootstrap.main(["--state-dir", str(root)]) == 0
     dry = _report_of(capsys.readouterr().out)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 0
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 0
     applied = _report_of(capsys.readouterr().out)
 
     assert dry["applied"] is False
@@ -1991,7 +1999,7 @@ def test_a_mistyped_mode_is_named_as_typed(tmp_path, monkeypatch, capsys) -> Non
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
     captured = capsys.readouterr()
     report = _report_of(captured.out)
     assert "'obserev'" in report["aborted"], "the refusal renamed the operator's typo"
@@ -2016,7 +2024,7 @@ def test_apply_refuses_below_observe(tmp_path, monkeypatch, capsys) -> None:
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
     assert client.acquires == []
     captured = capsys.readouterr()
     assert "refused --apply" in captured.err
@@ -2039,7 +2047,69 @@ def test_a_refused_acquire_reaches_the_exit_code(tmp_path, monkeypatch, capsys) 
     _install_client(
         monkeypatch, _Client(acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409"))
     )
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
+
+
+def test_an_unscoped_apply_is_refused(tmp_path, monkeypatch, capsys) -> None:
+    """The second-marker blocker, enforced rather than described.
+
+    KNOWN LIMITS says a fleet-wide --apply must not run before mctl-api can
+    report whether an execution tracks ownership (mctlhq/mctl-api#322). Stated
+    only in prose that is a blocker a caller reaches with one parameter: the
+    WorkflowTemplate already turns dry_run=false into --apply, and whether it
+    plumbs --service lives in another repository — a rule enforced only there
+    reads from here as unenforced.
+
+    The entity here is one a real apply WOULD write, and the rollout mode is
+    `observe`, so nothing else in `main` would stop it.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    report = _report_of(capsys.readouterr().out)
+    assert "refused --apply without --service or --slug" in report["aborted"]
+    assert "mctl-api#322" in report["aborted"]
+    assert client.acquires == [], "an unscoped --apply wrote to the store"
+    # The posture is on the record here too: this is an apply that wrote
+    # nothing, which is exactly the artifact `applied` exists to disambiguate.
+    assert report["applied"] is True
+
+
+def test_either_scope_satisfies_the_blocker(tmp_path, monkeypatch, capsys) -> None:
+    """--slug is a scope as much as --service is: both make the operator name
+    what they checked, which is the whole content of the rule."""
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    _install_client(monkeypatch, _Client())
+
+    assert (
+        bootstrap.main(["--state-dir", str(root), "--apply", "--slug", "issue-7-a-thing"]) == 0
+    )
+    assert _report_of(capsys.readouterr().out)["written"] == ["mctlhq/mctl-web#42"]
+
+
+def test_a_dry_run_needs_no_scope(tmp_path, monkeypatch, capsys) -> None:
+    """The refusal is about WRITING. A fleet-wide report is the thing an
+    operator reads BEFORE deciding what to scope an apply to, so requiring a
+    scope for it would make the rule unsatisfiable."""
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    _install_client(monkeypatch, _Client())
+
+    assert bootstrap.main(["--state-dir", str(root)]) == 0
+    assert _report_of(capsys.readouterr().out)["counts"]["devloop-workflow"] == 1
 
 
 def test_an_apply_at_enforce_is_refused(tmp_path, monkeypatch, capsys) -> None:
@@ -2055,6 +2125,6 @@ def test_an_apply_at_enforce_is_refused(tmp_path, monkeypatch, capsys) -> None:
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
     assert client.acquires == []
     assert "expected 'observe'" in capsys.readouterr().err
