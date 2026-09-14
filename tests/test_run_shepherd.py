@@ -2923,10 +2923,15 @@ def test_filter_dev_loop_owned_drops_only_owned(monkeypatch, capsys) -> None:
         proposal_dir=Path("/tmp/y"),
         status="implemented",
     )
+    # The pool submits the TRI-STATE probe; the bool is derived at the
+    # collection site. Patching _dev_loop_owns would patch a function the
+    # filter no longer calls, and the test would pass by measuring nothing.
     monkeypatch.setattr(
         run_shepherd,
-        "_dev_loop_owns",
-        lambda service, slug: slug == "issue-10-owned",
+        "_dev_loop_owns_answer",
+        lambda service, slug: (
+            run_shepherd.LEGACY_OWNED if slug == "issue-10-owned" else run_shepherd.LEGACY_FREE
+        ),
     )
     kept = run_shepherd._filter_dev_loop_owned([owned, free])
     assert kept == [free]
@@ -2982,13 +2987,14 @@ def test_filter_dev_loop_owned_keeps_unanswered_refs_when_budget_expires(
 
     release = threading.Event()
 
-    def slow_or_fast(service: str, slug: str) -> bool:
+    def slow_or_fast(service: str, slug: str) -> str:
         if slug == "issue-10-owned":
-            return True
+            return run_shepherd.LEGACY_OWNED
         release.wait(timeout=5)
-        return True  # would claim ownership — but must never be consulted
+        # Would claim ownership — but must never be consulted.
+        return run_shepherd.LEGACY_OWNED
 
-    monkeypatch.setattr(run_shepherd, "_dev_loop_owns", slow_or_fast)
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", slow_or_fast)
     monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
 
     refs = [
@@ -3104,11 +3110,11 @@ def test_filter_dev_loop_owned_returns_within_budget_with_queued_work(
 
     release = threading.Event()
 
-    def hangs(service: str, slug: str) -> bool:
+    def hangs(service: str, slug: str) -> str:
         release.wait(timeout=1.0)
-        return False
+        return run_shepherd.LEGACY_FREE
 
-    monkeypatch.setattr(run_shepherd, "_dev_loop_owns", hangs)
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", hangs)
     monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_WORKERS", 2)
     monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
 
@@ -4756,3 +4762,205 @@ def test_dot_github_can_never_resolve_to_full_merge(monkeypatch, capsys) -> None
 def test_dot_github_deferred_merge_owner_is_human_not_steward() -> None:
     """pr-steward has no role in .github; naming it would misattribute the merge."""
     assert run_shepherd._merge_owner_for(".github") == "human-codeowner"
+
+
+# --- the shadow compare (observe stage) --------------------------------
+
+
+def _tri_refs():
+    return [
+        run_shepherd.ProposalRef(
+            service="mctl-web", slug=slug, proposal_dir=Path("/tmp/x"),
+            status="implemented", pr_url=f"https://github.com/mctlhq/mctl-web/pull/{n}",
+        )
+        for n, slug in enumerate(
+            ("issue-10-owned", "issue-11-free", "issue-12-unknown"), start=1
+        )
+    ]
+
+
+def _scripted_answers(service: str, slug: str) -> str:
+    if slug == "issue-10-owned":
+        return run_shepherd.LEGACY_OWNED
+    if slug == "issue-11-free":
+        return run_shepherd.LEGACY_FREE
+    return run_shepherd.LEGACY_UNKNOWN
+
+
+def test_filter_decisions_are_identical_with_the_shadow_on_and_off(monkeypatch, capsys) -> None:
+    """The load-bearing test of the whole observe stage.
+
+    Observe must be observational. Not "the kept list looks similar" but: the
+    same refs survive AND the sweep's own output is unchanged, once the
+    shadow's own lines are removed. The second half is what makes this an
+    equivalence test rather than a list comparison -- it catches a shadow block
+    that quietly altered a warning, a skip line or the order of anything else
+    the tick prints.
+    """
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", _scripted_answers)
+
+    monkeypatch.delenv("LIFECYCLE_ROLLOUT_MODE", raising=False)
+    kept_off = run_shepherd._filter_dev_loop_owned(_tri_refs())
+    out_off = capsys.readouterr().out
+
+    class _Client:
+        def get_many(self, kind, phase, ids, asking=None):
+            from orchestrator.lifecycle.contract import UNKNOWN, UNOWNED, OwnershipAnswer
+
+            # Every verdict the store can answer, including one that raises on
+            # the way out -- an observer must survive its own data source.
+            out = {}
+            for i, entity_id in enumerate(ids):
+                if i == 0:
+                    raise RuntimeError("the store blew up mid-batch")
+                out[entity_id] = OwnershipAnswer(verdict=UNOWNED if i == 1 else UNKNOWN)
+            return out
+
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    monkeypatch.setattr(
+        run_shepherd.shadow, "compare_entities",
+        lambda mapping, **kw: _Client().get_many("pull-request", "review-remediation", sorted(mapping)),
+    )
+    kept_on = run_shepherd._filter_dev_loop_owned(_tri_refs())
+    out_on = capsys.readouterr().out
+
+    assert [r.slug for r in kept_off] == [r.slug for r in kept_on]
+    scrubbed = "\n".join(
+        line for line in out_on.splitlines()
+        if "lifecycle-shadow" not in line and "lifecycle shadow compare failed" not in line
+    )
+    assert scrubbed.strip() == out_off.strip()
+
+
+def test_the_shadow_is_not_consulted_below_observe(monkeypatch) -> None:
+    """Off is off: no client, no HTTP, no cost beyond the probe the sweep was
+    already paying for."""
+    monkeypatch.delenv("LIFECYCLE_ROLLOUT_MODE", raising=False)
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", _scripted_answers)
+    monkeypatch.setattr(
+        run_shepherd.shadow, "compare_proposal_refs",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("shadow ran while the mode was off")),
+    )
+    run_shepherd._filter_dev_loop_owned(_tri_refs())
+
+
+def test_the_shadow_sees_the_tristate_including_budget_expiry(monkeypatch) -> None:
+    """A ref the budget never answered is legacy-unknown, not legacy-free.
+
+    This is the whole reason the probe became three-valued: the bool collapses
+    "the budget ran out" into "nobody owns it", and counting that as a measured
+    disagreement would fill the soak with divergences that are really timeouts.
+    """
+    import threading
+
+    release = threading.Event()
+    seen: dict = {}
+
+    def slow(service: str, slug: str) -> str:
+        if slug == "issue-10-owned":
+            return run_shepherd.LEGACY_OWNED
+        release.wait(timeout=5)
+        return run_shepherd.LEGACY_OWNED
+
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", slow)
+    monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
+    monkeypatch.setattr(
+        run_shepherd.shadow, "compare_proposal_refs",
+        lambda refs, legacy, parse: seen.update(legacy) or run_shepherd.shadow.Totals(),
+    )
+    try:
+        run_shepherd._filter_dev_loop_owned(_tri_refs()[:2])
+    finally:
+        release.set()
+
+    assert seen.get(0) == run_shepherd.LEGACY_OWNED
+    # Index 1 never answered: absent from the dict, which the compare reads as
+    # LEGACY_UNKNOWN through its default rather than from anything written here.
+    assert 1 not in seen
+
+
+def test_a_failing_shadow_cannot_fail_the_sweep(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", _scripted_answers)
+    monkeypatch.setattr(
+        run_shepherd.shadow, "compare_proposal_refs",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    kept = run_shepherd._filter_dev_loop_owned(_tri_refs())
+    assert [r.slug for r in kept] == ["issue-11-free", "issue-12-unknown"]
+    assert "lifecycle shadow compare failed" in capsys.readouterr().out
+
+
+# --- the tri-state probe, path by path ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "setup", "expected"),
+    [
+        ("no issue prefix", "slug", run_shepherd.LEGACY_FREE),
+        ("no token", "token", run_shepherd.LEGACY_UNKNOWN),
+        ("non-https url", "scheme", run_shepherd.LEGACY_UNKNOWN),
+        ("404", "notfound", run_shepherd.LEGACY_FREE),
+        ("500", "servererror", run_shepherd.LEGACY_UNKNOWN),
+        ("network error", "network", run_shepherd.LEGACY_UNKNOWN),
+        ("bad json", "badjson", run_shepherd.LEGACY_UNKNOWN),
+        ("payload is not a dict", "notadict", run_shepherd.LEGACY_UNKNOWN),
+        ("completed", "completed", run_shepherd.LEGACY_FREE),
+        ("running, field absent", "nofield", run_shepherd.LEGACY_UNKNOWN),
+        ("running, field false", "declines", run_shepherd.LEGACY_FREE),
+        ("running and shepherding", "owned", run_shepherd.LEGACY_OWNED),
+    ],
+)
+def test_the_tristate_probe_maps_every_path(monkeypatch, capsys, name, setup, expected) -> None:
+    """One row per failure path, and each asserts the tri-state AND the
+    unchanged bool. The bool is the sweep's decision: this file's older tests
+    pin it path by path, and none of them may move."""
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    slug = "issue-10-test"
+
+    def _raise(exc):
+        def _open(request, timeout=None):
+            raise exc
+        return _open
+
+    if setup == "slug":
+        slug = "incident-9-oom"
+    elif setup == "token":
+        monkeypatch.setenv("MCTL_TOKEN", "")
+    elif setup == "scheme":
+        monkeypatch.setattr(run_shepherd, "MCTL_API_URL", "http://api.internal")
+    elif setup == "notfound":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(_raise(
+            urllib.error.HTTPError("u", 404, "nf", None, None))))
+    elif setup == "servererror":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(_raise(
+            urllib.error.HTTPError("u", 500, "boom", None, None))))
+    elif setup == "network":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(_raise(
+            urllib.error.URLError("unreachable"))))
+    elif setup == "badjson":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener",
+                            _opener(lambda r, timeout=None: _FakeHTTPResponse(b"{not json")))
+    elif setup == "notadict":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener",
+                            _opener(lambda r, timeout=None: _FakeHTTPResponse(b"[1,2]")))
+    elif setup == "completed":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
+            lambda r, timeout=None: _FakeHTTPResponse(b'{"status": "Completed"}')))
+    elif setup == "nofield":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
+            lambda r, timeout=None: _FakeHTTPResponse(b'{"status": "Running"}')))
+    elif setup == "declines":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
+            lambda r, timeout=None: _FakeHTTPResponse(
+                b'{"status": "Running", "shepherd_in_loop": false}')))
+    elif setup == "owned":
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
+            lambda r, timeout=None: _FakeHTTPResponse(
+                b'{"status": "Running", "shepherd_in_loop": true}')))
+
+    assert run_shepherd._dev_loop_owns_answer("mctl-web", slug) == expected
+    # The decision the sweep actually makes, unchanged in every case.
+    assert run_shepherd._dev_loop_owns("mctl-web", slug) is (expected == run_shepherd.LEGACY_OWNED)
+    capsys.readouterr()

@@ -31,9 +31,13 @@ import os
 
 from orchestrator.lifecycle.client import ownership_required
 
-#: Nothing is written and nothing is read. Break-glass, not a steady state:
-#: the DevLoop still schedules its ownership activity on the usual cadence, so
-#: the cost is the activity, not the write.
+#: Nothing is written and nothing is read. Break-glass, not a steady state.
+#:
+#: The DevLoop still SCHEDULES its ownership activity — it must, or a history
+#: recorded under observe would not replay on a worker set to off — but the
+#: activity short-circuits before any HTTP call. The cost is bounded rather
+#: than per-poll: each skipped write answers UNKNOWN, the caller counts it, and
+#: `_backed_off` stops asking after LIFECYCLE_UNKNOWN_WRITE_LIMIT of them.
 OFF = "off"
 
 #: The new answer is computed and recorded alongside the old one, and the OLD
