@@ -375,7 +375,32 @@ def plan_for(
     verdict answers None and the whole run goes red rather than quietly
     classifying on a field that is not there.
     """
-    from orchestrator.run_shepherd import LEGACY_OWNED, LEGACY_UNKNOWN
+    from orchestrator.run_shepherd import (
+        DEVLOOP_WORKFLOW_ORG,
+        LEGACY_OWNED,
+        LEGACY_UNKNOWN,
+        devloop_workflow_id,
+    )
+
+    # ONE evaluation, ABOVE the rungs, because two of them need it and they
+    # need it for opposite purposes: rung 3 writes the id, and rung 2 decides
+    # whether its ambiguity is retryable. Computed inside rung 3 instead, the
+    # permanent classification was unreachable through the production probe --
+    # `_dev_loop_owns_answer` converts the same ValueError to LEGACY_UNKNOWN,
+    # so the entity stopped at rung 2 and was reported RETRYABLE, telling an
+    # operator to re-run a directory name the same checkout reproduces exactly.
+    # That is the mislabel the branch was written to prevent, reached by the
+    # only path production can take.
+    #
+    # `id_error` is the third state, kept apart from `""`: an empty id means
+    # the slug never had a DevLoop (structural, an answer), while an error
+    # means the entity cannot be represented at all (a data problem in the
+    # checkout). Collapsing them would make a bad directory look like a
+    # pre-Temporal proposal.
+    try:
+        workflow_id, id_error = devloop_workflow_id(ref.service, ref.slug), ""
+    except ValueError as exc:
+        workflow_id, id_error = "", str(exc)
 
     base = Plan(
         entity_id=entity_id,
@@ -438,8 +463,18 @@ def plan_for(
     if legacy_answer == LEGACY_UNKNOWN:
         base.decision = DECISION_AMBIGUOUS
         base.undetermined = True
-        base.retryable = True
-        base.reason = "the DevLoop liveness probe could not answer; owner undetermined"
+        # RETRYABLE only if a re-run could plausibly answer differently, and an
+        # unrepresentable service never will: `_dev_loop_owns_answer` answers
+        # UNKNOWN for it precisely because it could not build the id, and the
+        # next run over the same checkout builds the same nothing. This is the
+        # ONLY path production takes for that input, so it is where the
+        # permanence has to be named.
+        base.retryable = not id_error
+        base.reason = (
+            f"the DevLoop liveness probe could not answer: {id_error}"
+            if id_error
+            else "the DevLoop liveness probe could not answer; owner undetermined"
+        )
         return base
 
     if legacy_answer == LEGACY_OWNED:
@@ -454,12 +489,6 @@ def plan_for(
         # entity refused as "in another repository", a red run whose reason
         # names the wrong cause.
         #
-        # Imported HERE rather than at module scope: `run_shepherd` pulls in
-        # the agent SDK at import time, and this module is imported by things
-        # that only want the report's vocabulary. Every other name from there
-        # is deferred the same way.
-        from orchestrator.run_shepherd import DEVLOOP_WORKFLOW_ORG, devloop_workflow_id
-
         # The WHOLE repo, not just the org, and CASE-INSENSITIVELY. GitHub
         # treats owner and repository names case-insensitively, so a `pr:`
         # spelled mctlhq/MCTL-Web in .status.yaml names the same repository
@@ -491,9 +520,7 @@ def plan_for(
                 "importing it would name another repository's workflow"
             )
             return base
-        try:
-            workflow_id = devloop_workflow_id(ref.service, ref.slug)
-        except ValueError as exc:
+        if id_error:
             # The service directory is not a representable repository name.
             # `_discover_refs` takes it from any directory under the state dir
             # that does not begin with `_` and never checks it against
@@ -507,12 +534,19 @@ def plan_for(
             # same checkout reproduces it exactly -- the fix is renaming the
             # directory.
             #
-            # Caught rather than allowed to escape: `build_report`'s plan loop
-            # has no handler, so one unrepresentable directory would abort the
-            # whole report instead of failing for its own entity.
+            # Reached only with an INJECTED probe. In production the probe is
+            # `_dev_loop_owns_answer`, which answers LEGACY_UNKNOWN for exactly
+            # this input, so the entity stops at rung 2 above -- where the same
+            # `id_error` makes the ambiguity permanent rather than retryable.
+            # Kept because a test double, or a future probe that answers from
+            # somewhere other than that function, can still reach here, and
+            # because an exception out of the ladder would abort the whole
+            # report rather than fail for its own entity.
             base.decision = DECISION_AMBIGUOUS
             base.undetermined = True
-            base.reason = f"a live DevLoop drives this, but its workflow id cannot be built: {exc}"
+            base.reason = (
+                f"a live DevLoop drives this, but its workflow id cannot be built: {id_error}"
+            )
             return base
         if not workflow_id:
             # Unreachable from the probe — a slug with no issue-<N>- prefix

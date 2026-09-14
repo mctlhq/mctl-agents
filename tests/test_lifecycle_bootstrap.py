@@ -1385,6 +1385,40 @@ def test_a_confirmed_devloop_we_cannot_name_fails_the_run(tmp_path, monkeypatch,
     assert "could not be determined" in capsys.readouterr().err
 
 
+def test_an_unrepresentable_service_through_the_real_probe(tmp_path, monkeypatch) -> None:
+    """What an operator actually gets, not what the ladder would say in
+    isolation.
+
+    In production `build_report` is called with `probe=_dev_loop_owns_answer`,
+    and that function answers LEGACY_UNKNOWN for exactly the inputs that make
+    `devloop_workflow_id` raise -- by design, since an exception there would
+    take the whole sweep tick down. So the entity never reaches rung 3's
+    permanent refusal: it stops at rung 2, and rung 2 is where the permanence
+    has to be named.
+
+    Asserted through the REAL probe rather than a double, because that
+    interaction is the finding: a test calling `plan_for` with LEGACY_OWNED in
+    hand exercises the one input `build_report` cannot produce for this shape.
+    """
+    from orchestrator import run_shepherd
+
+    monkeypatch.setenv("MCTL_TOKEN", "t")
+    ref = _ref(service="not a repo name")
+    object.__setattr__(ref, "pr_url", "https://github.com/mctlhq/not a repo name/pull/42")
+
+    report = bootstrap.build_report([ref], _Client(), run_shepherd._dev_loop_owns_answer)
+
+    # A report, not an abort: one bad directory must not take the run with it.
+    assert report.aborted == ""
+    assert report.planned == []
+    plan = report.ambiguous[0]
+    assert plan.undetermined is True
+    # PERMANENT. Retryable here sends an operator to re-run a directory name
+    # the same checkout reproduces exactly, and `main()` counts it under
+    # "retryable" in the summary that tells them which to do.
+    assert plan.retryable is False
+
+
 def test_an_unrepresentable_service_is_undetermined_not_a_crash() -> None:
     """`devloop_workflow_id` validates now, and the unvalidated half of the URL
     it builds is the SERVICE, not the slug.
