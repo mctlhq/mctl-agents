@@ -22,8 +22,11 @@ KNOWN LIMITS, written down rather than left to be rediscovered:
   the hazard is the Temporal worker's. Setting the variable here with the
   worker still off passes the gate. The mode is echoed into the report so what
   was claimed sits next to what it licensed.
-- **The probe cannot see the second patch marker, and this is a BLOCKER for
-  ``--apply``, not a caveat.** ``LEGACY_OWNED`` means ``shepherd_in_loop is
+- **The probe cannot see the second patch marker.** ENFORCED, not described:
+  ``may_apply`` refuses every write while ``OWNERSHIP_CAPABILITY_KNOWN`` is
+  False, and the only way past it is an explicit, scoped
+  ``--assume-tracked-ownership REASON`` whose justification goes on the report.
+  ``LEGACY_OWNED`` means ``shepherd_in_loop is
   True``, i.e. ``workflow.patched("shepherd-in-loop")`` plus the pinned-image
   check. But ``dev_loop.py`` gates every ownership call on ``shepherd_in_loop
   AND workflow.patched("lifecycle-ownership")`` — a SECOND, independent marker.
@@ -43,10 +46,14 @@ KNOWN LIMITS, written down rather than left to be rediscovered:
   returns ``status``, ``shepherd_in_loop`` and ``shepherd_in_loop_known``, and
   neither the ``lifecycle_claim`` query (``dev_loop.py``, the reader that
   answers this directly) nor the execution's start time is exposed. So the fix
-  is an mctl-api field, and ``--apply`` must not run at fleet scale before it
-  exists. Until then the only sound posture is a dry run, or an apply scoped
-  with ``--service``/``--slug`` to entities an operator has checked in Temporal
-  by hand.
+  is an mctl-api field, and until it lands the writes are REFUSED rather than
+  discouraged. Scope is not what licenses one: narrowing a run does not make an
+  unheartbeated row safe, it makes fewer of them.
+
+  The dependency order, so it is not rediscovered: this module's planner
+  (mctlhq/mctl-agents#384), then the entity-id contract across all three
+  builders (#386), then the API capability (mctlhq/mctl-api#322), and only then
+  a fleet-wide apply.
 - **Only DevLoop rows are imported.** The shepherd and pr-steward rungs were
   here and are gone: ``shadow.classify`` has one owner-type arm, so importing
   those rows turns an *agreeing* entity into ``store-forbids-old-permits``
@@ -237,6 +244,20 @@ class Plan:
     #: Every other producer is a data problem in the checkout that the same run
     #: reproduces exactly.
     retryable: bool = False
+    #: Whether the entity id is the one every other component will build.
+    #:
+    #: A conjunct of `may_apply`, not a report ornament. Rung 3 compares the
+    #: pull request's repository with `casefold`, and `build_report` records
+    #: the `pr:` spelling verbatim -- as `PRState.repo` and
+    #: `shadow.entity_id_for_pr` also do, which is why they agree today. But
+    #: "agree today" is an accident, not a contract (mctlhq/mctl-agents#386),
+    #: and the entity this makes durable is precisely the one whose id was
+    #: hand-typed in a casing nothing else will reproduce.
+    #:
+    #: EXACT, not case-insensitive: the case-insensitive comparison is what
+    #: lets the entity through the ladder, and this is what stops a write
+    #: turning that tolerance into a row.
+    entity_id_exact: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -249,6 +270,7 @@ class Plan:
             "reason": self.reason,
             "undetermined": self.undetermined,
             "retryable": self.retryable,
+            "entity_id_exact": self.entity_id_exact,
             # The three provenance fields apply_report writes. The dry run is
             # the deliverable and an operator reads it "against the store and
             # live Temporal" — which needs policy_ref, the provenance
@@ -275,6 +297,21 @@ class Report:
     ambiguous: list[Plan] = field(default_factory=list)
     written: list[str] = field(default_factory=list)
     failed: list[dict[str, str]] = field(default_factory=list)
+    #: Writable plans `may_apply` refused, with the clause that refused them.
+    #:
+    #: Apart from `failed`, which is the store declining a write this tool
+    #: attempted. These were never attempted, and the distinction is the one an
+    #: operator acts on: a refusal here is a gate in this repository, fixed by
+    #: landing the issue it names, while a failure is the store's answer about
+    #: that entity.
+    blocked: list[dict[str, str]] = field(default_factory=list)
+    #: The operator's justification for overriding `may_apply`'s capability
+    #: clause, verbatim. Empty when none was given.
+    #:
+    #: On the record because an override is a claim — "I checked these in
+    #: Temporal by hand" — and a claim that licenses durable writes belongs
+    #: next to what it licensed, for the same reason `rollout_mode` does.
+    ownership_override: str = ""
     aborted: str = ""
     #: The rollout mode this run attested to. On the record because the gate
     #: reads THIS process's environment and not the worker's.
@@ -335,6 +372,8 @@ class Report:
                 # structurally incapable of it.
                 "written": self.written,
                 "failed": self.failed,
+                "blocked": self.blocked,
+                "ownership_override": self.ownership_override,
             }
         counts = dict.fromkeys(DECISIONS, 0)
         for plan in [*self.planned, *self.ambiguous]:
@@ -355,6 +394,8 @@ class Report:
             "ambiguous": [p.as_dict() for p in self.ambiguous],
             "written": self.written,
             "failed": self.failed,
+            "blocked": self.blocked,
+            "ownership_override": self.ownership_override,
         }
 
 
@@ -787,7 +828,7 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
     whoever actually holds it. Aborting costs a re-run; the alternative costs
     an entity.
     """
-    from orchestrator.run_shepherd import LEGACY_UNKNOWN, _parse_pr_url
+    from orchestrator.run_shepherd import DEVLOOP_WORKFLOW_ORG, LEGACY_UNKNOWN, _parse_pr_url
 
     report = Report()
     by_entity: dict[str, tuple[Any, str]] = {}
@@ -898,6 +939,12 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
             repo=repo,
             held=held_by_entity[entity_id],
         )
+        # Set here, not in `plan_for`: this is where the parsed spelling and
+        # the service directory are both in scope, and the comparison the
+        # ladder makes is deliberately case-INSENSITIVE. `may_apply` needs the
+        # exact answer, because the tolerance that admits the entity is what a
+        # write would turn into a durable id nothing else reproduces.
+        plan.entity_id_exact = repo == f"{DEVLOOP_WORKFLOW_ORG}/{ref.service}"
         if plan.decision == DECISION_AMBIGUOUS:
             report.ambiguous.append(plan)
         else:
@@ -905,7 +952,67 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
     return report
 
 
-def apply_report(report: Report, client: OwnershipClient) -> Report:
+#: Whether mctl-api can say that a DevLoop execution tracks ownership.
+#:
+#: FALSE until mctlhq/mctl-api#322 lands. `/api/v1/agents/dev-loop/{id}`
+#: reports `shepherd_in_loop`, which is `workflow.patched("shepherd-in-loop")`
+#: plus the pinned-image check -- but every ownership call is gated on
+#: `shepherd_in_loop AND workflow.patched("lifecycle-ownership")`, a second,
+#: independent marker. An execution recorded between the two answers the probe
+#: True and replays the second as False forever: it never acquires, heartbeats
+#: or releases the row a write would create.
+#:
+#: A CONSTANT rather than a probe result, because there is nothing to probe:
+#: the field does not exist. When it does, this becomes a per-entity answer and
+#: the pair must repeat the `shepherd_in_loop`/`shepherd_in_loop_known`
+#: contract -- ABSENT is not FALSE, and unknown must BLOCK.
+OWNERSHIP_CAPABILITY_KNOWN = False
+
+
+def may_apply(plan: Plan, *, override: str = "") -> str:
+    """Whether this entity may be written. "" means yes; otherwise the reason.
+
+    THE predicate, and a conjunction — every clause must hold, and an UNKNOWN
+    clause blocks rather than passing or being retried:
+
+      1. the plan is a devloop-workflow import (the only writable decision);
+      2. mctl-api can report whether the execution tracks ownership;
+      3. it reports that it does;
+      4. the entity id is the one every other component will build.
+
+    (2) and (3) are one constant today, `OWNERSHIP_CAPABILITY_KNOWN`, because
+    the field does not exist yet — so this refuses every write until
+    mctlhq/mctl-api#322 lands, which is the honest reading of "unknown blocks".
+
+    A PREDICATE, not a comment. The limit was written into KNOWN LIMITS as a
+    blocker and enforced nowhere, and the first attempt to enforce it made a
+    NARROWER SCOPE the thing that licensed the write — which is a bypass of the
+    same gate rather than a gate: scoping a run does not make an unheartbeated
+    row safe, it just makes fewer of them.
+
+    `override` is the operator escape hatch, and it is explicit: a non-empty
+    justification, recorded on the report, asserting that these entities were
+    checked in Temporal by hand. It does not silently follow from `--service`.
+    """
+    if plan.decision != DECISION_DEVLOOP:
+        return f"not a writable decision ({plan.decision})"
+    if not plan.entity_id_exact:
+        return (
+            "the pull request's repository is spelled differently from the proposal's "
+            "service directory, so the id written here is not the one DevLoopWorkflow "
+            "and the shadow compare build (mctlhq/mctl-agents#386)"
+        )
+    if not OWNERSHIP_CAPABILITY_KNOWN and not override:
+        return (
+            "mctl-api cannot report whether this DevLoop execution tracks ownership "
+            "(mctlhq/mctl-api#322); the probe reads shepherd_in_loop, which is True for "
+            "executions recorded between the shepherd-in-loop and lifecycle-ownership "
+            "patch markers -- they answer it and never acquire, heartbeat or release"
+        )
+    return ""
+
+
+def apply_report(report: Report, client: OwnershipClient, *, override: str = "") -> Report:
     """Write the rows the report plans. Only the writable decisions.
 
     Idempotent on two legs, and both are load-bearing. `build_report`'s
@@ -942,13 +1049,17 @@ def apply_report(report: Report, client: OwnershipClient) -> Report:
     reviewed dry run a precondition rather than a courtesy.
     """
     for plan in report.planned:
-        # POSITIVE, and closed. The earlier form skipped ALREADY_OWNED and
-        # AMBIGUOUS, which read as two guards and was one: `build_report` puts
-        # ambiguous plans in `report.ambiguous`, never in `planned`, so that arm
-        # could not fire. Worse than dead code -- a decision added to DECISIONS
-        # later would have been written by default, because the skip list was
-        # the thing that had to be remembered.
-        if plan.decision != DECISION_DEVLOOP:
+        # ONE predicate, and it is a conjunction where unknown BLOCKS. The
+        # decision check that used to live here is its first clause, so a
+        # decision added to DECISIONS later is still not written by default.
+        #
+        # A blocked entity is RECORDED, not skipped silently: "312 planned, 0
+        # written" with no reason is the artifact an operator cannot act on,
+        # and `blocked` is the field that says which gate refused and why.
+        refusal = may_apply(plan, override=override)
+        if refusal:
+            if plan.decision == DECISION_DEVLOOP:
+                report.blocked.append({"entity_id": plan.entity_id, "reason": refusal})
             continue
         answer = client.acquire(
             EntityRef(kind=KIND_PULL_REQUEST, id=plan.entity_id),
@@ -1028,7 +1139,8 @@ def _print_report(report: Report) -> None:
     print(
         f"lifecycle-bootstrap [{_posture(report)}]: {writable} to write, "
         f"{already} already owned, {len(report.ambiguous)} ambiguous, "
-        f"{len(report.written)} written, {len(report.failed)} failed",
+        f"{len(report.written)} written, {len(report.blocked)} blocked, "
+        f"{len(report.failed)} failed",
         file=sys.stderr,
     )
 
@@ -1048,6 +1160,23 @@ def main(argv: list[str] | None = None) -> int:
     # mistake at fleet scale is a mistake to undo by hand.
     parser.add_argument("--service", default=None, help="limit to one service")
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
+    # The override, and it is a JUSTIFICATION rather than a bare flag: it takes
+    # the operator's reason, which goes on the report verbatim. A claim that
+    # licenses durable writes belongs next to what it licensed.
+    #
+    # It exists because `may_apply`'s capability clause refuses every write
+    # until mctlhq/mctl-api#322 lands, and an emergency path that is real must
+    # be explicit rather than something a narrower scope quietly confers.
+    parser.add_argument(
+        "--assume-tracked-ownership",
+        default="",
+        metavar="REASON",
+        help=(
+            "override the mctl-api#322 capability block for a SCOPED run, "
+            "asserting the entities were checked in Temporal by hand. "
+            "The reason is recorded on the report."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.state_dir.is_dir():
@@ -1155,45 +1284,27 @@ def main(argv: list[str] | None = None) -> int:
     # rename the mistake it is diagnosing.
     configured = rollout.mode()
     raw_mode = os.environ.get(rollout.ENV_VAR, "")
-    if args.apply and not (args.service or args.slug):
-        # THE SECOND-MARKER BLOCKER, enforced rather than described. The KNOWN
-        # LIMITS entry says a fleet-wide --apply must not run before mctl-api
-        # can report whether an execution tracks ownership; stated only in
-        # prose, that is a blocker a caller reaches with one parameter. The
-        # WorkflowTemplate already turns dry_run=false into --apply, and
-        # whether it plumbs --service lives in another repository -- a rule
-        # enforced only there reads from here as unenforced.
+    if args.assume_tracked_ownership and not (args.service or args.slug):
+        # The override requires a SCOPE, and this is the only place scope
+        # carries weight. It is not a gate of its own: narrowing a run does not
+        # make an unheartbeated row safe, it just makes fewer of them, and an
+        # earlier version of this refusal let `--service` alone license the
+        # write -- a bypass of `may_apply`'s capability clause wearing the
+        # shape of a gate.
         #
-        # Why the SCOPE is the right shape for it: the probe cannot tell an
-        # execution that tracks ownership from one recorded between the
-        # `shepherd-in-loop` and `lifecycle-ownership` patch markers, which
-        # answers the probe True and will never acquire, heartbeat or release
-        # the row this would write. Scoped, the operator names the entities and
-        # can check them in Temporal by hand; unscoped, the whole cohort is
-        # written at once, and the cohort is largest exactly when a pre-soak
-        # migration runs.
-        #
-        # It also protects a claim this tool makes about itself. `apply_report`
-        # sells idempotence on already-owned, and for that cohort it is false:
-        # nothing heartbeats the row, it expires, rung 1 stops firing, and the
-        # next run writes it again -- so "re-run it" becomes a loop that
-        # manufactures store-permits-old-forbids rather than a recovery.
-        #
-        # Lifted when mctlhq/mctl-api#322 lands and the probe can ask the
-        # second question.
+        # What the scope is for HERE is that the override's claim is "I checked
+        # these entities in Temporal by hand", and that claim is only
+        # checkable, and only honest, about entities the operator named.
         _print_report(
             Report(
                 aborted=(
-                    "refused --apply without --service or --slug: a fleet-wide apply is "
-                    "blocked until mctl-api can report whether a DevLoop execution tracks "
-                    "ownership (mctlhq/mctl-api#322). The probe reads shepherd_in_loop, "
-                    "which is True for executions recorded between the shepherd-in-loop "
-                    "and lifecycle-ownership patch markers -- they answer it and never "
-                    "acquire, heartbeat or release the row. Scope the run to entities you "
-                    "have checked in Temporal."
+                    "refused --assume-tracked-ownership without --service or --slug: "
+                    "the override asserts these entities were checked in Temporal by "
+                    "hand, which is a claim about a named set, not about the fleet."
                 ),
                 rollout_mode=configured,
                 applied=args.apply,
+                ownership_override=args.assume_tracked_ownership,
             )
         )
         return 2
@@ -1331,8 +1442,9 @@ def main(argv: list[str] | None = None) -> int:
     report.discovery_ignored_skip_set = discovery_ignores_skip_set
     report.applied = args.apply
 
+    report.ownership_override = args.assume_tracked_ownership
     if not report.aborted and args.apply:
-        apply_report(report, client)
+        apply_report(report, client, override=args.assume_tracked_ownership)
 
     _print_report(report)
     if report.aborted or report.failed:

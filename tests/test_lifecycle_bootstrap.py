@@ -25,7 +25,32 @@ from orchestrator.lifecycle.contract import (
 )
 from orchestrator.run_shepherd import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN, ProposalRef
 
+_OVERRIDE = "checked these executions in Temporal by hand"
 
+
+def _write_argv(root, *, service="mctl-web", slug=None, override=None):
+    """An argv that actually reaches the writer.
+
+    Every write needs BOTH a scope and the explicit capability override, which
+    is the point: `may_apply` refuses every write until mctlhq/mctl-api#322
+    lands, and a narrower scope does not license one. Spelled here rather than
+    inline so that when #322 lands, the call sites that should stop needing an
+    override are the ones still passing it.
+    """
+    argv = ["--state-dir", str(root), "--apply"]
+    if service:
+        argv += ["--service", service]
+    if slug:
+        argv += ["--slug", slug]
+    return [*argv, "--assume-tracked-ownership", override or _OVERRIDE]
+
+
+#: What an operator types to override `may_apply`'s capability clause.
+#:
+#: Spelled once so every write test states the same thing: these writes are
+#: only legal because the block is explicitly overridden, and when
+#: mctlhq/mctl-api#322 lands the tests that should stop needing it are the ones
+#: that still carry it.
 def _ref(service="mctl-web", slug="issue-7-a-thing", number=42) -> ProposalRef:
     return ProposalRef(
         service=service,
@@ -125,7 +150,7 @@ def test_an_abort_reaches_no_writer_under_apply(tmp_path, monkeypatch, capsys) -
     client = _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN, reason="down")})
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
+    assert bootstrap.main(_write_argv(root)) == 1
     report = _report_of(capsys.readouterr().out)
     assert report["aborted"]
     assert client.acquires == [], "an aborted run reached the writer under --apply"
@@ -567,7 +592,7 @@ def test_ambiguous_is_reported_and_left_unowned() -> None:
     report = bootstrap.build_report([_ref()], client, _probe(LEGACY_UNKNOWN))
     assert report.planned == []
     assert report.ambiguous[0].decision == bootstrap.DECISION_AMBIGUOUS
-    bootstrap.apply_report(report, client)
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
     assert client.acquires == []
 
 
@@ -698,7 +723,7 @@ def test_a_skipped_service_is_still_discovered(tmp_path, monkeypatch, capsys) ->
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-claude-remote"]) == 0
+    assert bootstrap.main(_write_argv(root, service="mctl-claude-remote")) == 0
     report = _report_of(capsys.readouterr().out)
     assert report["counts"]["devloop-workflow"] == 1
     # WRITTEN, end to end. Dropped at discovery the entity appears nowhere and
@@ -762,7 +787,7 @@ def test_apply_is_required_to_write(tmp_path, monkeypatch, capsys) -> None:
     assert client.acquires == [], "a run without --apply wrote to the store"
     capsys.readouterr()
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 0
+    assert bootstrap.main(_write_argv(root)) == 0
     assert [a[0] for a in client.acquires] == ["mctlhq/mctl-web#42"]
     assert _report_of(capsys.readouterr().out)["written"] == ["mctlhq/mctl-web#42"]
 
@@ -795,7 +820,7 @@ def test_the_devloop_row_carries_the_workflow_id(tmp_path, monkeypatch, capsys) 
     client = _Client()
     _install_client(monkeypatch, client)
 
-    bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"])
+    bootstrap.main(_write_argv(root))
     assert client.acquires[0][3]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-web-7"
 
 
@@ -1062,7 +1087,7 @@ def test_a_service_outside_SERVICES_is_still_addressable(tmp_path, monkeypatch, 
     _install_client(monkeypatch, _Client())
 
     assert (
-        bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-claude-remote"])
+        bootstrap.main(_write_argv(root, service="mctl-claude-remote"))
         == 0
     )
     assert _report_of(capsys.readouterr().out)["counts"]["total"] == 1
@@ -1807,7 +1832,7 @@ def test_a_second_run_writes_nothing() -> None:
         {"mctlhq/mctl-web#42": OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=held)}
     )
     report = bootstrap.build_report([_ref()], client, _probe(LEGACY_FREE))
-    bootstrap.apply_report(report, client)
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
 
     assert [p.decision for p in report.planned] == [bootstrap.DECISION_ALREADY_OWNED]
     assert client.acquires == []
@@ -1816,7 +1841,7 @@ def test_a_second_run_writes_nothing() -> None:
 def test_a_first_run_writes_the_planned_rows() -> None:
     client = _Client()
     report = bootstrap.build_report([_ref()], client, _probe(LEGACY_OWNED))
-    bootstrap.apply_report(report, client)
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
 
     assert [a[0] for a in client.acquires] == ["mctlhq/mctl-web#42"]
     assert client.acquires[0][1:3] == ("devloop-workflow", "dev-loop-mctlhq-mctl-web-7")
@@ -1830,7 +1855,7 @@ def test_a_first_run_writes_the_planned_rows() -> None:
 def test_a_refused_acquire_is_reported_not_raised() -> None:
     client = _Client(acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409"))
     report = bootstrap.build_report([_ref()], client, _probe(LEGACY_OWNED))
-    bootstrap.apply_report(report, client)
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
     assert report.written == []
     assert report.failed[0]["entity_id"] == "mctlhq/mctl-web#42"
 
@@ -1851,7 +1876,7 @@ def test_a_write_that_landed_but_could_not_be_confirmed_is_not_success() -> None
     """
     client = _Client(acquire_answer=OwnershipAnswer(verdict=UNKNOWN, accepted=True))
     report = bootstrap.build_report([_ref()], client, _probe(LEGACY_OWNED))
-    bootstrap.apply_report(report, client)
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
 
     assert client.acquires, "the write was never attempted"
     assert report.written == []
@@ -1879,7 +1904,7 @@ def test_one_refusal_does_not_stop_the_batch() -> None:
     client = _Mixed()
     refs = [_ref(), _ref(slug="issue-8-b", number=43), _ref(slug="issue-9-c", number=44)]
     report = bootstrap.build_report(refs, client, _probe(LEGACY_OWNED))
-    bootstrap.apply_report(report, client)
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
 
     assert [a[0] for a in client.acquires] == [
         "mctlhq/mctl-web#42",
@@ -1929,7 +1954,7 @@ def test_the_stderr_summary_carries_the_posture_too(tmp_path, monkeypatch, capsy
     bootstrap.main(["--state-dir", str(root)])
     assert "[dry run]" in capsys.readouterr().err
 
-    bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"])
+    bootstrap.main(_write_argv(root))
     assert "[apply]" in capsys.readouterr().err
 
 
@@ -1945,7 +1970,7 @@ def test_the_abort_summary_carries_the_posture(tmp_path, monkeypatch, capsys) ->
         monkeypatch, _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN)})
     )
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
+    assert bootstrap.main(_write_argv(root)) == 1
     err = capsys.readouterr().err
     assert "[apply]" in err and "ABORTED" in err
     # Not past tense: `applied` is the posture, and this is the one path where
@@ -1999,7 +2024,7 @@ def test_a_mistyped_mode_is_named_as_typed(tmp_path, monkeypatch, capsys) -> Non
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
+    assert bootstrap.main(_write_argv(root)) == 2
     captured = capsys.readouterr()
     report = _report_of(captured.out)
     assert "'obserev'" in report["aborted"], "the refusal renamed the operator's typo"
@@ -2024,7 +2049,7 @@ def test_apply_refuses_below_observe(tmp_path, monkeypatch, capsys) -> None:
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
+    assert bootstrap.main(_write_argv(root)) == 2
     assert client.acquires == []
     captured = capsys.readouterr()
     assert "refused --apply" in captured.err
@@ -2047,21 +2072,23 @@ def test_a_refused_acquire_reaches_the_exit_code(tmp_path, monkeypatch, capsys) 
     _install_client(
         monkeypatch, _Client(acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409"))
     )
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
+    assert bootstrap.main(_write_argv(root)) == 1
 
 
-def test_an_unscoped_apply_is_refused(tmp_path, monkeypatch, capsys) -> None:
-    """The second-marker blocker, enforced rather than described.
+def test_apply_is_blocked_until_the_capability_exists(tmp_path, monkeypatch, capsys) -> None:
+    """`may_apply`'s capability clause, and unknown means BLOCK.
 
-    KNOWN LIMITS says a fleet-wide --apply must not run before mctl-api can
-    report whether an execution tracks ownership (mctlhq/mctl-api#322). Stated
-    only in prose that is a blocker a caller reaches with one parameter: the
-    WorkflowTemplate already turns dry_run=false into --apply, and whether it
-    plumbs --service lives in another repository — a rule enforced only there
-    reads from here as unenforced.
+    mctl-api cannot report whether a DevLoop execution tracks ownership
+    (mctlhq/mctl-api#322): the probe reads `shepherd_in_loop`, which is True for
+    executions recorded between the `shepherd-in-loop` and
+    `lifecycle-ownership` markers -- they answer it and never acquire,
+    heartbeat or release. So every write is refused, including a scoped one:
+    narrowing a run does not make an unheartbeated row safe, it makes fewer of
+    them, and letting `--service` license the write was a bypass of this clause
+    wearing the shape of a gate.
 
-    The entity here is one a real apply WOULD write, and the rollout mode is
-    `observe`, so nothing else in `main` would stop it.
+    BLOCKED, not silently skipped. "1 to write, 0 written" with no reason is an
+    artifact an operator cannot act on.
     """
     from orchestrator import run_shepherd
 
@@ -2071,14 +2098,122 @@ def test_an_unscoped_apply_is_refused(tmp_path, monkeypatch, capsys) -> None:
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 0
+    captured = capsys.readouterr()
+    report = _report_of(captured.out)
+
+    assert client.acquires == [], "a write happened without the capability"
+    assert report["written"] == []
+    assert report["blocked"][0]["entity_id"] == "mctlhq/mctl-web#42"
+    assert "mctl-api#322" in report["blocked"][0]["reason"]
+    assert "1 blocked" in captured.err
+
+
+def test_the_override_is_explicit_and_recorded(tmp_path, monkeypatch, capsys) -> None:
+    """An emergency path that is real must be typed, not inferred.
+
+    The override takes the operator's JUSTIFICATION rather than being a bare
+    flag, and it goes on the report verbatim: a claim that licenses durable
+    writes belongs next to what it licensed, for the same reason `rollout_mode`
+    does.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert (
+        bootstrap.main(
+            [
+                "--state-dir",
+                str(root),
+                "--apply",
+                "--service",
+                "mctl-web",
+                "--assume-tracked-ownership",
+                _OVERRIDE,
+            ]
+        )
+        == 0
+    )
     report = _report_of(capsys.readouterr().out)
-    assert "refused --apply without --service or --slug" in report["aborted"]
-    assert "mctl-api#322" in report["aborted"]
-    assert client.acquires == [], "an unscoped --apply wrote to the store"
-    # The posture is on the record here too: this is an apply that wrote
-    # nothing, which is exactly the artifact `applied` exists to disambiguate.
-    assert report["applied"] is True
+    assert report["written"] == ["mctlhq/mctl-web#42"]
+    assert report["blocked"] == []
+    assert report["ownership_override"] == _OVERRIDE
+
+
+def test_the_override_requires_a_scope(tmp_path, monkeypatch, capsys) -> None:
+    """Its claim is "I checked these in Temporal by hand", which is only
+    checkable, and only honest, about entities the operator named."""
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert (
+        bootstrap.main(
+            ["--state-dir", str(root), "--apply", "--assume-tracked-ownership", _OVERRIDE]
+        )
+        == 2
+    )
+    report = _report_of(capsys.readouterr().out)
+    assert "refused --assume-tracked-ownership" in report["aborted"]
+    assert report["ownership_override"] == _OVERRIDE
+    assert client.acquires == []
+
+
+def test_a_miscased_entity_id_is_never_written(tmp_path, monkeypatch, capsys) -> None:
+    """`may_apply`'s id-contract clause (mctlhq/mctl-agents#386).
+
+    Rung 3 compares the repository with `casefold`, which is what lets the
+    entity through the ladder at all -- and `build_report` records the `pr:`
+    spelling verbatim, as `PRState.repo` and `shadow.entity_id_for_pr` also do.
+    They agree today by accident rather than by contract, and the entity a
+    write makes durable is precisely the one whose id was hand-typed in a
+    casing nothing else reproduces. The tolerance must not become a row.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = tmp_path / "agents-state"
+    d = root / "mctl-web" / "proposals" / "issue-7-a-thing"
+    d.mkdir(parents=True)
+    (d / ".status.yaml").write_text(
+        "status: implemented\npr: https://github.com/mctlhq/MCTL-Web/pull/42\n"
+    )
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert (
+        bootstrap.main(
+            [
+                "--state-dir",
+                str(root),
+                "--apply",
+                "--service",
+                "mctl-web",
+                "--assume-tracked-ownership",
+                _OVERRIDE,
+            ]
+        )
+        == 0
+    )
+    report = _report_of(capsys.readouterr().out)
+
+    # Planned -- the ladder admits it, case-insensitively, on purpose.
+    assert report["counts"]["devloop-workflow"] == 1
+    assert report["planned"][0]["entity_id_exact"] is False
+    # And blocked, even under the override: the override answers the
+    # capability clause, not this one.
+    assert client.acquires == []
+    assert "#386" in report["blocked"][0]["reason"]
 
 
 def test_either_scope_satisfies_the_blocker(tmp_path, monkeypatch, capsys) -> None:
@@ -2092,7 +2227,7 @@ def test_either_scope_satisfies_the_blocker(tmp_path, monkeypatch, capsys) -> No
     _install_client(monkeypatch, _Client())
 
     assert (
-        bootstrap.main(["--state-dir", str(root), "--apply", "--slug", "issue-7-a-thing"]) == 0
+        bootstrap.main(_write_argv(root, service=None, slug="issue-7-a-thing")) == 0
     )
     assert _report_of(capsys.readouterr().out)["written"] == ["mctlhq/mctl-web#42"]
 
@@ -2125,6 +2260,6 @@ def test_an_apply_at_enforce_is_refused(tmp_path, monkeypatch, capsys) -> None:
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 2
+    assert bootstrap.main(_write_argv(root)) == 2
     assert client.acquires == []
     assert "expected 'observe'" in capsys.readouterr().err
