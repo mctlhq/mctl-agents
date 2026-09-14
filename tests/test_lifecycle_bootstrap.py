@@ -25,6 +25,12 @@ from orchestrator.lifecycle.contract import (
 )
 from orchestrator.run_shepherd import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN, ProposalRef
 
+#: What an operator types to override `may_apply`'s capability clause.
+#:
+#: Spelled once so every write test states the same thing: these writes are
+#: only legal because the block is explicitly overridden. When
+#: mctlhq/mctl-api#322 lands, the tests that should stop needing it are the
+#: ones still carrying it.
 _OVERRIDE = "checked these executions in Temporal by hand"
 
 
@@ -45,12 +51,6 @@ def _write_argv(root, *, service="mctl-web", slug=None, override=None):
     return [*argv, "--assume-tracked-ownership", override or _OVERRIDE]
 
 
-#: What an operator types to override `may_apply`'s capability clause.
-#:
-#: Spelled once so every write test states the same thing: these writes are
-#: only legal because the block is explicitly overridden, and when
-#: mctlhq/mctl-api#322 lands the tests that should stop needing it are the ones
-#: that still carry it.
 def _ref(service="mctl-web", slug="issue-7-a-thing", number=42) -> ProposalRef:
     return ProposalRef(
         service=service,
@@ -1852,6 +1852,59 @@ def test_a_first_run_writes_the_planned_rows() -> None:
     assert client.acquires[0][3]["policy_ref"] == bootstrap.POLICY_REF
 
 
+def test_a_refusal_carries_what_the_server_saw() -> None:
+    """A `failed` entry an operator can act on.
+
+    `reason` is empty for a 2xx naming another owner -- contract.py attaches
+    the RECORD for that case, so "the caller can see what the server saw" --
+    and an entry with an empty reason and nothing else is a refusal that
+    explains nothing, which is the one thing the list is read for.
+    """
+    held = _record(held=True, owner_id="dev-loop-mctlhq-mctl-web-3")
+    client = _Client(
+        acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=held, reason="")
+    )
+    report = bootstrap.build_report([_ref()], client, _probe(LEGACY_OWNED))
+    bootstrap.apply_report(report, client, override=_OVERRIDE)
+
+    entry = report.failed[0]
+    assert entry["entity_id"] == "mctlhq/mctl-web#42"
+    assert entry["held_by_type"] == "shepherd"
+    assert entry["held_by_id"] == "dev-loop-mctlhq-mctl-web-3"
+    assert entry["held_state"] == "active"
+
+
+def test_a_mixed_batch_of_blocked_and_written_is_not_green(tmp_path, monkeypatch, capsys) -> None:
+    """The case the override survives, and the reason `blocked` reaches the
+    exit code.
+
+    `--assume-tracked-ownership` answers the capability clause and NOT the id
+    clause, so a batch where some rows fail `entity_id_exact` writes the rest,
+    records those, and would otherwise exit 0 — a partial apply that silently
+    skipped entities, green.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = tmp_path / "agents-state"
+    for slug, pr_repo in (("issue-7-a-thing", "mctl-web"), ("issue-8-b-thing", "MCTL-Web")):
+        d = root / "mctl-web" / "proposals" / slug
+        d.mkdir(parents=True)
+        n = 42 if slug.startswith("issue-7") else 43
+        (d / ".status.yaml").write_text(
+            f"status: implemented\npr: https://github.com/mctlhq/{pr_repo}/pull/{n}\n"
+        )
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(_write_argv(root)) == 1
+    report = _report_of(capsys.readouterr().out)
+
+    assert report["written"] == ["mctlhq/mctl-web#42"]
+    assert [b["entity_id"] for b in report["blocked"]] == ["mctlhq/MCTL-Web#43"]
+
+
 def test_a_refused_acquire_is_reported_not_raised() -> None:
     client = _Client(acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409"))
     report = bootstrap.build_report([_ref()], client, _probe(LEGACY_OWNED))
@@ -2098,7 +2151,12 @@ def test_apply_is_blocked_until_the_capability_exists(tmp_path, monkeypatch, cap
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 0
+    # EXIT 1. A blocked row is the shape a production apply has today -- with
+    # the capability unknown and no override, every writable row is blocked --
+    # and exiting 0 with `written: []` is indistinguishable, in the channel an
+    # Argo step branches on, from a successful apply against a fleet with
+    # nothing to import, which is the fleet's ordinary state.
+    assert bootstrap.main(["--state-dir", str(root), "--apply", "--service", "mctl-web"]) == 1
     captured = capsys.readouterr()
     report = _report_of(captured.out)
 
@@ -2191,20 +2249,11 @@ def test_a_miscased_entity_id_is_never_written(tmp_path, monkeypatch, capsys) ->
     client = _Client()
     _install_client(monkeypatch, client)
 
-    assert (
-        bootstrap.main(
-            [
-                "--state-dir",
-                str(root),
-                "--apply",
-                "--service",
-                "mctl-web",
-                "--assume-tracked-ownership",
-                _OVERRIDE,
-            ]
-        )
-        == 0
-    )
+    # EXIT 1, not 0. This is the mixed case in miniature: the override answers
+    # the capability clause and not the id clause, so a batch of forty with
+    # three miscased ids would write thirty-seven and skip three -- a partial
+    # apply that must not be green.
+    assert bootstrap.main(_write_argv(root)) == 1
     report = _report_of(capsys.readouterr().out)
 
     # Planned -- the ladder admits it, case-insensitively, on purpose.
@@ -2216,20 +2265,42 @@ def test_a_miscased_entity_id_is_never_written(tmp_path, monkeypatch, capsys) ->
     assert "#386" in report["blocked"][0]["reason"]
 
 
-def test_either_scope_satisfies_the_blocker(tmp_path, monkeypatch, capsys) -> None:
-    """--slug is a scope as much as --service is: both make the operator name
-    what they checked, which is the whole content of the rule."""
+def test_slug_alone_does_not_satisfy_the_override(tmp_path, monkeypatch, capsys) -> None:
+    """`--slug` is not a named set, and this file already says so.
+
+    `_discover_refs` applies `slug_filter` INSIDE the per-service walk, so
+    `--slug issue-7-a-thing` alone matches that slug in every service --
+    `test_slug_narrows_across_services` pins exactly that as deliberate. The
+    override's claim is "I checked these entities in Temporal by hand", which
+    is not a claim anyone can make about a fleet-wide slug match, so accepting
+    it here would have made two tests in this file assert opposite things about
+    the same flag.
+    """
     from orchestrator import run_shepherd
 
     _observe_env(monkeypatch)
     root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
-    _install_client(monkeypatch, _Client())
+    client = _Client()
+    _install_client(monkeypatch, client)
 
     assert (
-        bootstrap.main(_write_argv(root, service=None, slug="issue-7-a-thing")) == 0
+        bootstrap.main(
+            [
+                "--state-dir",
+                str(root),
+                "--apply",
+                "--slug",
+                "issue-7-a-thing",
+                "--assume-tracked-ownership",
+                _OVERRIDE,
+            ]
+        )
+        == 2
     )
-    assert _report_of(capsys.readouterr().out)["written"] == ["mctlhq/mctl-web#42"]
+    report = _report_of(capsys.readouterr().out)
+    assert "refused --assume-tracked-ownership" in report["aborted"]
+    assert client.acquires == []
 
 
 def test_a_dry_run_needs_no_scope(tmp_path, monkeypatch, capsys) -> None:

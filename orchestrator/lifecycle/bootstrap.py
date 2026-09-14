@@ -976,13 +976,18 @@ def may_apply(plan: Plan, *, override: str = "") -> str:
     clause blocks rather than passing or being retried:
 
       1. the plan is a devloop-workflow import (the only writable decision);
-      2. mctl-api can report whether the execution tracks ownership;
-      3. it reports that it does;
-      4. the entity id is the one every other component will build.
+      2. the entity id is the one every other component will build;
+      3. mctl-api can report whether the execution tracks ownership, and
+         reports that it does.
 
-    (2) and (3) are one constant today, `OWNERSHIP_CAPABILITY_KNOWN`, because
-    the field does not exist yet — so this refuses every write until
-    mctlhq/mctl-api#322 lands, which is the honest reading of "unknown blocks".
+    IN THAT ORDER, which is the order they are evaluated, because the order
+    decides which reason a blocked entity carries. A miscased id reports #386
+    rather than #322 — the right answer, since the override cannot clear it and
+    an operator sent to wait for #322 would wait forever.
+
+    (3) is one constant today, `OWNERSHIP_CAPABILITY_KNOWN`, because the field
+    does not exist yet — so this refuses every write until mctlhq/mctl-api#322
+    lands, which is the honest reading of "unknown blocks".
 
     A PREDICATE, not a comment. The limit was written into KNOWN LIMITS as a
     blocker and enforced nowhere, and the first attempt to enforce it made a
@@ -1088,8 +1093,22 @@ def apply_report(report: Report, client: OwnershipClient, *, override: str = "")
         if answer.may_mutate:
             report.written.append(plan.entity_id)
         else:
+            # The OWNER too, when the server attached a record. contract.py
+            # attaches it so "the caller can see what the server saw", and
+            # `reason` is empty for a 2xx naming another owner -- so a refusal
+            # could reach the report with nothing in it that explains the
+            # refusal, which is the one thing an operator reads it for.
+            record = answer.ownership
+            owner = record.owner if record else Owner()
             report.failed.append(
-                {"entity_id": plan.entity_id, "verdict": answer.verdict, "reason": answer.reason}
+                {
+                    "entity_id": plan.entity_id,
+                    "verdict": answer.verdict,
+                    "reason": answer.reason,
+                    "held_by_type": owner.type,
+                    "held_by_id": owner.id,
+                    "held_state": record.state if record else "",
+                }
             )
     return report
 
@@ -1284,17 +1303,25 @@ def main(argv: list[str] | None = None) -> int:
     # rename the mistake it is diagnosing.
     configured = rollout.mode()
     raw_mode = os.environ.get(rollout.ENV_VAR, "")
-    if args.assume_tracked_ownership and not (args.service or args.slug):
-        # The override requires a SCOPE, and this is the only place scope
+    if args.assume_tracked_ownership and not args.service:
+        # The override requires `--service`, and this is the only place scope
         # carries weight. It is not a gate of its own: narrowing a run does not
         # make an unheartbeated row safe, it just makes fewer of them, and an
-        # earlier version of this refusal let `--service` alone license the
-        # write -- a bypass of `may_apply`'s capability clause wearing the
-        # shape of a gate.
+        # earlier version of this refusal let a scope alone license the write --
+        # a bypass of `may_apply`'s capability clause wearing the shape of a
+        # gate.
         #
-        # What the scope is for HERE is that the override's claim is "I checked
-        # these entities in Temporal by hand", and that claim is only
-        # checkable, and only honest, about entities the operator named.
+        # What it is for HERE is that the override's claim is "I checked these
+        # entities in Temporal by hand", and that claim is only checkable, and
+        # only honest, about a set the operator can enumerate.
+        #
+        # `--service`, NOT "--service or --slug". `_discover_refs` applies
+        # `slug_filter` INSIDE the per-service walk, so `--slug issue-7-x`
+        # alone matches that slug in every service -- which
+        # `test_slug_narrows_across_services` pins as deliberate behaviour.
+        # Accepting it as the named set made two tests in one file assert
+        # opposite things about the same flag. `--slug` still narrows further;
+        # it just does not bound the set on its own.
         _print_report(
             Report(
                 aborted=(
@@ -1350,6 +1377,11 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 rollout_mode=configured,
                 applied=args.apply,
+                # On this path too. The field's whole rationale is that a claim
+                # licensing durable writes sits next to what it licensed, and
+                # an operator who passed one and was refused for a different
+                # reason still made the claim.
+                ownership_override=args.assume_tracked_ownership,
             )
         )
         return 2
@@ -1447,7 +1479,26 @@ def main(argv: list[str] | None = None) -> int:
         apply_report(report, client, override=args.assume_tracked_ownership)
 
     _print_report(report)
-    if report.aborted or report.failed:
+    # `blocked` counts, and it is the shape a production apply has TODAY.
+    #
+    # With OWNERSHIP_CAPABILITY_KNOWN False and no override, every writable row
+    # is blocked -- and the WorkflowTemplate reaches that with one parameter,
+    # since dry_run=false already yields --apply. Exiting 0 with `written: []`
+    # is, in the coarsest channel an Argo step branches on, indistinguishable
+    # from a successful apply against a fleet with nothing to import -- which
+    # is the ORDINARY state of the fleet by this module's own account. That is
+    # the same collapse `applied` was added to the JSON to prevent, one level
+    # out.
+    #
+    # The mixed case is worse and survives the override:
+    # `--assume-tracked-ownership` answers the capability clause and not the id
+    # clause, so a batch where three of forty rows fail `entity_id_exact`
+    # writes thirty-seven, records three, and exits 0 -- a partial apply that
+    # silently skipped entities.
+    #
+    # No dry-run false positive to weigh against it: `apply_report` is the only
+    # writer of `blocked`, and it runs only under --apply.
+    if report.aborted or report.failed or report.blocked:
         return 1
     # Discovering NOTHING is not a successful import: a checkout mounted one
     # level off, or a state dir with no proposals in an actionable status,
