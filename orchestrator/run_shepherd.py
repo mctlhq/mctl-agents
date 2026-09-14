@@ -1084,8 +1084,19 @@ def discover_services(state_dir: Path) -> frozenset[str]:
     the job of the ValueError handlers in `_dev_loop_owns_answer` and in the
     ownership bootstrap's ladder, and they are still load-bearing.
 
-    Missing or unreadable state dir answers the empty set rather than raising:
-    the callers each have their own, better-worded failure for that.
+    A MISSING state dir answers the empty set rather than raising; the callers
+    each have their own, better-worded failure for it.
+
+    An UNREADABLE one RAISES, and the half-claim that it does not is what two
+    callers have had to work around. `Path.is_dir()` swallows the OSError and
+    answers True for a directory this process can `stat` but not read, and the
+    `iterdir()` below has nothing around it, so a `--x` mount leaves here as a
+    `PermissionError`. The ownership bootstrap catches it on both paths on
+    exactly that basis.
+
+    Not swallowed HERE deliberately: answering the empty set for a mount that
+    cannot be read would turn an infrastructure fault into "no such service" at
+    the caller that filters on a name — a typo message for a broken volume.
     """
     if not state_dir.is_dir():
         return frozenset()

@@ -864,6 +864,31 @@ def test_a_mount_lost_during_discovery_reports(tmp_path, capsys) -> None:
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
+@pytest.mark.parametrize("extra", [[], ["--apply"], ["--apply", "--service", "mctl-web"]])
+def test_an_unreadable_state_dir_reports_the_same_way_whatever_the_flags(
+    tmp_path, capsys, extra
+) -> None:
+    """One broken mount, one answer.
+
+    The readability check sits above the `--apply` refusal precisely so this
+    holds. With it inside the `--service` branch, the same `--x` mount reported
+    itself under `--apply --service X` and, one flag over, hit the refusal
+    first — telling an operator the build does not write and to re-run without
+    the flag, with nothing about the mount at all. Same fault, same consumer,
+    two verdicts.
+    """
+    root = tmp_path / "agents-state"
+    (root / "mctl-web" / "proposals").mkdir(parents=True)
+    root.chmod(0o111)
+    try:
+        assert bootstrap.main(["--state-dir", str(root), *extra]) == 1
+        report = _report_of(capsys.readouterr().out)
+        assert "cannot read the state dir" in report["aborted"], extra
+    finally:
+        root.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
 def test_an_unreadable_state_dir_reports_on_a_fleet_wide_run(tmp_path, capsys) -> None:
     """The shape an operator is most likely to run, and the one the check
     originally skipped.

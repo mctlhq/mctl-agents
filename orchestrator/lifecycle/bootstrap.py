@@ -906,6 +906,29 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
         return 1
 
+    # ONE readability answer, BEFORE the `--apply` refusal, and its result is
+    # what the `--service` branch filters against.
+    #
+    # It was hoisted here, then moved back inside that branch as redundant --
+    # correctly, on its stated reason: the traceback it was written against is
+    # caught by the walk's guard now. Moving it re-created the asymmetry two
+    # rounds earlier had closed. With the refusal in front of the walk, an
+    # unreadable mount answered differently on either side of one flag:
+    # `--apply --service X` reported the mount, `--apply` fleet-wide hit the
+    # refusal first and was told the build does not write and to re-run without
+    # the flag, with nothing about the mount at all.
+    #
+    # So it is here for ORDERING, not for the retired traceback, and it is not
+    # a second walk: the `--service` branch reads this listing rather than
+    # taking its own.
+    from orchestrator.run_shepherd import discover_services
+
+    try:
+        present = discover_services(args.state_dir)
+    except OSError as exc:
+        _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
+        return 1
+
     if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
@@ -943,8 +966,10 @@ def main(argv: list[str] | None = None) -> int:
         #     mistyped, so it falls through to "discovered no proposals at
         #     all", which exits 1 WITH a report;
         #   - the state dir is missing or unreadable -> an infrastructure
-        #     fault, not an argument error, and answered ABOVE this block for
-        #     every caller rather than only for one that passed --service.
+        #     fault, not an argument error. Both are answered ABOVE this block
+        #     and above the --apply refusal, so one broken mount reads the same
+        #     way whichever flags the run carried; the walk's own guard below
+        #     catches what happens after this instant.
         #
         # The distinction is which red an operator can act on, and it is why
         # this refusal prints a report rather than calling `parser.error`:
@@ -952,21 +977,6 @@ def main(argv: list[str] | None = None) -> int:
         # the report as an output parameter cannot tell from the deliberate
         # `--apply` refusal below -- whose entire design note is that exit 2
         # with no report is the one outcome a log cannot interpret.
-        # Read HERE, where the `; found: ...` listing it supplies is used.
-        #
-        # It spent one commit hoisted above this block, to cover a fleet-wide
-        # run whose `iterdir()` left `main()` as a traceback. Wrapping
-        # `_discover_refs` covers that and more -- it is where the walk is, at
-        # every depth -- so the hoist's own reason retired, and what it left
-        # behind was a full listing of the state dir that no fleet-wide run
-        # reads, followed by `_discover_refs` doing the same listing again.
-        from orchestrator.run_shepherd import discover_services
-
-        try:
-            present = discover_services(args.state_dir)
-        except OSError as exc:
-            _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
-            return 1
         named_is_dir = (args.state_dir / args.service).is_dir()
         if args.service not in present and not named_is_dir:
             _print_report(
