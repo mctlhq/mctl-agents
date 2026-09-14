@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -260,6 +261,17 @@ class Report:
     #: DevLoop drives.
     skip_services: str = ""
     discovery_ignored_skip_set: bool = False
+    #: Whether this run was asked to WRITE. The posture, not the outcome.
+    #:
+    #: The load-bearing process input this half adds, and it belongs beside
+    #: rollout_mode and skip_services for the identical reason: a reader of the
+    #: report cannot otherwise see it. Without it a dry run and an apply that
+    #: wrote nothing are byte-identical artifacts -- same `0 written, 0
+    #: failed`, same empty lists, same exit 0 -- so a regression in the
+    #: WorkflowTemplate's dry_run -> --apply plumbing is silent, and the
+    #: reviewed dry run the merge order depends on carries no field saying
+    #: which posture produced it.
+    applied: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         # Computed only where it is used: on the abort path there is nothing
@@ -280,11 +292,18 @@ class Report:
                 "rollout_mode": self.rollout_mode,
                 "skip_services": self.skip_services,
                 "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
+                "applied": self.applied,
                 "counts": None,
                 "planned": [],
+                # THE FIELDS, not literals. Empty today -- `main` gates the
+                # write on `not report.aborted` -- but hardcoding them makes
+                # these the only two fields on this path that cannot contradict
+                # the code, which is precisely what a report is for. If a
+                # future path ever writes before aborting, the report must be
+                # able to say so rather than being incapable of it.
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
-                "written": [],
-                "failed": [],
+                "written": self.written,
+                "failed": self.failed,
             }
         counts = dict.fromkeys(DECISIONS, 0)
         for plan in [*self.planned, *self.ambiguous]:
@@ -295,6 +314,7 @@ class Report:
             "rollout_mode": self.rollout_mode,
             "skip_services": self.skip_services,
             "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
+            "applied": self.applied,
             # `total` is the measured decision rate the soak's sample target is
             # re-derived from: the ADR's floor of 200 comparisons is a floor on
             # the wrong axis, since the shepherd re-evaluates the same ref
@@ -947,9 +967,16 @@ def _print_report(report: Report) -> None:
     # apply_report skips the first, so the idempotent second run -- the one
     # this tool sells as writing nothing -- printed "312 planned, 0 written",
     # indistinguishable in a log tail from 312 rows the store refused.
+    #
+    # Counted POSITIVELY, the same way apply_report selects: "to write" must
+    # mean "what a write would attempt", and `planned - already` means
+    # "everything else", which is only the same number while DECISIONS has
+    # three members. A fourth decision routed into `planned` would be counted
+    # here and never written -- a summary promising rows that cannot arrive.
     already = sum(1 for p in report.planned if p.decision == DECISION_ALREADY_OWNED)
+    writable = sum(1 for p in report.planned if p.decision == DECISION_DEVLOOP)
     print(
-        f"lifecycle-bootstrap: {len(report.planned) - already} to write, "
+        f"lifecycle-bootstrap: {writable} to write, "
         f"{already} already owned, {len(report.ambiguous)} ambiguous, "
         f"{len(report.written)} written, {len(report.failed)} failed",
         file=sys.stderr,
@@ -1070,7 +1097,15 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    if args.apply and rollout.mode() != rollout.OBSERVE:
+    # Read ONCE. `rollout.mode()` maps an unrecognised value to OFF and warns
+    # as a side effect, so evaluating it four times in the refusal both printed
+    # the warning four times -- onto the report's own stdout channel -- and
+    # produced a message naming `'off'` for an operator who had actually typed
+    # `obserev`. The one exit whose entire job is to be diagnostic must not
+    # rename the mistake it is diagnosing.
+    configured = rollout.mode()
+    raw_mode = os.environ.get(rollout.ENV_VAR, "")
+    if args.apply and configured != rollout.OBSERVE:
         # The one switch every other writer in this package honours. At `off`
         # the DevLoopWorkflow's own ownership activity short-circuits, so a row
         # this tool writes for a devloop-workflow owner is never heartbeated,
@@ -1104,12 +1139,13 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(
             Report(
                 aborted=(
-                    f"refused --apply: {rollout.ENV_VAR}={rollout.mode()!r}, expected "
-                    f"{rollout.OBSERVE!r}. Below it the owners these rows name are not "
-                    "heartbeating; above it the shepherd is already reading the store "
-                    "and a bulk import races it."
+                    f"refused --apply: {rollout.ENV_VAR}={raw_mode!r} reads as "
+                    f"{configured!r}, expected {rollout.OBSERVE!r}. Below it the owners "
+                    "these rows name are not heartbeating; above it the shepherd is "
+                    "already reading the store and a bulk import races it."
                 ),
-                rollout_mode=rollout.mode(),
+                rollout_mode=configured,
+                applied=args.apply,
             )
         )
         return 2
@@ -1197,9 +1233,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
-    report.rollout_mode = rollout.mode()
+    report.rollout_mode = configured
     report.skip_services = ",".join(sorted(run_shepherd.SHEPHERD_SKIP_SERVICES))
     report.discovery_ignored_skip_set = discovery_ignores_skip_set
+    report.applied = args.apply
 
     if not report.aborted and args.apply:
         apply_report(report, client)

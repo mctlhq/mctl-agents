@@ -103,9 +103,35 @@ def test_any_unknown_aborts_the_whole_run_with_nothing_written() -> None:
     assert "mctlhq/mctl-web#42" in report.aborted
     assert report.planned == []
 
-    # And the writer is never reached: main() returns before apply_report.
-    bootstrap.apply_report(report, client)
+    # The writer is never reached, and that is a claim about main()'s
+    # `if not report.aborted and args.apply` guard -- which calling
+    # apply_report directly cannot observe. Driven through main() below, under
+    # --apply, which is the only shape where the guard is load-bearing.
     assert client.acquires == []
+
+
+def test_an_abort_reaches_no_writer_under_apply(tmp_path, monkeypatch, capsys) -> None:
+    """The guard in main(), exercised where it matters.
+
+    An UNKNOWN read aborts, and --apply must not write anyway. Asserted by
+    calling apply_report by hand, this proved only that apply_report does
+    nothing with an empty `planned` -- true of a build with no guard at all.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN, reason="down")})
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    report = _report_of(capsys.readouterr().out)
+    assert report["aborted"]
+    assert client.acquires == [], "an aborted run reached the writer under --apply"
+    # And the posture is on the record even here: the abort path is exactly
+    # where "was this a dry run?" is least recoverable from the outcome.
+    assert report["applied"] is True
 
 
 # --- the ladder --------------------------------------------------------
@@ -1857,6 +1883,84 @@ def test_one_refusal_does_not_stop_the_batch() -> None:
     ], "the batch stopped at the refusal"
     assert report.written == ["mctlhq/mctl-web#42", "mctlhq/mctl-web#44"]
     assert [f["entity_id"] for f in report.failed] == ["mctlhq/mctl-web#43"]
+
+
+def test_to_write_counts_what_a_write_would_attempt(capsys) -> None:
+    """Positively, the way apply_report selects.
+
+    `planned - already` means "everything else", which equals "what will be
+    written" only while DECISIONS has three members -- so the two expressions
+    agree on every input this code can currently produce, and a test built from
+    real reports cannot tell them apart. This one supplies the fourth decision
+    directly, which is the case the negative form gets wrong: a summary
+    promising rows that apply_report will skip.
+    """
+    report = bootstrap.Report(
+        planned=[
+            bootstrap.Plan(entity_id="a", decision=bootstrap.DECISION_DEVLOOP),
+            bootstrap.Plan(entity_id="b", decision=bootstrap.DECISION_ALREADY_OWNED),
+            bootstrap.Plan(entity_id="c", decision="some-future-decision"),
+        ]
+    )
+    bootstrap._print_report(report)
+    err = capsys.readouterr().err
+    assert "1 to write" in err, err
+    assert "1 already owned" in err
+
+
+def test_the_report_records_whether_it_was_asked_to_write(tmp_path, monkeypatch, capsys) -> None:
+    """A dry run and an apply that wrote nothing are otherwise identical.
+
+    Same `0 written, 0 failed`, same empty lists, same exit 0. Without the
+    posture on the record, a regression in the WorkflowTemplate's dry_run ->
+    --apply plumbing is silent, and the reviewed dry run the merge order
+    depends on carries no field saying which posture produced it.
+
+    So the test uses an entity that writes NOTHING under either posture --
+    rung 4, nothing drives it -- because that is the case the two artifacts
+    collapse into.
+    """
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    assert bootstrap.main(["--state-dir", str(root)]) == 0
+    dry = _report_of(capsys.readouterr().out)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 0
+    applied = _report_of(capsys.readouterr().out)
+
+    assert dry["applied"] is False
+    assert applied["applied"] is True
+    assert dry["written"] == applied["written"] == []
+    assert {k: v for k, v in dry.items() if k != "applied"} == {
+        k: v for k, v in applied.items() if k != "applied"
+    }, "the two postures differ in no other field, which is why this one is needed"
+
+
+def test_a_mistyped_mode_is_named_as_typed(tmp_path, monkeypatch, capsys) -> None:
+    """`rollout.mode()` maps an unrecognised value to OFF, so the refusal used
+    to tell an operator who set `obserev` that the mode was `'off'` -- renaming
+    the mistake it exists to diagnose. It also warned four times, onto the
+    report's own stdout channel, because the mode was evaluated four times."""
+    from orchestrator import run_shepherd
+
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "obserev")
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    captured = capsys.readouterr()
+    report = _report_of(captured.out)
+    assert "'obserev'" in report["aborted"], "the refusal renamed the operator's typo"
+    assert "reads as 'off'" in report["aborted"]
+    assert captured.out.count("unrecognised LIFECYCLE_ROLLOUT_MODE") == 1
+    assert client.acquires == []
 
 
 def test_apply_refuses_below_observe(tmp_path, monkeypatch, capsys) -> None:
