@@ -77,7 +77,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1191,8 +1190,9 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         metavar="REASON",
         help=(
-            "override the mctl-api#322 capability block for a SCOPED run, "
-            "asserting the entities were checked in Temporal by hand. "
+            "override the mctl-api#322 capability block. Requires --service: "
+            "the flag asserts these entities were checked in Temporal by hand, "
+            "and --slug alone matches a slug in every service. "
             "The reason is recorded on the report."
         ),
     )
@@ -1302,7 +1302,13 @@ def main(argv: list[str] | None = None) -> int:
     # `obserev`. The one exit whose entire job is to be diagnostic must not
     # rename the mistake it is diagnosing.
     configured = rollout.mode()
-    raw_mode = os.environ.get(rollout.ENV_VAR, "")
+    # From `rollout`, not `os.environ`: the switch table in that module says
+    # LIFECYCLE_ROLLOUT_MODE is "read in this module and nowhere else", and a
+    # second read site here would also normalise differently -- `mode()` strips
+    # and lowercases, so ` Observe ` reads as valid there and as a typo in a
+    # message that re-read the variable itself. That difference is the exact
+    # thing naming the raw value exists to surface.
+    raw_mode = rollout.raw_mode()
     if args.assume_tracked_ownership and not args.service:
         # The override requires `--service`, and this is the only place scope
         # carries weight. It is not a gate of its own: narrowing a run does not
@@ -1325,9 +1331,12 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(
             Report(
                 aborted=(
-                    "refused --assume-tracked-ownership without --service or --slug: "
-                    "the override asserts these entities were checked in Temporal by "
-                    "hand, which is a claim about a named set, not about the fleet."
+                    "refused --assume-tracked-ownership without --service: the "
+                    "override asserts these entities were checked in Temporal by hand, "
+                    "which is a claim about a named set. --slug alone is not one: "
+                    "_discover_refs applies it inside the per-service walk, so it "
+                    "matches that slug in every service. Add --service (--slug may "
+                    "narrow further)."
                 ),
                 rollout_mode=configured,
                 applied=args.apply,

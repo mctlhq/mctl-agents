@@ -1860,7 +1860,18 @@ def test_a_refusal_carries_what_the_server_saw() -> None:
     and an entry with an empty reason and nothing else is a refusal that
     explains nothing, which is the one thing the list is read for.
     """
-    held = _record(held=True, owner_id="dev-loop-mctlhq-mctl-web-3")
+    # A shape this codebase actually writes: the DevLoopWorkflow's own acquire
+    # names owner type `devloop-workflow` with its workflow id. `shepherd` with
+    # a `dev-loop-...` id is a pairing nothing produces, and a test asserting
+    # it pins a refusal the store cannot hand back.
+    held = Ownership(
+        entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
+        phase="review-remediation",
+        owner=Owner(type="devloop-workflow", id="dev-loop-mctlhq-mctl-web-42"),
+        state="active",
+        healthy=True,
+        held=True,
+    )
     client = _Client(
         acquire_answer=OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=held, reason="")
     )
@@ -1869,8 +1880,8 @@ def test_a_refusal_carries_what_the_server_saw() -> None:
 
     entry = report.failed[0]
     assert entry["entity_id"] == "mctlhq/mctl-web#42"
-    assert entry["held_by_type"] == "shepherd"
-    assert entry["held_by_id"] == "dev-loop-mctlhq-mctl-web-3"
+    assert entry["held_by_type"] == "devloop-workflow"
+    assert entry["held_by_id"] == "dev-loop-mctlhq-mctl-web-42"
     assert entry["held_state"] == "active"
 
 
@@ -2221,7 +2232,8 @@ def test_the_override_requires_a_scope(tmp_path, monkeypatch, capsys) -> None:
         == 2
     )
     report = _report_of(capsys.readouterr().out)
-    assert "refused --assume-tracked-ownership" in report["aborted"]
+    assert "refused --assume-tracked-ownership without --service:" in report["aborted"]
+    assert "without --service or --slug" not in report["aborted"]
     assert report["ownership_override"] == _OVERRIDE
     assert client.acquires == []
 
@@ -2299,7 +2311,12 @@ def test_slug_alone_does_not_satisfy_the_override(tmp_path, monkeypatch, capsys)
         == 2
     )
     report = _report_of(capsys.readouterr().out)
-    assert "refused --assume-tracked-ownership" in report["aborted"]
+    # The WHOLE sentence. Asserting only the prefix is what let the message
+    # name a flag this run had passed: `--slug` was in the refusal's list of
+    # what was missing, so re-running with it produced the identical message.
+    assert "refused --assume-tracked-ownership without --service:" in report["aborted"]
+    assert "--slug alone is not one" in report["aborted"]
+    assert "without --service or --slug" not in report["aborted"]
     assert client.acquires == []
 
 

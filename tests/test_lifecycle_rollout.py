@@ -125,3 +125,26 @@ def test_at_least_refuses_an_unknown_stage() -> None:
     caller, and answering False would hide it as "not yet at that stage"."""
     with pytest.raises(ValueError):
         rollout.at_least("soak")
+
+
+def test_raw_mode_answers_what_was_typed(monkeypatch) -> None:
+    """The variable before normalisation, and from THIS module.
+
+    `rollout.py`'s switch table says LIFECYCLE_ROLLOUT_MODE is "read in this
+    module and nowhere else". A caller reaching for `os.environ` to report what
+    an operator typed is a second read site — and the two normalise
+    differently, which is the difference a message naming the raw value exists
+    to surface: ` Observe ` is a valid mode to `mode()` and an unrecognised
+    string to a diagnostic that re-read the variable itself.
+    """
+    monkeypatch.setenv(rollout.ENV_VAR, " Observe ")
+    assert rollout.mode() == rollout.OBSERVE
+    assert rollout.raw_mode() == " Observe "
+
+
+def test_raw_mode_is_empty_when_unset(monkeypatch) -> None:
+    """Empty, not OFF. This answers "what did the operator type", and for an
+    unset variable that is nothing; `mode()` is what turns nothing into OFF."""
+    monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    assert rollout.raw_mode() == ""
+    assert rollout.mode() == rollout.OFF

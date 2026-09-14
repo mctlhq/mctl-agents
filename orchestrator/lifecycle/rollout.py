@@ -79,6 +79,25 @@ def mode() -> str:
     return OFF
 
 
+def raw_mode() -> str:
+    """The variable as an operator set it, before normalisation.
+
+    Exists so the invariant one table up — "``LIFECYCLE_ROLLOUT_MODE``: read in
+    this module and nowhere else" — stays true. A caller reaching for
+    ``os.environ`` to report what was typed is a second read site, and the two
+    normalise differently: ``mode()`` strips and lowercases, so ` Observe `
+    reads as a valid mode there and as an unrecognised string in a diagnostic
+    that re-read the variable itself. That difference is precisely what a
+    message naming the raw value exists to surface, so it must come from the
+    same place the decision does.
+
+    Empty string when unset, rather than OFF: this answers "what did the
+    operator type", and the answer to that for an unset variable is nothing.
+    ``mode()`` is what turns nothing into OFF.
+    """
+    return os.environ.get(ENV_VAR, "")
+
+
 def at_least(stage: str) -> bool:
     """Is the configured mode at or past `stage`?"""
     if stage not in _ORDER:
