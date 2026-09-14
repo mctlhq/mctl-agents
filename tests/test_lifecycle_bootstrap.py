@@ -878,14 +878,21 @@ def test_an_unreadable_state_dir_reports_the_same_way_whatever_the_flags(
     two verdicts.
     """
     root = tmp_path / "agents-state"
-    (root / "mctl-web" / "proposals").mkdir(parents=True)
-    root.chmod(0o111)
+    proposals = root / "mctl-web" / "proposals"
+    proposals.mkdir(parents=True)
+    # ONE DIRECTORY DOWN, which is where the previous version of this test
+    # could not see. `discover_services` admits a service on a `stat` of its
+    # `proposals/`, so a root-level chmod was answered by the cheap probe while
+    # this depth reached the refusal first -- the same permission bit answering
+    # `--apply` and a fleet-wide run differently.
+    proposals.chmod(0o111)
     try:
         assert bootstrap.main(["--state-dir", str(root), *extra]) == 1
         report = _report_of(capsys.readouterr().out)
-        assert "cannot read the state dir" in report["aborted"], extra
+        assert "discovery failed" in report["aborted"], extra
+        assert "refused --apply" not in report["aborted"], extra
     finally:
-        root.chmod(0o755)
+        proposals.chmod(0o755)
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")

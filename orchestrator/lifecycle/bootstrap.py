@@ -906,29 +906,6 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
         return 1
 
-    # ONE readability answer, BEFORE the `--apply` refusal, and its result is
-    # what the `--service` branch filters against.
-    #
-    # It was hoisted here, then moved back inside that branch as redundant --
-    # correctly, on its stated reason: the traceback it was written against is
-    # caught by the walk's guard now. Moving it re-created the asymmetry two
-    # rounds earlier had closed. With the refusal in front of the walk, an
-    # unreadable mount answered differently on either side of one flag:
-    # `--apply --service X` reported the mount, `--apply` fleet-wide hit the
-    # refusal first and was told the build does not write and to re-run without
-    # the flag, with nothing about the mount at all.
-    #
-    # So it is here for ORDERING, not for the retired traceback, and it is not
-    # a second walk: the `--service` branch reads this listing rather than
-    # taking its own.
-    from orchestrator.run_shepherd import discover_services
-
-    try:
-        present = discover_services(args.state_dir)
-    except OSError as exc:
-        _print_report(Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}"))
-        return 1
-
     if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
@@ -977,6 +954,21 @@ def main(argv: list[str] | None = None) -> int:
         # the report as an output parameter cannot tell from the deliberate
         # `--apply` refusal below -- whose entire design note is that exit 2
         # with no report is the one outcome a log cannot interpret.
+        # Read HERE, where the `; found: ...` listing it supplies is used.
+        # This is an ARGUMENT check -- it answers "did you name something
+        # this checkout has" -- so it belongs with the argument, and its own
+        # OSError arm covers a state dir that cannot be listed at the root.
+        # Every deeper read is the walk's, and the walk's guard is what
+        # answers for it.
+        from orchestrator.run_shepherd import discover_services
+
+        try:
+            present = discover_services(args.state_dir)
+        except OSError as exc:
+            _print_report(
+                Report(aborted=f"cannot read the state dir {args.state_dir}: {exc}")
+            )
+            return 1
         named_is_dir = (args.state_dir / args.service).is_dir()
         if args.service not in present and not named_is_dir:
             _print_report(
@@ -988,37 +980,6 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
-
-    if args.apply:
-        # This module PLANS. There is no writer in it -- no `acquire` call
-        # exists to gate -- so the refusal is unconditional rather than a
-        # rollout check that would be theatre over a no-op.
-        #
-        # Exit 2 and a REPORT, not a bare argparse error, for the reason the
-        # marker exists: an Argo step reads the report as an output parameter,
-        # and the one exit that printed none would be the one an operator most
-        # needs to read. `aborted` says which build this is.
-        #
-        # The gate this becomes is stated here so the order is not rediscovered
-        # when the writer lands: --apply will require EXACTLY `observe`. Below
-        # it the DevLoopWorkflow's own ownership activity short-circuits, so a
-        # row naming a devloop-workflow owner is never heartbeated, progressed
-        # or released by the workflow it names -- it sits `active` until its
-        # liveness bound expires, held by an owner that does not know it holds
-        # anything. Above it the shepherd is already CONSUMING the store, so a
-        # bulk import races a live reader. The order is: flip the WORKER to
-        # observe, then bootstrap, then flip the SHEPHERD.
-        _print_report(
-            Report(
-                aborted=(
-                    "refused --apply: this build plans and reports only; the write "
-                    "path (rollout gate, acquire, idempotence) is a separate change. "
-                    "Re-run without --apply for the report."
-                ),
-                rollout_mode=rollout.mode(),
-            )
-        )
-        return 2
 
     from orchestrator import run_shepherd
     from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
@@ -1101,6 +1062,59 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 1
+    # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
+    #
+    # "There is no readable checkout" outranks "this build does not write":
+    # the second is about what this run may do, the first about whether there
+    # is anything to do it to, and an operator sent away with the policy
+    # answer learns about the broken volume only on a second run.
+    #
+    # It was in front, with a cheap readability probe hoisted above it to keep
+    # the ordering true. That held for a mount broken AT THE ROOT and not one
+    # directory down: `discover_services` admits a service on a `stat` of its
+    # `proposals/`, so a `proposals/` at 0o111 passed the probe, hit the
+    # refusal, and answered `--apply` and a fleet-wide run differently for one
+    # permission bit. A guard that covers a depth is not a guard that covers
+    # the class.
+    #
+    # Discovery is where the whole class is answered, so the refusals moved
+    # behind it rather than the guard moving forward again. Discovery writes
+    # nothing -- `dry_run=True` unconditionally -- so nothing is risked by
+    # doing it first; what it costs is that a wrong mode is reported after the
+    # walk instead of before it.
+
+    if args.apply:
+        # This module PLANS. There is no writer in it -- no `acquire` call
+        # exists to gate -- so the refusal is unconditional rather than a
+        # rollout check that would be theatre over a no-op.
+        #
+        # Exit 2 and a REPORT, not a bare argparse error, for the reason the
+        # marker exists: an Argo step reads the report as an output parameter,
+        # and the one exit that printed none would be the one an operator most
+        # needs to read. `aborted` says which build this is.
+        #
+        # The gate this becomes is stated here so the order is not rediscovered
+        # when the writer lands: --apply will require EXACTLY `observe`. Below
+        # it the DevLoopWorkflow's own ownership activity short-circuits, so a
+        # row naming a devloop-workflow owner is never heartbeated, progressed
+        # or released by the workflow it names -- it sits `active` until its
+        # liveness bound expires, held by an owner that does not know it holds
+        # anything. Above it the shepherd is already CONSUMING the store, so a
+        # bulk import races a live reader. The order is: flip the WORKER to
+        # observe, then bootstrap, then flip the SHEPHERD.
+        _print_report(
+            Report(
+                aborted=(
+                    "refused --apply: this build plans and reports only; the write "
+                    "path (rollout gate, acquire, idempotence) is a separate change. "
+                    "Re-run without --apply for the report."
+                ),
+                rollout_mode=rollout.mode(),
+            )
+        )
+        return 2
+
+
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
     report.rollout_mode = rollout.mode()
