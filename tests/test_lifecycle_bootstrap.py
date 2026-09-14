@@ -83,21 +83,24 @@ def test_any_unknown_aborts_the_whole_run_with_nothing_written() -> None:
 
 
 @pytest.mark.parametrize(
-    ("verdict", "legacy", "want_decision", "want_owner_type"),
+    ("verdict", "legacy", "want_decision", "want_owner_type", "want_undetermined"),
     [
-        (OWNED_BY_OTHER, LEGACY_FREE, bootstrap.DECISION_ALREADY_OWNED, "shepherd"),
-        (UNOWNED, LEGACY_OWNED, bootstrap.DECISION_DEVLOOP, "devloop-workflow"),
+        (OWNED_BY_OTHER, LEGACY_FREE, bootstrap.DECISION_ALREADY_OWNED, "shepherd", False),
+        (UNOWNED, LEGACY_OWNED, bootstrap.DECISION_DEVLOOP, "devloop-workflow", False),
         # No live DevLoop: AMBIGUOUS, not a shepherd row. Importing one turns
         # an agreeing entity into store-forbids-old-permits for the length of
-        # its liveness bound, and nothing heartbeats it.
-        (UNOWNED, LEGACY_FREE, bootstrap.DECISION_AMBIGUOUS, ""),
+        # its liveness bound, and nothing heartbeats it. NOT undetermined --
+        # this is the ordinary outcome and a run made of it is a success.
+        (UNOWNED, LEGACY_FREE, bootstrap.DECISION_AMBIGUOUS, "", False),
         # The probe could not answer. NOT "no DevLoop": falling through to the
         # shepherd rung would hand it a pull request another machine may be
         # pushing to -- the exact condition the store exists to prevent.
-        (UNOWNED, LEGACY_UNKNOWN, bootstrap.DECISION_AMBIGUOUS, ""),
+        (UNOWNED, LEGACY_UNKNOWN, bootstrap.DECISION_AMBIGUOUS, "", True),
     ],
 )
-def test_the_import_ladder(verdict, legacy, want_decision, want_owner_type) -> None:
+def test_the_import_ladder(
+    verdict, legacy, want_decision, want_owner_type, want_undetermined
+) -> None:
     held = Ownership(
         entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
         phase="review-remediation",
@@ -110,6 +113,10 @@ def test_the_import_ladder(verdict, legacy, want_decision, want_owner_type) -> N
     plan = bootstrap.plan_for(_ref(), "mctlhq/mctl-web#42", answer, legacy, repo="mctlhq/mctl-web")
     assert plan.decision == want_decision
     assert plan.owner_type == want_owner_type
+    # The ladder table is the one place all rungs sit together, so it is where
+    # the three-way distinction belongs: two rungs report AMBIGUOUS and mean
+    # opposite things, and main() branches the exit code on exactly this.
+    assert plan.undetermined is want_undetermined
 
 
 def test_a_skipped_service_is_not_imported_either(monkeypatch) -> None:
@@ -445,7 +452,7 @@ def test_an_unanswered_probe_becomes_ambiguous_not_a_decision(monkeypatch) -> No
         release.wait(timeout=5)
         return LEGACY_OWNED
 
-    monkeypatch.setattr("orchestrator.run_shepherd.DEV_LOOP_LIVENESS_BUDGET_S", 0.5)
+    monkeypatch.setattr(bootstrap, "PROBE_BUDGET_S", 0.5)
     refs = [_ref(slug="issue-7-fast", number=1), _ref(slug="issue-8-slow", number=2)]
     try:
         answers = bootstrap.probe_all(refs, probe)
@@ -996,3 +1003,19 @@ def test_the_summary_separates_transient_from_permanent(tmp_path, monkeypatch, c
     assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
     err = capsys.readouterr().err
     assert "1 transient, 1 needing a fix in .status.yaml" in err
+
+
+def test_the_probe_budget_is_this_modules_own() -> None:
+    """Not the sweep's.
+
+    DEV_LOOP_LIVENESS_BUDGET_S is 60s because the sweep runs every five
+    minutes and an unanswered ref is FREE there — the shepherd fails open for
+    that proposal and asks again next tick. Here an unanswered ref is
+    undetermined, which makes the run red, so inheriting a bound sized for "we
+    will ask again shortly" would make budget exhaustion the expected outcome
+    on a large fleet: --apply writes what it could, exits 1, and the re-run
+    races the same clock.
+    """
+    from orchestrator import run_shepherd
+
+    assert bootstrap.PROBE_BUDGET_S > run_shepherd.DEV_LOOP_LIVENESS_BUDGET_S

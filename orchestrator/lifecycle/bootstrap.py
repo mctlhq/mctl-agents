@@ -85,6 +85,23 @@ DEVLOOP_WORKFLOW_OWNER = "mctlhq"
 #: guess about brace positions.
 REPORT_MARKER = "lifecycle-bootstrap-report:"
 
+#: Wall-clock budget for the whole liveness probe pass.
+#:
+#: NOT the sweep's DEV_LOOP_LIVENESS_BUDGET_S, and the difference is the point.
+#: That budget is 60s because the sweep runs every five minutes and an
+#: unanswered ref is FREE there -- the shepherd fails open for that proposal
+#: and asks again on the next tick. Here an unanswered ref is LEGACY_UNKNOWN,
+#: which is undetermined, which makes the run red. Inheriting a bound sized for
+#: "we will ask again shortly" into a one-shot migration turns budget
+#: exhaustion into the expected outcome on a large fleet: --apply writes what
+#: it could, exits 1, and the re-run races the same clock.
+#:
+#: This runs ONCE, so it gets a bound sized for finishing rather than for
+#: protecting a cadence. Keep it comfortably under the WorkflowTemplate's
+#: activeDeadlineSeconds (900s today), which has to cover the clone and the
+#: store read as well.
+PROBE_BUDGET_S = 300
+
 DECISIONS = (
     DECISION_ALREADY_OWNED,
     DECISION_DEVLOOP,
@@ -108,12 +125,22 @@ class Plan:
     temporal_workflow_id: str = ""
     #: AMBIGUOUS for lack of an ANSWER rather than because of one.
     #:
-    #: Both rung 2 and rung 4 report ambiguous and they mean opposite things.
-    #: Rung 4 -- no live DevLoop, and the owner that would take it has no
-    #: writer yet -- is the ordinary outcome for most of the fleet, and a run
-    #: made entirely of it wrote nothing because there was nothing to write.
-    #: Rung 2 is the probe having failed to speak, and that is the one an
-    #: operator has to see.
+    #: `main()` branches the exit code on this, so the full list of producers
+    #: belongs here:
+    #:
+    #:   - rung 2 -- the probe could not speak (TRANSIENT; a re-run may fix it);
+    #:   - rung 3's two refusals -- a live DevLoop is CONFIRMED and we cannot
+    #:     name it, because the pull request is in another repository or the
+    #:     slug yields no workflow id. These leave the dangerous class in place
+    #:     and are PERMANENT until `.status.yaml` is corrected;
+    #:   - an unreadable or non-pull-request `pr:` (PERMANENT, same reason);
+    #:   - two proposals mapping to one pull request, where the run cannot tell
+    #:     which is authoritative.
+    #:
+    #: Rung 4 is the one ambiguity that is NOT undetermined: no live DevLoop
+    #: drives the entity and the owner that would has no writer yet. That is
+    #: the ordinary outcome for most of the fleet, and a run made entirely of
+    #: it wrote nothing because there was nothing to write.
     undetermined: bool = False
 
     def as_dict(self) -> dict[str, Any]:
@@ -363,18 +390,18 @@ def probe_all(refs, probe) -> dict[int, str]:
     Serially this is one HTTP call per proposal at the probe's own 10s timeout,
     and the whole set runs BETWEEN the store read and the decisions made from
     it. That gap is where a bootstrap goes wrong: the longer it is, the more
-    likely the store moved under a decision already taken. The same pool and
-    the same wall-clock budget the sweep uses keep it independent of how many
-    proposals are open.
+    likely the store moved under a decision already taken. The sweep's pool
+    bounds it, under PROBE_BUDGET_S — this module's own budget, not the
+    sweep's, because an unanswered ref costs nothing there and makes the run
+    red here.
 
     A ref the budget did not answer is LEGACY_UNKNOWN — read as the dict's
-    default rather than written — so it reaches the ladder as ambiguous and is
-    left unowned. An unanswered probe must not become a decision.
+    default rather than written — so it reaches the ladder as ambiguous, is
+    left unowned, and makes the run RED. An unanswered probe must not become a
+    decision, and here it must not be mistaken for one either: sizing the
+    budget is an operator concern before a first --apply on a large fleet.
     """
-    from orchestrator.run_shepherd import (
-        DEV_LOOP_LIVENESS_BUDGET_S,
-        DEV_LOOP_LIVENESS_WORKERS,
-    )
+    from orchestrator.run_shepherd import DEV_LOOP_LIVENESS_WORKERS
 
     answers: dict[int, str] = {}
     if not refs:
@@ -385,7 +412,7 @@ def probe_all(refs, probe) -> dict[int, str]:
             pool.submit(probe, ref.service, ref.slug): i for i, ref in enumerate(refs)
         }
         try:
-            for future in as_completed(futures, timeout=DEV_LOOP_LIVENESS_BUDGET_S):
+            for future in as_completed(futures, timeout=PROBE_BUDGET_S):
                 try:
                     answers[futures[future]] = future.result()
                 except Exception as exc:  # noqa: BLE001 — see the docstring
@@ -400,7 +427,7 @@ def probe_all(refs, probe) -> dict[int, str]:
         except FuturesTimeoutError:
             unanswered = sum(1 for f in futures if not f.done())
             print(
-                f"warn: dev-loop probe hit its {DEV_LOOP_LIVENESS_BUDGET_S}s budget "
+                f"warn: dev-loop probe hit its {PROBE_BUDGET_S}s budget "
                 f"with {unanswered} proposal(s) unchecked — they will be reported ambiguous"
             )
     finally:
