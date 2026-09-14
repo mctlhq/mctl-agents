@@ -839,18 +839,26 @@ def test_a_service_with_no_proposals_dir_is_not_an_argument_error(tmp_path, caps
     assert "discovered no proposals at all" in captured.err
 
 
-def test_a_missing_state_dir_is_not_an_argument_error(tmp_path, capsys) -> None:
-    """An infrastructure fault, and it must not be answered as a typo.
+def test_a_missing_state_dir_reports_rather_than_exiting_bare(tmp_path, capsys) -> None:
+    """An infrastructure fault, answered with a REPORT.
 
     `--apply --service mctl-web` in a pod whose gitops volume failed to mount
-    is not an argument error. Handled by `parser.error` it produced exit 2 with
-    nothing on stdout, byte-identical to the deliberate --apply refusal for an
-    Argo step reading the report as an output parameter.
+    is not an argument error, and `parser.error` gave it exit 2 with nothing on
+    stdout — byte-identical, to an Argo step reading the report as an output
+    parameter, to the deliberate `--apply` refusal.
+
+    Exit 1 with a report is not much better if the report is missing, which is
+    where the first fix left it: the mount that went away MID-run was reported
+    and the mount that never arrived exited through `_discover_refs`'s bare
+    `SystemExit`. To the consumer this whole area is written for, those two
+    fail identically. The earlier version of this test asserted only the exit
+    code, so it pinned the absence of the report rather than catching it.
     """
-    with pytest.raises(SystemExit) as exc:
-        bootstrap.main(["--state-dir", str(tmp_path / "absent"), "--service", "mctl-web"])
-    assert exc.value.code != 2
-    assert "State dir not found" in str(exc.value)
+    assert bootstrap.main(["--state-dir", str(tmp_path / "absent"), "--service", "mctl-web"]) == 1
+    captured = capsys.readouterr()
+    report = _report_of(captured.out)
+    assert "state dir not found" in report["aborted"]
+    assert "ABORTED" in captured.err
 
 
 def test_the_filter_and_the_discovery_share_one_definition(tmp_path, monkeypatch, capsys) -> None:

@@ -171,7 +171,11 @@ class Plan:
     #: `main()` branches the exit code on this, so the full list of producers
     #: belongs here:
     #:
-    #:   - rung 2 -- the probe could not speak (TRANSIENT; a re-run may fix it);
+    #:   - rung 2 -- the probe could not speak, or could not be ASKED. The
+    #:     first is TRANSIENT and a re-run may fix it; the second (a service
+    #:     directory that is not a usable repository name, so no workflow id
+    #:     exists to ask about) is PERMANENT, which is why `retryable` is set
+    #:     from `id_error` there rather than unconditionally;
     #:   - rung 3's two refusals -- a live DevLoop is CONFIRMED and we cannot
     #:     name it, because the pull request is in another repository or the
     #:     slug yields no workflow id. These leave the dangerous class in place
@@ -888,7 +892,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
 
-    if args.service is not None and args.state_dir.is_dir():
+    if not args.state_dir.is_dir():
+        # The infrastructure fault the block below names FIRST, and the one an
+        # unmounted Argo volume actually produces. It used to fall through to
+        # `_discover_refs`'s bare `SystemExit("State dir not found: ...")` --
+        # stderr only, nothing behind REPORT_MARKER -- while the mount that
+        # went away MID-run, added in the same commit, printed a report. To the
+        # consumer this whole area is written for ("an Argo step reads the
+        # report as an output parameter") those two failed identically.
+        #
+        # So the invariant that commit claimed -- every red exit from this
+        # module carries the report -- is true now rather than nearly true.
+        _print_report(Report(aborted=f"state dir not found: {args.state_dir}"))
+        return 1
+
+    if args.service is not None:
         # Validated against `run_shepherd.discover_services`, which is what
         # `_discover_refs` iterates. ONE definition of "this checkout contains
         # this service", so this filter and that loop cannot disagree about a
@@ -907,16 +925,26 @@ def main(argv: list[str] | None = None) -> int:
         # -- and claiming otherwise would be a guard justified by a hazard it
         # does not remove.
         #
-        # THREE outcomes, and only one of them is this check's business:
+        # THE EFFECTIVE VALIDATOR IS `named_is_dir`, not `discover_services`,
+        # and that is deliberate rather than an oversight. `present` is a
+        # SUBSET of the directories under the state dir, so `service in
+        # present` implies `named_is_dir` and the condition below reduces to
+        # `not named_is_dir`. `discover_services` survives here as the source
+        # of the `; found: ...` listing -- the half that does the diagnostic
+        # work -- while the admit/refuse decision is deliberately wider,
+        # because of the second outcome below.
+        #
+        # TWO outcomes this check separates, and a third it must not touch:
         #
         #   - the name is not a directory at all -> a typo, refused below;
         #   - the name IS a directory with no `proposals/` -> an ordinary
         #     state, a service that never had a proposal or had its last one
-        #     archived. It falls through to "discovered no proposals at all",
-        #     which exits 1 WITH a report;
+        #     archived. Refusing it would be exit 2 for something nobody
+        #     mistyped, so it falls through to "discovered no proposals at
+        #     all", which exits 1 WITH a report;
         #   - the state dir is missing or unreadable -> an infrastructure
-        #     fault, not an argument error. Guarded above and below, so it
-        #     falls through to `_discover_refs`'s own `SystemExit`.
+        #     fault, not an argument error. Missing is answered above, before
+        #     this block; unreadable is the OSError arm below.
         #
         # The distinction is which red an operator can act on, and it is why
         # this refusal prints a report rather than calling `parser.error`:

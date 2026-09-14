@@ -1067,9 +1067,16 @@ def discover_services(state_dir: Path) -> frozenset[str]:
 
     Not "every directory" either. The state dir is a checkout, and a checkout
     holds things that are not services — editor droppings, a stray archive, a
-    partially-cloned path. Treating those as services is how a directory name
-    that is not a valid repository name reaches an id builder, which is a
-    failure this repository has already had once.
+    partially-cloned path -- and a caller filtering on a name wants to know
+    which names this checkout actually offers.
+
+    It is NOT what keeps a bad directory name out of an id builder, and saying
+    so would be a guard justified by a hazard it does not remove: the predicate
+    is *has a `proposals/` directory*, not *is a valid repository name*, so
+    `agents-state/not a repo name/proposals/issue-7-x/.status.yaml` satisfies
+    it and reaches `devloop_workflow_id` exactly as before. Containing that is
+    the job of the ValueError handlers in `_dev_loop_owns_answer` and in the
+    ownership bootstrap's ladder, and they are still load-bearing.
 
     Missing or unreadable state dir answers the empty set rather than raising:
     the callers each have their own, better-worded failure for that.
