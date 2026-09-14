@@ -270,8 +270,11 @@ def plan_for(
         # only while the two agree.
         from orchestrator.run_shepherd import devloop_workflow_id
 
-        owner = repo.split("/", 1)[0]
-        if owner != DEVLOOP_WORKFLOW_OWNER:
+        # `pr_org`, not `owner`: three other branches in this function bind
+        # `owner` to an Owner, and one name holding two types works only while
+        # the branches stay exclusive.
+        pr_org = repo.split("/", 1)[0]
+        if pr_org != DEVLOOP_WORKFLOW_OWNER:
             # devloop_workflow_id hardcodes the org, which is fail-open on the
             # probe -- a wrong owner just 404s into "not owned". On THIS path
             # the id becomes owner_id and temporal_workflow_id, so a wrong
