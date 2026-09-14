@@ -947,6 +947,38 @@ def test_the_refusal_does_not_wait_for_the_walk(tmp_path, monkeypatch, capsys) -
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
+@pytest.mark.parametrize(
+    "extra", [[], ["--apply"], ["--service", "mctl-web"], ["--apply", "--service", "mctl-web"]]
+)
+def test_an_unreadable_root_answers_the_same_way_for_every_caller(tmp_path, capsys, extra) -> None:
+    """Rung 2, and it has to hold for the invocation the WorkflowTemplate makes.
+
+    A state dir at 0o111 is traversable and not listable, so `is_dir()` passes
+    and one `iterdir()` is what sees it. That listing lived inside the
+    `--service` block, which a fleet-wide run skips — so the same unreadable
+    ROOT answered "cannot read the state dir" under `--apply --service X` and
+    "refused --apply" one flag over, for a flag that changes nothing about the
+    mount.
+
+    Rung 3 does not excuse that: its justification is that nothing cheaper than
+    the walk can SEE the fault, which is true of an unreadable `proposals/` and
+    false of the root. The four shapes are here because the asymmetry lived
+    between invocations, which is where the previous two tests each had a blind
+    spot.
+    """
+    root = tmp_path / "agents-state"
+    (root / "mctl-web" / "proposals").mkdir(parents=True)
+    root.chmod(0o111)
+    try:
+        assert bootstrap.main(["--state-dir", str(root), *extra]) == 1, extra
+        aborted = _report_of(capsys.readouterr().out)["aborted"]
+        assert "cannot read the state dir" in aborted, extra
+        assert "refused --apply" not in aborted, extra
+    finally:
+        root.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
 def test_an_unreadable_state_dir_reports_on_a_fleet_wide_run(tmp_path, capsys) -> None:
     """The shape an operator is most likely to run, and the one the check
     originally skipped.
