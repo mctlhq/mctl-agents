@@ -318,31 +318,88 @@ def _parse(pr_url: str):
 
 
 def test_compare_proposal_refs_maps_to_pull_request_ids() -> None:
+    """The ids the store is actually asked about.
+
+    EntityRef.for_pull_request takes "owner/repo" as ONE argument; handing it
+    the bare repo yields ids the store has never seen, every comparison reads
+    store-unknown, and the soak looks healthy while measuring nothing. Asserted
+    against the client rather than against a substituted compare_entities, so
+    the real mapping path runs.
+    """
     client = _FakeClient()
-    captured: list[tuple] = []
+    shadow.compare_proposal_refs(
+        [_Ref("https://github.com/mctlhq/mctl-web/pull/42")],
+        {0: shadow.LEGACY_OWNED},
+        _parse,
+        client=client,
+    )
+    assert [call[2] for call in client.calls] == [("mctlhq/mctl-web#42",)]
 
-    def _fake_compare(mapping, **kw):
-        captured.append(tuple(sorted(mapping)))
-        return shadow.Totals()
 
-    original = shadow.compare_entities
-    try:
-        shadow.compare_entities = _fake_compare  # type: ignore[assignment]
-        shadow.compare_proposal_refs(
-            [_Ref("https://github.com/mctlhq/mctl-web/pull/42")],
-            {0: shadow.LEGACY_OWNED},
-            _parse,
-        )
-    finally:
-        shadow.compare_entities = original  # type: ignore[assignment]
-    assert captured == [("mctlhq/mctl-web#42",)]
-    assert client.calls == []
+def test_exactly_one_totals_line_per_tick(capsys) -> None:
+    """The per-class counters and the summary are read together, and the log
+    format depends on there being one summary per tick. A partial tick that
+    emitted divergence lines and no summary is how the two drift apart."""
+    shadow.compare_proposal_refs(
+        [_Ref("https://github.com/mctlhq/mctl-web/pull/42"), _Ref("not-a-url", slug="issue-2-x")],
+        {0: shadow.LEGACY_FREE, 1: shadow.LEGACY_FREE},
+        _parse,
+        client=_FakeClient(),
+    )
+    out = capsys.readouterr().out
+    assert out.count("tick totals") == 1
+    # The unmapped ref is folded into the SAME summary as the compared one --
+    # not counted after it was already emitted.
+    assert "compared=2" in out
+    assert "store-unknown=1" in out
+
+
+def test_a_failing_store_still_closes_the_tick(capsys) -> None:
+    totals = shadow.compare_proposal_refs(
+        [_Ref("https://github.com/mctlhq/mctl-web/pull/42")],
+        {0: shadow.LEGACY_OWNED},
+        _parse,
+        client=_FakeClient(raises=RuntimeError("boom")),
+    )
+    out = capsys.readouterr().out
+    assert out.count("tick totals") == 1
+    assert "compare failed" in out
+    assert totals.compared == 0
+
+
+def test_compare_entities_is_bounded_in_wall_clock(monkeypatch, capsys) -> None:
+    """An observer that delays the thing it observes has stopped being one.
+
+    get_many chunks internally and issues its chunks sequentially, so without a
+    budget the compare's cost grows with the sweep and can outlast the 5-minute
+    cron interval. Ids past the budget are NOT COMPARED -- absent from the
+    totals rather than counted store-unknown, because the store did not fail to
+    answer, it was never asked.
+    """
+    monkeypatch.setattr(shadow, "SHADOW_CHUNK_SIZE", 1)
+    monkeypatch.setattr(shadow, "SHADOW_BUDGET_S", 0)
+
+    client = _FakeClient()
+    totals = shadow.compare_entities(
+        {f"mctlhq/mctl-web#{i}": shadow.LEGACY_FREE for i in range(5)}, client=client
+    )
+    # The budget can only stop the compare BETWEEN chunks, so the first chunk
+    # always runs -- a budget that could skip everything would make a slow tick
+    # indistinguishable from one that never happened.
+    assert totals.compared == 1
+    assert len(client.calls) == 1
+    out = capsys.readouterr().out
+    assert "not compared" in out
+    assert out.count("tick totals") == 1
 
 
 def test_an_unparseable_pr_url_counts_store_unknown(capsys) -> None:
-    """No new class: the vocabulary is closed and mirrors diverge.go. The store
-    genuinely gave no answer for this entity, and the totals still sum to the
-    number of refs."""
+    """No new class: the vocabulary is closed and mirrors diverge.go, and the
+    store genuinely gave no answer for this entity.
+
+    `compared` is NOT len(refs) in general -- two proposals pointing at one
+    pull request are compared once -- so it is not an invariant an operator can
+    reconcile against the sweep size."""
     totals = shadow.compare_proposal_refs([_Ref("not-a-url")], {0: shadow.LEGACY_FREE}, _parse)
     assert totals.compared == 1
     assert totals.counts[shadow.DIVERGE_STORE_UNKNOWN] == 1
@@ -361,3 +418,91 @@ def test_compare_proposal_refs_never_raises() -> None:
         _explodes,
     )
     assert totals.counts[shadow.DIVERGE_STORE_UNKNOWN] == 1
+
+
+def test_two_proposals_on_one_pr_are_compared_once(capsys) -> None:
+    client = _FakeClient()
+    totals = shadow.compare_proposal_refs(
+        [
+            _Ref("https://github.com/mctlhq/mctl-web/pull/42", slug="issue-1-x"),
+            _Ref("https://github.com/mctlhq/mctl-web/pull/42", slug="issue-2-y"),
+        ],
+        {0: shadow.LEGACY_FREE, 1: shadow.LEGACY_OWNED},
+        _parse,
+        client=client,
+    )
+    assert totals.compared == 1
+    assert [call[2] for call in client.calls] == [("mctlhq/mctl-web#42",)]
+    # OWNED > FREE > UNKNOWN, explicitly, so the class does not depend on the
+    # order the proposal directories happened to be listed in.
+    assert "two proposals map to" in capsys.readouterr().out
+
+
+# --- derived.held, through the real parser -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("payload_derived", "want_held"),
+    [
+        ({"derived": {"status": "healthy", "held": True}}, True),
+        ({"derived": {"status": "released", "held": False}}, False),
+        # Absent block: an mctl-api that predates it. NOT False -- that would
+        # say "nobody holds this", the one answer that licenses action.
+        ({}, None),
+        # Present but not a bool. bool("false") is True, and that coercion in
+        # this field would report an unowned entity as held.
+        ({"derived": {"status": "healthy", "held": "false"}}, None),
+        ({"derived": None}, None),
+    ],
+)
+def test_from_payload_parses_derived_held(payload_derived, want_held) -> None:
+    """Exercised through Ownership.from_payload rather than by constructing the
+    dataclass, because a key or shape regression in the PARSER would leave
+    every real record at held=None and turn the whole soak into store-unknown
+    -- while every test that builds Ownership(held=...) directly stayed green.
+    """
+    payload = {
+        "entity": {"kind": "pull-request", "id": "mctlhq/mctl-web#42"},
+        "phase": "review-remediation",
+        "owner": {"type": "devloop-workflow", "id": "wf-1"},
+        "state": "active",
+        "healthy": True,
+        **payload_derived,
+    }
+    record = Ownership.from_payload(payload)
+    assert record is not None
+    assert record.held is want_held
+
+
+def test_a_recorded_unowned_row_uses_the_servers_held() -> None:
+    """UNOWNED is not always "no record": answer_from returns it for a
+    released or terminal row, which is a record and carries derived.held.
+
+    Short-cutting to False off the verdict agrees with mctl-api today only
+    because verdict_for and Derive classify those states alike -- the
+    one-predicate-two-implementations coupling this module refuses everywhere
+    else.
+    """
+    released = Ownership(
+        entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
+        phase="review-remediation",
+        owner=Owner(type="shepherd", id="shepherd:mctl-web"),
+        state="released",
+        held=False,
+        derived_status="released",
+    )
+    assert shadow.held(OwnershipAnswer(verdict=UNOWNED, ownership=released)) is False
+
+    # The same row from a server that did not send the block: unknown, not free.
+    no_block = Ownership(
+        entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
+        phase="review-remediation",
+        owner=Owner(type="shepherd", id="shepherd:mctl-web"),
+        state="released",
+        held=None,
+    )
+    answer = OwnershipAnswer(verdict=UNOWNED, ownership=no_block)
+    assert shadow.held(answer) is None
+    assert shadow.classify(answer, shadow.LEGACY_OWNED).divergence_class == (
+        shadow.DIVERGE_STORE_UNKNOWN
+    )

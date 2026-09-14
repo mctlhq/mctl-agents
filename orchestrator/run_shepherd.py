@@ -130,6 +130,13 @@ VERDICT_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED"})
 # than os). A deployment pointing MCTL_API_BASE_URL at a staging API must
 # not have this one check silently talk to production instead.
 MCTL_API_URL = MCTL_API_BASE_URL.rstrip("/")
+
+# The shadow compare's ownership client. None means "build the default one",
+# which is what production does; a test injects a fake here so the REAL
+# compare_proposal_refs and compare_entities run and emit their real lines.
+# Patching compare_entities out instead would make an equivalence test assert
+# that a shadow which printed nothing printed nothing.
+SHADOW_CLIENT = None
 DEV_LOOP_LIVENESS_TIMEOUT_S = 10
 
 # The sweep tick runs every 5 minutes (see the module docstring), so the
@@ -222,9 +229,6 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
         ValueError,
         OSError,
     ) as exc:
-        # 404 = no such workflow (or an mctl-api predating the endpoint) —
-        # genuinely not owned. Anything else is an infra failure; log it so
-        # an operator can see the ownership check degraded, then sweep.
         if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
             # 404 = no such workflow (or an mctl-api predating the endpoint).
             # The ONE error that is an answer.
@@ -246,11 +250,19 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     # submits a tick, yet stays Running for up to the 14-day merge
     # deadline. Skipping it would leave its PR with no shepherd at all.
     # An mctl-api without the field answers None → swept, as before, and the
-    # bool wrapper still returns False. The tri-state splits the two halves
-    # apart: an absent key means the route does not serve the field and we
-    # could not tell, while an explicit false is a live execution declining to
-    # shepherd, which is a real "does not drive this".
+    # bool wrapper still returns False. The tri-state splits that False into
+    # its three causes, none of which changes the sweep's decision:
+    #
+    #  - the key is absent: the route does not serve the field at all, so we
+    #    could not tell;
+    #  - shepherd_in_loop_known is false: the route DID answer, with false as a
+    #    fallback because its query to the workflow never completed (an old
+    #    worker, an outage, a timeout). Same value, opposite meaning;
+    #  - an explicit false with known true: a live execution declining to
+    #    shepherd, which is a real "does not drive this".
     if "shepherd_in_loop" not in payload:
+        return LEGACY_UNKNOWN
+    if payload.get("shepherd_in_loop_known") is False:
         return LEGACY_UNKNOWN
     return LEGACY_OWNED if payload.get("shepherd_in_loop") is True else LEGACY_FREE
 
@@ -323,7 +335,7 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
     # raising — which it cannot.
     if shadow.enabled():
         try:
-            shadow.compare_proposal_refs(refs, legacy, _parse_pr_url)
+            shadow.compare_proposal_refs(refs, legacy, _parse_pr_url, client=SHADOW_CLIENT)
         except Exception as exc:  # noqa: BLE001 — an observer must never decide
             print(f"warn: lifecycle shadow compare failed: {exc}", flush=True)
     kept: list[ProposalRef] = []

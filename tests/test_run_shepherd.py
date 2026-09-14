@@ -4793,9 +4793,13 @@ def test_filter_decisions_are_identical_with_the_shadow_on_and_off(monkeypatch, 
     Observe must be observational. Not "the kept list looks similar" but: the
     same refs survive AND the sweep's own output is unchanged, once the
     shadow's own lines are removed. The second half is what makes this an
-    equivalence test rather than a list comparison -- it catches a shadow block
+    equivalence test rather than a list comparison — it catches a shadow block
     that quietly altered a warning, a skip line or the order of anything else
     the tick prints.
+
+    The real compare_proposal_refs and compare_entities run here, against an
+    injected client. Substituting compare_entities would assert that a shadow
+    which printed nothing printed nothing, which is true and is not the claim.
     """
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", _scripted_answers)
 
@@ -4803,33 +4807,72 @@ def test_filter_decisions_are_identical_with_the_shadow_on_and_off(monkeypatch, 
     kept_off = run_shepherd._filter_dev_loop_owned(_tri_refs())
     out_off = capsys.readouterr().out
 
-    class _Client:
-        def get_many(self, kind, phase, ids, asking=None):
-            from orchestrator.lifecycle.contract import UNKNOWN, UNOWNED, OwnershipAnswer
+    from orchestrator.lifecycle.contract import (
+        OWNED_BY_OTHER,
+        UNKNOWN,
+        UNOWNED,
+        EntityRef,
+        Owner,
+        Ownership,
+        OwnershipAnswer,
+    )
 
-            # Every verdict the store can answer, including one that raises on
-            # the way out -- an observer must survive its own data source.
-            out = {}
-            for i, entity_id in enumerate(ids):
-                if i == 0:
-                    raise RuntimeError("the store blew up mid-batch")
-                out[entity_id] = OwnershipAnswer(verdict=UNOWNED if i == 1 else UNKNOWN)
-            return out
+    class _EveryVerdict:
+        """One of each answer the store can give, including a held record."""
+
+        def get_many(self, kind, phase, ids, asking=None):
+            held = Ownership(
+                entity=EntityRef(kind=kind, id=ids[0]),
+                phase=phase,
+                owner=Owner(type="shepherd", id="shepherd:mctl-web"),
+                state="active",
+                healthy=True,
+                held=True,
+                derived_status="healthy",
+            )
+            answers = [
+                OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=held),
+                OwnershipAnswer(verdict=UNOWNED),
+                OwnershipAnswer(verdict=UNKNOWN, reason="store down"),
+            ]
+            return {entity_id: answers[i % len(answers)] for i, entity_id in enumerate(ids)}
 
     monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
-    monkeypatch.setattr(
-        run_shepherd.shadow, "compare_entities",
-        lambda mapping, **kw: _Client().get_many("pull-request", "review-remediation", sorted(mapping)),
-    )
+    monkeypatch.setattr(run_shepherd, "SHADOW_CLIENT", _EveryVerdict())
     kept_on = run_shepherd._filter_dev_loop_owned(_tri_refs())
     out_on = capsys.readouterr().out
 
+    # The shadow must actually have spoken, or the scrub below proves nothing.
+    assert "lifecycle-shadow: divergence" in out_on
+    assert out_on.count("lifecycle-shadow: tick totals") == 1
+
     assert [r.slug for r in kept_off] == [r.slug for r in kept_on]
     scrubbed = "\n".join(
-        line for line in out_on.splitlines()
-        if "lifecycle-shadow" not in line and "lifecycle shadow compare failed" not in line
+        line for line in out_on.splitlines() if "lifecycle-shadow" not in line
     )
     assert scrubbed.strip() == out_off.strip()
+
+
+def test_a_store_failure_still_closes_the_tick(monkeypatch, capsys) -> None:
+    """Exactly one totals line per tick, even when the batch read blows up.
+
+    The per-entity counters and the summary are read together; a tick that
+    emitted divergence lines and no summary is how the two drift apart.
+    """
+
+    class _Explodes:
+        def get_many(self, kind, phase, ids, asking=None):
+            raise RuntimeError("the store blew up mid-batch")
+
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", _scripted_answers)
+    monkeypatch.setattr(run_shepherd, "SHADOW_CLIENT", _Explodes())
+    kept = run_shepherd._filter_dev_loop_owned(_tri_refs())
+
+    out = capsys.readouterr().out
+    assert [r.slug for r in kept] == ["issue-11-free", "issue-12-unknown"]
+    assert out.count("lifecycle-shadow: tick totals") == 1
+    assert "compare failed" in out
 
 
 def test_the_shadow_is_not_consulted_below_observe(monkeypatch) -> None:
@@ -4867,7 +4910,7 @@ def test_the_shadow_sees_the_tristate_including_budget_expiry(monkeypatch) -> No
     monkeypatch.setattr(run_shepherd, "DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
     monkeypatch.setattr(
         run_shepherd.shadow, "compare_proposal_refs",
-        lambda refs, legacy, parse: seen.update(legacy) or run_shepherd.shadow.Totals(),
+        lambda refs, legacy, parse, **kw: seen.update(legacy) or run_shepherd.shadow.Totals(),
     )
     try:
         run_shepherd._filter_dev_loop_owned(_tri_refs()[:2])
@@ -4908,6 +4951,7 @@ def test_a_failing_shadow_cannot_fail_the_sweep(monkeypatch, capsys) -> None:
         ("payload is not a dict", "notadict", run_shepherd.LEGACY_UNKNOWN),
         ("completed", "completed", run_shepherd.LEGACY_FREE),
         ("running, field absent", "nofield", run_shepherd.LEGACY_UNKNOWN),
+        ("running, the query did not complete", "notknown", run_shepherd.LEGACY_UNKNOWN),
         ("running, field false", "declines", run_shepherd.LEGACY_FREE),
         ("running and shepherding", "owned", run_shepherd.LEGACY_OWNED),
     ],
@@ -4951,10 +4995,19 @@ def test_the_tristate_probe_maps_every_path(monkeypatch, capsys, name, setup, ex
     elif setup == "nofield":
         monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
             lambda r, timeout=None: _FakeHTTPResponse(b'{"status": "Running"}')))
+    elif setup == "notknown":
+        # mctl-api reports false both for a live execution declining to
+        # shepherd and for a query that never completed. Same value, opposite
+        # meaning; only shepherd_in_loop_known tells them apart.
+        monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
+            lambda r, timeout=None: _FakeHTTPResponse(
+                b'{"status": "Running", "shepherd_in_loop": false,'
+                b' "shepherd_in_loop_known": false}')))
     elif setup == "declines":
         monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
             lambda r, timeout=None: _FakeHTTPResponse(
-                b'{"status": "Running", "shepherd_in_loop": false}')))
+                b'{"status": "Running", "shepherd_in_loop": false,'
+                b' "shepherd_in_loop_known": true}')))
     elif setup == "owned":
         monkeypatch.setattr(run_shepherd, "_no_redirect_opener", _opener(
             lambda r, timeout=None: _FakeHTTPResponse(
