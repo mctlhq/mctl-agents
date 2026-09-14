@@ -144,6 +144,145 @@ def test_the_import_ladder(
     assert plan.retryable is want_retryable
 
 
+def _record(*, held, state="active", healthy=True, owner_id="shepherd:mctl-web") -> Ownership:
+    return Ownership(
+        entity=EntityRef(kind="pull-request", id="mctlhq/mctl-web#42"),
+        phase="review-remediation",
+        owner=Owner(type="shepherd", id=owner_id),
+        state=state,
+        healthy=healthy,
+        held=held,
+    )
+
+
+def _holding(record: Ownership) -> OwnershipAnswer:
+    """What the store answers for a record in a HOLDING state.
+
+    OWNED_BY_OTHER whatever `held` says -- which is the whole point. `state` is
+    `active`, and `verdict_for` classifies on the state set, not on liveness.
+    """
+    return OwnershipAnswer(verdict=OWNED_BY_OTHER, ownership=record)
+
+
+def test_a_dead_record_does_not_stop_the_ladder() -> None:
+    """The one shape rung 1 has to get right, and the one the import exists for.
+
+    `verdict_for` answers OWNED_BY_OTHER for ANY record in a holding state,
+    healthy or not -- correctly for its own question, "may I act". The shadow
+    compare asks a different one: `derived.held`, computed from the takeover
+    predicate, which is False for a record left `active` past its liveness
+    bound.
+
+    So with a live DevLoop the soak reports `store-permits-old-forbids`, the
+    one DANGEROUS class, while a verdict-keyed rung 1 called the same entity
+    already-owned and returned. Rung 1 is terminal, so no re-run would revisit
+    it: the import would report a clean run over exactly the entities it was
+    built to fix.
+    """
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        _holding(_record(held=False, healthy=False)),
+        LEGACY_OWNED,
+        repo="mctlhq/mctl-web",
+    )
+    assert plan.decision == bootstrap.DECISION_DEVLOOP
+    assert plan.owner_type == "devloop-workflow"
+    assert plan.owner_id == "dev-loop-mctlhq-mctl-web-7"
+    assert plan.undetermined is False
+
+
+def test_a_live_record_still_stops_the_ladder() -> None:
+    """The other half, or the fix above would be "never trust the store".
+
+    A record that genuinely holds the entity is left alone even with a live
+    DevLoop reported -- the store is authoritative about who holds it, and
+    writing over a live owner is how a bootstrap takes an entity from whoever
+    actually has it.
+    """
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        _holding(_record(held=True)),
+        LEGACY_OWNED,
+        repo="mctlhq/mctl-web",
+    )
+    assert plan.decision == bootstrap.DECISION_ALREADY_OWNED
+    assert plan.owner_id == "shepherd:mctl-web"
+
+
+def test_a_dead_record_with_no_devloop_is_ordinary_ambiguity() -> None:
+    """Falling through is not the same as being importable. With nothing
+    driving the pull request there is still no owner type with a writer, so
+    this is rung 4: ambiguous, NOT undetermined, and a run made of it is a
+    success."""
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        _holding(_record(held=False, healthy=False)),
+        LEGACY_FREE,
+        repo="mctlhq/mctl-web",
+    )
+    assert plan.decision == bootstrap.DECISION_AMBIGUOUS
+    assert plan.owner_id == ""
+    assert plan.undetermined is False
+
+
+def test_a_record_without_derived_held_is_undetermined_not_already_owned() -> None:
+    """An absence, never a third reading of `held`.
+
+    mctl-api predating the `derived` block answers a record with no `held`, and
+    `shadow.held` returns None. Classifying that as already-owned is the branch
+    that leaves the dangerous class in place silently; classifying it as a dead
+    record would write over an owner nobody read. It is undetermined, and
+    PERMANENT -- a re-run against the same mctl-api answers the same.
+
+    Loud on purpose: against a stale API every entity takes this branch and the
+    whole run goes red, which is the signal, rather than a quiet
+    misclassification of the entire fleet.
+    """
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        _holding(_record(held=None)),
+        LEGACY_OWNED,
+        repo="mctlhq/mctl-web",
+    )
+    assert plan.decision == bootstrap.DECISION_AMBIGUOUS
+    assert plan.undetermined is True
+    assert plan.retryable is False
+    assert "derived.held" in plan.reason
+
+
+def test_rung_one_uses_the_shadow_compares_own_predicate(monkeypatch) -> None:
+    """Not a second implementation of it.
+
+    The two answers differ on exactly the dangerous shape, so the guarantee
+    worth pinning is that there is ONE predicate rather than two that agree
+    today. Moving `shadow.held` has to move rung 1; if this module ever
+    re-derives held-ness, the other tests still pass and only this one fails.
+
+    The record says held=True, so a re-derivation from the record -- or from
+    the verdict -- would answer already-owned and the assertion below fails.
+    """
+    consulted = []
+
+    def fake_held(answer):
+        consulted.append(answer)
+        return False
+
+    monkeypatch.setattr(bootstrap.shadow, "held", fake_held)
+    plan = bootstrap.plan_for(
+        _ref(),
+        "mctlhq/mctl-web#42",
+        _holding(_record(held=True)),
+        LEGACY_OWNED,
+        repo="mctlhq/mctl-web",
+    )
+    assert consulted, "rung 1 did not consult shadow.held"
+    assert plan.decision == bootstrap.DECISION_DEVLOOP
+
+
 def test_a_skipped_service_is_not_imported_either(monkeypatch) -> None:
     """pr-steward has no lifecycle writer, same as the shepherd.
 
@@ -503,6 +642,22 @@ def test_a_report_run_is_allowed_below_observe(tmp_path, monkeypatch, capsys) ->
     assert _report_of(capsys.readouterr().out)["counts"]["devloop-workflow"] == 1
 
 
+def test_an_unknown_service_is_rejected_at_the_argument(tmp_path, capsys) -> None:
+    """Not discovered-as-nothing.
+
+    An unknown --service matches no proposal directory, so without this the run
+    discovers nothing and exits 1 saying "discovered no proposals at all" --
+    whose message sends the operator to check the volume mount for what is a
+    typo in their own argument. --service is used precisely on the scoped first
+    apply, which is the worst moment for that.
+    """
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    with pytest.raises(SystemExit) as exc:
+        bootstrap.main(["--state-dir", str(root), "--service", "mctl-wbe"])
+    assert exc.value.code == 2
+    assert "unknown service 'mctl-wbe'" in capsys.readouterr().err
+
+
 def test_the_scope_can_be_narrowed(tmp_path, monkeypatch, capsys) -> None:
     """An apply skips an entity the store already holds, so a row written
     wrongly cannot be corrected by re-running. A first apply must not have to
@@ -613,6 +768,23 @@ def test_the_policy_ref_does_not_encode_this_pods_environment(monkeypatch) -> No
         )
         refs.append(report.as_dict()["planned"][0]["policy_ref"])
     assert refs == ["lifecycle-bootstrap:devloop-live"] * 3
+
+
+def test_the_devloop_org_has_one_definition() -> None:
+    """The check and the thing it checks must be the same string.
+
+    `devloop_workflow_id` builds `dev-loop-{org}-{service}-{N}` and the
+    bootstrap refuses a pull request whose repository is not `{org}/{service}`.
+    Written out on both sides, a change to one would make the guard refuse
+    every entity as "in another repository" -- red, with a reason naming the
+    wrong cause.
+    """
+    from orchestrator import run_shepherd
+
+    assert bootstrap.DEVLOOP_WORKFLOW_OWNER == run_shepherd.DEVLOOP_WORKFLOW_ORG
+    assert run_shepherd.devloop_workflow_id("mctl-web", "issue-7-a").startswith(
+        f"dev-loop-{run_shepherd.DEVLOOP_WORKFLOW_ORG}-"
+    )
 
 
 def test_the_workflow_id_has_one_definition() -> None:

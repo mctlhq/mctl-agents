@@ -50,7 +50,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from orchestrator.lifecycle import rollout
+from config.settings import SERVICES
+from orchestrator.lifecycle import rollout, shadow
 from orchestrator.lifecycle.client import OwnershipClient
 from orchestrator.lifecycle.contract import (
     KIND_PULL_REQUEST,
@@ -64,6 +65,17 @@ from orchestrator.lifecycle.contract import (
     OwnershipAnswer,
 )
 
+
+def _devloop_workflow_org() -> str:
+    """`run_shepherd.DEVLOOP_WORKFLOW_ORG`, imported the way this module
+    imports everything from there: inside a function. `run_shepherd` pulls in
+    the agent SDK at import time, and a module-level import here would make
+    that a cost of merely reading the report's vocabulary."""
+    from orchestrator.run_shepherd import DEVLOOP_WORKFLOW_ORG
+
+    return DEVLOOP_WORKFLOW_ORG
+
+
 #: The report's decision vocabulary. Closed, like every other vocabulary in
 #: this package: an operator reviewing a dry run must be able to enumerate what
 #: they might see.
@@ -72,9 +84,15 @@ DECISION_DEVLOOP = "devloop-workflow"
 DECISION_AMBIGUOUS = "ambiguous"
 
 #: The org devloop_workflow_id builds ids under. Checked before a bootstrap
-#: writes one, because that function's hardcoded org is fail-open on a read and
-#: durable on a write.
-DEVLOOP_WORKFLOW_OWNER = "mctlhq"
+#: writes one, because that function's org is fail-open on a read and durable
+#: on a write.
+#:
+#: IMPORTED, not transcribed. A second "mctlhq" here would be a check that can
+#: disagree with the thing it checks -- and it would fail in the quiet
+#: direction, refusing every entity as "in another repository" rather than
+#: erroring, so the run would go red with a reason naming the wrong cause.
+#: Read at import time, which is fine: it is a module constant, not env.
+DEVLOOP_WORKFLOW_OWNER = _devloop_workflow_org()
 
 #: Prefix on the report line. stdout carries other things -- _discover_refs
 #: prints a skip notice per unowned service, and a probe thread past its budget
@@ -117,9 +135,16 @@ POLICY_REF = "lifecycle-bootstrap:devloop-live"
 #: it could, exits 1, and the re-run races the same clock.
 #:
 #: This runs ONCE, so it gets a bound sized for finishing rather than for
-#: protecting a cadence. Keep it comfortably under the WorkflowTemplate's
-#: activeDeadlineSeconds (900s today), which has to cover the clone and the
-#: store read as well.
+#: protecting a cadence.
+#:
+#: It is a bound on the PROBE PASS, not on the run, and the difference matters
+#: when sizing the WorkflowTemplate's activeDeadlineSeconds (900s today). That
+#: deadline has to cover the clone, DISCOVERY, the store read and then this.
+#: Discovery is the unbounded one: `_discover_refs` shells out to `gh pr list`
+#: per proposal, serially, with no budget of its own -- on a fleet-wide run
+#: that is the largest term in the sum and nothing here constrains it. So
+#: raising this constant is not free: the deadline has to move with it, and
+#: the headroom left over is what discovery gets.
 PROBE_BUDGET_S = 300
 
 #: Concurrency for the same pass, sized from the same arithmetic.
@@ -293,8 +318,9 @@ def plan_for(
 ) -> Plan:
     """The import ladder for one entity. Four rungs, in this order:
 
-      1. the store already holds it -- ALREADY_OWNED. Nothing to do, and this
-         is what makes a re-run write nothing;
+      1. the store HOLDS it -- ALREADY_OWNED. Nothing to do, and this is what
+         makes a re-run write nothing. "Holds", from the server's
+         ``derived.held``, NOT from the verdict: see below;
       2. the probe could not answer -- AMBIGUOUS, `undetermined`. An absence,
          not an answer;
       3. a live DevLoopWorkflow drives it -- DEVLOOP. The workflow is the
@@ -319,6 +345,27 @@ def plan_for(
     `legacy_answer` is the tri-state probe, not the bool. A probe that failed
     must not be read as "no DevLoop is driving this": rung 2 exists precisely
     so it cannot fall through to rung 4 and be counted as a measured absence.
+
+    RUNG 1 KEYS ON ``held``, NOT ON THE VERDICT, and the difference is the
+    whole point of the rung. ``verdict_for`` answers OWNED_BY_OTHER for any
+    record in a HOLDING state, healthy or not -- correctly, for its own
+    purpose, which is "may I act". ``shadow.held`` reads the server's
+    ``derived.held``, computed from the TAKEOVER PREDICATE. Those disagree on
+    exactly one shape, and it is the shape this tool exists for: a record left
+    `active` past its liveness bound. The soak sees held=False, and with a live
+    DevLoop reports ``store-permits-old-forbids`` -- the one dangerous class --
+    while a verdict-keyed rung 1 called the same entity already-owned and
+    returned. Rung 1 is terminal, so no re-run would ever revisit it: the
+    import would report a clean run over the very entities it was built to fix.
+
+    So a record that holds nothing does not stop the ladder. It falls through,
+    and a live DevLoop is recorded as the owner -- which is a TAKEOVER of a
+    dead row, and legal for exactly the reason the row reads held=False.
+
+    ``held`` unavailable is an ABSENCE, not a third reading. The server may
+    predate the ``derived`` block, in which case every entity answers None and
+    the whole run goes red rather than quietly classifying on a field that is
+    not there.
     """
     from orchestrator.run_shepherd import LEGACY_OWNED, LEGACY_UNKNOWN
 
@@ -331,11 +378,36 @@ def plan_for(
     )
 
     if answer.verdict in (OWNED_BY_OTHER, OWNED_BY_ME):
-        base.decision = DECISION_ALREADY_OWNED
-        owner = answer.ownership.owner if answer.ownership else Owner()
-        base.owner_type, base.owner_id = owner.type, owner.id
-        base.reason = "the store already holds this entity phase"
-        return base
+        # ONE predicate for "does the store withhold this entity", shared with
+        # the shadow compare. Re-deriving it here is the coupling every other
+        # module in this package refuses, and the two answers differ precisely
+        # on the dangerous shape -- see the docstring.
+        holds = shadow.held(answer)
+        if holds is None:
+            # A held verdict whose held-ness cannot be read: either no record
+            # came back with it, or the server predates `derived.held`. Both
+            # are "the owner cannot be seen", which is the condition the
+            # read-first abort exists for -- so it is undetermined and
+            # PERMANENT, since a re-run against the same mctl-api answers the
+            # same. Never silently already-owned: that is the branch that
+            # leaves the dangerous class in place.
+            base.decision = DECISION_AMBIGUOUS
+            base.undetermined = True
+            base.reason = (
+                "the store holds a record whose derived.held it did not report; "
+                "owner undetermined (mctl-api predates the derived block?)"
+            )
+            return base
+        if holds:
+            base.decision = DECISION_ALREADY_OWNED
+            owner = answer.ownership.owner if answer.ownership else Owner()
+            base.owner_type, base.owner_id = owner.type, owner.id
+            base.reason = "the store already holds this entity phase"
+            return base
+        # held=False under a holding verdict: a record past its liveness bound.
+        # It withholds the entity from nobody, so it must not stop the ladder.
+        # Fall through -- if a live DevLoop drives the pull request, rung 3
+        # records it and the acquire is a takeover the dead row licenses.
 
     if legacy_answer == LEGACY_UNKNOWN:
         base.decision = DECISION_AMBIGUOUS
@@ -694,6 +766,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--service", default=None, help="limit to one service")
     parser.add_argument("--slug", default=None, help="limit to one proposal slug")
     args = parser.parse_args(argv)
+
+    if args.service is not None and args.service not in SERVICES:
+        # The shepherd's own CLI validates this (run_shepherd.py), and the
+        # reason applies harder here. An unknown --service matches no proposal
+        # directory, so the run discovers nothing -- and "discovered no
+        # proposals at all" exits 1 with a message about a checkout mounted one
+        # level off, sending the operator to look at the volume mount for a
+        # typo in their own argument. On the scoped FIRST apply, which is
+        # exactly when --service is used, that is the worst moment for it.
+        parser.error(f"unknown service {args.service!r}; one of: {', '.join(SERVICES)}")
 
     if args.apply:
         # This module PLANS. There is no writer in it -- no `acquire` call

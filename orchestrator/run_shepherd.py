@@ -173,6 +173,17 @@ def _owns(answer: str) -> bool:
     return answer == LEGACY_OWNED
 
 
+#: The GitHub org DevLoop workflow ids are built under.
+#:
+#: A CONSTANT rather than a literal inside the f-string, because the ownership
+#: bootstrap has to check it: this function is fail-open on a read (a wrong org
+#: only 404s) and durable on a write (a wrong org becomes a row naming a
+#: workflow that does not exist), so the writer compares the pull request's
+#: repository against this before using an id. Transcribed on both sides, the
+#: check and the thing checked could disagree.
+DEVLOOP_WORKFLOW_ORG = "mctlhq"
+
+
 def devloop_workflow_id(service: str, slug: str) -> str:
     """The DevLoopWorkflow id for a proposal, or "" if it never had one.
 
@@ -196,7 +207,7 @@ def devloop_workflow_id(service: str, slug: str) -> str:
     m = re.match(r"issue-(\d+)-", slug)
     if not m:
         return ""
-    return f"dev-loop-mctlhq-{service}-{m.group(1)}"
+    return f"dev-loop-{DEVLOOP_WORKFLOW_ORG}-{service}-{m.group(1)}"
 
 
 def _dev_loop_owns(service: str, slug: str) -> bool:
