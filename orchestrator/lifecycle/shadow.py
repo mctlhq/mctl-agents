@@ -232,11 +232,17 @@ def classify(answer: OwnershipAnswer, legacy: str) -> Divergence:
 
     is_held = held(answer)
     if is_held is None:
-        return Divergence(
-            DIVERGE_STORE_UNKNOWN,
-            detail="record carries no derived.held; mctl-api predates the field",
-            store=answer.verdict,
-        )
+        # Two structurally different causes, and the detail is the first thing
+        # anyone reads if this class spikes during the soak -- naming the wrong
+        # one sends them to the wrong repository.
+        if answer.ownership is not None:
+            detail = "record carries no derived.held; mctl-api predates the field"
+        else:
+            # A verdict that says somebody holds the entity, with no record
+            # attached (contract.py's 409 branch). answer.reason carries the
+            # server's own message and is the only thing here that explains it.
+            detail = f"held verdict with no record attached: {answer.reason}"
+        return Divergence(DIVERGE_STORE_UNKNOWN, detail=detail, store=answer.verdict)
 
     if legacy == LEGACY_UNKNOWN:
         return Divergence(DIVERGE_LEGACY_UNKNOWN, store=answer.verdict)

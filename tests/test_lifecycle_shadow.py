@@ -551,3 +551,26 @@ def test_the_chunk_size_matches_the_clients_own() -> None:
     from orchestrator.lifecycle.client import BATCH_CHUNK_SIZE
 
     assert shadow.SHADOW_CHUNK_SIZE == BATCH_CHUNK_SIZE
+
+
+def test_the_two_unknown_causes_are_named_apart() -> None:
+    """`held()` answers None for two structurally different reasons, and the
+    detail is the first thing anyone reads if this class spikes."""
+    no_block = OwnershipAnswer(
+        verdict=OWNED_BY_OTHER,
+        ownership=Ownership(
+            entity=EntityRef(kind="pull-request", id="a#1"),
+            phase="review-remediation",
+            owner=Owner(type="shepherd", id="shepherd:x"),
+            state="active",
+            held=None,
+        ),
+    )
+    assert "predates the field" in shadow.classify(no_block, shadow.LEGACY_FREE).detail
+
+    no_record = OwnershipAnswer(verdict=OWNED_BY_OTHER, reason="409: owned by shepherd:x")
+    detail = shadow.classify(no_record, shadow.LEGACY_FREE).detail
+    assert "no record attached" in detail
+    # The server's own message survives: without it the line names an mctl-api
+    # version skew that did not happen and drops the only explanation there is.
+    assert "409: owned by shepherd:x" in detail
