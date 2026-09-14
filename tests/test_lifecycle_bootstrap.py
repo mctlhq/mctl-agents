@@ -320,29 +320,38 @@ def test_a_dry_run_does_not_touch_the_gitops_checkout(tmp_path, monkeypatch, cap
     assert status.read_text() == before, "the dry run rewrote .status.yaml"
 
 
-def test_a_skipped_service_is_discovered_at_all(tmp_path, monkeypatch, capsys) -> None:
-    """The pr-steward rung fires iff the service is SKIP — which is exactly the
-    set _discover_refs drops when reconcile is False. Without the fix_only
-    override the rung, and the pr-steward arm of owner_for, are dead in
-    production and counts["pr-steward"] reads 0 for a reason the report does
-    not show."""
+def test_a_skipped_service_is_not_discovered(tmp_path, monkeypatch, capsys) -> None:
+    """SHEPHERD_SKIP_SERVICES stays out of the import entirely.
+
+    The fix_only override that pulled them in existed only to make the
+    pr-steward rung reachable; that rung is gone, so every entity in a skipped
+    service could now land only in rung 4 and be left unowned. Discovering them
+    anyway pads `counts.total` — the measured decision rate the soak's sample
+    target is re-derived from — with entities this tool cannot act on.
+    """
     from orchestrator import run_shepherd
 
     root = _state_dir(tmp_path, "mctl-claude-remote", "issue-7-a-thing")
-    # Honours force_fix_only, as the real _service_mode does: that override is
-    # exactly what lets discovery see a skipped service, and a fake that
-    # ignored it would assert against a function this code does not call.
     monkeypatch.setattr(
         run_shepherd,
         "_service_mode",
-        lambda s, force_fix_only=False: run_shepherd.FIX_ONLY if force_fix_only else run_shepherd.SKIP,
+        lambda svc, force_fix_only=False: (
+            run_shepherd.FIX_ONLY if force_fix_only else run_shepherd.SKIP
+        ),
     )
     monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
     _install_client(monkeypatch, _Client())
 
     bootstrap.main(["--state-dir", str(root)])
-    report = _report_of(capsys.readouterr().out)
-    assert report["counts"]["devloop-workflow"] == 1
+    out = capsys.readouterr().out
+    report = _report_of(out)
+    assert report["counts"]["total"] == 0
+    # The cost, pinned rather than wished away: dropping the override makes
+    # _discover_refs's skip notice ROUTINE on stdout, where the old behaviour
+    # suppressed it by never reaching the SKIP branch. The report is still
+    # findable, which is the whole reason the marker exists.
+    assert "shepherd: skipping" in out
+    assert out.count(bootstrap.REPORT_MARKER) == 1
 
 
 def test_the_counts_include_the_ambiguous_ones(tmp_path, monkeypatch, capsys) -> None:
@@ -952,3 +961,38 @@ def test_a_slug_with_no_workflow_id_under_a_live_devloop_is_undetermined() -> No
     assert plan.decision == bootstrap.DECISION_AMBIGUOUS
     assert plan.undetermined is True
     assert plan.owner_id == ""
+
+
+def test_a_duplicate_mapping_is_undetermined() -> None:
+    """Two proposals on one pull request: the run cannot tell which is
+    authoritative, so whatever the winner decided is a coin toss the report
+    must not present as settled."""
+    report = bootstrap.build_report(
+        [_ref(slug="issue-7-a"), _ref(slug="issue-8-b")], _Client(), _probe(LEGACY_OWNED)
+    )
+    dupes = [p for p in report.ambiguous if "a second proposal maps to" in p.reason]
+    assert len(dupes) == 1
+    assert dupes[0].undetermined is True
+
+
+def test_the_summary_separates_transient_from_permanent(tmp_path, monkeypatch, capsys) -> None:
+    """The two need opposite responses: a probe that could not answer is worth
+    re-running, a malformed `pr:` is a data problem the same run reproduces."""
+    from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
+    root = tmp_path / "agents-state"
+    for slug, pr in (
+        ("issue-7-a-thing", "https://github.com/mctlhq/mctl-web/pull/42"),
+        ("issue-8-b-thing", "https://github.com/mctlhq/mctl-web/issues/43"),
+    ):
+        d = root / "mctl-web" / "proposals" / slug
+        d.mkdir(parents=True)
+        (d / ".status.yaml").write_text(f"status: implemented\npr: {pr}\n")
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_UNKNOWN)
+    _install_client(monkeypatch, _Client())
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    err = capsys.readouterr().err
+    assert "1 transient, 1 needing a fix in .status.yaml" in err

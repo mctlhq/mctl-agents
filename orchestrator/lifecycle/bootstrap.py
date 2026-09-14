@@ -480,6 +480,13 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
                     service=ref.service,
                     slug=ref.slug,
                     decision=DECISION_AMBIGUOUS,
+                    # UNDETERMINED: the run cannot tell which proposal is
+                    # authoritative for this pull request, so whatever the
+                    # winner decided is a coin toss the report should not
+                    # present as settled. Two proposals on one PR is a data
+                    # problem, and a bootstrap is the wrong place to guess past
+                    # one.
+                    undetermined=True,
                     reason=f"a second proposal maps to {entity_id}",
                 )
             )
@@ -662,19 +669,28 @@ def main(argv: list[str] | None = None) -> int:
     # contradict every other guarantee here, the `aborted` path's "nothing was
     # written" included.
     #
-    # fix_only=True is how the SKIPPED services get discovered at all. Without
-    # it _discover_refs drops every service in SHEPHERD_SKIP_SERVICES, which is
-    # exactly the set the pr-steward rung exists for — the rung, and the
-    # pr-steward arm of owner_for, would be dead code and counts["pr-steward"]
-    # would read 0 for a reason the report does not show. The override affects
-    # DISCOVERY only: policy.default_owner_for re-reads the real service mode,
-    # so a skipped service still answers pr-steward in the ladder.
+    # NO fix_only override. It existed solely to pull SHEPHERD_SKIP_SERVICES
+    # into discovery so the pr-steward rung was reachable; that rung is gone,
+    # so every entity in a skipped service can now only land in rung 4 and be
+    # left unowned.
+    #
+    # Discovering them anyway is not neutral: `counts.total` is the measured
+    # decision rate the soak's sample target is re-derived from, and padding it
+    # with entities this tool cannot act on makes that target wrong in the
+    # direction of "we measured more than we did".
+    #
+    # The cost, stated because it goes the other way: _discover_refs prints
+    # "shepherd: skipping <svc>" to stdout for every skipped service that has a
+    # proposals/ dir, and the override used to suppress that by making the SKIP
+    # branch unreachable. So the notice is now routine here, on a stream it
+    # shares with the report, and labelled with a component this is not. That
+    # is what REPORT_MARKER is for — the report is found by grepping, never by
+    # being the only thing on stdout.
     refs = _discover_refs(
         args.state_dir,
         service_filter=args.service,
         slug_filter=args.slug,
         dry_run=True,
-        fix_only=True,
     )
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
@@ -710,9 +726,18 @@ def main(argv: list[str] | None = None) -> int:
     # path.
     undetermined = [p for p in report.ambiguous if p.undetermined]
     if undetermined:
+        # Transient and permanent causes are counted apart, because they need
+        # opposite responses. A probe that could not answer, or a store read
+        # that came back empty for one id, is worth re-running. A malformed
+        # `pr:` or a pull request in the wrong repository is a data problem in
+        # the gitops checkout: the same run repeated produces the same refusal.
+        permanent = [p for p in undetermined if "probe could not answer" not in p.reason]
+        transient = len(undetermined) - len(permanent)
+        detail = f"{transient} transient, {len(permanent)} needing a fix in .status.yaml"
         print(
             f"lifecycle-bootstrap: {len(undetermined)} entit(ies) could not be "
-            f"determined (first: {undetermined[0].entity_id or undetermined[0].slug})",
+            f"determined ({detail}; first: "
+            f"{undetermined[0].entity_id or undetermined[0].slug})",
             file=sys.stderr,
         )
         return 1
