@@ -894,6 +894,38 @@ def test_a_run_that_proceeds_reports_a_fault_at_any_depth(tmp_path, capsys, extr
         proposals.chmod(0o755)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
+def test_a_refused_run_does_not_learn_about_the_walks_faults(tmp_path, capsys) -> None:
+    """The OTHER half of the ordering rule, asserted rather than only written.
+
+    An unreadable `proposals/` is visible to nothing cheaper than the walk, and
+    the walk runs after the refusal. So `--apply` answers "this flag does
+    nothing in this build" and says NOTHING about the mount — deliberately,
+    because the run did nothing and that is a complete answer to what was
+    asked. The re-run the refusal asks for is what finds it, which the
+    fleet-wide parameter of the test above pins.
+
+    Written down here because the prose said it and no test did: the three
+    flag shapes that once compared the refusal against an infrastructure fault
+    were dropped when the rule changed, leaving the ordering asserted only in a
+    docstring — and asserted in the OPPOSITE direction by the missing-state-dir
+    test, which is a cheap fault and so genuinely does outrank the refusal.
+    Both are true; they are different rungs of the same rule.
+    """
+    root = tmp_path / "agents-state"
+    proposals = root / "mctl-web" / "proposals"
+    proposals.mkdir(parents=True)
+    proposals.chmod(0o111)
+    try:
+        assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+        aborted = _report_of(capsys.readouterr().out)["aborted"]
+        assert "refused --apply" in aborted
+        assert "discovery failed" not in aborted
+        assert "cannot read" not in aborted
+    finally:
+        proposals.chmod(0o755)
+
+
 def test_the_refusal_does_not_wait_for_the_walk(tmp_path, monkeypatch, capsys) -> None:
     """`--apply` answers without reading the checkout.
 
@@ -963,10 +995,12 @@ def test_a_missing_state_dir_reports_rather_than_exiting_bare(tmp_path, capsys) 
     assert "state dir not found" in report["aborted"]
     assert "ABORTED" in captured.err
 
-    # AND under --apply, which is the invocation the docstring opens on and
-    # which no test passed. "There is no checkout" outranks "this build does
-    # not write", so it is exit 1 here rather than exit 2 at the --apply
-    # refusal — an ordering three commits have now changed and none pinned.
+    # AND under --apply. A MISSING state dir is a cheap fault — a stat — so it
+    # is answered before the refusal and wins: exit 1, not exit 2. That is rung
+    # 2 of the ordering rule in bootstrap.py, and it is not in tension with
+    # `test_a_refused_run_does_not_learn_about_the_walks_faults`, which pins
+    # rung 3: a fault only the WALK can see is reported after the refusal, so a
+    # refused run never reaches it.
     assert bootstrap.main([*argv, "--apply"]) == 1
     assert "state dir not found" in _report_of(capsys.readouterr().out)["aborted"]
 
