@@ -5035,6 +5035,37 @@ def test_the_tristate_probe_maps_every_path(
     capsys.readouterr()
 
 
+def test_an_unrepresentable_service_answers_unknown_rather_than_raising(monkeypatch) -> None:
+    """`_dev_loop_owns_answer` is TOTAL, and the sweep depends on it.
+
+    `devloop_workflow_id` delegates to `issue_ref.workflow_id_for`, which
+    validates. The unvalidated half of the URL it builds is the SERVICE, not
+    the slug: `_discover_refs` takes the service from any directory under the
+    state dir that does not begin with `_` and never checks it against
+    SERVICES, so a directory name outside `[A-Za-z0-9_.-]+` raises ValueError
+    where the f-string this replaced could not.
+
+    Unhandled, that surfaces on the future in `_filter_dev_loop_owned`, whose
+    only handler is `except FuturesTimeoutError`, and aborts the whole tick for
+    every service instead of failing open for the one proposal -- verbatim the
+    regression the comment inside this function records having fixed once.
+
+    UNKNOWN, not FREE: the entity cannot be represented, so nothing was asked,
+    and "nobody drives this" would be a claim rather than an answer. The bool
+    wrapper still reads it as False, so the sweep's decision is unchanged.
+
+    The parametrised table above fixes service="mctl-web", so nothing else
+    reaches this path.
+    """
+    monkeypatch.setenv("MCTL_TOKEN", "t")
+    for service in ("not a repo name", "mctl\u2011web", "a/b"):
+        assert (
+            run_shepherd._dev_loop_owns_answer(service, "issue-7-a-thing")
+            == run_shepherd.LEGACY_UNKNOWN
+        ), service
+        assert run_shepherd._dev_loop_owns(service, "issue-7-a-thing") is False
+
+
 def test_the_sweep_and_the_wrapper_share_one_predicate() -> None:
     """The bool tests above are only meaningful while production calls what
     they exercise.

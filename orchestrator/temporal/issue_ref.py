@@ -9,7 +9,19 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-_ISSUE_URL_RE = re.compile(r"^https://github\.com/mctlhq/([A-Za-z0-9_.-]+)/issues/([0-9]+)$")
+#: The one GitHub org this pipeline runs under.
+#:
+#: Named rather than left inside the regex because other modules have to agree
+#: with it: `run_shepherd.devloop_workflow_id` builds the issue URL it feeds to
+#: `workflow_id_for` from a proposal's service directory, and the ownership
+#: bootstrap checks a pull request's repository against it before writing a row
+#: naming that workflow. Spelled three times, those are three things that can
+#: drift from the format this file defines.
+ISSUE_URL_ORG = "mctlhq"
+
+_ISSUE_URL_RE = re.compile(
+    rf"^https://github\.com/{re.escape(ISSUE_URL_ORG)}/([A-Za-z0-9_.-]+)/issues/([0-9]+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -24,7 +36,7 @@ def parse_issue_url(issue_url: str) -> IssueRefParts:
     if not match:
         raise ValueError(f"{issue_url!r} does not look like a mctlhq GitHub issue URL")
     repo, number = match.groups()
-    return IssueRefParts(owner="mctlhq", repo=repo, number=number)
+    return IssueRefParts(owner=ISSUE_URL_ORG, repo=repo, number=number)
 
 
 def workflow_id_for(issue_url: str) -> str:

@@ -90,6 +90,7 @@ from orchestrator.lifecycle import shadow
 from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.temporal.issue_ref import ISSUE_URL_ORG, workflow_id_for
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
 
 # ---------------------------------------------------------------------------
@@ -173,6 +174,52 @@ def _owns(answer: str) -> bool:
     return answer == LEGACY_OWNED
 
 
+#: The GitHub org DevLoop workflow ids are built under.
+#:
+#: RE-EXPORTED from `issue_ref`, which owns both the org and the id format,
+#: rather than declared here. The ownership bootstrap checks a pull request's
+#: repository against this before writing a row that names a workflow, so a
+#: second spelling would be a check that can disagree with the thing it checks.
+DEVLOOP_WORKFLOW_ORG = ISSUE_URL_ORG
+
+
+def devloop_workflow_id(service: str, slug: str) -> str:
+    """The DevLoopWorkflow id for a proposal, or "" if it never had one.
+
+    ADAPTS a proposal to `issue_ref.workflow_id_for`; it does not re-derive the
+    id. That function is what `temporal.start` names the execution with, so a
+    second transcription of `dev-loop-{owner}-{repo}-{issue}` here would let a
+    future scheme or validation change make the liveness probe — and the
+    ownership bootstrap, which writes this value DURABLY into a row's
+    temporal_workflow_id — name a workflow Temporal never started.
+
+    The only thing this adds is the translation, which `workflow_id_for` cannot
+    do: a ProposalRef carries an `issue-<N>-` slug and a service directory
+    rather than an issue URL, and no repo owner at all — unlike orphans.py,
+    which derives one from `pr.repo`.
+
+    A slug with no `issue-<N>-` prefix answers "" rather than raising:
+    structurally that proposal never had a DevLoop, which is an answer. The
+    empty string must never become an owner id, and both callers guard on it.
+
+    THIS FUNCTION CAN RAISE, which the f-string it replaced could not, and the
+    unvalidated half of the URL is the SERVICE rather than the slug.
+    `_discover_refs` takes the service from any directory under the state dir
+    that does not begin with `_` and never checks it against SERVICES, so a
+    directory name outside `parse_issue_url`'s `[A-Za-z0-9_.-]+` raises
+    ValueError. Both callers handle it, and deliberately differently, because
+    they have different vocabularies for "this entity cannot be represented":
+    `_dev_loop_owns_answer` answers LEGACY_UNKNOWN, and the ownership bootstrap
+    reports the entity undetermined. Neither may let it escape — in the sweep
+    it surfaces on a future whose only handler is `except FuturesTimeoutError`
+    and takes the whole tick down.
+    """
+    m = re.match(r"issue-(\d+)-", slug)
+    if not m:
+        return ""
+    return workflow_id_for(f"https://github.com/{DEVLOOP_WORKFLOW_ORG}/{service}/issues/{m.group(1)}")
+
+
 def _dev_loop_owns(service: str, slug: str) -> bool:
     """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
 
@@ -199,8 +246,28 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     Nothing about the bool's behaviour changes here. Every path that returned
     False still maps to a non-OWNED answer.
     """
-    m = re.match(r"issue-(\d+)-", slug)
-    if not m:
+    try:
+        workflow_id = devloop_workflow_id(service, slug)
+    except ValueError:
+        # `devloop_workflow_id` validates through `parse_issue_url` now, and
+        # the unvalidated half of the URL it builds is the SERVICE, not the
+        # slug: `_discover_refs` takes the service from any directory under the
+        # state dir that does not start with `_` and never checks it against
+        # SERVICES, so a directory name outside `[A-Za-z0-9_.-]+` raises here.
+        #
+        # UNKNOWN, not FREE. We cannot represent the entity, so we did not ask
+        # — and answering "nobody drives this" would be a claim rather than an
+        # answer. The bool wrapper still reads it as False, so the sweep's
+        # behaviour is unchanged.
+        #
+        # Caught HERE rather than left to the caller for the reason the comment
+        # in the try below records: an exception out of this function surfaces
+        # on the future in `_filter_dev_loop_owned`, whose only handler is
+        # `except FuturesTimeoutError`, and aborts the whole tick for every
+        # service instead of failing open for the one proposal. The f-string
+        # this call replaced could not raise at all.
+        return LEGACY_UNKNOWN
+    if not workflow_id:
         # Structural, not a failure: a slug with no issue-<N>- prefix
         # (incident-*, anything pre-Temporal) never had a DevLoop, so the old
         # mechanism genuinely answers "nobody drives this".
@@ -209,11 +276,6 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     if not token:
         # Never asked.
         return LEGACY_UNKNOWN
-    # `mctlhq` is hardcoded because a ProposalRef carries no repo owner —
-    # unlike orphans.py, which derives one from `pr.repo`. Every proposal the
-    # shepherd sweeps lives under this org today; a wrong owner would only
-    # produce a 404, i.e. the fail-open "not owned" path.
-    workflow_id = f"dev-loop-mctlhq-{service}-{m.group(1)}"
     url = f"{MCTL_API_URL}/api/v1/agents/dev-loop/{workflow_id}"
     if not url.startswith("https://"):
         # MCTL_API_URL is operator-provided env; refuse non-https schemes
@@ -989,6 +1051,62 @@ def update_status(
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
+def discover_services(state_dir: Path) -> frozenset[str]:
+    """The services this checkout actually contains.
+
+    STRUCTURAL, not a name list: a directory under the state dir that does not
+    begin with `_` and contains a `proposals/` directory. That is the same
+    shape `_discover_refs` globs, which is the point — the walk and anything
+    describing what the walk will find read one definition.
+
+    It is NOT the one source every `--service` validator reads, and claiming so
+    was wrong about both of them: `run_shepherd.main()` validates against
+    `config.settings.SERVICES`, and the ownership bootstrap's effective admit
+    test is `(state_dir / service).is_dir()`, deliberately wider so a service
+    with no proposals yet reads as an ordinary state rather than a typo. What
+    this gives that caller is the `; found: ...` listing.
+
+    Not `config.settings.SERVICES`: a repository whose pull requests another
+    lifecycle drives has proposals here and no SERVICES entry
+    (`mctl-claude-remote`), and validating a flag against SERVICES makes it the
+    one service an operator cannot scope a run to.
+
+    Not "every directory" either. The state dir is a checkout, and a checkout
+    holds things that are not services — editor droppings, a stray archive, a
+    partially-cloned path -- and a caller filtering on a name wants to know
+    which names this checkout actually offers.
+
+    It is NOT what keeps a bad directory name out of an id builder, and saying
+    so would be a guard justified by a hazard it does not remove: the predicate
+    is *has a `proposals/` directory*, not *is a valid repository name*, so
+    `agents-state/not a repo name/proposals/issue-7-x/.status.yaml` satisfies
+    it and reaches `devloop_workflow_id` exactly as before. Containing that is
+    the job of the ValueError handlers in `_dev_loop_owns_answer` and in the
+    ownership bootstrap's ladder, and they are still load-bearing.
+
+    A MISSING state dir answers the empty set rather than raising; the callers
+    each have their own, better-worded failure for it.
+
+    An UNREADABLE one RAISES, and the half-claim that it does not is what two
+    callers have had to work around. `Path.is_dir()` swallows the OSError and
+    answers True for a directory this process can `stat` but not read, and the
+    `iterdir()` below has nothing around it, so a `--x` mount leaves here as a
+    `PermissionError`. The ownership bootstrap catches it on both paths on
+    exactly that basis.
+
+    Not swallowed HERE deliberately: answering the empty set for a mount that
+    cannot be read would turn an infrastructure fault into "no such service" at
+    the caller that filters on a name — a typo message for a broken volume.
+    """
+    if not state_dir.is_dir():
+        return frozenset()
+    return frozenset(
+        d.name
+        for d in state_dir.iterdir()
+        if d.is_dir() and not d.name.startswith("_") and (d / "proposals").is_dir()
+    )
+
+
 def _discover_refs(
     state_dir: Path,
     service_filter: str | None = None,
@@ -1018,8 +1136,14 @@ def _discover_refs(
         raise SystemExit(f"State dir not found: {state_dir}")
 
     refs: list[ProposalRef] = []
+    # THE one definition of "this checkout contains this service", shared with
+    # whatever validates a --service argument. Iterated rather than re-tested
+    # inline so the two cannot drift: a filter that admits a name this loop
+    # would skip produces "discovered no proposals at all", which reads as a
+    # mis-mounted volume rather than as an argument the loop never accepts.
+    services = discover_services(state_dir)
     for service_dir in sorted(state_dir.iterdir()):
-        if not service_dir.is_dir() or service_dir.name.startswith("_"):
+        if service_dir.name not in services:
             continue
         service = service_dir.name
         # Scope the force_fix_only override to the targeted service: when a
@@ -1035,11 +1159,13 @@ def _discover_refs(
             # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
             # but log it (only for real targets with a proposals/ dir) so an
             # operator isn't confused about why its proposals never appear.
-            if (service_dir / "proposals").is_dir():
-                print(
-                    f"shepherd: skipping {service} "
-                    "(SHEPHERD_SKIP_SERVICES; owned by another PR lifecycle)"
-                )
+            # No `proposals/` check here any more: `discover_services` already
+            # required one, which is what made this notice about "real targets"
+            # rather than every directory in the checkout.
+            print(
+                f"shepherd: skipping {service} "
+                "(SHEPHERD_SKIP_SERVICES; owned by another PR lifecycle)"
+            )
             continue
         if service_filter and service != service_filter:
             continue
