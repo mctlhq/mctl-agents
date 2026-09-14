@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -105,6 +106,15 @@ class Plan:
     proposal_ref: str = ""
     policy_ref: str = ""
     temporal_workflow_id: str = ""
+    #: AMBIGUOUS for lack of an ANSWER rather than because of one.
+    #:
+    #: Both rung 2 and rung 4 report ambiguous and they mean opposite things.
+    #: Rung 4 -- no live DevLoop, and the owner that would take it has no
+    #: writer yet -- is the ordinary outcome for most of the fleet, and a run
+    #: made entirely of it wrote nothing because there was nothing to write.
+    #: Rung 2 is the probe having failed to speak, and that is the one an
+    #: operator has to see.
+    undetermined: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -115,6 +125,7 @@ class Plan:
             "owner_type": self.owner_type,
             "owner_id": self.owner_id,
             "reason": self.reason,
+            "undetermined": self.undetermined,
             # The three provenance fields apply_report actually writes. The
             # dry run is the deliverable and an operator reads it "against the
             # store and live Temporal" — which needs policy_ref, the provenance
@@ -196,25 +207,27 @@ def plan_for(
     *,
     repo: str,
 ) -> Plan:
-    """The import ladder for one entity.
+    """The import ladder for one entity. Four rungs, in this order:
 
-    Order matters and each rung is a different question:
+      1. the store already holds it -- ALREADY_OWNED. Nothing to do, and this
+         is what makes a re-run write nothing;
+      2. the probe could not answer -- AMBIGUOUS, `undetermined`. An absence,
+         not an answer;
+      3. a live DevLoopWorkflow drives it -- DEVLOOP. The workflow is the
+         owner, and recording anything else would name a holder that is not
+         the one actually pushing;
+      4. anything else -- AMBIGUOUS, and NOT undetermined. This is a real
+         answer: no live DevLoop drives the entity, and the owner that would
+         is one with no lifecycle writer yet. Left unowned on purpose.
 
-      1. the store already holds it -- nothing to do, and this is what makes a
-         re-run write nothing;
-      2. a live DevLoopWorkflow drives it -- the workflow is the owner, and
-         recording anything else would name a holder that is not the one
-         actually pushing;
-      3. the service is skipped by the shepherd -- its PRs belong to another
-         lifecycle entirely (pr-steward today);
-      4. a proposal directory and a pull request -- the shepherd;
-      5. anything else is AMBIGUOUS and is left unowned.
+    Rungs 2 and 4 both produce AMBIGUOUS and mean opposite things, which is
+    why `Plan.undetermined` separates them: rung 4 is the ordinary outcome for
+    most of the fleet and a run made entirely of it is a success, while rung 2
+    is the store or the probe having failed to speak.
 
-    `legacy_answer` is the tri-state probe, not the bool: a probe that failed
-    must not be read as "no DevLoop is driving this", or rung 2 falls through
-    to rung 4 and the bootstrap hands the shepherd a pull request another
-    machine is pushing to -- manufacturing the exact condition the store exists
-    to prevent.
+    `legacy_answer` is the tri-state probe, not the bool. A probe that failed
+    must not be read as "no DevLoop is driving this": rung 2 exists precisely
+    so it cannot fall through to rung 4 and be counted as a measured absence.
     """
     from orchestrator.run_shepherd import LEGACY_OWNED, LEGACY_UNKNOWN
 
@@ -235,6 +248,7 @@ def plan_for(
 
     if legacy_answer == LEGACY_UNKNOWN:
         base.decision = DECISION_AMBIGUOUS
+        base.undetermined = True
         base.reason = "the DevLoop liveness probe could not answer; owner undetermined"
         return base
 
@@ -248,8 +262,14 @@ def plan_for(
         # `pr_org`, not `owner`: three other branches in this function bind
         # `owner` to an Owner, and one name holding two types works only while
         # the branches stay exclusive.
-        pr_org = repo.split("/", 1)[0]
-        if pr_org != DEVLOOP_WORKFLOW_OWNER:
+        # The WHOLE repo, not just the org. devloop_workflow_id builds
+        # `dev-loop-mctlhq-{service}-{N}` from the proposal's service directory,
+        # which is only the DevLoop's id while the service name and the repo
+        # name are the same string. A proposal under agents-state/mctl-web
+        # whose `pr:` points at mctlhq/something-else would otherwise be
+        # imported as an owner naming a workflow for a different repository.
+        expected_repo = f"{DEVLOOP_WORKFLOW_OWNER}/{ref.service}"
+        if repo != expected_repo:
             # devloop_workflow_id hardcodes the org, which is fail-open on the
             # probe -- a wrong owner just 404s into "not owned". On THIS path
             # the id becomes owner_id and temporal_workflow_id, so a wrong
@@ -258,8 +278,9 @@ def plan_for(
             # justification that holds only for the read.
             base.decision = DECISION_AMBIGUOUS
             base.reason = (
-                f"{repo} is not under {DEVLOOP_WORKFLOW_OWNER}; "
-                "the DevLoop workflow id would name another org's workflow"
+                f"the pull request is in {repo}, but this proposal's DevLoop id "
+                f"is built for {expected_repo}; importing it would name another "
+                "repository's workflow"
             )
             return base
         workflow_id = devloop_workflow_id(ref.service, ref.slug)
@@ -368,6 +389,24 @@ def probe_all(refs, probe) -> dict[int, str]:
     return answers
 
 
+#: A GitHub pull request URL, web or API form. _parse_pr_url walks four
+#: segments from the right and validates neither the host nor the route, so
+#: `.../issues/42` and `https://example.invalid/a/b/c/42` both parse cleanly
+#: into a pull-request entity id. On the READ side that was fail-open — the
+#: shepherd 404s and moves on. Here it would acquire a durable row against a
+#: real but unrelated entity, quietly in both directions.
+_PULL_REQUEST_URL = re.compile(
+    r"^https://(github\.com/[^/]+/[^/]+/pull"
+    r"|api\.github\.com/repos/[^/]+/[^/]+/pulls)/[0-9]+/?$"
+)
+
+
+def _require_pull_request_url(pr_url: str) -> None:
+    """Raise unless `pr_url` names a GitHub pull request."""
+    if not _PULL_REQUEST_URL.match(pr_url.strip()):
+        raise ValueError(f"not a GitHub pull request URL: {pr_url!r}")
+
+
 def _answers_in_order(answers: dict[int, str], count: int) -> list[str]:
     """probe_all's index-keyed answers as a dense list.
 
@@ -396,6 +435,7 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
 
     for ref in refs:
         try:
+            _require_pull_request_url(ref.pr_url or "")
             owner_name, repo_name, number = _parse_pr_url(ref.pr_url or "")
         except Exception as exc:  # noqa: BLE001 — an unreadable URL is not a crash
             report.ambiguous.append(
@@ -403,6 +443,9 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
                     service=ref.service,
                     slug=ref.slug,
                     decision=DECISION_AMBIGUOUS,
+                    # Undetermined: the entity could not be identified, which
+                    # is an absence of an answer rather than one.
+                    undetermined=True,
                     reason=f"no pull request entity id: {exc}",
                 )
             )
@@ -624,21 +667,33 @@ def main(argv: list[str] | None = None) -> int:
     _print_report(report)
     if report.aborted or report.failed:
         return 1
-    # A run that classified nothing, or an --apply that wrote nothing, must not
-    # look like a successful import.
-    #
-    # The likeliest way to import nothing is SILENT: with MCTL_TOKEN unset the
-    # probe answers LEGACY_UNKNOWN for every ref and prints nothing at all
-    # ("never asked"), so every plan is ambiguous, `planned` is empty, `failed`
-    # is empty, and the Argo step goes green having done nothing. A checkout
-    # mounted one level off reads the same.
+    # Discovering NOTHING is not a successful import: a checkout mounted one
+    # level off, or a state dir with no proposals in an actionable status,
+    # reads exactly like a clean run.
     if not report.planned and not report.ambiguous:
         print("lifecycle-bootstrap: discovered no proposals at all", file=sys.stderr)
         return 1
-    if args.apply and not report.planned:
+
+    # Writing nothing IS a success, and this is the correction the shepherd and
+    # pr-steward removal forces. Since only live-DevLoop entities are imported,
+    # "no live DevLoop anywhere right now" is the ordinary state of the fleet:
+    # every plan is ambiguous, nothing is written, and that is the right
+    # outcome rather than a failure.
+    #
+    # What must fail is an entity the run could not get an ANSWER about.
+    #
+    # An earlier version failed on `not report.planned` and justified it with
+    # "MCTL_TOKEN unset makes the probe answer UNKNOWN silently". That was
+    # wrong twice: the criterion condemned the ordinary case, and the scenario
+    # cannot happen -- the store read uses the same token, OwnershipClient
+    # raises OwnershipUnavailable without one, every id reads UNKNOWN, and the
+    # run ABORTS above with nothing written. The loud path was always the loud
+    # path.
+    undetermined = [p for p in report.ambiguous if p.undetermined]
+    if undetermined:
         print(
-            f"lifecycle-bootstrap: --apply had nothing to write; "
-            f"{len(report.ambiguous)} entit(ies) were ambiguous",
+            f"lifecycle-bootstrap: {len(undetermined)} entit(ies) could not be "
+            f"determined (first: {undetermined[0].entity_id or undetermined[0].slug})",
             file=sys.stderr,
         )
         return 1

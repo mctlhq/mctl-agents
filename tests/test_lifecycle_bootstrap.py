@@ -414,21 +414,32 @@ def test_the_devloop_row_carries_the_workflow_id(tmp_path, monkeypatch, capsys) 
 
 
 def test_an_unanswered_probe_becomes_ambiguous_not_a_decision(monkeypatch) -> None:
-    """A ref the probe's budget did not answer must not become a decision."""
+    """A ref the probe's budget did not answer must not become a decision.
+
+    The fast probe signals an Event the slow one waits on, so the ordering is
+    pinned by synchronisation rather than by a 200ms wall clock -- on a loaded
+    runner thread-pool startup can lose that race, and the failure would read
+    as a regression in probe_all rather than as scheduling noise.
+    """
     import threading
 
+    fast_done = threading.Event()
     release = threading.Event()
 
-    def slow(service, slug):
+    def probe(service, slug):
         if slug == "issue-7-fast":
+            fast_done.set()
             return LEGACY_FREE
+        # Not scheduled until the fast one has answered, and then held past
+        # the budget.
+        fast_done.wait(timeout=5)
         release.wait(timeout=5)
         return LEGACY_OWNED
 
-    monkeypatch.setattr("orchestrator.run_shepherd.DEV_LOOP_LIVENESS_BUDGET_S", 0.2)
+    monkeypatch.setattr("orchestrator.run_shepherd.DEV_LOOP_LIVENESS_BUDGET_S", 0.5)
     refs = [_ref(slug="issue-7-fast", number=1), _ref(slug="issue-8-slow", number=2)]
     try:
-        answers = bootstrap.probe_all(refs, slow)
+        answers = bootstrap.probe_all(refs, probe)
     finally:
         release.set()
     assert answers.get(0) == LEGACY_FREE
@@ -730,11 +741,12 @@ def test_an_apply_at_enforce_is_refused(tmp_path, monkeypatch, capsys) -> None:
     assert "expected 'observe'" in capsys.readouterr().err
 
 
-def test_a_silent_no_op_apply_fails(tmp_path, monkeypatch, capsys) -> None:
-    """The likeliest way to import nothing is silent: with MCTL_TOKEN unset the
-    probe answers LEGACY_UNKNOWN for every ref and prints nothing at all. Every
-    plan is ambiguous, nothing is written, and the Argo step would have gone
-    green having done nothing."""
+def test_an_undetermined_entity_fails_the_run(tmp_path, monkeypatch, capsys) -> None:
+    """An entity the run could not get an ANSWER about is the failure.
+
+    Not "nothing was written" — since only live-DevLoop entities are imported,
+    writing nothing is the ordinary state of the fleet.
+    """
     from orchestrator import run_shepherd
 
     _writes_allowed(monkeypatch)
@@ -743,7 +755,58 @@ def test_a_silent_no_op_apply_fails(tmp_path, monkeypatch, capsys) -> None:
     _install_client(monkeypatch, _Client())
 
     assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
-    assert "nothing to write" in capsys.readouterr().err
+    assert "could not be determined" in capsys.readouterr().err
+
+
+def test_an_apply_with_nothing_to_write_succeeds(tmp_path, monkeypatch, capsys) -> None:
+    """The correction the shepherd/pr-steward removal forces.
+
+    Only live-DevLoop entities are imported, so "no live DevLoop anywhere right
+    now" is the ordinary state of the fleet: every plan is ambiguous, nothing
+    is written, and that is the right outcome. The earlier criterion
+    (`not report.planned` -> exit 1) condemned exactly this case.
+    """
+    from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    client = _Client()
+    _install_client(monkeypatch, client)
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 0
+    assert client.acquires == []
+    report = _report_of(capsys.readouterr().out)
+    assert report["counts"]["ambiguous"] == 1
+    # The two ambiguity causes are distinguishable on the wire, which is what
+    # makes the exit code above defensible.
+    assert report["ambiguous"][0]["undetermined"] is False
+
+
+def test_a_missing_token_aborts_rather_than_looking_empty(tmp_path, monkeypatch, capsys) -> None:
+    """The scenario an earlier comment here claimed was silent.
+
+    It is not: the store read uses the same token, OwnershipClient raises
+    without one, every id reads UNKNOWN, and the run aborts with nothing
+    written. The loud path was always the loud path.
+    """
+    from orchestrator import run_shepherd
+
+    _writes_allowed(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+
+    class _NoToken:
+        def get_many(self, kind, phase, ids, asking=None):
+            return {i: OwnershipAnswer(verdict=UNKNOWN, reason="MCTL_TOKEN is not set") for i in ids}
+
+        def acquire(self, *a, **kw):
+            raise AssertionError("acquired despite an aborted read")
+
+    _install_client(monkeypatch, _NoToken())
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    err = capsys.readouterr().err
+    assert "ABORTED" in err
 
 
 def test_discovering_no_proposals_is_not_success(tmp_path, monkeypatch, capsys) -> None:
@@ -779,3 +842,53 @@ def test_the_summary_separates_already_owned_from_work(tmp_path, monkeypatch, ca
     bootstrap.main(["--state-dir", str(root), "--apply"])
     err = capsys.readouterr().err
     assert "0 to write, 1 already owned" in err
+
+
+def test_a_pr_url_that_is_not_a_pull_request_is_rejected() -> None:
+    """_parse_pr_url walks four segments from the right and validates neither
+    the host nor the route, so `.../issues/42` parses cleanly into the entity
+    id of pull request 42 — a different thing entirely.
+
+    On the read side that was fail-open: the shepherd 404s and moves on. Here
+    it would acquire a durable row against a real but unrelated entity.
+    """
+    for bad in (
+        "https://github.com/mctlhq/mctl-web/issues/42",
+        "https://example.invalid/a/b/c/42",
+        "https://github.com/mctlhq/mctl-web/pull/notanumber",
+    ):
+        ref = _ref()
+        ref.pr_url = bad
+        report = bootstrap.build_report([ref], _Client(), _probe(LEGACY_OWNED))
+        assert report.planned == [], bad
+        assert report.ambiguous[0].undetermined is True
+        assert "pull request" in report.ambiguous[0].reason
+
+    for good in (
+        "https://github.com/mctlhq/mctl-web/pull/42",
+        "https://api.github.com/repos/mctlhq/mctl-web/pulls/42",
+    ):
+        ref = _ref()
+        ref.pr_url = good
+        report = bootstrap.build_report([ref], _Client(), _probe(LEGACY_OWNED))
+        assert [p.entity_id for p in report.planned] == ["mctlhq/mctl-web#42"], good
+
+
+def test_the_whole_repo_must_match_the_service() -> None:
+    """devloop_workflow_id builds `dev-loop-mctlhq-{service}-{N}` from the
+    proposal's directory, which is the DevLoop's id only while the service name
+    and the repo name are the same string. Checking the org alone let a
+    proposal under agents-state/mctl-web whose `pr:` points at
+    mctlhq/something-else be imported as an owner naming another repository's
+    workflow.
+    """
+    plan = bootstrap.plan_for(
+        _ref(service="mctl-web"),
+        "mctlhq/something-else#42",
+        OwnershipAnswer(verdict=UNOWNED),
+        LEGACY_OWNED,
+        repo="mctlhq/something-else",
+    )
+    assert plan.decision == bootstrap.DECISION_AMBIGUOUS
+    assert plan.owner_id == ""
+    assert "mctlhq/mctl-web" in plan.reason
