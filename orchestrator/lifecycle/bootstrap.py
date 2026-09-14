@@ -1280,10 +1280,11 @@ def main(argv: list[str] | None = None) -> int:
         #     mistyped, so it falls through to "discovered no proposals at
         #     all", which exits 1 WITH a report;
         #   - the state dir is missing or unreadable -> an infrastructure
-        #     fault, not an argument error. Both are answered ABOVE this block
-        #     and above the --apply refusal, so one broken mount reads the same
-        #     way whichever flags the run carried; the walk's own guard below
-        #     catches what happens after this instant.
+        #     fault, not an argument error. Missing is answered above this
+        #     block; unreadable AT THE ROOT by the arm just below, because that
+        #     is the read this check itself makes; and unreadable at any
+        #     greater depth by the walk's own guard, which is the only thing
+        #     that can see it.
         #
         # The distinction is which red an operator can act on, and it is why
         # this refusal prints a report rather than calling `parser.error`:
@@ -1318,87 +1319,26 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    from orchestrator import run_shepherd
-    from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
+    # THE REFUSAL FIRST, because it is DETERMINISTIC and needs nothing.
+    #
+    # There is no `acquire` in this module, so the answer does not depend on
+    # anything discovery learns -- and discovery is the opposite of cheap:
+    # `_discover_refs` shells `gh pr list` for every proposal with no `pr:`,
+    # serially, gated on `reconcile` rather than on `dry_run`, so a dry run
+    # suppresses the `.status.yaml` rewrite and not the subprocess. Behind it,
+    # the production invocation (`dry_run=false` -> `--apply`) walked the whole
+    # fleet and spent GitHub quota per PR-less proposal before printing one
+    # sentence of refusal.
+    #
+    # It sat behind discovery for one commit, to make `an infrastructure fault
+    # outranks a policy refusal` true at every depth. The depth gap is closed
+    # by the WALK'S OWN GUARD, which is where it belongs and where it stays;
+    # the refusal's position was never what closed it. What moving the refusal
+    # bought was that a REFUSED run also learns about a broken mount -- and a
+    # refused run does nothing, so its complete and correct answer is `this
+    # flag does nothing in this build`. The mount is reported by the re-run
+    # the refusal asks for.
 
-    # dry_run=True ALWAYS, including under --apply. _discover_refs rewrites
-    # .status.yaml when it finds a PR by branch — flipping in-progress to
-    # implemented — and this tool writes ownership rows, never gitops files. A
-    # "dry run" that edited the checkout before the store was even read would
-    # contradict every other guarantee here, the `aborted` path's "nothing was
-    # written" included.
-    #
-    # fix_only=True, and it is NOT about fix-only mode. It is the lever that
-    # short-circuits _service_mode before SHEPHERD_SKIP_SERVICES is read, which
-    # is what makes this import INDEPENDENT of the bootstrap pod's environment.
-    #
-    # It was briefly removed, on the premise that a skipped service can only
-    # land in rung 4 and so only pads counts.total. That premise is false: a
-    # DevLoopWorkflow is started per ISSUE and knows nothing about
-    # SHEPHERD_SKIP_SERVICES, so a skipped service can perfectly well have a
-    # live DevLoop driving one of its pull requests — exactly the entity this
-    # import exists to record.
-    #
-    # Removing it failed quietly in both directions. Unset here (the default,
-    # and the WorkflowTemplate was written against a caller that did not read
-    # this variable) nothing resolves to SKIP and the removal is a production
-    # no-op with no signal that it did not take effect. Set wider than the
-    # shepherd's, a service the sweep DOES compare is dropped at discovery: its
-    # live-DevLoop entities are never probed, never planned, never reported —
-    # and the store keeps no owner for an entity a DevLoop drives, which is
-    # store-permits-old-forbids left in place by a run that exits 0 with a
-    # clean report.
-    #
-    # The skip set is recorded in the report either way. It is load-bearing
-    # input read from this process's environment, the same shape of problem as
-    # the rollout mode, and it gets the same treatment.
-    #
-    # ONE name for the flag and the field that reports it. Written twice --
-    # `True` in the call and `True` again on the report -- the field could only
-    # ever say `true`, including on a build where the call had changed and the
-    # claim had become false. A report field that cannot contradict the code it
-    # describes documents an intention rather than a run.
-    discovery_ignores_skip_set = True
-    # GUARDED, and this is where the invariant lives for EVERY caller: a
-    # `--service` run, a fleet-wide one, and every depth of the walk. Anything
-    # earlier is a snapshot, and a snapshot cannot answer for the read that
-    # follows it.
-    #
-    # What raises out of the walk is the two listings —
-    # `sorted(state_dir.iterdir())` and `sorted(proposals_dir.iterdir())`. The
-    # per-file `.status.yaml` read does NOT: `_discover_refs` wraps that in its
-    # own `except Exception` and warns-and-skips, deliberately, so one
-    # malformed file anywhere in the fleet does not abort the run. Saying
-    # otherwise here would invite a later reader to delete that narrower
-    # handler as redundant with this one, which is the behaviour its `noqa`
-    # comment exists to prevent.
-    #
-    # `SystemExit` alongside `OSError`, because that is how `_discover_refs`
-    # reports a missing state dir: a message rather than a report.
-    #
-    # The domain is wider than the walk and the message says so — this also
-    # catches `gh` missing from PATH (a `FileNotFoundError`, hence an
-    # `OSError`) from the `pr:`-less branch lookup, and attributing that to the
-    # state dir alone would mislead on the one field an Argo step reads as its
-    # output parameter.
-    try:
-        refs = _discover_refs(
-            args.state_dir,
-            service_filter=args.service,
-            slug_filter=args.slug,
-            dry_run=True,
-            fix_only=discovery_ignores_skip_set,
-        )
-    except (OSError, SystemExit) as exc:
-        _print_report(
-            Report(
-                aborted=(
-                    f"discovery failed while walking {args.state_dir} "
-                    f"(or running a tool it needs): {exc}"
-                )
-            )
-        )
-        return 1
     # POLICY REFUSALS COME AFTER DISCOVERY, and that ordering is the point.
     #
     # "There is no readable checkout" outranks "this build does not write":
@@ -1419,7 +1359,6 @@ def main(argv: list[str] | None = None) -> int:
     # nothing -- `dry_run=True` unconditionally -- so nothing is risked by
     # doing it first; what it costs is that a wrong mode is reported after the
     # walk instead of before it.
-
     # Read ONCE. `rollout.mode()` maps an unrecognised value to OFF and warns
     # as a side effect, so evaluating it four times in the refusal both printed
     # the warning four times -- onto the report's own stdout channel -- and
@@ -1528,6 +1467,87 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    from orchestrator import run_shepherd
+    from orchestrator.run_shepherd import _dev_loop_owns_answer, _discover_refs
+
+    # dry_run=True ALWAYS, including under --apply. _discover_refs rewrites
+    # .status.yaml when it finds a PR by branch — flipping in-progress to
+    # implemented — and this tool writes ownership rows, never gitops files. A
+    # "dry run" that edited the checkout before the store was even read would
+    # contradict every other guarantee here, the `aborted` path's "nothing was
+    # written" included.
+    #
+    # fix_only=True, and it is NOT about fix-only mode. It is the lever that
+    # short-circuits _service_mode before SHEPHERD_SKIP_SERVICES is read, which
+    # is what makes this import INDEPENDENT of the bootstrap pod's environment.
+    #
+    # It was briefly removed, on the premise that a skipped service can only
+    # land in rung 4 and so only pads counts.total. That premise is false: a
+    # DevLoopWorkflow is started per ISSUE and knows nothing about
+    # SHEPHERD_SKIP_SERVICES, so a skipped service can perfectly well have a
+    # live DevLoop driving one of its pull requests — exactly the entity this
+    # import exists to record.
+    #
+    # Removing it failed quietly in both directions. Unset here (the default,
+    # and the WorkflowTemplate was written against a caller that did not read
+    # this variable) nothing resolves to SKIP and the removal is a production
+    # no-op with no signal that it did not take effect. Set wider than the
+    # shepherd's, a service the sweep DOES compare is dropped at discovery: its
+    # live-DevLoop entities are never probed, never planned, never reported —
+    # and the store keeps no owner for an entity a DevLoop drives, which is
+    # store-permits-old-forbids left in place by a run that exits 0 with a
+    # clean report.
+    #
+    # The skip set is recorded in the report either way. It is load-bearing
+    # input read from this process's environment, the same shape of problem as
+    # the rollout mode, and it gets the same treatment.
+    #
+    # ONE name for the flag and the field that reports it. Written twice --
+    # `True` in the call and `True` again on the report -- the field could only
+    # ever say `true`, including on a build where the call had changed and the
+    # claim had become false. A report field that cannot contradict the code it
+    # describes documents an intention rather than a run.
+    discovery_ignores_skip_set = True
+    # GUARDED, and this is where the invariant lives for EVERY caller: a
+    # `--service` run, a fleet-wide one, and every depth of the walk. Anything
+    # earlier is a snapshot, and a snapshot cannot answer for the read that
+    # follows it.
+    #
+    # What raises out of the walk is the two listings —
+    # `sorted(state_dir.iterdir())` and `sorted(proposals_dir.iterdir())`. The
+    # per-file `.status.yaml` read does NOT: `_discover_refs` wraps that in its
+    # own `except Exception` and warns-and-skips, deliberately, so one
+    # malformed file anywhere in the fleet does not abort the run. Saying
+    # otherwise here would invite a later reader to delete that narrower
+    # handler as redundant with this one, which is the behaviour its `noqa`
+    # comment exists to prevent.
+    #
+    # `SystemExit` alongside `OSError`, because that is how `_discover_refs`
+    # reports a missing state dir: a message rather than a report.
+    #
+    # The domain is wider than the walk and the message says so — this also
+    # catches `gh` missing from PATH (a `FileNotFoundError`, hence an
+    # `OSError`) from the `pr:`-less branch lookup, and attributing that to the
+    # state dir alone would mislead on the one field an Argo step reads as its
+    # output parameter.
+    try:
+        refs = _discover_refs(
+            args.state_dir,
+            service_filter=args.service,
+            slug_filter=args.slug,
+            dry_run=True,
+            fix_only=discovery_ignores_skip_set,
+        )
+    except (OSError, SystemExit) as exc:
+        _print_report(
+            Report(
+                aborted=(
+                    f"discovery failed while walking {args.state_dir} "
+                    f"(or running a tool it needs): {exc}"
+                )
+            )
+        )
+        return 1
     client = OwnershipClient()
     report = build_report(refs, client, _dev_loop_owns_answer)
     report.rollout_mode = configured

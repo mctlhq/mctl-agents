@@ -932,35 +932,54 @@ def test_a_mount_lost_during_discovery_reports(tmp_path, capsys) -> None:
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
-@pytest.mark.parametrize("extra", [[], ["--apply"], ["--apply", "--service", "mctl-web"]])
-def test_an_unreadable_state_dir_reports_the_same_way_whatever_the_flags(
-    tmp_path, capsys, extra
-) -> None:
-    """One broken mount, one answer.
+@pytest.mark.parametrize("extra", [[], ["--service", "mctl-web"]])
+def test_a_run_that_proceeds_reports_a_fault_at_any_depth(tmp_path, capsys, extra) -> None:
+    """The invariant, stated as what it actually is.
 
-    The readability check sits above the `--apply` refusal precisely so this
-    holds. With it inside the `--service` branch, the same `--x` mount reported
-    itself under `--apply --service X` and, one flag over, hit the refusal
-    first — telling an operator the build does not write and to re-run without
-    the flag, with nothing about the mount at all. Same fault, same consumer,
-    two verdicts.
+    A run that gets past the refusals reports an infrastructure fault wherever
+    in the walk it happens — including one directory down, where
+    `discover_services` admits a service on a `stat` of its `proposals/` and
+    only the walk's own guard can see. That guard is what closes the depth gap,
+    and it is why the earlier root-only test could not.
+
+    NOT "one mount, one answer whatever the flags". That claim was broader than
+    the code and broader than it should be: `--apply` in this build is refused
+    unconditionally, and its refusal is a complete answer to what was asked —
+    the flag does nothing here. The mount is reported by the re-run the refusal
+    asks for, and putting the refusal behind discovery to avoid that cost the
+    production invocation a full fleet walk, with a `gh pr list` per PR-less
+    proposal, before printing one sentence.
     """
     root = tmp_path / "agents-state"
     proposals = root / "mctl-web" / "proposals"
     proposals.mkdir(parents=True)
-    # ONE DIRECTORY DOWN, which is where the previous version of this test
-    # could not see. `discover_services` admits a service on a `stat` of its
-    # `proposals/`, so a root-level chmod was answered by the cheap probe while
-    # this depth reached the refusal first -- the same permission bit answering
-    # `--apply` and a fleet-wide run differently.
     proposals.chmod(0o111)
     try:
         assert bootstrap.main(["--state-dir", str(root), *extra]) == 1
         report = _report_of(capsys.readouterr().out)
         assert "discovery failed" in report["aborted"], extra
-        assert "refused --apply" not in report["aborted"], extra
     finally:
         proposals.chmod(0o755)
+
+
+def test_the_refusal_does_not_wait_for_the_walk(tmp_path, monkeypatch, capsys) -> None:
+    """`--apply` answers without reading the checkout.
+
+    The refusal is deterministic — there is no writer in this build, so nothing
+    discovery learns can change it — while discovery shells `gh pr list` per
+    PR-less proposal, serially and unbudgeted. Behind it, the production
+    invocation walked the whole fleet before printing one sentence.
+    """
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+
+    def _explode(*a, **kw):
+        raise AssertionError("discovery ran before the refusal")
+
+    monkeypatch.setattr(run_shepherd, "_discover_refs", _explode)
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 2
+    assert "refused --apply" in _report_of(capsys.readouterr().out)["aborted"]
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="uid 0 bypasses directory read permission")
