@@ -22,6 +22,31 @@ KNOWN LIMITS, written down rather than left to be rediscovered:
   the hazard is the Temporal worker's. Setting the variable here with the
   worker still off passes the gate. The mode is echoed into the report so what
   was claimed sits next to what it licensed.
+- **The probe cannot see the second patch marker, and this is a BLOCKER for
+  ``--apply``, not a caveat.** ``LEGACY_OWNED`` means ``shepherd_in_loop is
+  True``, i.e. ``workflow.patched("shepherd-in-loop")`` plus the pinned-image
+  check. But ``dev_loop.py`` gates every ownership call on ``shepherd_in_loop
+  AND workflow.patched("lifecycle-ownership")`` — a SECOND, independent marker.
+  An execution recorded between the two replays the second as False forever:
+  it answers ``shepherd_in_loop=True`` to the probe, rung 3 plans a
+  ``devloop-workflow`` row, and ``_ownership()`` is never called for it. No
+  acquire, no heartbeat, no release — the orphan the rollout gate exists to
+  prevent, reached through the probe instead of the mode.
+
+  It is NOT the gap the bullet above describes. That one is operator-fixable:
+  flip the worker and it closes. A patch marker is per-execution history and
+  permanent for the life of that execution, and the cohort is largest exactly
+  when a pre-soak migration runs, against watches that stay Running up to
+  ``MERGE_WATCH_DEADLINE``.
+
+  The probe cannot distinguish it today: ``/api/v1/agents/dev-loop/{id}``
+  returns ``status``, ``shepherd_in_loop`` and ``shepherd_in_loop_known``, and
+  neither the ``lifecycle_claim`` query (``dev_loop.py``, the reader that
+  answers this directly) nor the execution's start time is exposed. So the fix
+  is an mctl-api field, and ``--apply`` must not run at fleet scale before it
+  exists. Until then the only sound posture is a dry run, or an apply scoped
+  with ``--service``/``--slug`` to entities an operator has checked in Temporal
+  by hand.
 - **Only DevLoop rows are imported.** The shepherd and pr-steward rungs were
   here and are gone: ``shadow.classify`` has one owner-type arm, so importing
   those rows turns an *agreeing* entity into ``store-forbids-old-permits``
@@ -294,13 +319,14 @@ class Report:
                 "discovery_ignored_skip_set": self.discovery_ignored_skip_set,
                 "applied": self.applied,
                 "counts": None,
-                "planned": [],
-                # THE FIELDS, not literals. Empty today -- `main` gates the
-                # write on `not report.aborted` -- but hardcoding them makes
-                # these the only two fields on this path that cannot contradict
-                # the code, which is precisely what a report is for. If a
-                # future path ever writes before aborting, the report must be
-                # able to say so rather than being incapable of it.
+                # THE FIELD, for the same reason as the two below it: empty
+                # today because build_report returns before the plan loop, but
+                # a literal here is a field that cannot contradict the code.
+                "planned": [p.as_dict() for p in self.planned],
+                # Likewise. Empty today -- `main` gates the write on `not
+                # report.aborted` -- but if a future path ever writes before
+                # aborting, the report must be able to say so rather than
+                # being structurally incapable of it.
                 "ambiguous": [p.as_dict() for p in self.ambiguous],
                 "written": self.written,
                 "failed": self.failed,
@@ -961,7 +987,8 @@ def _print_report(report: Report) -> None:
     """
     print(f"{REPORT_MARKER} {json.dumps(report.as_dict())}", flush=True)
     if report.aborted:
-        print(f"lifecycle-bootstrap: ABORTED: {report.aborted}", file=sys.stderr)
+        posture = "applied" if report.applied else "dry run"
+        print(f"lifecycle-bootstrap [{posture}]: ABORTED: {report.aborted}", file=sys.stderr)
         return
     # `already-owned` counted apart from the work. Both live in `planned` and
     # apply_report skips the first, so the idempotent second run -- the one
@@ -975,8 +1002,13 @@ def _print_report(report: Report) -> None:
     # here and never written -- a summary promising rows that cannot arrive.
     already = sum(1 for p in report.planned if p.decision == DECISION_ALREADY_OWNED)
     writable = sum(1 for p in report.planned if p.decision == DECISION_DEVLOOP)
+    # The posture on this channel too. It is the one the docstring says exists
+    # to answer "did this work" from a log tail without parsing anything, and
+    # without it a dry run and an apply that wrote nothing read identically
+    # there -- which is the exact case `applied` was added to the JSON for.
+    posture = "applied" if report.applied else "dry run"
     print(
-        f"lifecycle-bootstrap: {writable} to write, "
+        f"lifecycle-bootstrap [{posture}]: {writable} to write, "
         f"{already} already owned, {len(report.ambiguous)} ambiguous, "
         f"{len(report.written)} written, {len(report.failed)} failed",
         file=sys.stderr,

@@ -1908,6 +1908,43 @@ def test_to_write_counts_what_a_write_would_attempt(capsys) -> None:
     assert "1 already owned" in err
 
 
+def test_the_stderr_summary_carries_the_posture_too(tmp_path, monkeypatch, capsys) -> None:
+    """stderr is the channel whose docstring says it exists to answer "did this
+    work" from a log tail without parsing anything. Without the posture there,
+    a dry run and an apply that wrote nothing read identically on it -- the
+    exact case `applied` was added to the JSON for, on the channel an operator
+    actually tails."""
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_FREE)
+    _install_client(monkeypatch, _Client())
+
+    bootstrap.main(["--state-dir", str(root)])
+    assert "[dry run]" in capsys.readouterr().err
+
+    bootstrap.main(["--state-dir", str(root), "--apply"])
+    assert "[applied]" in capsys.readouterr().err
+
+
+def test_the_abort_summary_carries_the_posture(tmp_path, monkeypatch, capsys) -> None:
+    """The abort is the path where "was this a dry run?" is least recoverable
+    from the outcome, so it is the one that most needs saying."""
+    from orchestrator import run_shepherd
+
+    _observe_env(monkeypatch)
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda s, sl: LEGACY_OWNED)
+    _install_client(
+        monkeypatch, _Client({"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNKNOWN)})
+    )
+
+    assert bootstrap.main(["--state-dir", str(root), "--apply"]) == 1
+    err = capsys.readouterr().err
+    assert "[applied]" in err and "ABORTED" in err
+
+
 def test_the_report_records_whether_it_was_asked_to_write(tmp_path, monkeypatch, capsys) -> None:
     """A dry run and an apply that wrote nothing are otherwise identical.
 
