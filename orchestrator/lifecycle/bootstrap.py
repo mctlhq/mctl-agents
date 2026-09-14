@@ -287,6 +287,32 @@ class Report:
         }
 
 
+def _rung_one_answers(answer: OwnershipAnswer, held: bool | None) -> bool:
+    """Whether rung 1 returns for this entity, so the probe buys nothing.
+
+    THE predicate, called by `plan_for` to take rung 1 and by `build_report` to
+    choose the probe set. Two expressions that agree today is what this has
+    gone wrong as, twice: first the probe set keyed on the verdict while rung 1
+    keyed on `held`, so a dead `active` row was never probed; then it keyed on
+    `held` alone while rung 1 keyed on the verdict AND `held`, so a record in a
+    FREE state whose `derived.held` is absent -- UNOWNED with held None, which
+    `shadow.held` returns for a released or terminal row like any other -- was
+    dropped from the probe set by a rung that then declined to answer for it.
+
+    Both times the entity landed on rung 2: undetermined, and `retryable`
+    asserting that a re-run might answer differently about a probe that was
+    never attempted.
+
+    `held is not False`, so the budget saving survives: rung 1 answers for a
+    held record (already-owned) AND for a holding verdict whose held-ness the
+    server did not report (undetermined, permanent). Neither reads the legacy
+    answer, so neither is worth an HTTP call -- which matters most against an
+    mctl-api predating the `derived` block, where that is every entity and the
+    run should fail fast rather than burn PROBE_BUDGET_S first.
+    """
+    return answer.verdict in (OWNED_BY_OTHER, OWNED_BY_ME) and held is not False
+
+
 def plan_for(
     ref,
     entity_id: str,
@@ -357,7 +383,7 @@ def plan_for(
         policy_ref=POLICY_REF,
     )
 
-    if answer.verdict in (OWNED_BY_OTHER, OWNED_BY_ME):
+    if _rung_one_answers(answer, held):
         # `held` is PASSED IN, evaluated once by build_report, rather than
         # computed here. Not tidiness: the first version of this fix keyed rung
         # 1 on `shadow.held` and left build_report selecting the probe set on
@@ -674,30 +700,25 @@ def build_report(refs, client: OwnershipClient, probe) -> Report:
     # Probed AFTER the store read, all at once, and ONLY for the entities whose
     # decision depends on the answer.
     #
-    # An entity the store already holds returns at rung 1 before the legacy
-    # answer is read, so probing it buys nothing — and the budget is shared
-    # wall-clock, not per-ref. On the idempotence path, where every entity is
-    # already-owned, the whole 60s would go to answers nobody reads; against a
-    # slow mctl-api those probes crowd out the undecided entities, which then
-    # fall to UNKNOWN and are reported ambiguous. Ambiguous means left UNOWNED,
+    # An entity rung 1 answers for returns before the legacy answer is read, so
+    # probing it buys nothing — and the budget is shared wall-clock, not
+    # per-ref. On the idempotence path, where every entity is already-owned,
+    # the whole PROBE_BUDGET_S would go to answers nobody reads; against a slow
+    # mctl-api those probes crowd out the undecided entities, which then fall
+    # to UNKNOWN and are reported ambiguous. Ambiguous means left UNOWNED,
     # which is precisely the store-permits-old-forbids class this tool exists
     # to remove.
     ordered = sorted(by_entity)
-    # ONE evaluation of "does the store withhold this entity", here, feeding
-    # both the probe set and rung 1. Keyed on the VERDICT this excluded a dead
-    # `active` row from the probe set -- it answers OWNED_BY_OTHER -- so the
-    # entity reached the ladder with LEGACY_UNKNOWN and stopped at rung 2,
-    # undetermined and wrongly `retryable`, with rung 3 unreachable for the one
-    # class this tool exists to remove.
-    #
-    # `is False`, not `is not True`: None is a record whose held-ness the
-    # server did not report, and rung 1 answers undetermined for it whatever
-    # the probe says. Probing it would spend the budget on entities already
-    # decided -- and against an mctl-api predating the `derived` block that is
-    # EVERY entity, turning a run that should fail fast into one that burns
-    # PROBE_BUDGET_S first.
+    # `held` evaluated ONCE per entity, and the probe set taken from THE SAME
+    # PREDICATE rung 1 takes -- not from a second expression that agrees with
+    # it. See `_rung_one_answers` for the two ways the second expression has
+    # already been wrong.
     held_by_entity = {entity_id: shadow.held(answers[entity_id]) for entity_id in ordered}
-    undecided = [entity_id for entity_id in ordered if held_by_entity[entity_id] is False]
+    undecided = [
+        entity_id
+        for entity_id in ordered
+        if not _rung_one_answers(answers[entity_id], held_by_entity[entity_id])
+    ]
     legacy_by_entity = dict(
         zip(
             undecided,

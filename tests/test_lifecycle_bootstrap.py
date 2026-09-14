@@ -313,6 +313,58 @@ def test_held_ness_is_asked_once_and_decides_both(monkeypatch) -> None:
     )
 
 
+def test_a_free_record_without_derived_held_is_still_probed() -> None:
+    """The branch the previous filter dropped.
+
+    `shadow.held` returns `ownership.held` whenever a record is present --
+    including for UNOWNED, which `answer_from` gives a released or terminal
+    row. So a FREE-state record whose `derived.held` is absent answers UNOWNED
+    with held None.
+
+    Keyed on `held is False` alone, that entity was excluded from the probe
+    set; and rung 1 declines to answer for it, because its guard also requires
+    a holding verdict. It therefore reached rung 2 as undetermined with
+    `retryable=True` for a probe that was never attempted -- the same defect
+    the dead-`active`-row fix closed, one branch over.
+
+    It must be PROBED, and then decided on the real answer: nothing holds a
+    released row, so a live DevLoop is importable.
+    """
+    probed = []
+
+    def probe(service, slug):
+        probed.append(slug)
+        return LEGACY_OWNED
+
+    released = _record(held=None, state="released", owner_id="")
+    client = _Client(
+        {"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNOWNED, ownership=released)}
+    )
+    report = bootstrap.build_report([_ref()], client, probe)
+
+    assert probed == ["issue-7-a-thing"], "a free record was dropped from the probe set"
+    assert [p.decision for p in report.planned] == [bootstrap.DECISION_DEVLOOP]
+    assert report.ambiguous == []
+
+
+def test_a_free_record_with_no_devloop_is_not_undetermined() -> None:
+    """The other half: probed, answered, and NOT red.
+
+    Without the probe this entity was undetermined and retryable, which makes
+    the run fail and tells the operator to re-run it. With it, the answer is
+    the ordinary rung 4: nothing drives this pull request.
+    """
+    released = _record(held=None, state="terminal", owner_id="")
+    client = _Client(
+        {"mctlhq/mctl-web#42": OwnershipAnswer(verdict=UNOWNED, ownership=released)}
+    )
+    report = bootstrap.build_report([_ref()], client, _probe(LEGACY_FREE))
+
+    assert report.planned == []
+    assert report.ambiguous[0].undetermined is False
+    assert report.ambiguous[0].retryable is False
+
+
 def test_a_record_the_server_cannot_report_held_for_is_not_probed(monkeypatch) -> None:
     """`is False`, not `is not True`, and the difference is the budget.
 
