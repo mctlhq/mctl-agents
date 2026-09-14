@@ -1302,6 +1302,46 @@ def test_the_whole_repo_must_match_the_service() -> None:
     assert plan.retryable is False
 
 
+@pytest.mark.parametrize(
+    "pr_url",
+    [
+        "https://github.com/mctlhq/mctl-web/pull/42",
+        # Miscased, which is the input that used to be argued about. GitHub
+        # treats owner and repo case-insensitively; the ownership store does
+        # not, since the id is an opaque string. Every component therefore has
+        # to build the SAME one, and the answer this repo has settled on is
+        # "the `pr:` field verbatim" -- `PRState.repo` is `pr_match.group(1)`,
+        # never re-read from the API's full_name (pr_state.py), DevLoop's
+        # acquire is `state.repo or ""` (dev_loop.py), and `entity_id_for_pr`
+        # is verbatim too.
+        "https://github.com/MCTLHQ/MCTL-Web/pull/42",
+        "https://api.github.com/repos/mctlhq/mctl-web/pulls/42",
+    ],
+)
+def test_this_module_and_the_shadow_compare_build_one_id(pr_url) -> None:
+    """The property canonicalising the id would have broken.
+
+    A row written under an id the shadow compare does not construct is
+    invisible to `compare_proposal_refs`: it reads no record and classifies
+    store-permits-old-forbids, dangerous — the class the module docstring opens
+    by naming as the thing to remove. And rung 1 would miss a row
+    DevLoopWorkflow already holds and plan a duplicate. Rung 1 is terminal, so
+    no re-run revisits either.
+
+    So the id is the `pr:` field verbatim, on both sides, and this pins the two
+    together rather than each against a literal.
+    """
+    from orchestrator.lifecycle import shadow as shadow_mod
+    from orchestrator.run_shepherd import _parse_pr_url
+
+    ref = _ref()
+    object.__setattr__(ref, "pr_url", pr_url)
+    report = bootstrap.build_report([ref], _Client(), _probe(LEGACY_FREE))
+
+    owner, repo, number = _parse_pr_url(pr_url)
+    assert report.ambiguous[0].entity_id == shadow_mod.entity_id_for_pr(owner, repo, int(number))
+
+
 def test_the_repo_check_is_case_insensitive() -> None:
     """GitHub treats owner and repository names case-insensitively, so a `pr:`
     spelled mctlhq/MCTL-Web names the same repository and must not be refused
