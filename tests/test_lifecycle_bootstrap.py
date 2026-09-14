@@ -817,8 +817,54 @@ def test_an_unknown_service_is_rejected_at_the_argument(tmp_path, capsys) -> Non
         bootstrap.main(["--state-dir", str(root), "--service", "mctl-wbe"])
     assert exc.value.code == 2
     err = capsys.readouterr().err
-    assert "no service directory 'mctl-wbe'" in err
+    assert "no service state dir 'mctl-wbe'" in err
     assert "found: mctl-web" in err
+
+
+def test_the_filter_and_the_discovery_share_one_definition(tmp_path, monkeypatch) -> None:
+    """A name the filter admits is a name discovery accepts, and vice versa.
+
+    Two answers to "is this a service" is how a --service the loop never
+    accepts reaches "discovered no proposals at all", which reads as a
+    mis-mounted volume rather than as an argument. And how a directory that is
+    not a service -- editor droppings, a stray archive -- reaches an id
+    builder, which is where the ValueError in `workflow_id_for` came from.
+
+    Asserted by MOVING the shared function: patching it moves both, so a second
+    definition on either side fails here while every value-level test stays
+    green.
+    """
+    from orchestrator import run_shepherd
+
+    root = _state_dir(tmp_path, "mctl-web", "issue-7-a-thing")
+    (root / "_scratch").mkdir()
+    (root / "notes.txt").write_text("not a service")
+    (root / "half-a-clone").mkdir()  # no proposals/ -- structurally not a service
+
+    assert run_shepherd.discover_services(root) == frozenset({"mctl-web"})
+
+    monkeypatch.setattr(run_shepherd, "discover_services", lambda d: frozenset())
+    with pytest.raises(SystemExit):
+        bootstrap.main(["--state-dir", str(root), "--service", "mctl-web"])
+
+
+def test_a_directory_that_is_not_a_service_is_not_one(tmp_path) -> None:
+    """Structural, not "everything that is not underscore-prefixed".
+
+    Replacing the SERVICES check with "any directory" re-opened the class that
+    produced the `workflow_id_for` ValueError: a checkout holds things that are
+    not services, and a name that is not a valid repository name must not reach
+    an id builder in the first place.
+    """
+    from orchestrator import run_shepherd
+
+    root = tmp_path / "agents-state"
+    (root / "mctl-web" / "proposals").mkdir(parents=True)
+    (root / "not a repo name").mkdir()
+    (root / "_archive" / "proposals").mkdir(parents=True)
+
+    assert run_shepherd.discover_services(root) == frozenset({"mctl-web"})
+    assert run_shepherd.discover_services(tmp_path / "absent") == frozenset()
 
 
 def test_a_service_outside_SERVICES_is_still_addressable(tmp_path, monkeypatch, capsys) -> None:

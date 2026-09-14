@@ -1051,6 +1051,38 @@ def update_status(
 # ---------------------------------------------------------------------------
 # Discovery
 # ---------------------------------------------------------------------------
+def discover_services(state_dir: Path) -> frozenset[str]:
+    """The services this checkout actually contains.
+
+    STRUCTURAL, not a name list: a directory under the state dir that does not
+    begin with `_` and contains a `proposals/` directory. That is the same
+    shape `_discover_refs` globs, which is the point — this is the ONE source
+    both it and any caller validating a `--service` argument read, so the
+    filter and the discovery cannot disagree about what a service is.
+
+    Not `config.settings.SERVICES`: a repository whose pull requests another
+    lifecycle drives has proposals here and no SERVICES entry
+    (`mctl-claude-remote`), and validating a flag against SERVICES makes it the
+    one service an operator cannot scope a run to.
+
+    Not "every directory" either. The state dir is a checkout, and a checkout
+    holds things that are not services — editor droppings, a stray archive, a
+    partially-cloned path. Treating those as services is how a directory name
+    that is not a valid repository name reaches an id builder, which is a
+    failure this repository has already had once.
+
+    Missing or unreadable state dir answers the empty set rather than raising:
+    the callers each have their own, better-worded failure for that.
+    """
+    if not state_dir.is_dir():
+        return frozenset()
+    return frozenset(
+        d.name
+        for d in state_dir.iterdir()
+        if d.is_dir() and not d.name.startswith("_") and (d / "proposals").is_dir()
+    )
+
+
 def _discover_refs(
     state_dir: Path,
     service_filter: str | None = None,
@@ -1080,8 +1112,14 @@ def _discover_refs(
         raise SystemExit(f"State dir not found: {state_dir}")
 
     refs: list[ProposalRef] = []
+    # THE one definition of "this checkout contains this service", shared with
+    # whatever validates a --service argument. Iterated rather than re-tested
+    # inline so the two cannot drift: a filter that admits a name this loop
+    # would skip produces "discovered no proposals at all", which reads as a
+    # mis-mounted volume rather than as an argument the loop never accepts.
+    services = discover_services(state_dir)
     for service_dir in sorted(state_dir.iterdir()):
-        if not service_dir.is_dir() or service_dir.name.startswith("_"):
+        if service_dir.name not in services:
             continue
         service = service_dir.name
         # Scope the force_fix_only override to the targeted service: when a
@@ -1097,11 +1135,13 @@ def _discover_refs(
             # Owned by another PR lifecycle (e.g. pr-steward). Leave it alone,
             # but log it (only for real targets with a proposals/ dir) so an
             # operator isn't confused about why its proposals never appear.
-            if (service_dir / "proposals").is_dir():
-                print(
-                    f"shepherd: skipping {service} "
-                    "(SHEPHERD_SKIP_SERVICES; owned by another PR lifecycle)"
-                )
+            # No `proposals/` check here any more: `discover_services` already
+            # required one, which is what made this notice about "real targets"
+            # rather than every directory in the checkout.
+            print(
+                f"shepherd: skipping {service} "
+                "(SHEPHERD_SKIP_SERVICES; owned by another PR lifecycle)"
+            )
             continue
         if service_filter and service != service_filter:
             continue

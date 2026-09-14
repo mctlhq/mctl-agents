@@ -870,34 +870,36 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.service is not None:
-        # Validated against the CHECKOUT, not `config.settings.SERVICES`.
+        # Validated against `run_shepherd.discover_services`, which is also
+        # what `_discover_refs` iterates. ONE definition of "this checkout
+        # contains this service", so the filter and the discovery physically
+        # cannot disagree: a name this check admits is a name that loop
+        # accepts, and vice versa.
         #
-        # The shepherd's CLI validates against SERVICES, and copying that here
-        # would be wrong: discovery walks every directory under the state dir
-        # that does not begin with `_`, so a repository with proposals but no
-        # SERVICES entry -- mctl-claude-remote, whose pull requests another
-        # lifecycle drives -- is discoverable, and SERVICES would make it the
-        # one thing an operator cannot scope to. The authority for "is this a
-        # service" here is what the checkout contains.
+        # Not `config.settings.SERVICES` — a repository whose pull requests
+        # another lifecycle drives has proposals here and no SERVICES entry
+        # (`mctl-claude-remote`), and SERVICES would make it the one service an
+        # operator cannot scope a run to. Not "every directory" either: a
+        # checkout holds things that are not services, and treating those as
+        # services is how a directory name that is not a valid repository name
+        # reaches an id builder — a failure this module has already had once.
+        # `discover_services` answers structurally: not `_`-prefixed, and has a
+        # `proposals/` directory.
         #
         # The protection the check exists for is unchanged: an unknown
-        # --service matches no proposal directory, so the run discovers nothing
-        # and "discovered no proposals at all" exits 1 with a message about a
-        # checkout mounted one level off -- sending the operator to inspect the
-        # volume mount for a typo in their own argument, on the scoped run,
-        # which is exactly when the flag is used.
-        present: list[str] = []
-        if args.state_dir.is_dir():
-            present = sorted(
-                d.name
-                for d in args.state_dir.iterdir()
-                if d.is_dir() and not d.name.startswith("_")
-            )
+        # --service otherwise matches nothing, and "discovered no proposals at
+        # all" exits 1 with a message about a checkout mounted one level off —
+        # sending the operator to inspect the volume mount for a typo in their
+        # own argument, on the scoped run, which is when the flag is used.
+        from orchestrator.run_shepherd import discover_services
+
+        present = discover_services(args.state_dir)
         if args.service not in present:
             parser.error(
-                f"no service directory {args.service!r} under {args.state_dir}"
-                + (f"; found: {', '.join(present)}" if present else "")
+                f"no service state dir {args.service!r} under {args.state_dir}"
+                + (f"; found: {', '.join(sorted(present))}" if present else "")
             )
+
 
     if args.apply:
         # This module PLANS. There is no writer in it -- no `acquire` call
