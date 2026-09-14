@@ -160,6 +160,19 @@ DEV_LOOP_LIVENESS_WORKERS = 8
 DEV_LOOP_LIVENESS_BUDGET_S = 60
 
 
+def _owns(answer: str) -> bool:
+    """The sweep's decision, as a function of the tri-state answer.
+
+    ONE definition, called from both the probe wrapper below and the pool's
+    collection site in _filter_dev_loop_owned. The alternative — the wrapper
+    here and `answer == LEGACY_OWNED` written out again in the filter — makes
+    the tests that pin "unchanged answer for every input" tautological: they
+    would exercise a function production no longer calls, and an edit to the
+    inline comparison would leave every one of them green.
+    """
+    return answer == LEGACY_OWNED
+
+
 def _dev_loop_owns(service: str, slug: str) -> bool:
     """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
 
@@ -167,7 +180,7 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
     True. A total function of _dev_loop_owns_answer, so the sweep's decision
     cannot drift from what the shadow compare reports about it.
     """
-    return _dev_loop_owns_answer(service, slug) == LEGACY_OWNED
+    return _owns(_dev_loop_owns_answer(service, slug))
 
 
 def _dev_loop_owns_answer(service: str, slug: str) -> str:
@@ -313,10 +326,11 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
             for future in as_completed(futures, timeout=DEV_LOOP_LIVENESS_BUDGET_S):
                 i = futures[future]
                 answer = legacy[i] = future.result()
-                # The same predicate the bool wrapper applies, so `owned` — and
-                # therefore `kept` below — is bit-for-bit what it was before
-                # the pool started returning three values instead of two.
-                if answer == LEGACY_OWNED:
+                # THE predicate the bool wrapper applies, not a copy of it, so
+                # `owned` — and therefore `kept` below — is bit-for-bit what it
+                # was before the pool started returning three values instead of
+                # two, and the tests that pin the wrapper pin this path too.
+                if _owns(answer):
                     owned.add(i)
         except FuturesTimeoutError:
             # Budget spent. Whatever already answered still counts; the

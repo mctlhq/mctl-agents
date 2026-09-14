@@ -5033,3 +5033,28 @@ def test_the_tristate_probe_maps_every_path(
     # The decision the sweep actually makes, unchanged in every case.
     assert run_shepherd._dev_loop_owns("mctl-web", slug) is want_bool
     capsys.readouterr()
+
+
+def test_the_sweep_and_the_wrapper_share_one_predicate() -> None:
+    """The bool tests above are only meaningful while production calls what
+    they exercise.
+
+    `_filter_dev_loop_owned` derives its decision through `_owns`, the same
+    function `_dev_loop_owns` is built from. Written out inline instead, an
+    edit to the sweep's comparison would leave every row of the tri-state table
+    green while the sweep did something else.
+    """
+    import inspect
+
+    source = inspect.getsource(run_shepherd._filter_dev_loop_owned)
+    assert "_owns(answer)" in source
+    assert "== LEGACY_OWNED" not in source, (
+        "the sweep re-derives the predicate instead of calling _owns; "
+        "the bool tests then pin a function production does not use"
+    )
+    for answer, want in (
+        (run_shepherd.LEGACY_OWNED, True),
+        (run_shepherd.LEGACY_FREE, False),
+        (run_shepherd.LEGACY_UNKNOWN, False),
+    ):
+        assert run_shepherd._owns(answer) is want
