@@ -86,6 +86,8 @@ import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator.github_token import refresh_github_token
+from orchestrator.lifecycle import shadow
+from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
@@ -128,6 +130,13 @@ VERDICT_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED"})
 # than os). A deployment pointing MCTL_API_BASE_URL at a staging API must
 # not have this one check silently talk to production instead.
 MCTL_API_URL = MCTL_API_BASE_URL.rstrip("/")
+
+# The shadow compare's ownership client. None means "build the default one",
+# which is what production does; a test injects a fake here so the REAL
+# compare_proposal_refs and compare_entities run and emit their real lines.
+# Patching compare_entities out instead would make an equivalence test assert
+# that a shadow which printed nothing printed nothing.
+SHADOW_CLIENT = None
 DEV_LOOP_LIVENESS_TIMEOUT_S = 10
 
 # The sweep tick runs every 5 minutes (see the module docstring), so the
@@ -151,20 +160,55 @@ DEV_LOOP_LIVENESS_WORKERS = 8
 DEV_LOOP_LIVENESS_BUDGET_S = 60
 
 
+def _owns(answer: str) -> bool:
+    """The sweep's decision, as a function of the tri-state answer.
+
+    ONE definition, called from both the probe wrapper below and the pool's
+    collection site in _filter_dev_loop_owned. The alternative — the wrapper
+    here and `answer == LEGACY_OWNED` written out again in the filter — makes
+    the tests that pin "unchanged answer for every input" tautological: they
+    would exercise a function production no longer calls, and an edit to the
+    inline comparison would leave every one of them green.
+    """
+    return answer == LEGACY_OWNED
+
+
 def _dev_loop_owns(service: str, slug: str) -> bool:
     """True iff a RUNNING DevLoopWorkflow drives this proposal (#213).
 
+    Unchanged contract, unchanged answer for every input: OWNED is the only
+    True. A total function of _dev_loop_owns_answer, so the sweep's decision
+    cannot drift from what the shadow compare reports about it.
+    """
+    return _owns(_dev_loop_owns_answer(service, slug))
+
+
+def _dev_loop_owns_answer(service: str, slug: str) -> str:
+    """The same probe, three-valued: LEGACY_OWNED / LEGACY_FREE / LEGACY_UNKNOWN.
+
     The workflow id is derived exactly the way start.py derives it
-    (dev-loop-mctlhq-{service}-{issue-number}); slugs without the
-    issue-<N>- prefix (incident-*, pre-Temporal) never had a DevLoop.
-    Every failure path returns False — see the MCTL_API_URL note above.
+    (dev-loop-mctlhq-{service}-{issue-number}).
+
+    The distinction this adds is between a real "no owner" and "I could not
+    find out". _dev_loop_owns collapses both into False — deliberately, since
+    for the SWEEP the safe default is to drive everything — but the shadow
+    compare cannot use that bool: counting an unreachable mctl-api as "the old
+    mechanism says free" would report every outage as a measured disagreement,
+    and diverge.go's LegacyAnswer is three-valued for exactly this reason.
+
+    Nothing about the bool's behaviour changes here. Every path that returned
+    False still maps to a non-OWNED answer.
     """
     m = re.match(r"issue-(\d+)-", slug)
     if not m:
-        return False
+        # Structural, not a failure: a slug with no issue-<N>- prefix
+        # (incident-*, anything pre-Temporal) never had a DevLoop, so the old
+        # mechanism genuinely answers "nobody drives this".
+        return LEGACY_FREE
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
-        return False
+        # Never asked.
+        return LEGACY_UNKNOWN
     # `mctlhq` is hardcoded because a ProposalRef carries no repo owner —
     # unlike orphans.py, which derives one from `pr.repo`. Every proposal the
     # shepherd sweeps lives under this org today; a wrong owner would only
@@ -175,7 +219,7 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
         # MCTL_API_URL is operator-provided env; refuse non-https schemes
         # (also satisfies ruff S310's audited-scheme requirement).
         print(f"warn: dev-loop liveness check skipped: non-https MCTL_API_URL {MCTL_API_URL}")
-        return False
+        return LEGACY_UNKNOWN
     try:
         # Constructed INSIDE the guard: Request.__init__ parses the url and
         # raises ValueError on a malformed one (an unmatched IPv6 bracket,
@@ -198,20 +242,51 @@ def _dev_loop_owns(service: str, slug: str) -> bool:
         ValueError,
         OSError,
     ) as exc:
-        # 404 = no such workflow (or an mctl-api predating the endpoint) —
-        # genuinely not owned. Anything else is an infra failure; log it so
-        # an operator can see the ownership check degraded, then sweep.
-        if not (isinstance(exc, urllib.error.HTTPError) and exc.code == 404):
-            print(f"warn: dev-loop liveness check failed for {workflow_id}: {exc}")
-        return False
-    if not isinstance(payload, dict) or payload.get("status") != "Running":
-        return False
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+            # 404 = no such workflow (or an mctl-api predating the endpoint).
+            # The ONE error that is an answer.
+            return LEGACY_FREE
+        # Anything else is an infra failure — a network error, a 5xx, a 401,
+        # or a redirect, which _NoRedirects surfaces as an HTTPError too. Log
+        # it so an operator can see the ownership check degraded, then sweep.
+        print(f"warn: dev-loop liveness check failed for {workflow_id}: {exc}")
+        return LEGACY_UNKNOWN
+    if not isinstance(payload, dict):
+        # Answered, unreadable.
+        return LEGACY_UNKNOWN
+    if payload.get("status") != "Running":
+        # A real answer: no live DevLoop. Covers Completed/Failed/Terminated
+        # and a body with no status at all.
+        return LEGACY_FREE
     # Running is not the same as ticking: an execution that started before
     # the shepherd-in-loop patch replays that branch as False and never
     # submits a tick, yet stays Running for up to the 14-day merge
     # deadline. Skipping it would leave its PR with no shepherd at all.
-    # An mctl-api without the field answers None → swept, as before.
-    return payload.get("shepherd_in_loop") is True
+    # An mctl-api without the field answers None → swept, as before, and the
+    # bool wrapper still returns False. The tri-state splits that False into
+    # its three causes, none of which changes the sweep's decision:
+    #
+    #  - the key is absent: the route does not serve the field at all, so we
+    #    could not tell;
+    #  - shepherd_in_loop_known is false: the route DID answer, with false as a
+    #    fallback because its query to the workflow never completed (an old
+    #    worker, an outage, a timeout). Same value, opposite meaning;
+    #  - an explicit false with known true: a live execution declining to
+    #    shepherd, which is a real "does not drive this".
+    if "shepherd_in_loop" not in payload:
+        return LEGACY_UNKNOWN
+    # `is True` FIRST, and the order is the invariant rather than a preference.
+    # It is the only condition the pre-split bool ever answered True on, so
+    # testing it before anything else makes "unchanged answer for every input"
+    # true by construction instead of by an assumption about which field
+    # combinations mctl-api can produce. A payload carrying true together with
+    # known=false -- which this repo pins nowhere -- would otherwise answer
+    # UNKNOWN, and the ref would be swept while a live DevLoop drives it.
+    if payload.get("shepherd_in_loop") is True:
+        return LEGACY_OWNED
+    if payload.get("shepherd_in_loop_known") is False:
+        return LEGACY_UNKNOWN
+    return LEGACY_FREE
 
 
 def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
@@ -227,6 +302,12 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
     if not refs:
         return refs
     owned: set[int] = set()
+    # The tri-state answer per ref, carried alongside the bool for the shadow
+    # compare below. Absent means the probe never ran or never finished, which
+    # is LEGACY_UNKNOWN — read as the dict's default rather than written
+    # anywhere, so the budget-expired case and the never-started case cannot
+    # drift apart.
+    legacy: dict[int, str] = {}
     workers = min(DEV_LOOP_LIVENESS_WORKERS, len(refs))
     # NOT `with ThreadPoolExecutor(...)`: __exit__ runs shutdown(wait=True,
     # cancel_futures=False), which blocks until every *queued* task has also
@@ -238,13 +319,19 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         futures = {
-            pool.submit(_dev_loop_owns, ref.service, ref.slug): i
+            pool.submit(_dev_loop_owns_answer, ref.service, ref.slug): i
             for i, ref in enumerate(refs)
         }
         try:
             for future in as_completed(futures, timeout=DEV_LOOP_LIVENESS_BUDGET_S):
-                if future.result():
-                    owned.add(futures[future])
+                i = futures[future]
+                answer = legacy[i] = future.result()
+                # THE predicate the bool wrapper applies, not a copy of it, so
+                # `owned` — and therefore `kept` below — is bit-for-bit what it
+                # was before the pool started returning three values instead of
+                # two, and the tests that pin the wrapper pin this path too.
+                if _owns(answer):
+                    owned.add(i)
         except FuturesTimeoutError:
             # Budget spent. Whatever already answered still counts; the
             # rest stay unchecked and get swept.
@@ -263,6 +350,17 @@ def _filter_dev_loop_owned(refs: list[ProposalRef]) -> list[ProposalRef]:
         # timeout is 10s and not the budget. The tick's *work* stays inside
         # the budget either way; only the process's last breath waits.
         pool.shutdown(wait=False, cancel_futures=True)
+
+    # AFTER the pool, so the compare spends none of the 60s budget, and BEFORE
+    # `kept` is built, so the code reads in the order the rollout does: measure,
+    # then decide. Nothing below reads `legacy`; `kept` is built from `owned`
+    # alone, and the one way this block could change a sweep decision is by
+    # raising — which it cannot.
+    if shadow.enabled():
+        try:
+            shadow.compare_proposal_refs(refs, legacy, _parse_pr_url, client=SHADOW_CLIENT)
+        except Exception as exc:  # noqa: BLE001 — an observer must never decide
+            print(f"warn: lifecycle shadow compare failed: {exc}", flush=True)
     kept: list[ProposalRef] = []
     for i, ref in enumerate(refs):
         if i in owned:

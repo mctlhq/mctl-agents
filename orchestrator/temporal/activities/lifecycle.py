@@ -23,6 +23,7 @@ from typing import Any
 import httpx
 from temporalio import activity
 
+from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.contract import (
     OWNED_BY_ME,
     UNKNOWN,
@@ -204,6 +205,29 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
     path = _PATHS.get(req.op)
     if path is None:
         return OwnershipResult(verdict=UNKNOWN, reason=f"unknown op {req.op!r}")
+
+    if not rollout.records_writes():
+        # Break-glass OFF (ADR-010 §12): nothing is written and nothing is
+        # read. Gated on records_writes() rather than on mode() == OFF because
+        # every op this activity performs is a mutation, and rollout.py's
+        # three-switch table gives each question exactly one reader.
+        #
+        # This belongs in ACTIVITY code and nowhere else. Activities run
+        # outside the workflow sandbox, so reading the environment here is
+        # legal; the same read inside @workflow.defn is not. More importantly,
+        # the command sequence is identical in every mode — the workflow still
+        # schedules this activity and still records its completion, and only
+        # the PAYLOAD differs. Payloads are replayed from history rather than
+        # recomputed, so a history recorded under observe replays byte-for-byte
+        # on a worker configured off. Gating track_ownership in dev_loop.py
+        # instead would REMOVE commands from history and break that replay.
+        mode = rollout.mode()
+        activity.logger.info("lifecycle %s skipped: %s=%s", req.op, rollout.ENV_VAR, mode)
+        return OwnershipResult(
+            verdict=UNKNOWN,
+            accepted=False,
+            reason=f"rollout mode {mode}: ownership not consulted",
+        )
 
     if req.op == "progress" and not req.evidence:
         # The same guard LifecycleClient.progress raises on, in the form this

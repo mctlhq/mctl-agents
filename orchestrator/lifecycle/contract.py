@@ -91,6 +91,28 @@ class Ownership:
     stuck: bool = False
     healthy: bool = False
 
+    #: ``derived.held`` from mctl-api: does this record withhold the entity
+    #: from other actors? ``None`` means the server did not send it.
+    #:
+    #: Three-valued on purpose, and NOT defaulted to False. `held` is the
+    #: takeover predicate, and mctl-api computes it from the state and the
+    #: liveness bound rather than from the status string, because a
+    #: handing-off row past its bound reports the more specific
+    #: `handoff-stalled` while being dead and recoverable. Re-deriving that
+    #: here would be the second implementation of one predicate in two
+    #: languages, and mctl-api's own derive.go records that the first consumer
+    #: to re-derive it got it wrong — in the direction that turns the one
+    #: dangerous divergence class into agreement.
+    #:
+    #: So an absent field is carried as absent. A default of False would say
+    #: "nobody holds this", which is the single answer that licenses action.
+    held: bool | None = None
+
+    #: ``derived.status`` — the closed vocabulary healthy | stuck | dead |
+    #: handing-off | handoff-stalled | released | terminal | unknown. Carried
+    #: for reporting only; nothing decides on it.
+    derived_status: str = ""
+
     @staticmethod
     def from_payload(data: dict[str, Any]) -> Ownership | None:
         """Build from an mctl-api response, or return None if it is not one.
@@ -169,7 +191,27 @@ class Ownership:
             dead=bool(data.get("dead")),
             stuck=bool(data.get("stuck")),
             healthy=bool(data.get("healthy")),
+            # NOT required the way `state` and `healthy` are: an mctl-api that
+            # predates the derived block must still parse. It answers held=None
+            # and the shadow compare reports store-unknown for that record,
+            # which is loud and correct — rather than quietly classifying
+            # against a predicate nobody computed.
+            held=_derived_held(data.get("derived")),
+            derived_status=str(_mapping(data.get("derived")).get("status") or ""),
         )
+
+
+def _derived_held(raw: Any) -> bool | None:
+    """``derived.held``, or None when the server did not send it.
+
+    A non-bool value is also None: a string "false" coerced with bool() is
+    True, and that coercion in this particular field would report an
+    unowned entity as held — or, one release later, the reverse.
+    """
+    if not isinstance(raw, dict):
+        return None
+    held = raw.get("held")
+    return held if isinstance(held, bool) else None
 
 
 # The five answers to "is this entity owned?", and the reason this type

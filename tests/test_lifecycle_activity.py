@@ -14,12 +14,14 @@ so far has been, went untested.
 from __future__ import annotations
 
 import json
+import pathlib
 from typing import Any
 
 import anyio
 import httpx
 import pytest
 
+from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.contract import (
     OWNED_BY_ME,
     OWNED_BY_OTHER,
@@ -63,7 +65,14 @@ _REAL_ASYNC_CLIENT = httpx.AsyncClient
 
 
 def _run(monkeypatch: pytest.MonkeyPatch, handler: Any, req: act.OwnershipRequest | None = None):
-    """Drive the activity with a faked transport."""
+    """Drive the activity with a faked transport.
+
+    The rollout mode is set to observe here, not left to the default: OFF
+    short-circuits before any HTTP call, which is the point of that gate and
+    would silently turn every case below into an assertion about the
+    short-circuit rather than about the branch it names.
+    """
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
     monkeypatch.setattr(act, "auth_headers", lambda: {"Authorization": "Bearer test"})
 
     def _factory(**kwargs: Any) -> httpx.AsyncClient:
@@ -154,6 +163,9 @@ def test_missing_token_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> None:
     def _no_auth() -> dict[str, str]:
         raise RuntimeError("MCTL_TOKEN is not set")
 
+    # Observe, so the credential branch is reached at all: the rollout gate
+    # sits above it and would otherwise answer first.
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
     monkeypatch.setattr(act, "auth_headers", _no_auth)
     result = anyio.run(act.lifecycle_ownership, _req())
     assert result.verdict == UNKNOWN
@@ -322,3 +334,72 @@ def test_dead_and_stuck_survive_the_wire_type(monkeypatch: pytest.MonkeyPatch) -
     result = _run(monkeypatch, handler_dead, _req(op="acquire"))
     assert result.dead is True
     assert result.stuck is False
+
+
+# --- the rollout gate --------------------------------------------------
+
+
+def test_off_mode_short_circuits_before_any_http(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OFF means nothing is written and nothing is read.
+
+    The transport raises, so the assertion is not merely that the verdict is
+    UNKNOWN — a failed call answers UNKNOWN too — but that no call was made at
+    all.
+    """
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OFF)
+    monkeypatch.setattr(act, "auth_headers", lambda: {"Authorization": "Bearer test"})
+
+    def _explode(**kwargs: Any) -> httpx.AsyncClient:
+        raise AssertionError("the activity opened a client while the rollout mode was off")
+
+    monkeypatch.setattr(act.httpx, "AsyncClient", _explode)
+    result = anyio.run(act.lifecycle_ownership, _req())
+
+    assert result.verdict == UNKNOWN
+    assert result.accepted is False
+    # The reason names the mode: the caller's own warning says "could not
+    # establish ownership", which under off is true but alarming, and an
+    # operator reading it needs to know it was a configuration choice.
+    assert rollout.OFF in result.reason
+
+
+def test_an_unset_mode_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default is off, so a deployment that never sets the variable writes
+    nothing — the safe direction, and the one that changes nothing."""
+    monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    monkeypatch.setattr(act, "auth_headers", lambda: {"Authorization": "Bearer test"})
+    monkeypatch.setattr(
+        act.httpx,
+        "AsyncClient",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("opened a client with no mode set")),
+    )
+    assert anyio.run(act.lifecycle_ownership, _req()).verdict == UNKNOWN
+
+
+def test_observe_still_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The regression in the other direction: a gate that never opens is not a
+    gate, it is an outage."""
+    result = _run(monkeypatch, _respond(200, _record()))
+    assert result.verdict == OWNED_BY_ME
+
+
+def test_the_gate_is_read_in_the_activity_not_the_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The invariant behind D4, stated as a test.
+
+    The rollout mode must never be read inside workflow code: doing so would
+    change which commands the workflow issues, and a history recorded under
+    observe would stop replaying on a worker set to off. dev_loop.py reads
+    `workflow.patched(...)` — a history marker — and nothing else.
+    """
+    source = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "orchestrator"
+        / "temporal"
+        / "workflows"
+        / "dev_loop.py"
+    ).read_text()
+    assert rollout.ENV_VAR not in source, (
+        f"{rollout.ENV_VAR} is read inside workflow code; it must be read in an "
+        "activity, or a history recorded under one mode stops replaying under another"
+    )
+    assert "lifecycle.rollout" not in source and "import rollout" not in source
