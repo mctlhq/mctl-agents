@@ -200,9 +200,19 @@ def devloop_workflow_id(service: str, slug: str) -> str:
 
     A slug with no `issue-<N>-` prefix answers "" rather than raising:
     structurally that proposal never had a DevLoop, which is an answer. The
-    empty string must never become an owner id, and the bootstrap guards on
-    that; `workflow_id_for` raises for a genuinely malformed URL, which cannot
-    arise from a matched slug.
+    empty string must never become an owner id, and both callers guard on it.
+
+    THIS FUNCTION CAN RAISE, which the f-string it replaced could not, and the
+    unvalidated half of the URL is the SERVICE rather than the slug.
+    `_discover_refs` takes the service from any directory under the state dir
+    that does not begin with `_` and never checks it against SERVICES, so a
+    directory name outside `parse_issue_url`'s `[A-Za-z0-9_.-]+` raises
+    ValueError. Both callers handle it, and deliberately differently, because
+    they have different vocabularies for "this entity cannot be represented":
+    `_dev_loop_owns_answer` answers LEGACY_UNKNOWN, and the ownership bootstrap
+    reports the entity undetermined. Neither may let it escape — in the sweep
+    it surfaces on a future whose only handler is `except FuturesTimeoutError`
+    and takes the whole tick down.
     """
     m = re.match(r"issue-(\d+)-", slug)
     if not m:
@@ -236,7 +246,27 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     Nothing about the bool's behaviour changes here. Every path that returned
     False still maps to a non-OWNED answer.
     """
-    workflow_id = devloop_workflow_id(service, slug)
+    try:
+        workflow_id = devloop_workflow_id(service, slug)
+    except ValueError:
+        # `devloop_workflow_id` validates through `parse_issue_url` now, and
+        # the unvalidated half of the URL it builds is the SERVICE, not the
+        # slug: `_discover_refs` takes the service from any directory under the
+        # state dir that does not start with `_` and never checks it against
+        # SERVICES, so a directory name outside `[A-Za-z0-9_.-]+` raises here.
+        #
+        # UNKNOWN, not FREE. We cannot represent the entity, so we did not ask
+        # — and answering "nobody drives this" would be a claim rather than an
+        # answer. The bool wrapper still reads it as False, so the sweep's
+        # behaviour is unchanged.
+        #
+        # Caught HERE rather than left to the caller for the reason the comment
+        # in the try below records: an exception out of this function surfaces
+        # on the future in `_filter_dev_loop_owned`, whose only handler is
+        # `except FuturesTimeoutError`, and aborts the whole tick for every
+        # service instead of failing open for the one proposal. The f-string
+        # this call replaced could not raise at all.
+        return LEGACY_UNKNOWN
     if not workflow_id:
         # Structural, not a failure: a slug with no issue-<N>- prefix
         # (incident-*, anything pre-Temporal) never had a DevLoop, so the old

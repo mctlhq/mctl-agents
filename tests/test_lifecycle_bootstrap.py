@@ -1385,6 +1385,36 @@ def test_a_confirmed_devloop_we_cannot_name_fails_the_run(tmp_path, monkeypatch,
     assert "could not be determined" in capsys.readouterr().err
 
 
+def test_an_unrepresentable_service_is_undetermined_not_a_crash() -> None:
+    """`devloop_workflow_id` validates now, and the unvalidated half of the URL
+    it builds is the SERVICE, not the slug.
+
+    `_discover_refs` takes the service from any directory under the state dir
+    that does not begin with `_`, never checks it against SERVICES, and this
+    module passes fix_only=True so every directory is discovered whatever its
+    mode resolves to. A directory name outside `parse_issue_url`'s
+    `[A-Za-z0-9_.-]+` therefore raises -- and `build_report`'s plan loop has no
+    handler, so unhandled it would abort the whole report rather than fail for
+    its own entity.
+
+    Undetermined and PERMANENT: a live DevLoop is confirmed and we are
+    declining to name it, and a re-run over the same checkout reproduces it.
+    """
+    plan = bootstrap.plan_for(
+        _ref(service="not a repo name"),
+        "mctlhq/not a repo name#42",
+        OwnershipAnswer(verdict=UNOWNED),
+        LEGACY_OWNED,
+        repo="mctlhq/not a repo name",
+        held=False,
+    )
+    assert plan.decision == bootstrap.DECISION_AMBIGUOUS
+    assert plan.undetermined is True
+    assert plan.retryable is False
+    assert plan.owner_id == ""
+    assert "workflow id cannot be built" in plan.reason
+
+
 def test_a_slug_with_no_workflow_id_under_a_live_devloop_is_undetermined() -> None:
     plan = bootstrap.plan_for(
         _ref(slug="incident-9-oom"),

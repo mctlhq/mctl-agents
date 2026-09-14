@@ -491,7 +491,29 @@ def plan_for(
                 "importing it would name another repository's workflow"
             )
             return base
-        workflow_id = devloop_workflow_id(ref.service, ref.slug)
+        try:
+            workflow_id = devloop_workflow_id(ref.service, ref.slug)
+        except ValueError as exc:
+            # The service directory is not a representable repository name.
+            # `_discover_refs` takes it from any directory under the state dir
+            # that does not begin with `_` and never checks it against
+            # SERVICES, and this module passes fix_only=True so every directory
+            # is discovered whatever its mode resolves to.
+            #
+            # UNDETERMINED and PERMANENT, the same as the two refusals around
+            # it and for the same reason: a live DevLoop is CONFIRMED for this
+            # entity and we are declining to name it, so the store keeps no
+            # live owner for a pull request a DevLoop drives. A re-run over the
+            # same checkout reproduces it exactly -- the fix is renaming the
+            # directory.
+            #
+            # Caught rather than allowed to escape: `build_report`'s plan loop
+            # has no handler, so one unrepresentable directory would abort the
+            # whole report instead of failing for its own entity.
+            base.decision = DECISION_AMBIGUOUS
+            base.undetermined = True
+            base.reason = f"a live DevLoop drives this, but its workflow id cannot be built: {exc}"
+            return base
         if not workflow_id:
             # Unreachable from the probe — a slug with no issue-<N>- prefix
             # answers LEGACY_FREE — but an empty owner id must never become a
