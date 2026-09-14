@@ -1,5 +1,28 @@
 # Changelog
 
+## [1.45.0](https://github.com/mctlhq/mctl-agents/compare/1.44.0...1.45.0) (2026-09-13)
+
+
+### Features
+
+* **lifecycle:** add the rollout mode the ADR describes ([d97596c](https://github.com/mctlhq/mctl-agents/commit/d97596c8d9c010d439247998927f8ff8897daf46))
+* **lifecycle:** add the rollout mode the ADR describes ([082bc2e](https://github.com/mctlhq/mctl-agents/commit/082bc2e2476af9a7187064fc19542802dc51dc6c)), closes [#57](https://github.com/mctlhq/mctl-agents/issues/57)
+
+
+### Bug Fixes
+
+* **lifecycle:** a refused claim expires instead of silencing the watch ([8105846](https://github.com/mctlhq/mctl-agents/commit/8105846fc7bbba9496494619829d03fb17835bc9))
+* **lifecycle:** a refused claim expires instead of silencing the watch ([223e674](https://github.com/mctlhq/mctl-agents/commit/223e674562504d720b91a022f3f1cc9b8483aa49))
+* **lifecycle:** abandonment reflects the last write, not "ever failed" ([044a3aa](https://github.com/mctlhq/mctl-agents/commit/044a3aa4910e9c6bea8c7672a91f5e8e0f03a2e3))
+* **lifecycle:** count abandoned entities, not failed attempts ([7135ee4](https://github.com/mctlhq/mctl-agents/commit/7135ee48dd355ce6891dc552241286f15a5c544b))
+* **lifecycle:** end the refusal streak on a successful re-acquire ([8903e05](https://github.com/mctlhq/mctl-agents/commit/8903e05e3ba4420cbfd9fb59c35cd1342392b90a))
+* **lifecycle:** give the abandoned-claim guard a reader ([7455915](https://github.com/mctlhq/mctl-agents/commit/7455915f4cadbad981b2aec8e24d65aeb94bdb81))
+* **lifecycle:** give the abandoned-claim guard a reader ([eee5c92](https://github.com/mctlhq/mctl-agents/commit/eee5c9282e36050b384a82dbcdf3f5b62e123aff))
+* **lifecycle:** parse the entity number once in the cleanup ([09f851e](https://github.com/mctlhq/mctl-agents/commit/09f851e0ef9c179673beb2cb3fa398bbb83d32ef))
+* **lifecycle:** read one entity from the record path ([bf35753](https://github.com/mctlhq/mctl-agents/commit/bf35753303eeea18b0e5abbdeb446c1f855a8412))
+* **lifecycle:** read one entity from the record path ([d4f357b](https://github.com/mctlhq/mctl-agents/commit/d4f357b23d092021401676ad8794a6eead37a90f))
+* **lifecycle:** the epoch goes with the claim ([7bc0b1e](https://github.com/mctlhq/mctl-agents/commit/7bc0b1e91869568511a197e3fc19bcfaaa3f43c2))
+
 ## [1.44.0](https://github.com/mctlhq/mctl-agents/compare/1.43.0...1.44.0) (2026-09-13)
 
 
