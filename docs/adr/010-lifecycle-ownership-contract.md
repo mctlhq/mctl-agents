@@ -585,13 +585,26 @@ resolved as implemented, not merely proposed:
   `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` (default `1800`, one
   `MERGE_POLL_INTERVAL`), both env-overridable tunables, not contract.
 
-`run_implementer._push_followup` and the adopt-existing-branch path of
+`run_implementer._push_followup` and the existing-branch path of
 `_push_and_open_pr` now push with `--force-with-lease=<branch>:<sha>` — the
 explicit-SHA form, never the bare flag — and both call `ClaimClient.check()`
-immediately beforehand, aborting non-charging (`FollowupKind = "fenced"`,
-`run_implementer.EXIT_FENCED`) on `CLAIM_FENCED`. `run_shepherd._attempt_is_fresh`
-is the union of an active claim and the yaml lease, and the yaml branch now
-also requires a named holder rather than trusting `expires_at` alone.
+immediately beforehand, aborting non-charging on `CLAIM_FENCED`
+(`run_implementer.EXIT_FENCED`) and on a refusal — another executor holds the
+entity, or the store could not answer under the ownership break-glass —
+(`EXIT_CLAIM_REFUSED`). Both codes classify as `FollowupKind = "fenced"`: two
+different events, one shepherd handling, charge nothing and say which.
+That existing-branch push REPLACES the branch rather than adopting it: the
+retry clones fresh and recreates the branch off the default branch, so the
+dead attempt's commits are discarded. Intended — nothing references them —
+but `--force-with-lease` proves only that the ref did not move, never that we
+contain it. `run_shepherd._attempt_is_fresh` is the union of an active claim
+and the yaml lease. The `attempt` block's `id` is read by the CLAIM branch
+only; the yaml branch stays keyed on `expires_at` alone, because an unexpired
+lease is a live hold whether or not a holder was ever recorded, and with no
+`id` there is nobody to ask a claim about, so the yaml lease decides at every
+stage including `only`. A `CLAIM_UNKNOWN` never frees an attempt: like
+`claim.blocks_mutation`, it is gated on the `LIFECYCLE_OWNERSHIP_REQUIRED`
+break-glass, so an unreachable store holds rather than releases.
 `DevLoopWorkflow._watch_pr`'s `finally` still issues a bare `release` when the
 watch ends non-terminally. It was briefly changed to `handoff-start` and
 reverted inside this same change: `handoff-start` writes a HOLDING

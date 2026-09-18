@@ -754,8 +754,20 @@ def claim_verdict_for(claim: ExecutionClaim, asking: Executor | None) -> str:
     return CLAIM_HELD_BY_OTHER
 
 
-def _claim_error_of(status: int, payload: dict[str, Any]) -> str:
-    return str(payload.get("error") or f"HTTP {status}")
+def _claim_error_of(status: int, payload: Any) -> str:
+    """The error prose for a non-2xx claim response.
+
+    `payload` is typed loosely on purpose: it comes from
+    `json.loads(exc.read() or b"{}")` on an error body, and a gateway or proxy
+    in front of mctl-api can answer a valid JSON scalar, list or `null`
+    instead of an envelope. Calling `.get()` on one of those raises
+    AttributeError from inside the very branch that exists to answer
+    CLAIM_UNKNOWN — turning a fail-closed verdict into a crash (agy P3 on
+    `31232dc`). Every other reader in this function already isinstance-guards;
+    this one did not.
+    """
+    err = payload.get("error") if isinstance(payload, dict) else None
+    return str(err or f"HTTP {status}")
 
 
 def _looks_like_claim_answer(payload: dict[str, Any]) -> bool:

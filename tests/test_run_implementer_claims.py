@@ -16,6 +16,7 @@ from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
     CLAIM_HELD_BY_ME,
     CLAIM_HELD_BY_OTHER,
+    CLAIM_UNKNOWN,
     ClaimAnswer,
 )
 
@@ -40,6 +41,7 @@ def test_push_followup_uses_the_explicit_force_with_lease_form(monkeypatch: pyte
 
 
 def test_push_followup_checks_the_claim_and_aborts_on_fence(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
     calls: list[list[str]] = []
     monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: calls.append(cmd))
 
@@ -191,12 +193,39 @@ def test_acquire_raises_when_another_executor_holds_it(monkeypatch: pytest.Monke
         _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 holds it"))
 
 
-def test_acquire_raises_fenced_regardless_of_stage(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A fence is raised unconditionally, exactly as `_check_claim_or_raise`
-    does, so the two sites cannot answer one verdict two different ways."""
-    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+def test_acquire_raises_on_a_fence_at_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
     with pytest.raises(run_implementer.ImplementerFenced):
         _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved"))
+
+
+def test_a_fence_is_advisory_below_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`observe` RECORDS writes, so a real 409 `fenced` does come back there.
+
+    Halting on it would be the observe stage composing safety, which is
+    precisely what that stage must not do (ADR-010 §12; agy P2 on `31232dc`).
+    Gated by one predicate here and in `_check_claim_or_raise`, so the two
+    sites cannot answer one verdict two different ways.
+    """
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    assert _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved")) is None
+
+
+def test_a_fence_before_a_push_is_advisory_below_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same predicate on the push-site check: observe logs the divergence
+    and pushes, enforce raises."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: calls.append(cmd))
+
+    class _FencedClient:
+        def check(self, *a, **kw):
+            return ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved")
+
+    run_implementer._push_followup(
+        Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=_ctx(_FencedClient()),
+    )
+    assert len(calls) == 1, calls
 
 
 def _ctx(client):
@@ -247,6 +276,7 @@ def test_adopt_path_does_not_pin_the_proposal_claim_to_a_branch_sha(
 def test_brand_new_branch_push_is_also_claim_checked(monkeypatch: pytest.MonkeyPatch) -> None:
     """"No remote ref yet" is a statement about git, not about who may write.
     The model ran for a long time between the acquire and this push."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
     calls: list[list[str]] = []
 
     class _FencedClient:
@@ -312,3 +342,133 @@ def test_the_claim_is_released_on_a_failing_arm_too(
 
     assert result.error
     assert released == [expected_reason], released
+
+
+def test_an_unreachable_store_is_not_reported_as_a_competing_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ownership_required()` defaults to True, so at `enforce` a CLAIM_UNKNOWN
+    is failed closed — correctly. What was wrong is what the operator then
+    read: "another executor holds the claim", sending them to look for an
+    executor that does not exist, when the real event is an expired token or a
+    503 from mctl-api (claude P2 on `31232dc`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    monkeypatch.delenv("LIFECYCLE_OWNERSHIP_REQUIRED", raising=False)
+    with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
+        _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_UNKNOWN, reason="MCTL_TOKEN is not set"))
+    message = str(excinfo.value)
+    assert "another executor holds" not in message, message
+    assert "could not answer" in message
+    assert "MCTL_TOKEN is not set" in message
+    assert "LIFECYCLE_OWNERSHIP_REQUIRED" in message
+
+
+def test_the_break_glass_still_returns_none_on_an_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one path on which CLAIM_UNKNOWN really does return None — the
+    documented break-glass, explicitly off. The docstring used to claim this
+    was the DEFAULT path."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    monkeypatch.setenv("LIFECYCLE_OWNERSHIP_REQUIRED", "false")
+    assert _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_UNKNOWN, reason="503")) is None
+
+
+@pytest.mark.parametrize(
+    ("verdict", "forbidden", "required"),
+    [
+        (CLAIM_UNKNOWN, "another executor holds", "could not answer"),
+        (CLAIM_HELD_BY_OTHER, "could not answer", "another executor holds"),
+    ],
+)
+def test_the_push_site_refusal_reads_the_same_as_the_acquire_one(
+    monkeypatch: pytest.MonkeyPatch, verdict: str, forbidden: str, required: str,
+) -> None:
+    """One verdict, one wording, whichever site observed it — and the same
+    sentinel exit code, so the shepherd cannot classify the two apart."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    monkeypatch.delenv("LIFECYCLE_OWNERSHIP_REQUIRED", raising=False)
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: None)
+
+    class _Client:
+        def check(self, *a, **kw):
+            return ClaimAnswer(verdict=verdict, reason="store said so")
+
+    with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
+        run_implementer._push_followup(
+            Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=_ctx(_Client()),
+        )
+    message = str(excinfo.value)
+    assert forbidden not in message, message
+    assert required in message
+    assert (
+        run_implementer._review_feedback_exit_code(message) == run_implementer.EXIT_CLAIM_REFUSED
+    )
+
+
+def test_review_feedback_exit_code_maps_the_claim_refusal_prefix() -> None:
+    """Left as EXIT_GENERIC_FAILURE, a refusal reached the operator as
+    "follow-up subprocess failed transiently" — the exact legibility gap
+    EXIT_FENCED was added to close — and repeated every tick for the life of a
+    leaked lease (claude P3 on `31232dc`)."""
+    assert (
+        run_implementer._review_feedback_exit_code(
+            f"{run_implementer.CLAIM_REFUSED_ERROR_PREFIX} another executor holds it"
+        )
+        == run_implementer.EXIT_CLAIM_REFUSED
+    )
+    assert run_implementer.EXIT_CLAIM_REFUSED != run_implementer.EXIT_FENCED
+
+
+def test_an_unreadable_remote_head_falls_through_to_the_plain_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--force-with-lease=<branch>:` means "the ref must not already exist" —
+    the negation of the precondition that selected the existing-branch path.
+    An unreadable head must not be expressed as a lease at all."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: calls.append(cmd))
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=Path("/tmp/proposal"), status="accepted",
+    )
+    with patch.object(run_implementer, "_open_pr_for_branch", return_value="https://pr"):
+        run_implementer._push_and_open_pr(Path("/tmp/repo"), ref, claim_context=None)
+
+    assert calls == [["git", "push", "-u", "origin", "feat/agents-slug"]]
+
+
+def test_a_refused_acquire_leaves_the_proposal_accepted_and_uncharged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The safety property the acquire/status reorder exists to produce, and
+    the one a future refactor would silently undo by moving the status write
+    back above the acquire: a lost race must write NOTHING — no `in-progress`
+    flip, no 130-minute yaml lease stamped with our identity over the real
+    holder's (claude P3 on `31232dc`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    proposal_dir = tmp_path / "mctl-web" / "slug"
+    proposal_dir.mkdir(parents=True)
+    status_path = proposal_dir / ".status.yaml"
+    status_path.write_text("status: accepted\n", encoding="utf-8")
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=proposal_dir, status="accepted",
+        approval_ok=True,
+    )
+
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "ClaimClient", _client_answering(
+        ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 holds it")
+    ))
+    monkeypatch.setattr(
+        run_implementer, "_clone_target",
+        lambda *_a, **_kw: pytest.fail("a refused acquire must not clone or run the model"),
+    )
+
+    result = run_implementer.implement_one(ref)
+
+    assert result.counts_toward_limit is False
+    assert result.pr_url is None
+    assert "another executor holds" in (result.skipped_reason or "")
+    body = status_path.read_text(encoding="utf-8")
+    assert "in-progress" not in body, body
+    assert "attempt" not in body, body

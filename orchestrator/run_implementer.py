@@ -105,9 +105,11 @@ from config.settings import (
 )
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
+from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
 from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
+    CLAIM_UNKNOWN,
     OWNER_IMPLEMENTER,
     PHASE_IMPLEMENT,
     PHASE_REVIEW_REMEDIATION,
@@ -208,6 +210,17 @@ EXIT_DELIBERATE_NO_OP = 47
 # claim against the CURRENT world instead (ADR-010 phase 2, #352). Shares the
 # non-charging behaviour of 46/47: the executor did nothing wrong.
 EXIT_FENCED = 48
+# A claim check REFUSED this attempt: another executor holds the entity, or
+# the claim store could not be reached while `LIFECYCLE_OWNERSHIP_REQUIRED` is
+# on. Distinct from 48 — nothing moved under this attempt, it simply may not
+# act right now — but it shares 48's shepherd handling (`FollowupKind =
+# "fenced"`, non-charging, its own log line) because the operator question is
+# the same one: a claim stood this attempt down, deliberately. Left as
+# EXIT_GENERIC_FAILURE it reached the operator as "follow-up subprocess failed
+# transiently", the exact legibility gap EXIT_FENCED was added to close, and
+# it repeats every tick for the life of a leaked lease (claude P3 on
+# `31232dc`).
+EXIT_CLAIM_REFUSED = 49
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -223,6 +236,8 @@ REFUSAL_MARKER_FILENAME = ".implementer-refusal.json"
 REFUSAL_ERROR_PREFIX = "deliberate no-op:"
 # Prefix mapped to EXIT_FENCED. Same style, raised by ImplementerFenced.
 FENCED_ERROR_PREFIX = "fenced:"
+# Prefix mapped to EXIT_CLAIM_REFUSED, raised by ImplementerClaimRefused.
+CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -430,6 +445,13 @@ def _review_feedback_exit_code(error: str) -> int:
         executor aborted before invoking git; the shepherd must not charge a
         review attempt for a race it did not cause.
 
+      - 49: an ExecutionClaim check REFUSED this attempt — another executor
+        holds the entity, or the store was unreachable under the ownership
+        break-glass. Nothing moved, so it is not a fence; the shepherd
+        handles it with the same non-charging arm and its own log line,
+        because "a claim stood this attempt down" is what the operator needs
+        to read either way.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -449,6 +471,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_DELIBERATE_NO_OP
     if error.startswith(FENCED_ERROR_PREFIX):
         return EXIT_FENCED
+    if error.startswith(CLAIM_REFUSED_ERROR_PREFIX):
+        return EXIT_CLAIM_REFUSED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -541,13 +565,22 @@ class ImplementerFenced(RuntimeError):
 
 
 class ImplementerClaimRefused(RuntimeError):
-    """`acquire` answered "someone else holds this" where that answer blocks.
+    """A claim check refused this attempt where that refusal blocks.
 
-    Distinct from `ImplementerFenced`: nothing moved under this attempt, it
-    simply lost the race. Distinct from a generic failure too, because the
-    correct response is to stand down silently rather than to mark the
-    proposal `needs-triage` — the other executor is doing the work right now,
-    and triaging the entity it holds is how two coordinating processes turn
+    Two different answers arrive here, and the message says which:
+
+    - CLAIM_HELD_BY_OTHER — a real, named executor holds the entity and this
+      attempt lost the race;
+    - CLAIM_UNKNOWN — the store could not be reached (or no token was
+      configured) while `LIFECYCLE_OWNERSHIP_REQUIRED` is on, the default.
+      Nobody holds anything; uncertainty is being failed closed. Reporting
+      that as a competing holder sent the operator looking for an executor
+      that does not exist (claude P2 on `31232dc`).
+
+    Distinct from `ImplementerFenced`: nothing moved under this attempt.
+    Distinct from a generic failure too, because the correct response is to
+    stand down silently rather than to mark the proposal `needs-triage` — the
+    entity is healthy, and triaging it is how two coordinating processes turn
     into one broken one.
 
     Only raised where the answer actually composes safety
@@ -656,9 +689,13 @@ def _acquire_claim(
     Three outcomes, because the caller must act differently on each:
 
     - a `_ClaimContext` — granted, and every downstream push checks it;
-    - None — no claim is in play (CLAIM_UNKNOWN, or any rollout stage below
-      `enforce` where the claim is advisory). NOT an error: the run proceeds
-      on the pre-claim mechanisms, the yaml lease and `--force-with-lease`;
+    - None — no claim is in play: any answer at a rollout stage below
+      `enforce`, where the claim is advisory, and CLAIM_UNKNOWN when the
+      `LIFECYCLE_OWNERSHIP_REQUIRED` break-glass is explicitly off. NOT an
+      error: the run proceeds on the pre-claim mechanisms, the yaml lease and
+      `--force-with-lease`. Note that this is NOT the default path for
+      CLAIM_UNKNOWN: `ownership_required()` defaults to True, so at `enforce`
+      an unreachable store raises below rather than returning here;
     - `ImplementerFenced` / `ImplementerClaimRefused` — a definite "no" that
       the rollout stage says must stop a mutation. Raised rather than
       returned, because a returned None is indistinguishable from "no claim
@@ -681,27 +718,44 @@ def _acquire_claim(
         #
         # So the answer is split the same way `_check_claim_or_raise` splits
         # it, and by the same predicate, so the two cannot drift:
-        # CLAIM_FENCED is raised unconditionally, exactly as
-        # `_check_claim_or_raise` does — not gated on `blocks_mutation` — so
-        # the two sites cannot answer one verdict two ways. It is not
-        # reachable below the recording stages anyway: `ClaimClient._write`
-        # short-circuits to CLAIM_UNKNOWN when `rollout.records_writes()` is
-        # False, so no fence can come back from a stage that would ignore it.
-        if answer.verdict == CLAIM_FENCED:
+        # A fence is the sharpest answer the store gives, but `observe` still
+        # RECORDS writes (`rollout.records_writes()` is True from observe up),
+        # so a real 409 `fenced` does come back there — and halting the
+        # attempt on it would be the observe stage composing safety, which is
+        # exactly what it must not do (ADR-010 §12; agy P2 on `31232dc`). An
+        # earlier revision raised unconditionally on the theory that a fence
+        # was unreachable below enforce; that is true of `off` alone. Gated
+        # here and in `_check_claim_or_raise` by the same predicate, so the
+        # two sites still cannot answer one verdict two different ways.
+        if answer.verdict == CLAIM_FENCED and rollout.new_answer_may_veto():
             raise ImplementerFenced(
                 f"{FENCED_ERROR_PREFIX} claim for {entity.kind}:{entity.id}/{phase} "
                 f"fenced at acquire: {answer.reason}"
             )
         if blocks_mutation(answer):
+            # Two answers block here, and they are NOT the same event. A
+            # CLAIM_UNKNOWN reaches this branch at `enforce` by default —
+            # `ownership_required()` reads LIFECYCLE_OWNERSHIP_REQUIRED with a
+            # default of true — so an expired token or a 503 from mctl-api
+            # lands on a message that must not assert a competing executor
+            # nobody can find (claude P2 on `31232dc`).
+            if answer.verdict == CLAIM_UNKNOWN:
+                raise ImplementerClaimRefused(
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the claim store could not answer for "
+                    f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}. "
+                    f"Nobody is known to hold it; uncertainty is failed closed because "
+                    f"LIFECYCLE_OWNERSHIP_REQUIRED is on (set it to false to proceed anyway)"
+                )
             raise ImplementerClaimRefused(
-                f"another executor holds the claim for {entity.kind}:{entity.id}/{phase}: "
-                f"{answer.reason or answer.verdict}"
+                f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
+                f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}"
             )
-        # Everything left is "I could not tell" (CLAIM_UNKNOWN), or any answer
-        # at a rollout stage below `enforce` where the claim is advisory by
-        # design. Decline the claim — never adopt a claim_id that may name the
-        # winning executor's claim rather than ours — and proceed exactly as
-        # this module did before claims existed.
+        # Everything left is an answer at a rollout stage where the claim is
+        # advisory by design — below `enforce`, or a CLAIM_UNKNOWN with the
+        # ownership break-glass explicitly off. Decline the claim — never
+        # adopt a claim_id that may name the winning executor's claim rather
+        # than ours — and proceed exactly as this module did before claims
+        # existed.
         return None
     claim_id = answer.claim.claim_id if answer.claim else ""
     return _ClaimContext(
@@ -722,18 +776,39 @@ def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = No
     answer = ctx.client.check(
         ctx.claim_id, ctx.entity, ctx.phase, ctx.owner_epoch, version, ctx.executor, ctx.attempt
     )
-    if answer.verdict == CLAIM_FENCED:
+    if answer.verdict == CLAIM_FENCED and not rollout.new_answer_may_veto():
+        # Below `enforce` the claim is advisory: observe records writes, so a
+        # fence genuinely arrives here, and stopping the push on it would make
+        # the observe stage decide. Logged instead — the divergence is the
+        # whole product of that stage (agy P2 on `31232dc`).
+        print(
+            f"lifecycle: claim for {ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} answered "
+            f"fenced before push ({answer.reason}); advisory below enforce, pushing anyway"
+        )
+    elif answer.verdict == CLAIM_FENCED:
         raise ImplementerFenced(
             f"{FENCED_ERROR_PREFIX} claim for {ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} "
             f"fenced before push: {answer.reason}"
         )
     if blocks_mutation(answer):
-        # Not a fence: CLAIM_UNKNOWN under the enforce break-glass, or
-        # someone else genuinely holds it. Left as a plain error, which
-        # `_review_feedback_exit_code` leaves as EXIT_GENERIC_FAILURE — the
-        # shepherd's transient, non-charging arm, since this attempt did
-        # nothing wrong and a retry may simply find the store reachable again.
-        raise RuntimeError(f"claim check blocked the push: {answer.reason}")
+        # Not a fence: either the store could not answer while the ownership
+        # break-glass is on, or someone else genuinely holds it. Same two
+        # answers, same split and the same exception as `_acquire_claim`, so
+        # one verdict cannot be reported two different ways depending on which
+        # site observed it — and EXIT_CLAIM_REFUSED so the shepherd names it
+        # instead of printing "subprocess failed transiently". Still
+        # non-charging: this attempt did nothing wrong.
+        if answer.verdict == CLAIM_UNKNOWN:
+            raise ImplementerClaimRefused(
+                f"{CLAIM_REFUSED_ERROR_PREFIX} the claim store could not answer for "
+                f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} before the push: "
+                f"{answer.reason or answer.verdict}. Nobody is known to hold it; "
+                f"uncertainty is failed closed because LIFECYCLE_OWNERSHIP_REQUIRED is on"
+            )
+        raise ImplementerClaimRefused(
+            f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
+            f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase}: {answer.reason or answer.verdict}"
+        )
 
 
 _PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
@@ -1443,12 +1518,14 @@ def review_feedback_one(
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
     except ImplementerClaimRefused as e:
-        # Another executor holds the review-remediation claim on this PR. Not
-        # a failure of the findings and not a fence: nothing moved, this
-        # attempt simply lost the race, and the holder is pushing the fix-up
-        # right now. Left as EXIT_GENERIC_FAILURE, which the shepherd reads as
-        # transient and non-charging — the correct reading, since the next
-        # tick will find either the holder's commit or a free claim.
+        # A claim check refused this attempt on this PR. Not a failure of the
+        # findings and not a fence: nothing moved, this attempt either lost
+        # the race or could not reach the store under the ownership
+        # break-glass. Mapped to EXIT_CLAIM_REFUSED, which the shepherd
+        # classifies alongside a fence: non-charging, and printed as the claim
+        # decision it is rather than as "subprocess failed transiently" — a
+        # leaked lease otherwise repeats that misleading line every tick for
+        # the full lease (claude P3 on `31232dc`).
         release_reason = "claim held by another executor"
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
@@ -1995,14 +2072,25 @@ def _push_and_open_pr(
     repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
 ) -> str:
     branch = f"feat/agents-{ref.slug}"
-    if _branch_exists_on_origin(repo_dir, branch):
+    expected_sha = _remote_head_sha(repo_dir, branch) if _branch_exists_on_origin(repo_dir, branch) else None
+    if expected_sha:
         # A previous attempt already pushed and died before opening the PR —
         # a retried pod, exactly the case ADR-010 §8 names (mctl-agents#352).
-        # Adopt the branch rather than blindly `-u` pushing again, and CAS on
-        # the head this attempt just observed: `--force-with-lease` fails the
-        # push if a third writer moves the branch in the gap between this
-        # read and the push below.
-        expected_sha = _remote_head_sha(repo_dir, branch) or ""
+        # REPLACE, not adopt: this attempt cloned fresh and recreated the
+        # branch off the default branch, so the local branch does not contain
+        # the dead attempt's commits and this push discards them. That is
+        # intended — those commits are referenced by no PR, and the findings
+        # they were meant to address are being implemented again here — but
+        # `--force-with-lease` proves only that nobody MOVED the ref since the
+        # read below, never that we contain it, so calling it an adoption read
+        # as a guarantee it does not make (claude P3, carried from `b64b35b`).
+        #
+        # The lease is still the CAS that matters: it fails the push if a
+        # third writer moves the branch in the gap between the read above and
+        # the push below. A missing head is NOT expressible as a lease —
+        # `--force-with-lease=<branch>:` means "must not already exist", the
+        # negation of the precondition that selected this path — so an
+        # unreadable head falls through to the plain `-u` push instead.
         if claim_context is not None:
             # Deliberately NOT `entity_version=expected_sha`. This claim is on
             # the PROPOSAL (`EntityRef.for_proposal`, acquired with
@@ -2020,8 +2108,9 @@ def _push_and_open_pr(
             cwd=repo_dir,
         )
     else:
-        # Brand new branch — no remote ref exists, so git has nothing to fence
-        # against. The CLAIM still does: the model ran for a long time between
+        # Brand new branch — no remote ref exists (or its head could not be
+        # read), so git has nothing to fence against. The CLAIM still does:
+        # the model ran for a long time between
         # the acquire and here, and the claim may have been fenced or expired
         # in that window. ADR-010 requires the check immediately before EVERY
         # push this module performs, and "there is no remote ref yet" is a
@@ -2156,6 +2245,17 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     #
     # Below `enforce` this still cannot block: the claim is advisory there and
     # `_acquire_claim` returns None.
+    #
+    # The order has a known cost, accepted deliberately: between a granted
+    # acquire and the `in-progress` write below, this process holds a claim
+    # that no `.status.yaml` records. A SIGKILL in that window (eviction, OOM,
+    # node drain) leaves an active claim with no `attempt` block, so
+    # `_attempt_is_fresh` — which reads only the yaml — answers "not held",
+    # the shepherd re-invokes, and every re-invocation is refused by the
+    # orphan claim until its lease expires. Bounded by that lease and by a
+    # window of two writes; the alternative ordering trades it for stamping
+    # our identity over a live holder, which is unbounded and silent (claude
+    # P3 on `31232dc`).
     try:
         claim_ctx = _acquire_claim(
             EntityRef.for_proposal(ref.service, ref.slug),

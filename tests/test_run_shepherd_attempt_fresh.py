@@ -16,6 +16,7 @@ from orchestrator import run_shepherd
 from orchestrator.lifecycle.contract import (
     CLAIM_HELD_BY_ME,
     CLAIM_HELD_BY_OTHER,
+    CLAIM_UNCLAIMED,
     CLAIM_UNKNOWN,
     ClaimAnswer,
 )
@@ -137,13 +138,55 @@ def test_at_only_a_claim_held_by_another_still_wins(
 
 def test_at_only_the_yaml_lease_is_not_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """At `only` a claim is the sole answer: an unexpired yaml lease no
-    longer matters once the claim answers negatively."""
+    longer matters once the claim answers a DEFINITE no.
+
+    Deliberately CLAIM_UNCLAIMED and not CLAIM_UNKNOWN — "nobody holds this"
+    is an answer, "I could not reach the store" is not, and the two must not
+    be demonstrated with the same fixture.
+    """
     monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "only")
     monkeypatch.setattr(
-        run_shepherd.ClaimClient, "check", lambda self, *a, **kw: ClaimAnswer(verdict=CLAIM_UNKNOWN)
+        run_shepherd.ClaimClient, "check", lambda self, *a, **kw: ClaimAnswer(verdict=CLAIM_UNCLAIMED)
     )
     future = (datetime.now(UTC) + timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
     ref = _ref(tmp_path, id="attempt-1", expires_at=future)
+    assert run_shepherd._attempt_is_fresh(ref) is False
+
+
+def test_an_unreachable_store_does_not_free_an_attempt_at_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Uncertainty never licenses a second executor.
+
+    At `only` the yaml lease is not consulted, so before this arm an mctl-api
+    outage answered "not fresh" for every in-flight attempt at once and the
+    shepherd would have started a concurrent implementer against each — the
+    store being down becoming the thing that breaks the invariant it enforces
+    (agy P2 on `31232dc`).
+    """
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "only")
+    monkeypatch.delenv("LIFECYCLE_OWNERSHIP_REQUIRED", raising=False)
+    monkeypatch.setattr(
+        run_shepherd.ClaimClient, "check", lambda self, *a, **kw: ClaimAnswer(verdict=CLAIM_UNKNOWN)
+    )
+    past = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    ref = _ref(tmp_path, id="attempt-1", expires_at=past)
+    assert run_shepherd._attempt_is_fresh(ref) is True
+
+
+def test_the_break_glass_can_still_release_an_unknown_at_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`LIFECYCLE_OWNERSHIP_REQUIRED=false` is the documented break-glass, and
+    it is the ONLY way an unreachable store stops holding attempts. Same gate
+    `claim.blocks_mutation` uses, so the two cannot drift apart."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "only")
+    monkeypatch.setenv("LIFECYCLE_OWNERSHIP_REQUIRED", "false")
+    monkeypatch.setattr(
+        run_shepherd.ClaimClient, "check", lambda self, *a, **kw: ClaimAnswer(verdict=CLAIM_UNKNOWN)
+    )
+    past = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    ref = _ref(tmp_path, id="attempt-1", expires_at=past)
     assert run_shepherd._attempt_is_fresh(ref) is False
 
 

@@ -3663,7 +3663,32 @@ def test_fenced_code_is_classified_on_its_own() -> None:
     assert run_implementer.EXIT_FENCED not in deterministic
     assert run_implementer.EXIT_FENCED not in harness
     assert run_implementer.EXIT_FENCED not in run_shepherd._refusal_codes()
-    assert fenced == frozenset({48})
+    assert run_implementer.EXIT_CLAIM_REFUSED in fenced
+    assert fenced == frozenset({48, 49})
+
+
+def test_a_claim_refusal_is_classified_with_the_fence_not_as_transient() -> None:
+    """49 is a different EVENT from 48 — nothing moved, this attempt simply
+    may not act — but the same shepherd handling. Left on the `transient` arm
+    it reached the operator as "follow-up subprocess failed transiently", and
+    a claim leaked by a crashed pod repeated that line every tick for the full
+    lease (claude P3 on `31232dc`)."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_CLAIM_REFUSED
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", lambda *a, **kw: _Result()):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "fenced"
+    assert exc.value.transient is True
+    assert run_implementer.EXIT_CLAIM_REFUSED not in run_shepherd._refusal_codes()
 
 
 def test_apply_followup_classifies_a_fenced_exit_as_fenced() -> None:
@@ -3769,6 +3794,36 @@ def test_apply_followup_cleans_up_the_refusal_temp_file() -> None:
             run_shepherd.apply_followup("mctl-web", "test-slug", findings)
 
     assert seen and not Path(seen[0]).exists()
+
+
+def test_outer_loop_does_not_charge_an_attempt_on_a_fence(tmp_path, capsys) -> None:
+    """A fenced follow-up waits and costs nothing.
+
+    The classification is only half the fix: `process_one` must also leave
+    `review_attempts`, `harness_failures` and the status untouched, so an
+    executor that correctly lost a race does not spend the budget of the one
+    that won it (agy P3 on `31232dc`).
+    """
+    ref = make_ref(tmp_path, review_attempts=3)
+
+    def fenced(*_a, **_kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "implementer follow-up exited non-zero (48)", kind="fenced",
+        )
+
+    result = _drive(ref, fenced)
+
+    assert result.decision == "wait"
+    final = read_status(ref)
+    assert final["review_attempts"] == 3
+    assert final["status"] == "implemented"
+    assert "harness_failures" not in final
+    assert ref.review_attempts == 3
+    # The distinct log line is the point of naming this outcome: a claim
+    # decision, not "subprocess failed transiently".
+    out = capsys.readouterr().out
+    assert "a claim check stood the follow-up down" in out
+    assert "transiently" not in out
 
 
 def test_outer_loop_does_not_charge_an_attempt_on_refusal(tmp_path, capsys) -> None:

@@ -318,3 +318,24 @@ def test_blocks_mutation_respects_rollout_stage(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("LIFECYCLE_OWNERSHIP_REQUIRED", "false")
     assert blocks_mutation(unknown) is False, "break-glass exempts UNKNOWN only"
     assert blocks_mutation(fenced) is True, "the break-glass never exempts a genuine fence"
+
+
+@pytest.mark.parametrize("payload", ["502 Bad Gateway", ["error"], None, 7])
+def test_a_non_dict_error_body_still_answers_unknown(payload) -> None:
+    """A gateway in front of mctl-api can answer a valid JSON scalar or list.
+
+    `_claim_error_of` called `.get()` on whatever `json.loads` returned, so a
+    proxy's `"502 Bad Gateway"` raised AttributeError from inside the very
+    branch that exists to answer CLAIM_UNKNOWN — a fail-closed verdict turned
+    into a crash (agy P3 on `31232dc`).
+    """
+    answer = claim_answer_from(502, payload, None)
+    assert answer.verdict == CLAIM_UNKNOWN
+    assert answer.may_execute is False
+
+
+@pytest.mark.parametrize("payload", ["conflict", [], None])
+def test_a_non_dict_409_body_still_fails_closed(payload) -> None:
+    answer = claim_answer_from(409, payload, None)
+    assert answer.verdict == CLAIM_HELD_BY_OTHER
+    assert answer.may_execute is False

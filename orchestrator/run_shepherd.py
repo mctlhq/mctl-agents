@@ -90,6 +90,7 @@ from orchestrator.lifecycle import rollout, shadow
 from orchestrator.lifecycle.claim import ClaimClient
 from orchestrator.lifecycle.contract import (
     CLAIM_HELD_BY_OTHER,
+    CLAIM_UNKNOWN,
     OWNER_IMPLEMENTER,
     PHASE_IMPLEMENT,
     EntityRef,
@@ -709,16 +710,24 @@ def _refusal_codes() -> frozenset[int]:
 
 
 def _fenced_codes() -> frozenset[int]:
-    """Exit codes that mean "an ExecutionClaim check fenced this attempt".
+    """Exit codes that mean "an ExecutionClaim check stood this attempt down".
 
-    A fourth set for the same reason ``_refusal_codes`` is its own: a fence
-    is neither deterministic (the proposal did nothing wrong) nor a harness
-    failure (nothing was lost — the check ran and correctly refused) nor a
-    refusal (the agent never even ran; the check aborted before it did).
+    A fourth set for the same reason ``_refusal_codes`` is its own: a claim
+    decision is neither deterministic (the proposal did nothing wrong) nor a
+    harness failure (nothing was lost — the check ran and correctly refused)
+    nor a refusal (the agent never even ran; the check aborted before it did).
+
+    Two codes, one kind. ``EXIT_FENCED`` (48) means the world moved under this
+    attempt; ``EXIT_CLAIM_REFUSED`` (49) means it may not act right now —
+    another executor holds the entity, or the store could not answer under the
+    ownership break-glass. They are different events, and the message says
+    which, but the shepherd's handling is identical: charge nothing, print the
+    claim decision rather than "subprocess failed transiently", retry next
+    tick against a fresh claim.
     """
     from orchestrator import run_implementer  # deferred — see apply_followup
 
-    return frozenset({run_implementer.EXIT_FENCED})
+    return frozenset({run_implementer.EXIT_FENCED, run_implementer.EXIT_CLAIM_REFUSED})
 
 
 def _read_refusal_reason(path: str) -> str | None:
@@ -2174,11 +2183,12 @@ def apply_followup(
         # an operator decision, which is what exhausted the budget on
         # portfolio#56.
         #
-        # `EXIT_FENCED` = 48 is the fifth: an ExecutionClaim check refused the
-        # attempt because someone else owns the entity now. Not the proposal's
-        # fault, so not chargeable; nothing was lost, so not a harness failure;
-        # the agent never ran, so not a refusal. It gets its own arm before
-        # the harness/deterministic ones, because a fence is a positive
+        # `EXIT_FENCED` = 48 and `EXIT_CLAIM_REFUSED` = 49 are the fifth: an
+        # ExecutionClaim check stood the attempt down — the world moved under
+        # it (48), or it may not act right now (49). Not the proposal's fault,
+        # so not chargeable; nothing was lost, so not a harness failure; the
+        # agent never ran, so not a refusal. They get their own arm before the
+        # harness/deterministic ones, because a claim decision is a positive
         # identification and must not fall through to `transient`.
         deterministic_codes, harness_codes = _followup_code_sets()
         kind: FollowupKind
@@ -2548,9 +2558,13 @@ def process_one(
                 )
             if e.kind == "fenced":
                 # Not a failure of the proposal or the findings — an
-                # ExecutionClaim check right before the push answered
-                # CLAIM_FENCED (ADR-010 phase 2, #352): the owner epoch moved
-                # or the pinned entity version changed under this attempt.
+                # ExecutionClaim check stood this attempt down (ADR-010 phase
+                # 2, #352): either CLAIM_FENCED right before the push (the
+                # owner epoch moved, or the pinned entity version changed
+                # under this attempt), or a refusal — another executor holds
+                # the entity, or the store could not answer under the
+                # ownership break-glass. `_fenced_codes()` carries both; the
+                # message printed below says which.
                 # Distinct log line from the plain transient arm below: a
                 # fence is a POSITIVE signal that the world moved on, not an
                 # unexplained plumbing blip, and an operator reading the two
@@ -2559,9 +2573,9 @@ def process_one(
                 # move — the executor did nothing wrong, and the next tick
                 # takes a fresh claim against the current world.
                 print(
-                    f"info: {ref.service}/{ref.slug}: follow-up fenced ({e}); "
-                    f"not charging a review attempt; the next tick will take a "
-                    f"fresh claim"
+                    f"info: {ref.service}/{ref.slug}: a claim check stood the "
+                    f"follow-up down ({e}); not charging a review attempt; the "
+                    f"next tick will take a fresh claim"
                 )
                 return ShepherdResult(
                     ref=ref,
@@ -2744,8 +2758,13 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
 
     The claim check only affects the answer at `enforce` and above:
     `observe` computes and logs a divergence but composes no safety, the
-    same rule every other rollout stage in this codebase follows. At `only`
-    the yaml read is gone — a claim is the sole answer.
+    same rule every other rollout stage in this codebase follows. At `only` a
+    DEFINITE claim answer is the sole answer and the yaml lease below is not
+    read — but only where the claim branch runs at all: with no recorded
+    holder `id` there is nobody to ask about, the branch is skipped, and the
+    yaml lease is read at every stage including `only`. An indefinite answer
+    (`CLAIM_UNKNOWN`) does not decide either; it holds the entity, gated on
+    the `LIFECYCLE_OWNERSHIP_REQUIRED` break-glass.
     """
     attempt = _load_status(ref.status_path).get("attempt") or {}
     holder = attempt.get("id") if isinstance(attempt, dict) else None
@@ -2771,6 +2790,17 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
             # (codex P1/P2 on ADR-010 phase 2, #352). Always fail closed
             # here, regardless of rollout stage — this only runs where the
             # claim mechanism is active in the first place.
+            return True
+        if answer.verdict == CLAIM_UNKNOWN and rollout.blocks_on_unknown():
+            # Uncertainty never licenses a second executor. At `only` the yaml
+            # lease is not consulted, so without this arm an mctl-api outage
+            # answers "the attempt is not fresh" for EVERY in-flight attempt
+            # and the shepherd starts a concurrent implementer against each
+            # one — a store being down turned into the thing that breaks the
+            # invariant it enforces (agy P2 on `31232dc`). Same shape as
+            # `claim.blocks_mutation`: UNKNOWN is gated on the
+            # `LIFECYCLE_OWNERSHIP_REQUIRED` break-glass, never treated like a
+            # definite answer.
             return True
         if rollout.new_answer_decides():
             return False
