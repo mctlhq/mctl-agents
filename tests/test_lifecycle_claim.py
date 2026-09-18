@@ -311,6 +311,26 @@ def test_two_acquires_produce_exactly_one_winner(monkeypatch: pytest.MonkeyPatch
     assert a2.claim is not None and a2.claim.executor == ME
 
 
+def test_env_example_never_pins_a_computed_claim_lease() -> None:
+    """`_claim_lease_seconds` reads any non-empty value as an ABSOLUTE
+    override, so an active line in `.env.example` propagates into every
+    environment copied from it and clamps a lease the code computes. For the
+    review lease that defeats the floor entirely: raising
+    IMPLEMENTER_TIMEOUT_SECONDS no longer raises the lease, the claim expires
+    mid-run, and the push-site check stands a valid attempt down (agy P2 on
+    `0af3b38`). The example file may document the variables; it must not set
+    them."""
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / ".env.example"
+    active = [
+        line
+        for line in example.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("LIFECYCLE_CLAIM_LEASE_SECONDS_")
+    ]
+    assert active == [], active
+
+
 def test_a_retaken_409_is_logged_renewed_not_acquired(monkeypatch: pytest.MonkeyPatch) -> None:
     """The store REFUSED this acquire; the client read the record as ours. The
     event must say what the store did — `acquired` asserts a grant that never
@@ -481,8 +501,9 @@ def test_a_refused_release_is_not_logged_as_released(monkeypatch: pytest.MonkeyP
 
 
 def test_renew_sends_lease_seconds_and_parses_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`renew` has no production callers yet — the review lease is sized to
-    outlive its run instead — so its wire shape is only held in place by this
+    """`renew`'s only production call is the retake in `_acquire_claim`, which
+    never varies the body — the review lease is sized to outlive its run
+    instead of being heartbeated — so its wire shape is held in place by this
     test (agy P3 on `c29195c`)."""
     sent: list[dict[str, Any]] = []
     paths: list[str] = []
@@ -520,3 +541,76 @@ def test_record_sends_the_idempotency_key_and_outcome(monkeypatch: pytest.Monkey
     assert sent[0]["action"] == "push"
     assert sent[0]["outcome"] == "ok"
     assert paths[0].endswith("/record")
+
+
+# --- a 2xx renew with no record (claude P2 on `0af3b38`) --------------------
+
+
+@pytest.mark.parametrize(
+    "payload,body_empty",
+    [({}, True), ({"status": "renewed"}, False), ({"ok": True}, False)],
+)
+def test_a_renew_the_store_performed_is_held_by_me_even_with_no_record(
+    payload: dict[str, Any], body_empty: bool
+) -> None:
+    """`/renew` is addressed BY CLAIM ID by the actor already holding it, so a
+    2xx answers the only question asked and the record resolves nothing the
+    caller did not send. Reading it as UNKNOWN refuses the attempt whose lease
+    the store just extended — and under the ownership break-glass it does so on
+    every restart until the orphan lease expires."""
+    answer = claim_answer_from(
+        200 if payload else 204,
+        payload,
+        ME,
+        path="/api/v1/lifecycle/claims/renew",
+        body_empty=body_empty,
+    )
+    assert answer.verdict == CLAIM_HELD_BY_ME
+    assert answer.claim is None
+    assert answer.accepted is True
+
+
+def test_a_2xx_body_we_could_not_parse_is_never_a_renew() -> None:
+    """The gateway case the ownership side already fails closed on: an HTML
+    error page served with a 200 reaches the contract as an empty mapping with
+    `body_empty` False. It is not a no-content success and must stay UNKNOWN."""
+    answer = claim_answer_from(
+        200, {}, ME, path="/api/v1/lifecycle/claims/renew", body_empty=False
+    )
+    assert answer.verdict == CLAIM_UNKNOWN
+
+
+def test_only_renew_reads_a_recordless_2xx_as_a_hold() -> None:
+    """On `acquire` the record is the only thing naming the winner, so a
+    body-less 2xx there is a protocol anomaly, not a grant. The path list is
+    closed on this side deliberately."""
+    for route in ("acquire", "check", "record", "release"):
+        answer = claim_answer_from(
+            204, {}, ME, path=f"/api/v1/lifecycle/claims/{route}", body_empty=True
+        )
+        assert answer.verdict == CLAIM_UNKNOWN, route
+
+
+# --- the op field on the event line (claude P3 on `0af3b38`) ---------------
+
+
+def test_a_retake_and_its_renew_are_two_distinguishable_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The retake maps a refused `acquire` onto `renewed` and then renews for
+    real. Without the call that produced it, the two lines are byte-identical
+    and the event the remap exists to surface cannot be counted."""
+    out = io.StringIO()
+    monkeypatch.setattr("sys.stdout", out)
+    claim_module._emit(
+        claim_module.EVENT_RENEWED, ENTITY, PHASE, 0, "sha-a", ME, "attempt-1", "c1",
+        op="acquire",
+    )
+    claim_module._emit(
+        claim_module.EVENT_RENEWED, ENTITY, PHASE, 0, "sha-a", ME, "attempt-1", "c1",
+        op="renew",
+    )
+    first, second = out.getvalue().splitlines()
+    assert first.endswith("op=acquire")
+    assert second.endswith("op=renew")
+    assert first != second

@@ -583,12 +583,29 @@ resolved as implemented, not merely proposed:
   expiring before the run it guards, which answers `CLAIM_UNCLAIMED` to the
   shepherd's freshness check and lets a second implementer start against a
   live one. So `_acquire_claim` renews the adopted claim before returning a
-  context (the renew this section's determinism exists for), refuses when the
-  record carries no claim id to renew or check, and treats a refused renew as
-  the refusal the 409 originally was — through the same rollout predicate as
-  every other refusal, so the stages cannot drift. The acquire is logged
-  `renewed`, never `acquired`: the store granted nothing, and the retake is
-  the event worth seeing, because reaching it means a pod died holding a claim.
+  context (the renew this section's determinism exists for) and treats a
+  refused renew as the refusal the 409 originally was — through the same
+  rollout predicate as every other refusal, so the stages cannot drift. The
+  acquire is logged `renewed`, never `acquired`: the store granted nothing, and
+  the retake is the event worth seeing, because reaching it means a pod died
+  holding a claim. The two `renewed` lines it produces — the remapped acquire
+  and the renew itself — are told apart by the `op=` field the claim log
+  carries, not by a seventh event: the vocabulary above stays closed.
+
+  **A 2xx renew needs no record.** `/claims/renew` is the one claim route whose
+  success is meaningful with an empty body, and the client reads a `204`, a
+  `{"status": "renewed"}` or an `{"ok": true}` as `claim-held-by-me` with no
+  record attached. A renew is addressed BY CLAIM ID by the actor already
+  holding it, so the record resolves nothing the caller did not send, and
+  nobody new is licensed; on `acquire`, where the record is the only thing
+  naming the winner, a body-less 2xx stays the protocol anomaly it is. This is
+  the claim-side counterpart of `/release` and `/terminal` answering
+  `wrote-no-record`, and it is pinned here because the retake made `renew` a
+  safety input for the first time: without it a store that answers renews
+  body-lessly refuses the restarted attempt on every restart, under
+  `LIFECYCLE_OWNERSHIP_REQUIRED`, until the orphan lease expires. A body that
+  fails to parse — an HTML error page served with a 200 — is not in this
+  branch: it answers `claim-unknown`, as before.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
   resolves `WORKFLOW_UID`, then
   `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The
@@ -611,10 +628,15 @@ resolved as implemented, not merely proposed:
   contract. The review default is one `MERGE_POLL_INTERVAL` (1800s) as a
   FLOOR, widened to `IMPLEMENTER_TIMEOUT_SECONDS + 2 ×
   IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` when those bound a longer run. Nothing
-  renews a claim mid-run — `ClaimClient.renew` exists but has no production
-  callers — so a lease shorter than the run holding it expires under its own
-  attempt and comes back from the push-site check as `CLAIM_UNCLAIMED`,
-  standing the attempt down for a race that never happened.
+  renews a claim mid-run — `ClaimClient.renew`'s only production call is the
+  retake in `_acquire_claim`, which runs once, before the run starts, and never
+  again as a heartbeat — so a lease shorter than the run holding it expires
+  under its own attempt and comes back from the push-site check as
+  `CLAIM_UNCLAIMED`, standing the attempt down for a race that never happened.
+  Both variables are therefore shipped COMMENTED OUT in `.env.example`:
+  `_claim_lease_seconds` treats any non-empty value as an absolute override,
+  so an active `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW=1800` re-pins the floor
+  the sizing above exists to widen (agy P2 on `0af3b38`).
 
 `run_implementer._push_followup` and the existing-branch path of
 `_push_and_open_pr` now push with `--force-with-lease=<branch>:<sha>` — the

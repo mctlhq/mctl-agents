@@ -68,8 +68,17 @@ def _emit(
     executor: Executor,
     attempt: str,
     claim_id: str,
+    *,
+    op: str = "",
 ) -> None:
     """Emit one structured claim event line. Never raises.
+
+    ``op`` is the CALL that produced the event, which is not the event: the
+    retake maps a refused `acquire` onto `renewed` and then renews for real,
+    and without the op the two lines are byte-identical, so the one event the
+    remap exists to surface — a pod died holding a claim — cannot be counted
+    or alerted on (claude P3 on `0af3b38`). Kept out of the event vocabulary
+    itself, which stays the closed six-word set ADR-010 §6 pins.
 
     A logging call must not be the reason a claim decision is lost: this
     function runs after the HTTP round trip already completed, so an
@@ -80,7 +89,8 @@ def _emit(
         print(
             f"{LOG_PREFIX} {event} entity={entity.kind}:{entity.id} phase={phase} "
             f"epoch={owner_epoch} version={entity_version} "
-            f"executor={executor.type}/{executor.id} attempt={attempt} claim={claim_id}",
+            f"executor={executor.type}/{executor.id} attempt={attempt} claim={claim_id}"
+            + (f" op={op}" if op else ""),
             flush=True,
         )
     except Exception:  # noqa: BLE001, S110 — emission must never raise, and the
@@ -449,4 +459,7 @@ class ClaimClient:
             # A successful check()/record() is a pass-through, not a
             # decision — nothing changed, so nothing is logged.
             return
-        _emit(event, entity, phase, owner_epoch, entity_version, executor, attempt, claim_id)
+        _emit(
+            event, entity, phase, owner_epoch, entity_version, executor, attempt, claim_id,
+            op=op_name,
+        )

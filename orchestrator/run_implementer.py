@@ -589,8 +589,10 @@ class ImplementerClaimRefused(RuntimeError):
       that does not exist (claude P2 on `31232dc`);
     - CLAIM_UNCLAIMED where a hold was expected — `claim_verdict_for` answers
       it for `released`, `expired` and `fenced`, so the common shape is this
-      attempt's OWN lease running out mid-run (`ClaimClient.renew` has no
-      production callers). Nobody else holds it either; naming a rival here
+      attempt's OWN lease running out mid-run — `ClaimClient.renew` runs only
+      on the retake path, never as a heartbeat, so a lease that is too short
+      for the run holding it is still never extended. Nobody else holds it
+      either; naming a rival here
       hides the one thing an operator can act on, which is the lease
       (claude P2 on `d5e2a48`).
 
@@ -679,7 +681,8 @@ def _claim_lease_seconds(env_var: str, default: timedelta) -> int:
 # One MERGE_POLL_INTERVAL (run_shepherd.py) — a review-remediation claim only
 # needs to outlive one shepherd poll, not a full implement run. It is a FLOOR,
 # not the whole answer: the lease also has to outlive the run that holds it,
-# and nothing renews it (`ClaimClient.renew` has no production callers). A
+# and nothing renews it mid-run — the one production call of `ClaimClient.renew`
+# is the retake in `_acquire_claim`, which runs once, before the run starts. A
 # claim that expires mid-run comes back from the push-site check as
 # CLAIM_UNCLAIMED and stands the attempt down for no reason at all, so the
 # default is sized from the two timeouts that actually bound the run rather
@@ -873,18 +876,12 @@ def _acquire_claim(
         # point of the deterministic identity. A refused renew is the refusal
         # the 409 originally was, answered by the same rollout predicate as
         # every other refusal here so the stages cannot drift.
-        if not claim_id:
-            # A 409 body with no readable claim_id cannot be renewed or checked:
-            # `check` would send an empty id, which is a well-formed request for
-            # a claim that does not exist, and the refusal would surface much
-            # later as a push-site fence (claude P3 on `6794aad`).
-            raise ImplementerClaimRefused(
-                f"{CLAIM_REFUSED_ERROR_PREFIX} the acquire for "
-                f"{entity.kind}:{entity.id}/{phase} was refused with a record naming this "
-                f"attempt but no claim id, so the claim it names cannot be renewed or "
-                f"checked: {answer.reason or answer.verdict}",
-                verdict=CLAIM_UNKNOWN,
-            )
+        # `claim_id` is non-empty here by construction, and deliberately not
+        # re-checked: `retaken` is set only where `claim_verdict_for` read a
+        # record `ExecutionClaim.from_payload` accepted, and that parse requires
+        # a claim id. The guard this replaced could not run, and being the one
+        # refusal in this function the rollout predicate did not gate, it said
+        # the opposite of the paragraph above it (claude P3 on `0af3b38`).
         renewed = client.renew(
             claim_id, entity, phase, 0, entity_version, executor, attempt,
             lease_seconds=lease_seconds,

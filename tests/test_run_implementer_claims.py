@@ -23,6 +23,7 @@ from orchestrator.lifecycle.contract import (
     CLAIM_UNKNOWN,
     ClaimAnswer,
     ExecutionClaim,
+    claim_answer_from,
 )
 
 
@@ -312,26 +313,35 @@ def test_a_refused_renew_is_advisory_below_enforce(monkeypatch: pytest.MonkeyPat
     ) is None
 
 
-def test_a_retake_with_no_claim_id_is_refused_not_carried(
+def test_a_renew_the_store_performed_without_a_record_keeps_the_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An empty claim id still produces well-formed `check` requests, so this
-    would regress silently and surface much later as a push-site fence (claude
-    P3 on `6794aad`)."""
+    """The retake made `renew` a safety input for the first time, and mctl-api
+    may answer a renew it PERFORMED with a `204` or a bare `{"ok": true}`.
+    Reading that as UNKNOWN refuses the restarted attempt on every restart
+    until the orphan lease expires — the stall the retake exists to end
+    (claude P2 on `0af3b38`). The claim id is the one the 409 named; nothing
+    was left for the record to resolve."""
     monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
-    monkeypatch.setattr(
-        run_implementer, "ClaimClient",
-        _retaking_client(ClaimAnswer(verdict=CLAIM_HELD_BY_ME), claim_id=""),
-    )
-    with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
-        run_implementer._acquire_claim(
-            run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
-            run_implementer.PHASE_IMPLEMENT,
-            "",
-            "attempt-1",
-            lease_seconds=60,
+    client = _retaking_client(
+        claim_answer_from(
+            204,
+            {},
+            run_implementer.Executor(type=run_implementer.OWNER_IMPLEMENTER, id="attempt-1"),
+            path="/api/v1/lifecycle/claims/renew",
+            body_empty=True,
         )
-    assert excinfo.value.verdict == CLAIM_UNKNOWN
+    )
+    monkeypatch.setattr(run_implementer, "ClaimClient", client)
+    ctx = run_implementer._acquire_claim(
+        run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+        run_implementer.PHASE_IMPLEMENT,
+        "",
+        "attempt-1",
+        lease_seconds=60,
+    )
+    assert ctx is not None
+    assert ctx.claim_id == "c1"
 
 
 def test_acquire_returns_none_below_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -690,8 +700,9 @@ def test_a_vanished_claim_is_not_reported_as_a_competing_holder(
 ) -> None:
     """CLAIM_UNCLAIMED is the THIRD verdict that reaches the refusal branch —
     `claim_verdict_for` answers it for `released`, `expired` and `fenced` —
-    and the common shape is this attempt's own lease running out, since
-    `ClaimClient.renew` has no production callers. Naming a rival there sends
+    and the common shape is this attempt's own lease running out, since nothing
+    renews a claim mid-run — `ClaimClient.renew` runs once, on the retake, before
+    the run starts. Naming a rival there sends
     the operator looking for an executor that does not exist and hides the one
     thing they can act on (claude P2 on `d5e2a48`)."""
     monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")

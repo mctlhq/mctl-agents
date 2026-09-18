@@ -176,7 +176,9 @@ review-remediation follow-up. The review value is a *floor* of `1800`
 `IMPLEMENTER_TIMEOUT_SECONDS + 2 x IMPLEMENTER_COMMAND_TIMEOUT_SECONDS`,
 so the lease outlives the run it guards: with the stock `900 + 2 x 300`
 the floor wins at 1800 seconds, and raising `IMPLEMENTER_TIMEOUT_SECONDS`
-raises the lease with it.
+raises the lease with it. That only holds while the variable is unset: both
+are absolute overrides rather than floors, which is why `.env.example` ships
+them commented out.
 
 ### Tier 3 — PR shepherd
 

@@ -344,6 +344,14 @@ class ExecutionClaimResult:
     lease_until: str = ""
     reason: str = ""
     accepted: bool = False
+    # Carried for the same reason `accepted` is: the field answers a question
+    # the verdict cannot. CLAIM_HELD_BY_ME reaches a workflow identically
+    # whether the store GRANTED the acquire or REFUSED it with a record naming
+    # this attempt, and only the second obliges the caller to renew before
+    # leaning on the lease. Dropping it here is how the wire type would make
+    # that distinction unrepresentable — the omission `OwnershipResult.accepted`
+    # already shipped once (claude P3 on `0af3b38`).
+    retaken: bool = False
 
     @property
     def may_execute(self) -> bool:
@@ -403,6 +411,7 @@ def _claim_result_from(answer: ClaimAnswer) -> ExecutionClaimResult:
         lease_until=claim.lease_until if claim else "",
         reason=answer.reason,
         accepted=answer.accepted,
+        retaken=answer.retaken,
     )
 
 

@@ -124,3 +124,35 @@ def test_missing_credentials_is_unknown_not_raised(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(act, "auth_headers", _no_auth)
     result = anyio.run(act.execution_claim, _req())
     assert result.verdict == CLAIM_UNKNOWN
+
+
+def test_a_retaken_409_reaches_the_workflow_as_a_retake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAIM_HELD_BY_ME arrives identically whether the store GRANTED the
+    acquire or REFUSED it with a record naming this attempt, and only the
+    second obliges the caller to renew before leaning on the lease. Dropping
+    `retaken` from the wire type makes that distinction unrepresentable for
+    the Temporal transport — the omission `OwnershipResult.accepted` already
+    shipped once (claude P3 on `0af3b38`)."""
+    result = _run(monkeypatch, _respond(409, {"code": "claim-held", "claim": _claim()}))
+    assert result.verdict == CLAIM_HELD_BY_ME
+    assert result.retaken is True
+
+
+def test_a_granted_acquire_is_not_marked_retaken_on_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result = _run(monkeypatch, _respond(200, _claim()))
+    assert result.retaken is False
+
+
+def test_a_recordless_2xx_renew_reaches_the_workflow_as_a_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The activity shares one classifier with the sync client, so the renew
+    body tolerance must not be a client-only property."""
+    result = _run(monkeypatch, _respond(204, None), req=_req(op="renew", claim_id="c1"))
+    assert result.verdict == CLAIM_HELD_BY_ME
+    assert result.claim_id == ""
+    assert result.accepted is True

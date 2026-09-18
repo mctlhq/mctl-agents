@@ -782,6 +782,27 @@ def _looks_like_claim_answer(payload: dict[str, Any]) -> bool:
     return claim_record_of(payload) is not None
 
 
+# The one claim route whose 2xx is meaningful WITHOUT a record. Closed, and
+# closed on this side deliberately, exactly like RELINQUISHING_PATH_SUFFIXES
+# above: a named route this image does not recognise must fall through to
+# CLAIM_UNKNOWN, never into the branch that keeps a hold alive.
+#
+# A renew is addressed BY CLAIM ID by the actor that already holds it, so a
+# 2xx answers only one question — "your lease is extended" — and the record it
+# normally carries resolves nothing the caller did not already send. That is
+# what separates it from `acquire`, where the record is the only thing naming
+# the winner and a body-less 2xx is a protocol anomaly. Reading a 2xx renew as
+# CLAIM_UNKNOWN is therefore not fail-closed but simply wrong: it refuses the
+# attempt whose lease the store just extended, and under
+# `LIFECYCLE_OWNERSHIP_REQUIRED` it does so on every restart until the lease
+# runs out — the stall the retake exists to end (claude P2 on `0af3b38`).
+RENEWING_PATH_SUFFIXES = ("/renew",)
+
+
+def _confirms_existing_claim(path: str) -> bool:
+    return path.endswith(RENEWING_PATH_SUFFIXES)
+
+
 def claim_answer_from(
     status: int,
     payload: dict[str, Any],
@@ -802,6 +823,22 @@ def claim_answer_from(
         accepted = body_empty or _looks_like_claim_answer(payload)
         claim = claim_record_of(payload)
         if claim is None:
+            if _confirms_existing_claim(path) and (body_empty or payload):
+                # The store performed the renew and said nothing more: a 204,
+                # a `{"status": "renewed"}`, an `{"ok": true}`. The claim is
+                # held by the asker — that is what a 2xx on this route means —
+                # and no record is attached, because none arrived.
+                #
+                # `body_empty or payload` is the guard that keeps a gateway out
+                # of this branch: an HTML error page served with a 200 parses to
+                # an empty mapping with `body_empty` False, which is neither, so
+                # it still answers CLAIM_UNKNOWN. Only a genuine no-content
+                # answer or a body we could actually parse gets here.
+                return ClaimAnswer(
+                    verdict=CLAIM_HELD_BY_ME,
+                    reason=f"{status} renew with no claim record",
+                    accepted=True,
+                )
             return ClaimAnswer(
                 verdict=CLAIM_UNKNOWN,
                 reason=f"no claim record in a {status} response",
