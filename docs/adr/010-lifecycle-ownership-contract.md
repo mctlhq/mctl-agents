@@ -606,7 +606,17 @@ resolved as implemented, not merely proposed:
   `LIFECYCLE_OWNERSHIP_REQUIRED`, until the orphan lease expires. The branch
   is narrow on purpose, and narrow by ALLOW-list on both axes: it admits an
   empty body, or one whose every key is an acknowledgement name (`ok`,
-  `renewed`, `result`, `status`, `success`) carrying an affirmative value.
+  `renewed`, `result`, `status`, `success`) carrying an affirmative value —
+  literal `true`, or one of `accepted`, `active`, `held`, `ok`, `renewed`,
+  `success`, `updated`, compared case-insensitively. Both sets are written out
+  here because this section is the only place the renew response shape is
+  pinned, and a server author guessing `{"status": "extended"}` or
+  `{"ok": "true"}` would be refused. A store with anything more to say — the
+  new `lease_until` above all — should answer with a FULL claim record, which
+  is read the ordinary way; the tolerance here is for the bare
+  acknowledgement, and a half-record (`{"status": "renewed", "lease_until":
+  ...}`, no `claim_id`, no `state`) is deliberately neither: a partial record
+  is the one shape this image cannot verify and must not assume.
   Everything else answers `claim-unknown` — a record this image could not read
   (a 200 error envelope, a record from a newer mctl-api, a record nested one
   level deeper), and equally an acknowledgement that says NO (`{"ok": false}`,

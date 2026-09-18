@@ -803,17 +803,13 @@ def _confirms_existing_claim(path: str) -> bool:
     return path.endswith(RENEWING_PATH_SUFFIXES)
 
 
-# Every key that means the body was TRYING to describe a claim, or to explain
-# why there is not one. Closed on the fail-CLOSED side: a body carrying any of
-# them is a record (or an error envelope) this image could not read, never an
-# acknowledgement.
-#
 # The distinction `body_empty` alone cannot make. A 200 `{"error": "claim
 # expired"}`, or a record from an mctl-api deploy this image is behind on —
 # a renamed field, a level of nesting added — both leave `claim_record_of`
 # answering None, and reading THAT as a live hold is the same unpinned-shape
 # assumption as the defect this branch fixes, pointed the other way
 # (claude P2 on `b362b5e`).
+#
 # The ONLY keys a bare renew acknowledgement may carry, and the only values
 # they may hold. Both are closed ALLOW-lists, the direction every other set in
 # this module points: a miss falls to CLAIM_UNKNOWN, never to the verdict.
