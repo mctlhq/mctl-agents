@@ -353,6 +353,14 @@ class ClaimClient:
         op_name: str,
         **extra: Any,
     ) -> ClaimAnswer:
+        # The id this call ADDRESSES, bound once beside `path` and `payload`
+        # below rather than re-derived at each of the three exits: a fifth
+        # claim-addressed route is then one place to get right, not three.
+        # `or ""` rather than `str(...)` deliberately — it agrees with the
+        # payload filter a few lines down, which drops both "" and None, so
+        # an id that was never sent can never be logged as one that was
+        # (claude P3 on `3b4b724`).
+        asked_claim_id = extra.get("claim_id") or ""
         if not rollout.records_writes():
             # Break-glass OFF (ADR-010 §12): no claim HTTP call at all. Below
             # `observe` the new answer is never consulted, so making the call
@@ -363,7 +371,7 @@ class ClaimClient:
             )
             self._emit_for(
                 op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
-                status=None, asked_claim_id=str(extra.get("claim_id", "")),
+                status=None, asked_claim_id=asked_claim_id,
             )
             return answer
         payload: dict[str, Any] = {
@@ -384,7 +392,7 @@ class ClaimClient:
             answer = ClaimAnswer(verdict=CLAIM_UNKNOWN, reason=str(exc))
             self._emit_for(
                 op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
-                status=None, asked_claim_id=str(extra.get("claim_id", "")),
+                status=None, asked_claim_id=asked_claim_id,
             )
             return answer
         answer = claim_answer_from(
@@ -392,7 +400,7 @@ class ClaimClient:
         )
         self._emit_for(
             op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
-            status=res.status, asked_claim_id=str(extra.get("claim_id", "")),
+            status=res.status, asked_claim_id=asked_claim_id,
         )
         return answer
 
