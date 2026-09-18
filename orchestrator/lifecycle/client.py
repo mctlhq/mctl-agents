@@ -28,11 +28,11 @@ from typing import Any
 
 from orchestrator.lifecycle.contract import (
     UNKNOWN,
-    UNOWNED,
     EntityRef,
     Owner,
     OwnershipAnswer,
     answer_from,
+    batch_answers_from,
 )
 
 DEFAULT_TIMEOUT_S = 10
@@ -200,29 +200,14 @@ class OwnershipClient:
             res = self._request("GET", query)
         except OwnershipUnavailable as exc:
             return {i: OwnershipAnswer(verdict=UNKNOWN, reason=str(exc)) for i in ids}
-        if not (200 <= res.status < 300):
-            reason = _error_of(res)
-            return {i: OwnershipAnswer(verdict=UNKNOWN, reason=reason) for i in ids}
-        raw_found = res.payload.get("ownership")
-        if not isinstance(raw_found, dict):
-            # A 200 without the envelope this endpoint documents is a surprise.
-            # Reading it as "no records" would report every id UNOWNED, which
-            # is the one wrong answer that licenses action.
-            return {
-                i: OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised batch payload")
-                for i in ids
-            }
-        out: dict[str, OwnershipAnswer] = {}
-        for i in ids:
-            raw = raw_found.get(i)
-            if raw is None:
-                out[i] = OwnershipAnswer(verdict=UNOWNED)
-                continue
-            # Through the SHARED classifier, not a local copy: this was the
-            # one path still deciding for itself, so every reason-string and
-            # state fix made elsewhere stopped at the sweep's door.
-            out[i] = answer_from(200, raw, asking, is_read=True, path=query)
-        return out
+        # Through the SHARED classifier, not a local copy: this path was the
+        # last one deciding for itself what a batch envelope means, so every
+        # reason-string and state fix made elsewhere stopped at the sweep's
+        # door — and the reconcile activity would have had to carry a second
+        # copy of the same rules.
+        return batch_answers_from(
+            res.status, res.payload, ids, asking, path=query, reason=_error_of(res)
+        )
 
     # -- writes ---------------------------------------------------------
 

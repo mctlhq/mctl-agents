@@ -82,6 +82,13 @@ class PRSnapshot:
     number: int
     merged: bool
     closed_unmerged: bool
+    #: The head this read observed. Defaulted, because a snapshot recorded in
+    #: an activity result before this field existed must still deserialize.
+    #: Carried because the lifecycle reconciler records the canonical head as
+    #: evidence for every decision it takes (#353) — it is free here, the PR
+    #: payload is already in hand, and fetching it separately would be a
+    #: second read of the same object for every open PR in the sweep.
+    head_sha: str = ""
 
 
 async def _gather_or_raise(coros: list) -> list:
@@ -340,11 +347,13 @@ async def fetch_pr_snapshots(refs: list[ProposalStateRef]) -> dict[tuple[str, st
                 raise ProposalListingError(f"unexpected payload type from {url}")
             merged = bool(data.get("merged"))
             closed = (data.get("state") or "").lower() == "closed"
+            head = data.get("head")
             snapshots[(ref.service, ref.slug)] = PRSnapshot(
                 repo=repo,
                 number=number,
                 merged=merged,
                 closed_unmerged=closed and not merged,
+                head_sha=str(head.get("sha") or "") if isinstance(head, dict) else "",
             )
 
         await _gather_or_raise([one(ref, repo, number) for ref, repo, number in wanted])

@@ -576,6 +576,46 @@ def answer_from(
     return OwnershipAnswer(verdict=UNKNOWN, reason=_error_of(status, payload))
 
 
+def batch_answers_from(
+    status: int,
+    payload: dict[str, Any],
+    ids: list[str],
+    asking: Owner | None = None,
+    *,
+    path: str = "",
+    reason: str = "",
+) -> dict[str, OwnershipAnswer]:
+    """Turn one `/ownership/batch` response into an answer PER ID.
+
+    Here rather than in a transport for the reason `answer_from` is: there are
+    two callers — the synchronous client used by CLI processes and the async
+    reconcile activity — and the envelope rules below are safety decisions,
+    not parsing details. Every id asked for appears in the result; an id that
+    could not be answered is UNKNOWN, never absent, so a caller iterating the
+    result cannot read a store outage as a clean sweep.
+    """
+    if not (200 <= status < 300):
+        why = reason or _error_of(status, payload)
+        return {i: OwnershipAnswer(verdict=UNKNOWN, reason=why) for i in ids}
+    raw_found = payload.get("ownership")
+    if not isinstance(raw_found, dict):
+        # A 200 without the envelope this endpoint documents is a surprise.
+        # Reading it as "no records" would report every id UNOWNED, which is
+        # the one wrong answer that licenses action.
+        return {
+            i: OwnershipAnswer(verdict=UNKNOWN, reason="unrecognised batch payload")
+            for i in ids
+        }
+    out: dict[str, OwnershipAnswer] = {}
+    for i in ids:
+        raw = raw_found.get(i)
+        if raw is None:
+            out[i] = OwnershipAnswer(verdict=UNOWNED)
+            continue
+        out[i] = answer_from(200, raw, asking, is_read=True, path=path)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # ExecutionClaim (ADR-010 phase 2, #352).
 #
