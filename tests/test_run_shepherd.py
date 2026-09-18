@@ -3648,6 +3648,46 @@ def test_refusal_code_is_classified_on_its_own() -> None:
     assert refused == frozenset({47})
 
 
+def test_fenced_code_is_classified_on_its_own() -> None:
+    """48 is its own outcome, and `_fenced_codes()` is actually consulted.
+
+    The set existed on `ddcdb0e` and was called from nowhere, so the entire
+    `"fenced"` outcome — including the dedicated `process_one` arm — was
+    unreachable: a fenced follow-up fell through to `transient` and was
+    reported as an unexplained plumbing blip. Membership alone would not have
+    caught that, so the classification itself is asserted below.
+    """
+    deterministic, harness = run_shepherd._followup_code_sets()
+    fenced = run_shepherd._fenced_codes()
+    assert run_implementer.EXIT_FENCED in fenced
+    assert run_implementer.EXIT_FENCED not in deterministic
+    assert run_implementer.EXIT_FENCED not in harness
+    assert run_implementer.EXIT_FENCED not in run_shepherd._refusal_codes()
+    assert fenced == frozenset({48})
+
+
+def test_apply_followup_classifies_a_fenced_exit_as_fenced() -> None:
+    """returncode=48 -> kind="fenced", not "transient"."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_FENCED
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "fenced"
+    assert exc.value.transient is True
+
+
 def test_refused_is_not_charged_an_attempt() -> None:
     """`transient` is derived from `kind`; a refusal must land on the free side."""
     exc = run_shepherd.FollowupSubprocessError("x", kind="refused")

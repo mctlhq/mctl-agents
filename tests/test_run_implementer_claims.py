@@ -12,7 +12,12 @@ from unittest.mock import patch
 import pytest
 
 from orchestrator import run_implementer
-from orchestrator.lifecycle.contract import CLAIM_FENCED, ClaimAnswer
+from orchestrator.lifecycle.contract import (
+    CLAIM_FENCED,
+    CLAIM_HELD_BY_ME,
+    CLAIM_HELD_BY_OTHER,
+    ClaimAnswer,
+)
 
 
 def test_push_followup_uses_the_explicit_force_with_lease_form(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,3 +133,182 @@ def test_push_and_open_pr_uses_dash_u_for_a_brand_new_branch(monkeypatch: pytest
         run_implementer._push_and_open_pr(Path("/tmp/repo"), ref, claim_context=None)
 
     assert calls == [["git", "push", "-u", "origin", "feat/agents-slug"]]
+
+
+def test_attempt_id_distinguishes_two_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Determinism must not become a collision.
+
+    Two pods on the same proposal in the same epoch used to derive the SAME
+    id, so each one's `acquire` read as the other renewing its own claim —
+    CLAIM_HELD_BY_ME to both, and the mechanism meant to stop concurrent
+    implementers licensed them instead. `HOSTNAME` is the pod name, so it is
+    stable across a container restart within a pod (determinism kept) and
+    different across pods (collision gone).
+    """
+    monkeypatch.delenv("WORKFLOW_UID", raising=False)
+    monkeypatch.setenv("HOSTNAME", "implementer-abc")
+    first = run_implementer._resolve_attempt_id("mctl-web", "slug", 0, 0)
+    assert first == run_implementer._resolve_attempt_id("mctl-web", "slug", 0, 0)
+    monkeypatch.setenv("HOSTNAME", "implementer-def")
+    assert first != run_implementer._resolve_attempt_id("mctl-web", "slug", 0, 0)
+
+
+def _client_answering(answer):
+    class _Client:
+        def acquire(self, *a, **kw):
+            return answer
+
+        def check(self, *a, **kw):
+            return answer
+
+    return _Client
+
+
+def _acquire(monkeypatch, answer):
+    monkeypatch.setattr(run_implementer, "ClaimClient", _client_answering(answer))
+    return run_implementer._acquire_claim(
+        run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+        run_implementer.PHASE_IMPLEMENT,
+        "",
+        "attempt-1",
+        lease_seconds=60,
+    )
+
+
+def test_acquire_returns_none_below_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Below `enforce` a rejected acquire is advisory: the run proceeds on the
+    pre-claim mechanisms exactly as it did before ADR-010 phase 2."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    assert _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER)) is None
+
+
+def test_acquire_raises_when_another_executor_holds_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The defect on `ddcdb0e`: a rejected acquire returned None, and every
+    downstream check is guarded by `if claim_context is not None` — so the
+    rejection DISABLED the fencing instead of declining the attempt."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    with pytest.raises(run_implementer.ImplementerClaimRefused):
+        _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 holds it"))
+
+
+def test_acquire_raises_fenced_regardless_of_stage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fence is raised unconditionally, exactly as `_check_claim_or_raise`
+    does, so the two sites cannot answer one verdict two different ways."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    with pytest.raises(run_implementer.ImplementerFenced):
+        _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved"))
+
+
+def _ctx(client):
+    return run_implementer._ClaimContext(
+        client=client,
+        claim_id="c1",
+        entity=run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+        phase=run_implementer.PHASE_IMPLEMENT,
+        owner_epoch=0,
+        entity_version="",
+        executor=run_implementer.Executor(
+            type=run_implementer.OWNER_IMPLEMENTER, id="attempt-1"
+        ),
+        attempt="attempt-1",
+    )
+
+
+def test_adopt_path_does_not_pin_the_proposal_claim_to_a_branch_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proposal claim is acquired with `entity_version=""` — it has no git
+    head. Asserting the branch SHA against it at check time claims a pin the
+    claim never made, and the server fences on a version mismatch, aborting a
+    perfectly good attempt. `--force-with-lease` stays the git CAS."""
+    seen: list[tuple] = []
+
+    class _Client:
+        def check(self, *a, **kw):
+            seen.append(a)
+            return ClaimAnswer(verdict=CLAIM_HELD_BY_ME)
+
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: "b" * 40)
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: None)
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=Path("/tmp/proposal"), status="accepted",
+    )
+    with patch.object(run_implementer, "_open_pr_for_branch", return_value="https://pr"):
+        run_implementer._push_and_open_pr(Path("/tmp/repo"), ref, claim_context=_ctx(_Client()))
+
+    assert seen, "the adopt path must still check the claim"
+    # `check(claim_id, entity, phase, owner_epoch, entity_version, ...)` —
+    # the version is positional arg 5, and must stay the empty one the claim
+    # was acquired with, never the branch head.
+    assert [args[4] for args in seen] == [""], seen
+
+
+def test_brand_new_branch_push_is_also_claim_checked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """"No remote ref yet" is a statement about git, not about who may write.
+    The model ran for a long time between the acquire and this push."""
+    calls: list[list[str]] = []
+
+    class _FencedClient:
+        def check(self, *a, **kw):
+            return ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved")
+
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: calls.append(cmd))
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=Path("/tmp/proposal"), status="accepted",
+    )
+    with patch.object(run_implementer, "_open_pr_for_branch", return_value="https://pr"):
+        with pytest.raises(run_implementer.ImplementerFenced):
+            run_implementer._push_and_open_pr(
+                Path("/tmp/repo"), ref, claim_context=_ctx(_FencedClient()),
+            )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_reason"),
+    [
+        (lambda: (_ for _ in ()).throw(run_implementer.ImplementerOperationTimeout("slow")),
+         "operation timed out"),
+        (lambda: (_ for _ in ()).throw(RuntimeError("boom")), "unexpected error"),
+    ],
+)
+def test_the_claim_is_released_on_a_failing_arm_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure, expected_reason: str,
+) -> None:
+    """The `finally` is what makes the release unconditional.
+
+    A claim released on only the happy arm leaks on every other one, and a
+    leaked claim holds the entity for the whole lease — up to 130 minutes of
+    a live executor that no longer exists. Untested on `ddcdb0e`: nothing
+    exercised an exception path with a claim held.
+    """
+    released: list[str] = []
+
+    class _Client:
+        def release(self, *a, reason: str = "", **kw):
+            released.append(reason)
+
+    proposal_dir = tmp_path / "mctl-web" / "slug"
+    proposal_dir.mkdir(parents=True)
+    (proposal_dir / ".status.yaml").write_text(
+        "status: in-review\npr: https://github.com/mctlhq/mctl-web/pull/7\n", encoding="utf-8",
+    )
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=proposal_dir, status="in-review",
+    )
+
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a, **_kw: tmp_path / "repo")
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a, **_kw: "a" * 40)
+    monkeypatch.setattr(run_implementer, "_acquire_claim", lambda *_a, **_kw: _ctx(_Client()))
+    monkeypatch.setattr(run_implementer, "_build_prompt", lambda *_a, **_kw: "prompt")
+    monkeypatch.setattr(run_implementer.anyio, "run", lambda *_a, **_kw: failure())
+
+    result = run_implementer.review_feedback_one(ref, {"summaries": []})
+
+    assert result.error
+    assert released == [expected_reason], released

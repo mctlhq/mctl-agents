@@ -47,7 +47,6 @@ from temporalio.exceptions import (
 with workflow.unsafe.imports_passed_through():
     from orchestrator.lifecycle.contract import (
         OWNED_BY_OTHER,
-        OWNER_SHEPHERD,
         UNKNOWN,
         UNOWNED,
         EntityRef,
@@ -230,12 +229,6 @@ LIFECYCLE_REFUSAL_GIVE_UP = 3
 # `_ownership` and compared in two arms; as three separate literals they had to
 # agree by inspection, and nothing failed if one of them changed.
 OWNER_TYPE = "devloop-workflow"
-
-# The fallback shepherd's owner id for a handoff target. The shepherd is a
-# stateless cron actor, not a single addressable instance, so "cron" names the
-# role rather than a specific process — matching the id every existing test
-# fixture for a shepherd-typed Owner already uses.
-SHEPHERD_HANDOFF_OWNER_ID = "cron"
 
 # Consecutive failed HEARTBEATS before the loop stops believing it owns the
 # entity. A SEPARATE constant, and a smaller number, because it counts a
@@ -2192,15 +2185,15 @@ class DevLoopWorkflow:
         # cron sweeper owns the PR and this loop must not record itself as the
         # owner. Its own marker, because it adds commands to history.
         track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
-        # ExecutionClaim / handoff (ADR-010 phase 2, #352). A SEPARATE marker
-        # from "lifecycle-ownership": rollout.py pins one job per switch, and
-        # an execution recorded under phase 1 must replay the bare `release`
-        # this finally used to issue, unchanged. `workflow.patched` must
-        # still be called unconditionally here (Temporal's patch contract),
-        # even though the resulting flag is not read below yet — no
-        # `handoff/complete` caller exists in this repository (#353), so the
-        # `finally` block still issues a bare `release`, not `handoff-start`.
-        _use_claims_handoff = track_ownership and workflow.patched("lifecycle-claims")
+        # NOTE (ADR-010 phase 2, #352): there is deliberately no
+        # "lifecycle-claims" patch marker here. This PR reverted the watch-end
+        # write to a bare `release` because nothing in this repository calls
+        # `handoff/complete` yet, so the branch the marker would gate does not
+        # exist. A `workflow.patched` call writes a marker into EVERY new
+        # execution's history and can only be retired through
+        # `deprecate_patch` plus a second deploy — a cost with no branch to
+        # pay for. The marker belongs in the change that actually ships the
+        # handoff (#353), where it will guard a real fork in behaviour.
         if track_ownership:
             # ADR-010 §12 asks for the resolved policy to be recorded on the
             # row, so "why does this actor own it" is answerable without
@@ -2379,9 +2372,8 @@ class DevLoopWorkflow:
                 # `handoff-start` here would leave the row stuck in
                 # `handing-off` forever, which is worse than the zero-owner
                 # gap a release leaves. Revert to `release` until a completer
-                # exists; `use_claims_handoff` stays computed (and
-                # `workflow.patched` still called, for replay determinism)
-                # so the switch is a one-line flip once #353 ships one.
+                # exists; the flip back to `handoff-start` belongs to #353,
+                # together with the patch marker that must gate it.
                 op = "terminal" if terminal_state else "release"
                 done = await self._ownership(
                     op,
@@ -2398,7 +2390,6 @@ class DevLoopWorkflow:
                         if terminal_state and last is not None
                         else "merge watch ended without a terminal pull-request state"
                     ),
-                    to=Owner(type=OWNER_SHEPHERD, id=SHEPHERD_HANDOFF_OWNER_ID) if op == "handoff-start" else None,
                 )
                 # Same policy as the in-loop terminal path, and now the same
                 # code: two phrasings of one rule is how they came to disagree.

@@ -422,7 +422,8 @@ fail-safe direction `_shepherd_is_pinned` already takes.
 *"between those two points this execution IS the owner, and the cron must
 already be standing down"*. The sweeper sees a healthy owner and skips.
 
-**2 — direct implementer PR (#239).** On PR creation the implementer
+**2 — direct implementer PR (#239).** *Target state, not yet wired — it waits
+on the `handoff/complete` caller in #353.* On PR creation the implementer
 **handoff-starts** to `owner_type=shepherd`, which the next sweeper tick
 completes by acquiring at epoch+1. Between those two points the row exists in
 `handing-off`: a *deterministic* unowned state the reconciler can adopt, which
@@ -565,11 +566,20 @@ resolved as implemented, not merely proposed:
   licence to execute.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
   resolves `WORKFLOW_UID`, then
-  `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}")`. The
+  `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The
   `attempt_ordinal` is fixed at `0` for the implement phase, since this
   repository's `.status.yaml` `attempt` block has no per-epoch attempt counter
   to derive a real ordinal from yet — a fixed ordinal still satisfies the
-  determinism and renew-on-restart properties this fallback exists for.
+  determinism and renew-on-restart properties this fallback exists for. (The
+  review-remediation phase does have one, `review_attempts`, and uses it.)
+  `HOSTNAME` is in the digest because determinism must not become a collision:
+  without it two pods working the same proposal in the same epoch derive the
+  SAME executor id, each one's `acquire` reads as the other renewing its own
+  claim, and the mechanism meant to stop concurrent implementers licenses
+  them. In Kubernetes `HOSTNAME` is the pod name — stable across a container
+  restart inside one pod, distinct across pods. Residual, stated rather than
+  hidden: two processes on one host with no `WORKFLOW_UID` still collide; the
+  fix for that shape is to set `WORKFLOW_UID`, not to mint a random id.
 - **Lease durations.** `LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default
   `7800`, matching the yaml lease it dual-writes beside) and
   `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` (default `1800`, one
@@ -582,11 +592,17 @@ immediately beforehand, aborting non-charging (`FollowupKind = "fenced"`,
 `run_implementer.EXIT_FENCED`) on `CLAIM_FENCED`. `run_shepherd._attempt_is_fresh`
 is the union of an active claim and the yaml lease, and the yaml branch now
 also requires a named holder rather than trusting `expires_at` alone.
-`DevLoopWorkflow._watch_pr`'s `finally` issues `handoff-start` to
-`OWNER_SHEPHERD` instead of a bare `release` when the watch ends
-non-terminally, behind a new `workflow.patched("lifecycle-claims")` marker
-kept separate from `lifecycle-ownership` so a history recorded under phase 1
-replays unchanged.
+`DevLoopWorkflow._watch_pr`'s `finally` still issues a bare `release` when the
+watch ends non-terminally. It was briefly changed to `handoff-start` and
+reverted inside this same change: `handoff-start` writes a HOLDING
+`handing-off` state that only `/handoff/complete` resolves, and no caller of
+that route exists in this repository yet (#353), so the write would have left
+every abandoned watch stuck in `handing-off` — strictly worse than the
+zero-owner gap a release leaves. There is deliberately no
+`workflow.patched("lifecycle-claims")` marker either: a marker is recorded in
+every new execution's history and can only be retired through
+`deprecate_patch` plus a second deploy, so it belongs to the change that
+actually ships the handoff, not to a branch that does not exist.
 
 **Known simplification.** The delegated-claim path (a shepherd fixing a
 steward-owned PR under the steward's epoch) is not fully wired: this repo has

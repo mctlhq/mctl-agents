@@ -791,7 +791,7 @@ class FollowupSubprocessError(RuntimeError):
     omission from ``deterministic_codes``, so the label carries the intent
     explicitly, drives a distinct operator-facing log line, and is directly
     assertable in tests. Values:
-    ``"transient" | "deterministic" | "harness" | "refused"``.
+    ``"transient" | "deterministic" | "harness" | "refused" | "fenced"``.
 
     ``"refused"`` (mctl-agents#360) is the fourth label and the only one that
     is not a failure at all: the agent read the findings and decided that
@@ -799,6 +799,12 @@ class FollowupSubprocessError(RuntimeError):
     because an explicit operator decision on the PR forbade the change. It
     shares the non-charging behaviour, and carries ``reason``, the agent's own
     explanation, so the operator sees *why* the tick did nothing.
+
+    ``"fenced"`` (ADR-010 phase 2) is the fifth: an ExecutionClaim check
+    refused the attempt because another executor owns the entity. It is not
+    chargeable either — the proposal is fine and the work will be done, just
+    not by us — and it is retried like a transient, because the claim it lost
+    to will eventually be released or expire.
     """
 
     def __init__(
@@ -2167,12 +2173,21 @@ def apply_followup(
         # (mctl-agents#360). Charging it would punish the agent for honouring
         # an operator decision, which is what exhausted the budget on
         # portfolio#56.
+        #
+        # `EXIT_FENCED` = 48 is the fifth: an ExecutionClaim check refused the
+        # attempt because someone else owns the entity now. Not the proposal's
+        # fault, so not chargeable; nothing was lost, so not a harness failure;
+        # the agent never ran, so not a refusal. It gets its own arm before
+        # the harness/deterministic ones, because a fence is a positive
+        # identification and must not fall through to `transient`.
         deterministic_codes, harness_codes = _followup_code_sets()
         kind: FollowupKind
         reason = None
         if proc.returncode in _refusal_codes():
             kind = "refused"
             reason = refusal_reason
+        elif proc.returncode in _fenced_codes():
+            kind = "fenced"
         elif proc.returncode in harness_codes:
             kind = "harness"
         elif proc.returncode in deterministic_codes:
@@ -2718,9 +2733,14 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
 
     ADR-010 phase 2 (mctl-agents#352) makes this a UNION, prescribed in
     §12: held if an active ExecutionClaim exists OR the yaml lease is
-    unexpired. The yaml branch now also compares the HOLDER, not
-    `expires_at` alone — the defect requirements.md names directly: the
-    attempt block's `id` was written and never compared against anything.
+    unexpired. The attempt block's `id` is what the claim branch above asks
+    about — that is the use requirements.md asks for, an id that was written
+    and never read. It is deliberately NOT a precondition of the yaml branch:
+    an unexpired lease means someone is holding this entity right now, and a
+    missing `id` (an older status file, a pre-claim writer) does not make that
+    130-minute hold free. Requiring the id there would have started a second
+    implementer against a live one — the exact race this predicate exists to
+    prevent.
 
     The claim check only affects the answer at `enforce` and above:
     `observe` computes and logs a divergence but composes no safety, the
@@ -2755,8 +2775,6 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
         if rollout.new_answer_decides():
             return False
 
-    if not isinstance(holder, str) or not holder:
-        return False
     expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
     if not expires_at:
         return False
