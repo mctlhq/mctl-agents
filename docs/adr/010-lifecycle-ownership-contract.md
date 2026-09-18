@@ -241,8 +241,19 @@ which is all it was ever evidence of; the absence of progress is a separate
 signal with a separate and much longer bound, and its remedy is to tell a human
 rather than to hand the entity to another machine that will be just as stuck.
 
-The cadence itself: `SHEPHERD_TICK_EVERY_POLLS = 8` against a 30-minute
-`MERGE_POLL_INTERVAL`, so roughly **4 h**.
+The cadence itself: `SHEPHERD_TICK_EVERY_POLLS = 1` against a 15-minute
+`MERGE_POLL_INTERVAL`, so roughly **15 min**. It was every 8th poll of a
+30-minute interval — 4 h — on the ground that a tick provisioned a Hetzner
+volume; mctl-gitops `193dbe5c` (2026-09-05) moved every agent template to an
+`emptyDir`, and the cost the number was protecting no longer exists.
+
+The **10 h bound above is unchanged**, and deliberately so. Liveness is not
+refreshed by the tick — `LIFECYCLE_HEARTBEAT_EVERY_POLLS` is its own cadence,
+held at ~2 h across this change precisely so the bound keeps its margin (a
+heartbeat every 2 h against a 10 h bound survives four consecutive misses).
+Tightening the bound to match the faster tick would be a reconciler change with
+its own risk, and a bound that is too generous only delays a takeover; one that
+is too tight takes a PR away from a healthy owner.
 
 `deploy-watch`, `investigate` and `await-approval` are **reserved and not
 implemented**. Naming them here without shipping them is deliberate — ADR-007

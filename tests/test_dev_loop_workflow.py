@@ -43,6 +43,50 @@ from orchestrator.temporal.workflows.dev_loop import (
 )
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
+
+def test_legacy_cadence_is_the_pre_marker_numbers_verbatim() -> None:
+    """An execution replaying without `fast-shepherd-cadence` must see its own
+    history's numbers, so these are literals on purpose: deriving them from the
+    current cadence would make the branch agree with whatever changed it."""
+    legacy = dev_loop.LEGACY_CADENCE
+    assert legacy.poll_interval == timedelta(minutes=30)
+    assert legacy.shepherd_tick_every_polls == 8
+    assert legacy.shepherd_ticks_max == 12
+    assert legacy.heartbeat_every_polls == 4
+    assert legacy.unknown_write_limit == 6
+    assert legacy.refusal_backoff_polls == 20
+    assert legacy.pr_lookup_grace_polls == 4
+
+
+def test_halving_the_poll_interval_did_not_halve_the_other_bounds() -> None:
+    """The poll counts are wall-clock intents written in polls (~2 h heartbeat,
+    ~3 h unknown-write window, the 10 h liveness bound, ~2 h of PR-link grace).
+    A change to MERGE_POLL_INTERVAL that does not move them silently rescales
+    all four — which is the whole reason `_Cadence` carries them together."""
+    fast, legacy = dev_loop.CADENCE, dev_loop.LEGACY_CADENCE
+    for field in (
+        "heartbeat_every_polls",
+        "unknown_write_limit",
+        "refusal_backoff_polls",
+        "pr_lookup_grace_polls",
+    ):
+        assert (
+            getattr(fast, field) * fast.poll_interval
+            == getattr(legacy, field) * legacy.poll_interval
+        ), field
+
+
+def test_the_shepherd_tick_got_faster_without_shrinking_its_window() -> None:
+    """The point of the change (#213 follow-up): a finished review is picked
+    up in minutes rather than hours, and the active window stays long enough
+    for the shepherd's own MAX_REVIEW_ATTEMPTS cap to be the thing that stops
+    a stuck PR."""
+    fast, legacy = dev_loop.CADENCE, dev_loop.LEGACY_CADENCE
+    tick = fast.shepherd_tick_every_polls * fast.poll_interval
+    assert tick == timedelta(minutes=15)
+    assert tick < legacy.shepherd_tick_every_polls * legacy.poll_interval
+    assert fast.shepherd_ticks_max * tick >= timedelta(hours=24)
+
 _SENTINEL_TARGET = DeployTarget(team="admins", app="mctl-telegram")
 _DEFAULT_RELEASE = ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z")
 
@@ -1748,13 +1792,15 @@ class TestDevLoopWorkflow:
         )
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[open_pr] * 12 + [MERGED_PR],
+            pr_states=[open_pr] * (2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT) + [MERGED_PR],
             issue=916,
             ownership_unavailable=True,
         )
         acquires = [o for o in ops if o.op == "acquire"]
         # Throttled: fewer than one per poll.
-        assert len(acquires) < 12, f"the gate never engaged: {len(acquires)} acquires"
+        assert len(acquires) < 2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"the gate never engaged: {len(acquires)} acquires"
+        )
         # But NOT a permanent give-up: asking resumes on heartbeat boundaries
         # after the limit, which is the whole difference from the behaviour
         # this replaced.
@@ -1780,13 +1826,15 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 12 + [MERGED_PR],
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * (2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT) + [MERGED_PR],
             issue=917,
             ownership_progress_fails=True,
         )
         progress = [o for o in ops if o.op == "progress"]
         assert progress, f"the progress path was never reached: {[o.op for o in ops]}"
-        assert len(progress) < 12, f"the progress write was never throttled: {len(progress)}"
+        assert len(progress) < 2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"the progress write was never throttled: {len(progress)}"
+        )
         # And the heartbeat still runs while progress is throttled — the
         # liveness fix this back-off sits on top of must survive it.
         first = [o.op for o in ops].index("progress")
@@ -1825,7 +1873,7 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 12 + [MERGED_PR],
+            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * (2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT) + [MERGED_PR],
             issue=918,
             ownership_body_less="progress",
         )
@@ -1865,14 +1913,16 @@ class TestDevLoopWorkflow:
         )
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[open_pr] * 12 + [MERGED_PR],
+            pr_states=[open_pr] * (2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT) + [MERGED_PR],
             issue=919,
             ownership_body_less="acquire",
         )
         # No claim was recorded, so nothing but acquires was ever attempted...
         assert all(o.op == "acquire" for o in ops), [o.op for o in ops]
         # ...and it counted toward the back-off rather than being ignored.
-        assert len(ops) < 12, f"a body-less acquire was never counted: {len(ops)}"
+        assert len(ops) < 2 * LIFECYCLE_UNKNOWN_WRITE_LIMIT, (
+            f"a body-less acquire was never counted: {len(ops)}"
+        )
         assert len(ops) > LIFECYCLE_UNKNOWN_WRITE_LIMIT, len(ops)
         # The arm's predicate is reachable for this route, which is the thing
         # the previous version of this test could not see.
@@ -1916,7 +1966,12 @@ class TestDevLoopWorkflow:
         # the heartbeat fails.
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40), _pr("b" * 40)] + [_pr("b" * 40)] * 30 + [MERGED_PR],
+            pr_states=(
+                [_pr("a" * 40), _pr("b" * 40)]
+                + [_pr("b" * 40)]
+                * (LIFECYCLE_HEARTBEAT_EVERY_POLLS * (LIFECYCLE_UNKNOWN_WRITE_LIMIT + 4))
+                + [MERGED_PR]
+            ),
             issue=920,
             ownership_unavailable_op="acquire",
         )
@@ -1965,7 +2020,12 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40)] + [_pr("b" * 40)] * 40 + [MERGED_PR],
+            pr_states=(
+                [_pr("a" * 40)]
+                + [_pr("b" * 40)]
+                * (LIFECYCLE_HEARTBEAT_EVERY_POLLS * (LIFECYCLE_UNKNOWN_WRITE_LIMIT + 4))
+                + [MERGED_PR]
+            ),
             issue=921,
             ownership_self_unhealthy_after=1,
         )
@@ -2575,7 +2635,11 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            pr_states=(
+                [_pr("a" * 40)]
+                + [_pr("b" * 40)] * LIFECYCLE_HEARTBEAT_EVERY_POLLS
+                + [MERGED_PR]
+            ),
             issue=910,
             ownership_progress_fails=True,
         )
@@ -2615,7 +2679,11 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            pr_states=(
+                [_pr("a" * 40)]
+                + [_pr("b" * 40)] * LIFECYCLE_HEARTBEAT_EVERY_POLLS
+                + [MERGED_PR]
+            ),
             issue=913,
             ownership_progress_fails=True,
         )
@@ -2645,7 +2713,11 @@ class TestDevLoopWorkflow:
 
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[_pr("a" * 40), _pr("b" * 40), _pr("b" * 40), _pr("b" * 40), MERGED_PR],
+            pr_states=(
+                [_pr("a" * 40)]
+                + [_pr("b" * 40)] * LIFECYCLE_HEARTBEAT_EVERY_POLLS
+                + [MERGED_PR]
+            ),
             issue=914,
             ownership_progress_unowned=True,
         )
@@ -2787,7 +2859,9 @@ class TestDevLoopWorkflow:
         )
         _result, ops = await self._run_ownership_loop(
             env,
-            pr_states=[same, same, same, same, same, MERGED_PR],
+            pr_states=(
+                [same] * (LIFECYCLE_HEARTBEAT_EVERY_POLLS + 1) + [MERGED_PR]
+            ),
             issue=909,
             ownership_lost_after=1,
         )
@@ -3064,9 +3138,13 @@ class TestDevLoopWorkflow:
         assert result.pr.state == "OPEN"
 
     async def test_shepherd_tick_runs_while_pr_stays_open(self, env):
-        """Stage 6.1 review loop (#213): while the PR is open, every 8th
-        poll submits a slug-scoped shepherd tick; the merged poll after it
-        ends the watch."""
+        """Stage 6.1 review loop (#213): while the PR is open, every
+        SHEPHERD_TICK_EVERY_POLLS-th poll submits a slug-scoped shepherd
+        tick; the merged poll after it ends the watch.
+
+        One open poll per tick and exactly one tick, so the assertion pins
+        the cadence rather than restating whatever number it currently has.
+        """
         open_pr = PRState(
             found=True,
             pr_url=MERGED_PR.pr_url,
@@ -3075,7 +3153,8 @@ class TestDevLoopWorkflow:
             state="OPEN",
         )
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(
-            released=True, pr_states=[open_pr] * 8 + [MERGED_PR]
+            released=True,
+            pr_states=[open_pr] * SHEPHERD_TICK_EVERY_POLLS + [MERGED_PR],
         )
         async with Worker(
             env.client,
