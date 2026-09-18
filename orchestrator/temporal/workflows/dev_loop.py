@@ -50,7 +50,6 @@ with workflow.unsafe.imports_passed_through():
         UNKNOWN,
         UNOWNED,
         EntityRef,
-        Owner,
     )
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
@@ -1252,8 +1251,7 @@ class DevLoopWorkflow:
             )
 
     async def _ownership(self, op: str, *, repo: str, number: int, head_sha: str = "",
-                         evidence: str = "", reason: str = "",
-                         to: Owner | None = None) -> OwnershipResult | None:
+                         evidence: str = "", reason: str = "") -> OwnershipResult | None:
         """Run one ownership operation as an ACTIVITY.
 
         Never raises. Ownership is a coordination signal, not the work: a
@@ -1283,8 +1281,15 @@ class DevLoopWorkflow:
             proposal_ref=self._proposal_ref,
             policy_ref=self._policy_ref,
             temporal_workflow_id=info.workflow_id,
-            to_owner_type=to.type if to is not None else "",
-            to_owner_id=to.id if to is not None else "",
+            # NOTE: `handoff` is the only op that reads these, and this
+            # workflow never hands its claim to a named successor — it
+            # releases and lets the next holder acquire. The parameter that
+            # used to thread an `Owner` here had no caller passing it in any
+            # of the five call sites, so it was a dead branch carrying an
+            # import (claude P3 on `8ac2080`). Add it back with the caller
+            # that needs it, not before.
+            to_owner_type="",
+            to_owner_id="",
         )
         try:
             return await workflow.execute_activity(

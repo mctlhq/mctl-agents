@@ -563,7 +563,17 @@ resolved as implemented, not merely proposed:
 - **Wire status for a fence.** A 409 carrying `code: "fenced"` is `CLAIM_FENCED`;
   a 409 carrying `code: "claim-held"`, or any other 409, is `CLAIM_HELD_BY_OTHER`
   — never guessed toward either side on an unrecognised code, and never a
-  licence to execute.
+  licence to execute. One exception, and only one: a 409 whose claim record
+  names the **asking** attempt is `CLAIM_HELD_BY_ME`. Determinism in §8 exists
+  so a restarted pod re-derives the same identity and can retake the claim its
+  killed predecessor never released; classifying that conflict as a rival's
+  would leave the proposal stuck `in-progress` behind itself for the full
+  lease, with the operator told a competing executor holds it — naming us. The
+  comparison is `claim_verdict_for(claim, asking)`, so a free state on a 409
+  does **not** qualify: a conflict answering "nobody holds it" is a
+  contradiction, and resolving it toward vacancy is the one direction that
+  licenses a second executor. A fence outranks both — the epoch moved, so even
+  our own record is not a licence to continue.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
   resolves `WORKFLOW_UID`, then
   `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The

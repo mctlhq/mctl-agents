@@ -817,7 +817,30 @@ def claim_answer_from(
         claim = claim_record_of(payload)
         if code == "fenced":
             return ClaimAnswer(verdict=CLAIM_FENCED, claim=claim, reason=_claim_error_of(status, payload))
+        if claim is not None and claim_verdict_for(claim, asking) == CLAIM_HELD_BY_ME:
+            # The record names the ASKING attempt: this is our own claim, not
+            # a rival's, and whether mctl-api encodes a same-executor
+            # re-acquire as 200 or 409 is the §6 open question two lines up.
+            # The client does not have to bet on it — the record and the
+            # comparison are both already here, and `claim_verdict_for` is the
+            # one function allowed to make it.
+            #
+            # The case is not exotic: `_resolve_attempt_id` is deterministic
+            # precisely so a restarted pod re-derives the SAME identity and can
+            # re-take the claim its killed predecessor never released (§8).
+            # Read as HELD_BY_OTHER it was told its own orphan claim belongs to
+            # somebody else, stood down writing nothing, and left the proposal
+            # stuck `in-progress` behind itself for the full lease — with the
+            # operator told a competing executor holds it, naming us (claude P2
+            # on `8ac2080`).
+            return ClaimAnswer(
+                verdict=CLAIM_HELD_BY_ME, claim=claim, reason=_claim_error_of(status, payload)
+            )
         if code == "claim-held" or claim is not None:
+            # Any other record on a 409 is somebody else's. Deliberately NOT
+            # `claim_verdict_for`'s full answer: a free state on a CONFLICT is
+            # a contradiction the client must not resolve toward "nobody holds
+            # it", which is the one direction that licenses a second executor.
             return ClaimAnswer(
                 verdict=CLAIM_HELD_BY_OTHER, claim=claim, reason=_claim_error_of(status, payload)
             )

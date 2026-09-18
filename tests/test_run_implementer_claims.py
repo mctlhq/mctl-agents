@@ -807,6 +807,7 @@ def test_a_409_fence_never_clobbers_the_new_holders_attempt(
     assert "needs-triage" not in body, body
     assert "someone-else" in body, body
     assert released, "our own claim record is still let go of"
+    assert "not recorded" in result.error, result.error
 
 
 def test_a_fence_with_no_rival_still_records_needs_triage(
@@ -823,6 +824,7 @@ def test_a_fence_with_no_rival_still_records_needs_triage(
     assert result.error
     assert "needs-triage" in body, body
     assert "code: fenced" in body, body
+    assert "not recorded" not in result.error, result.error
 
 
 def test_a_declined_hand_back_says_so_in_the_skip_reason(

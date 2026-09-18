@@ -167,11 +167,16 @@ Both the initial push and every follow-up push carry an `ExecutionClaim`
 short-lived mutual-exclusion lease checked immediately before `git push`,
 with `--force-with-lease=<branch>:<sha>` as the authoritative fence
 underneath it. Below `LIFECYCLE_ROLLOUT_MODE=enforce` the claim is advisory
-only. Two lease durations are tunable via env, both defaulting to the
-lease they replace: `LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default
-`7800`, i.e. 130 minutes) for the initial implement attempt, and
-`LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` (default `1800`, i.e. 30 minutes,
-one `MERGE_POLL_INTERVAL`) for a review-remediation follow-up.
+only. Two lease durations are tunable via env:
+`LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default `7800`, i.e. 130
+minutes, the `attempt` lease it replaces) for the initial implement
+attempt, and `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` for a
+review-remediation follow-up. The review value is a *floor* of `1800`
+(30 minutes, one `MERGE_POLL_INTERVAL`) under
+`IMPLEMENTER_TIMEOUT_SECONDS + 2 x IMPLEMENTER_COMMAND_TIMEOUT_SECONDS`,
+so the lease outlives the run it guards: with the stock `900 + 2 x 300`
+the floor wins at 1800 seconds, and raising `IMPLEMENTER_TIMEOUT_SECONDS`
+raises the lease with it.
 
 ### Tier 3 — PR shepherd
 

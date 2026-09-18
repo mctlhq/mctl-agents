@@ -96,6 +96,60 @@ def test_a_409_without_a_recognised_code_is_held_by_other_not_fenced() -> None:
     assert answer.may_execute is False
 
 
+def test_a_409_whose_record_names_me_is_my_own_claim_not_a_rival() -> None:
+    """A restarted pod re-derives the SAME attempt id (`_resolve_attempt_id` is
+    deterministic for exactly that reason, ADR-010 §8), so a conflict against
+    its own orphaned claim names itself. Read as HELD_BY_OTHER it would stand
+    down behind itself for the whole lease."""
+    payload = {"error": "held", "code": "claim-held", "claim": _claim(ME)}
+    answer = claim_answer_from(409, payload, ME)
+    assert answer.verdict == CLAIM_HELD_BY_ME
+    assert answer.may_execute is True
+    assert answer.claim is not None
+    assert answer.claim.executor == ME
+
+
+def test_a_409_whose_record_names_another_executor_stays_held_by_other() -> None:
+    payload = {"error": "held", "code": "claim-held", "claim": _claim(OTHER)}
+    answer = claim_answer_from(409, payload, ME)
+    assert answer.verdict == CLAIM_HELD_BY_OTHER
+    assert answer.may_execute is False
+    assert answer.claim is not None
+    assert answer.claim.executor == OTHER
+
+
+@pytest.mark.parametrize("state", ["released", "expired", "fenced"])
+def test_a_free_state_on_a_409_is_never_read_as_unclaimed(state: str) -> None:
+    """A free state on a CONFLICT is a contradiction. Resolving it toward
+    "nobody holds it" is the one direction that licenses a second executor, so
+    a foreign record stays HELD_BY_OTHER whatever state it carries."""
+    payload = {"error": "held", "code": "claim-held", "claim": _claim(OTHER, state=state)}
+    answer = claim_answer_from(409, payload, ME)
+    assert answer.verdict == CLAIM_HELD_BY_OTHER
+    assert answer.may_execute is False
+
+
+@pytest.mark.parametrize("state", ["released", "expired"])
+def test_a_free_state_naming_me_on_a_409_does_not_license_execution(state: str) -> None:
+    """The same contradiction with our own name on it: `claim_verdict_for`
+    answers UNCLAIMED for a free state, which is not HELD_BY_ME, so the
+    promotion above must not fire and the answer falls through to the
+    fail-closed arm."""
+    payload = {"error": "held", "code": "claim-held", "claim": _claim(ME, state=state)}
+    answer = claim_answer_from(409, payload, ME)
+    assert answer.verdict == CLAIM_HELD_BY_OTHER
+    assert answer.may_execute is False
+
+
+def test_a_fence_naming_me_is_still_a_fence() -> None:
+    """Fencing outranks ownership: the epoch moved, so even our own record is
+    not a licence to keep going."""
+    payload = {"error": "owner epoch moved", "code": "fenced", "claim": _claim(ME, state="fenced")}
+    answer = claim_answer_from(409, payload, ME)
+    assert answer.verdict == CLAIM_FENCED
+    assert answer.may_execute is False
+
+
 @pytest.mark.parametrize(
     "status,payload",
     [

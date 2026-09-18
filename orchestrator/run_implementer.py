@@ -2171,6 +2171,21 @@ def _github_projection(existing: ExistingResult) -> dict[str, Any]:
     return projection
 
 
+def _triage_error(message: str, recorded: bool) -> str:
+    """Annotate a failure message with what `_mark_needs_triage` actually did.
+
+    The compare-and-swap can decline the write, and "recorded at a human gate"
+    and "left alone because a second executor now owns the proposal" are two
+    different states of the world. The caller turns this into
+    `ImplementResult.error`, so the batch summary says which one happened
+    instead of asserting a status write that never landed (claude P3 on
+    `8ac2080`) — the same thing the hand-back already does for its skip reason.
+    """
+    if recorded:
+        return message
+    return f"{message} (not recorded: another attempt now holds the proposal)"
+
+
 def _mark_needs_triage(
     ref: ProposalRef,
     *,
@@ -2502,7 +2517,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
-            _mark_needs_triage(
+            recorded = _mark_needs_triage(
                 ref,
                 code="no-commits",
                 stage="agent",
@@ -2513,7 +2528,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
-                error="implementer produced no commits",
+                error=_triage_error("implementer produced no commits", recorded),
             )
 
         # 6b. Chart MAJOR-version guard — the long-tail timebomb from the
@@ -2535,7 +2550,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 "will be pre-staged or the migration sequenced. See "
                 "feedback_eso_chart_2x_crd_lifecycle.md."
             )
-            _mark_needs_triage(
+            recorded = _mark_needs_triage(
                 ref,
                 code="chart-major-migration-required",
                 stage="policy",
@@ -2543,7 +2558,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 attempt=attempt,
                 claim_context=claim_ctx,
             )
-            return ImplementResult(ref=ref, pr_url=None, error=msg)
+            return ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
 
         # 7. Push + PR.
         pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
@@ -2568,7 +2583,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # moved on. Left with a distinct triage code so a race is legible
         # instead of landing in the generic `unexpected-error` arm.
         msg = str(e)
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="fenced",
             stage="push",
@@ -2576,7 +2591,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=attempt,
             claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except ImplementerClaimRefused as e:
         # The push-site claim check refused this attempt: a skip, not a
@@ -2647,7 +2662,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # the generic `unexpected-error` arm below and a harness failure is
         # indistinguishable from a crash in the proposal's history.
         msg = str(e)
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="orphaned-subagent",
             stage="runtime",
@@ -2655,11 +2670,11 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=attempt,
             claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except ImplementerOperationTimeout as e:
         msg = f"operation timed out: {e}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="operation-timeout",
             stage="runtime",
@@ -2667,11 +2682,11 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=attempt,
             claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="shell-failed",
             stage="shell",
@@ -2679,7 +2694,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=attempt,
             claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except SystemExit as e:
         # _stage_implementer_agent and a few other helpers raise SystemExit
@@ -2688,7 +2703,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # tree yet). Catching SystemExit alongside Exception here keeps
         # one bad proposal from killing a multi-proposal run mid-pipeline.
         msg = f"SystemExit: {e}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="configuration-error",
             stage="agent",
@@ -2696,11 +2711,11 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=attempt,
             claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         msg = f"{type(e).__name__}: {e}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="unexpected-error",
             stage="agent",
@@ -2708,7 +2723,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=attempt,
             claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     finally:
         # Keep target dir for post-mortem on failure; clean only on success.
