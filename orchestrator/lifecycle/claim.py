@@ -425,8 +425,13 @@ class ClaimClient:
             # `{"status": "released"}` body with `accepted` FALSE — that is a
             # release the store performed, and logging it `rejected` is the
             # same lie in the opposite direction (claude P3 on `af661d7`).
-            # Every 2xx is a release; everything else — 409, 404, 5xx, or no
-            # request at all — is not.
+            # Within this arm: every 2xx is a release, and everything else —
+            # 409, 404, 5xx, or no request at all — is not. It IS only within
+            # this arm: the `fenced` and `expired` checks above run first and
+            # answer their own events, so a 2xx release whose body reports a
+            # fenced or expired record never reaches here (claude P3 on
+            # `0808376`). That ordering is deliberate — those two say what
+            # happened to the claim, which outranks what this call asked for.
             event = EVENT_RELEASED if status is not None and 200 <= status < 300 else EVENT_REJECTED
         elif op_name in ("check", "record") and answer.verdict != CLAIM_HELD_BY_ME:
             event = EVENT_REJECTED

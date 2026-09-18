@@ -668,8 +668,15 @@ def test_the_review_lease_always_outlives_the_run_it_covers(
 
 def _implement_one_refused_at_the_push(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, push_answer: ClaimAnswer,
+    *, stamp_other_attempt: bool = False, allow_triage: bool = False,
 ):
-    """Drive `implement_one` past a successful acquire to a push-site refusal."""
+    """Drive `implement_one` past a successful acquire to a push-site refusal.
+
+    With `stamp_other_attempt`, a second executor takes the proposal while
+    this attempt is running: the SDK step rewrites `.status.yaml` with its own
+    `attempt` block, which is the window every status write from an ending
+    attempt has to survive.
+    """
     monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
     proposal_dir = tmp_path / "mctl-web" / "slug"
     proposal_dir.mkdir(parents=True)
@@ -703,14 +710,21 @@ def _implement_one_refused_at_the_push(
     monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a, **_kw: None)
     monkeypatch.setattr(run_implementer, "_build_prompt", lambda *_a, **_kw: "prompt")
-    monkeypatch.setattr(run_implementer.anyio, "run", lambda *_a, **_kw: None)
+    def _sdk(*_a, **_kw):
+        if stamp_other_attempt:
+            status_path.write_text(
+                "status: in-progress\nattempt:\n  id: someone-else\n", encoding="utf-8"
+            )
+
+    monkeypatch.setattr(run_implementer.anyio, "run", _sdk)
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
     monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
-    monkeypatch.setattr(
-        run_implementer, "_mark_needs_triage",
-        lambda *a, **kw: pytest.fail("a claim refusal must never mark needs-triage"),
-    )
+    if not allow_triage:
+        monkeypatch.setattr(
+            run_implementer, "_mark_needs_triage",
+            lambda *a, **kw: pytest.fail("a claim refusal must never mark needs-triage"),
+        )
 
     result = run_implementer.implement_one(ref)
     return result, status_path.read_text(encoding="utf-8"), released
@@ -770,6 +784,64 @@ def test_an_unclaimed_answer_with_no_record_proves_nothing_and_writes_nothing(
     )
     assert result.error is None
     assert "in-progress" in body, body
+
+
+def test_a_409_fence_never_clobbers_the_new_holders_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other encoding of the same fence. `claim_answer_from` turns a 2xx
+    `{"state": "fenced"}` into CLAIM_UNCLAIMED but a 409 `{"code": "fenced"}`
+    — ADR-010 §6's primary encoding — into CLAIM_FENCED, which lands in
+    `except ImplementerFenced` and writes `needs-triage` carrying THIS
+    attempt's block. Same hole as the hand-back: it erases the block
+    `_attempt_is_fresh` reads, and parks the proposal at a human gate for a
+    race the exception's own docstring calls not a failure of the proposal
+    (claude P2 on `0808376`)."""
+    result, body, released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch,
+        ClaimAnswer(verdict=CLAIM_FENCED, reason="owner epoch moved"),
+        stamp_other_attempt=True,
+        allow_triage=True,
+    )
+    assert result.error
+    assert "needs-triage" not in body, body
+    assert "someone-else" in body, body
+    assert released, "our own claim record is still let go of"
+
+
+def test_a_fence_with_no_rival_still_records_needs_triage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compare-and-swap narrows the write, it does not remove it: where
+    `.status.yaml` still names this attempt, a fence is recorded exactly as
+    before."""
+    result, body, _released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch,
+        ClaimAnswer(verdict=CLAIM_FENCED, reason="owner epoch moved"),
+        allow_triage=True,
+    )
+    assert result.error
+    assert "needs-triage" in body, body
+    assert "code: fenced" in body, body
+
+
+def test_a_declined_hand_back_says_so_in_the_skip_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Handed back and NOT handed back are different outcomes — the first
+    retries on the next tick, the second does not — so they must not read
+    identically in the batch summary (claude P3 on `0808376`)."""
+    result, _body, _released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch,
+        ClaimAnswer(
+            verdict=CLAIM_UNCLAIMED,
+            reason="lease expired",
+            claim=ExecutionClaim(claim_id="c1", state=CLAIM_STATE_EXPIRED),
+        ),
+        stamp_other_attempt=True,
+    )
+    assert result.skipped_reason
+    assert "in-progress" in result.skipped_reason, result.skipped_reason
 
 
 def test_the_hand_back_never_clobbers_a_second_executors_attempt(

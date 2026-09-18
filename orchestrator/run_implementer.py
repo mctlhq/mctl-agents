@@ -974,28 +974,45 @@ def update_status_yaml(
     ref.status = new_status
 
 
+def _status_attempt_id(ref: ProposalRef) -> str | None:
+    """The attempt id `.status.yaml` currently names, or None."""
+    held = _load_status(ref.status_path).get("attempt")
+    return held.get("id") if isinstance(held, dict) else None
+
+
+def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> bool:
+    """Whether this attempt may still write the proposal's status.
+
+    THE invariant behind every status write an ending attempt makes, and it
+    is deliberately one function rather than a guard per arm. Between this
+    attempt's own `in-progress` write and the moment it finds out it lost the
+    entity, a second executor can legitimately have taken the proposal and
+    stamped its own `attempt` block. Any write that carries OUR attempt block
+    — a hand-back to `accepted`, a `needs-triage` failure, anything — erases
+    theirs, and `_attempt_is_fresh` (which reads only the yaml on that branch)
+    then answers "not held" and lets a THIRD implementer start. Raised first
+    against the `CLAIM_UNCLAIMED` hand-back (claude P2 on `af661d7`) and then
+    against the 409 fence reaching `_mark_needs_triage`, which is ADR-010 §6's
+    primary fence encoding (claude P2 on `0808376`); both are the same bug, so
+    both now consult the same predicate.
+    """
+    held_id = _status_attempt_id(ref)
+    if held_id == attempt_id:
+        return True
+    print(
+        f"lifecycle: {ref.service}/{ref.slug}: not {doing} — `.status.yaml` names "
+        f"attempt {held_id or '<none>'}, not this one ({attempt_id}); leaving the "
+        f"current holder's status alone"
+    )
+    return False
+
+
 def _hand_back_if_still_ours(ref: ProposalRef, attempt_id: str) -> bool:
     """Restore `accepted` only while `.status.yaml` still names our attempt.
 
-    A compare-and-swap, not a blind write. Between this attempt's own
-    `in-progress` write and the moment its claim turns out to be gone, a
-    second executor can legitimately have taken the proposal and stamped its
-    own `attempt` block. `update_status_yaml(ref, "accepted", attempt=None)`
-    would erase that block, and `_attempt_is_fresh` — which reads only the
-    yaml — would then answer "not held" and let a THIRD implementer start
-    (claude P2 on `af661d7`).
-
     Returns True when the hand-back was written.
     """
-    current = _load_status(ref.status_path)
-    held = current.get("attempt")
-    held_id = held.get("id") if isinstance(held, dict) else None
-    if held_id != attempt_id:
-        print(
-            f"lifecycle: {ref.service}/{ref.slug}: not handing the proposal back — "
-            f"`.status.yaml` names attempt {held_id or '<none>'}, not this one "
-            f"({attempt_id}); leaving the current holder's status alone"
-        )
+    if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
         return False
     update_status_yaml(ref, "accepted", attempt=None, failure=None)
     return True
@@ -1553,6 +1570,16 @@ def review_feedback_one(
     # function contradicted it by releasing unconditionally (claude P3 on
     # `af661d7`). Failing closed here costs the rest of the lease; releasing
     # into an outage costs a second executor on the same PR.
+    #
+    # The cost is real and is NOT only paid on an unreachable store.
+    # CLAIM_UNKNOWN also covers three answers the store did give — a 2xx
+    # carrying no claim record, a 404, and a claim state this image does not
+    # recognise — and on those the skipped release strands the PR for the full
+    # `_review_claim_lease_default()` window (at least 30 minutes, and longer
+    # once IMPLEMENTER_TIMEOUT_SECONDS is raised) rather than for nothing
+    # (claude P3 on `0808376`). Accepted deliberately: none of those three
+    # answers says who holds the claim, so all three are the case this rule is
+    # for. `LIFECYCLE_OWNERSHIP_REQUIRED=false` is the break-glass.
     release_claim = True
     branch = f"feat/agents-{ref.slug}"
     try:
@@ -2153,7 +2180,12 @@ def _mark_needs_triage(
     pr_url: str | None = None,
     attempt: dict[str, Any] | None = None,
     claim_context: _ClaimContext | None = None,
-) -> None:
+) -> bool:
+    """Record a terminal failure on the proposal. True when it was written.
+
+    False means a second executor now owns the proposal and its status was
+    deliberately left alone — see `_status_is_still_ours`.
+    """
     fields: dict[str, Any] = {
         "failure": {
             "code": code,
@@ -2165,6 +2197,19 @@ def _mark_needs_triage(
     if pr_url:
         fields["pr"] = pr_url
     if attempt:
+        # The same compare-and-swap the hand-back does, for the same reason:
+        # this write carries OUR attempt block, so making it while somebody
+        # else's run is live erases the block `_attempt_is_fresh` reads — and
+        # parks the proposal at a human gate for a race that, on the fence
+        # arm, the exception's own docstring calls "not a failure of the
+        # proposal" (claude P2 on `0808376`). An attempt-less call (no attempt
+        # was ever stamped) has nothing to compare and writes as before.
+        attempt_id = attempt.get("id") or ""
+        if not _status_is_still_ours(ref, attempt_id, doing=f"recording {code}"):
+            # Still release: the claim names our own record, so letting go of
+            # it frees nothing of theirs and leaks nothing of ours.
+            _release_claim(claim_context, reason=f"{stage}: {code}")
+            return False
         finished = dict(attempt)
         finished["finished_at"] = _now_iso()
         fields["attempt"] = finished
@@ -2172,6 +2217,7 @@ def _mark_needs_triage(
     # A terminal arm relinquishes the claim it was holding (ADR-010 phase 2,
     # #352) — best-effort, and never the reason this write fails.
     _release_claim(claim_context, reason=f"{stage}: {code}")
+    return True
 
 
 def _mark_blocked(
@@ -2563,7 +2609,12 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # Nothing was pushed, so there is nothing to reconcile. The
             # restore is a compare-and-swap — see `_hand_back_if_still_ours`.
             _release_claim(claim_ctx, reason="claim vanished mid-run")
-            _hand_back_if_still_ours(ref, attempt_id)
+            if not _hand_back_if_still_ours(ref, attempt_id):
+                # The CAS declined: somebody else's attempt is in the file, so
+                # the proposal was NOT handed back and the next tick will not
+                # retry it. Two different outcomes must not read identically
+                # in the batch summary (claude P3 on `0808376`).
+                msg = f"{msg} (left `in-progress` for the attempt that now holds it)"
         elif e.verdict == CLAIM_UNCLAIMED:
             # CLAIM_UNCLAIMED on a `fenced` record, or on no record at all.
             # `FREE_CLAIM_STATES` calls a fence free because acquiring over one

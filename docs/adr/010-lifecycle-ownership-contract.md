@@ -629,6 +629,16 @@ compare-and-swap on `attempt.id`: between this attempt's `in-progress` write
 and the moment its claim turns out to be gone, a second executor can have taken
 the proposal legitimately, and `update_status_yaml(..., attempt=None)` would
 erase the block `_attempt_is_fresh` reads — letting a third implementer start.
+
+That compare-and-swap is a property of every status write an ending attempt
+makes, not of the hand-back alone, and lives in one predicate
+(`_status_is_still_ours`) for that reason. The 409 `{"code": "fenced"}` form —
+ADR-010 §6's primary fence encoding, as opposed to the 2xx `fenced` record —
+answers `CLAIM_FENCED` and lands on `_mark_needs_triage`, which writes
+`needs-triage` carrying the ending attempt's own block; unguarded, that is the
+same erasure plus a human gate on a race the fence is explicitly not a failure
+of. `_mark_needs_triage` therefore consults the same predicate whenever it was
+given an attempt, returns whether it wrote, and releases the claim either way.
 The same "do not act on what the store did not say" rule governs the release
 event: only a 2xx from `/release` logs `released`, because a body-less 204 and
 a plain `{"status": "released"}` land on opposite values of `accepted` while
