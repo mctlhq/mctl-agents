@@ -353,9 +353,11 @@ class ClaimClient:
         op_name: str,
         **extra: Any,
     ) -> ClaimAnswer:
-        # The id this call ADDRESSES, bound once beside `path` and `payload`
-        # below rather than re-derived at each of the three exits: a fifth
-        # claim-addressed route is then one place to get right, not three.
+        # The id this call ADDRESSES, bound once at the top of the function —
+        # before the first exit that reads it, which is why it cannot sit
+        # beside `path` and `payload` — rather than re-derived at each of the
+        # three exits: a fifth claim-addressed route is then one place to get
+        # right, not three.
         # `or ""` rather than `str(...)` deliberately — it agrees with the
         # payload filter a few lines down, which drops both "" and None, so
         # an id that was never sent can never be logged as one that was
