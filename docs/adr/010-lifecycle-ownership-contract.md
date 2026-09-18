@@ -582,8 +582,14 @@ resolved as implemented, not merely proposed:
   fix for that shape is to set `WORKFLOW_UID`, not to mint a random id.
 - **Lease durations.** `LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default
   `7800`, matching the yaml lease it dual-writes beside) and
-  `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` (default `1800`, one
-  `MERGE_POLL_INTERVAL`), both env-overridable tunables, not contract.
+  `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW`, both env-overridable tunables, not
+  contract. The review default is one `MERGE_POLL_INTERVAL` (1800s) as a
+  FLOOR, widened to `IMPLEMENTER_TIMEOUT_SECONDS + 2 ×
+  IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` when those bound a longer run. Nothing
+  renews a claim mid-run — `ClaimClient.renew` exists but has no production
+  callers — so a lease shorter than the run holding it expires under its own
+  attempt and comes back from the push-site check as `CLAIM_UNCLAIMED`,
+  standing the attempt down for a race that never happened.
 
 `run_implementer._push_followup` and the existing-branch path of
 `_push_and_open_pr` now push with `--force-with-lease=<branch>:<sha>` — the
@@ -592,7 +598,16 @@ immediately beforehand, aborting non-charging on `CLAIM_FENCED`
 (`run_implementer.EXIT_FENCED`) and on a refusal — another executor holds the
 entity, or the store could not answer under the ownership break-glass —
 (`EXIT_CLAIM_REFUSED`). Both codes classify as `FollowupKind = "fenced"`: two
-different events, one shepherd handling, charge nothing and say which.
+different events, one shepherd handling, charge nothing and say which. Three
+verdicts reach that refusal and each is reported as itself rather than as a
+rival executor: `CLAIM_HELD_BY_OTHER` (a real, named holder),
+`CLAIM_UNKNOWN` (the store could not answer, failed closed under
+`LIFECYCLE_OWNERSHIP_REQUIRED`) and `CLAIM_UNCLAIMED` (the hold this attempt
+expected is gone — released, expired or fenced). In batch mode the same
+refusal is a skip at both sites: `implement_one` returns
+`counts_toward_limit=False` and never `_mark_needs_triage`, leaving
+`.status.yaml` exactly as the holder left it rather than rewriting a live
+`in-progress` back to `accepted`.
 That existing-branch push REPLACES the branch rather than adopting it: the
 retry clones fresh and recreates the branch off the default branch, so the
 dead attempt's commits are discarded. Intended — nothing references them —

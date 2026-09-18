@@ -16,6 +16,7 @@ from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
     CLAIM_HELD_BY_ME,
     CLAIM_HELD_BY_OTHER,
+    CLAIM_UNCLAIMED,
     CLAIM_UNKNOWN,
     ClaimAnswer,
 )
@@ -456,6 +457,14 @@ def test_a_refused_acquire_leaves_the_proposal_accepted_and_uncharged(
     )
 
     monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda *_a, **_kw: None)
+    # The GitHub preflight runs before the acquire and shells out to `gh`.
+    # Stub it: on a runner with a token it answers for real, and this test is
+    # about the claim, not about what GitHub says.
+    monkeypatch.setattr(
+        run_implementer,
+        "_preflight_existing_result",
+        lambda *_a, **_kw: run_implementer.ExistingResult(action="none"),
+    )
     monkeypatch.setattr(run_implementer, "ClaimClient", _client_answering(
         ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 holds it")
     ))
@@ -472,3 +481,131 @@ def test_a_refused_acquire_leaves_the_proposal_accepted_and_uncharged(
     body = status_path.read_text(encoding="utf-8")
     assert "in-progress" not in body, body
     assert "attempt" not in body, body
+
+
+def test_a_vanished_claim_is_not_reported_as_a_competing_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAIM_UNCLAIMED is the THIRD verdict that reaches the refusal branch —
+    `claim_verdict_for` answers it for `released`, `expired` and `fenced` —
+    and the common shape is this attempt's own lease running out, since
+    `ClaimClient.renew` has no production callers. Naming a rival there sends
+    the operator looking for an executor that does not exist and hides the one
+    thing they can act on (claude P2 on `d5e2a48`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
+        _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_UNCLAIMED, reason="lease expired"))
+    msg = str(excinfo.value)
+    assert "the lease ran out from under this attempt" in msg
+    assert "another executor holds" not in msg
+
+
+@pytest.mark.parametrize(
+    ("verdict", "expected", "forbidden"),
+    [
+        (CLAIM_UNCLAIMED, "the lease ran out from under this attempt", "another executor holds"),
+        (CLAIM_HELD_BY_OTHER, "another executor holds", "lease ran out"),
+        (CLAIM_UNKNOWN, "could not answer", "another executor holds"),
+    ],
+)
+def test_the_push_site_reports_each_verdict_as_itself(
+    monkeypatch: pytest.MonkeyPatch, verdict: str, expected: str, forbidden: str,
+) -> None:
+    """One verdict, one wording, at both raise sites: the push-site check must
+    not collapse three different situations into "another executor holds"."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    ctx = run_implementer._ClaimContext(
+        client=_client_answering(ClaimAnswer(verdict=verdict, reason="because"))(),
+        claim_id="c1",
+        entity=run_implementer.EntityRef.for_pull_request("mctlhq/mctl-web", 1, "a" * 40),
+        phase=run_implementer.PHASE_REVIEW_REMEDIATION,
+        owner_epoch=0,
+        entity_version="a" * 40,
+        executor=run_implementer.Executor(type=run_implementer.OWNER_IMPLEMENTER, id="attempt-1"),
+        attempt="attempt-1",
+    )
+    with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
+        run_implementer._check_claim_or_raise(ctx)
+    msg = str(excinfo.value)
+    assert expected in msg
+    assert forbidden not in msg
+
+
+def test_a_push_site_refusal_is_a_skip_not_needs_triage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The acquire succeeds, the run happens, and the claim is gone by the
+    time of the push. Without a dedicated arm this fell through to
+    `except Exception` and was recorded as `unexpected-error`/`agent` — a
+    crash in the proposal's history for a race the attempt did not cause, and
+    the exact outcome `ImplementerClaimRefused`'s docstring forbids
+    (claude + agy P2 on `d5e2a48`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    proposal_dir = tmp_path / "mctl-web" / "slug"
+    proposal_dir.mkdir(parents=True)
+    status_path = proposal_dir / ".status.yaml"
+    status_path.write_text("status: accepted\n", encoding="utf-8")
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=proposal_dir, status="accepted",
+        approval_ok=True,
+    )
+
+    answers = iter([
+        ClaimAnswer(verdict=CLAIM_HELD_BY_ME),                        # acquire
+        ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 took it"),  # push site
+    ])
+
+    class _Client:
+        def acquire(self, *a, **kw):
+            return next(answers)
+
+        def check(self, *a, **kw):
+            return next(answers)
+
+        def release(self, *a, **kw):
+            return None
+
+    monkeypatch.setattr(run_implementer, "ClaimClient", _Client)
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        run_implementer,
+        "_preflight_existing_result",
+        lambda *_a, **_kw: run_implementer.ExistingResult(action="none"),
+    )
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a, **_kw: tmp_path / "repo")
+    monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_build_prompt", lambda *_a, **_kw: "prompt")
+    monkeypatch.setattr(run_implementer.anyio, "run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    triaged: list[str] = []
+    monkeypatch.setattr(
+        run_implementer, "_mark_needs_triage",
+        lambda *a, **kw: triaged.append(kw.get("code", "")),
+    )
+
+    result = run_implementer.implement_one(ref)
+
+    assert triaged == [], triaged
+    assert result.error is None
+    assert result.counts_toward_limit is False
+    assert "another executor holds" in (result.skipped_reason or "")
+    # The status file keeps the holder's view of the world: this attempt does
+    # not rewrite it back to `accepted` over a live `in-progress`.
+    assert "in-progress" in status_path.read_text(encoding="utf-8")
+
+
+def test_the_review_lease_always_outlives_the_run_it_covers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nothing renews a claim mid-run, so a lease shorter than the run's own
+    timeouts guarantees a CLAIM_UNCLAIMED refusal at the push site. The floor
+    holds for the default timeouts; a raised IMPLEMENTER_TIMEOUT_SECONDS must
+    widen the lease rather than silently outgrow it."""
+    assert run_implementer._review_claim_lease_default() >= run_implementer.REVIEW_CLAIM_LEASE_FLOOR
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 7200.0)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    widened = run_implementer._review_claim_lease_default()
+    assert widened.total_seconds() >= 7200.0

@@ -2801,6 +2801,18 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
             # `claim.blocks_mutation`: UNKNOWN is gated on the
             # `LIFECYCLE_OWNERSHIP_REQUIRED` break-glass, never treated like a
             # definite answer.
+            #
+            # This outranks an EXPIRED yaml lease, so it is the one arm that
+            # holds an attempt nothing can be shown to hold. Silence there
+            # reads as "the shepherd stopped picking this up" with no cause
+            # on record, so name both the outage and the way out of it
+            # (claude P3 on `d5e2a48`).
+            print(
+                f"info: {ref.service}/{ref.slug}: the claim store could not "
+                f"answer ({answer.reason or answer.verdict}); holding the "
+                f"attempt rather than starting a second executor; set "
+                f"LIFECYCLE_OWNERSHIP_REQUIRED=false to proceed anyway"
+            )
             return True
         if rollout.new_answer_decides():
             return False

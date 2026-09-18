@@ -109,6 +109,7 @@ from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
 from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
+    CLAIM_UNCLAIMED,
     CLAIM_UNKNOWN,
     OWNER_IMPLEMENTER,
     PHASE_IMPLEMENT,
@@ -567,7 +568,7 @@ class ImplementerFenced(RuntimeError):
 class ImplementerClaimRefused(RuntimeError):
     """A claim check refused this attempt where that refusal blocks.
 
-    Two different answers arrive here, and the message says which:
+    Three different answers arrive here, and the message says which:
 
     - CLAIM_HELD_BY_OTHER — a real, named executor holds the entity and this
       attempt lost the race;
@@ -575,7 +576,13 @@ class ImplementerClaimRefused(RuntimeError):
       configured) while `LIFECYCLE_OWNERSHIP_REQUIRED` is on, the default.
       Nobody holds anything; uncertainty is being failed closed. Reporting
       that as a competing holder sent the operator looking for an executor
-      that does not exist (claude P2 on `31232dc`).
+      that does not exist (claude P2 on `31232dc`);
+    - CLAIM_UNCLAIMED where a hold was expected — `claim_verdict_for` answers
+      it for `released`, `expired` and `fenced`, so the common shape is this
+      attempt's OWN lease running out mid-run (`ClaimClient.renew` has no
+      production callers). Nobody else holds it either; naming a rival here
+      hides the one thing an operator can act on, which is the lease
+      (claude P2 on `d5e2a48`).
 
     Distinct from `ImplementerFenced`: nothing moved under this attempt.
     Distinct from a generic failure too, because the correct response is to
@@ -629,8 +636,31 @@ def _claim_lease_seconds(env_var: str, default: timedelta) -> int:
 
 
 # One MERGE_POLL_INTERVAL (run_shepherd.py) — a review-remediation claim only
-# needs to outlive one shepherd poll, not a full implement run.
-REVIEW_CLAIM_LEASE_DEFAULT = timedelta(minutes=30)
+# needs to outlive one shepherd poll, not a full implement run. It is a FLOOR,
+# not the whole answer: the lease also has to outlive the run that holds it,
+# and nothing renews it (`ClaimClient.renew` has no production callers). A
+# claim that expires mid-run comes back from the push-site check as
+# CLAIM_UNCLAIMED and stands the attempt down for no reason at all, so the
+# default is sized from the two timeouts that actually bound the run rather
+# than pinned to a literal that a raised IMPLEMENTER_TIMEOUT_SECONDS silently
+# outgrows (claude P2 on `d5e2a48`).
+REVIEW_CLAIM_LEASE_FLOOR = timedelta(minutes=30)
+
+
+def _review_claim_lease_default() -> timedelta:
+    """The review lease floor, widened to cover the run it has to outlive.
+
+    `IMPLEMENTER_TIMEOUT_SECONDS` bounds the SDK run; the git work around it
+    is bounded by `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which
+    the clone before and the push after are the two that matter. The margin
+    is deliberately the whole of both rather than a fraction: expiring early
+    costs a wasted attempt, expiring late costs a wait no longer than one
+    shepherd poll.
+    """
+    bound = timedelta(
+        seconds=IMPLEMENTER_TIMEOUT_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
+    )
+    return max(REVIEW_CLAIM_LEASE_FLOOR, bound)
 
 
 def _resolve_attempt_id(service: str, slug: str, owner_epoch: int, attempt_ordinal: int) -> str:
@@ -746,6 +776,13 @@ def _acquire_claim(
                     f"Nobody is known to hold it; uncertainty is failed closed because "
                     f"LIFECYCLE_OWNERSHIP_REQUIRED is on (set it to false to proceed anyway)"
                 )
+            if answer.verdict == CLAIM_UNCLAIMED:
+                raise ImplementerClaimRefused(
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the claim this attempt expected to hold on "
+                    f"{entity.kind}:{entity.id}/{phase} is gone (released, expired or fenced): "
+                    f"{answer.reason or answer.verdict}. Nobody else holds it; the lease ran "
+                    f"out from under this attempt"
+                )
             raise ImplementerClaimRefused(
                 f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
                 f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}"
@@ -804,6 +841,13 @@ def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = No
                 f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} before the push: "
                 f"{answer.reason or answer.verdict}. Nobody is known to hold it; "
                 f"uncertainty is failed closed because LIFECYCLE_OWNERSHIP_REQUIRED is on"
+            )
+        if answer.verdict == CLAIM_UNCLAIMED:
+            raise ImplementerClaimRefused(
+                f"{CLAIM_REFUSED_ERROR_PREFIX} the claim this attempt held on "
+                f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} is gone (released, expired or "
+                f"fenced) by the time of the push: {answer.reason or answer.verdict}. Nobody "
+                f"else holds it; the lease ran out from under this attempt"
             )
         raise ImplementerClaimRefused(
             f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
@@ -1466,7 +1510,7 @@ def review_feedback_one(
                 old_head,
                 attempt_id,
                 lease_seconds=_claim_lease_seconds(
-                    "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", REVIEW_CLAIM_LEASE_DEFAULT
+                    "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", _review_claim_lease_default()
                 ),
             )
 
@@ -1526,7 +1570,7 @@ def review_feedback_one(
         # decision it is rather than as "subprocess failed transiently" — a
         # leaked lease otherwise repeats that misleading line every tick for
         # the full lease (claude P3 on `31232dc`).
-        release_reason = "claim held by another executor"
+        release_reason = "claim refused"
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
     except ImplementerOrphanedSubagent as e:
@@ -2387,6 +2431,28 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
+    except ImplementerClaimRefused as e:
+        # The push-site claim check refused this attempt. Same shape as the
+        # acquire-site arm above the `try`: a skip, not a failure, and
+        # explicitly NOT `_mark_needs_triage` — the exception's own docstring
+        # forbids that outcome, and without this arm the refusal fell through
+        # to the generic `except Exception` and was recorded as
+        # `unexpected-error`/`agent`, i.e. a crash in the proposal's history
+        # (claude + agy P2 on `d5e2a48`).
+        #
+        # The `.status.yaml` is deliberately left exactly as it is, still
+        # `in-progress` with this attempt's block. Whoever holds the claim now
+        # writes the only status this proposal gets; rewriting it back to
+        # `accepted` from here would clobber a live holder's `in-progress` and
+        # invite the second run this whole contract exists to prevent. When
+        # nobody holds it (CLAIM_UNCLAIMED — this attempt's own lease ran out)
+        # the yaml lease expires on its own and the next tick retries.
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason=str(e),
+            counts_toward_limit=False,
+        )
     except ImplementerOrphanedSubagent as e:
         # Batch mode has no review-attempt budget, so it needs no sentinel exit
         # code — but it does need its own triage code, otherwise this lands in

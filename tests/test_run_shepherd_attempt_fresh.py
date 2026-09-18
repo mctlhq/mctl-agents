@@ -174,6 +174,28 @@ def test_an_unreachable_store_does_not_free_an_attempt_at_only(
     assert run_shepherd._attempt_is_fresh(ref) is True
 
 
+def test_holding_on_an_unknown_says_why_and_how_to_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """This is the one arm that holds an attempt nothing can be shown to
+    hold — it outranks an EXPIRED yaml lease — so silence there reads as "the
+    shepherd stopped picking this up" with no cause on record (claude P3 on
+    `d5e2a48`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "only")
+    monkeypatch.delenv("LIFECYCLE_OWNERSHIP_REQUIRED", raising=False)
+    monkeypatch.setattr(
+        run_shepherd.ClaimClient,
+        "check",
+        lambda self, *a, **kw: ClaimAnswer(verdict=CLAIM_UNKNOWN, reason="mctl-api unreachable"),
+    )
+    past = (datetime.now(UTC) - timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    ref = _ref(tmp_path, id="attempt-1", expires_at=past)
+    assert run_shepherd._attempt_is_fresh(ref) is True
+    out = capsys.readouterr().out
+    assert "mctl-api unreachable" in out
+    assert "LIFECYCLE_OWNERSHIP_REQUIRED=false" in out
+
+
 def test_the_break_glass_can_still_release_an_unknown_at_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
