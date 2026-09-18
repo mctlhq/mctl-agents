@@ -363,7 +363,7 @@ class ClaimClient:
             )
             self._emit_for(
                 op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
-                status=None,
+                status=None, asked_claim_id=str(extra.get("claim_id", "")),
             )
             return answer
         payload: dict[str, Any] = {
@@ -384,7 +384,7 @@ class ClaimClient:
             answer = ClaimAnswer(verdict=CLAIM_UNKNOWN, reason=str(exc))
             self._emit_for(
                 op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
-                status=None,
+                status=None, asked_claim_id=str(extra.get("claim_id", "")),
             )
             return answer
         answer = claim_answer_from(
@@ -392,7 +392,7 @@ class ClaimClient:
         )
         self._emit_for(
             op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
-            status=res.status,
+            status=res.status, asked_claim_id=str(extra.get("claim_id", "")),
         )
         return answer
 
@@ -408,6 +408,7 @@ class ClaimClient:
         attempt: str,
         *,
         status: int | None = None,
+        asked_claim_id: str = "",
     ) -> None:
         """Map one call's outcome onto the closed event vocabulary and log it.
 
@@ -416,8 +417,16 @@ class ClaimClient:
         rollout mode that skips the call). It is the only input that separates
         "the store answered" from "we never got there", and the release event
         below is the one mapping that needs to know the difference.
+
+        ``asked_claim_id`` is the id the CALL carried, for the four routes
+        addressed by claim id. Without it the shapes that reach this log most
+        often — a `204` release, a `{"status": "released"}` release, the
+        recordless `2xx` renew — log `claim=` empty, and an operator grepping
+        for one id finds the `acquired` line but not the `released` line that
+        closes it (claude P3 on `61be855`). The record still wins when there
+        is one: it is what the store says the claim IS.
         """
-        claim_id = answer.claim.claim_id if answer.claim else ""
+        claim_id = answer.claim.claim_id if answer.claim else asked_claim_id
         # What happened TO THE CLAIM outranks what this call asked for, and
         # the record is one of the two ways to learn it. `CLAIM_FENCED` is
         # only ever a 409 envelope code; a 2xx body reporting `state:

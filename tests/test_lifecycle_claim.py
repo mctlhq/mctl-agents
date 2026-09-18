@@ -747,3 +747,51 @@ def test_a_2xx_release_reports_what_happened_to_the_claim(
     )
     c.release("c1", ENTITY, PHASE, 0, ME, "attempt-1", reason="done")
     assert lines == [expected], lines
+
+
+def test_a_recordless_outcome_still_logs_the_claim_id_the_call_carried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shapes that reach `_emit_for` most often carry no record at all: a
+    `204` release, a `{"status": "released"}` release, and the recordless
+    `2xx` renew `b362b5e` deliberately made a first-class success. Deriving
+    the logged id solely from the record logged `claim=` empty for all three,
+    so an operator grepping `lifecycle-claim:` for one id found the
+    `acquired` line and not the `released` line that closes it — although
+    every one of these routes is ADDRESSED by claim id and was given one
+    (claude P3 on `61be855`)."""
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: seen.append((a[0], a[7])))
+
+    released_204 = _client(monkeypatch, lambda req: _FakeResponse(b"", status=204))
+    released_204.release("c-204", ENTITY, PHASE, 0, ME, "attempt-1", reason="done")
+
+    released_body = _client(
+        monkeypatch, lambda req: _FakeResponse(b'{"status": "released"}', status=200)
+    )
+    released_body.release("c-body", ENTITY, PHASE, 0, ME, "attempt-1", reason="done")
+
+    renewed = _client(monkeypatch, lambda req: _FakeResponse(b'{"renewed": true}', status=200))
+    renewed.renew("c-renew", ENTITY, PHASE, 0, "sha-a", ME, "attempt-1", lease_seconds=60)
+
+    assert seen == [
+        (claim_module.EVENT_RELEASED, "c-204"),
+        (claim_module.EVENT_RELEASED, "c-body"),
+        (claim_module.EVENT_RENEWED, "c-renew"),
+    ], seen
+
+
+def test_the_record_outranks_the_asked_for_claim_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fallback is a fallback. When the store answers with a full record,
+    the id it reports is what the claim IS, and that is what gets logged even
+    if the call addressed a different one — the same "say what the store did,
+    not what the call asked for" rule the release arm was corrected to
+    twice."""
+    seen: list[tuple[str, str]] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: seen.append((a[0], a[7])))
+    c = _client(
+        monkeypatch,
+        lambda req: _FakeResponse(json.dumps(_claim(ME, claim_id="c-store")).encode(), status=200),
+    )
+    c.release("c-asked", ENTITY, PHASE, 0, ME, "attempt-1", reason="done")
+    assert seen == [(claim_module.EVENT_RELEASED, "c-store")], seen
