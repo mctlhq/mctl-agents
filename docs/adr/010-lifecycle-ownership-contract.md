@@ -619,15 +619,14 @@ resolved as implemented, not merely proposed:
   is the one shape this image cannot verify and must not assume.
   Everything else answers `claim-unknown` — a record this image could not read
   (a 200 error envelope, a record from a newer mctl-api, a record nested one
-  level deeper), and equally an acknowledgement that says NO — `{"ok": false}` and
-  `{"status": "expired"}` on the value rule, `{"reason": "lease already
+  level deeper), and equally an acknowledgement that says NO — `{"ok": false}`
+  and `{"status": "expired"}` on the value rule, `{"reason": "lease already
   expired"}` on the key rule, since `reason` is no acknowledgement name at
-  all. Reading the
-  sets this way round is the point: a name nobody has thought of falls to
-  `claim-unknown` rather than to the most confident verdict in the vocabulary
-  (claude P2 on `b362b5e` and `f4d0dec`). A body that fails to parse
-  at all — an HTML error page served with a 200 — is likewise `claim-unknown`,
-  as before.
+  all. Reading the sets this way round is the point: a name nobody has thought
+  of falls to `claim-unknown` rather than to the most confident verdict in the
+  vocabulary (claude P2 on `b362b5e` and `f4d0dec`). A body that fails to
+  parse at all — an HTML error page served with a 200 — is likewise
+  `claim-unknown`, as before.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
   resolves `WORKFLOW_UID`, then
   `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The

@@ -578,6 +578,13 @@ def test_a_renew_the_store_performed_is_held_by_me_even_with_no_record(
         {"claim": {"claim_id": "c1"}},
         {"data": {"claim_id": "c1", "state": "active"}},
         {"claim_id": "c1"},
+        # The half-record ADR-010 refuses by name: an acknowledgement carrying
+        # the new lease and nothing else that identifies the claim. It belongs
+        # here rather than with the denials — it says YES, and is refused for
+        # describing a claim this image cannot verify. A store with this much
+        # to say should answer with a FULL record (claude P3 on `467e23d` and
+        # `75e1285`).
+        {"status": "renewed", "lease_until": "2026-09-18T22:00:00Z"},
     ],
 )
 def test_a_2xx_renew_describing_a_claim_we_cannot_read_is_never_a_hold(
@@ -605,11 +612,6 @@ def test_a_2xx_renew_describing_a_claim_we_cannot_read_is_never_a_hold(
         {"renewed": False},
         {"reason": "lease already expired"},
         {"message": "renewed"},
-        # The half-record ADR-010 now refuses by name: an acknowledgement
-        # carrying the new lease and nothing else that identifies the claim.
-        # A store with this much to say should answer with a FULL record
-        # (claude P3 on `467e23d`).
-        {"status": "renewed", "lease_until": "2026-09-18T22:00:00Z"},
         {"ok": True, "state": "expired"},
         {"ok": 1},
     ],
@@ -721,3 +723,27 @@ def test_a_claim_lease_override_can_only_lengthen(
         _claim_lease_seconds(env_var, timedelta(seconds=computed))
         == int(computed * factor)
     )
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [("fenced", claim_module.EVENT_FENCED), ("expired", claim_module.EVENT_EXPIRED)],
+)
+def test_a_2xx_release_reports_what_happened_to_the_claim(
+    monkeypatch: pytest.MonkeyPatch, state: str, expected: str
+) -> None:
+    """What happened TO THE CLAIM outranks what the call asked for, and the
+    release arm's own comment says so. It was only true for `expired`:
+    `CLAIM_FENCED` is a 409 envelope code, so a 2xx body reporting
+    `state: "fenced"` verdicts as CLAIM_UNCLAIMED — `fenced` is in
+    FREE_CLAIM_STATES — and the release arm logged `released` for a claim the
+    store had fenced, the one direction this log must never be wrong in
+    (agy P3 on `75e1285`)."""
+    lines: list[str] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: lines.append(a[0]))
+    c = _client(
+        monkeypatch,
+        lambda req: _FakeResponse(json.dumps(_claim(ME, state=state)).encode(), status=200),
+    )
+    c.release("c1", ENTITY, PHASE, 0, ME, "attempt-1", reason="done")
+    assert lines == [expected], lines

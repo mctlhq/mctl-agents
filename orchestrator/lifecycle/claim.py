@@ -37,6 +37,7 @@ from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
     CLAIM_HELD_BY_ME,
     CLAIM_STATE_EXPIRED,
+    CLAIM_STATE_FENCED,
     CLAIM_UNKNOWN,
     ClaimAnswer,
     EntityRef,
@@ -417,9 +418,18 @@ class ClaimClient:
         below is the one mapping that needs to know the difference.
         """
         claim_id = answer.claim.claim_id if answer.claim else ""
-        if answer.verdict == CLAIM_FENCED:
+        # What happened TO THE CLAIM outranks what this call asked for, and
+        # the record is one of the two ways to learn it. `CLAIM_FENCED` is
+        # only ever a 409 envelope code; a 2xx body reporting `state:
+        # "fenced"` verdicts as CLAIM_UNCLAIMED, because `fenced` is in
+        # FREE_CLAIM_STATES — so reading the verdict alone logged a fenced
+        # release as `released`, the one direction this log must never be
+        # wrong in. Both states are now read off the record, the same way
+        # (agy P3 on `75e1285`).
+        record_state = answer.claim.state if answer.claim else ""
+        if answer.verdict == CLAIM_FENCED or record_state == CLAIM_STATE_FENCED:
             event = EVENT_FENCED
-        elif answer.claim is not None and answer.claim.state == CLAIM_STATE_EXPIRED:
+        elif record_state == CLAIM_STATE_EXPIRED:
             event = EVENT_EXPIRED
         elif op_name == "acquire":
             if answer.retaken:
