@@ -181,7 +181,7 @@ def test_a_commit_beats_the_marker(repo, monkeypatch) -> None:
     """A marker written next to a real commit must not suppress the push."""
     _stub_review_feedback(monkeypatch, repo)
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
-    monkeypatch.setattr(run_implementer, "_push_followup", lambda *_a: None)
+    monkeypatch.setattr(run_implementer, "_push_followup", lambda *_a, **_kw: None)
     monkeypatch.setattr(run_implementer, "_load_status", lambda *_a: {"pr": "https://pr"})
     _write_marker(repo, {"refused": True, "reason": "should be ignored"})
 

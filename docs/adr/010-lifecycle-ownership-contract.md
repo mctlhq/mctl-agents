@@ -542,13 +542,64 @@ rollout judged by anecdote.
 | 0 | #350 | this ADR |
 | 1 | #351 | `LifecycleOwnership` only — store, API, client, writers, projection, `observe`, bootstrap |
 | 1 | mctl-api#293 | read-only inspection, ships before the soak so rollout is diagnosable |
-| 2 | #352 | `ExecutionClaim`, database-clock lease and renew, epoch fencing, handoff |
+| 2 | #352 | `ExecutionClaim`, database-clock lease and renew, epoch fencing, handoff — **shipped** (Python contract, clients, call sites, rollout gate; the mctl-api routes ship separately) |
 | 3 | #353 | reconciler over known ownership rows; adoption integration after #334 |
 | 4 | mctl-api#294 | guarded operator recovery with optimistic preconditions |
 | 5 | — | extension beyond DevLoop, gated on the pilot; hand-off to `mctlhq/.github#21` and `#42` |
 
 Phase 1 acquires ownership only. No `ExecutionClaim`, no lease and no fencing
 ship in #351; the existing 130-minute `attempt` lease is untouched until #352.
+
+**Phase 2 (#352), as shipped in this repository.** `orchestrator/lifecycle/contract.py`
+gained the claim types (`ExecutionClaim`, `Executor`, `ClaimAnswer`), the closed
+verdict vocabulary and the single classifier `claim_answer_from`, plus
+`idempotency_key_for`. `orchestrator/lifecycle/claim.py` is the synchronous
+`ClaimClient` for `run_shepherd`/`run_implementer`, and
+`orchestrator/temporal/activities/lifecycle.py` gained the `execution_claim`
+activity for `DevLoopWorkflow`. Three open questions from requirements.md were
+resolved as implemented, not merely proposed:
+
+- **Wire status for a fence.** A 409 carrying `code: "fenced"` is `CLAIM_FENCED`;
+  a 409 carrying `code: "claim-held"`, or any other 409, is `CLAIM_HELD_BY_OTHER`
+  — never guessed toward either side on an unrecognised code, and never a
+  licence to execute.
+- **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
+  resolves `WORKFLOW_UID`, then
+  `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}")`. The
+  `attempt_ordinal` is fixed at `0` for the implement phase, since this
+  repository's `.status.yaml` `attempt` block has no per-epoch attempt counter
+  to derive a real ordinal from yet — a fixed ordinal still satisfies the
+  determinism and renew-on-restart properties this fallback exists for.
+- **Lease durations.** `LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default
+  `7800`, matching the yaml lease it dual-writes beside) and
+  `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` (default `1800`, one
+  `MERGE_POLL_INTERVAL`), both env-overridable tunables, not contract.
+
+`run_implementer._push_followup` and the adopt-existing-branch path of
+`_push_and_open_pr` now push with `--force-with-lease=<branch>:<sha>` — the
+explicit-SHA form, never the bare flag — and both call `ClaimClient.check()`
+immediately beforehand, aborting non-charging (`FollowupKind = "fenced"`,
+`run_implementer.EXIT_FENCED`) on `CLAIM_FENCED`. `run_shepherd._attempt_is_fresh`
+is the union of an active claim and the yaml lease, and the yaml branch now
+also requires a named holder rather than trusting `expires_at` alone.
+`DevLoopWorkflow._watch_pr`'s `finally` issues `handoff-start` to
+`OWNER_SHEPHERD` instead of a bare `release` when the watch ends
+non-terminally, behind a new `workflow.patched("lifecycle-claims")` marker
+kept separate from `lifecycle-ownership` so a history recorded under phase 1
+replays unchanged.
+
+**Known simplification.** The delegated-claim path (a shepherd fixing a
+steward-owned PR under the steward's epoch) is not fully wired: this repo has
+no existing mechanism to read the CURRENT ownership epoch from a Tier 3 CLI
+process, so both `run_implementer` and `run_shepherd` acquire claims with
+`owner_epoch=0` rather than the steward's live epoch. Epoch fencing is
+therefore inert for CLI-originated claims until that read is added; the
+`entity_version` fence (the git head SHA, via `--force-with-lease`) is
+unaffected and remains the authoritative CAS for every push in this
+repository. Merge authority is unaffected either way: it is re-evaluated at
+the merge boundary through `policy.merge_authority_for`,
+`run_shepherd._service_mode` and `NEVER_MERGE_SERVICES`, none of which read a
+claim.
 
 ## Testable invariants
 

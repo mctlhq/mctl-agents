@@ -7,6 +7,7 @@ still deserializes out of Temporal history.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -33,6 +34,10 @@ OWNER_SHEPHERD = "shepherd"
 OWNER_PR_STEWARD = "pr-steward"
 OWNER_RECONCILER = "reconciler"
 OWNER_HUMAN_CODEOWNER = "human-codeowner"
+# The Tier 2 implementer CLI process (run_implementer.py). Added for
+# ExecutionClaim executors (phase 2, #352): it is the first lifecycle caller
+# that is neither the DevLoop workflow nor a Tier 3 process.
+OWNER_IMPLEMENTER = "implementer"
 
 
 @dataclass(frozen=True)
@@ -569,3 +574,260 @@ def answer_from(
     # the record moved underneath the caller, which is the strongest possible
     # reason not to act on a stale belief.
     return OwnershipAnswer(verdict=UNKNOWN, reason=_error_of(status, payload))
+
+
+# ---------------------------------------------------------------------------
+# ExecutionClaim (ADR-010 phase 2, #352).
+#
+# Ownership above answers "who is responsible for reaching a terminal state on
+# (entity, phase)" — a durable fact. A claim answers a narrower, shorter-lived
+# question: "may THIS attempt perform a mutating step RIGHT NOW". Holding a
+# claim grants nothing about merge or push authority on its own (#344); it is
+# mutual exclusion plus fencing plus idempotency, nothing else.
+#
+# The classifier lives here, next to `answer_from`, for the same reason: two
+# transports (a sync urllib client for CLI processes, an async httpx activity
+# for Temporal) must not each carry their own copy of "what does this HTTP
+# response mean". That already happened once to the ownership classifier.
+# ---------------------------------------------------------------------------
+
+CLAIM_HELD_BY_ME = "claim-held-by-me"
+CLAIM_HELD_BY_OTHER = "claim-held-by-other"
+CLAIM_FENCED = "claim-fenced"
+CLAIM_UNCLAIMED = "claim-unclaimed"
+CLAIM_UNKNOWN = "claim-unknown"
+
+# Claim states, distinct from the ownership STATE_* vocabulary above even
+# where the words coincide: a claim is a short lease, not a durable row, and
+# "active" here never implies ownership health.
+CLAIM_STATE_ACTIVE = "active"
+CLAIM_STATE_RELEASED = "released"
+CLAIM_STATE_EXPIRED = "expired"
+CLAIM_STATE_FENCED = "fenced"
+
+# Both closed, mirroring HOLDING_STATES / FREE_STATES: a claim state in
+# neither set is CLAIM_UNKNOWN, never guessed toward either side.
+HOLDING_CLAIM_STATES = frozenset({CLAIM_STATE_ACTIVE})
+FREE_CLAIM_STATES = frozenset({CLAIM_STATE_RELEASED, CLAIM_STATE_EXPIRED, CLAIM_STATE_FENCED})
+
+
+@dataclass(frozen=True)
+class Executor:
+    """The concrete worker attempt asking for (or holding) a claim.
+
+    Distinct from ``Owner``: an ``Owner`` names who is durably RESPONSIBLE,
+    an ``Executor`` names who is, right now, DOING. A delegated claim (a
+    shepherd fixing a steward-owned PR) has an executor of type "shepherd"
+    while the owning row still names the steward — holding the claim moves
+    no ownership and grants no merge authority (#344).
+    """
+
+    type: str = ""  # shepherd | pr-steward | devloop-workflow | reconciler | implementer
+    id: str = ""
+
+
+@dataclass(frozen=True)
+class ExecutionClaim:
+    """One short-lived mutual-exclusion lease on (entity, phase, epoch, version).
+
+    Every field defaulted, matching ``Ownership``, so a claim recorded before a
+    field existed still deserializes out of Temporal history.
+    """
+
+    claim_id: str = ""
+    entity: EntityRef = field(default_factory=EntityRef)
+    phase: str = ""
+    #: FENCE. Must match the ownership row's current epoch, or the claim is
+    #: CLAIM_FENCED (a handoff moved on without this attempt).
+    owner_epoch: int = 0
+    #: FENCE. The head SHA or content hash this attempt is pinned to. A new
+    #: PR head or a changed `.status.yaml` content hash fences it.
+    entity_version: str = ""
+    executor: Executor = field(default_factory=Executor)
+    attempt: str = ""
+    #: Server clock. Informational to the client — never computed locally.
+    lease_until: str = ""
+    idempotency_key: str = ""
+    outcome: str = ""
+    state: str = ""
+
+    @staticmethod
+    def from_payload(data: dict[str, Any]) -> ExecutionClaim | None:
+        """Build from an mctl-api response, or None if it is not one.
+
+        Same two rules as ``Ownership.from_payload``: unknown keys are
+        ignored (a routine mctl-api deploy must not become a claims outage),
+        and a malformed body returns None rather than an all-empty record
+        that would read downstream as a confident answer.
+        """
+        if not isinstance(data, dict):
+            return None
+
+        def _mapping(raw: Any) -> dict[str, Any]:
+            return raw if isinstance(raw, dict) else {}
+
+        def _int(raw: Any) -> int:
+            try:
+                return int(raw or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        ent = _mapping(data.get("entity"))
+        exe = _mapping(data.get("executor"))
+        # A record with no claim_id, phase, executor type or state is not a
+        # record — every real response carries all four, and this is the
+        # cheapest way to tell a claim payload from an error envelope that
+        # happened to be 200.
+        if (
+            not data.get("claim_id")
+            or not data.get("phase")
+            or not exe.get("type")
+            or not data.get("state")
+        ):
+            return None
+
+        return ExecutionClaim(
+            claim_id=str(data.get("claim_id") or ""),
+            entity=EntityRef(
+                kind=str(ent.get("kind") or ""),
+                id=str(ent.get("id") or ""),
+                version=str(ent.get("version") or ""),
+            ),
+            phase=str(data.get("phase") or ""),
+            owner_epoch=_int(data.get("owner_epoch")),
+            entity_version=str(data.get("entity_version") or ""),
+            executor=Executor(type=str(exe.get("type") or ""), id=str(exe.get("id") or "")),
+            attempt=str(data.get("attempt") or ""),
+            lease_until=str(data.get("lease_until") or ""),
+            idempotency_key=str(data.get("idempotency_key") or ""),
+            outcome=str(data.get("outcome") or ""),
+            state=str(data.get("state") or ""),
+        )
+
+
+@dataclass(frozen=True)
+class ClaimAnswer:
+    """The result of asking for (or checking) an execution claim."""
+
+    verdict: str = CLAIM_UNKNOWN
+    claim: ExecutionClaim | None = None
+    reason: str = ""
+    accepted: bool = False
+
+    @property
+    def may_execute(self) -> bool:
+        """Whether the asking executor may perform the mutating step.
+
+        True only for CLAIM_HELD_BY_ME. CLAIM_UNKNOWN is False for the same
+        reason OwnershipAnswer.may_mutate is False on UNKNOWN: uncertainty
+        must never license a second executor to push or merge.
+        """
+        return self.verdict == CLAIM_HELD_BY_ME
+
+
+def claim_record_of(payload: dict[str, Any]) -> ExecutionClaim | None:
+    """The claim in a response body, top level or nested under ``claim``."""
+    if not isinstance(payload, dict):
+        return None
+    claim = ExecutionClaim.from_payload(payload)
+    if claim is not None:
+        return claim
+    nested = payload.get("claim")
+    if isinstance(nested, dict):
+        return ExecutionClaim.from_payload(nested)
+    return None
+
+
+def claim_verdict_for(claim: ExecutionClaim, asking: Executor | None) -> str:
+    """Turn a claim record into an answer, mirroring ``verdict_for``.
+
+    Both state sets are closed and a state in neither is CLAIM_UNKNOWN — a
+    claim state added server-side and unrecognised by this image must not be
+    guessed toward either "I hold it" or "it is free".
+    """
+    if claim.state in FREE_CLAIM_STATES:
+        return CLAIM_UNCLAIMED
+    if claim.state not in HOLDING_CLAIM_STATES:
+        return CLAIM_UNKNOWN
+    if asking is not None and claim.executor == asking:
+        return CLAIM_HELD_BY_ME
+    return CLAIM_HELD_BY_OTHER
+
+
+def _claim_error_of(status: int, payload: dict[str, Any]) -> str:
+    return str(payload.get("error") or f"HTTP {status}")
+
+
+def _looks_like_claim_answer(payload: dict[str, Any]) -> bool:
+    return claim_record_of(payload) is not None
+
+
+def claim_answer_from(
+    status: int,
+    payload: dict[str, Any],
+    asking: Executor | None,
+    *,
+    path: str = "",
+    body_empty: bool = False,
+) -> ClaimAnswer:
+    """Turn one HTTP response into a claim answer. The only implementation.
+
+    Deliberately simpler than ``answer_from``: every claim route is a
+    mutation (there is no claim "read" the way ownership has ``GET``), so
+    there is no ``is_read`` branch and no WROTE_NO_RECORD-equivalent verdict
+    — a body-less 2xx here is a protocol anomaly the same way it is for every
+    ownership route except release/terminal.
+    """
+    if 200 <= status < 300:
+        accepted = body_empty or _looks_like_claim_answer(payload)
+        claim = claim_record_of(payload)
+        if claim is None:
+            return ClaimAnswer(
+                verdict=CLAIM_UNKNOWN,
+                reason=f"no claim record in a {status} response",
+                accepted=accepted,
+            )
+        verdict = claim_verdict_for(claim, asking)
+        reason = "" if verdict != CLAIM_UNKNOWN else f"unrecognised claim state {claim.state!r}"
+        return ClaimAnswer(verdict=verdict, claim=claim, reason=reason, accepted=accepted)
+    if status == 404:
+        # POST .../acquire (and every other claim route) has no not-found
+        # semantics. A 404 is a missing route or a wrong base path, never "no
+        # such claim" — answering CLAIM_UNCLAIMED would be fail-open exactly
+        # like the equivalent ownership branch.
+        return ClaimAnswer(verdict=CLAIM_UNKNOWN, reason=f"404 from {path or 'a write'}")
+    if status == 409:
+        # ADR-010 §6's open question: mctl-api answers a fence and a
+        # held-by-other conflict with the same status code, distinguished by
+        # an envelope `code` field. Anything else on a 409 is UNKNOWN, not
+        # guessed toward either side.
+        code = str(payload.get("code") or "") if isinstance(payload, dict) else ""
+        claim = claim_record_of(payload)
+        if code == "fenced":
+            return ClaimAnswer(verdict=CLAIM_FENCED, claim=claim, reason=_claim_error_of(status, payload))
+        if code == "claim-held" or claim is not None:
+            return ClaimAnswer(
+                verdict=CLAIM_HELD_BY_OTHER, claim=claim, reason=_claim_error_of(status, payload)
+            )
+        # A 409 with neither a recognised code nor a claim record is the
+        # fail-closed direction: it neither licenses execution nor charges an
+        # attempt (requirements.md, "Wire status for a fence").
+        return ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason=_claim_error_of(status, payload))
+    # 412, 503, 5xx, 401/403, timeouts surfaced by the transport as a non-2xx
+    # — every one of these means "I could not establish the claim", which is
+    # CLAIM_UNKNOWN and never CLAIM_UNCLAIMED.
+    return ClaimAnswer(verdict=CLAIM_UNKNOWN, reason=_claim_error_of(status, payload))
+
+
+def idempotency_key_for(
+    kind: str, entity_id: str, phase: str, owner_epoch: int, attempt: str, version: str, action: str
+) -> str:
+    """The idempotency key ADR-010 §8 specifies: a pure hash, no clock, no
+    random source.
+
+    Identical input always produces identical output — the property a
+    Temporal activity retry, a Temporal replay and an Argo pod restart all
+    depend on to dedupe against the same recorded outcome.
+    """
+    raw = f"{kind}|{entity_id}|{phase}|{owner_epoch}|{attempt}|{version}|{action}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()

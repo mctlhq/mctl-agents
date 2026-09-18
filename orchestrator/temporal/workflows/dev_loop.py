@@ -45,7 +45,14 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, UNKNOWN, UNOWNED, EntityRef
+    from orchestrator.lifecycle.contract import (
+        OWNED_BY_OTHER,
+        OWNER_SHEPHERD,
+        UNKNOWN,
+        UNOWNED,
+        EntityRef,
+        Owner,
+    )
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -223,6 +230,12 @@ LIFECYCLE_REFUSAL_GIVE_UP = 3
 # `_ownership` and compared in two arms; as three separate literals they had to
 # agree by inspection, and nothing failed if one of them changed.
 OWNER_TYPE = "devloop-workflow"
+
+# The fallback shepherd's owner id for a handoff target. The shepherd is a
+# stateless cron actor, not a single addressable instance, so "cron" names the
+# role rather than a specific process — matching the id every existing test
+# fixture for a shepherd-typed Owner already uses.
+SHEPHERD_HANDOFF_OWNER_ID = "cron"
 
 # Consecutive failed HEARTBEATS before the loop stops believing it owns the
 # entity. A SEPARATE constant, and a smaller number, because it counts a
@@ -1246,7 +1259,8 @@ class DevLoopWorkflow:
             )
 
     async def _ownership(self, op: str, *, repo: str, number: int, head_sha: str = "",
-                         evidence: str = "", reason: str = "") -> OwnershipResult | None:
+                         evidence: str = "", reason: str = "",
+                         to: Owner | None = None) -> OwnershipResult | None:
         """Run one ownership operation as an ACTIVITY.
 
         Never raises. Ownership is a coordination signal, not the work: a
@@ -1276,6 +1290,8 @@ class DevLoopWorkflow:
             proposal_ref=self._proposal_ref,
             policy_ref=self._policy_ref,
             temporal_workflow_id=info.workflow_id,
+            to_owner_type=to.type if to is not None else "",
+            to_owner_id=to.id if to is not None else "",
         )
         try:
             return await workflow.execute_activity(
@@ -2176,6 +2192,11 @@ class DevLoopWorkflow:
         # cron sweeper owns the PR and this loop must not record itself as the
         # owner. Its own marker, because it adds commands to history.
         track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
+        # ExecutionClaim / handoff (ADR-010 phase 2, #352). A SEPARATE marker
+        # from "lifecycle-ownership": rollout.py pins one job per switch, and
+        # an execution recorded under phase 1 must replay the bare `release`
+        # this finally used to issue, unchanged.
+        use_claims_handoff = track_ownership and workflow.patched("lifecycle-claims")
         if track_ownership:
             # ADR-010 §12 asks for the resolved policy to be recorded on the
             # row, so "why does this actor own it" is answerable without
@@ -2346,8 +2367,18 @@ class DevLoopWorkflow:
                 # "somebody must take this", which is the one state this
                 # contract defines as work remaining.
                 terminal_state = last is not None and last.state in ("MERGED", "CLOSED")
+                # Non-terminal end: HANDOFF, not a bare release, once
+                # "lifecycle-claims" is patched in. A release leaves a
+                # zero-owner gap for the cron sweeper to notice on its own
+                # schedule; a handoff to OWNER_SHEPHERD records the
+                # transition explicitly and bumps the fencing epoch on
+                # completion (ADR-010 §10 path 2), so a pre-handoff executor
+                # that wakes up later is fenced instead of racing the new one.
+                # A history recorded before this marker keeps replaying the
+                # bare release it already committed to.
+                op = "terminal" if terminal_state else ("handoff-start" if use_claims_handoff else "release")
                 done = await self._ownership(
-                    "terminal" if terminal_state else "release",
+                    op,
                     repo=repo,
                     number=number,
                     # The head this watch last saw. `_payload` sends `version`
@@ -2361,6 +2392,7 @@ class DevLoopWorkflow:
                         if terminal_state and last is not None
                         else "merge watch ended without a terminal pull-request state"
                     ),
+                    to=Owner(type=OWNER_SHEPHERD, id=SHEPHERD_HANDOFF_OWNER_ID) if op == "handoff-start" else None,
                 )
                 # Same policy as the in-loop terminal path, and now the same
                 # code: two phrasings of one rule is how they came to disagree.
@@ -2372,9 +2404,7 @@ class DevLoopWorkflow:
                 # Temporal serves queries against completed executions, so the
                 # terminal value of these fields is observable exactly when the
                 # question is asked.
-                self._finish_claim(
-                    "terminal" if terminal_state else "release", done, repo, number
-                )
+                self._finish_claim(op, done, repo, number)
             # After the LAST relinquishing write of this watch, whichever path
             # made it. One metric line per abandoned entity, not per failed
             # attempt — see _report_claim_abandonment.

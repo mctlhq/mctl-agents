@@ -162,6 +162,17 @@ the [Tier 3 shepherd](#tier-3--pr-shepherd) to address code review
 findings on an existing PR (no new branch, no new PR; pushes a
 follow-up commit on the same head ref).
 
+Both the initial push and every follow-up push carry an `ExecutionClaim`
+(ADR-010 phase 2, `docs/adr/010-lifecycle-ownership-contract.md`): a
+short-lived mutual-exclusion lease checked immediately before `git push`,
+with `--force-with-lease=<branch>:<sha>` as the authoritative fence
+underneath it. Below `LIFECYCLE_ROLLOUT_MODE=enforce` the claim is advisory
+only. Two lease durations are tunable via env, both defaulting to the
+lease they replace: `LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default
+`7800`, i.e. 130 minutes) for the initial implement attempt, and
+`LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` (default `1800`, i.e. 30 minutes,
+one `MERGE_POLL_INTERVAL`) for a review-remediation follow-up.
+
 ### Tier 3 — PR shepherd
 
 `orchestrator/run_shepherd.py` drives implementer-opened PRs through

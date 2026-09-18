@@ -86,7 +86,14 @@ import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator.github_token import refresh_github_token
-from orchestrator.lifecycle import shadow
+from orchestrator.lifecycle import rollout, shadow
+from orchestrator.lifecycle.claim import ClaimClient
+from orchestrator.lifecycle.contract import (
+    OWNER_IMPLEMENTER,
+    PHASE_IMPLEMENT,
+    EntityRef,
+    Executor,
+)
 from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
@@ -640,7 +647,11 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
 # over orchestrator/, so a Literal catches all three assignment sites for free.
 # `"refused"` (mctl-agents#360) is in the same position: it is bounded by
 # MAX_REFUSALS, and a typo would fall through to the counter-less arm.
-FollowupKind = Literal["transient", "deterministic", "harness", "refused"]
+# `"fenced"` (ADR-010 phase 2, mctl-agents#352) is the fifth: like `"refused"`
+# and `"harness"` it is non-charging, but it is not bounded by any counter at
+# all — a fence is expected to be rare and self-resolving (the next tick takes
+# a fresh claim), so there is nothing here for a runaway loop to exhaust.
+FollowupKind = Literal["transient", "deterministic", "harness", "refused", "fenced"]
 
 
 def _stuck_note(refusals: int, reason: str) -> str:
@@ -694,6 +705,19 @@ def _refusal_codes() -> frozenset[int]:
     from orchestrator import run_implementer  # deferred — see apply_followup
 
     return frozenset({run_implementer.EXIT_DELIBERATE_NO_OP})
+
+
+def _fenced_codes() -> frozenset[int]:
+    """Exit codes that mean "an ExecutionClaim check fenced this attempt".
+
+    A fourth set for the same reason ``_refusal_codes`` is its own: a fence
+    is neither deterministic (the proposal did nothing wrong) nor a harness
+    failure (nothing was lost — the check ran and correctly refused) nor a
+    refusal (the agent never even ran; the check aborted before it did).
+    """
+    from orchestrator import run_implementer  # deferred — see apply_followup
+
+    return frozenset({run_implementer.EXIT_FENCED})
 
 
 def _read_refusal_reason(path: str) -> str | None:
@@ -2506,6 +2530,28 @@ def process_one(
                     decision="wait",
                     notes="harness failure (orphaned sub-agent); will retry next tick",
                 )
+            if e.kind == "fenced":
+                # Not a failure of the proposal or the findings — an
+                # ExecutionClaim check right before the push answered
+                # CLAIM_FENCED (ADR-010 phase 2, #352): the owner epoch moved
+                # or the pinned entity version changed under this attempt.
+                # Distinct log line from the plain transient arm below: a
+                # fence is a POSITIVE signal that the world moved on, not an
+                # unexplained plumbing blip, and an operator reading the two
+                # apart is the whole point of naming this outcome separately.
+                # Neither review_attempts nor harness_failures nor refusals
+                # move — the executor did nothing wrong, and the next tick
+                # takes a fresh claim against the current world.
+                print(
+                    f"info: {ref.service}/{ref.slug}: follow-up fenced ({e}); "
+                    f"not charging a review attempt; the next tick will take a "
+                    f"fresh claim"
+                )
+                return ShepherdResult(
+                    ref=ref,
+                    decision="wait",
+                    notes="follow-up fenced; will retry next tick with a fresh claim",
+                )
             if e.transient:
                 print(
                     f"warn: {ref.service}/{ref.slug}: follow-up subprocess "
@@ -2667,7 +2713,39 @@ def _update_status_if_changed(
 
 
 def _attempt_is_fresh(ref: ProposalRef) -> bool:
+    """Is the entity still actively held — by claim, or by the yaml lease?
+
+    ADR-010 phase 2 (mctl-agents#352) makes this a UNION, prescribed in
+    §12: held if an active ExecutionClaim exists OR the yaml lease is
+    unexpired. The yaml branch now also compares the HOLDER, not
+    `expires_at` alone — the defect requirements.md names directly: the
+    attempt block's `id` was written and never compared against anything.
+
+    The claim check only affects the answer at `enforce` and above:
+    `observe` computes and logs a divergence but composes no safety, the
+    same rule every other rollout stage in this codebase follows. At `only`
+    the yaml read is gone — a claim is the sole answer.
+    """
     attempt = _load_status(ref.status_path).get("attempt") or {}
+    holder = attempt.get("id") if isinstance(attempt, dict) else None
+
+    if rollout.new_answer_may_veto() and isinstance(holder, str) and holder:
+        answer = ClaimClient().check(
+            "",
+            EntityRef.for_proposal(ref.service, ref.slug),
+            PHASE_IMPLEMENT,
+            0,
+            "",
+            Executor(type=OWNER_IMPLEMENTER, id=holder),
+            holder,
+        )
+        if answer.may_execute:
+            return True
+        if rollout.new_answer_decides():
+            return False
+
+    if not isinstance(holder, str) or not holder:
+        return False
     expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
     if not expires_at:
         return False

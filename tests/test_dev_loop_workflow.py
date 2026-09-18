@@ -1235,13 +1235,16 @@ class TestDevLoopWorkflow:
         # A merged PR is finished, not handed back: nothing should pick it up.
         assert "release" not in [o.op for o in ops]
 
-    async def test_ownership_released_when_the_watch_ends_without_a_terminal_pr(self, env):
+    async def test_ownership_handed_off_when_the_watch_ends_without_a_terminal_pr(self, env):
         """The watch gave up without the PR reaching MERGED or CLOSED, so the
         work REMAINS and somebody must be able to take it.
 
-        Release, not terminal: terminal would mean finished, and a reconciler
-        would leave it alone forever — which is the zero-owner gap #239
-        describes, arrived at from the other direction.
+        Handoff-start to the shepherd, not a bare release (ADR-010 phase 2,
+        #352): terminal would mean finished, and a reconciler would leave it
+        alone forever — which is the zero-owner gap #239 describes, arrived at
+        from the other direction. A bare release left the same gap for the
+        cron sweeper to notice on its own schedule instead of recording the
+        transition explicitly.
         """
         open_pr = PRState(
             found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
@@ -1255,14 +1258,17 @@ class TestDevLoopWorkflow:
             issue=902,
         )
         assert ops[0].op == "acquire"
-        assert ops[-1].op == "release", [o.op for o in ops]
+        assert ops[-1].op == "handoff-start", [o.op for o in ops]
         assert "terminal" not in [o.op for o in ops]
+        assert "release" not in [o.op for o in ops]
+        assert ops[-1].to_owner_type == "shepherd"
+        assert ops[-1].to_owner_id
         # And it carries the head this watch last saw. `_payload` sends
         # `version` unconditionally, so omitting it made the LAST write of the
         # watch the only one carrying an empty one — and the version is what
         # the row records about the entity it is letting go of.
         assert ops[-1].version == "a" * 40, (
-            f"the final release carried no version: {ops[-1].version!r}"
+            f"the final handoff carried no version: {ops[-1].version!r}"
         )
 
     async def test_ownership_store_outage_does_not_fail_the_loop(self, env):

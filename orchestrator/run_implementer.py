@@ -79,6 +79,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -86,7 +87,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -105,6 +105,15 @@ from config.settings import (
 )
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
+from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
+from orchestrator.lifecycle.contract import (
+    CLAIM_FENCED,
+    OWNER_IMPLEMENTER,
+    PHASE_IMPLEMENT,
+    PHASE_REVIEW_REMEDIATION,
+    EntityRef,
+    Executor,
+)
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
@@ -191,6 +200,14 @@ EXIT_ORPHANED_SUBAGENT = 46
 # charge a review attempt: on portfolio#56 two correct refusals burned 2 of 5
 # attempts and forced a GitOps reset (mctl-gitops#1205).
 EXIT_DELIBERATE_NO_OP = 47
+# Fenced, NOT a failure of the proposal or the findings: an ExecutionClaim
+# check immediately before a push answered CLAIM_FENCED — the owner epoch
+# moved (a handoff completed) or the entity's pinned version changed (a new
+# PR head) since this attempt's claim was pinned. Re-running against the
+# world this attempt observed cannot succeed; the next tick must take a new
+# claim against the CURRENT world instead (ADR-010 phase 2, #352). Shares the
+# non-charging behaviour of 46/47: the executor did nothing wrong.
+EXIT_FENCED = 48
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -204,6 +221,8 @@ REFUSAL_MARKER_FILENAME = ".implementer-refusal.json"
 # Prefix on `ImplementResult.error` that `_review_feedback_exit_code()` maps to
 # EXIT_DELIBERATE_NO_OP. Same string-prefix style as the other sentinels.
 REFUSAL_ERROR_PREFIX = "deliberate no-op:"
+# Prefix mapped to EXIT_FENCED. Same style, raised by ImplementerFenced.
+FENCED_ERROR_PREFIX = "fenced:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -405,6 +424,12 @@ def _review_feedback_exit_code(error: str) -> int:
         MAX_REVIEW_ATTEMPTS without a single real try at the findings. The
         shepherd classifies this as a harness failure and retries.
 
+      - 48: an ExecutionClaim check right before the push answered
+        CLAIM_FENCED (ADR-010 phase 2, #352) — the epoch moved or the pinned
+        entity version changed since this attempt's claim was taken. The
+        executor aborted before invoking git; the shepherd must not charge a
+        review attempt for a race it did not cause.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -422,6 +447,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_BRANCH_MISSING_ON_ORIGIN
     if error.startswith(REFUSAL_ERROR_PREFIX):
         return EXIT_DELIBERATE_NO_OP
+    if error.startswith(FENCED_ERROR_PREFIX):
+        return EXIT_FENCED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -502,6 +529,17 @@ class ImplementerOperationTimeout(RuntimeError):
     """A bounded model or shell operation exceeded its wall-clock limit."""
 
 
+class ImplementerFenced(RuntimeError):
+    """An ExecutionClaim check answered CLAIM_FENCED right before a push.
+
+    Not a failure of the proposal: the world this attempt's claim was pinned
+    to has moved on (a handoff bumped the epoch, or the entity's version
+    changed under it), so retrying against the SAME evidence cannot succeed.
+    Mapped to EXIT_FENCED so the shepherd does not charge a review attempt for
+    a race the executor did not cause (ADR-010 phase 2, #352).
+    """
+
+
 class ImplementerOrphanedSubagent(OrphanedSubagentError):
     """The run ended while the delegated implementer sub-agent was still live.
 
@@ -513,6 +551,140 @@ class ImplementerOrphanedSubagent(OrphanedSubagentError):
     Subclasses the shared error so the helper can raise the generic type while
     the orchestrator keeps its greppable `Implementer*` naming.
     """
+
+
+# ---------------------------------------------------------------------------
+# ExecutionClaim wiring (ADR-010 phase 2, #352).
+#
+# The implementer's first lifecycle import of any kind: it acquires a claim
+# on (devloop-proposal, "{service}/{slug}", implement) beside the existing
+# `attempt` lease, and checks a claim immediately before every push this
+# module performs. Below `enforce`, every check is advisory (logged, never
+# blocking) — see `orchestrator.lifecycle.claim.blocks_mutation`.
+# ---------------------------------------------------------------------------
+
+# The 130-minute implement attempt lease, named rather than a bare literal so
+# the yaml lease and the claim's `lease_seconds` read the same constant.
+IMPLEMENT_ATTEMPT_LEASE = timedelta(minutes=130)
+
+
+def _claim_lease_seconds(env_var: str, default: timedelta) -> int:
+    raw = os.environ.get(env_var, "").strip()
+    if not raw:
+        return int(default.total_seconds())
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default.total_seconds())
+
+
+# One MERGE_POLL_INTERVAL (run_shepherd.py) — a review-remediation claim only
+# needs to outlive one shepherd poll, not a full implement run.
+REVIEW_CLAIM_LEASE_DEFAULT = timedelta(minutes=30)
+
+
+def _resolve_attempt_id(service: str, slug: str, owner_epoch: int, attempt_ordinal: int) -> str:
+    """Deterministic attempt identity: WORKFLOW_UID, or a derived fallback.
+
+    Never `uuid.uuid4()` — a random id is non-deterministic in exactly the
+    retried-pod case where determinism matters (ADR-010 §8): a pod that
+    restarts and re-derives the SAME identity must be able to renew its own
+    claim rather than be refused by it. `service` and `slug` are always
+    present on a real `ProposalRef`, so this always succeeds; there is no
+    reachable "cannot derive an identity" case for this caller.
+    """
+    workflow_uid = os.environ.get("WORKFLOW_UID", "").strip()
+    if workflow_uid:
+        return workflow_uid
+    raw = f"{service}|{slug}|{owner_epoch}|{attempt_ordinal}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _ClaimContext:
+    """Everything one push-site fencing check needs, bundled so a call site
+    passes one argument instead of seven that must stay in lock-step."""
+
+    client: ClaimClient
+    claim_id: str
+    entity: EntityRef
+    phase: str
+    owner_epoch: int
+    entity_version: str
+    executor: Executor
+    attempt: str
+
+
+def _acquire_claim(
+    entity: EntityRef, phase: str, entity_version: str, attempt: str, *, lease_seconds: int, proposal_ref: str = ""
+) -> _ClaimContext | None:
+    """Acquire an execution claim, or return None if it could not be granted.
+
+    None is NOT an error: below `enforce` every call answers `claim-unknown`
+    by design (rollout.py), and a caller that cannot acquire a claim declines
+    it and lets the existing fallback mechanism (the yaml lease, or a fenced
+    push) keep the entity — it never fails the run.
+    """
+    client = ClaimClient()
+    executor = Executor(type=OWNER_IMPLEMENTER, id=attempt)
+    answer = client.acquire(
+        entity, phase, 0, entity_version, executor, attempt,
+        lease_seconds=lease_seconds, proposal_ref=proposal_ref,
+    )
+    claim_id = answer.claim.claim_id if answer.claim else ""
+    return _ClaimContext(
+        client=client, claim_id=claim_id, entity=entity, phase=phase,
+        owner_epoch=0, entity_version=entity_version, executor=executor, attempt=attempt,
+    )
+
+
+def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = None) -> None:
+    """The early filter immediately before a mutation.
+
+    NOT the authoritative check — that is the target system's own
+    precondition (`--force-with-lease`, `--match-head-commit`). This exists so
+    a fence is detected (and the attempt classified non-charging) before
+    spending a git round trip on a push that would fail anyway.
+    """
+    version = ctx.entity_version if entity_version is None else entity_version
+    answer = ctx.client.check(
+        ctx.claim_id, ctx.entity, ctx.phase, ctx.owner_epoch, version, ctx.executor, ctx.attempt
+    )
+    if answer.verdict == CLAIM_FENCED:
+        raise ImplementerFenced(
+            f"{FENCED_ERROR_PREFIX} claim for {ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} "
+            f"fenced before push: {answer.reason}"
+        )
+    if blocks_mutation(answer):
+        # Not a fence: CLAIM_UNKNOWN under the enforce break-glass, or
+        # someone else genuinely holds it. Left as a plain error, which
+        # `_review_feedback_exit_code` leaves as EXIT_GENERIC_FAILURE — the
+        # shepherd's transient, non-charging arm, since this attempt did
+        # nothing wrong and a retry may simply find the store reachable again.
+        raise RuntimeError(f"claim check blocked the push: {answer.reason}")
+
+
+_PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
+
+
+def _parse_pr_url(url: str) -> tuple[str, int] | None:
+    """Split a GitHub PR URL into (repo, number), or None if it does not match."""
+    m = _PR_URL_RE.match(url.strip())
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def _release_claim(ctx: _ClaimContext | None, *, reason: str) -> None:
+    """Best-effort release. Must never fail the run it is cleaning up after."""
+    if ctx is None:
+        return
+    try:
+        ctx.client.release(
+            ctx.claim_id, ctx.entity, ctx.phase, ctx.owner_epoch, ctx.executor, ctx.attempt, reason=reason[:200]
+        )
+    except Exception as exc:  # noqa: BLE001 — releasing a claim must never fail the run
+        print(f"warn: could not release claim {ctx.claim_id!r}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -918,9 +1090,29 @@ def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:
     return bool(proc.stdout.strip())
 
 
-def _push_followup(repo_dir: Path, branch: str) -> None:
-    """Push the follow-up commit to the existing branch (no `-u`)."""
-    _run(["git", "push", "origin", branch], cwd=repo_dir)
+def _remote_head_sha(repo_dir: Path, branch: str) -> str | None:
+    """The current head SHA of ``branch`` on origin, or None if it has none."""
+    proc = _run(["git", "ls-remote", "--heads", "origin", branch], cwd=repo_dir, check=False)
+    line = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    return line.split()[0] if line else None
+
+
+def _push_followup(
+    repo_dir: Path, branch: str, expected_sha: str, *, claim_context: _ClaimContext | None = None
+) -> None:
+    """Push the follow-up commit to the existing branch (no `-u`).
+
+    Fences on the claimed head SHA: `--force-with-lease=<branch>:<expected_sha>`
+    is the AUTHORITATIVE check — the push itself fails if the remote moved,
+    independently of the claim. `claim_context`, when given, is the EARLY
+    filter checked immediately before this git call (ADR-010 phase 2, #352).
+    """
+    if claim_context is not None:
+        _check_claim_or_raise(claim_context, entity_version=expected_sha)
+    _run(
+        ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
+        cwd=repo_dir,
+    )
 
 
 async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
@@ -1098,6 +1290,28 @@ def review_feedback_one(
         # commit). See codex P1 on PR #12.
         old_head = _capture_head_sha(target)
 
+        # 4b. ExecutionClaim on (pull-request, review-remediation), pinned to
+        # the head just captured (ADR-010 phase 2, #352). Acquired BEFORE the
+        # SDK runs so a concurrent attempt on the same PR is refused before
+        # spending the SDK call; `claim_ctx` is None when the PR url is not
+        # yet recorded or no claim could be granted, and the run proceeds
+        # exactly as it did before this proposal — the claim is advisory
+        # below `enforce`.
+        claim_ctx: _ClaimContext | None = None
+        parsed_pr = _parse_pr_url(str(_load_status(ref.status_path).get("pr") or ""))
+        attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=0)
+        if parsed_pr is not None:
+            repo, number = parsed_pr
+            claim_ctx = _acquire_claim(
+                EntityRef.for_pull_request(repo, number, old_head),
+                PHASE_REVIEW_REMEDIATION,
+                old_head,
+                attempt_id,
+                lease_seconds=_claim_lease_seconds(
+                    "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", REVIEW_CLAIM_LEASE_DEFAULT
+                ),
+            )
+
         # 5. Run the SDK with the bundle baked into the prompt.
         prompt = _build_prompt(ref, review_feedback=bundle)
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
@@ -1109,27 +1323,40 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
+                _release_claim(claim_ctx, reason="no follow-up: refused")
                 return ImplementResult(
                     ref=ref,
                     pr_url=None,
                     error=f"{REFUSAL_ERROR_PREFIX} {refusal}",
                 )
+            _release_claim(claim_ctx, reason="no follow-up commits")
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
                 error="implementer produced no follow-up commits",
             )
 
-        # 7. Push to the existing branch — no -u, no new PR.
-        _push_followup(target, branch)
+        # 7. Push to the existing branch — no -u, no new PR. `old_head` is
+        # both the `--force-with-lease` CAS and the claim's pinned version:
+        # if the branch moved since step 4, the claim check catches it before
+        # git runs, and the push's own lease catches it even if the claim
+        # check could not (store unreachable, rollout below `enforce`).
+        _push_followup(target, branch, old_head, claim_context=claim_ctx)
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
+        _release_claim(claim_ctx, reason="follow-up pushed")
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerFenced as e:
+        # Not a failure of the proposal — see EXIT_FENCED. The claim is
+        # already fenced server-side (or the classification decided this
+        # attempt cannot proceed); nothing to release.
+        result = ImplementResult(ref=ref, pr_url=None, error=str(e))
+        return result
     except ImplementerOrphanedSubagent as e:
         # The message is already prefixed "orphaned sub-agent:" — that prefix is
         # what _review_feedback_exit_code() matches on. Deliberately do NOT try
@@ -1600,6 +1827,7 @@ def _mark_needs_triage(
     message: str,
     pr_url: str | None = None,
     attempt: dict[str, Any] | None = None,
+    claim_context: _ClaimContext | None = None,
 ) -> None:
     fields: dict[str, Any] = {
         "failure": {
@@ -1616,6 +1844,9 @@ def _mark_needs_triage(
         finished["finished_at"] = _now_iso()
         fields["attempt"] = finished
     update_status_yaml(ref, "needs-triage", **fields)
+    # A terminal arm relinquishes the claim it was holding (ADR-010 phase 2,
+    # #352) — best-effort, and never the reason this write fails.
+    _release_claim(claim_context, reason=f"{stage}: {code}")
 
 
 def _mark_blocked(
@@ -1657,9 +1888,28 @@ def _mark_blocked(
     return True
 
 
-def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
+def _push_and_open_pr(
+    repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
+) -> str:
     branch = f"feat/agents-{ref.slug}"
-    _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
+    if _branch_exists_on_origin(repo_dir, branch):
+        # A previous attempt already pushed and died before opening the PR —
+        # a retried pod, exactly the case ADR-010 §8 names (mctl-agents#352).
+        # Adopt the branch rather than blindly `-u` pushing again, and CAS on
+        # the head this attempt just observed: `--force-with-lease` fails the
+        # push if a third writer moves the branch in the gap between this
+        # read and the push below.
+        expected_sha = _remote_head_sha(repo_dir, branch) or ""
+        if claim_context is not None:
+            _check_claim_or_raise(claim_context, entity_version=expected_sha)
+        _run(
+            ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
+            cwd=repo_dir,
+        )
+    else:
+        # Brand new branch — no remote ref exists, so there is nothing to
+        # fence against yet.
+        _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
     return _open_pr_for_branch(ref, branch)
 
 
@@ -1775,15 +2025,31 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         raise SystemExit(f"SDK authentication failed: {exc}") from exc
 
     started = datetime.now(UTC)
+    # Never uuid.uuid4() (ADR-010 §8): a random id is non-deterministic in
+    # exactly the retried-pod case where determinism matters.
+    attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=0)
     attempt = {
-        "id": os.getenv("WORKFLOW_UID") or str(uuid.uuid4()),
+        "id": attempt_id,
         "started_at": started.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "expires_at": (
-            started + timedelta(minutes=130)
+            started + IMPLEMENT_ATTEMPT_LEASE
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
     # Mark in-progress only after GitHub proves there is no prior result.
     update_status_yaml(ref, "in-progress", attempt=attempt, failure=None, blocked=None)
+
+    # ExecutionClaim beside the yaml lease above, dual-written through
+    # `enforce` (ADR-010 phase 2, #352). `_acquire_claim` never raises and
+    # never blocks this run: below `enforce` the claim is advisory, and a
+    # store outage or rollout-off simply means no claim is held.
+    claim_ctx = _acquire_claim(
+        EntityRef.for_proposal(ref.service, ref.slug),
+        PHASE_IMPLEMENT,
+        "",
+        attempt_id,
+        lease_seconds=_claim_lease_seconds("LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT", IMPLEMENT_ATTEMPT_LEASE),
+        proposal_ref=f"{ref.service}/{ref.slug}",
+    )
 
     target = None
     result: ImplementResult | None = None
@@ -1810,6 +2076,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 stage="agent",
                 message="implementer produced no commits",
                 attempt=attempt,
+                claim_context=claim_ctx,
             )
             return ImplementResult(
                 ref=ref,
@@ -1842,11 +2109,12 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 stage="policy",
                 message=msg,
                 attempt=attempt,
+                claim_context=claim_ctx,
             )
             return ImplementResult(ref=ref, pr_url=None, error=msg)
 
         # 7. Push + PR.
-        pr_url = _push_and_open_pr(target, ref)
+        pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
 
         # 8. Mark implemented.
         completed_attempt = dict(attempt)
@@ -1859,9 +2127,25 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             failure=None,
             notes=None,
         )
+        _release_claim(claim_ctx, reason="implemented")
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerFenced as e:
+        # Not a failure of the proposal: the world this attempt was pinned to
+        # moved on. Left with a distinct triage code so a race is legible
+        # instead of landing in the generic `unexpected-error` arm.
+        msg = str(e)
+        _mark_needs_triage(
+            ref,
+            code="fenced",
+            stage="push",
+            message=msg,
+            attempt=attempt,
+            claim_context=claim_ctx,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        return result
     except ImplementerOrphanedSubagent as e:
         # Batch mode has no review-attempt budget, so it needs no sentinel exit
         # code — but it does need its own triage code, otherwise this lands in
@@ -1874,6 +2158,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             stage="runtime",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
@@ -1885,6 +2170,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             stage="runtime",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
@@ -1896,6 +2182,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             stage="shell",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
@@ -1912,6 +2199,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             stage="agent",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
@@ -1923,6 +2211,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             stage="agent",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
