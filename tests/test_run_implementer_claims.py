@@ -7,6 +7,7 @@ implementer never mints a random attempt id (T7).
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -132,6 +133,7 @@ def test_push_and_open_pr_adopts_an_existing_branch_with_a_lease(monkeypatch: py
 def test_push_and_open_pr_uses_dash_u_for_a_brand_new_branch(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
     monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: calls.append(cmd))
 
     ref = run_implementer.ProposalRef(
@@ -451,6 +453,7 @@ def test_brand_new_branch_push_is_also_claim_checked(monkeypatch: pytest.MonkeyP
             return ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved")
 
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
     monkeypatch.setattr(run_implementer, "_run", lambda cmd, **kw: calls.append(cmd))
     ref = run_implementer.ProposalRef(
         service="mctl-web", slug="slug", proposal_dir=Path("/tmp/proposal"), status="accepted",
@@ -794,6 +797,7 @@ def test_a_push_site_refusal_is_a_skip_not_needs_triage(
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
     monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
     triaged: list[str] = []
     monkeypatch.setattr(
         run_implementer, "_mark_needs_triage",
@@ -883,6 +887,7 @@ def _implement_one_refused_at_the_push(
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
     monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
     monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
     if not allow_triage:
         monkeypatch.setattr(
             run_implementer, "_mark_needs_triage",
@@ -1049,3 +1054,29 @@ def test_an_unreachable_store_at_the_push_fails_closed_and_keeps_the_hold(
     assert result.error is None
     assert "in-progress" in body, body
     assert released == [], released
+
+
+def test_the_push_site_reads_the_remote_head_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two `git ls-remote` calls where one answers: `_remote_head_sha` already
+    returns None for a branch origin does not have, so guarding it with
+    `_branch_exists_on_origin` only added a second remote round-trip whose
+    transient failure would read as "no branch" and send an existing branch
+    down the `push -u` arm — a non-fast-forward failure for a race that never
+    happened (agy P3 on `f4d0dec`)."""
+    ls_remotes: list[list[str]] = []
+
+    def _fake_run(cmd, **kw):
+        if cmd[:2] == ["git", "ls-remote"]:
+            ls_remotes.append(cmd)
+            return SimpleNamespace(stdout=f"{'b' * 40}\trefs/heads/feat/agents-slug\n", returncode=0)
+        return SimpleNamespace(stdout="", returncode=0)
+
+    monkeypatch.setattr(run_implementer, "_run", _fake_run)
+    monkeypatch.setattr(run_implementer, "_open_pr_for_branch", lambda *_a, **_kw: "https://pr")
+
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=Path("/tmp/proposal"), status="accepted",
+    )
+    run_implementer._push_and_open_pr(Path("/tmp/repo"), ref, claim_context=None)
+
+    assert len(ls_remotes) == 1, ls_remotes

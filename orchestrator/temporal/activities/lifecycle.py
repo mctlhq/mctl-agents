@@ -357,7 +357,10 @@ class ExecutionClaimResult:
     # `state` and `lease_until` all empty — indistinguishable, from the fields
     # alone, from a record that arrived empty. Same argument as `retaken` one
     # field up: the wire type must not make the distinction unrepresentable
-    # (claude P3 on `b362b5e`).
+    # (claude P3 on `b362b5e`). An empty `claim_id` here is not a lost id: a
+    # renew is addressed BY claim id, so the caller keeps the one it sent and
+    # carries it into every later `check` / `release` (claude P3 on
+    # `f4d0dec`).
     has_record: bool = False
 
     @property

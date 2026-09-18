@@ -679,9 +679,12 @@ def _claim_lease_seconds(env_var: str, default: timedelta) -> int:
     live run down. Documenting that hazard is what the previous version did,
     and a comment in `.env.example` does not survive being copied into a
     values file (claude P3 on `b362b5e`, from agy's P2 one round earlier).
-    A deliberately shorter lease is not a tunable this module offers; the way
-    to shorten it is to shorten the run, through the timeouts the default is
-    derived from.
+    A deliberately shorter lease is not a tunable this module offers, and for
+    IMPLEMENT there is no downward route at all: `IMPLEMENT_ATTEMPT_LEASE` is
+    the 130 minutes the yaml `attempt` lease is stamped for, a constant no
+    timeout feeds. Only REVIEW's default moves, and it moves by shortening the
+    run — the implementer timeouts it is derived from (claude P3 on
+    `f4d0dec`).
     """
     raw = os.environ.get(env_var, "").strip()
     computed = int(default.total_seconds())
@@ -2355,7 +2358,12 @@ def _push_and_open_pr(
     repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
 ) -> str:
     branch = f"feat/agents-{ref.slug}"
-    expected_sha = _remote_head_sha(repo_dir, branch) if _branch_exists_on_origin(repo_dir, branch) else None
+    # One `git ls-remote`, not two: `_remote_head_sha` already answers None for
+    # a branch origin does not have, and guarding it with
+    # `_branch_exists_on_origin` only added a second remote call whose
+    # transient failure would read as "no branch" and send us down the `push
+    # -u` arm against a branch that exists (agy P3 on `f4d0dec`).
+    expected_sha = _remote_head_sha(repo_dir, branch)
     if expected_sha:
         # A previous attempt already pushed and died before opening the PR —
         # a retried pod, exactly the case ADR-010 §8 names (mctl-agents#352).

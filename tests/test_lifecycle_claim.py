@@ -596,6 +596,45 @@ def test_a_2xx_renew_describing_a_claim_we_cannot_read_is_never_a_hold(
     assert answer.verdict == CLAIM_UNKNOWN
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"ok": False},
+        {"status": "expired"},
+        {"status": "rejected"},
+        {"renewed": False},
+        {"reason": "lease already expired"},
+        {"message": "renewed"},
+        {"ok": True, "state": "expired"},
+        {"ok": 1},
+    ],
+)
+def test_a_2xx_renew_that_says_no_is_never_a_hold(payload: dict[str, Any]) -> None:
+    """A body may deny the renew in the same breath as returning 200, and the
+    denial is the answer. The first guard read only the KEYS, so the exact
+    negation of an acknowledgement passed it — `reason` is not even
+    hypothetical, it is a key this repo's own `_claim_payload` sends. Both
+    sets are now allow-lists: an unknown key and an unaffirmative value each
+    fall to CLAIM_UNKNOWN (claude P2 on `f4d0dec`)."""
+    answer = claim_answer_from(
+        200, payload, ME, path="/api/v1/lifecycle/claims/renew", body_empty=False
+    )
+    assert answer.verdict == CLAIM_UNKNOWN
+
+
+@pytest.mark.parametrize(
+    "payload", [{"ok": True}, {"status": "renewed"}, {"status": "RENEWED"}, {"success": "ok"}]
+)
+def test_a_2xx_renew_that_only_acknowledges_is_still_a_hold(
+    payload: dict[str, Any],
+) -> None:
+    """The narrowing must not close the branch it exists to keep open."""
+    answer = claim_answer_from(
+        200, payload, ME, path="/api/v1/lifecycle/claims/renew", body_empty=False
+    )
+    assert answer.verdict == CLAIM_HELD_BY_ME
+
+
 def test_only_renew_reads_a_recordless_2xx_as_a_hold() -> None:
     """On `acquire` the record is the only thing naming the winner, so a
     body-less 2xx there is a protocol anomaly, not a grant. The path list is
@@ -633,18 +672,29 @@ def test_a_retake_and_its_renew_are_two_distinguishable_lines(
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    ("env_var", "computed"),
     [
-        ("", 1800),
-        ("900", 1800),
-        ("1799", 1800),
-        ("1800", 1800),
-        ("3600", 3600),
-        ("not-a-number", 1800),
+        ("LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", 1800),
+        # IMPLEMENT has no downward route at all — its default is a literal
+        # 130 minutes matched to the yaml `attempt` lease, fed by no timeout —
+        # so the clamp is the ONLY thing standing between a copied-in value
+        # and a claim shorter than the attempt it guards (claude P3 on
+        # `f4d0dec`).
+        ("LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT", 7800),
     ],
 )
+# `asked` is the override as a MULTIPLE of the computed lease, so one case
+# list covers both variables; None means unset, a string means unparseable.
+@pytest.mark.parametrize(
+    ("asked", "factor"),
+    [(None, 1.0), (0.5, 1.0), (0.999, 1.0), (1.0, 1.0), (2.0, 2.0), ("junk", 1.0)],
+)
 def test_a_claim_lease_override_can_only_lengthen(
-    monkeypatch: pytest.MonkeyPatch, raw: str, expected: int
+    monkeypatch: pytest.MonkeyPatch,
+    env_var: str,
+    computed: int,
+    asked: float | str | None,
+    factor: float,
 ) -> None:
     """The hazard the commented-out `.env.example` lines documented, closed in
     code: a lease shorter than the run it guards expires under its own attempt
@@ -656,10 +706,13 @@ def test_a_claim_lease_override_can_only_lengthen(
 
     from orchestrator.run_implementer import _claim_lease_seconds
 
-    monkeypatch.setenv("LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", raw)
+    if asked is None:
+        monkeypatch.setenv(env_var, "")
+    elif isinstance(asked, str):
+        monkeypatch.setenv(env_var, asked)
+    else:
+        monkeypatch.setenv(env_var, str(int(computed * asked)))
     assert (
-        _claim_lease_seconds(
-            "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", timedelta(seconds=1800)
-        )
-        == expected
+        _claim_lease_seconds(env_var, timedelta(seconds=computed))
+        == int(computed * factor)
     )

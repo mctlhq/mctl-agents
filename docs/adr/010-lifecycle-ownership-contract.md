@@ -604,11 +604,16 @@ resolved as implemented, not merely proposed:
   safety input for the first time: without it a store that answers renews
   body-lessly refuses the restarted attempt on every restart, under
   `LIFECYCLE_OWNERSHIP_REQUIRED`, until the orphan lease expires. The branch
-  is narrow on purpose: it admits an empty body, or a body that describes NO
-  claim — no claim-shaped key, no nested structure. Anything that does describe
-  one this image could not read (a 200 error envelope, a record from a newer
-  mctl-api) answers `claim-unknown`, so an unreadable record never becomes the
-  most confident verdict (claude P2 on `b362b5e`). A body that fails to parse
+  is narrow on purpose, and narrow by ALLOW-list on both axes: it admits an
+  empty body, or one whose every key is an acknowledgement name (`ok`,
+  `renewed`, `result`, `status`, `success`) carrying an affirmative value.
+  Everything else answers `claim-unknown` — a record this image could not read
+  (a 200 error envelope, a record from a newer mctl-api, a record nested one
+  level deeper), and equally an acknowledgement that says NO (`{"ok": false}`,
+  `{"status": "expired"}`, `{"reason": "lease already expired"}`). Reading the
+  sets this way round is the point: a name nobody has thought of falls to
+  `claim-unknown` rather than to the most confident verdict in the vocabulary
+  (claude P2 on `b362b5e` and `f4d0dec`). A body that fails to parse
   at all — an HTML error page served with a 200 — is likewise `claim-unknown`,
   as before.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`

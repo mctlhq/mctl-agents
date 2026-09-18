@@ -814,42 +814,45 @@ def _confirms_existing_claim(path: str) -> bool:
 # answering None, and reading THAT as a live hold is the same unpinned-shape
 # assumption as the defect this branch fixes, pointed the other way
 # (claude P2 on `b362b5e`).
-CLAIM_SHAPED_KEYS = frozenset(
-    {
-        "attempt",
-        "claim",
-        "claim_id",
-        "claims",
-        "code",
-        "detail",
-        "entity",
-        "error",
-        "executor",
-        "executor_id",
-        "executor_type",
-        "lease_until",
-        "message",
-        "owner_epoch",
-        "phase",
-        "state",
-    }
+# The ONLY keys a bare renew acknowledgement may carry, and the only values
+# they may hold. Both are closed ALLOW-lists, the direction every other set in
+# this module points: a miss falls to CLAIM_UNKNOWN, never to the verdict.
+# A deny-list of claim-shaped names was the first shape of this guard and it
+# leaked in the obvious way — it inspected no value, so the exact negation of
+# an acknowledgement (`{"ok": false}`, `{"status": "expired"}`, `{"renewed":
+# false}`, `{"reason": "lease already expired"}`) read as a held claim, and
+# `reason` is a key this repo's own `_claim_payload` sends (claude P2 on
+# `f4d0dec`).
+ACKNOWLEDGING_KEYS = frozenset({"ok", "renewed", "result", "status", "success"})
+AFFIRMATIVE_VALUES = frozenset(
+    {"accepted", "active", "held", "ok", "renewed", "success", "updated"}
 )
 
 
 def _acknowledges_without_describing(payload: dict[str, Any]) -> bool:
-    """Whether a body says "done" and nothing about a claim.
+    """Whether a body says "renewed" and nothing else at all.
 
-    `{"status": "renewed"}` and `{"ok": true}` qualify; anything claim-shaped
-    or nested does not. Nesting is refused wholesale because that is how a
-    record arrives one level deeper than this image looks (`{"data": {"claim":
-    ...}}`), and enumerating the envelope names it could hide behind is the
-    open-vocabulary mistake this module refuses everywhere else.
+    `{"status": "renewed"}` and `{"ok": true}` qualify. A key outside
+    `ACKNOWLEDGING_KEYS` does not — that includes every claim-shaped name, and
+    also every name nobody has thought of, which is the point of reading the
+    set this way round. A value outside `AFFIRMATIVE_VALUES` does not either:
+    an acknowledgement that says NO is a refusal, and a refusal must never
+    reach the most confident verdict in the vocabulary. Nesting is refused by
+    both rules at once — a `dict` is no affirmative value — which is how a
+    record arriving one level deeper than this image looks (`{"data":
+    {"claim": ...}}`) stays CLAIM_UNKNOWN.
     """
     if not isinstance(payload, dict) or not payload:
         return False
-    if set(payload) & CLAIM_SHAPED_KEYS:
+    for key, value in payload.items():
+        if key not in ACKNOWLEDGING_KEYS:
+            return False
+        if value is True:
+            continue
+        if isinstance(value, str) and value.strip().lower() in AFFIRMATIVE_VALUES:
+            continue
         return False
-    return all(not isinstance(value, (dict, list)) for value in payload.values())
+    return True
 
 
 def claim_answer_from(
