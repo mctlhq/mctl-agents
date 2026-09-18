@@ -18,10 +18,20 @@ from temporalio.exceptions import ActivityError
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.discovery import ReconcileDiscoveryResult, discover_and_project
+    from orchestrator.temporal.activities.lifecycle_reconcile import (
+        LifecycleReconcileResult,
+        reconcile_lifecycle_ownership,
+    )
     from orchestrator.temporal.activities.orphans import OrphanDetectionResult, detect_orphans
     from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
 
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
+# The ownership sweep (#353) reads every open agent PR and then issues up to
+# two writes per finding, so it is allowed longer than the read-only
+# activities. Still far below the 15-minute tick: a sweep that overran its own
+# schedule would have two ticks classifying the same rows, and the second
+# would read epochs the first had just moved.
+LIFECYCLE_ACTIVITY_TIMEOUT = timedelta(minutes=10)
 ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
 # mctl-api operation wrapping cwft-mctl-agents-reconcile: clone-gitops ->
@@ -56,6 +66,10 @@ class ReconcileWorkflowResult:
     # and the next tick will try again. Defaulted so results recorded before
     # this stage existed still deserialize.
     applied: WorkflowResult | None = None
+    # The ownership sweep's report (#353). None means the tick ran before the
+    # lifecycle-reconcile patch existed, or took the unpatched replay branch
+    # where the active DevLoop set is unknown and the sweep must not run.
+    lifecycle: LifecycleReconcileResult | None = None
 
 
 @workflow.defn
@@ -63,6 +77,7 @@ class ReconcileWorkflow:
     @workflow.run
     async def run(self, input_data: ReconcileWorkflowInput | None = None) -> ReconcileWorkflowResult:
         state_dir_path = input_data.state_dir_path if input_data else ""
+        lifecycle_result: LifecycleReconcileResult | None = None
 
         discovery_result: ReconcileDiscoveryResult = await workflow.execute_activity(
             discover_and_project,
@@ -112,6 +127,31 @@ class ReconcileWorkflow:
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=ACTIVITY_RETRY_POLICY,
             )
+            # Inside the arm where the active set is KNOWN, deliberately. The
+            # sweep uses it to tell a row whose Temporal execution is still
+            # running from one whose is not, and with an unknown active set
+            # every ownership row would look like a conflicting owner — the
+            # same false-positive shape that made #151 report every proposal
+            # as an orphan, except here it would end in writes.
+            if workflow.patched("lifecycle-reconcile"):
+                try:
+                    lifecycle_result = await workflow.execute_activity(
+                        reconcile_lifecycle_ownership,
+                        args=[active_ids],
+                        start_to_close_timeout=LIFECYCLE_ACTIVITY_TIMEOUT,
+                        retry_policy=ACTIVITY_RETRY_POLICY,
+                    )
+                except ActivityError as exc:
+                    # The sweep is an addition to this tick, not a condition
+                    # of it. It reads GitHub and mctl-api, so it has two more
+                    # ways to fail than anything else here, and letting that
+                    # propagate would cost the tick its projection write —
+                    # exactly the quiet loss the visibility arm above refuses
+                    # to accept. Recorded as a skipped sweep; the next tick
+                    # reads the same rows again, none of which moved.
+                    lifecycle_result = LifecycleReconcileResult(
+                        skipped_reason=f"ownership sweep failed: {exc}",
+                    )
         else:
             # Unpatched replay branch: schedule detect_orphans with exactly
             # the one argument the old history recorded.
@@ -142,6 +182,7 @@ class ReconcileWorkflow:
             discovery=discovery_result,
             orphans=orphans_result,
             applied=applied,
+            lifecycle=lifecycle_result,
         )
 
     async def _apply(self, discovery: ReconcileDiscoveryResult) -> WorkflowResult | None:

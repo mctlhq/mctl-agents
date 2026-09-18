@@ -433,8 +433,10 @@ fail-safe direction `_shepherd_is_pinned` already takes.
 *"between those two points this execution IS the owner, and the cron must
 already be standing down"*. The sweeper sees a healthy owner and skips.
 
-**2 — direct implementer PR (#239).** *Target state, not yet wired — it waits
-on the `handoff/complete` caller in #353.* On PR creation the implementer
+**2 — direct implementer PR (#239).** *The `handoff/complete` caller now
+exists (#353): the reconcile sweep completes an incomplete handoff on the named
+target's behalf. What is still missing is the implementer's `handoff-start` on
+PR creation, which is #239's own half.* On PR creation the implementer
 **handoff-starts** to `owner_type=shepherd`, which the next sweeper tick
 completes by acquiring at epoch+1. Between those two points the row exists in
 `handing-off`: a *deterministic* unowned state the reconciler can adopt, which
@@ -555,7 +557,7 @@ rollout judged by anecdote.
 | 1 | #351 | `LifecycleOwnership` only — store, API, client, writers, projection, `observe`, bootstrap |
 | 1 | mctl-api#293 | read-only inspection, ships before the soak so rollout is diagnosable |
 | 2 | #352 | `ExecutionClaim`, database-clock lease and renew, epoch fencing, handoff — **shipped** (Python contract, clients, call sites, rollout gate; the mctl-api routes ship separately) |
-| 3 | #353 | reconciler over known ownership rows; adoption integration after #334 |
+| 3 | #353 | reconciler over known ownership rows — **shipped**; adoption integration after #334 |
 | 4 | mctl-api#294 | guarded operator recovery with optimistic preconditions |
 | 5 | — | extension beyond DevLoop, gated on the pilot; hand-off to `mctlhq/.github#21` and `#42` |
 
@@ -763,6 +765,66 @@ the merge boundary through `policy.merge_authority_for`,
 `run_shepherd._service_mode` and `NEVER_MERGE_SERVICES`, none of which read a
 claim.
 
+**Phase 3 (#353), as shipped in this repository.** The sweep runs inside the
+existing `ReconcileWorkflow` on its 15-minute tick, behind
+`workflow.patched("lifecycle-reconcile")` and inside the arm where the active
+DevLoop set is KNOWN — an unknown active set would make every ownership row
+look like a conflict, which is the false-positive shape of #151 except ending
+in writes rather than in a report. No second scheduler is added; the
+non-goals forbid one.
+
+The decision is separated from the I/O, because the conditions this phase
+handles are properties of a record and testing them through a transport tests
+the transport:
+
+- `orchestrator/lifecycle/reconciler.py` is a pure function of an
+  `Observation`, returning a `Decision` from a closed action vocabulary
+  (`none`, `skip`, `complete-handoff`, `recover`, `escalate`). Every branch
+  records a stable `reason` slug and a prose `evidence` line carrying the
+  entity, the phase, the head, the record version and the epoch — which is
+  what a recovery sends, since the route refuses an empty evidence.
+- `orchestrator/temporal/activities/lifecycle_reconcile.py` gathers the
+  observations (GitHub snapshots plus one batched ownership read per
+  kind/phase), applies the decisions, and reports
+  `LifecycleReconcileResult(examined, findings, applied, escalations,
+  skipped_reason)`. `applied` counts writes the SERVER accepted, never
+  decisions taken: a recovery refused with `ErrOwnerAlive` is a finding with
+  an outcome, and counting it would report a takeover that did not happen.
+- Mutations are gated on `rollout.new_answer_may_veto()` (enforce and above).
+  Below it every decision is still computed, logged and returned with
+  `outcome="observed"` — which is what `observe` is for, and what makes the
+  first `enforce` tick a shape an operator has already read.
+- The batch classifier moved into `contract.batch_answers_from`, so the sync
+  client and this activity share one answer to "what does a batch envelope
+  mean". Every id asked for is answered; an id that could not be answered is
+  `UNKNOWN`, never absent, so a store outage cannot be read as a clean sweep.
+
+Three decisions worth stating, because each one is a refusal:
+
+- **Zero owner is reported, not adopted.** `acquire` refuses an entity phase
+  that already has an ACTIVE row regardless of who wrote it, so a row this
+  sweep planted naming `reconciler` would refuse the legitimate DevLoop's
+  acquire until it aged past its own liveness bound. The requirement is that
+  the condition converges to one owner *or* a visible conflict; this takes the
+  second arm. Discovery of adoptable PRs remains pilot case 4 / #334.
+
+  And "zero owner" means *nobody holds a phase somebody is working on*: an
+  entity with no record and no live execution is a queued proposal, or drift
+  `detect_orphans` reports in the same tick from the same active set. The
+  sweep says nothing about either, because a counter that is non-zero in
+  steady state is a counter nobody reads.
+- **The reconciler does not keep what it recovers.** It cannot advance a PR,
+  so a recovery is for the epoch bump — which fences every claim pinned to the
+  dead generation — and is immediately followed by `release`, or by `terminal`
+  when the entity is already merged or closed. Both follow-ups assert the
+  epoch the SERVER granted, not the one the sweep asked with.
+- **A stale claim is escalated, never fenced from here.** The fences are the
+  owner epoch and the entity version, and §6 puts both on the server. The
+  `/api/v1/lifecycle/claims/*` routes do not exist yet, so every claim read
+  answers `CLAIM_UNKNOWN`; the table treats that as *no information* rather
+  than as *no claim*, which is the only reading that does not escalate every
+  healthy PR on the platform at the first `enforce` tick.
+
 ## Testable invariants
 
 1. Two concurrent acquires on one `(entity, phase)` produce exactly one winner,
@@ -798,6 +860,12 @@ claim.
     review indistinguishable from a crashed worker.
 11. One fully missed tick does not make a live owner look dead; the liveness
     bound exceeds two cadences for exactly that reason.
+12. The reconcile sweep writes nothing it was not licensed to write: an
+    `UNKNOWN` verdict, an unrecognised state, a `stuck` owner, a claim
+    conflict and a second live worker each produce a report and no mutation,
+    and a recovery asserts the epoch the sweep read rather than the row's
+    current one. Proved by mutation in both directions in
+    `tests/test_lifecycle_reconciler.py`.
 
 Every guard is proved by mutation in both directions. A guard that can only pass
 is not a guard.

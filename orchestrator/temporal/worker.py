@@ -44,6 +44,9 @@ from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
+from orchestrator.temporal.activities.lifecycle_reconcile import (
+    reconcile_lifecycle_ownership,
+)
 from orchestrator.temporal.activities.orphans import detect_orphans
 from orchestrator.temporal.activities.pr_state import get_pr_state
 from orchestrator.temporal.activities.proposals import find_proposal_slug
@@ -451,6 +454,12 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         record_execution,
         lifecycle_ownership,
         execution_claim,
+        # Short in the sense this list means: bounded GitHub reads plus a
+        # batched ownership read, and at most a couple of writes per finding.
+        # Same shape as detect_orphans two entries down, and for the same
+        # reason it belongs on the control queue rather than the execution
+        # one — nothing here waits on a mutex or an Argo run.
+        reconcile_lifecycle_ownership,
         find_proposal_slug,
         get_pr_state,
         resolve_deploy_target,

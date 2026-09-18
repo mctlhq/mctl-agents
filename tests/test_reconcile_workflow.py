@@ -19,6 +19,7 @@ from temporalio.testing import WorkflowEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.discovery import ProposalProjection, ReconcileDiscoveryResult
+from orchestrator.temporal.activities.lifecycle_reconcile import LifecycleReconcileResult
 from orchestrator.temporal.activities.orphans import OrphanDetectionResult, OrphanSignal
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
@@ -41,6 +42,7 @@ def _fake_activities(
     projections: list[ProposalProjection] | None = None,
     submit_fails: bool = False,
     submit_phase: str = "Succeeded",
+    lifecycle_fails: bool = False,
 ):
     received: dict = {}
     received["submits"] = []
@@ -80,11 +82,21 @@ def _fake_activities(
             ],
         )
 
+    @activity.defn(name="reconcile_lifecycle_ownership")
+    async def fake_reconcile_lifecycle_ownership(
+        active_workflow_ids: list[str] | None = None,
+    ) -> LifecycleReconcileResult:
+        received["lifecycle_active_ids"] = active_workflow_ids
+        if lifecycle_fails:
+            raise ApplicationError("mctl-api unavailable", non_retryable=True)
+        return LifecycleReconcileResult(examined=2, applied=1)
+
     return [
         fake_discover_and_project,
         fake_list_active_dev_loop_ids,
         fake_detect_orphans,
         fake_submit_and_wait,
+        fake_reconcile_lifecycle_ownership,
     ], received
 
 
@@ -128,6 +140,13 @@ class TestReconcileWorkflow:
         assert len(result.orphans.orphans) == 1
         # A tick that actually ran detection carries no skipped marker.
         assert result.orphans.skipped_reason is None
+        # The ownership sweep (#353) runs in the same arm and gets the SAME
+        # active set: it uses it to tell a live worker from a stale record,
+        # and an empty one there would read as "no workflow is running" for
+        # every row.
+        assert received["lifecycle_active_ids"] == ["dev-loop-mctlhq-mctl-web-10"]
+        assert result.lifecycle is not None
+        assert result.lifecycle.applied == 1
 
     async def test_visibility_failure_skips_orphan_detection(self, env):
         """Unknown active set → no orphan report this tick, not a page for
@@ -228,6 +247,26 @@ class TestReconcileApplies:
         assert result.orphans.skipped_reason is not None
         assert [i.operation for i in received["submits"]] == ["mctl-agents-reconcile"]
         assert result.applied is not None
+
+    async def test_a_failed_ownership_sweep_still_writes_the_drift(self, env):
+        """The sweep reads GitHub and mctl-api, so it has two more ways to
+        fail than anything else in the tick. Letting that propagate would cost
+        the projection write for a reason unrelated to it — the same quiet
+        loss the visibility arm refuses."""
+        acts, received = _fake_activities(
+            projections=DRIFT,
+            active_ids=["dev-loop-mctlhq-mctl-web-10"],
+            lifecycle_fails=True,
+        )
+
+        result = await _run(env, acts)
+
+        assert [i.operation for i in received["submits"]] == ["mctl-agents-reconcile"]
+        assert result.applied is not None
+        assert result.lifecycle is not None
+        assert "ownership sweep failed" in result.lifecycle.skipped_reason
+        # And the rest of the tick is untouched: orphan detection still ran.
+        assert result.orphans.total_actionable == 1
 
     async def test_a_cwft_that_ran_and_failed_is_not_read_as_written(self, env, caplog):
         """submit_and_wait RETURNS for every terminal phase, including

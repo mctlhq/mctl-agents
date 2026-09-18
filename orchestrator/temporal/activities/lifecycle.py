@@ -104,6 +104,13 @@ class OwnershipResult:
 
 _PATHS = {
     "acquire": "/api/v1/lifecycle/ownership/acquire",
+    # The two ops the reconciler adds (#353). `recover` is the only route that
+    # takes a LIVE row, and it re-derives liveness server-side — this client
+    # may ask, never assert (ADR-010 §5). `handoff-complete` finishes a handoff
+    # on the incoming owner's behalf, which is the caller ADR-010's pilot case
+    # 2 leaves to this phase.
+    "recover": "/api/v1/lifecycle/ownership/recover",
+    "handoff-complete": "/api/v1/lifecycle/ownership/handoff/complete",
     "progress": "/api/v1/lifecycle/ownership/progress",
     "release": "/api/v1/lifecycle/ownership/release",
     "terminal": "/api/v1/lifecycle/ownership/terminal",
@@ -206,6 +213,23 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
     Returns an `unknown` verdict rather than raising on any failure. A
     persistent failure must still leave the loop running, because the cron
     sweeper is the fallback owner and it only stands down for a positive claim.
+    """
+    return await perform_ownership_op(req)
+
+
+async def perform_ownership_op(req: OwnershipRequest) -> OwnershipResult:
+    """The body of `lifecycle_ownership`, callable from another ACTIVITY.
+
+    Split out for the reconcile sweep (#353), which performs several ownership
+    writes inside one activity — a recovery and the release or terminal that
+    follows it — and must not schedule a Temporal activity per write: the sweep
+    examines every open agent PR, and one activity task each would put hundreds
+    of round trips on the control queue every 15 minutes to do what one HTTP
+    call apiece already does.
+
+    Everything this function does — the rollout short-circuit, the soft
+    failures, the shared classifier — applies to that caller unchanged, which
+    is the point of sharing the body rather than copying it.
     """
     path = _PATHS.get(req.op)
     if path is None:
