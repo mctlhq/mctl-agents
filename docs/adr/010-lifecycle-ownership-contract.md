@@ -604,10 +604,18 @@ rival executor: `CLAIM_HELD_BY_OTHER` (a real, named holder),
 `CLAIM_UNKNOWN` (the store could not answer, failed closed under
 `LIFECYCLE_OWNERSHIP_REQUIRED`) and `CLAIM_UNCLAIMED` (the hold this attempt
 expected is gone — released, expired or fenced). In batch mode the same
-refusal is a skip at both sites: `implement_one` returns
-`counts_toward_limit=False` and never `_mark_needs_triage`, leaving
-`.status.yaml` exactly as the holder left it rather than rewriting a live
-`in-progress` back to `accepted`.
+refusal is a skip at both sites — never `_mark_needs_triage` — but not the
+same skip. The acquire site exits before anything is spent, so it does not
+charge the batch budget; the push site runs after a full model pass, so it
+does (`counts_toward_limit` defaults True), otherwise one mctl-api blip per
+proposal re-runs the model down the whole accepted queue. What happens to
+`.status.yaml` follows the verdict, which the exception carries as an
+attribute: `CLAIM_HELD_BY_OTHER` leaves the file to the live holder,
+`CLAIM_UNKNOWN` fails closed and leaves the yaml lease to expire without
+releasing a claim it cannot confirm, and `CLAIM_UNCLAIMED` — nobody holds it,
+because this attempt's lease expired or the store fenced the claim — releases
+and restores `accepted` so the next tick retries instead of waiting out a
+130-minute hold that does not exist.
 That existing-branch push REPLACES the branch rather than adopting it: the
 retry clones fresh and recreates the branch off the default branch, so the
 dead attempt's commits are discarded. Intended — nothing references them —

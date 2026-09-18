@@ -339,3 +339,65 @@ def test_a_non_dict_409_body_still_fails_closed(payload) -> None:
     answer = claim_answer_from(409, payload, None)
     assert answer.verdict == CLAIM_HELD_BY_OTHER
     assert answer.may_execute is False
+
+
+def test_a_release_that_never_reached_the_store_is_not_logged_as_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one direction this log must never be wrong in: asserting a freed
+    hold that may still be held. The transport-failure path answers
+    CLAIM_UNKNOWN, and `release` used to map to `released` unconditionally
+    (agy P3 on `c29195c`)."""
+    lines: list[str] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: lines.append(a[0]))
+
+    def _boom(req: Any) -> Any:
+        raise OSError("connection refused")
+
+    c = _client(monkeypatch, _boom)
+    answer = c.release("c1", ENTITY, PHASE, 0, ME, "attempt-1")
+    assert answer.verdict == CLAIM_UNKNOWN
+    assert claim_module.EVENT_RELEASED not in lines
+    assert claim_module.EVENT_REJECTED in lines
+
+
+def test_renew_sends_lease_seconds_and_parses_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`renew` has no production callers yet — the review lease is sized to
+    outlive its run instead — so its wire shape is only held in place by this
+    test (agy P3 on `c29195c`)."""
+    sent: list[dict[str, Any]] = []
+    paths: list[str] = []
+
+    def _handler(req: Any) -> Any:
+        paths.append(req.full_url)
+        sent.append(json.loads(req.data.decode()))
+        return _FakeResponse(json.dumps(_claim(ME)).encode())
+
+    c = _client(monkeypatch, _handler)
+    answer = c.renew("c1", ENTITY, PHASE, 0, "sha-a", ME, "attempt-1", lease_seconds=900)
+    assert answer.verdict == CLAIM_HELD_BY_ME
+    assert sent[0]["lease_seconds"] == 900
+    assert sent[0]["executor_id"] == ME.id
+    assert "lease_until" not in sent[0]
+    assert paths[0].endswith("/renew")
+
+
+def test_record_sends_the_idempotency_key_and_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    sent: list[dict[str, Any]] = []
+    paths: list[str] = []
+
+    def _handler(req: Any) -> Any:
+        paths.append(req.full_url)
+        sent.append(json.loads(req.data.decode()))
+        return _FakeResponse(json.dumps(_claim(ME)).encode())
+
+    c = _client(monkeypatch, _handler)
+    answer = c.record(
+        "c1", ENTITY, PHASE, 0, "sha-a", ME, "attempt-1",
+        idempotency_key="key-1", action="push", outcome="ok",
+    )
+    assert answer.verdict == CLAIM_HELD_BY_ME
+    assert sent[0]["idempotency_key"] == "key-1"
+    assert sent[0]["action"] == "push"
+    assert sent[0]["outcome"] == "ok"
+    assert paths[0].endswith("/record")

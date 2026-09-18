@@ -496,14 +496,15 @@ def test_a_vanished_claim_is_not_reported_as_a_competing_holder(
     with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
         _acquire(monkeypatch, ClaimAnswer(verdict=CLAIM_UNCLAIMED, reason="lease expired"))
     msg = str(excinfo.value)
-    assert "the lease ran out from under this attempt" in msg
+    assert "was refused although the claim reads free" in msg
     assert "another executor holds" not in msg
+    assert excinfo.value.verdict == CLAIM_UNCLAIMED
 
 
 @pytest.mark.parametrize(
     ("verdict", "expected", "forbidden"),
     [
-        (CLAIM_UNCLAIMED, "the lease ran out from under this attempt", "another executor holds"),
+        (CLAIM_UNCLAIMED, "Nobody else holds it", "another executor holds"),
         (CLAIM_HELD_BY_OTHER, "another executor holds", "lease ran out"),
         (CLAIM_UNKNOWN, "could not answer", "another executor holds"),
     ],
@@ -590,8 +591,12 @@ def test_a_push_site_refusal_is_a_skip_not_needs_triage(
 
     assert triaged == [], triaged
     assert result.error is None
-    assert result.counts_toward_limit is False
     assert "another executor holds" in (result.skipped_reason or "")
+    # A full model pass already ran, so the batch budget IS charged — unlike
+    # the acquire-site arm, which exits before anything is spent. Leaving it
+    # uncharged lets one blip per proposal re-run the model down the whole
+    # accepted queue (claude P2 on `c29195c`).
+    assert result.counts_toward_limit is True
     # The status file keeps the holder's view of the world: this attempt does
     # not rewrite it back to `accepted` over a live `in-progress`.
     assert "in-progress" in status_path.read_text(encoding="utf-8")
@@ -609,3 +614,84 @@ def test_the_review_lease_always_outlives_the_run_it_covers(
     monkeypatch.setattr(run_implementer, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
     widened = run_implementer._review_claim_lease_default()
     assert widened.total_seconds() >= 7200.0
+
+
+def _implement_one_refused_at_the_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, push_answer: ClaimAnswer,
+):
+    """Drive `implement_one` past a successful acquire to a push-site refusal."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    proposal_dir = tmp_path / "mctl-web" / "slug"
+    proposal_dir.mkdir(parents=True)
+    status_path = proposal_dir / ".status.yaml"
+    status_path.write_text("status: accepted\n", encoding="utf-8")
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=proposal_dir, status="accepted",
+        approval_ok=True,
+    )
+    answers = iter([ClaimAnswer(verdict=CLAIM_HELD_BY_ME), push_answer])
+    released: list[str] = []
+
+    class _Client:
+        def acquire(self, *a, **kw):
+            return next(answers)
+
+        def check(self, *a, **kw):
+            return next(answers)
+
+        def release(self, *a, **kw):
+            released.append(kw.get("reason", ""))
+            return ClaimAnswer(verdict=CLAIM_UNCLAIMED)
+
+    monkeypatch.setattr(run_implementer, "ClaimClient", _Client)
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        run_implementer, "_preflight_existing_result",
+        lambda *_a, **_kw: run_implementer.ExistingResult(action="none"),
+    )
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a, **_kw: tmp_path / "repo")
+    monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_build_prompt", lambda *_a, **_kw: "prompt")
+    monkeypatch.setattr(run_implementer.anyio, "run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: False)
+    monkeypatch.setattr(
+        run_implementer, "_mark_needs_triage",
+        lambda *a, **kw: pytest.fail("a claim refusal must never mark needs-triage"),
+    )
+
+    result = run_implementer.implement_one(ref)
+    return result, status_path.read_text(encoding="utf-8"), released
+
+
+def test_a_vanished_claim_hands_the_proposal_back_for_an_immediate_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLAIM_UNCLAIMED means NOBODY holds it — this attempt's lease expired,
+    or the store fenced the claim. Parking the proposal `in-progress` would
+    then cost the rest of a 130-minute lease for a hold that does not exist,
+    so the arm releases and restores `accepted` (claude P3 on `c29195c`)."""
+    result, body, released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch, ClaimAnswer(verdict=CLAIM_UNCLAIMED, reason="lease expired"),
+    )
+    assert result.error is None
+    assert "in-progress" not in body, body
+    assert "status: accepted" in body, body
+    assert released, "a claim nobody holds must not be left dangling"
+
+
+def test_an_unreachable_store_at_the_push_fails_closed_and_keeps_the_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opposite direction, and the reason the three verdicts cannot share
+    one handler: on CLAIM_UNKNOWN nothing is known, so the yaml lease is left
+    to expire on its own and the claim is deliberately NOT released — a
+    release we cannot confirm is how an outage frees a live hold."""
+    result, body, released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch, ClaimAnswer(verdict=CLAIM_UNKNOWN, reason="mctl-api unreachable"),
+    )
+    assert result.error is None
+    assert "in-progress" in body, body
+    assert released == [], released

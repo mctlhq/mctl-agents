@@ -398,7 +398,14 @@ class ClaimClient:
         elif op_name == "renew":
             event = EVENT_RENEWED if answer.verdict == CLAIM_HELD_BY_ME else EVENT_REJECTED
         elif op_name == "release":
-            event = EVENT_RELEASED
+            # A release that never reached the store is not a release, and
+            # logging `released` for it asserts a freed hold that may still be
+            # held — the one direction this log must never be wrong in (agy P3
+            # on `c29195c`). `accepted` is the discriminator and the verdict is
+            # not: a genuinely successful body-less 204 answers CLAIM_UNKNOWN
+            # (no record came back to read) while still being the write that
+            # freed the claim.
+            event = EVENT_RELEASED if answer.accepted else EVENT_REJECTED
         elif op_name in ("check", "record") and answer.verdict != CLAIM_HELD_BY_ME:
             event = EVENT_REJECTED
         else:

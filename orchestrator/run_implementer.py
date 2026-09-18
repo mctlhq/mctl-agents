@@ -109,6 +109,7 @@ from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
 from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
+    CLAIM_HELD_BY_OTHER,
     CLAIM_UNCLAIMED,
     CLAIM_UNKNOWN,
     OWNER_IMPLEMENTER,
@@ -594,7 +595,17 @@ class ImplementerClaimRefused(RuntimeError):
     (`claim.blocks_mutation` True, i.e. `enforce` and above). Below that the
     claim is advisory and a rejected acquire returns None, exactly as before
     ADR-010 phase 2.
+
+    The verdict is carried as an attribute, not only inside the message: the
+    handler in `implement_one` has to tell the three apart to know whether the
+    entity is held by someone (leave it alone), free (hand it back for an
+    immediate retry) or unknown (fail closed and wait out the lease). Parsing
+    that back out of prose would be the bug this class exists to avoid.
     """
+
+    def __init__(self, message: str, *, verdict: str = CLAIM_UNKNOWN) -> None:
+        super().__init__(message)
+        self.verdict = verdict
 
 
 class ImplementerOrphanedSubagent(OrphanedSubagentError):
@@ -653,9 +664,14 @@ def _review_claim_lease_default() -> timedelta:
     `IMPLEMENTER_TIMEOUT_SECONDS` bounds the SDK run; the git work around it
     is bounded by `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which
     the clone before and the push after are the two that matter. The margin
-    is deliberately the whole of both rather than a fraction: expiring early
-    costs a wasted attempt, expiring late costs a wait no longer than one
-    shepherd poll.
+    is deliberately the whole of both rather than a fraction, because the two
+    errors are not symmetric in the way they look: expiring EARLY refuses a
+    live attempt at its own push, and expiring LATE strands the entity for the
+    rest of the lease whenever the holder cannot run its own `finally` — a
+    crashed or evicted pod does not release, so the wait is the full remaining
+    lease and not one shepherd poll (claude P3 on `c29195c`). A wider lease is
+    still the right trade: the early error is certain and repeats, the late
+    one needs a crash.
     """
     bound = timedelta(
         seconds=IMPLEMENTER_TIMEOUT_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
@@ -774,18 +790,22 @@ def _acquire_claim(
                     f"{CLAIM_REFUSED_ERROR_PREFIX} the claim store could not answer for "
                     f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}. "
                     f"Nobody is known to hold it; uncertainty is failed closed because "
-                    f"LIFECYCLE_OWNERSHIP_REQUIRED is on (set it to false to proceed anyway)"
+                    f"LIFECYCLE_OWNERSHIP_REQUIRED is on (set it to false to proceed anyway)",
+                    verdict=CLAIM_UNKNOWN,
                 )
             if answer.verdict == CLAIM_UNCLAIMED:
                 raise ImplementerClaimRefused(
-                    f"{CLAIM_REFUSED_ERROR_PREFIX} the claim this attempt expected to hold on "
-                    f"{entity.kind}:{entity.id}/{phase} is gone (released, expired or fenced): "
-                    f"{answer.reason or answer.verdict}. Nobody else holds it; the lease ran "
-                    f"out from under this attempt"
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the acquire for "
+                    f"{entity.kind}:{entity.id}/{phase} was refused although the claim reads "
+                    f"free (released, expired or fenced): {answer.reason or answer.verdict}. "
+                    f"Nobody holds it; this attempt never held it either, so the refusal is "
+                    f"the store's, not a lost race (claude P3 on `c29195c`)",
+                    verdict=CLAIM_UNCLAIMED,
                 )
             raise ImplementerClaimRefused(
                 f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
-                f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}"
+                f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}",
+                verdict=CLAIM_HELD_BY_OTHER,
             )
         # Everything left is an answer at a rollout stage where the claim is
         # advisory by design — below `enforce`, or a CLAIM_UNKNOWN with the
@@ -840,18 +860,22 @@ def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = No
                 f"{CLAIM_REFUSED_ERROR_PREFIX} the claim store could not answer for "
                 f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} before the push: "
                 f"{answer.reason or answer.verdict}. Nobody is known to hold it; "
-                f"uncertainty is failed closed because LIFECYCLE_OWNERSHIP_REQUIRED is on"
+                f"uncertainty is failed closed because LIFECYCLE_OWNERSHIP_REQUIRED is on",
+                verdict=CLAIM_UNKNOWN,
             )
         if answer.verdict == CLAIM_UNCLAIMED:
             raise ImplementerClaimRefused(
                 f"{CLAIM_REFUSED_ERROR_PREFIX} the claim this attempt held on "
-                f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} is gone (released, expired or "
-                f"fenced) by the time of the push: {answer.reason or answer.verdict}. Nobody "
-                f"else holds it; the lease ran out from under this attempt"
+                f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} is gone by the time of the "
+                f"push: {answer.reason or answer.verdict}. Nobody else holds it — either this "
+                f"attempt's own lease ran out (nothing renews it mid-run) or the store fenced "
+                f"the claim and reports the free state that leaves behind",
+                verdict=CLAIM_UNCLAIMED,
             )
         raise ImplementerClaimRefused(
             f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
-            f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase}: {answer.reason or answer.verdict}"
+            f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase}: {answer.reason or answer.verdict}",
+            verdict=CLAIM_HELD_BY_OTHER,
         )
 
 
@@ -2432,27 +2456,51 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
     except ImplementerClaimRefused as e:
-        # The push-site claim check refused this attempt. Same shape as the
-        # acquire-site arm above the `try`: a skip, not a failure, and
-        # explicitly NOT `_mark_needs_triage` — the exception's own docstring
-        # forbids that outcome, and without this arm the refusal fell through
-        # to the generic `except Exception` and was recorded as
+        # The push-site claim check refused this attempt: a skip, not a
+        # failure, and explicitly NOT `_mark_needs_triage` — the exception's
+        # own docstring forbids that outcome, and without this arm the refusal
+        # fell through to the generic `except Exception` and was recorded as
         # `unexpected-error`/`agent`, i.e. a crash in the proposal's history
         # (claude + agy P2 on `d5e2a48`).
         #
-        # The `.status.yaml` is deliberately left exactly as it is, still
-        # `in-progress` with this attempt's block. Whoever holds the claim now
-        # writes the only status this proposal gets; rewriting it back to
-        # `accepted` from here would clobber a live holder's `in-progress` and
-        # invite the second run this whole contract exists to prevent. When
-        # nobody holds it (CLAIM_UNCLAIMED — this attempt's own lease ran out)
-        # the yaml lease expires on its own and the next tick retries.
-        return ImplementResult(
-            ref=ref,
-            pr_url=None,
-            skipped_reason=str(e),
-            counts_toward_limit=False,
-        )
+        # It DOES charge the batch budget, unlike the acquire-site arm this
+        # was first copied from. Every `counts_toward_limit=False` in this
+        # module is a pre-SDK exit — approval blocked, preflight failed,
+        # acquire refused — where nothing was spent. Here a full model pass
+        # has already run, and `_implement_refs` charges on that flag alone:
+        # leaving it False lets one mctl-api blip per proposal run the model
+        # again down the whole accepted queue, which is the subscription-usage
+        # multiplication `_max_proposals_error` exists to prevent
+        # (incident-7eb12290, claude P2 on `c29195c`).
+        #
+        # What happens to `.status.yaml` depends on WHICH refusal this is;
+        # the three are not one situation (claude P3 on `c29195c`):
+        msg = str(e)
+        if e.verdict == CLAIM_UNCLAIMED:
+            # Nobody holds it. Either this attempt's lease expired (nothing
+            # renews it mid-run) or the store fenced the claim. Parking the
+            # proposal `in-progress` would then cost the rest of a 130-minute
+            # lease for a hold that does not exist, so hand it back: release
+            # best-effort and restore `accepted` so the next tick re-acquires
+            # and re-runs against the current world. Nothing was pushed, so
+            # there is nothing to reconcile.
+            _release_claim(claim_ctx, reason="claim vanished mid-run")
+            update_status_yaml(ref, "accepted", attempt=None, failure=None)
+        elif e.verdict == CLAIM_UNKNOWN:
+            # The store could not answer. Fail closed: leave `in-progress`
+            # and let the yaml lease expire on its own rather than hand the
+            # entity to a second executor on the strength of an outage. The
+            # claim is deliberately NOT released — a release we cannot
+            # confirm is how an outage frees a live hold.
+            pass
+        else:
+            # CLAIM_HELD_BY_OTHER: a real, named holder is running this now,
+            # and their run writes the only status this proposal gets.
+            # Rewriting it back to `accepted` from here would clobber their
+            # `in-progress` and invite the second run this contract exists to
+            # prevent.
+            pass
+        return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
     except ImplementerOrphanedSubagent as e:
         # Batch mode has no review-attempt budget, so it needs no sentinel exit
         # code — but it does need its own triage code, otherwise this lands in
