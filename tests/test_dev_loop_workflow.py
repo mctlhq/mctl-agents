@@ -43,6 +43,10 @@ from orchestrator.temporal.workflows.dev_loop import (
 )
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
+# The watch loop skips poll 1 (it runs at t=0, before the first sleep), so the
+# first tick boundary is not SHEPHERD_TICK_EVERY_POLLS whenever that is 1.
+FIRST_SHEPHERD_TICK_POLL = max(2, SHEPHERD_TICK_EVERY_POLLS)
+
 
 def test_legacy_cadence_is_the_pre_marker_numbers_verbatim() -> None:
     """An execution replaying without `fast-shepherd-cadence` must see its own
@@ -99,6 +103,20 @@ MERGED_PR = PRState(
     merged=True,
     merge_commit="cafe1234",
 )
+
+
+def test_the_first_poll_never_ticks() -> None:
+    """agy P2 round 1: poll 1 runs at t=0, before the loop's first sleep.
+
+    With SHEPHERD_TICK_EVERY_POLLS == 1 a bare `%` would tick seconds after
+    the PR opened, ahead of the review it is meant to collect. The guard is
+    a no-op for the legacy cadence, whose first boundary is poll 8 anyway.
+    """
+    assert FIRST_SHEPHERD_TICK_POLL > 1
+    assert FIRST_SHEPHERD_TICK_POLL % SHEPHERD_TICK_EVERY_POLLS == 0
+    legacy = dev_loop.LEGACY_CADENCE
+    assert max(2, legacy.shepherd_tick_every_polls) == legacy.shepherd_tick_every_polls
+
 
 
 @activity.defn(name="find_proposal_slug")
@@ -3142,8 +3160,10 @@ class TestDevLoopWorkflow:
         SHEPHERD_TICK_EVERY_POLLS-th poll submits a slug-scoped shepherd
         tick; the merged poll after it ends the watch.
 
-        One open poll per tick and exactly one tick, so the assertion pins
-        the cadence rather than restating whatever number it currently has.
+        Poll 1 is excluded on purpose — it runs at t=0, before the loop's
+        first sleep — so the first boundary is FIRST_SHEPHERD_TICK_POLL.
+        Exactly one tick, so the assertion pins the cadence rather than
+        restating whatever number it currently has.
         """
         open_pr = PRState(
             found=True,
@@ -3154,7 +3174,7 @@ class TestDevLoopWorkflow:
         )
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
-            pr_states=[open_pr] * SHEPHERD_TICK_EVERY_POLLS + [MERGED_PR],
+            pr_states=[open_pr] * FIRST_SHEPHERD_TICK_POLL + [MERGED_PR],
         )
         async with Worker(
             env.client,
@@ -3186,7 +3206,7 @@ class TestDevLoopWorkflow:
 
         While the merge watch runs under the shepherd-in-loop patch, the
         query must already answer True — the cron has to stand down from
-        the moment the watch starts, not from the first tick 4 h later.
+        the moment the watch starts, not from the first tick a poll later.
         """
         open_pr = PRState(
             found=True,
@@ -3666,11 +3686,10 @@ class TestDevLoopWorkflow:
     async def test_shepherd_ticks_stop_at_the_cap(self, env):
         """SHEPHERD_TICKS_MAX must actually stop ticking (#230 P3).
 
-        Each tick provisions a Hetzner volume, and the shepherd itself
-        flips review-stuck after MAX_REVIEW_ATTEMPTS address-review
-        attempts — so a wedged PR must not burn one every ~4 h for the
-        full 14-day watch. Drive the watch past 13 tick boundaries and
-        assert the 13th produces nothing.
+        The shepherd flips review-stuck after MAX_REVIEW_ATTEMPTS
+        address-review attempts, so a wedged PR must not keep ticking for
+        the full 14-day watch. Drive the watch one boundary past the cap
+        and assert that last boundary produces nothing.
         """
         open_pr = PRState(
             found=True,
@@ -3679,7 +3698,10 @@ class TestDevLoopWorkflow:
             number=MERGED_PR.number,
             state="OPEN",
         )
-        polls = SHEPHERD_TICK_EVERY_POLLS * (SHEPHERD_TICKS_MAX + 1)
+        # +1 because poll 1 never ticks, so N ticks need N boundaries
+        # starting at FIRST_SHEPHERD_TICK_POLL, not at poll
+        # SHEPHERD_TICK_EVERY_POLLS.
+        polls = SHEPHERD_TICK_EVERY_POLLS * (SHEPHERD_TICKS_MAX + 1) + 1
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True, pr_states=[open_pr] * polls + [MERGED_PR]
         )

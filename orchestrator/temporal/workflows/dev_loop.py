@@ -171,9 +171,13 @@ PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 # uncollected — four hours of dead time per round, on a review that lands in
 # minutes.
 #
-# Poll 1 is 15 min in, not immediate, so the "don't tick before claude review
-# has even started" property the old `% 8` gave for free still holds without a
-# separate guard.
+# The first poll runs at t=0, before the loop's first sleep, so `% 1` alone
+# would tick seconds after the PR opened — agy P2 round 1 caught that the
+# "don't tick before claude review has even started" property the old `% 8`
+# gave for free does NOT survive the change. `_watch_pr` therefore skips
+# poll 1 explicitly; the first tick lands one interval (15 min) in. The guard
+# is a no-op for LEGACY_CADENCE, whose first boundary is poll 8 either way,
+# so it needs no patch marker.
 SHEPHERD_TICK_EVERY_POLLS = 1
 LEGACY_SHEPHERD_TICK_EVERY_POLLS = 8
 # Capped: after SHEPHERD_TICKS_MAX active ticks the loop keeps watching
@@ -2368,10 +2372,16 @@ class DevLoopWorkflow:
                         return state
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
-                    # consuming its boundary and dropping it for ~4 h.
+                    # consuming its boundary and dropping it for a whole
+                    # tick period.
                     poll_index += 1
                     if (
                         shepherd_in_loop
+                        # Poll 1 happens at t=0 (the sleep is at the bottom of
+                        # the loop), so a tick on it would fire before claude
+                        # review has started. Harmless — it would decide `wait`
+                        # — but it burns a tick from the budget for nothing.
+                        and poll_index > 1
                         and poll_index % cadence.shepherd_tick_every_polls == 0
                         and shepherd_ticks < cadence.shepherd_ticks_max
                     ):
