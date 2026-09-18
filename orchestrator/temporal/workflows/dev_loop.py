@@ -127,50 +127,84 @@ SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
 APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
-# state until it merges/closes. Two cheap GitHub reads per poll — 30 min is
+# state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
 # responsive enough for a merge event nothing downstream reacts to in
-# real time yet, and ~2.9k history events over the full 14-day deadline
+# real time yet, and ~5.8k history events over the full 14-day deadline
 # stays far under Temporal's 50k event limit. The deadline bounds the
 # workflow's lifetime: a PR still open after two weeks is returned as-is
 # (state="OPEN"), not waited on forever.
-MERGE_POLL_INTERVAL = timedelta(minutes=30)
+#
+# It was 30 min until the `fast-shepherd-cadence` marker. The poll interval is
+# the clock every other cadence in this module is expressed against, so
+# halving it would silently halve four unrelated wall-clock intents; each of
+# the poll COUNTS below is doubled in the same change to hold them steady, and
+# both sets are carried in `_Cadence` so a reader sees they are one decision.
+MERGE_POLL_INTERVAL = timedelta(minutes=15)
+LEGACY_MERGE_POLL_INTERVAL = timedelta(minutes=30)
 MERGE_WATCH_DEADLINE = timedelta(days=14)
 # The implementer writes the pr: link into .status.yaml in the same commit
 # that flips it to implemented, so the link should be visible on the first
 # poll. A few polls of grace absorb gitops main lag; after that, a missing
 # link means the status write failed — give up rather than poll for 14 days.
-PR_LOOKUP_GRACE_POLLS = 4
+# Eight polls at the 15-min interval is the same ~2 h of grace four polls
+# bought at 30 min.
+PR_LOOKUP_GRACE_POLLS = 8
+LEGACY_PR_LOOKUP_GRACE_POLLS = 4
 PR_STATE_TIMEOUT = timedelta(minutes=2)
 PR_STATE_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 
 # Stage 6.1 review loop (#213): while the PR stays open, the workflow runs
 # its OWN shepherd ticks instead of relying on the global cron (which
 # narrows to a sweeper and skips slugs a running DevLoop owns — see
-# run_shepherd._dev_loop_owns). Cadence: every 8th poll ≈ 4 h — each tick
-# provisions a Hetzner volume, so hours not minutes (ADR-006 cost note),
-# and never on the first poll (claude review auto-fires on PR open; an
-# immediate tick would just observe "review pending"). Capped: after
-# SHEPHERD_TICKS_MAX active ticks the loop keeps watching passively —
-# the shepherd itself flips review-stuck after MAX_REVIEW_ATTEMPTS
-# address-review attempts, so a stuck PR must not burn a volume every
-# 4 h for two weeks.
-SHEPHERD_TICK_EVERY_POLLS = 8
-SHEPHERD_TICKS_MAX = 12
+# run_shepherd._dev_loop_owns). Cadence: every poll ≈ 15 min.
+#
+# It was every 8th poll ≈ 4 h, justified as "each tick provisions a Hetzner
+# volume, so hours not minutes (ADR-006 cost note)". That cost no longer
+# exists: mctl-gitops `193dbe5c` (2026-09-05) took cwft-mctl-agents-shepherd
+# off its workdir PVC, and no agent template has a volumeClaimTemplate any
+# more — a tick is a clone and a few gh reads on an emptyDir.
+#
+# What a tick can still cost is an implementer run, and that is charged on the
+# `address-review` decision, not on the tick: a tick that finds the review
+# still pending decides `wait`, spends no MAX_REVIEW_ATTEMPTS slot and posts
+# nothing. So this constant only sets how long a FINISHED review sits
+# uncollected — four hours of dead time per round, on a review that lands in
+# minutes.
+#
+# The first poll runs at t=0, before the loop's first sleep, so `% 1` alone
+# would tick seconds after the PR opened — agy P2 round 1 caught that the
+# "don't tick before claude review has even started" property the old `% 8`
+# gave for free does NOT survive the change. `_watch_pr` therefore skips
+# poll 1 explicitly; the first tick lands one interval (15 min) in. The guard
+# is a no-op for LEGACY_CADENCE, whose first boundary is poll 8 either way,
+# so it needs no patch marker.
+SHEPHERD_TICK_EVERY_POLLS = 1
+LEGACY_SHEPHERD_TICK_EVERY_POLLS = 8
+# Capped: after SHEPHERD_TICKS_MAX active ticks the loop keeps watching
+# passively — the shepherd itself flips review-stuck after
+# MAX_REVIEW_ATTEMPTS address-review attempts, so a stuck PR must not tick
+# for the rest of a fourteen-day watch. 96 ticks is ~24 h of active
+# shepherding (it was 12 ticks ≈ 48 h at the old cadence): rounds that used
+# to take a day now take an hour, and a PR still unresolved 24 h in needs a
+# human, not a 97th tick.
+SHEPHERD_TICKS_MAX = 96
+LEGACY_SHEPHERD_TICKS_MAX = 12
 
-# Ownership liveness is refreshed every 4th poll (~2 h at MERGE_POLL_INTERVAL),
+# Ownership liveness is refreshed every 8th poll (~2 h at MERGE_POLL_INTERVAL),
 # on its OWN cadence rather than riding the shepherd tick boundary.
 #
-# It cannot ride the ticks: those stop after SHEPHERD_TICKS_MAX (~48 h) while
+# It cannot ride the ticks: those stop after SHEPHERD_TICKS_MAX (~24 h) while
 # the watch runs up to MERGE_WATCH_DEADLINE (14 days), so a loop that is
 # healthily watching a long-lived PR would stop proving liveness after two days
 # and start reading as a crashed owner.
 #
-# It is not every poll either: a 14-day watch is ~672 polls, and one extra
+# It is not every poll either: a 14-day watch is ~1344 polls, and one extra
 # activity per poll doubles the history of the longest-lived workflow in the
 # system to record something that changes nothing. At 2 h against the 10 h
 # liveness bound, four consecutive heartbeats can be lost before the owner
 # looks dead.
-LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
+LIFECYCLE_HEARTBEAT_EVERY_POLLS = 8
+LEGACY_LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 
 # Consecutive ownership WRITES that answer neither "mine" nor "someone else's"
 # before the loop drops back to the heartbeat cadence.
@@ -178,8 +212,8 @@ LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 # Not a permanent give-up. A store that is down for three hours is usually back
 # later in a fourteen-day watch, and a loop that stopped forever would hold no
 # claim for the rest of it; retrying on the heartbeat boundary is the cheaper
-# answer. Six polls is about three hours, and continuing to ask every poll for
-# the remaining fortnight is ~670 activities against an endpoint that is not
+# answer. Twelve polls is about three hours, and continuing to ask every poll
+# for the remaining fortnight is ~1340 activities against an endpoint that is not
 # answering, with the cron sweeper owning the PR throughout — the same outcome
 # as before any of this existed.
 #
@@ -190,7 +224,8 @@ LIFECYCLE_HEARTBEAT_EVERY_POLLS = 4
 # this" is an answer, not a failure to answer, so it is believed for far longer
 # — LIFECYCLE_REFUSAL_BACKOFF_POLLS rather than one heartbeat boundary. It is
 # not believed forever, though; see that constant for why.)
-LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
+LIFECYCLE_UNKNOWN_WRITE_LIMIT = 12
+LEGACY_LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
 
 # Polls a refusal is believed for before the loop asks again.
 #
@@ -201,11 +236,12 @@ LIFECYCLE_UNKNOWN_WRITE_LIMIT = 6
 # claimable again inside the same watch. A loop holding a permanent refusal
 # never finds out.
 #
-# 20 polls is 10 h at MERGE_POLL_INTERVAL, which is the liveness bound itself:
+# 40 polls is 10 h at MERGE_POLL_INTERVAL, which is the liveness bound itself:
 # a refusal must be re-tested at most one bound later, because past that point
 # the owner it names may already be gone. Re-testing sooner would spend
 # activities re-learning a fact that cannot yet have changed.
-LIFECYCLE_REFUSAL_BACKOFF_POLLS = 20
+LIFECYCLE_REFUSAL_BACKOFF_POLLS = 40
+LEGACY_LIFECYCLE_REFUSAL_BACKOFF_POLLS = 20
 
 # Consecutive REFUSALS naming THE SAME owner before the loop stops asking for
 # good.
@@ -233,10 +269,10 @@ OWNER_TYPE = "devloop-workflow"
 # entity. A SEPARATE constant, and a smaller number, because it counts a
 # different thing.
 #
-# LIFECYCLE_UNKNOWN_WRITE_LIMIT's two counters advance once per POLL (30 min),
-# so six of them is about three hours. `_unknown_heartbeats` advances inside
-# the `% LIFECYCLE_HEARTBEAT_EVERY_POLLS` block, so it advances once per four
-# polls (~2 h) — and six of THOSE is twelve hours, past the very bound the
+# LIFECYCLE_UNKNOWN_WRITE_LIMIT's two counters advance once per POLL (15 min),
+# so twelve of them is about three hours. `_unknown_heartbeats` advances
+# inside the `% LIFECYCLE_HEARTBEAT_EVERY_POLLS` block, so it advances once
+# per eight polls (~2 h) — and six of THOSE is twelve hours, past the bound the
 # give-up exists to beat. Reusing the constant made the correction arrive after
 # the event it is meant to precede: the reconciler force-releases at the 10 h
 # liveness bound, and the loop went on believing it owned the row for another
@@ -247,6 +283,52 @@ OWNER_TYPE = "devloop-workflow"
 # with room for the store to come back, and four (~8 h) is the last value that
 # still is.
 LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT = 3
+
+
+@dataclass(frozen=True)
+class _Cadence:
+    """Every duration the watch loop measures in polls, as one value.
+
+    The poll interval and the poll COUNTS are a single decision — halving the
+    interval halves each count's wall-clock meaning — so they travel together
+    rather than as seven module constants a future change can move one at a
+    time. It is also what makes the `fast-shepherd-cadence` marker cheap: a
+    replaying execution reads LEGACY_CADENCE and schedules exactly the timers
+    and activities its history already records.
+    """
+
+    poll_interval: timedelta
+    shepherd_tick_every_polls: int
+    shepherd_ticks_max: int
+    heartbeat_every_polls: int
+    unknown_write_limit: int
+    refusal_backoff_polls: int
+    pr_lookup_grace_polls: int
+
+
+CADENCE = _Cadence(
+    poll_interval=MERGE_POLL_INTERVAL,
+    shepherd_tick_every_polls=SHEPHERD_TICK_EVERY_POLLS,
+    shepherd_ticks_max=SHEPHERD_TICKS_MAX,
+    heartbeat_every_polls=LIFECYCLE_HEARTBEAT_EVERY_POLLS,
+    unknown_write_limit=LIFECYCLE_UNKNOWN_WRITE_LIMIT,
+    refusal_backoff_polls=LIFECYCLE_REFUSAL_BACKOFF_POLLS,
+    pr_lookup_grace_polls=PR_LOOKUP_GRACE_POLLS,
+)
+
+# The cadence histories recorded before the `fast-shepherd-cadence` marker.
+# Kept verbatim, not derived: an execution started under it must keep sleeping
+# 30 min and ticking every 8th poll, because both the timer durations and the
+# number of activities per poll are commands its history already holds.
+LEGACY_CADENCE = _Cadence(
+    poll_interval=LEGACY_MERGE_POLL_INTERVAL,
+    shepherd_tick_every_polls=LEGACY_SHEPHERD_TICK_EVERY_POLLS,
+    shepherd_ticks_max=LEGACY_SHEPHERD_TICKS_MAX,
+    heartbeat_every_polls=LEGACY_LIFECYCLE_HEARTBEAT_EVERY_POLLS,
+    unknown_write_limit=LEGACY_LIFECYCLE_UNKNOWN_WRITE_LIMIT,
+    refusal_backoff_polls=LEGACY_LIFECYCLE_REFUSAL_BACKOFF_POLLS,
+    pr_lookup_grace_polls=LEGACY_PR_LOOKUP_GRACE_POLLS,
+)
 
 # Activity bounds for ownership calls. Short and few: ownership is a
 # coordination signal, and a loop must never stall on it.
@@ -630,6 +712,11 @@ def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
 @workflow.defn
 class DevLoopWorkflow:
     def __init__(self) -> None:
+        # Which cadence this execution runs at. Bound for real in _watch_pr,
+        # once, off the `fast-shepherd-cadence` marker; CADENCE here so every
+        # path that reads it before the watch starts (and every unit test that
+        # drives a method directly) sees the current numbers rather than None.
+        self._cadence = CADENCE
         self._approved = False
         self._approver: str | None = None
         self._shepherd_in_loop = False
@@ -1384,7 +1471,7 @@ class DevLoopWorkflow:
         self._refused_by_id = result.owner_id
         self._claim_refused = True
         self._claim_refused_until_poll = (
-            self._poll_index_for_heartbeat + LIFECYCLE_REFUSAL_BACKOFF_POLLS
+            self._poll_index_for_heartbeat + self._cadence.refusal_backoff_polls
         )
 
     def _finish_claim(
@@ -1555,14 +1642,14 @@ class DevLoopWorkflow:
             if self._backed_off(self._unknown_acquires):
                 # The store has been unreachable, or answering something
                 # unusable, for this many consecutive attempts. Re-asking on
-                # every poll for the rest of a 14-day watch is ~670 activities
+                # every poll for the rest of a 14-day watch is ~1340 activities
                 # against an endpoint that is not answering; the sweeper owns
                 # the PR meanwhile, which is the same outcome as before any of
                 # this existed.
                 return
             if self._refusal_still_holds():
                 # Somebody else owns this PR and said so. Re-asking on every
-                # poll for the rest of a 14-day watch is ~670 activities to
+                # poll for the rest of a 14-day watch is ~1340 activities to
                 # re-learn one fact; the reconciler is what resolves a
                 # conflict, not this loop.
                 #
@@ -1892,7 +1979,7 @@ class DevLoopWorkflow:
             #
             # The retries are bounded by _backed_off on the way IN, with the
             # counter this arm advances. Without it a /progress that 500s from
-            # poll 2 onward costs one activity per poll for the remaining ~670
+            # poll 2 onward costs one activity per poll for the remaining ~1340
             # polls of a fourteen-day watch — precisely the history cost
             # LIFECYCLE_UNKNOWN_WRITE_LIMIT exists to refuse, arriving by the
             # path that falling through created. An earlier version of this
@@ -1900,7 +1987,7 @@ class DevLoopWorkflow:
             # not, because that counter is only read and only written inside
             # the unclaimed branch.
 
-        if self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS == 0:
+        if self._poll_index_for_heartbeat % self._cadence.heartbeat_every_polls == 0:
             result = await self._ownership(
                 "acquire", repo=repo, number=number, head_sha=head
             )
@@ -2133,8 +2220,8 @@ class DevLoopWorkflow:
         does not throttle the acquire that is still working.
         """
         return (
-            unanswered >= LIFECYCLE_UNKNOWN_WRITE_LIMIT
-            and self._poll_index_for_heartbeat % LIFECYCLE_HEARTBEAT_EVERY_POLLS != 0
+            unanswered >= self._cadence.unknown_write_limit
+            and self._poll_index_for_heartbeat % self._cadence.heartbeat_every_polls != 0
         )
 
     async def _watch_pr(self, service: str, slug: str) -> PRState | None:
@@ -2150,9 +2237,16 @@ class DevLoopWorkflow:
         last: PRState | None = None
         # In-loop shepherd (#213): evaluated once — the marker also fixes
         # whether tick commands appear in this execution's history at all.
+        # Poll interval, tick cadence and every poll COUNT below, as one
+        # value (#213 follow-up). Its own marker because it changes both the
+        # timer durations and the number of activities a poll schedules: an
+        # execution recorded under the old 30-min/4-h cadence must keep
+        # replaying it, and `_Cadence` is what lets it.
+        cadence = CADENCE if workflow.patched("fast-shepherd-cadence") else LEGACY_CADENCE
+        self._cadence = cadence
         shepherd_in_loop = workflow.patched("shepherd-in-loop")
         # Published to the sweeper via the shepherd_in_loop query the moment
-        # the watch starts, not at the first tick 4 h later: between those
+        # the watch starts, not at the first tick a poll later: between those
         # two points this execution IS the owner, and the cron must already
         # be standing down.
         if shepherd_in_loop and not await _shepherd_is_pinned():
@@ -2250,7 +2344,7 @@ class DevLoopWorkflow:
                         service,
                         slug,
                     )
-                    await workflow.sleep(MERGE_POLL_INTERVAL)
+                    await workflow.sleep(cadence.poll_interval)
                     continue
                 if state.found:
                     last = state
@@ -2278,12 +2372,18 @@ class DevLoopWorkflow:
                         return state
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
-                    # consuming its boundary and dropping it for ~4 h.
+                    # consuming its boundary and dropping it for a whole
+                    # tick period.
                     poll_index += 1
                     if (
                         shepherd_in_loop
-                        and poll_index % SHEPHERD_TICK_EVERY_POLLS == 0
-                        and shepherd_ticks < SHEPHERD_TICKS_MAX
+                        # Poll 1 happens at t=0 (the sleep is at the bottom of
+                        # the loop), so a tick on it would fire before claude
+                        # review has started. Harmless — it would decide `wait`
+                        # — but it burns a tick from the budget for nothing.
+                        and poll_index > 1
+                        and poll_index % cadence.shepherd_tick_every_polls == 0
+                        and shepherd_ticks < cadence.shepherd_ticks_max
                     ):
                         # The tick is the same one-shot the cron ran, scoped to
                         # exactly this proposal (service+slug → run_shepherd's
@@ -2336,7 +2436,7 @@ class DevLoopWorkflow:
                     # once found (agy P3's zombie loop). The counter resets on
                     # every successful resolve, so one transient blip never
                     # ends the watch.
-                    if polls_without_pr >= PR_LOOKUP_GRACE_POLLS:
+                    if polls_without_pr >= cadence.pr_lookup_grace_polls:
                         workflow.logger.warning(
                             "merge watch for %s/%s giving up after %d consecutive "
                             "polls without a resolvable PR (last=%s)",
@@ -2346,7 +2446,7 @@ class DevLoopWorkflow:
                             "none" if last is None else (last.pr_url or "unresolved"),
                         )
                         return last
-                await workflow.sleep(MERGE_POLL_INTERVAL)
+                await workflow.sleep(cadence.poll_interval)
         finally:
             await self._settle_tick(tick_task, service, slug)
             if track_ownership and self._owned_entity_id:

@@ -17,7 +17,7 @@ agents:
 budgets_usd:
   implementer: '3.00'
   incident_responder: '5.00'
-  issue_investigator: '3.00'
+  issue_investigator: '8.00'
   mentor: '2.00'
   service_agent: '5.00'
   shepherd: '5.00'
@@ -49,14 +49,17 @@ dev_loop:
   approve_step_timeout: 15 min
   deploy_verify_deadline: 45 min
   incident_watch_window: 30 min
-  merge_poll_interval: 30 min
+  merge_poll_interval: 15 min
   merge_watch_deadline: 14 d
   patched_markers:
   - atomic-approve
   - concurrent-shepherd-tick
   - deploy-observation
   - exec-queue
+  - fast-shepherd-cadence
   - incident-watch
+  - lifecycle-ownership
+  - lifecycle-refusal-backoff
   - merge-detection
   - registry-required
   - shepherd-in-loop
@@ -64,8 +67,8 @@ dev_loop:
   release_lookup_deadline: 20 min
   sdk_step_retry_attempts: '3'
   sdk_step_timeout: 2 h
-  shepherd_tick_every_polls: '8'
-  shepherd_ticks_max: '12'
+  shepherd_tick_every_polls: '1'
+  shepherd_ticks_max: '96'
 implementer:
   lease_minutes: '130'
 manifest_api_versions:
