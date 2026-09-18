@@ -361,6 +361,42 @@ def test_a_release_that_never_reached_the_store_is_not_logged_as_released(
     assert claim_module.EVENT_REJECTED in lines
 
 
+@pytest.mark.parametrize(
+    "body",
+    [b"", b'{"status": "released"}', b'{"ok": true}'],
+    ids=["204-empty", "status-body", "ack-body"],
+)
+def test_any_2xx_release_is_logged_as_released_whatever_the_body(
+    monkeypatch: pytest.MonkeyPatch, body: bytes,
+) -> None:
+    """The mirror of the test above, and the other direction of the same lie.
+    A 2xx release freed the claim regardless of what came back in the body:
+    a body-less 204 answers CLAIM_UNKNOWN with `accepted` True, a plain
+    `{"status": "released"}` answers it with `accepted` FALSE, and neither is
+    a rejection. The HTTP status is the discriminator (claude P3 on
+    `af661d7`)."""
+    lines: list[str] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: lines.append(a[0]))
+
+    status = 204 if body == b"" else 200
+    c = _client(monkeypatch, lambda req: _FakeResponse(body, status=status))
+    c.release("c1", ENTITY, PHASE, 0, ME, "attempt-1")
+    assert claim_module.EVENT_RELEASED in lines
+    assert claim_module.EVENT_REJECTED not in lines
+
+
+def test_a_refused_release_is_not_logged_as_released(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A store that answered, and answered no. Distinct from both the 2xx
+    above and the transport failure below it."""
+    lines: list[str] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: lines.append(a[0]))
+
+    c = _client(monkeypatch, lambda req: _FakeResponse(b'{"code": "claim-held"}', status=409))
+    c.release("c1", ENTITY, PHASE, 0, ME, "attempt-1")
+    assert claim_module.EVENT_RELEASED not in lines
+    assert claim_module.EVENT_REJECTED in lines
+
+
 def test_renew_sends_lease_seconds_and_parses_the_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     """`renew` has no production callers yet — the review lease is sized to
     outlive its run instead — so its wire shape is only held in place by this

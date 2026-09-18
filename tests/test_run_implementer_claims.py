@@ -16,9 +16,13 @@ from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
     CLAIM_HELD_BY_ME,
     CLAIM_HELD_BY_OTHER,
+    CLAIM_STATE_EXPIRED,
+    CLAIM_STATE_FENCED,
+    CLAIM_STATE_RELEASED,
     CLAIM_UNCLAIMED,
     CLAIM_UNKNOWN,
     ClaimAnswer,
+    ExecutionClaim,
 )
 
 
@@ -345,6 +349,52 @@ def test_the_claim_is_released_on_a_failing_arm_too(
     assert released == [expected_reason], released
 
 
+@pytest.mark.parametrize(
+    ("verdict", "expect_released"),
+    [(CLAIM_UNKNOWN, False), (CLAIM_HELD_BY_OTHER, True), (CLAIM_UNCLAIMED, True)],
+)
+def test_review_feedback_does_not_release_a_hold_it_could_not_confirm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verdict: str, expect_released: bool,
+) -> None:
+    """The one exception to the unconditional `finally`. `implement_one`'s
+    CLAIM_UNKNOWN arm states the rule — a release we cannot confirm is how an
+    outage frees a live hold — and this function contradicted it by releasing
+    on every arm including that one (claude P3 on `af661d7`). Every other
+    refusal still releases: our claim_id names our own record, so the call
+    frees nothing of a rival's."""
+    released: list[str] = []
+
+    class _Client:
+        def release(self, *a, reason: str = "", **kw):
+            released.append(reason)
+
+    proposal_dir = tmp_path / "mctl-web" / "slug"
+    proposal_dir.mkdir(parents=True)
+    (proposal_dir / ".status.yaml").write_text(
+        "status: in-review\npr: https://github.com/mctlhq/mctl-web/pull/7\n", encoding="utf-8",
+    )
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=proposal_dir, status="in-review",
+    )
+
+    def _refuse():
+        raise run_implementer.ImplementerClaimRefused("claim-refused: x", verdict=verdict)
+
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a, **_kw: tmp_path / "repo")
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a, **_kw: "a" * 40)
+    monkeypatch.setattr(run_implementer, "_acquire_claim", lambda *_a, **_kw: _ctx(_Client()))
+    monkeypatch.setattr(run_implementer, "_build_prompt", lambda *_a, **_kw: "prompt")
+    monkeypatch.setattr(run_implementer.anyio, "run", lambda *_a, **_kw: _refuse())
+
+    result = run_implementer.review_feedback_one(ref, {"summaries": []})
+
+    assert result.error
+    assert bool(released) is expect_released, released
+
+
 def test_an_unreachable_store_is_not_reported_as_a_competing_holder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -666,20 +716,87 @@ def _implement_one_refused_at_the_push(
     return result, status_path.read_text(encoding="utf-8"), released
 
 
+@pytest.mark.parametrize("state", [CLAIM_STATE_EXPIRED, CLAIM_STATE_RELEASED])
 def test_a_vanished_claim_hands_the_proposal_back_for_an_immediate_retry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str,
 ) -> None:
-    """CLAIM_UNCLAIMED means NOBODY holds it — this attempt's lease expired,
-    or the store fenced the claim. Parking the proposal `in-progress` would
-    then cost the rest of a 130-minute lease for a hold that does not exist,
-    so the arm releases and restores `accepted` (claude P3 on `c29195c`)."""
+    """`expired` or `released` means NOBODY holds it — typically this attempt's
+    own lease running out. Parking the proposal `in-progress` would then cost
+    the rest of a 130-minute lease for a hold that does not exist, so the arm
+    releases and restores `accepted` (claude P3 on `c29195c`)."""
     result, body, released = _implement_one_refused_at_the_push(
-        tmp_path, monkeypatch, ClaimAnswer(verdict=CLAIM_UNCLAIMED, reason="lease expired"),
+        tmp_path, monkeypatch,
+        ClaimAnswer(
+            verdict=CLAIM_UNCLAIMED,
+            reason="lease expired",
+            claim=ExecutionClaim(claim_id="c1", state=state),
+        ),
     )
     assert result.error is None
     assert "in-progress" not in body, body
     assert "status: accepted" in body, body
     assert released, "a claim nobody holds must not be left dangling"
+
+
+def test_a_fenced_record_is_not_treated_as_a_free_entity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FREE_CLAIM_STATES` folds `fenced` in beside `released` and `expired`,
+    so a claim fenced server-side by a NEWER executor comes back through
+    `check` (which sends our own claim_id) as our own fenced record and reads
+    CLAIM_UNCLAIMED. That executor is running right now and owns the `attempt`
+    block; handing the proposal back would erase it and let a third
+    implementer start (claude P2 on `af661d7`)."""
+    result, body, _released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch,
+        ClaimAnswer(
+            verdict=CLAIM_UNCLAIMED,
+            reason="fenced by a newer executor",
+            claim=ExecutionClaim(claim_id="c1", state=CLAIM_STATE_FENCED),
+        ),
+    )
+    assert result.error is None
+    assert "in-progress" in body, body
+    assert "status: accepted" not in body, body
+
+
+def test_an_unclaimed_answer_with_no_record_proves_nothing_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same rule for the answer that named no claim at all: a verdict
+    without a record cannot license a write over somebody else's status."""
+    result, body, _released = _implement_one_refused_at_the_push(
+        tmp_path, monkeypatch, ClaimAnswer(verdict=CLAIM_UNCLAIMED, reason="no record"),
+    )
+    assert result.error is None
+    assert "in-progress" in body, body
+
+
+def test_the_hand_back_never_clobbers_a_second_executors_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hand-back is a compare-and-swap. Where `.status.yaml` names a
+    different attempt, the second executor took the proposal legitimately and
+    its `attempt` block is the one the shepherd's `_attempt_is_fresh` reads —
+    erasing it is how a third implementer starts (claude P2 on `af661d7`)."""
+    proposal_dir = tmp_path / "mctl-web" / "slug"
+    proposal_dir.mkdir(parents=True)
+    status_path = proposal_dir / ".status.yaml"
+    status_path.write_text(
+        "status: in-progress\nattempt:\n  id: someone-else\n", encoding="utf-8"
+    )
+    ref = run_implementer.ProposalRef(
+        service="mctl-web", slug="slug", proposal_dir=proposal_dir, status="in-progress",
+        approval_ok=True,
+    )
+
+    assert run_implementer._hand_back_if_still_ours(ref, "ours") is False
+    body = status_path.read_text(encoding="utf-8")
+    assert "someone-else" in body, body
+    assert "status: in-progress" in body, body
+
+    assert run_implementer._hand_back_if_still_ours(ref, "someone-else") is True
+    assert "status: accepted" in status_path.read_text(encoding="utf-8")
 
 
 def test_an_unreachable_store_at_the_push_fails_closed_and_keeps_the_hold(

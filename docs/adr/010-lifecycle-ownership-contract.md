@@ -612,10 +612,27 @@ proposal re-runs the model down the whole accepted queue. What happens to
 `.status.yaml` follows the verdict, which the exception carries as an
 attribute: `CLAIM_HELD_BY_OTHER` leaves the file to the live holder,
 `CLAIM_UNKNOWN` fails closed and leaves the yaml lease to expire without
-releasing a claim it cannot confirm, and `CLAIM_UNCLAIMED` — nobody holds it,
-because this attempt's lease expired or the store fenced the claim — releases
-and restores `accepted` so the next tick retries instead of waiting out a
-130-minute hold that does not exist.
+releasing a claim it cannot confirm, and `CLAIM_UNCLAIMED` hands the proposal
+back — releasing and restoring `accepted` so the next tick retries instead of
+waiting out a 130-minute hold that does not exist.
+
+The hand-back is narrower than the verdict, on two axes. First, the verdict
+alone does not prove the entity is free: `FREE_CLAIM_STATES` folds `fenced` in
+beside `released` and `expired`, and `check` sends this attempt's own
+`claim_id`, so a claim fenced server-side by a newer executor comes back as our
+own fenced record and reads `CLAIM_UNCLAIMED`. That executor is running right
+now and owns the `attempt` block. The exception therefore carries the raw
+`claim_state` as well, and only `released` and `expired` — an answer that
+proves nobody is there — hand back; a `fenced` record, or an answer that named
+no claim at all, is handled like a live holder. Second, the restore is a
+compare-and-swap on `attempt.id`: between this attempt's `in-progress` write
+and the moment its claim turns out to be gone, a second executor can have taken
+the proposal legitimately, and `update_status_yaml(..., attempt=None)` would
+erase the block `_attempt_is_fresh` reads — letting a third implementer start.
+The same "do not act on what the store did not say" rule governs the release
+event: only a 2xx from `/release` logs `released`, because a body-less 204 and
+a plain `{"status": "released"}` land on opposite values of `accepted` while
+both being writes that freed the claim.
 That existing-branch push REPLACES the branch rather than adopting it: the
 retry clones fresh and recreates the branch off the default branch, so the
 dead attempt's commits are discarded. Intended — nothing references them —

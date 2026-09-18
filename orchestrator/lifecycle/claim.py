@@ -350,7 +350,10 @@ class ClaimClient:
                 verdict=CLAIM_UNKNOWN,
                 reason=f"rollout mode {rollout.mode()}: claims not consulted",
             )
-            self._emit_for(op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt)
+            self._emit_for(
+                op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
+                status=None,
+            )
             return answer
         payload: dict[str, Any] = {
             "kind": entity.kind,
@@ -368,12 +371,18 @@ class ClaimClient:
             res = self._request("POST", path, payload)
         except OwnershipUnavailable as exc:
             answer = ClaimAnswer(verdict=CLAIM_UNKNOWN, reason=str(exc))
-            self._emit_for(op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt)
+            self._emit_for(
+                op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
+                status=None,
+            )
             return answer
         answer = claim_answer_from(
             res.status, res.payload, executor, path=res.status_path, body_empty=res.body_empty
         )
-        self._emit_for(op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt)
+        self._emit_for(
+            op_name, answer, entity, phase, owner_epoch, entity_version, executor, attempt,
+            status=res.status,
+        )
         return answer
 
     def _emit_for(
@@ -386,8 +395,17 @@ class ClaimClient:
         entity_version: str,
         executor: Executor,
         attempt: str,
+        *,
+        status: int | None = None,
     ) -> None:
-        """Map one call's outcome onto the closed event vocabulary and log it."""
+        """Map one call's outcome onto the closed event vocabulary and log it.
+
+        ``status`` is the HTTP status the store actually answered with, or
+        None when no request was made at all (transport failure, or the
+        rollout mode that skips the call). It is the only input that separates
+        "the store answered" from "we never got there", and the release event
+        below is the one mapping that needs to know the difference.
+        """
         claim_id = answer.claim.claim_id if answer.claim else ""
         if answer.verdict == CLAIM_FENCED:
             event = EVENT_FENCED
@@ -401,11 +419,15 @@ class ClaimClient:
             # A release that never reached the store is not a release, and
             # logging `released` for it asserts a freed hold that may still be
             # held — the one direction this log must never be wrong in (agy P3
-            # on `c29195c`). `accepted` is the discriminator and the verdict is
-            # not: a genuinely successful body-less 204 answers CLAIM_UNKNOWN
-            # (no record came back to read) while still being the write that
-            # freed the claim.
-            event = EVENT_RELEASED if answer.accepted else EVENT_REJECTED
+            # on `c29195c`). The discriminator is the HTTP status, not
+            # `answer.accepted` and not the verdict: a body-less 204 answers
+            # CLAIM_UNKNOWN with `accepted` True, but so does a plain
+            # `{"status": "released"}` body with `accepted` FALSE — that is a
+            # release the store performed, and logging it `rejected` is the
+            # same lie in the opposite direction (claude P3 on `af661d7`).
+            # Every 2xx is a release; everything else — 409, 404, 5xx, or no
+            # request at all — is not.
+            event = EVENT_RELEASED if status is not None and 200 <= status < 300 else EVENT_REJECTED
         elif op_name in ("check", "record") and answer.verdict != CLAIM_HELD_BY_ME:
             event = EVENT_REJECTED
         else:

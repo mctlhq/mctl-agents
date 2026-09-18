@@ -110,6 +110,8 @@ from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
 from orchestrator.lifecycle.contract import (
     CLAIM_FENCED,
     CLAIM_HELD_BY_OTHER,
+    CLAIM_STATE_EXPIRED,
+    CLAIM_STATE_RELEASED,
     CLAIM_UNCLAIMED,
     CLAIM_UNKNOWN,
     OWNER_IMPLEMENTER,
@@ -566,6 +568,13 @@ class ImplementerFenced(RuntimeError):
     """
 
 
+# The subset of `FREE_CLAIM_STATES` that means "nobody is here", as opposed to
+# "somebody fenced this". `fenced` is deliberately absent: it is a free state
+# for the purpose of acquiring, and the opposite of one for the purpose of
+# deciding whether this attempt may still write the proposal's status.
+_VACANT_CLAIM_STATES = frozenset({CLAIM_STATE_RELEASED, CLAIM_STATE_EXPIRED})
+
+
 class ImplementerClaimRefused(RuntimeError):
     """A claim check refused this attempt where that refusal blocks.
 
@@ -601,11 +610,32 @@ class ImplementerClaimRefused(RuntimeError):
     entity is held by someone (leave it alone), free (hand it back for an
     immediate retry) or unknown (fail closed and wait out the lease). Parsing
     that back out of prose would be the bug this class exists to avoid.
+
+    `claim_state` carries the raw state under a CLAIM_UNCLAIMED verdict,
+    because that verdict is NOT one situation. `FREE_CLAIM_STATES` folds
+    `fenced` in beside `released` and `expired`, and `check` sends this
+    attempt's own claim_id — so a claim fenced server-side by a newer executor
+    comes back as our own fenced record and reads "free". Handing the proposal
+    back on that erases the block the new holder just wrote (claude P2 on
+    `af661d7`). Only `released` and `expired` mean nobody is there.
     """
 
-    def __init__(self, message: str, *, verdict: str = CLAIM_UNKNOWN) -> None:
+    def __init__(
+        self, message: str, *, verdict: str = CLAIM_UNKNOWN, claim_state: str | None = None
+    ) -> None:
         super().__init__(message)
         self.verdict = verdict
+        self.claim_state = claim_state
+
+    @property
+    def entity_is_free(self) -> bool:
+        """True only where the answer PROVES nobody holds the entity.
+
+        A missing state is not a proof: `claim_answer_from` leaves `claim`
+        None whenever the store answered without a record, and an answer that
+        named no claim cannot license a write over someone else's.
+        """
+        return self.verdict == CLAIM_UNCLAIMED and self.claim_state in _VACANT_CLAIM_STATES
 
 
 class ImplementerOrphanedSubagent(OrphanedSubagentError):
@@ -794,13 +824,21 @@ def _acquire_claim(
                     verdict=CLAIM_UNKNOWN,
                 )
             if answer.verdict == CLAIM_UNCLAIMED:
+                # Naming the free state rather than a rival: this attempt never
+                # held anything here, so the refusal is the store's own
+                # (claude P3 on `c29195c`). The SHA stays in this comment and
+                # out of the message — the message reaches the shepherd's log
+                # and the batch summary, where a commit id from this branch is
+                # noise to whoever is reading an incident (claude P3 on
+                # `af661d7`).
                 raise ImplementerClaimRefused(
                     f"{CLAIM_REFUSED_ERROR_PREFIX} the acquire for "
                     f"{entity.kind}:{entity.id}/{phase} was refused although the claim reads "
                     f"free (released, expired or fenced): {answer.reason or answer.verdict}. "
                     f"Nobody holds it; this attempt never held it either, so the refusal is "
-                    f"the store's, not a lost race (claude P3 on `c29195c`)",
+                    f"the store's, not a lost race",
                     verdict=CLAIM_UNCLAIMED,
+                    claim_state=answer.claim.state if answer.claim else None,
                 )
             raise ImplementerClaimRefused(
                 f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
@@ -871,6 +909,7 @@ def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = No
                 f"attempt's own lease ran out (nothing renews it mid-run) or the store fenced "
                 f"the claim and reports the free state that leaves behind",
                 verdict=CLAIM_UNCLAIMED,
+                claim_state=answer.claim.state if answer.claim else None,
             )
         raise ImplementerClaimRefused(
             f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
@@ -933,6 +972,33 @@ def update_status_yaml(
     """
     update_status_file(ref.status_path, new_status, actor=actor, **fields)
     ref.status = new_status
+
+
+def _hand_back_if_still_ours(ref: ProposalRef, attempt_id: str) -> bool:
+    """Restore `accepted` only while `.status.yaml` still names our attempt.
+
+    A compare-and-swap, not a blind write. Between this attempt's own
+    `in-progress` write and the moment its claim turns out to be gone, a
+    second executor can legitimately have taken the proposal and stamped its
+    own `attempt` block. `update_status_yaml(ref, "accepted", attempt=None)`
+    would erase that block, and `_attempt_is_fresh` — which reads only the
+    yaml — would then answer "not held" and let a THIRD implementer start
+    (claude P2 on `af661d7`).
+
+    Returns True when the hand-back was written.
+    """
+    current = _load_status(ref.status_path)
+    held = current.get("attempt")
+    held_id = held.get("id") if isinstance(held, dict) else None
+    if held_id != attempt_id:
+        print(
+            f"lifecycle: {ref.service}/{ref.slug}: not handing the proposal back — "
+            f"`.status.yaml` names attempt {held_id or '<none>'}, not this one "
+            f"({attempt_id}); leaving the current holder's status alone"
+        )
+        return False
+    update_status_yaml(ref, "accepted", attempt=None, failure=None)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1481,6 +1547,13 @@ def review_feedback_one(
     # ADR-010 phase 2 (#352): a claim released on only one arm leaks on every
     # other one.
     release_reason = "attempt ended"
+    # Released on every exit path but one: a CLAIM_UNKNOWN refusal, where the
+    # store could not answer. `implement_one`'s arm states the rule — a
+    # release we cannot confirm is how an outage frees a live hold — and this
+    # function contradicted it by releasing unconditionally (claude P3 on
+    # `af661d7`). Failing closed here costs the rest of the lease; releasing
+    # into an outage costs a second executor on the same PR.
+    release_claim = True
     branch = f"feat/agents-{ref.slug}"
     try:
         # 1. Clone the sibling repo. The shepherd's bundle path holds the
@@ -1595,6 +1668,7 @@ def review_feedback_one(
         # leaked lease otherwise repeats that misleading line every tick for
         # the full lease (claude P3 on `31232dc`).
         release_reason = "claim refused"
+        release_claim = e.verdict != CLAIM_UNKNOWN
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
     except ImplementerOrphanedSubagent as e:
@@ -1628,9 +1702,12 @@ def review_feedback_one(
         result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
         return result
     finally:
-        # Unconditional: a claim released on only one exit path leaks on
-        # every other one (codex P2, ADR-010 phase 2 / #352).
-        _release_claim(claim_ctx, reason=release_reason)
+        # One `finally` rather than a release per arm: a claim released on
+        # only one exit path leaks on every other one (codex P2, ADR-010
+        # phase 2 / #352). The single exception is set above, where the store
+        # itself could not be reached.
+        if release_claim:
+            _release_claim(claim_ctx, reason=release_reason)
         if target and target.exists() and result is not None and result.error is None:
             try:
                 shutil.rmtree(target)
@@ -2476,16 +2553,28 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # What happens to `.status.yaml` depends on WHICH refusal this is;
         # the three are not one situation (claude P3 on `c29195c`):
         msg = str(e)
-        if e.verdict == CLAIM_UNCLAIMED:
-            # Nobody holds it. Either this attempt's lease expired (nothing
-            # renews it mid-run) or the store fenced the claim. Parking the
-            # proposal `in-progress` would then cost the rest of a 130-minute
-            # lease for a hold that does not exist, so hand it back: release
-            # best-effort and restore `accepted` so the next tick re-acquires
-            # and re-runs against the current world. Nothing was pushed, so
-            # there is nothing to reconcile.
+        if e.entity_is_free:
+            # `released` or `expired`, and nothing else: nobody holds it, and
+            # this attempt's own lease is the likeliest reason (nothing renews
+            # it mid-run). Parking the proposal `in-progress` would cost the
+            # rest of a 130-minute lease for a hold that does not exist, so
+            # hand it back: release best-effort and restore `accepted` so the
+            # next tick re-acquires and re-runs against the current world.
+            # Nothing was pushed, so there is nothing to reconcile. The
+            # restore is a compare-and-swap — see `_hand_back_if_still_ours`.
             _release_claim(claim_ctx, reason="claim vanished mid-run")
-            update_status_yaml(ref, "accepted", attempt=None, failure=None)
+            _hand_back_if_still_ours(ref, attempt_id)
+        elif e.verdict == CLAIM_UNCLAIMED:
+            # CLAIM_UNCLAIMED on a `fenced` record, or on no record at all.
+            # `FREE_CLAIM_STATES` calls a fence free because acquiring over one
+            # is legal; deciding this proposal's status on it is not. A fence
+            # is somebody ELSE's write — the newer executor that fenced us is
+            # running right now and owns the `attempt` block — and an answer
+            # that named no claim proves nothing either way. Same handling as a
+            # live holder: leave the status alone (claude P2 on `af661d7`).
+            # The claim is still released: our claim_id names our own fenced
+            # record, so the call frees nothing of theirs.
+            _release_claim(claim_ctx, reason="claim fenced or unreadable mid-run")
         elif e.verdict == CLAIM_UNKNOWN:
             # The store could not answer. Fail closed: leave `in-progress`
             # and let the yaml lease expire on its own rather than hand the
