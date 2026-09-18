@@ -89,6 +89,7 @@ from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout, shadow
 from orchestrator.lifecycle.claim import ClaimClient
 from orchestrator.lifecycle.contract import (
+    CLAIM_HELD_BY_OTHER,
     OWNER_IMPLEMENTER,
     PHASE_IMPLEMENT,
     EntityRef,
@@ -2740,6 +2741,16 @@ def _attempt_is_fresh(ref: ProposalRef) -> bool:
             holder,
         )
         if answer.may_execute:
+            return True
+        if answer.verdict == CLAIM_HELD_BY_OTHER:
+            # Someone else — not the recorded holder, but a real, named
+            # executor — actively holds this claim. `may_execute` is False
+            # for both "unclaimed" and "held by other"; treating a claim
+            # held by another as free would race that other holder the
+            # moment the claim mechanism is the one actually deciding
+            # (codex P1/P2 on ADR-010 phase 2, #352). Always fail closed
+            # here, regardless of rollout stage — this only runs where the
+            # claim mechanism is active in the first place.
             return True
         if rollout.new_answer_decides():
             return False

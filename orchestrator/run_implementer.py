@@ -631,6 +631,10 @@ def _acquire_claim(
         entity, phase, 0, entity_version, executor, attempt,
         lease_seconds=lease_seconds, proposal_ref=proposal_ref,
     )
+    if not answer.may_execute:
+        # Rejected, fenced or unknown: decline the claim rather than adopt a
+        # claim_id that may name the winning executor's claim, not ours.
+        return None
     claim_id = answer.claim.claim_id if answer.claim else ""
     return _ClaimContext(
         client=client, claim_id=claim_id, entity=entity, phase=phase,
@@ -1260,6 +1264,12 @@ def review_feedback_one(
 
     target = None
     result: ImplementResult | None = None
+    claim_ctx: _ClaimContext | None = None
+    # Read in `finally` so the claim is released on every exit path, not just
+    # the ones that remembered to call `_release_claim` — see codex P2 on
+    # ADR-010 phase 2 (#352): a claim released on only one arm leaks on every
+    # other one.
+    release_reason = "attempt ended"
     branch = f"feat/agents-{ref.slug}"
     try:
         # 1. Clone the sibling repo. The shepherd's bundle path holds the
@@ -1293,13 +1303,18 @@ def review_feedback_one(
         # 4b. ExecutionClaim on (pull-request, review-remediation), pinned to
         # the head just captured (ADR-010 phase 2, #352). Acquired BEFORE the
         # SDK runs so a concurrent attempt on the same PR is refused before
-        # spending the SDK call; `claim_ctx` is None when the PR url is not
-        # yet recorded or no claim could be granted, and the run proceeds
-        # exactly as it did before this proposal — the claim is advisory
-        # below `enforce`.
-        claim_ctx: _ClaimContext | None = None
-        parsed_pr = _parse_pr_url(str(_load_status(ref.status_path).get("pr") or ""))
-        attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=0)
+        # spending the SDK call; `claim_ctx` stays None when the PR url is
+        # not yet recorded or no claim could be granted, and the run
+        # proceeds exactly as it did before this proposal — the claim is
+        # advisory below `enforce`. Released unconditionally in `finally`.
+        pre_status = _load_status(ref.status_path)
+        parsed_pr = _parse_pr_url(str(pre_status.get("pr") or ""))
+        # Unlike the implement phase (fixed ordinal — no per-epoch counter
+        # exists yet, ADR-010 phase 2), review-remediation already persists
+        # one in `.status.yaml`'s `review_attempts`, so the WORKFLOW_UID-less
+        # fallback can and should use it to keep distinct attempts distinct.
+        attempt_ordinal = int(pre_status.get("review_attempts", 0) or 0)
+        attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=attempt_ordinal)
         if parsed_pr is not None:
             repo, number = parsed_pr
             claim_ctx = _acquire_claim(
@@ -1323,13 +1338,13 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
-                _release_claim(claim_ctx, reason="no follow-up: refused")
+                release_reason = "no follow-up: refused"
                 return ImplementResult(
                     ref=ref,
                     pr_url=None,
                     error=f"{REFUSAL_ERROR_PREFIX} {refusal}",
                 )
-            _release_claim(claim_ctx, reason="no follow-up commits")
+            release_reason = "no follow-up commits"
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
@@ -1347,14 +1362,16 @@ def review_feedback_one(
         # surface; do NOT rewrite the status — that belongs to the shepherd.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
-        _release_claim(claim_ctx, reason="follow-up pushed")
+        release_reason = "follow-up pushed"
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
     except ImplementerFenced as e:
         # Not a failure of the proposal — see EXIT_FENCED. The claim is
         # already fenced server-side (or the classification decided this
-        # attempt cannot proceed); nothing to release.
+        # attempt cannot proceed), but the release below is still a
+        # best-effort no-op call, not a mutation, so it stays unconditional.
+        release_reason = "fenced"
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
     except ImplementerOrphanedSubagent as e:
@@ -1363,9 +1380,11 @@ def review_feedback_one(
         # to push whatever is in the worktree here: by construction the child may
         # still be writing, and racing its `git commit` (index.lock) or pushing a
         # half-finished change is worse than a free retry on the next tick.
+        release_reason = "orphaned sub-agent"
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
     except ImplementerOperationTimeout as e:
+        release_reason = "operation timed out"
         result = ImplementResult(
             ref=ref,
             pr_url=None,
@@ -1373,16 +1392,22 @@ def review_feedback_one(
         )
         return result
     except subprocess.CalledProcessError as e:
+        release_reason = "shell step failed"
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
     except SystemExit as e:
+        release_reason = "SystemExit"
         result = ImplementResult(ref=ref, pr_url=None, error=f"SystemExit: {e}")
         return result
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
+        release_reason = "unexpected error"
         result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
         return result
     finally:
+        # Unconditional: a claim released on only one exit path leaks on
+        # every other one (codex P2, ADR-010 phase 2 / #352).
+        _release_claim(claim_ctx, reason=release_reason)
         if target and target.exists() and result is not None and result.error is None:
             try:
                 shutil.rmtree(target)

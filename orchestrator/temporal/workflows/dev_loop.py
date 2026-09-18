@@ -2195,8 +2195,12 @@ class DevLoopWorkflow:
         # ExecutionClaim / handoff (ADR-010 phase 2, #352). A SEPARATE marker
         # from "lifecycle-ownership": rollout.py pins one job per switch, and
         # an execution recorded under phase 1 must replay the bare `release`
-        # this finally used to issue, unchanged.
-        use_claims_handoff = track_ownership and workflow.patched("lifecycle-claims")
+        # this finally used to issue, unchanged. `workflow.patched` must
+        # still be called unconditionally here (Temporal's patch contract),
+        # even though the resulting flag is not read below yet — no
+        # `handoff/complete` caller exists in this repository (#353), so the
+        # `finally` block still issues a bare `release`, not `handoff-start`.
+        _use_claims_handoff = track_ownership and workflow.patched("lifecycle-claims")
         if track_ownership:
             # ADR-010 §12 asks for the resolved policy to be recorded on the
             # row, so "why does this actor own it" is answerable without
@@ -2367,16 +2371,18 @@ class DevLoopWorkflow:
                 # "somebody must take this", which is the one state this
                 # contract defines as work remaining.
                 terminal_state = last is not None and last.state in ("MERGED", "CLOSED")
-                # Non-terminal end: HANDOFF, not a bare release, once
-                # "lifecycle-claims" is patched in. A release leaves a
-                # zero-owner gap for the cron sweeper to notice on its own
-                # schedule; a handoff to OWNER_SHEPHERD records the
-                # transition explicitly and bumps the fencing epoch on
-                # completion (ADR-010 §10 path 2), so a pre-handoff executor
-                # that wakes up later is fenced instead of racing the new one.
-                # A history recorded before this marker keeps replaying the
-                # bare release it already committed to.
-                op = "terminal" if terminal_state else ("handoff-start" if use_claims_handoff else "release")
+                # Non-terminal end: still a bare RELEASE, not "handoff-start".
+                # `handoff-start` writes a HOLDING `handing-off` state
+                # (contract.py) that only `/handoff/complete` can resolve —
+                # and nothing in this repository calls `handoff/complete`
+                # anywhere (no reconciler yet, #353), so issuing
+                # `handoff-start` here would leave the row stuck in
+                # `handing-off` forever, which is worse than the zero-owner
+                # gap a release leaves. Revert to `release` until a completer
+                # exists; `use_claims_handoff` stays computed (and
+                # `workflow.patched` still called, for replay determinism)
+                # so the switch is a one-line flip once #353 ships one.
+                op = "terminal" if terminal_state else "release"
                 done = await self._ownership(
                     op,
                     repo=repo,
