@@ -576,6 +576,13 @@ def answer_from(
     return OwnershipAnswer(verdict=UNKNOWN, reason=_error_of(status, payload))
 
 
+#: Ids per batch read, for every client that issues one. The server caps a
+#: batch at 500 and the URL carries one `id=` each. It lives here rather than
+#: in either caller because a difference between two callers' chunk sizes
+#: would be a difference in what a batch means, not a tuning choice.
+BATCH_CHUNK_SIZE = 100
+
+
 def batch_answers_from(
     status: int,
     payload: dict[str, Any],

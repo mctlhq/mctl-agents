@@ -89,12 +89,25 @@ class TestZeroOwner:
         assert not d.mutates
         assert "abc1234" in d.evidence
 
-    def test_zero_owner_without_a_worker(self):
+    def test_unowned_with_no_worker_is_the_orphan_sweeps_business(self):
+        # An open PR nobody owns AND nobody is working on is real drift, but
+        # `detect_orphans` reports it in the same tick from the same active
+        # set. The activity therefore never sets needs_owner without a live
+        # execution; this asserts the table agrees rather than inventing a
+        # second alertable counter for it.
         d = r.classify(
-            _held(verdict=UNOWNED, state="", owner=Owner(), epoch=0, live_workflow_id=""),
+            _held(
+                verdict=UNOWNED,
+                state="",
+                owner=Owner(),
+                epoch=0,
+                live_workflow_id="",
+                needs_owner=False,
+            ),
             ME,
         )
-        assert d.reason == "zero-owner"
+        assert d.action == r.ACTION_NONE
+        assert d.reason == "no-work"
 
     def test_unowned_and_terminal_is_settled(self):
         d = r.classify(

@@ -217,10 +217,14 @@ def classify(obs: Observation, reconciler: Owner) -> Decision:
                 evidence=f"{where}: {obs.entity_terminal_reason or 'terminal'} and unowned — settled",
             )
         if not obs.needs_owner:
+            # Unowned with nobody working on it: a queued proposal before its
+            # implementer starts, a phase already past, or an entity whose
+            # missing worker `detect_orphans` reports in the same tick. None
+            # of the three is an ownership anomaly.
             return Decision(
                 action=ACTION_NONE,
                 reason="no-work",
-                evidence=f"{where}: unowned, and the entity has no actionable work",
+                evidence=f"{where}: unowned, and nothing is working on the entity",
             )
         # Zero owner on live work — reported, never adopted.
         #
@@ -235,17 +239,12 @@ def classify(obs: Observation, reconciler: Owner) -> Decision:
         # pilot case 4). #353's requirement is that the condition converges to
         # one owner OR a visible conflict; this is the second arm, stated out
         # loud rather than by planting a row nobody can use.
-        detail = (
-            f"{obs.live_workflow_id} is running against a record nobody wrote"
-            if obs.live_workflow_id
-            else "and no workflow is running against it either"
-        )
         return Decision(
             action=ACTION_ESCALATE,
-            reason="zero-owner-live-worker" if obs.live_workflow_id else "zero-owner",
+            reason="zero-owner-live-worker",
             evidence=(
                 f"{where}: no ownership record on live work; head={obs.head or 'unknown'}, "
-                f"{detail}"
+                f"{obs.live_workflow_id or 'a worker'} is running against a record nobody wrote"
             ),
         )
 

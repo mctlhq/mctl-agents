@@ -807,6 +807,12 @@ Three decisions worth stating, because each one is a refusal:
   acquire until it aged past its own liveness bound. The requirement is that
   the condition converges to one owner *or* a visible conflict; this takes the
   second arm. Discovery of adoptable PRs remains pilot case 4 / #334.
+
+  And "zero owner" means *nobody holds a phase somebody is working on*: an
+  entity with no record and no live execution is a queued proposal, or drift
+  `detect_orphans` reports in the same tick from the same active set. The
+  sweep says nothing about either, because a counter that is non-zero in
+  steady state is a counter nobody reads.
 - **The reconciler does not keep what it recovers.** It cannot advance a PR,
   so a recovery is for the epoch bump — which fences every claim pinned to the
   dead generation — and is immediately followed by `release`, or by `terminal`

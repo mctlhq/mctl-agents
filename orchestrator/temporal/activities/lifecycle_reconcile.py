@@ -37,6 +37,7 @@ from temporalio import activity
 
 from orchestrator.lifecycle import reconciler, rollout
 from orchestrator.lifecycle.contract import (
+    BATCH_CHUNK_SIZE,
     KIND_DEVLOOP_PROPOSAL,
     KIND_PULL_REQUEST,
     OWNER_DEVLOOP_WORKFLOW,
@@ -72,12 +73,6 @@ READ_TIMEOUT_SECONDS = 20.0
 #: condition #353 lists.
 TERMINAL_STATUSES = frozenset({"merged", "rejected", "review-stuck"})
 
-#: Ids per batch read. The server caps a batch at 500 and the URL carries one
-#: `id=` each; the sync client uses 100 for the same reason and this must not
-#: drift from it, so the number is imported rather than repeated... it is not
-#: importable without dragging urllib into an async module, so it is asserted
-#: in tests instead (tests/test_lifecycle_reconcile.py).
-BATCH_CHUNK_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -125,6 +120,12 @@ OUTCOME_REPORTED = "reported"
 OUTCOME_OBSERVED = "observed"
 OUTCOME_APPLIED = "applied"
 OUTCOME_REFUSED = "refused"
+#: The recovery was accepted but its follow-up (release or terminal) was not,
+#: so the row is still held by an actor that does no work. It self-heals
+#: within one liveness bound — the reconciler stops heartbeating the moment
+#: this activity returns — but a reader grouping on `outcome` must be able to
+#: see it, which it cannot if the only trace is a suffix on the evidence.
+OUTCOME_HELD = "applied-still-held"
 
 
 @activity.defn
@@ -176,7 +177,10 @@ async def reconcile_lifecycle_ownership(
         decision = reconciler.classify(obs, me)
         finding = await _apply(obs, decision, me)
         findings.append(finding)
-        if finding.outcome == OUTCOME_APPLIED:
+        # A half-done recovery still moved the row — the epoch bumped and
+        # every claim pinned to the dead generation is fenced — so it counts
+        # here, and says what it really is in `outcome`.
+        if finding.outcome == OUTCOME_APPLIED or finding.outcome.startswith(OUTCOME_HELD):
             applied += 1
         if decision.action == reconciler.ACTION_ESCALATE:
             escalations += 1
@@ -224,6 +228,7 @@ def _observe(
         pr = snapshots.get((ref.service, ref.slug))
         actionable = ref.status in ACTIONABLE_STATUSES
         proposal_ref = f"{ref.service}/{ref.slug}"
+        live = _live_id(ref, pr, active)
 
         out.append(
             reconciler.Observation(
@@ -235,9 +240,16 @@ def _observe(
                 entity_terminal_reason=f"proposal status {ref.status}",
                 # The implement phase ends when a PR exists: the PR, not the
                 # proposal, is what anybody works on afterwards.
-                needs_owner=actionable and pr is None,
+                #
+                # And a phase only NEEDS an owner while somebody is working on
+                # it. An accepted proposal that no implementer has picked up
+                # yet is unowned on purpose — that is the queue, not a lost
+                # row — so requiring a live execution is what keeps the
+                # steady state quiet instead of escalating every queued
+                # proposal on every 15-minute tick.
+                needs_owner=actionable and pr is None and bool(live),
                 head=pr.head_sha if pr else "",
-                live_workflow_id=_live_id(ref, pr, active),
+                live_workflow_id=live,
             )
         )
 
@@ -256,9 +268,14 @@ def _observe(
                 proposal_ref=proposal_ref,
                 entity_terminal=bool(terminal_reason),
                 entity_terminal_reason=terminal_reason,
-                needs_owner=actionable and not terminal_reason,
+                # Same rule as the proposal above. An open PR with no
+                # DevLoop running against it and no ownership row is real
+                # drift, but it is drift `detect_orphans` reports in this very
+                # tick, from the same active set; saying it twice adds an
+                # alertable counter, not information.
+                needs_owner=actionable and not terminal_reason and bool(live),
                 head=pr.head_sha,
-                live_workflow_id=_live_id(ref, pr, active),
+                live_workflow_id=live,
             )
         )
     return out
@@ -311,7 +328,13 @@ async def _read_batch(
     out: dict[str, OwnershipAnswer] = {}
     for start in range(0, len(ids), BATCH_CHUNK_SIZE):
         chunk = ids[start : start + BATCH_CHUNK_SIZE]
-        params: list[tuple[str, str]] = [("kind", kind), ("phase", phase)]
+        # Spelled with httpx's own primitive union rather than str: a
+        # list is invariant, so list[tuple[str, str]] is not a subtype of the
+        # parameter's declared type even though every element is one.
+        params: list[tuple[str, str | int | float | bool | None]] = [
+            ("kind", kind),
+            ("phase", phase),
+        ]
         params += [("id", i) for i in chunk]
         path = "/api/v1/lifecycle/ownership/batch"
         try:
@@ -424,23 +447,25 @@ async def _apply(
             "terminal", obs, me, epoch=result.epoch,
             reason=f"reconciler: {obs.entity_terminal_reason or 'entity terminal'}",
         )
-        return replace(
-            finding,
-            evidence=f"{finding.evidence}; recovered and closed"
-            if done.accepted
-            else f"{finding.evidence}; recovered, but close was refused: {done.reason}",
-        )
+        if not done.accepted:
+            return replace(
+                finding,
+                outcome=f"{OUTCOME_HELD}: close refused: {done.reason}",
+                evidence=f"{finding.evidence}; recovered, but close was refused",
+            )
+        return replace(finding, evidence=f"{finding.evidence}; recovered and closed")
     if decision.then_release:
         done = await _op(
             "release", obs, me, epoch=result.epoch,
             reason="reconciler: recovered from a dead owner; free for the next actor",
         )
-        return replace(
-            finding,
-            evidence=f"{finding.evidence}; recovered and released"
-            if done.accepted
-            else f"{finding.evidence}; recovered, but release was refused: {done.reason}",
-        )
+        if not done.accepted:
+            return replace(
+                finding,
+                outcome=f"{OUTCOME_HELD}: release refused: {done.reason}",
+                evidence=f"{finding.evidence}; recovered, but release was refused",
+            )
+        return replace(finding, evidence=f"{finding.evidence}; recovered and released")
     return finding
 
 
@@ -478,7 +503,14 @@ async def _op(
             # writing back what the row already said would erase the one piece
             # of evidence a reader could use to see how far behind the dead
             # owner was.
-            version=obs.head,
+            #
+            # Only for the PR, though. A commit sha is the pull-request
+            # entity's version; the proposal's is not a sha, and a sweep that
+            # wrote one there would be writing a value from a different entity
+            # into a column that becomes a claim fence once the claims routes
+            # ship. Blank is safe rather than lossy: every write path falls
+            # back with COALESCE(NULLIF($n, ''), entity_version).
+            version=obs.head if obs.kind == KIND_PULL_REQUEST else "",
             owner_type=owner.type,
             owner_id=owner.id,
             epoch=epoch,

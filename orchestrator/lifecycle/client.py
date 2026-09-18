@@ -27,6 +27,7 @@ import urllib.request
 from typing import Any
 
 from orchestrator.lifecycle.contract import (
+    BATCH_CHUNK_SIZE,
     UNKNOWN,
     EntityRef,
     Owner,
@@ -45,7 +46,6 @@ DEFAULT_TIMEOUT_S = 10
 # indistinguishable from the store being down. Chunking keeps one oversized
 # sweep from looking like an outage. 100 ids is roughly 4 KB of query string
 # against the server's own 500-id cap.
-BATCH_CHUNK_SIZE = 100
 
 # When true, an unreachable store blocks mutating steps instead of letting the
 # old mechanism decide. Documented break-glass: set false to restore

@@ -27,6 +27,8 @@ REPO = "mctlhq/mctl-web"
 SLUG = "issue-10-widget"
 PR_ID = f"{REPO}#42"
 PROPOSAL_ID = f"mctl-web/{SLUG}"
+# What orphans._expected_workflow_id reconstructs for this proposal.
+LIVE_WORKFLOW_ID = "dev-loop-mctlhq-mctl-web-10"
 
 
 def _refs() -> list[ProposalStateRef]:
@@ -194,6 +196,38 @@ async def test_a_dead_owner_on_a_merged_pr_is_closed_not_released(monkeypatch):
     assert "recovered and closed" in _finding(result, PR_ID).evidence
 
 
+class _FailFollowUp(_Fake):
+    """Recovery lands; the write that gives the row back does not."""
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method != "GET" and not request.url.path.endswith("/recover"):
+            self.writes.append((request.url.path, json.loads(request.content or b"{}")))
+            return httpx.Response(
+                503, content=json.dumps({"code": "unavailable", "error": "store down"}).encode()
+            )
+        return super().__call__(request)
+
+
+async def test_a_refused_release_is_reported_as_still_held(monkeypatch):
+    """The reconciler recovered the row and then failed to give it back, so
+    the entity is held by an actor that does no work. It self-heals within one
+    liveness bound, but a reader grouping on `outcome` has to be able to see
+    it — `applied` alone would say the opposite."""
+    fake = _FailFollowUp(
+        {PR_ID: _record(healthy=False, dead=True, derived={"status": "dead", "held": True})}
+    )
+    result = await _run(fake, monkeypatch)
+    assert [p for p, _ in fake.writes] == [
+        "/api/v1/lifecycle/ownership/recover",
+        "/api/v1/lifecycle/ownership/release",
+    ]
+    finding = _finding(result, PR_ID)
+    assert finding.outcome.startswith(act.OUTCOME_HELD)
+    assert "release was refused" in finding.evidence
+    # The recovery itself did happen, and the count is of accepted writes.
+    assert result.applied == 1
+
+
 async def test_a_refused_recovery_is_not_counted_as_applied(monkeypatch):
     """409 ErrOwnerAlive: the server re-derived liveness and the owner is not
     dead after all. Reporting that as a takeover would be reporting a write
@@ -247,10 +281,26 @@ async def test_zero_owner_escalates_without_planting_a_row(monkeypatch):
     """Adopting would make the sweep's own row refuse the legitimate DevLoop's
     acquire until it aged out (ADR-010 pilot case 4 / #334)."""
     fake = _Fake({})
-    result = await _run(fake, monkeypatch)
+    result = await _run(fake, monkeypatch, active=[LIVE_WORKFLOW_ID])
     assert fake.writes == []
     assert result.escalations >= 1
     assert _finding(result, PR_ID).action == "escalate"
+
+
+async def test_no_record_and_no_worker_is_not_escalated(monkeypatch):
+    """The steady state must be silent.
+
+    An entity nobody owns and nobody is working on is either a queued
+    proposal before its implementer starts, or drift `detect_orphans` reports
+    in this same tick. Escalating it here would fire on every actionable
+    proposal every 15 minutes and make the counter useless for the condition
+    it exists to catch.
+    """
+    fake = _Fake({})
+    result = await _run(fake, monkeypatch, active=[])
+    assert fake.writes == []
+    assert result.escalations == 0
+    assert {f.action for f in result.findings} == {"none"}
 
 
 async def test_both_entity_phases_are_examined(monkeypatch):

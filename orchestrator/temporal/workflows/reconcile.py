@@ -66,6 +66,10 @@ class ReconcileWorkflowResult:
     # and the next tick will try again. Defaulted so results recorded before
     # this stage existed still deserialize.
     applied: WorkflowResult | None = None
+    # The ownership sweep's report (#353). None means the tick ran before the
+    # lifecycle-reconcile patch existed, or took the unpatched replay branch
+    # where the active DevLoop set is unknown and the sweep must not run.
+    lifecycle: LifecycleReconcileResult | None = None
 
 
 @workflow.defn
@@ -130,12 +134,24 @@ class ReconcileWorkflow:
             # same false-positive shape that made #151 report every proposal
             # as an orphan, except here it would end in writes.
             if workflow.patched("lifecycle-reconcile"):
-                lifecycle_result = await workflow.execute_activity(
-                    reconcile_lifecycle_ownership,
-                    args=[active_ids],
-                    start_to_close_timeout=LIFECYCLE_ACTIVITY_TIMEOUT,
-                    retry_policy=ACTIVITY_RETRY_POLICY,
-                )
+                try:
+                    lifecycle_result = await workflow.execute_activity(
+                        reconcile_lifecycle_ownership,
+                        args=[active_ids],
+                        start_to_close_timeout=LIFECYCLE_ACTIVITY_TIMEOUT,
+                        retry_policy=ACTIVITY_RETRY_POLICY,
+                    )
+                except ActivityError as exc:
+                    # The sweep is an addition to this tick, not a condition
+                    # of it. It reads GitHub and mctl-api, so it has two more
+                    # ways to fail than anything else here, and letting that
+                    # propagate would cost the tick its projection write —
+                    # exactly the quiet loss the visibility arm above refuses
+                    # to accept. Recorded as a skipped sweep; the next tick
+                    # reads the same rows again, none of which moved.
+                    lifecycle_result = LifecycleReconcileResult(
+                        skipped_reason=f"ownership sweep failed: {exc}",
+                    )
         else:
             # Unpatched replay branch: schedule detect_orphans with exactly
             # the one argument the old history recorded.
