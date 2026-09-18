@@ -713,6 +713,14 @@ class ClaimAnswer:
     claim: ExecutionClaim | None = None
     reason: str = ""
     accepted: bool = False
+    # True only for the one answer the store REFUSED and the client still read
+    # as ours: a 409 whose record names the asking attempt (see the 409 arm in
+    # `claim_answer_from`). The caller must not treat that like a granted
+    # acquire — no lease was applied, so the adopted claim carries the dead
+    # predecessor's remaining `lease_until` and has to be renewed before the
+    # run leans on it (claude P2 on `6794aad`). The log needs it too: `acquired`
+    # would assert a grant that never happened.
+    retaken: bool = False
 
     @property
     def may_execute(self) -> bool:
@@ -834,7 +842,10 @@ def claim_answer_from(
             # operator told a competing executor holds it, naming us (claude P2
             # on `8ac2080`).
             return ClaimAnswer(
-                verdict=CLAIM_HELD_BY_ME, claim=claim, reason=_claim_error_of(status, payload)
+                verdict=CLAIM_HELD_BY_ME,
+                claim=claim,
+                reason=_claim_error_of(status, payload),
+                retaken=True,
             )
         if code == "claim-held" or claim is not None:
             # Any other record on a 409 is somebody else's. Deliberately NOT

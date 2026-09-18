@@ -182,6 +182,158 @@ def _acquire(monkeypatch, answer):
     )
 
 
+def _retaking_client(renew_answer, *, claim_id: str = "c1"):
+    """A store that refuses the acquire with a 409 naming THIS attempt — the
+    orphan-claim retake — and answers `renew` with whatever the test wants."""
+    acquired = ClaimAnswer(
+        verdict=CLAIM_HELD_BY_ME,
+        claim=ExecutionClaim(claim_id=claim_id, state="active"),
+        reason="409 claim-held",
+        retaken=True,
+    )
+    renews: list[dict] = []
+
+    class _Client:
+        calls = renews
+
+        def acquire(self, *a, **kw):
+            return acquired
+
+        def renew(self, cid, *a, **kw):
+            renews.append({"claim_id": cid, "lease_seconds": kw.get("lease_seconds")})
+            return renew_answer
+
+        def check(self, *a, **kw):
+            return acquired
+
+    return _Client
+
+
+def test_a_retaken_claim_is_renewed_before_the_run_leans_on_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 409 never applied `lease_seconds`, so the adopted claim carries the
+    DEAD pod's remaining lease while `implement_one` stamps a fresh full-length
+    yaml one — the claim expiring before the run it guards, which is the
+    direction that lets a second implementer start (claude P2 on `6794aad`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    client = _retaking_client(
+        ClaimAnswer(verdict=CLAIM_HELD_BY_ME, claim=ExecutionClaim(claim_id="c1", state="active"))
+    )
+    monkeypatch.setattr(run_implementer, "ClaimClient", client)
+    ctx = run_implementer._acquire_claim(
+        run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+        run_implementer.PHASE_IMPLEMENT,
+        "",
+        "attempt-1",
+        lease_seconds=60,
+    )
+    assert ctx is not None
+    assert ctx.claim_id == "c1"
+    assert client.calls == [{"claim_id": "c1", "lease_seconds": 60}], client.calls
+
+
+def test_a_granted_acquire_is_not_renewed_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The renew belongs to the retake alone: a granted acquire already applied
+    the lease, and a second write per attempt would be noise in the event log."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    client = _retaking_client(ClaimAnswer(verdict=CLAIM_HELD_BY_ME))
+
+    class _Granted(client):  # type: ignore[misc, valid-type]
+        def acquire(self, *a, **kw):
+            return ClaimAnswer(
+                verdict=CLAIM_HELD_BY_ME, claim=ExecutionClaim(claim_id="c1", state="active")
+            )
+
+    monkeypatch.setattr(run_implementer, "ClaimClient", _Granted)
+    ctx = run_implementer._acquire_claim(
+        run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+        run_implementer.PHASE_IMPLEMENT,
+        "",
+        "attempt-1",
+        lease_seconds=60,
+    )
+    assert ctx is not None
+    assert client.calls == [], client.calls
+
+
+def test_a_refused_renew_is_the_refusal_the_409_originally_was(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adopting a claim this attempt cannot extend is worse than not adopting
+    it: the run would proceed past a lease nobody is holding."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    monkeypatch.setattr(
+        run_implementer, "ClaimClient",
+        _retaking_client(ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 took it")),
+    )
+    with pytest.raises(run_implementer.ImplementerClaimRefused):
+        run_implementer._acquire_claim(
+            run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+            run_implementer.PHASE_IMPLEMENT,
+            "",
+            "attempt-1",
+            lease_seconds=60,
+        )
+
+
+def test_a_fence_while_renewing_the_retaken_claim_fences_the_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    monkeypatch.setattr(
+        run_implementer, "ClaimClient",
+        _retaking_client(ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved")),
+    )
+    with pytest.raises(run_implementer.ImplementerFenced):
+        run_implementer._acquire_claim(
+            run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+            run_implementer.PHASE_IMPLEMENT,
+            "",
+            "attempt-1",
+            lease_seconds=60,
+        )
+
+
+def test_a_refused_renew_is_advisory_below_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same rollout predicate as every other refusal here, so the stages cannot
+    drift: below `enforce` the claim is declined, not raised on."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    monkeypatch.setattr(
+        run_implementer, "ClaimClient",
+        _retaking_client(ClaimAnswer(verdict=CLAIM_HELD_BY_OTHER, reason="pod-2 took it")),
+    )
+    assert run_implementer._acquire_claim(
+        run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+        run_implementer.PHASE_IMPLEMENT,
+        "",
+        "attempt-1",
+        lease_seconds=60,
+    ) is None
+
+
+def test_a_retake_with_no_claim_id_is_refused_not_carried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty claim id still produces well-formed `check` requests, so this
+    would regress silently and surface much later as a push-site fence (claude
+    P3 on `6794aad`)."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "enforce")
+    monkeypatch.setattr(
+        run_implementer, "ClaimClient",
+        _retaking_client(ClaimAnswer(verdict=CLAIM_HELD_BY_ME), claim_id=""),
+    )
+    with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
+        run_implementer._acquire_claim(
+            run_implementer.EntityRef.for_proposal("mctl-web", "slug"),
+            run_implementer.PHASE_IMPLEMENT,
+            "",
+            "attempt-1",
+            lease_seconds=60,
+        )
+    assert excinfo.value.verdict == CLAIM_UNKNOWN
+
+
 def test_acquire_returns_none_below_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
     """Below `enforce` a rejected acquire is advisory: the run proceeds on the
     pre-claim mechanisms exactly as it did before ADR-010 phase 2."""

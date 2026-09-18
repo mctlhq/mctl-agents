@@ -412,7 +412,17 @@ class ClaimClient:
         elif answer.claim is not None and answer.claim.state == CLAIM_STATE_EXPIRED:
             event = EVENT_EXPIRED
         elif op_name == "acquire":
-            event = EVENT_ACQUIRED if answer.verdict == CLAIM_HELD_BY_ME else EVENT_REJECTED
+            if answer.retaken:
+                # The store REFUSED this acquire (409) and the client read the
+                # record as ours anyway. `acquired` would assert a grant that
+                # never happened — the same "say what the store did, not what
+                # the call asked for" rule the release arm below was corrected
+                # to twice. `renewed` is the honest one: the claim already
+                # existed, and it is the event worth seeing, because reaching
+                # it means a pod died holding a claim (claude P3 on `6794aad`).
+                event = EVENT_RENEWED
+            else:
+                event = EVENT_ACQUIRED if answer.verdict == CLAIM_HELD_BY_ME else EVENT_REJECTED
         elif op_name == "renew":
             event = EVENT_RENEWED if answer.verdict == CLAIM_HELD_BY_ME else EVENT_REJECTED
         elif op_name == "release":

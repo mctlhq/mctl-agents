@@ -853,6 +853,63 @@ def _acquire_claim(
         # existed.
         return None
     claim_id = answer.claim.claim_id if answer.claim else ""
+    if answer.retaken:
+        # The one granted answer the store actually REFUSED: a 409 whose record
+        # names this attempt, i.e. the orphan claim a killed predecessor of this
+        # same (deterministic) identity never released. A refused acquire never
+        # applied `lease_seconds`, so what is adopted here is the DEAD pod's
+        # remaining `lease_until`, while `implement_one` stamps a fresh
+        # full-length yaml lease two statements later. On the granted path the
+        # two expire together by construction; this is the one path that
+        # desynchronises them, in the direction `_review_claim_lease_default()`
+        # exists to prevent — the claim expiring before the run it guards. Left
+        # alone, an expiry mid-run answers CLAIM_UNCLAIMED to the shepherd's
+        # freshness check, which matches none of its arms and falls through to
+        # "not held" with the unexpired yaml lease never read: a second
+        # implementer against a live one (claude P2 on `6794aad`).
+        #
+        # So the retake is completed rather than assumed, with the renew ADR-010
+        # §8 and `_resolve_attempt_id`'s docstring both already name as the
+        # point of the deterministic identity. A refused renew is the refusal
+        # the 409 originally was, answered by the same rollout predicate as
+        # every other refusal here so the stages cannot drift.
+        if not claim_id:
+            # A 409 body with no readable claim_id cannot be renewed or checked:
+            # `check` would send an empty id, which is a well-formed request for
+            # a claim that does not exist, and the refusal would surface much
+            # later as a push-site fence (claude P3 on `6794aad`).
+            raise ImplementerClaimRefused(
+                f"{CLAIM_REFUSED_ERROR_PREFIX} the acquire for "
+                f"{entity.kind}:{entity.id}/{phase} was refused with a record naming this "
+                f"attempt but no claim id, so the claim it names cannot be renewed or "
+                f"checked: {answer.reason or answer.verdict}",
+                verdict=CLAIM_UNKNOWN,
+            )
+        renewed = client.renew(
+            claim_id, entity, phase, 0, entity_version, executor, attempt,
+            lease_seconds=lease_seconds,
+        )
+        if not renewed.may_execute:
+            if renewed.verdict == CLAIM_FENCED and rollout.new_answer_may_veto():
+                raise ImplementerFenced(
+                    f"{FENCED_ERROR_PREFIX} claim for {entity.kind}:{entity.id}/{phase} "
+                    f"fenced while renewing this attempt's own claim: {renewed.reason}"
+                )
+            if blocks_mutation(renewed):
+                raise ImplementerClaimRefused(
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the claim for "
+                    f"{entity.kind}:{entity.id}/{phase} names this attempt but its lease "
+                    f"could not be extended: {renewed.reason or renewed.verdict}. The "
+                    f"adopted lease is the previous pod's remainder, so continuing would "
+                    f"run past a claim nobody is holding",
+                    verdict=renewed.verdict,
+                    claim_state=renewed.claim.state if renewed.claim else None,
+                )
+            # Advisory stage: decline the claim rather than carry one whose
+            # lease this run cannot vouch for, exactly as the branch above does.
+            return None
+        if renewed.claim is not None and renewed.claim.claim_id:
+            claim_id = renewed.claim.claim_id
     return _ClaimContext(
         client=client, claim_id=claim_id, entity=entity, phase=phase,
         owner_epoch=0, entity_version=entity_version, executor=executor, attempt=attempt,

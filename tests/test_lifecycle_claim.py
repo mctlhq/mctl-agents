@@ -311,6 +311,35 @@ def test_two_acquires_produce_exactly_one_winner(monkeypatch: pytest.MonkeyPatch
     assert a2.claim is not None and a2.claim.executor == ME
 
 
+def test_a_retaken_409_is_logged_renewed_not_acquired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The store REFUSED this acquire; the client read the record as ours. The
+    event must say what the store did — `acquired` asserts a grant that never
+    happened, and the retake is the line worth seeing, since reaching it means
+    a pod died holding a claim (claude P3 on `6794aad`)."""
+    lines: list[str] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: lines.append(a[0]))
+    c = _client(
+        monkeypatch,
+        lambda req: _FakeResponse(
+            json.dumps({"error": "held", "code": "claim-held", "claim": _claim(ME)}).encode(),
+            status=409,
+        ),
+    )
+    answer = c.acquire(ENTITY, PHASE, 0, "sha-a", ME, "attempt-1", lease_seconds=60)
+    assert answer.verdict == CLAIM_HELD_BY_ME
+    assert answer.retaken is True
+    assert lines == [claim_module.EVENT_RENEWED], lines
+
+
+def test_a_granted_acquire_is_not_marked_retaken(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines: list[str] = []
+    monkeypatch.setattr(claim_module, "_emit", lambda *a, **kw: lines.append(a[0]))
+    c = _client(monkeypatch, lambda req: _FakeResponse(json.dumps(_claim(ME)).encode()))
+    answer = c.acquire(ENTITY, PHASE, 0, "sha-a", ME, "attempt-1", lease_seconds=60)
+    assert answer.retaken is False
+    assert lines == [claim_module.EVENT_ACQUIRED], lines
+
+
 def test_events_emitted_for_the_closed_vocabulary(monkeypatch: pytest.MonkeyPatch) -> None:
     """T13. Each decision emits a line carrying entity, phase, epoch, executor
     and attempt identifiers."""

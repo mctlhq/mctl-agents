@@ -574,6 +574,21 @@ resolved as implemented, not merely proposed:
   contradiction, and resolving it toward vacancy is the one direction that
   licenses a second executor. A fence outranks both — the epoch moved, so even
   our own record is not a licence to continue.
+
+  A retake is *completed*, not assumed. A 409 is a refused acquire, so the
+  store never applied `lease_seconds`: what the client adopts is the dead
+  predecessor's remaining `lease_until`, while the implementer stamps a fresh
+  full-length `.status.yaml` lease moments later. That is the one path where
+  the two leases desynchronise, and in the dangerous direction — the claim
+  expiring before the run it guards, which answers `CLAIM_UNCLAIMED` to the
+  shepherd's freshness check and lets a second implementer start against a
+  live one. So `_acquire_claim` renews the adopted claim before returning a
+  context (the renew this section's determinism exists for), refuses when the
+  record carries no claim id to renew or check, and treats a refused renew as
+  the refusal the 409 originally was — through the same rollout predicate as
+  every other refusal, so the stages cannot drift. The acquire is logged
+  `renewed`, never `acquired`: the store granted nothing, and the retake is
+  the event worth seeing, because reaching it means a pod died holding a claim.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
   resolves `WORKFLOW_UID`, then
   `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The
