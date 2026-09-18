@@ -283,7 +283,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
     return refs
 
 
-def pr_ref_of(ref: ProposalStateRef) -> tuple[str, int] | None:
+def pr_ref_of(ref: ProposalStateRef, *, warn: bool = True) -> tuple[str, int] | None:
     """The (repo, number) this proposal records, or None.
 
     Its own function because two callers need the answer and only one of them
@@ -291,6 +291,10 @@ def pr_ref_of(ref: ProposalStateRef) -> tuple[str, int] | None:
     pull-request entity by repo and number, which the URL already carries.
     A missing, unparseable, or foreign ``pr:`` answers None — the same "refuse
     to track someone else's PR" rule get_pr_state applies.
+
+    ``warn=False`` silences the foreign-PR line for a second caller looking at
+    a ref the fetch below already parsed and already logged: one skipped ref
+    should read as one skipped ref.
     """
     if not ref.pr_url:
         return None
@@ -299,6 +303,8 @@ def pr_ref_of(ref: ProposalStateRef) -> tuple[str, int] | None:
         return None
     repo, number = match.group(1), int(match.group(2))
     if repo.lower() != f"mctlhq/{ref.service}".lower():
+        if not warn:
+            return None
         activity.logger.warning(
             "reconcile: %s/%s records PR %s outside mctlhq/%s — not tracking it",
             ref.service,

@@ -157,10 +157,11 @@ async def reconcile_lifecycle_ownership(
 
     refs = await list_proposal_refs()
     # Only the refs whose PR state this sweep still has to learn. A terminal
-    # proposal (`merged`, `rejected`) already answers both questions a snapshot
-    # would: which PR it owns is in `pr_url`, and that the entity is finished is
-    # the status itself. Fetching it anyway is one `GET /pulls/{n}` per ref per
-    # tick on the token every dev loop shares, over the bucket that only grows.
+    # proposal — `merged`, `rejected`, or `review-stuck`, all three of them —
+    # already answers both questions a snapshot would: which PR it owns is in
+    # `pr_url`, and that the entity is finished is the status itself.
+    # Fetching it anyway is one `GET /pulls/{n}` per ref per tick on the token
+    # every dev loop shares, over the bucket that only grows.
     snapshots = await fetch_pr_snapshots(
         [ref for ref in refs if ref.status not in TERMINAL_STATUSES]
     )
@@ -239,7 +240,9 @@ def _observe(
         # terminal proposal still produce a pull-request observation without a
         # snapshot: the entity is addressed by repo and number, and its
         # terminality comes from the proposal status.
-        pr_id = pr_ref_of(ref)
+        # warn=False: the fetch above parsed the same ref and already logged
+        # any foreign `pr:` it skipped.
+        pr_id = pr_ref_of(ref, warn=False)
         actionable = ref.status in ACTIONABLE_STATUSES
         proposal_ref = f"{ref.service}/{ref.slug}"
         live = _live_id(ref, pr_id[0] if pr_id else None, active)
@@ -270,11 +273,19 @@ def _observe(
         if pr_id is None:
             continue
         terminal_reason = ""
-        if pr is None:
-            # No snapshot means the proposal is terminal (see the fetch above),
-            # so the PR's own state is not what decides here: a finished
-            # proposal leaves nothing for anybody to hold on its PR either.
+        if ref.status in TERMINAL_STATUSES:
+            # From the STATUS, not from the absent snapshot. A terminal
+            # proposal leaves nothing for anybody to hold on its PR either,
+            # and `review-stuck` is deliberately in that set (ADR-010 §5)
+            # even though its PR is usually still open: the entity's own
+            # lifecycle has stopped until a human moves it.
             terminal_reason = f"proposal status {ref.status}"
+        elif pr is None:
+            # A ref the fetch DID cover and came back without: `one()` returns
+            # silently on a 404, which means the PR is out of reach, not that
+            # it is finished. Unknown is not terminal, the same way unknown is
+            # not unowned — say nothing about this entity this tick.
+            continue
         elif pr.merged:
             terminal_reason = "PR merged"
         elif pr.closed_unmerged:

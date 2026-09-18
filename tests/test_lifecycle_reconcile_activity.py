@@ -361,3 +361,30 @@ async def test_a_proposal_recovery_sends_no_entity_version(monkeypatch):
     recover = next(b for p, b in fake.writes if p.endswith("/recover"))
     assert recover["version"] == ""
     assert _finding(result, PROPOSAL_ID).action == "recover"
+
+
+async def test_a_pr_read_that_404s_says_nothing_about_the_entity(monkeypatch):
+    """`fetch_pr_snapshots` returns without a snapshot on a 404, deliberately:
+    a PR we cannot see is absent, not finished. Reading that absence as
+    terminality would close the row of an OPEN PR — and ADR-010 §5 has no
+    arrow out of `terminal`, so the sweep would wedge the entity it exists to
+    un-wedge. Unknown is not terminal, the same way unknown is not unowned."""
+    fake = _Fake({PR_ID: _record(healthy=False, dead=True, derived={"status": "dead", "held": True})})
+    result = await _run(fake, monkeypatch, snapshots={})
+    assert [f.entity_id for f in result.findings] == [PROPOSAL_ID]
+    assert fake.writes == []
+
+
+async def test_a_review_stuck_pr_is_closed_not_released(monkeypatch):
+    """`review-stuck` is in TERMINAL_STATUSES (ADR-010 §5) although its PR is
+    normally still open — the entity's lifecycle has stopped until a human
+    moves it. It is the one member of the set the shepherd can bring back, so
+    its classification is pinned rather than left to the fetch filter."""
+    stuck = [replace(_refs()[0], status="review-stuck")]
+    fake = _Fake({PR_ID: _record(healthy=False, dead=True, derived={"status": "dead", "held": True})})
+    result = await _run(fake, monkeypatch, refs=stuck, snapshots={})
+    assert [p for p, _ in fake.writes] == [
+        "/api/v1/lifecycle/ownership/recover",
+        "/api/v1/lifecycle/ownership/terminal",
+    ]
+    assert "recovered and closed" in _finding(result, PR_ID).evidence
