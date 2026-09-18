@@ -312,13 +312,12 @@ def test_two_acquires_produce_exactly_one_winner(monkeypatch: pytest.MonkeyPatch
 
 
 def test_env_example_never_pins_a_computed_claim_lease() -> None:
-    """`_claim_lease_seconds` reads any non-empty value as an ABSOLUTE
-    override, so an active line in `.env.example` propagates into every
-    environment copied from it and clamps a lease the code computes. For the
-    review lease that defeats the floor entirely: raising
-    IMPLEMENTER_TIMEOUT_SECONDS no longer raises the lease, the claim expires
-    mid-run, and the push-site check stands a valid attempt down (agy P2 on
-    `0af3b38`). The example file may document the variables; it must not set
+    """An active line in `.env.example` propagates into every environment
+    copied from it and pins a lease nobody chose. `_claim_lease_seconds` now
+    refuses a value SHORTER than the computed one, so the worst case is no
+    longer a claim expiring mid-run (agy P2 on `0af3b38`, claude P3 on
+    `b362b5e`) — but a pinned longer value is still a number to keep in step
+    by hand. The example file may document the variables; it must not set
     them."""
     from pathlib import Path
 
@@ -570,12 +569,29 @@ def test_a_renew_the_store_performed_is_held_by_me_even_with_no_record(
     assert answer.accepted is True
 
 
-def test_a_2xx_body_we_could_not_parse_is_never_a_renew() -> None:
-    """The gateway case the ownership side already fails closed on: an HTML
-    error page served with a 200 reaches the contract as an empty mapping with
-    `body_empty` False. It is not a no-content success and must stay UNKNOWN."""
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"error": "claim expired"},
+        {"code": "claim-held"},
+        {"claim": {"claim_id": "c1"}},
+        {"data": {"claim_id": "c1", "state": "active"}},
+        {"claim_id": "c1"},
+    ],
+)
+def test_a_2xx_renew_describing_a_claim_we_cannot_read_is_never_a_hold(
+    payload: dict[str, Any],
+) -> None:
+    """The branch admits an acknowledgement, never a record this image failed
+    to read. A body that did not parse (`{}` with `body_empty` False — an HTML
+    error page served with a 200), a 200 error envelope, and a record shaped
+    for an mctl-api this image is behind on all leave `claim_record_of`
+    answering None, and reading THAT as a live hold is the same unpinned-shape
+    assumption as the defect this route's tolerance fixes, pointed the other
+    way (claude P2 on `b362b5e`)."""
     answer = claim_answer_from(
-        200, {}, ME, path="/api/v1/lifecycle/claims/renew", body_empty=False
+        200, payload, ME, path="/api/v1/lifecycle/claims/renew", body_empty=False
     )
     assert answer.verdict == CLAIM_UNKNOWN
 
@@ -614,3 +630,36 @@ def test_a_retake_and_its_renew_are_two_distinguishable_lines(
     assert first.endswith("op=acquire")
     assert second.endswith("op=renew")
     assert first != second
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("", 1800),
+        ("900", 1800),
+        ("1799", 1800),
+        ("1800", 1800),
+        ("3600", 3600),
+        ("not-a-number", 1800),
+    ],
+)
+def test_a_claim_lease_override_can_only_lengthen(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: int
+) -> None:
+    """The hazard the commented-out `.env.example` lines documented, closed in
+    code: a lease shorter than the run it guards expires under its own attempt
+    and comes back from the push-site check as CLAIM_UNCLAIMED, standing a
+    valid attempt down. An operator may hold a claim LONGER — that only costs
+    a slower takeover after a crash — so a larger value is honoured and a
+    smaller one is refused with a log line (claude P3 on `b362b5e`)."""
+    from datetime import timedelta
+
+    from orchestrator.run_implementer import _claim_lease_seconds
+
+    monkeypatch.setenv("LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", raw)
+    assert (
+        _claim_lease_seconds(
+            "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", timedelta(seconds=1800)
+        )
+        == expected
+    )

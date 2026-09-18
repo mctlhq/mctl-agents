@@ -669,13 +669,36 @@ IMPLEMENT_ATTEMPT_LEASE = timedelta(minutes=130)
 
 
 def _claim_lease_seconds(env_var: str, default: timedelta) -> int:
+    """The lease for one claim: the computed default, or a LONGER override.
+
+    The override can only lengthen. Every default here is computed from the
+    run it has to outlive — 130 minutes matching the yaml `attempt` lease,
+    or `_review_claim_lease_default()`'s floor widened by the implementer
+    timeouts — and a shorter value expires the claim under its own attempt,
+    which comes back from the push-site check as CLAIM_UNCLAIMED and stands a
+    live run down. Documenting that hazard is what the previous version did,
+    and a comment in `.env.example` does not survive being copied into a
+    values file (claude P3 on `b362b5e`, from agy's P2 one round earlier).
+    A deliberately shorter lease is not a tunable this module offers; the way
+    to shorten it is to shorten the run, through the timeouts the default is
+    derived from.
+    """
     raw = os.environ.get(env_var, "").strip()
+    computed = int(default.total_seconds())
     if not raw:
-        return int(default.total_seconds())
+        return computed
     try:
-        return int(raw)
+        asked = int(raw)
     except ValueError:
-        return int(default.total_seconds())
+        return computed
+    if asked < computed:
+        print(
+            f"[lifecycle] {env_var}={asked} is shorter than the computed lease "
+            f"{computed}s and would expire under the run it guards; using {computed}s",
+            flush=True,
+        )
+        return computed
+    return asked
 
 
 # One MERGE_POLL_INTERVAL (run_shepherd.py) — a review-remediation claim only

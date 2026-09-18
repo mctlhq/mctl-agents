@@ -156,3 +156,28 @@ def test_a_recordless_2xx_renew_reaches_the_workflow_as_a_hold(
     assert result.verdict == CLAIM_HELD_BY_ME
     assert result.claim_id == ""
     assert result.accepted is True
+
+
+def test_a_non_json_2xx_renew_is_unknown_not_a_hold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The activity is the transport that CAN reach the contract with an
+    unparseable body — `ClaimClient._request` raises before the contract sees
+    one — so the gateway case belongs here: an HTML error page served with a
+    200 arrives as an empty mapping with a non-empty raw body, and must not be
+    read as a renewed hold (claude P2/P3 on `b362b5e`)."""
+
+    def _html(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>502 Bad Gateway</html>")
+
+    result = _run(monkeypatch, _html, req=_req(op="renew", claim_id="c1"))
+    assert result.verdict == CLAIM_UNKNOWN
+
+
+def test_a_recordless_renew_is_marked_recordless_on_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`claim_id`, `state` and `lease_until` all come back empty, which from
+    the fields alone is indistinguishable from a record that arrived empty."""
+    result = _run(monkeypatch, _respond(204, None), req=_req(op="renew", claim_id="c1"))
+    assert result.has_record is False
+    granted = _run(monkeypatch, _respond(200, _claim()))
+    assert granted.has_record is True

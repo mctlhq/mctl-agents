@@ -352,6 +352,13 @@ class ExecutionClaimResult:
     # that distinction unrepresentable — the omission `OwnershipResult.accepted`
     # already shipped once (claude P3 on `0af3b38`).
     retaken: bool = False
+    # Whether a claim RECORD came back, as opposed to a bare acknowledgement.
+    # A 2xx renew with no record answers `claim-held-by-me` with `claim_id`,
+    # `state` and `lease_until` all empty — indistinguishable, from the fields
+    # alone, from a record that arrived empty. Same argument as `retaken` one
+    # field up: the wire type must not make the distinction unrepresentable
+    # (claude P3 on `b362b5e`).
+    has_record: bool = False
 
     @property
     def may_execute(self) -> bool:
@@ -412,6 +419,7 @@ def _claim_result_from(answer: ClaimAnswer) -> ExecutionClaimResult:
         reason=answer.reason,
         accepted=answer.accepted,
         retaken=answer.retaken,
+        has_record=claim is not None,
     )
 
 

@@ -603,9 +603,14 @@ resolved as implemented, not merely proposed:
   `wrote-no-record`, and it is pinned here because the retake made `renew` a
   safety input for the first time: without it a store that answers renews
   body-lessly refuses the restarted attempt on every restart, under
-  `LIFECYCLE_OWNERSHIP_REQUIRED`, until the orphan lease expires. A body that
-  fails to parse — an HTML error page served with a 200 — is not in this
-  branch: it answers `claim-unknown`, as before.
+  `LIFECYCLE_OWNERSHIP_REQUIRED`, until the orphan lease expires. The branch
+  is narrow on purpose: it admits an empty body, or a body that describes NO
+  claim — no claim-shaped key, no nested structure. Anything that does describe
+  one this image could not read (a 200 error envelope, a record from a newer
+  mctl-api) answers `claim-unknown`, so an unreadable record never becomes the
+  most confident verdict (claude P2 on `b362b5e`). A body that fails to parse
+  at all — an HTML error page served with a 200 — is likewise `claim-unknown`,
+  as before.
 - **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
   resolves `WORKFLOW_UID`, then
   `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The
@@ -633,10 +638,14 @@ resolved as implemented, not merely proposed:
   again as a heartbeat — so a lease shorter than the run holding it expires
   under its own attempt and comes back from the push-site check as
   `CLAIM_UNCLAIMED`, standing the attempt down for a race that never happened.
-  Both variables are therefore shipped COMMENTED OUT in `.env.example`:
-  `_claim_lease_seconds` treats any non-empty value as an absolute override,
-  so an active `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW=1800` re-pins the floor
-  the sizing above exists to widen (agy P2 on `0af3b38`).
+  `_claim_lease_seconds` is therefore LENGTHEN-ONLY: an override below the
+  computed lease is refused with a log line naming both numbers, and the
+  computed lease is used. Commenting the variables out of `.env.example`
+  documented that hazard; clamping removes it, so an active
+  `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW=1800` can no longer re-pin the floor
+  the sizing above exists to widen (agy P2 on `0af3b38`, claude P3 on
+  `b362b5e`). They stay commented out regardless, since a pinned value is
+  still one more thing to keep in step by hand.
 
 `run_implementer._push_followup` and the existing-branch path of
 `_push_and_open_pr` now push with `--force-with-lease=<branch>:<sha>` — the

@@ -803,6 +803,55 @@ def _confirms_existing_claim(path: str) -> bool:
     return path.endswith(RENEWING_PATH_SUFFIXES)
 
 
+# Every key that means the body was TRYING to describe a claim, or to explain
+# why there is not one. Closed on the fail-CLOSED side: a body carrying any of
+# them is a record (or an error envelope) this image could not read, never an
+# acknowledgement.
+#
+# The distinction `body_empty` alone cannot make. A 200 `{"error": "claim
+# expired"}`, or a record from an mctl-api deploy this image is behind on —
+# a renamed field, a level of nesting added — both leave `claim_record_of`
+# answering None, and reading THAT as a live hold is the same unpinned-shape
+# assumption as the defect this branch fixes, pointed the other way
+# (claude P2 on `b362b5e`).
+CLAIM_SHAPED_KEYS = frozenset(
+    {
+        "attempt",
+        "claim",
+        "claim_id",
+        "claims",
+        "code",
+        "detail",
+        "entity",
+        "error",
+        "executor",
+        "executor_id",
+        "executor_type",
+        "lease_until",
+        "message",
+        "owner_epoch",
+        "phase",
+        "state",
+    }
+)
+
+
+def _acknowledges_without_describing(payload: dict[str, Any]) -> bool:
+    """Whether a body says "done" and nothing about a claim.
+
+    `{"status": "renewed"}` and `{"ok": true}` qualify; anything claim-shaped
+    or nested does not. Nesting is refused wholesale because that is how a
+    record arrives one level deeper than this image looks (`{"data": {"claim":
+    ...}}`), and enumerating the envelope names it could hide behind is the
+    open-vocabulary mistake this module refuses everywhere else.
+    """
+    if not isinstance(payload, dict) or not payload:
+        return False
+    if set(payload) & CLAIM_SHAPED_KEYS:
+        return False
+    return all(not isinstance(value, (dict, list)) for value in payload.values())
+
+
 def claim_answer_from(
     status: int,
     payload: dict[str, Any],
@@ -823,17 +872,22 @@ def claim_answer_from(
         accepted = body_empty or _looks_like_claim_answer(payload)
         claim = claim_record_of(payload)
         if claim is None:
-            if _confirms_existing_claim(path) and (body_empty or payload):
+            if _confirms_existing_claim(path) and (
+                body_empty or _acknowledges_without_describing(payload)
+            ):
                 # The store performed the renew and said nothing more: a 204,
                 # a `{"status": "renewed"}`, an `{"ok": true}`. The claim is
                 # held by the asker — that is what a 2xx on this route means —
                 # and no record is attached, because none arrived.
                 #
-                # `body_empty or payload` is the guard that keeps a gateway out
-                # of this branch: an HTML error page served with a 200 parses to
-                # an empty mapping with `body_empty` False, which is neither, so
-                # it still answers CLAIM_UNKNOWN. Only a genuine no-content
-                # answer or a body we could actually parse gets here.
+                # The guard admits only a genuine no-content answer or a body
+                # that describes NO claim at all. A body that failed to parse
+                # (an HTML error page served with a 200) reaches here as an
+                # empty mapping with `body_empty` False and is neither; so is a
+                # 200 error envelope, and so is a record whose shape this image
+                # is behind on — all three keep answering CLAIM_UNKNOWN, which
+                # is where an unrecognised claim belongs, exactly as
+                # `claim_verdict_for` fails an unrecognised STATE closed.
                 return ClaimAnswer(
                     verdict=CLAIM_HELD_BY_ME,
                     reason=f"{status} renew with no claim record",
