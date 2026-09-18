@@ -8,6 +8,7 @@ actually turns into the right sequence of writes at the right epoch.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -310,3 +311,53 @@ async def test_both_entity_phases_are_examined(monkeypatch):
     result = await _run(fake, monkeypatch)
     assert {f.entity_id for f in result.findings} == {PR_ID, PROPOSAL_ID}
     assert _finding(result, PROPOSAL_ID).phase == "implement"
+
+
+async def test_a_terminal_proposal_is_examined_without_reading_its_pr(monkeypatch):
+    """A `merged` proposal answers both questions a snapshot would — which PR
+    it owns is in `pr_url`, and that the entity is finished is the status — so
+    fetching it is a `GET /pulls/{n}` per tick on the shared token, over the
+    one bucket that only grows. The observation must survive the saving."""
+    merged = [replace(_refs()[0], status="merged")]
+    fake = _Fake({PR_ID: _record(healthy=False, dead=True, derived={"status": "dead", "held": True})})
+    _wire(monkeypatch, fake, mode=rollout.ENFORCE, refs=merged)
+
+    asked: list[list[ProposalStateRef]] = []
+
+    async def _fetch(refs_arg):
+        asked.append(list(refs_arg))
+        return {}
+
+    monkeypatch.setattr(act, "fetch_pr_snapshots", _fetch)
+    result = await ActivityEnvironment().run(act.reconcile_lifecycle_ownership, [])
+
+    assert asked == [[]]
+    # Still both entities, and the PR is still seen as terminal — a dead owner
+    # on it gets recovered and closed, not recovered and released.
+    assert {f.entity_id for f in result.findings} == {PR_ID, PROPOSAL_ID}
+    assert [p for p, _ in fake.writes] == [
+        "/api/v1/lifecycle/ownership/recover",
+        "/api/v1/lifecycle/ownership/terminal",
+    ]
+
+
+async def test_a_proposal_recovery_sends_no_entity_version(monkeypatch):
+    """A proposal has no content hash to fence on. Sending the PR's head here
+    would pin the row's `entity_version` to a value that names a different
+    entity; blank is what makes mctl-api keep whatever the row already has
+    (COALESCE/NULLIF in internal/lifecycle/store.go)."""
+    fake = _Fake(
+        {
+            PROPOSAL_ID: _record(
+                entity={"kind": "devloop-proposal", "id": PROPOSAL_ID, "version": ""},
+                phase="implement",
+                healthy=False,
+                dead=True,
+                derived={"status": "dead", "held": True},
+            )
+        }
+    )
+    result = await _run(fake, monkeypatch)
+    recover = next(b for p, b in fake.writes if p.endswith("/recover"))
+    assert recover["version"] == ""
+    assert _finding(result, PROPOSAL_ID).action == "recover"

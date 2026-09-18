@@ -576,10 +576,18 @@ def answer_from(
     return OwnershipAnswer(verdict=UNKNOWN, reason=_error_of(status, payload))
 
 
-#: Ids per batch read, for every client that issues one. The server caps a
-#: batch at 500 and the URL carries one `id=` each. It lives here rather than
-#: in either caller because a difference between two callers' chunk sizes
-#: would be a difference in what a batch means, not a tuning choice.
+#: Ids per batch read, for every client that issues one.
+#:
+#: The URL carries one `id=` parameter per entity, so an unbounded sweep builds
+#: an unbounded query string and eventually earns a 414 or 431 — at which point
+#: EVERY id in that sweep turns UNKNOWN and the whole pass halts, in a way
+#: indistinguishable from the store being down. Chunking keeps one oversized
+#: sweep from looking like an outage. 100 ids is roughly 4 KB of query string
+#: against the server's own 500-id cap.
+#:
+#: It lives here rather than in either caller because a difference between two
+#: callers' chunk sizes would be a difference in what a batch means, not a
+#: tuning choice.
 BATCH_CHUNK_SIZE = 100
 
 

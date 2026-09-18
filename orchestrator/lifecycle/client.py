@@ -38,15 +38,6 @@ from orchestrator.lifecycle.contract import (
 
 DEFAULT_TIMEOUT_S = 10
 
-# Ids per batch request.
-#
-# The URL carries one `id=` parameter per entity, so an unbounded sweep builds
-# an unbounded query string and eventually earns a 414 or 431 — at which point
-# EVERY id in that sweep turns UNKNOWN and the whole pass halts, in a way
-# indistinguishable from the store being down. Chunking keeps one oversized
-# sweep from looking like an outage. 100 ids is roughly 4 KB of query string
-# against the server's own 500-id cap.
-
 # When true, an unreachable store blocks mutating steps instead of letting the
 # old mechanism decide. Documented break-glass: set false to restore
 # fail-open behaviour during an mctl-api outage.

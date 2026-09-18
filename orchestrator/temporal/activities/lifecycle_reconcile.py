@@ -44,6 +44,7 @@ from orchestrator.lifecycle.contract import (
     OWNER_RECONCILER,
     PHASE_IMPLEMENT,
     PHASE_REVIEW_REMEDIATION,
+    UNKNOWN,
     EntityRef,
     Owner,
     OwnershipAnswer,
@@ -54,6 +55,7 @@ from orchestrator.temporal.activities.gitops_state import (
     PRSnapshot,
     fetch_pr_snapshots,
     list_proposal_refs,
+    pr_ref_of,
 )
 from orchestrator.temporal.activities.lifecycle import (
     OwnershipRequest,
@@ -154,7 +156,14 @@ async def reconcile_lifecycle_ownership(
         return LifecycleReconcileResult(skipped_reason=f"auth: {exc}")
 
     refs = await list_proposal_refs()
-    snapshots = await fetch_pr_snapshots(refs)
+    # Only the refs whose PR state this sweep still has to learn. A terminal
+    # proposal (`merged`, `rejected`) already answers both questions a snapshot
+    # would: which PR it owns is in `pr_url`, and that the entity is finished is
+    # the status itself. Fetching it anyway is one `GET /pulls/{n}` per ref per
+    # tick on the token every dev loop shares, over the bucket that only grows.
+    snapshots = await fetch_pr_snapshots(
+        [ref for ref in refs if ref.status not in TERMINAL_STATUSES]
+    )
     active = set(active_workflow_ids or [])
 
     observations = _observe(refs, snapshots, active)
@@ -226,9 +235,14 @@ def _observe(
     out: list[reconciler.Observation] = []
     for ref in refs:
         pr = snapshots.get((ref.service, ref.slug))
+        # The PR this proposal owns, from the URL alone. It is what lets a
+        # terminal proposal still produce a pull-request observation without a
+        # snapshot: the entity is addressed by repo and number, and its
+        # terminality comes from the proposal status.
+        pr_id = pr_ref_of(ref)
         actionable = ref.status in ACTIONABLE_STATUSES
         proposal_ref = f"{ref.service}/{ref.slug}"
-        live = _live_id(ref, pr, active)
+        live = _live_id(ref, pr_id[0] if pr_id else None, active)
 
         out.append(
             reconciler.Observation(
@@ -247,23 +261,28 @@ def _observe(
                 # row — so requiring a live execution is what keeps the
                 # steady state quiet instead of escalating every queued
                 # proposal on every 15-minute tick.
-                needs_owner=actionable and pr is None and bool(live),
+                needs_owner=actionable and pr_id is None and bool(live),
                 head=pr.head_sha if pr else "",
                 live_workflow_id=live,
             )
         )
 
-        if pr is None:
+        if pr_id is None:
             continue
         terminal_reason = ""
-        if pr.merged:
+        if pr is None:
+            # No snapshot means the proposal is terminal (see the fetch above),
+            # so the PR's own state is not what decides here: a finished
+            # proposal leaves nothing for anybody to hold on its PR either.
+            terminal_reason = f"proposal status {ref.status}"
+        elif pr.merged:
             terminal_reason = "PR merged"
         elif pr.closed_unmerged:
             terminal_reason = "PR closed unmerged"
         out.append(
             reconciler.Observation(
                 kind=KIND_PULL_REQUEST,
-                entity_id=EntityRef.for_pull_request(pr.repo, pr.number).id,
+                entity_id=EntityRef.for_pull_request(pr_id[0], pr_id[1]).id,
                 phase=PHASE_REVIEW_REMEDIATION,
                 proposal_ref=proposal_ref,
                 entity_terminal=bool(terminal_reason),
@@ -274,14 +293,14 @@ def _observe(
                 # tick, from the same active set; saying it twice adds an
                 # alertable counter, not information.
                 needs_owner=actionable and not terminal_reason and bool(live),
-                head=pr.head_sha,
+                head=pr.head_sha if pr else "",
                 live_workflow_id=live,
             )
         )
     return out
 
 
-def _live_id(ref: ProposalStateRef, pr: PRSnapshot | None, active: set[str]) -> str:
+def _live_id(ref: ProposalStateRef, repo: str | None, active: set[str]) -> str:
     """The DevLoopWorkflow running against this proposal, or "".
 
     Through `_expected_workflow_id`, the orphan sweep's own reconstruction,
@@ -290,7 +309,7 @@ def _live_id(ref: ProposalStateRef, pr: PRSnapshot | None, active: set[str]) -> 
     of it (#212), and a private copy here would be the third answer to a
     question that has been wrong twice.
     """
-    expected = _expected_workflow_id(ref.slug, pr.repo if pr else None, ref.service)
+    expected = _expected_workflow_id(ref.slug, repo, ref.service)
     return expected if expected and expected in active else ""
 
 
@@ -342,7 +361,7 @@ async def _read_batch(
         except Exception as exc:  # noqa: BLE001 — httpx raises a wide family
             activity.logger.warning("lifecycle reconcile batch read failed: %s", exc)
             out.update(
-                {i: OwnershipAnswer(verdict="unknown", reason=str(exc)) for i in chunk}
+                {i: OwnershipAnswer(verdict=UNKNOWN, reason=str(exc)) for i in chunk}
             )
             continue
         body: dict[str, Any] = {}
@@ -363,28 +382,42 @@ async def _read_batch(
 def _with_answer(
     obs: reconciler.Observation, answer: OwnershipAnswer
 ) -> reconciler.Observation:
+    """The observation with the store's answer folded in.
+
+    `replace` rather than a field-by-field rebuild: the latter silently drops
+    whatever the author forgot, which is exactly what happened to the four
+    `claim_*` fields — `stale-claim` would have been dead code the day
+    `_observe` started filling them, and nothing would have failed to say so.
+    """
     own = answer.ownership
-    return reconciler.Observation(
-        kind=obs.kind,
-        entity_id=obs.entity_id,
-        phase=obs.phase,
-        proposal_ref=obs.proposal_ref,
+    if own is None:
+        return replace(
+            obs,
+            verdict=answer.verdict,
+            state="",
+            owner=Owner(),
+            epoch=0,
+            dead=False,
+            stuck=False,
+            healthy=False,
+            derived_status=answer.reason,
+            handoff_to=None,
+            record_version="",
+            temporal_workflow_id="",
+        )
+    return replace(
+        obs,
         verdict=answer.verdict,
-        state=own.state if own else "",
-        owner=own.owner if own else Owner(),
-        epoch=own.epoch if own else 0,
-        dead=own.dead if own else False,
-        stuck=own.stuck if own else False,
-        healthy=own.healthy if own else False,
-        derived_status=own.derived_status if own else answer.reason,
-        handoff_to=own.handoff_to if own else None,
-        record_version=own.entity.version if own else "",
-        temporal_workflow_id=own.temporal_workflow_id if own else "",
-        head=obs.head,
-        entity_terminal=obs.entity_terminal,
-        entity_terminal_reason=obs.entity_terminal_reason,
-        live_workflow_id=obs.live_workflow_id,
-        needs_owner=obs.needs_owner,
+        state=own.state,
+        owner=own.owner,
+        epoch=own.epoch,
+        dead=own.dead,
+        stuck=own.stuck,
+        healthy=own.healthy,
+        derived_status=own.derived_status,
+        handoff_to=own.handoff_to,
+        record_version=own.entity.version,
+        temporal_workflow_id=own.temporal_workflow_id,
     )
 
 

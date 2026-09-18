@@ -283,6 +283,33 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
     return refs
 
 
+def pr_ref_of(ref: ProposalStateRef) -> tuple[str, int] | None:
+    """The (repo, number) this proposal records, or None.
+
+    Its own function because two callers need the answer and only one of them
+    needs the PR over the wire: the ownership sweep (#353) addresses the
+    pull-request entity by repo and number, which the URL already carries.
+    A missing, unparseable, or foreign ``pr:`` answers None — the same "refuse
+    to track someone else's PR" rule get_pr_state applies.
+    """
+    if not ref.pr_url:
+        return None
+    match = _PR_URL_RE.search(ref.pr_url) or _PR_API_URL_RE.search(ref.pr_url)
+    if not match:
+        return None
+    repo, number = match.group(1), int(match.group(2))
+    if repo.lower() != f"mctlhq/{ref.service}".lower():
+        activity.logger.warning(
+            "reconcile: %s/%s records PR %s outside mctlhq/%s — not tracking it",
+            ref.service,
+            ref.slug,
+            ref.pr_url,
+            ref.service,
+        )
+        return None
+    return repo, number
+
+
 async def fetch_pr_snapshots(refs: list[ProposalStateRef]) -> dict[tuple[str, str], PRSnapshot]:
     """PR state for every ref that records one, keyed by (service, slug).
 
@@ -292,22 +319,10 @@ async def fetch_pr_snapshots(refs: list[ProposalStateRef]) -> dict[tuple[str, st
     """
     wanted: list[tuple[ProposalStateRef, str, int]] = []
     for ref in refs:
-        if not ref.pr_url:
+        pr = pr_ref_of(ref)
+        if pr is None:
             continue
-        match = _PR_URL_RE.search(ref.pr_url) or _PR_API_URL_RE.search(ref.pr_url)
-        if not match:
-            continue
-        repo, number = match.group(1), int(match.group(2))
-        if repo.lower() != f"mctlhq/{ref.service}".lower():
-            activity.logger.warning(
-                "reconcile: %s/%s records PR %s outside mctlhq/%s — not tracking it",
-                ref.service,
-                ref.slug,
-                ref.pr_url,
-                ref.service,
-            )
-            continue
-        wanted.append((ref, repo, number))
+        wanted.append((ref, pr[0], pr[1]))
 
     if not wanted:
         return {}
