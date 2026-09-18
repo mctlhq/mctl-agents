@@ -54,8 +54,10 @@ _DEV_LOOP_CONSTANTS = {
 
 _IMPLEMENTER_CONSTANTS = {
     # The attempt lease the implementer writes into .status.yaml before it
-    # pushes (run_implementer.py); the lifecycle diagram quotes it.
-    "lease_minutes": r"started \+ timedelta\(minutes=(\d+)\)",
+    # pushes (run_implementer.py); the lifecycle diagram quotes it. Named
+    # IMPLEMENT_ATTEMPT_LEASE since ADR-010 phase 2 (mctl-agents#352), where
+    # the same constant also becomes the ExecutionClaim's default lease.
+    "lease_minutes": r"^IMPLEMENT_ATTEMPT_LEASE = timedelta\(minutes=(\d+)\)",
 }
 
 _SHEPHERD_CONSTANTS = {

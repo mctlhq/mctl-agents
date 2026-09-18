@@ -45,7 +45,12 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
-    from orchestrator.lifecycle.contract import OWNED_BY_OTHER, UNKNOWN, UNOWNED, EntityRef
+    from orchestrator.lifecycle.contract import (
+        OWNED_BY_OTHER,
+        UNKNOWN,
+        UNOWNED,
+        EntityRef,
+    )
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -1276,6 +1281,15 @@ class DevLoopWorkflow:
             proposal_ref=self._proposal_ref,
             policy_ref=self._policy_ref,
             temporal_workflow_id=info.workflow_id,
+            # NOTE: `handoff` is the only op that reads these, and this
+            # workflow never hands its claim to a named successor — it
+            # releases and lets the next holder acquire. The parameter that
+            # used to thread an `Owner` here had no caller passing it in any
+            # of the five call sites, so it was a dead branch carrying an
+            # import (claude P3 on `8ac2080`). Add it back with the caller
+            # that needs it, not before.
+            to_owner_type="",
+            to_owner_id="",
         )
         try:
             return await workflow.execute_activity(
@@ -2176,6 +2190,15 @@ class DevLoopWorkflow:
         # cron sweeper owns the PR and this loop must not record itself as the
         # owner. Its own marker, because it adds commands to history.
         track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
+        # NOTE (ADR-010 phase 2, #352): there is deliberately no
+        # "lifecycle-claims" patch marker here. This PR reverted the watch-end
+        # write to a bare `release` because nothing in this repository calls
+        # `handoff/complete` yet, so the branch the marker would gate does not
+        # exist. A `workflow.patched` call writes a marker into EVERY new
+        # execution's history and can only be retired through
+        # `deprecate_patch` plus a second deploy — a cost with no branch to
+        # pay for. The marker belongs in the change that actually ships the
+        # handoff (#353), where it will guard a real fork in behaviour.
         if track_ownership:
             # ADR-010 §12 asks for the resolved policy to be recorded on the
             # row, so "why does this actor own it" is answerable without
@@ -2346,8 +2369,19 @@ class DevLoopWorkflow:
                 # "somebody must take this", which is the one state this
                 # contract defines as work remaining.
                 terminal_state = last is not None and last.state in ("MERGED", "CLOSED")
+                # Non-terminal end: still a bare RELEASE, not "handoff-start".
+                # `handoff-start` writes a HOLDING `handing-off` state
+                # (contract.py) that only `/handoff/complete` can resolve —
+                # and nothing in this repository calls `handoff/complete`
+                # anywhere (no reconciler yet, #353), so issuing
+                # `handoff-start` here would leave the row stuck in
+                # `handing-off` forever, which is worse than the zero-owner
+                # gap a release leaves. Revert to `release` until a completer
+                # exists; the flip back to `handoff-start` belongs to #353,
+                # together with the patch marker that must gate it.
+                op = "terminal" if terminal_state else "release"
                 done = await self._ownership(
-                    "terminal" if terminal_state else "release",
+                    op,
                     repo=repo,
                     number=number,
                     # The head this watch last saw. `_payload` sends `version`
@@ -2372,9 +2406,7 @@ class DevLoopWorkflow:
                 # Temporal serves queries against completed executions, so the
                 # terminal value of these fields is observable exactly when the
                 # question is asked.
-                self._finish_claim(
-                    "terminal" if terminal_state else "release", done, repo, number
-                )
+                self._finish_claim(op, done, repo, number)
             # After the LAST relinquishing write of this watch, whichever path
             # made it. One metric line per abandoned entity, not per failed
             # attempt — see _report_claim_abandonment.

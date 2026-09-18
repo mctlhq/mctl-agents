@@ -79,6 +79,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -86,7 +87,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 from collections.abc import AsyncGenerator
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -105,6 +105,21 @@ from config.settings import (
 )
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.github_token import refresh_github_token
+from orchestrator.lifecycle import rollout
+from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
+from orchestrator.lifecycle.contract import (
+    CLAIM_FENCED,
+    CLAIM_HELD_BY_OTHER,
+    CLAIM_STATE_EXPIRED,
+    CLAIM_STATE_RELEASED,
+    CLAIM_UNCLAIMED,
+    CLAIM_UNKNOWN,
+    OWNER_IMPLEMENTER,
+    PHASE_IMPLEMENT,
+    PHASE_REVIEW_REMEDIATION,
+    EntityRef,
+    Executor,
+)
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
@@ -191,6 +206,25 @@ EXIT_ORPHANED_SUBAGENT = 46
 # charge a review attempt: on portfolio#56 two correct refusals burned 2 of 5
 # attempts and forced a GitOps reset (mctl-gitops#1205).
 EXIT_DELIBERATE_NO_OP = 47
+# Fenced, NOT a failure of the proposal or the findings: an ExecutionClaim
+# check immediately before a push answered CLAIM_FENCED — the owner epoch
+# moved (a handoff completed) or the entity's pinned version changed (a new
+# PR head) since this attempt's claim was pinned. Re-running against the
+# world this attempt observed cannot succeed; the next tick must take a new
+# claim against the CURRENT world instead (ADR-010 phase 2, #352). Shares the
+# non-charging behaviour of 46/47: the executor did nothing wrong.
+EXIT_FENCED = 48
+# A claim check REFUSED this attempt: another executor holds the entity, or
+# the claim store could not be reached while `LIFECYCLE_OWNERSHIP_REQUIRED` is
+# on. Distinct from 48 — nothing moved under this attempt, it simply may not
+# act right now — but it shares 48's shepherd handling (`FollowupKind =
+# "fenced"`, non-charging, its own log line) because the operator question is
+# the same one: a claim stood this attempt down, deliberately. Left as
+# EXIT_GENERIC_FAILURE it reached the operator as "follow-up subprocess failed
+# transiently", the exact legibility gap EXIT_FENCED was added to close, and
+# it repeats every tick for the life of a leaked lease (claude P3 on
+# `31232dc`).
+EXIT_CLAIM_REFUSED = 49
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -204,6 +238,10 @@ REFUSAL_MARKER_FILENAME = ".implementer-refusal.json"
 # Prefix on `ImplementResult.error` that `_review_feedback_exit_code()` maps to
 # EXIT_DELIBERATE_NO_OP. Same string-prefix style as the other sentinels.
 REFUSAL_ERROR_PREFIX = "deliberate no-op:"
+# Prefix mapped to EXIT_FENCED. Same style, raised by ImplementerFenced.
+FENCED_ERROR_PREFIX = "fenced:"
+# Prefix mapped to EXIT_CLAIM_REFUSED, raised by ImplementerClaimRefused.
+CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -405,6 +443,19 @@ def _review_feedback_exit_code(error: str) -> int:
         MAX_REVIEW_ATTEMPTS without a single real try at the findings. The
         shepherd classifies this as a harness failure and retries.
 
+      - 48: an ExecutionClaim check right before the push answered
+        CLAIM_FENCED (ADR-010 phase 2, #352) — the epoch moved or the pinned
+        entity version changed since this attempt's claim was taken. The
+        executor aborted before invoking git; the shepherd must not charge a
+        review attempt for a race it did not cause.
+
+      - 49: an ExecutionClaim check REFUSED this attempt — another executor
+        holds the entity, or the store was unreachable under the ownership
+        break-glass. Nothing moved, so it is not a fence; the shepherd
+        handles it with the same non-charging arm and its own log line,
+        because "a claim stood this attempt down" is what the operator needs
+        to read either way.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -422,6 +473,10 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_BRANCH_MISSING_ON_ORIGIN
     if error.startswith(REFUSAL_ERROR_PREFIX):
         return EXIT_DELIBERATE_NO_OP
+    if error.startswith(FENCED_ERROR_PREFIX):
+        return EXIT_FENCED
+    if error.startswith(CLAIM_REFUSED_ERROR_PREFIX):
+        return EXIT_CLAIM_REFUSED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -502,6 +557,89 @@ class ImplementerOperationTimeout(RuntimeError):
     """A bounded model or shell operation exceeded its wall-clock limit."""
 
 
+class ImplementerFenced(RuntimeError):
+    """An ExecutionClaim check answered CLAIM_FENCED right before a push.
+
+    Not a failure of the proposal: the world this attempt's claim was pinned
+    to has moved on (a handoff bumped the epoch, or the entity's version
+    changed under it), so retrying against the SAME evidence cannot succeed.
+    Mapped to EXIT_FENCED so the shepherd does not charge a review attempt for
+    a race the executor did not cause (ADR-010 phase 2, #352).
+    """
+
+
+# The subset of `FREE_CLAIM_STATES` that means "nobody is here", as opposed to
+# "somebody fenced this". `fenced` is deliberately absent: it is a free state
+# for the purpose of acquiring, and the opposite of one for the purpose of
+# deciding whether this attempt may still write the proposal's status.
+_VACANT_CLAIM_STATES = frozenset({CLAIM_STATE_RELEASED, CLAIM_STATE_EXPIRED})
+
+
+class ImplementerClaimRefused(RuntimeError):
+    """A claim check refused this attempt where that refusal blocks.
+
+    Three different answers arrive here, and the message says which:
+
+    - CLAIM_HELD_BY_OTHER — a real, named executor holds the entity and this
+      attempt lost the race;
+    - CLAIM_UNKNOWN — the store could not be reached (or no token was
+      configured) while `LIFECYCLE_OWNERSHIP_REQUIRED` is on, the default.
+      Nobody holds anything; uncertainty is being failed closed. Reporting
+      that as a competing holder sent the operator looking for an executor
+      that does not exist (claude P2 on `31232dc`);
+    - CLAIM_UNCLAIMED where a hold was expected — `claim_verdict_for` answers
+      it for `released`, `expired` and `fenced`, so the common shape is this
+      attempt's OWN lease running out mid-run — `ClaimClient.renew` runs only
+      on the retake path, never as a heartbeat, so a lease that is too short
+      for the run holding it is still never extended. Nobody else holds it
+      either; naming a rival here
+      hides the one thing an operator can act on, which is the lease
+      (claude P2 on `d5e2a48`).
+
+    Distinct from `ImplementerFenced`: nothing moved under this attempt.
+    Distinct from a generic failure too, because the correct response is to
+    stand down silently rather than to mark the proposal `needs-triage` — the
+    entity is healthy, and triaging it is how two coordinating processes turn
+    into one broken one.
+
+    Only raised where the answer actually composes safety
+    (`claim.blocks_mutation` True, i.e. `enforce` and above). Below that the
+    claim is advisory and a rejected acquire returns None, exactly as before
+    ADR-010 phase 2.
+
+    The verdict is carried as an attribute, not only inside the message: the
+    handler in `implement_one` has to tell the three apart to know whether the
+    entity is held by someone (leave it alone), free (hand it back for an
+    immediate retry) or unknown (fail closed and wait out the lease). Parsing
+    that back out of prose would be the bug this class exists to avoid.
+
+    `claim_state` carries the raw state under a CLAIM_UNCLAIMED verdict,
+    because that verdict is NOT one situation. `FREE_CLAIM_STATES` folds
+    `fenced` in beside `released` and `expired`, and `check` sends this
+    attempt's own claim_id — so a claim fenced server-side by a newer executor
+    comes back as our own fenced record and reads "free". Handing the proposal
+    back on that erases the block the new holder just wrote (claude P2 on
+    `af661d7`). Only `released` and `expired` mean nobody is there.
+    """
+
+    def __init__(
+        self, message: str, *, verdict: str = CLAIM_UNKNOWN, claim_state: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.verdict = verdict
+        self.claim_state = claim_state
+
+    @property
+    def entity_is_free(self) -> bool:
+        """True only where the answer PROVES nobody holds the entity.
+
+        A missing state is not a proof: `claim_answer_from` leaves `claim`
+        None whenever the store answered without a record, and an answer that
+        named no claim cannot license a write over someone else's.
+        """
+        return self.verdict == CLAIM_UNCLAIMED and self.claim_state in _VACANT_CLAIM_STATES
+
+
 class ImplementerOrphanedSubagent(OrphanedSubagentError):
     """The run ended while the delegated implementer sub-agent was still live.
 
@@ -513,6 +651,374 @@ class ImplementerOrphanedSubagent(OrphanedSubagentError):
     Subclasses the shared error so the helper can raise the generic type while
     the orchestrator keeps its greppable `Implementer*` naming.
     """
+
+
+# ---------------------------------------------------------------------------
+# ExecutionClaim wiring (ADR-010 phase 2, #352).
+#
+# The implementer's first lifecycle import of any kind: it acquires a claim
+# on (devloop-proposal, "{service}/{slug}", implement) beside the existing
+# `attempt` lease, and checks a claim immediately before every push this
+# module performs. Below `enforce`, every check is advisory (logged, never
+# blocking) — see `orchestrator.lifecycle.claim.blocks_mutation`.
+# ---------------------------------------------------------------------------
+
+# The 130-minute implement attempt lease, named rather than a bare literal so
+# the yaml lease and the claim's `lease_seconds` read the same constant.
+IMPLEMENT_ATTEMPT_LEASE = timedelta(minutes=130)
+
+
+def _claim_lease_seconds(env_var: str, default: timedelta) -> int:
+    """The lease for one claim: the computed default, or a LONGER override.
+
+    The override can only lengthen. Every default here is computed from the
+    run it has to outlive — 130 minutes matching the yaml `attempt` lease,
+    or `_review_claim_lease_default()`'s floor widened by the implementer
+    timeouts — and a shorter value expires the claim under its own attempt,
+    which comes back from the push-site check as CLAIM_UNCLAIMED and stands a
+    live run down. Documenting that hazard is what the previous version did,
+    and a comment in `.env.example` does not survive being copied into a
+    values file (claude P3 on `b362b5e`, from agy's P2 one round earlier).
+    A deliberately shorter lease is not a tunable this module offers, and for
+    IMPLEMENT there is no downward route at all: `IMPLEMENT_ATTEMPT_LEASE` is
+    the 130 minutes the yaml `attempt` lease is stamped for, a constant no
+    timeout feeds. Only REVIEW's default moves, and it moves by shortening the
+    run — the implementer timeouts it is derived from (claude P3 on
+    `f4d0dec`).
+    """
+    raw = os.environ.get(env_var, "").strip()
+    computed = int(default.total_seconds())
+    if not raw:
+        return computed
+    try:
+        asked = int(raw)
+    except ValueError:
+        return computed
+    if asked < computed:
+        print(
+            f"[lifecycle] {env_var}={asked} is shorter than the computed lease "
+            f"{computed}s and would expire under the run it guards; using {computed}s",
+            flush=True,
+        )
+        return computed
+    return asked
+
+
+# One MERGE_POLL_INTERVAL (run_shepherd.py) — a review-remediation claim only
+# needs to outlive one shepherd poll, not a full implement run. It is a FLOOR,
+# not the whole answer: the lease also has to outlive the run that holds it,
+# and nothing renews it mid-run — the one production call of `ClaimClient.renew`
+# is the retake in `_acquire_claim`, which runs once, before the run starts. A
+# claim that expires mid-run comes back from the push-site check as
+# CLAIM_UNCLAIMED and stands the attempt down for no reason at all, so the
+# default is sized from the two timeouts that actually bound the run rather
+# than pinned to a literal that a raised IMPLEMENTER_TIMEOUT_SECONDS silently
+# outgrows (claude P2 on `d5e2a48`).
+REVIEW_CLAIM_LEASE_FLOOR = timedelta(minutes=30)
+
+
+def _review_claim_lease_default() -> timedelta:
+    """The review lease floor, widened to cover the run it has to outlive.
+
+    `IMPLEMENTER_TIMEOUT_SECONDS` bounds the SDK run; the git work around it
+    is bounded by `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which
+    the clone before and the push after are the two that matter. The margin
+    is deliberately the whole of both rather than a fraction, because the two
+    errors are not symmetric in the way they look: expiring EARLY refuses a
+    live attempt at its own push, and expiring LATE strands the entity for the
+    rest of the lease whenever the holder cannot run its own `finally` — a
+    crashed or evicted pod does not release, so the wait is the full remaining
+    lease and not one shepherd poll (claude P3 on `c29195c`). A wider lease is
+    still the right trade: the early error is certain and repeats, the late
+    one needs a crash.
+    """
+    bound = timedelta(
+        seconds=IMPLEMENTER_TIMEOUT_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
+    )
+    return max(REVIEW_CLAIM_LEASE_FLOOR, bound)
+
+
+def _resolve_attempt_id(service: str, slug: str, owner_epoch: int, attempt_ordinal: int) -> str:
+    """Deterministic attempt identity: WORKFLOW_UID, or a derived fallback.
+
+    Never `uuid.uuid4()` — a random id is non-deterministic in exactly the
+    retried-pod case where determinism matters (ADR-010 §8): a pod that
+    restarts and re-derives the SAME identity must be able to renew its own
+    claim rather than be refused by it. `service` and `slug` are always
+    present on a real `ProposalRef`, so this always succeeds; there is no
+    reachable "cannot derive an identity" case for this caller.
+
+    `HOSTNAME` is folded into the fallback because determinism and uniqueness
+    pull in opposite directions here, and both matter. Without it, two pods
+    starting on the same proposal in the same epoch derive the SAME executor
+    id, so each one's `acquire` reads as the other RENEWING its own claim:
+    the claim answers CLAIM_HELD_BY_ME to both, and the mechanism meant to
+    stop concurrent implementers becomes the thing that permits them. In
+    Kubernetes `HOSTNAME` is the pod name, so it is stable across a container
+    restart within the same pod — the restart case determinism exists for
+    (ADR-010 §8) still re-derives its own id and renews its own claim.
+
+    Residual, stated rather than hidden: two processes on ONE host without
+    `WORKFLOW_UID` still collide. That is not a shape anything deploys — the
+    Temporal path always sets `WORKFLOW_UID` — and the fix for it is to set
+    `WORKFLOW_UID`, not to make this id random.
+    """
+    workflow_uid = os.environ.get("WORKFLOW_UID", "").strip()
+    if workflow_uid:
+        return workflow_uid
+    host = os.environ.get("HOSTNAME", "").strip()
+    raw = f"{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{host}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _ClaimContext:
+    """Everything one push-site fencing check needs, bundled so a call site
+    passes one argument instead of seven that must stay in lock-step."""
+
+    client: ClaimClient
+    claim_id: str
+    entity: EntityRef
+    phase: str
+    owner_epoch: int
+    entity_version: str
+    executor: Executor
+    attempt: str
+
+
+def _acquire_claim(
+    entity: EntityRef, phase: str, entity_version: str, attempt: str, *, lease_seconds: int, proposal_ref: str = ""
+) -> _ClaimContext | None:
+    """Acquire an execution claim: a context, None, or a refusal.
+
+    Three outcomes, because the caller must act differently on each:
+
+    - a `_ClaimContext` — granted, and every downstream push checks it;
+    - None — no claim is in play: any answer at a rollout stage below
+      `enforce`, where the claim is advisory, and CLAIM_UNKNOWN when the
+      `LIFECYCLE_OWNERSHIP_REQUIRED` break-glass is explicitly off. NOT an
+      error: the run proceeds on the pre-claim mechanisms, the yaml lease and
+      `--force-with-lease`. Note that this is NOT the default path for
+      CLAIM_UNKNOWN: `ownership_required()` defaults to True, so at `enforce`
+      an unreachable store raises below rather than returning here;
+    - `ImplementerFenced` / `ImplementerClaimRefused` — a definite "no" that
+      the rollout stage says must stop a mutation. Raised rather than
+      returned, because a returned None is indistinguishable from "no claim
+      mechanism here" at every call site downstream.
+    """
+    client = ClaimClient()
+    executor = Executor(type=OWNER_IMPLEMENTER, id=attempt)
+    answer = client.acquire(
+        entity, phase, 0, entity_version, executor, attempt,
+        lease_seconds=lease_seconds, proposal_ref=proposal_ref,
+    )
+    if not answer.may_execute:
+        # Three different answers hide behind one falsy `may_execute`, and
+        # collapsing them is what made the first remediation of this defect
+        # worse than the defect. Every downstream fencing check is guarded by
+        # `if claim_context is not None`, so returning None does not DECLINE
+        # the attempt — it DISABLES the check. At `enforce` that turned "wastes
+        # an SDK call, then correctly blocks the push" into "wastes an SDK
+        # call, then pushes on top of the holder".
+        #
+        # So the answer is split the same way `_check_claim_or_raise` splits
+        # it, and by the same predicate, so the two cannot drift:
+        # A fence is the sharpest answer the store gives, but `observe` still
+        # RECORDS writes (`rollout.records_writes()` is True from observe up),
+        # so a real 409 `fenced` does come back there — and halting the
+        # attempt on it would be the observe stage composing safety, which is
+        # exactly what it must not do (ADR-010 §12; agy P2 on `31232dc`). An
+        # earlier revision raised unconditionally on the theory that a fence
+        # was unreachable below enforce; that is true of `off` alone. Gated
+        # here and in `_check_claim_or_raise` by the same predicate, so the
+        # two sites still cannot answer one verdict two different ways.
+        if answer.verdict == CLAIM_FENCED and rollout.new_answer_may_veto():
+            raise ImplementerFenced(
+                f"{FENCED_ERROR_PREFIX} claim for {entity.kind}:{entity.id}/{phase} "
+                f"fenced at acquire: {answer.reason}"
+            )
+        if blocks_mutation(answer):
+            # Two answers block here, and they are NOT the same event. A
+            # CLAIM_UNKNOWN reaches this branch at `enforce` by default —
+            # `ownership_required()` reads LIFECYCLE_OWNERSHIP_REQUIRED with a
+            # default of true — so an expired token or a 503 from mctl-api
+            # lands on a message that must not assert a competing executor
+            # nobody can find (claude P2 on `31232dc`).
+            if answer.verdict == CLAIM_UNKNOWN:
+                raise ImplementerClaimRefused(
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the claim store could not answer for "
+                    f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}. "
+                    f"Nobody is known to hold it; uncertainty is failed closed because "
+                    f"LIFECYCLE_OWNERSHIP_REQUIRED is on (set it to false to proceed anyway)",
+                    verdict=CLAIM_UNKNOWN,
+                )
+            if answer.verdict == CLAIM_UNCLAIMED:
+                # Naming the free state rather than a rival: this attempt never
+                # held anything here, so the refusal is the store's own
+                # (claude P3 on `c29195c`). The SHA stays in this comment and
+                # out of the message — the message reaches the shepherd's log
+                # and the batch summary, where a commit id from this branch is
+                # noise to whoever is reading an incident (claude P3 on
+                # `af661d7`).
+                raise ImplementerClaimRefused(
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the acquire for "
+                    f"{entity.kind}:{entity.id}/{phase} was refused although the claim reads "
+                    f"free (released, expired or fenced): {answer.reason or answer.verdict}. "
+                    f"Nobody holds it; this attempt never held it either, so the refusal is "
+                    f"the store's, not a lost race",
+                    verdict=CLAIM_UNCLAIMED,
+                    claim_state=answer.claim.state if answer.claim else None,
+                )
+            raise ImplementerClaimRefused(
+                f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
+                f"{entity.kind}:{entity.id}/{phase}: {answer.reason or answer.verdict}",
+                verdict=CLAIM_HELD_BY_OTHER,
+            )
+        # Everything left is an answer at a rollout stage where the claim is
+        # advisory by design — below `enforce`, or a CLAIM_UNKNOWN with the
+        # ownership break-glass explicitly off. Decline the claim — never
+        # adopt a claim_id that may name the winning executor's claim rather
+        # than ours — and proceed exactly as this module did before claims
+        # existed.
+        return None
+    claim_id = answer.claim.claim_id if answer.claim else ""
+    if answer.retaken:
+        # The one granted answer the store actually REFUSED: a 409 whose record
+        # names this attempt, i.e. the orphan claim a killed predecessor of this
+        # same (deterministic) identity never released. A refused acquire never
+        # applied `lease_seconds`, so what is adopted here is the DEAD pod's
+        # remaining `lease_until`, while `implement_one` stamps a fresh
+        # full-length yaml lease two statements later. On the granted path the
+        # two expire together by construction; this is the one path that
+        # desynchronises them, in the direction `_review_claim_lease_default()`
+        # exists to prevent — the claim expiring before the run it guards. Left
+        # alone, an expiry mid-run answers CLAIM_UNCLAIMED to the shepherd's
+        # freshness check, which matches none of its arms and falls through to
+        # "not held" with the unexpired yaml lease never read: a second
+        # implementer against a live one (claude P2 on `6794aad`).
+        #
+        # So the retake is completed rather than assumed, with the renew ADR-010
+        # §8 and `_resolve_attempt_id`'s docstring both already name as the
+        # point of the deterministic identity. A refused renew is the refusal
+        # the 409 originally was, answered by the same rollout predicate as
+        # every other refusal here so the stages cannot drift.
+        # `claim_id` is non-empty here by construction, and deliberately not
+        # re-checked: `retaken` is set only where `claim_verdict_for` read a
+        # record `ExecutionClaim.from_payload` accepted, and that parse requires
+        # a claim id. The guard this replaced could not run, and being the one
+        # refusal in this function the rollout predicate did not gate, it said
+        # the opposite of the paragraph above it (claude P3 on `0af3b38`).
+        renewed = client.renew(
+            claim_id, entity, phase, 0, entity_version, executor, attempt,
+            lease_seconds=lease_seconds,
+        )
+        if not renewed.may_execute:
+            if renewed.verdict == CLAIM_FENCED and rollout.new_answer_may_veto():
+                raise ImplementerFenced(
+                    f"{FENCED_ERROR_PREFIX} claim for {entity.kind}:{entity.id}/{phase} "
+                    f"fenced while renewing this attempt's own claim: {renewed.reason}"
+                )
+            if blocks_mutation(renewed):
+                raise ImplementerClaimRefused(
+                    f"{CLAIM_REFUSED_ERROR_PREFIX} the claim for "
+                    f"{entity.kind}:{entity.id}/{phase} names this attempt but its lease "
+                    f"could not be extended: {renewed.reason or renewed.verdict}. The "
+                    f"adopted lease is the previous pod's remainder, so continuing would "
+                    f"run past a claim nobody is holding",
+                    verdict=renewed.verdict,
+                    claim_state=renewed.claim.state if renewed.claim else None,
+                )
+            # Advisory stage: decline the claim rather than carry one whose
+            # lease this run cannot vouch for, exactly as the branch above does.
+            return None
+        if renewed.claim is not None and renewed.claim.claim_id:
+            claim_id = renewed.claim.claim_id
+    return _ClaimContext(
+        client=client, claim_id=claim_id, entity=entity, phase=phase,
+        owner_epoch=0, entity_version=entity_version, executor=executor, attempt=attempt,
+    )
+
+
+def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = None) -> None:
+    """The early filter immediately before a mutation.
+
+    NOT the authoritative check — that is the target system's own
+    precondition (`--force-with-lease`, `--match-head-commit`). This exists so
+    a fence is detected (and the attempt classified non-charging) before
+    spending a git round trip on a push that would fail anyway.
+    """
+    version = ctx.entity_version if entity_version is None else entity_version
+    answer = ctx.client.check(
+        ctx.claim_id, ctx.entity, ctx.phase, ctx.owner_epoch, version, ctx.executor, ctx.attempt
+    )
+    if answer.verdict == CLAIM_FENCED and not rollout.new_answer_may_veto():
+        # Below `enforce` the claim is advisory: observe records writes, so a
+        # fence genuinely arrives here, and stopping the push on it would make
+        # the observe stage decide. Logged instead — the divergence is the
+        # whole product of that stage (agy P2 on `31232dc`).
+        print(
+            f"lifecycle: claim for {ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} answered "
+            f"fenced before push ({answer.reason}); advisory below enforce, pushing anyway"
+        )
+    elif answer.verdict == CLAIM_FENCED:
+        raise ImplementerFenced(
+            f"{FENCED_ERROR_PREFIX} claim for {ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} "
+            f"fenced before push: {answer.reason}"
+        )
+    if blocks_mutation(answer):
+        # Not a fence: either the store could not answer while the ownership
+        # break-glass is on, or someone else genuinely holds it. Same two
+        # answers, same split and the same exception as `_acquire_claim`, so
+        # one verdict cannot be reported two different ways depending on which
+        # site observed it — and EXIT_CLAIM_REFUSED so the shepherd names it
+        # instead of printing "subprocess failed transiently". Still
+        # non-charging: this attempt did nothing wrong.
+        if answer.verdict == CLAIM_UNKNOWN:
+            raise ImplementerClaimRefused(
+                f"{CLAIM_REFUSED_ERROR_PREFIX} the claim store could not answer for "
+                f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} before the push: "
+                f"{answer.reason or answer.verdict}. Nobody is known to hold it; "
+                f"uncertainty is failed closed because LIFECYCLE_OWNERSHIP_REQUIRED is on",
+                verdict=CLAIM_UNKNOWN,
+            )
+        if answer.verdict == CLAIM_UNCLAIMED:
+            raise ImplementerClaimRefused(
+                f"{CLAIM_REFUSED_ERROR_PREFIX} the claim this attempt held on "
+                f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase} is gone by the time of the "
+                f"push: {answer.reason or answer.verdict}. Nobody else holds it — either this "
+                f"attempt's own lease ran out (nothing renews it mid-run) or the store fenced "
+                f"the claim and reports the free state that leaves behind",
+                verdict=CLAIM_UNCLAIMED,
+                claim_state=answer.claim.state if answer.claim else None,
+            )
+        raise ImplementerClaimRefused(
+            f"{CLAIM_REFUSED_ERROR_PREFIX} another executor holds the claim for "
+            f"{ctx.entity.kind}:{ctx.entity.id}/{ctx.phase}: {answer.reason or answer.verdict}",
+            verdict=CLAIM_HELD_BY_OTHER,
+        )
+
+
+_PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
+
+
+def _parse_pr_url(url: str) -> tuple[str, int] | None:
+    """Split a GitHub PR URL into (repo, number), or None if it does not match."""
+    m = _PR_URL_RE.match(url.strip())
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def _release_claim(ctx: _ClaimContext | None, *, reason: str) -> None:
+    """Best-effort release. Must never fail the run it is cleaning up after."""
+    if ctx is None:
+        return
+    try:
+        ctx.client.release(
+            ctx.claim_id, ctx.entity, ctx.phase, ctx.owner_epoch, ctx.executor, ctx.attempt, reason=reason[:200]
+        )
+    except Exception as exc:  # noqa: BLE001 — releasing a claim must never fail the run
+        print(f"warn: could not release claim {ctx.claim_id!r}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +1052,50 @@ def update_status_yaml(
     """
     update_status_file(ref.status_path, new_status, actor=actor, **fields)
     ref.status = new_status
+
+
+def _status_attempt_id(ref: ProposalRef) -> str | None:
+    """The attempt id `.status.yaml` currently names, or None."""
+    held = _load_status(ref.status_path).get("attempt")
+    return held.get("id") if isinstance(held, dict) else None
+
+
+def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> bool:
+    """Whether this attempt may still write the proposal's status.
+
+    THE invariant behind every status write an ending attempt makes, and it
+    is deliberately one function rather than a guard per arm. Between this
+    attempt's own `in-progress` write and the moment it finds out it lost the
+    entity, a second executor can legitimately have taken the proposal and
+    stamped its own `attempt` block. Any write that carries OUR attempt block
+    — a hand-back to `accepted`, a `needs-triage` failure, anything — erases
+    theirs, and `_attempt_is_fresh` (which reads only the yaml on that branch)
+    then answers "not held" and lets a THIRD implementer start. Raised first
+    against the `CLAIM_UNCLAIMED` hand-back (claude P2 on `af661d7`) and then
+    against the 409 fence reaching `_mark_needs_triage`, which is ADR-010 §6's
+    primary fence encoding (claude P2 on `0808376`); both are the same bug, so
+    both now consult the same predicate.
+    """
+    held_id = _status_attempt_id(ref)
+    if held_id == attempt_id:
+        return True
+    print(
+        f"lifecycle: {ref.service}/{ref.slug}: not {doing} — `.status.yaml` names "
+        f"attempt {held_id or '<none>'}, not this one ({attempt_id}); leaving the "
+        f"current holder's status alone"
+    )
+    return False
+
+
+def _hand_back_if_still_ours(ref: ProposalRef, attempt_id: str) -> bool:
+    """Restore `accepted` only while `.status.yaml` still names our attempt.
+
+    Returns True when the hand-back was written.
+    """
+    if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
+        return False
+    update_status_yaml(ref, "accepted", attempt=None, failure=None)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -918,9 +1468,29 @@ def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:
     return bool(proc.stdout.strip())
 
 
-def _push_followup(repo_dir: Path, branch: str) -> None:
-    """Push the follow-up commit to the existing branch (no `-u`)."""
-    _run(["git", "push", "origin", branch], cwd=repo_dir)
+def _remote_head_sha(repo_dir: Path, branch: str) -> str | None:
+    """The current head SHA of ``branch`` on origin, or None if it has none."""
+    proc = _run(["git", "ls-remote", "--heads", "origin", branch], cwd=repo_dir, check=False)
+    line = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
+    return line.split()[0] if line else None
+
+
+def _push_followup(
+    repo_dir: Path, branch: str, expected_sha: str, *, claim_context: _ClaimContext | None = None
+) -> None:
+    """Push the follow-up commit to the existing branch (no `-u`).
+
+    Fences on the claimed head SHA: `--force-with-lease=<branch>:<expected_sha>`
+    is the AUTHORITATIVE check — the push itself fails if the remote moved,
+    independently of the claim. `claim_context`, when given, is the EARLY
+    filter checked immediately before this git call (ADR-010 phase 2, #352).
+    """
+    if claim_context is not None:
+        _check_claim_or_raise(claim_context, entity_version=expected_sha)
+    _run(
+        ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
+        cwd=repo_dir,
+    )
 
 
 async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
@@ -1068,6 +1638,29 @@ def review_feedback_one(
 
     target = None
     result: ImplementResult | None = None
+    claim_ctx: _ClaimContext | None = None
+    # Read in `finally` so the claim is released on every exit path, not just
+    # the ones that remembered to call `_release_claim` — see codex P2 on
+    # ADR-010 phase 2 (#352): a claim released on only one arm leaks on every
+    # other one.
+    release_reason = "attempt ended"
+    # Released on every exit path but one: a CLAIM_UNKNOWN refusal, where the
+    # store could not answer. `implement_one`'s arm states the rule — a
+    # release we cannot confirm is how an outage frees a live hold — and this
+    # function contradicted it by releasing unconditionally (claude P3 on
+    # `af661d7`). Failing closed here costs the rest of the lease; releasing
+    # into an outage costs a second executor on the same PR.
+    #
+    # The cost is real and is NOT only paid on an unreachable store.
+    # CLAIM_UNKNOWN also covers three answers the store did give — a 2xx
+    # carrying no claim record, a 404, and a claim state this image does not
+    # recognise — and on those the skipped release strands the PR for the full
+    # `_review_claim_lease_default()` window (at least 30 minutes, and longer
+    # once IMPLEMENTER_TIMEOUT_SECONDS is raised) rather than for nothing
+    # (claude P3 on `0808376`). Accepted deliberately: none of those three
+    # answers says who holds the claim, so all three are the case this rule is
+    # for. `LIFECYCLE_OWNERSHIP_REQUIRED=false` is the break-glass.
+    release_claim = True
     branch = f"feat/agents-{ref.slug}"
     try:
         # 1. Clone the sibling repo. The shepherd's bundle path holds the
@@ -1098,6 +1691,33 @@ def review_feedback_one(
         # commit). See codex P1 on PR #12.
         old_head = _capture_head_sha(target)
 
+        # 4b. ExecutionClaim on (pull-request, review-remediation), pinned to
+        # the head just captured (ADR-010 phase 2, #352). Acquired BEFORE the
+        # SDK runs so a concurrent attempt on the same PR is refused before
+        # spending the SDK call; `claim_ctx` stays None when the PR url is
+        # not yet recorded or no claim could be granted, and the run
+        # proceeds exactly as it did before this proposal — the claim is
+        # advisory below `enforce`. Released unconditionally in `finally`.
+        pre_status = _load_status(ref.status_path)
+        parsed_pr = _parse_pr_url(str(pre_status.get("pr") or ""))
+        # Unlike the implement phase (fixed ordinal — no per-epoch counter
+        # exists yet, ADR-010 phase 2), review-remediation already persists
+        # one in `.status.yaml`'s `review_attempts`, so the WORKFLOW_UID-less
+        # fallback can and should use it to keep distinct attempts distinct.
+        attempt_ordinal = int(pre_status.get("review_attempts", 0) or 0)
+        attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=attempt_ordinal)
+        if parsed_pr is not None:
+            repo, number = parsed_pr
+            claim_ctx = _acquire_claim(
+                EntityRef.for_pull_request(repo, number, old_head),
+                PHASE_REVIEW_REMEDIATION,
+                old_head,
+                attempt_id,
+                lease_seconds=_claim_lease_seconds(
+                    "LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW", _review_claim_lease_default()
+                ),
+            )
+
         # 5. Run the SDK with the bundle baked into the prompt.
         prompt = _build_prompt(ref, review_feedback=bundle)
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
@@ -1109,36 +1729,66 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
+                release_reason = "no follow-up: refused"
                 return ImplementResult(
                     ref=ref,
                     pr_url=None,
                     error=f"{REFUSAL_ERROR_PREFIX} {refusal}",
                 )
+            release_reason = "no follow-up commits"
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
                 error="implementer produced no follow-up commits",
             )
 
-        # 7. Push to the existing branch — no -u, no new PR.
-        _push_followup(target, branch)
+        # 7. Push to the existing branch — no -u, no new PR. `old_head` is
+        # both the `--force-with-lease` CAS and the claim's pinned version:
+        # if the branch moved since step 4, the claim check catches it before
+        # git runs, and the push's own lease catches it even if the claim
+        # check could not (store unreachable, rollout below `enforce`).
+        _push_followup(target, branch, old_head, claim_context=claim_ctx)
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
+        release_reason = "follow-up pushed"
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerFenced as e:
+        # Not a failure of the proposal — see EXIT_FENCED. The claim is
+        # already fenced server-side (or the classification decided this
+        # attempt cannot proceed), but the release below is still a
+        # best-effort no-op call, not a mutation, so it stays unconditional.
+        release_reason = "fenced"
+        result = ImplementResult(ref=ref, pr_url=None, error=str(e))
+        return result
+    except ImplementerClaimRefused as e:
+        # A claim check refused this attempt on this PR. Not a failure of the
+        # findings and not a fence: nothing moved, this attempt either lost
+        # the race or could not reach the store under the ownership
+        # break-glass. Mapped to EXIT_CLAIM_REFUSED, which the shepherd
+        # classifies alongside a fence: non-charging, and printed as the claim
+        # decision it is rather than as "subprocess failed transiently" — a
+        # leaked lease otherwise repeats that misleading line every tick for
+        # the full lease (claude P3 on `31232dc`).
+        release_reason = "claim refused"
+        release_claim = e.verdict != CLAIM_UNKNOWN
+        result = ImplementResult(ref=ref, pr_url=None, error=str(e))
+        return result
     except ImplementerOrphanedSubagent as e:
         # The message is already prefixed "orphaned sub-agent:" — that prefix is
         # what _review_feedback_exit_code() matches on. Deliberately do NOT try
         # to push whatever is in the worktree here: by construction the child may
         # still be writing, and racing its `git commit` (index.lock) or pushing a
         # half-finished change is worse than a free retry on the next tick.
+        release_reason = "orphaned sub-agent"
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
         return result
     except ImplementerOperationTimeout as e:
+        release_reason = "operation timed out"
         result = ImplementResult(
             ref=ref,
             pr_url=None,
@@ -1146,16 +1796,25 @@ def review_feedback_one(
         )
         return result
     except subprocess.CalledProcessError as e:
+        release_reason = "shell step failed"
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         result = ImplementResult(ref=ref, pr_url=None, error=msg)
         return result
     except SystemExit as e:
+        release_reason = "SystemExit"
         result = ImplementResult(ref=ref, pr_url=None, error=f"SystemExit: {e}")
         return result
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
+        release_reason = "unexpected error"
         result = ImplementResult(ref=ref, pr_url=None, error=f"{type(e).__name__}: {e}")
         return result
     finally:
+        # One `finally` rather than a release per arm: a claim released on
+        # only one exit path leaks on every other one (codex P2, ADR-010
+        # phase 2 / #352). The single exception is set above, where the store
+        # itself could not be reached.
+        if release_claim:
+            _release_claim(claim_ctx, reason=release_reason)
         if target and target.exists() and result is not None and result.error is None:
             try:
                 shutil.rmtree(target)
@@ -1592,6 +2251,21 @@ def _github_projection(existing: ExistingResult) -> dict[str, Any]:
     return projection
 
 
+def _triage_error(message: str, recorded: bool) -> str:
+    """Annotate a failure message with what `_mark_needs_triage` actually did.
+
+    The compare-and-swap can decline the write, and "recorded at a human gate"
+    and "left alone because a second executor now owns the proposal" are two
+    different states of the world. The caller turns this into
+    `ImplementResult.error`, so the batch summary says which one happened
+    instead of asserting a status write that never landed (claude P3 on
+    `8ac2080`) — the same thing the hand-back already does for its skip reason.
+    """
+    if recorded:
+        return message
+    return f"{message} (not recorded: another attempt now holds the proposal)"
+
+
 def _mark_needs_triage(
     ref: ProposalRef,
     *,
@@ -1600,7 +2274,13 @@ def _mark_needs_triage(
     message: str,
     pr_url: str | None = None,
     attempt: dict[str, Any] | None = None,
-) -> None:
+    claim_context: _ClaimContext | None = None,
+) -> bool:
+    """Record a terminal failure on the proposal. True when it was written.
+
+    False means a second executor now owns the proposal and its status was
+    deliberately left alone — see `_status_is_still_ours`.
+    """
     fields: dict[str, Any] = {
         "failure": {
             "code": code,
@@ -1612,10 +2292,27 @@ def _mark_needs_triage(
     if pr_url:
         fields["pr"] = pr_url
     if attempt:
+        # The same compare-and-swap the hand-back does, for the same reason:
+        # this write carries OUR attempt block, so making it while somebody
+        # else's run is live erases the block `_attempt_is_fresh` reads — and
+        # parks the proposal at a human gate for a race that, on the fence
+        # arm, the exception's own docstring calls "not a failure of the
+        # proposal" (claude P2 on `0808376`). An attempt-less call (no attempt
+        # was ever stamped) has nothing to compare and writes as before.
+        attempt_id = attempt.get("id") or ""
+        if not _status_is_still_ours(ref, attempt_id, doing=f"recording {code}"):
+            # Still release: the claim names our own record, so letting go of
+            # it frees nothing of theirs and leaks nothing of ours.
+            _release_claim(claim_context, reason=f"{stage}: {code}")
+            return False
         finished = dict(attempt)
         finished["finished_at"] = _now_iso()
         fields["attempt"] = finished
     update_status_yaml(ref, "needs-triage", **fields)
+    # A terminal arm relinquishes the claim it was holding (ADR-010 phase 2,
+    # #352) — best-effort, and never the reason this write fails.
+    _release_claim(claim_context, reason=f"{stage}: {code}")
+    return True
 
 
 def _mark_blocked(
@@ -1657,9 +2354,61 @@ def _mark_blocked(
     return True
 
 
-def _push_and_open_pr(repo_dir: Path, ref: ProposalRef) -> str:
+def _push_and_open_pr(
+    repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
+) -> str:
     branch = f"feat/agents-{ref.slug}"
-    _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
+    # One `git ls-remote`, not two: `_remote_head_sha` already answers None for
+    # a branch origin does not have, and guarding it with
+    # `_branch_exists_on_origin` only added a second remote call whose
+    # transient failure would read as "no branch" and send us down the `push
+    # -u` arm against a branch that exists (agy P3 on `f4d0dec`).
+    expected_sha = _remote_head_sha(repo_dir, branch)
+    if expected_sha:
+        # A previous attempt already pushed and died before opening the PR —
+        # a retried pod, exactly the case ADR-010 §8 names (mctl-agents#352).
+        # REPLACE, not adopt: this attempt cloned fresh and recreated the
+        # branch off the default branch, so the local branch does not contain
+        # the dead attempt's commits and this push discards them. That is
+        # intended — those commits are referenced by no PR, and the findings
+        # they were meant to address are being implemented again here — but
+        # `--force-with-lease` proves only that nobody MOVED the ref since the
+        # read below, never that we contain it, so calling it an adoption read
+        # as a guarantee it does not make (claude P3, carried from `b64b35b`).
+        #
+        # The lease is still the CAS that matters: it fails the push if a
+        # third writer moves the branch in the gap between the read above and
+        # the push below. A missing head is NOT expressible as a lease —
+        # `--force-with-lease=<branch>:` means "must not already exist", the
+        # negation of the precondition that selected this path — so an
+        # unreadable head falls through to the plain `-u` push instead.
+        if claim_context is not None:
+            # Deliberately NOT `entity_version=expected_sha`. This claim is on
+            # the PROPOSAL (`EntityRef.for_proposal`, acquired with
+            # `entity_version=""`) — a proposal has no git head to pin at
+            # implement time. Asserting this branch's SHA against it claims a
+            # pin the claim never made, and by ADR-010 §6 the server fences on
+            # the claim's own `entity_version` against the current head: a
+            # version the claim does not hold is a conflict it must answer,
+            # which would abort a perfectly good attempt as CLAIM_FENCED.
+            # `--force-with-lease` below is the authoritative git CAS and is
+            # unaffected either way (agy P2 on ddcdb0e).
+            _check_claim_or_raise(claim_context)
+        _run(
+            ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
+            cwd=repo_dir,
+        )
+    else:
+        # Brand new branch — no remote ref exists (or its head could not be
+        # read), so git has nothing to fence against. The CLAIM still does:
+        # the model ran for a long time between
+        # the acquire and here, and the claim may have been fenced or expired
+        # in that window. ADR-010 requires the check immediately before EVERY
+        # push this module performs, and "there is no remote ref yet" is a
+        # statement about git, not about who is allowed to write.
+        if claim_context is not None:
+            _check_claim_or_raise(claim_context)
+        _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
     return _open_pr_for_branch(ref, branch)
 
 
@@ -1774,15 +2523,64 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # item instead of draining the entire queue into needs-triage.
         raise SystemExit(f"SDK authentication failed: {exc}") from exc
 
+    # Never uuid.uuid4() (ADR-010 §8): a random id is non-deterministic in
+    # exactly the retried-pod case where determinism matters.
+    attempt_id = _resolve_attempt_id(ref.service, ref.slug, owner_epoch=0, attempt_ordinal=0)
+
+    # ExecutionClaim beside the yaml lease, dual-written through `enforce`
+    # (ADR-010 phase 2, #352). BEFORE the `in-progress` write, not after: a
+    # refused acquire means another executor is working this proposal right
+    # now, and the two writes this function would otherwise have already made
+    # — the status flip and the 130-minute yaml lease — would stamp our
+    # identity over theirs before we stood down.
+    #
+    # Below `enforce` this still cannot block: the claim is advisory there and
+    # `_acquire_claim` returns None.
+    #
+    # The order has a known cost, accepted deliberately: between a granted
+    # acquire and the `in-progress` write below, this process holds a claim
+    # that no `.status.yaml` records. A SIGKILL in that window (eviction, OOM,
+    # node drain) leaves an active claim with no `attempt` block, so
+    # `_attempt_is_fresh` — which reads only the yaml — answers "not held",
+    # the shepherd re-invokes, and every re-invocation is refused by the
+    # orphan claim until its lease expires. Bounded by that lease and by a
+    # window of two writes; the alternative ordering trades it for stamping
+    # our identity over a live holder, which is unbounded and silent (claude
+    # P3 on `31232dc`).
+    try:
+        claim_ctx = _acquire_claim(
+            EntityRef.for_proposal(ref.service, ref.slug),
+            PHASE_IMPLEMENT,
+            "",
+            attempt_id,
+            lease_seconds=_claim_lease_seconds(
+                "LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT", IMPLEMENT_ATTEMPT_LEASE
+            ),
+            proposal_ref=f"{ref.service}/{ref.slug}",
+        )
+    except (ImplementerFenced, ImplementerClaimRefused) as exc:
+        # A skip, not a failure, and explicitly NOT `_mark_needs_triage`: the
+        # entity is healthy and held by someone who is running it. Leave the
+        # proposal `accepted` and untouched so the holder's own run writes the
+        # only status this proposal gets, and do not charge the batch budget
+        # for a race this attempt did not cause.
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason=str(exc),
+            counts_toward_limit=False,
+        )
+
     started = datetime.now(UTC)
     attempt = {
-        "id": os.getenv("WORKFLOW_UID") or str(uuid.uuid4()),
+        "id": attempt_id,
         "started_at": started.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "expires_at": (
-            started + timedelta(minutes=130)
+            started + IMPLEMENT_ATTEMPT_LEASE
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
-    # Mark in-progress only after GitHub proves there is no prior result.
+    # Mark in-progress only after GitHub proves there is no prior result AND
+    # the claim was not refused above.
     update_status_yaml(ref, "in-progress", attempt=attempt, failure=None, blocked=None)
 
     target = None
@@ -1804,17 +2602,18 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
-            _mark_needs_triage(
+            recorded = _mark_needs_triage(
                 ref,
                 code="no-commits",
                 stage="agent",
                 message="implementer produced no commits",
                 attempt=attempt,
+                claim_context=claim_ctx,
             )
             return ImplementResult(
                 ref=ref,
                 pr_url=None,
-                error="implementer produced no commits",
+                error=_triage_error("implementer produced no commits", recorded),
             )
 
         # 6b. Chart MAJOR-version guard — the long-tail timebomb from the
@@ -1836,17 +2635,18 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 "will be pre-staged or the migration sequenced. See "
                 "feedback_eso_chart_2x_crd_lifecycle.md."
             )
-            _mark_needs_triage(
+            recorded = _mark_needs_triage(
                 ref,
                 code="chart-major-migration-required",
                 stage="policy",
                 message=msg,
                 attempt=attempt,
+                claim_context=claim_ctx,
             )
-            return ImplementResult(ref=ref, pr_url=None, error=msg)
+            return ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
 
         # 7. Push + PR.
-        pr_url = _push_and_open_pr(target, ref)
+        pr_url = _push_and_open_pr(target, ref, claim_context=claim_ctx)
 
         # 8. Mark implemented.
         completed_attempt = dict(attempt)
@@ -1859,45 +2659,127 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             failure=None,
             notes=None,
         )
+        _release_claim(claim_ctx, reason="implemented")
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
+    except ImplementerFenced as e:
+        # Not a failure of the proposal: the world this attempt was pinned to
+        # moved on. Left with a distinct triage code so a race is legible
+        # instead of landing in the generic `unexpected-error` arm.
+        msg = str(e)
+        recorded = _mark_needs_triage(
+            ref,
+            code="fenced",
+            stage="push",
+            message=msg,
+            attempt=attempt,
+            claim_context=claim_ctx,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
+        return result
+    except ImplementerClaimRefused as e:
+        # The push-site claim check refused this attempt: a skip, not a
+        # failure, and explicitly NOT `_mark_needs_triage` — the exception's
+        # own docstring forbids that outcome, and without this arm the refusal
+        # fell through to the generic `except Exception` and was recorded as
+        # `unexpected-error`/`agent`, i.e. a crash in the proposal's history
+        # (claude + agy P2 on `d5e2a48`).
+        #
+        # It DOES charge the batch budget, unlike the acquire-site arm this
+        # was first copied from. Every `counts_toward_limit=False` in this
+        # module is a pre-SDK exit — approval blocked, preflight failed,
+        # acquire refused — where nothing was spent. Here a full model pass
+        # has already run, and `_implement_refs` charges on that flag alone:
+        # leaving it False lets one mctl-api blip per proposal run the model
+        # again down the whole accepted queue, which is the subscription-usage
+        # multiplication `_max_proposals_error` exists to prevent
+        # (incident-7eb12290, claude P2 on `c29195c`).
+        #
+        # What happens to `.status.yaml` depends on WHICH refusal this is;
+        # the three are not one situation (claude P3 on `c29195c`):
+        msg = str(e)
+        if e.entity_is_free:
+            # `released` or `expired`, and nothing else: nobody holds it, and
+            # this attempt's own lease is the likeliest reason (nothing renews
+            # it mid-run). Parking the proposal `in-progress` would cost the
+            # rest of a 130-minute lease for a hold that does not exist, so
+            # hand it back: release best-effort and restore `accepted` so the
+            # next tick re-acquires and re-runs against the current world.
+            # Nothing was pushed, so there is nothing to reconcile. The
+            # restore is a compare-and-swap — see `_hand_back_if_still_ours`.
+            _release_claim(claim_ctx, reason="claim vanished mid-run")
+            if not _hand_back_if_still_ours(ref, attempt_id):
+                # The CAS declined: somebody else's attempt is in the file, so
+                # the proposal was NOT handed back and the next tick will not
+                # retry it. Two different outcomes must not read identically
+                # in the batch summary (claude P3 on `0808376`).
+                msg = f"{msg} (left `in-progress` for the attempt that now holds it)"
+        elif e.verdict == CLAIM_UNCLAIMED:
+            # CLAIM_UNCLAIMED on a `fenced` record, or on no record at all.
+            # `FREE_CLAIM_STATES` calls a fence free because acquiring over one
+            # is legal; deciding this proposal's status on it is not. A fence
+            # is somebody ELSE's write — the newer executor that fenced us is
+            # running right now and owns the `attempt` block — and an answer
+            # that named no claim proves nothing either way. Same handling as a
+            # live holder: leave the status alone (claude P2 on `af661d7`).
+            # The claim is still released: our claim_id names our own fenced
+            # record, so the call frees nothing of theirs.
+            _release_claim(claim_ctx, reason="claim fenced or unreadable mid-run")
+        elif e.verdict == CLAIM_UNKNOWN:
+            # The store could not answer. Fail closed: leave `in-progress`
+            # and let the yaml lease expire on its own rather than hand the
+            # entity to a second executor on the strength of an outage. The
+            # claim is deliberately NOT released — a release we cannot
+            # confirm is how an outage frees a live hold.
+            pass
+        else:
+            # CLAIM_HELD_BY_OTHER: a real, named holder is running this now,
+            # and their run writes the only status this proposal gets.
+            # Rewriting it back to `accepted` from here would clobber their
+            # `in-progress` and invite the second run this contract exists to
+            # prevent.
+            pass
+        return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
     except ImplementerOrphanedSubagent as e:
         # Batch mode has no review-attempt budget, so it needs no sentinel exit
         # code — but it does need its own triage code, otherwise this lands in
         # the generic `unexpected-error` arm below and a harness failure is
         # indistinguishable from a crash in the proposal's history.
         msg = str(e)
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="orphaned-subagent",
             stage="runtime",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except ImplementerOperationTimeout as e:
         msg = f"operation timed out: {e}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="operation-timeout",
             stage="runtime",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="shell-failed",
             stage="shell",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except SystemExit as e:
         # _stage_implementer_agent and a few other helpers raise SystemExit
@@ -1906,25 +2788,27 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # tree yet). Catching SystemExit alongside Exception here keeps
         # one bad proposal from killing a multi-proposal run mid-pipeline.
         msg = f"SystemExit: {e}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="configuration-error",
             stage="agent",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     except Exception as e:  # pragma: no cover — defensive  # noqa: BLE001 — surfaces as a result, not a crash
         msg = f"{type(e).__name__}: {e}"
-        _mark_needs_triage(
+        recorded = _mark_needs_triage(
             ref,
             code="unexpected-error",
             stage="agent",
             message=msg,
             attempt=attempt,
+            claim_context=claim_ctx,
         )
-        result = ImplementResult(ref=ref, pr_url=None, error=msg)
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
     finally:
         # Keep target dir for post-mortem on failure; clean only on success.

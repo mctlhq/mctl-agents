@@ -422,7 +422,8 @@ fail-safe direction `_shepherd_is_pinned` already takes.
 *"between those two points this execution IS the owner, and the cron must
 already be standing down"*. The sweeper sees a healthy owner and skips.
 
-**2 — direct implementer PR (#239).** On PR creation the implementer
+**2 — direct implementer PR (#239).** *Target state, not yet wired — it waits
+on the `handoff/complete` caller in #353.* On PR creation the implementer
 **handoff-starts** to `owner_type=shepherd`, which the next sweeper tick
 completes by acquiring at epoch+1. Between those two points the row exists in
 `handing-off`: a *deterministic* unowned state the reconciler can adopt, which
@@ -542,13 +543,214 @@ rollout judged by anecdote.
 | 0 | #350 | this ADR |
 | 1 | #351 | `LifecycleOwnership` only — store, API, client, writers, projection, `observe`, bootstrap |
 | 1 | mctl-api#293 | read-only inspection, ships before the soak so rollout is diagnosable |
-| 2 | #352 | `ExecutionClaim`, database-clock lease and renew, epoch fencing, handoff |
+| 2 | #352 | `ExecutionClaim`, database-clock lease and renew, epoch fencing, handoff — **shipped** (Python contract, clients, call sites, rollout gate; the mctl-api routes ship separately) |
 | 3 | #353 | reconciler over known ownership rows; adoption integration after #334 |
 | 4 | mctl-api#294 | guarded operator recovery with optimistic preconditions |
 | 5 | — | extension beyond DevLoop, gated on the pilot; hand-off to `mctlhq/.github#21` and `#42` |
 
 Phase 1 acquires ownership only. No `ExecutionClaim`, no lease and no fencing
 ship in #351; the existing 130-minute `attempt` lease is untouched until #352.
+
+**Phase 2 (#352), as shipped in this repository.** `orchestrator/lifecycle/contract.py`
+gained the claim types (`ExecutionClaim`, `Executor`, `ClaimAnswer`), the closed
+verdict vocabulary and the single classifier `claim_answer_from`, plus
+`idempotency_key_for`. `orchestrator/lifecycle/claim.py` is the synchronous
+`ClaimClient` for `run_shepherd`/`run_implementer`, and
+`orchestrator/temporal/activities/lifecycle.py` gained the `execution_claim`
+activity for `DevLoopWorkflow`. Three open questions from requirements.md were
+resolved as implemented, not merely proposed:
+
+- **Wire status for a fence.** A 409 carrying `code: "fenced"` is `CLAIM_FENCED`;
+  a 409 carrying `code: "claim-held"`, or any other 409, is `CLAIM_HELD_BY_OTHER`
+  — never guessed toward either side on an unrecognised code, and never a
+  licence to execute. One exception, and only one: a 409 whose claim record
+  names the **asking** attempt is `CLAIM_HELD_BY_ME`. Determinism in §8 exists
+  so a restarted pod re-derives the same identity and can retake the claim its
+  killed predecessor never released; classifying that conflict as a rival's
+  would leave the proposal stuck `in-progress` behind itself for the full
+  lease, with the operator told a competing executor holds it — naming us. The
+  comparison is `claim_verdict_for(claim, asking)`, so a free state on a 409
+  does **not** qualify: a conflict answering "nobody holds it" is a
+  contradiction, and resolving it toward vacancy is the one direction that
+  licenses a second executor. A fence outranks both — the epoch moved, so even
+  our own record is not a licence to continue.
+
+  A retake is *completed*, not assumed. A 409 is a refused acquire, so the
+  store never applied `lease_seconds`: what the client adopts is the dead
+  predecessor's remaining `lease_until`, while the implementer stamps a fresh
+  full-length `.status.yaml` lease moments later. That is the one path where
+  the two leases desynchronise, and in the dangerous direction — the claim
+  expiring before the run it guards, which answers `CLAIM_UNCLAIMED` to the
+  shepherd's freshness check and lets a second implementer start against a
+  live one. So `_acquire_claim` renews the adopted claim before returning a
+  context (the renew this section's determinism exists for) and treats a
+  refused renew as the refusal the 409 originally was — through the same
+  rollout predicate as every other refusal, so the stages cannot drift. The
+  acquire is logged `renewed`, never `acquired`: the store granted nothing, and
+  the retake is the event worth seeing, because reaching it means a pod died
+  holding a claim. The two `renewed` lines it produces — the remapped acquire
+  and the renew itself — are told apart by the `op=` field the claim log
+  carries, not by a seventh event: the vocabulary above stays closed.
+
+  **A 2xx renew needs no record.** `/claims/renew` is the one claim route whose
+  success is meaningful with an empty body, and the client reads a `204`, a
+  `{"status": "renewed"}` or an `{"ok": true}` as `claim-held-by-me` with no
+  record attached. A renew is addressed BY CLAIM ID by the actor already
+  holding it, so the record resolves nothing the caller did not send, and
+  nobody new is licensed; on `acquire`, where the record is the only thing
+  naming the winner, a body-less 2xx stays the protocol anomaly it is. This is
+  the claim-side counterpart of `/release` and `/terminal` answering
+  `wrote-no-record`, and it is pinned here because the retake made `renew` a
+  safety input for the first time: without it a store that answers renews
+  body-lessly refuses the restarted attempt on every restart, under
+  `LIFECYCLE_OWNERSHIP_REQUIRED`, until the orphan lease expires. The branch
+  is narrow on purpose, and narrow by ALLOW-list on both axes: it admits an
+  empty body, or one whose every key is an acknowledgement name (`ok`,
+  `renewed`, `result`, `status`, `success`) carrying an affirmative value —
+  literal `true`, or one of `accepted`, `active`, `held`, `ok`, `renewed`,
+  `success`, `updated`, compared case-insensitively. Both sets are written out
+  here because this section is the only place the renew response shape is
+  pinned, and a server author guessing `{"status": "extended"}` or
+  `{"ok": "true"}` would be refused. A store with anything more to say — the
+  new `lease_until` above all — should answer with a FULL claim record, which
+  is read the ordinary way; the tolerance here is for the bare
+  acknowledgement, and a half-record (`{"status": "renewed", "lease_until":
+  ...}`, no `claim_id`, no `state`) is deliberately neither: a partial record
+  is the one shape this image cannot verify and must not assume.
+  Everything else answers `claim-unknown` — a record this image could not read
+  (a 200 error envelope, a record from a newer mctl-api, a record nested one
+  level deeper), and equally an acknowledgement that says NO — `{"ok": false}`
+  and `{"status": "expired"}` on the value rule, `{"reason": "lease already
+  expired"}` on the key rule, since `reason` is no acknowledgement name at
+  all. Reading the sets this way round is the point: a name nobody has thought
+  of falls to `claim-unknown` rather than to the most confident verdict in the
+  vocabulary (claude P2 on `b362b5e` and `f4d0dec`). A body that fails to
+  parse at all — an HTML error page served with a 200 — is likewise
+  `claim-unknown`, as before.
+- **Deterministic attempt fallback.** `run_implementer._resolve_attempt_id`
+  resolves `WORKFLOW_UID`, then
+  `sha256("{service}|{slug}|{owner_epoch}|{attempt_ordinal}|{HOSTNAME}")`. The
+  `attempt_ordinal` is fixed at `0` for the implement phase, since this
+  repository's `.status.yaml` `attempt` block has no per-epoch attempt counter
+  to derive a real ordinal from yet — a fixed ordinal still satisfies the
+  determinism and renew-on-restart properties this fallback exists for. (The
+  review-remediation phase does have one, `review_attempts`, and uses it.)
+  `HOSTNAME` is in the digest because determinism must not become a collision:
+  without it two pods working the same proposal in the same epoch derive the
+  SAME executor id, each one's `acquire` reads as the other renewing its own
+  claim, and the mechanism meant to stop concurrent implementers licenses
+  them. In Kubernetes `HOSTNAME` is the pod name — stable across a container
+  restart inside one pod, distinct across pods. Residual, stated rather than
+  hidden: two processes on one host with no `WORKFLOW_UID` still collide; the
+  fix for that shape is to set `WORKFLOW_UID`, not to mint a random id.
+- **Lease durations.** `LIFECYCLE_CLAIM_LEASE_SECONDS_IMPLEMENT` (default
+  `7800`, matching the yaml lease it dual-writes beside) and
+  `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW`, both env-overridable tunables, not
+  contract. The review default is one `MERGE_POLL_INTERVAL` (1800s) as a
+  FLOOR, widened to `IMPLEMENTER_TIMEOUT_SECONDS + 2 ×
+  IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` when those bound a longer run. Nothing
+  renews a claim mid-run — `ClaimClient.renew`'s only production call is the
+  retake in `_acquire_claim`, which runs once, before the run starts, and never
+  again as a heartbeat — so a lease shorter than the run holding it expires
+  under its own attempt and comes back from the push-site check as
+  `CLAIM_UNCLAIMED`, standing the attempt down for a race that never happened.
+  `_claim_lease_seconds` is therefore LENGTHEN-ONLY: an override below the
+  computed lease is refused with a log line naming both numbers, and the
+  computed lease is used. Commenting the variables out of `.env.example`
+  documented that hazard; clamping removes it, so an active
+  `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW=1800` can no longer re-pin the floor
+  the sizing above exists to widen (agy P2 on `0af3b38`, claude P3 on
+  `b362b5e`). They stay commented out regardless, since a pinned value is
+  still one more thing to keep in step by hand.
+
+`run_implementer._push_followup` and the existing-branch path of
+`_push_and_open_pr` now push with `--force-with-lease=<branch>:<sha>` — the
+explicit-SHA form, never the bare flag — and both call `ClaimClient.check()`
+immediately beforehand, aborting non-charging on `CLAIM_FENCED`
+(`run_implementer.EXIT_FENCED`) and on a refusal — another executor holds the
+entity, or the store could not answer under the ownership break-glass —
+(`EXIT_CLAIM_REFUSED`). Both codes classify as `FollowupKind = "fenced"`: two
+different events, one shepherd handling, charge nothing and say which. Three
+verdicts reach that refusal and each is reported as itself rather than as a
+rival executor: `CLAIM_HELD_BY_OTHER` (a real, named holder),
+`CLAIM_UNKNOWN` (the store could not answer, failed closed under
+`LIFECYCLE_OWNERSHIP_REQUIRED`) and `CLAIM_UNCLAIMED` (the hold this attempt
+expected is gone — released, expired or fenced). In batch mode the same
+refusal is a skip at both sites — never `_mark_needs_triage` — but not the
+same skip. The acquire site exits before anything is spent, so it does not
+charge the batch budget; the push site runs after a full model pass, so it
+does (`counts_toward_limit` defaults True), otherwise one mctl-api blip per
+proposal re-runs the model down the whole accepted queue. What happens to
+`.status.yaml` follows the verdict, which the exception carries as an
+attribute: `CLAIM_HELD_BY_OTHER` leaves the file to the live holder,
+`CLAIM_UNKNOWN` fails closed and leaves the yaml lease to expire without
+releasing a claim it cannot confirm, and `CLAIM_UNCLAIMED` hands the proposal
+back — releasing and restoring `accepted` so the next tick retries instead of
+waiting out a 130-minute hold that does not exist.
+
+The hand-back is narrower than the verdict, on two axes. First, the verdict
+alone does not prove the entity is free: `FREE_CLAIM_STATES` folds `fenced` in
+beside `released` and `expired`, and `check` sends this attempt's own
+`claim_id`, so a claim fenced server-side by a newer executor comes back as our
+own fenced record and reads `CLAIM_UNCLAIMED`. That executor is running right
+now and owns the `attempt` block. The exception therefore carries the raw
+`claim_state` as well, and only `released` and `expired` — an answer that
+proves nobody is there — hand back; a `fenced` record, or an answer that named
+no claim at all, is handled like a live holder. Second, the restore is a
+compare-and-swap on `attempt.id`: between this attempt's `in-progress` write
+and the moment its claim turns out to be gone, a second executor can have taken
+the proposal legitimately, and `update_status_yaml(..., attempt=None)` would
+erase the block `_attempt_is_fresh` reads — letting a third implementer start.
+
+That compare-and-swap is a property of every status write an ending attempt
+makes, not of the hand-back alone, and lives in one predicate
+(`_status_is_still_ours`) for that reason. The 409 `{"code": "fenced"}` form —
+ADR-010 §6's primary fence encoding, as opposed to the 2xx `fenced` record —
+answers `CLAIM_FENCED` and lands on `_mark_needs_triage`, which writes
+`needs-triage` carrying the ending attempt's own block; unguarded, that is the
+same erasure plus a human gate on a race the fence is explicitly not a failure
+of. `_mark_needs_triage` therefore consults the same predicate whenever it was
+given an attempt, returns whether it wrote, and releases the claim either way.
+The same "do not act on what the store did not say" rule governs the release
+event: only a 2xx from `/release` logs `released`, because a body-less 204 and
+a plain `{"status": "released"}` land on opposite values of `accepted` while
+both being writes that freed the claim.
+That existing-branch push REPLACES the branch rather than adopting it: the
+retry clones fresh and recreates the branch off the default branch, so the
+dead attempt's commits are discarded. Intended — nothing references them —
+but `--force-with-lease` proves only that the ref did not move, never that we
+contain it. `run_shepherd._attempt_is_fresh` is the union of an active claim
+and the yaml lease. The `attempt` block's `id` is read by the CLAIM branch
+only; the yaml branch stays keyed on `expires_at` alone, because an unexpired
+lease is a live hold whether or not a holder was ever recorded, and with no
+`id` there is nobody to ask a claim about, so the yaml lease decides at every
+stage including `only`. A `CLAIM_UNKNOWN` never frees an attempt: like
+`claim.blocks_mutation`, it is gated on the `LIFECYCLE_OWNERSHIP_REQUIRED`
+break-glass, so an unreachable store holds rather than releases.
+`DevLoopWorkflow._watch_pr`'s `finally` still issues a bare `release` when the
+watch ends non-terminally. It was briefly changed to `handoff-start` and
+reverted inside this same change: `handoff-start` writes a HOLDING
+`handing-off` state that only `/handoff/complete` resolves, and no caller of
+that route exists in this repository yet (#353), so the write would have left
+every abandoned watch stuck in `handing-off` — strictly worse than the
+zero-owner gap a release leaves. There is deliberately no
+`workflow.patched("lifecycle-claims")` marker either: a marker is recorded in
+every new execution's history and can only be retired through
+`deprecate_patch` plus a second deploy, so it belongs to the change that
+actually ships the handoff, not to a branch that does not exist.
+
+**Known simplification.** The delegated-claim path (a shepherd fixing a
+steward-owned PR under the steward's epoch) is not fully wired: this repo has
+no existing mechanism to read the CURRENT ownership epoch from a Tier 3 CLI
+process, so both `run_implementer` and `run_shepherd` acquire claims with
+`owner_epoch=0` rather than the steward's live epoch. Epoch fencing is
+therefore inert for CLI-originated claims until that read is added; the
+`entity_version` fence (the git head SHA, via `--force-with-lease`) is
+unaffected and remains the authoritative CAS for every push in this
+repository. Merge authority is unaffected either way: it is re-evaluated at
+the merge boundary through `policy.merge_authority_for`,
+`run_shepherd._service_mode` and `NEVER_MERGE_SERVICES`, none of which read a
+claim.
 
 ## Testable invariants
 

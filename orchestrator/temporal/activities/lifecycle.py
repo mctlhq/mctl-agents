@@ -25,11 +25,16 @@ from temporalio import activity
 
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.contract import (
+    CLAIM_HELD_BY_ME,
+    CLAIM_UNKNOWN,
     OWNED_BY_ME,
     UNKNOWN,
+    ClaimAnswer,
+    Executor,
     Owner,
     OwnershipAnswer,
     answer_from,
+    claim_answer_from,
 )
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
@@ -281,6 +286,204 @@ async def lifecycle_ownership(req: OwnershipRequest) -> OwnershipResult:
             # error page from a gateway parses to {} as well, and reading that
             # as a completed write would drop the caller's claim on a write
             # that never reached the store.
+            body_empty=not raw,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# ExecutionClaim (ADR-010 phase 2, #352).
+#
+# A SECOND activity next to lifecycle_ownership, not an overload of it: the
+# workflow already exposes a `lifecycle_claim` query reporting the workflow's
+# OWNERSHIP claim state (dev_loop.py, LifecycleClaim / `:674-693`). Reusing
+# that name for the EXECUTION claim this activity handles would put two
+# different concepts behind one word in the one file where telling them apart
+# matters, so this one is `execution_claim` / `ExecutionClaim*` throughout.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutionClaimRequest:
+    """One claim operation, flattened for the activity boundary.
+
+    Same rationale as OwnershipRequest: flat scalars, every field defaulted,
+    so history recorded before a field existed still deserializes.
+    """
+
+    op: str = ""  # acquire | renew | check | record | release
+    kind: str = ""
+    entity_id: str = ""
+    phase: str = ""
+    owner_epoch: int = 0
+    entity_version: str = ""
+    executor_type: str = ""
+    executor_id: str = ""
+    attempt: str = ""
+    claim_id: str = ""
+    lease_seconds: int = 0
+    idempotency_key: str = ""
+    action: str = ""
+    outcome: str = ""
+    proposal_ref: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class ExecutionClaimResult:
+    """What the workflow gets back. `unknown` is the default verdict, same
+    conservative-by-default rule as OwnershipResult."""
+
+    verdict: str = CLAIM_UNKNOWN
+    claim_id: str = ""
+    owner_epoch: int = 0
+    entity_version: str = ""
+    executor_type: str = ""
+    executor_id: str = ""
+    state: str = ""
+    lease_until: str = ""
+    reason: str = ""
+    accepted: bool = False
+    # Carried for the same reason `accepted` is: the field answers a question
+    # the verdict cannot. CLAIM_HELD_BY_ME reaches a workflow identically
+    # whether the store GRANTED the acquire or REFUSED it with a record naming
+    # this attempt, and only the second obliges the caller to renew before
+    # leaning on the lease. Dropping it here is how the wire type would make
+    # that distinction unrepresentable — the omission `OwnershipResult.accepted`
+    # already shipped once (claude P3 on `0af3b38`).
+    retaken: bool = False
+    # Whether a claim RECORD came back, as opposed to a bare acknowledgement.
+    # A 2xx renew with no record answers `claim-held-by-me` with `claim_id`,
+    # `state` and `lease_until` all empty — indistinguishable, from the fields
+    # alone, from a record that arrived empty. Same argument as `retaken` one
+    # field up: the wire type must not make the distinction unrepresentable
+    # (claude P3 on `b362b5e`). An empty `claim_id` here is not a lost id: a
+    # renew is addressed BY claim id, so the caller keeps the one it sent and
+    # carries it into every later `check` / `release` (claude P3 on
+    # `f4d0dec`).
+    has_record: bool = False
+
+    @property
+    def may_execute(self) -> bool:
+        return self.verdict == CLAIM_HELD_BY_ME
+
+
+_CLAIM_PATHS = {
+    "acquire": "/api/v1/lifecycle/claims/acquire",
+    "renew": "/api/v1/lifecycle/claims/renew",
+    "check": "/api/v1/lifecycle/claims/check",
+    "record": "/api/v1/lifecycle/claims/record",
+    "release": "/api/v1/lifecycle/claims/release",
+}
+
+
+def _claim_payload(req: ExecutionClaimRequest) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "kind": req.kind,
+        "id": req.entity_id,
+        "phase": req.phase,
+        "owner_epoch": req.owner_epoch,
+        "entity_version": req.entity_version,
+        "executor_type": req.executor_type,
+        "executor_id": req.executor_id,
+        "attempt": req.attempt,
+    }
+    for key, value in (
+        ("claim_id", req.claim_id),
+        ("lease_seconds", req.lease_seconds),
+        ("idempotency_key", req.idempotency_key),
+        ("action", req.action),
+        ("outcome", req.outcome),
+        ("proposal_ref", req.proposal_ref),
+        ("reason", req.reason),
+    ):
+        if value:
+            body[key] = value
+    return body
+
+
+def _claim_result_from(answer: ClaimAnswer) -> ExecutionClaimResult:
+    """Flatten a shared ClaimAnswer into the activity's wire type.
+
+    Classification stays in contract.claim_answer_from — this function only
+    flattens what it already decided, the same discipline _result_from keeps
+    for ownership.
+    """
+    claim = answer.claim
+    return ExecutionClaimResult(
+        verdict=answer.verdict,
+        claim_id=claim.claim_id if claim else "",
+        owner_epoch=claim.owner_epoch if claim else 0,
+        entity_version=claim.entity_version if claim else "",
+        executor_type=claim.executor.type if claim else "",
+        executor_id=claim.executor.id if claim else "",
+        state=claim.state if claim else "",
+        lease_until=claim.lease_until if claim else "",
+        reason=answer.reason,
+        accepted=answer.accepted,
+        retaken=answer.retaken,
+        has_record=claim is not None,
+    )
+
+
+@activity.defn
+async def execution_claim(req: ExecutionClaimRequest) -> ExecutionClaimResult:
+    """Perform one execution-claim operation against mctl-api.
+
+    Returns an `unknown` verdict rather than raising on any failure — a claim
+    call must never fail the workflow; it declines the claim and lets the
+    existing fallback owner keep the entity.
+    """
+    path = _CLAIM_PATHS.get(req.op)
+    if path is None:
+        return ExecutionClaimResult(verdict=CLAIM_UNKNOWN, reason=f"unknown op {req.op!r}")
+
+    if not rollout.records_writes():
+        # Same short-circuit lifecycle_ownership applies (lines above), and
+        # for the same reason: it must live in the ACTIVITY, not in
+        # dev_loop.py, or a history recorded under a different rollout mode
+        # would replay a different command sequence.
+        mode = rollout.mode()
+        activity.logger.info("lifecycle claim %s skipped: %s=%s", req.op, rollout.ENV_VAR, mode)
+        return ExecutionClaimResult(
+            verdict=CLAIM_UNKNOWN,
+            accepted=False,
+            reason=f"rollout mode {mode}: claims not consulted",
+        )
+
+    if req.op in ("acquire", "renew", "check", "record", "release") and not req.attempt:
+        return ExecutionClaimResult(verdict=CLAIM_UNKNOWN, reason="attempt id is required")
+
+    try:
+        headers = auth_headers()
+    except Exception as exc:  # noqa: BLE001 — auth_headers raises on a missing token
+        activity.logger.warning("lifecycle claim %s has no usable credentials: %s", req.op, exc)
+        return ExecutionClaimResult(verdict=CLAIM_UNKNOWN, reason=f"auth: {exc}")
+
+    try:
+        async with httpx.AsyncClient(
+            base_url=MCTL_API_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS
+        ) as client:
+            resp = await client.post(path, json=_claim_payload(req), headers=headers)
+    except Exception as exc:  # noqa: BLE001 — httpx raises a wide family
+        activity.logger.warning("lifecycle claim %s unreachable: %s", req.op, exc)
+        return ExecutionClaimResult(verdict=CLAIM_UNKNOWN, reason=str(exc))
+
+    raw = resp.content
+    body: dict[str, Any] = {}
+    try:
+        parsed = resp.json()
+        if isinstance(parsed, dict):
+            body = parsed
+    except Exception:  # noqa: BLE001 — a non-JSON body is still a response
+        body = {}
+
+    return _claim_result_from(
+        claim_answer_from(
+            resp.status_code,
+            body,
+            Executor(type=req.executor_type, id=req.executor_id),
+            path=path,
             body_empty=not raw,
         )
     )

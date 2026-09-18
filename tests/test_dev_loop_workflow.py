@@ -1242,6 +1242,13 @@ class TestDevLoopWorkflow:
         Release, not terminal: terminal would mean finished, and a reconciler
         would leave it alone forever — which is the zero-owner gap #239
         describes, arrived at from the other direction.
+
+        And release, not `handoff-start`: `handoff-start` writes a HOLDING
+        `handing-off` state that only `/handoff/complete` resolves, and no
+        caller of it exists in this repository yet (#353). Asserting the
+        handoff here is what made this test red on `ddcdb0e` — the workflow
+        had already been reverted to `release` and the test had not. The
+        assertion follows the code, not the intended end state.
         """
         open_pr = PRState(
             found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
