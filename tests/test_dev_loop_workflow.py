@@ -118,7 +118,6 @@ def test_the_first_poll_never_ticks() -> None:
     assert max(2, legacy.shepherd_tick_every_polls) == legacy.shepherd_tick_every_polls
 
 
-
 @activity.defn(name="find_proposal_slug")
 async def _fake_find_proposal_slug(service: str, issue_number: str) -> str | None:
     """Deterministic fake mirroring the real activity's contract: the slug
