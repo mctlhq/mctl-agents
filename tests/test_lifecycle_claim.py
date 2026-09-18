@@ -605,6 +605,11 @@ def test_a_2xx_renew_describing_a_claim_we_cannot_read_is_never_a_hold(
         {"renewed": False},
         {"reason": "lease already expired"},
         {"message": "renewed"},
+        # The half-record ADR-010 now refuses by name: an acknowledgement
+        # carrying the new lease and nothing else that identifies the claim.
+        # A store with this much to say should answer with a FULL record
+        # (claude P3 on `467e23d`).
+        {"status": "renewed", "lease_until": "2026-09-18T22:00:00Z"},
         {"ok": True, "state": "expired"},
         {"ok": 1},
     ],
