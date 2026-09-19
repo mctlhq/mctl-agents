@@ -1,0 +1,270 @@
+"""ImplementSweepWorkflow / SweptImplementWorkflow orchestration tests (#412).
+
+Same harness as test_reconcile_workflow.py: the real workflow definitions
+against temporalio's time-skipping test environment, with fake activities.
+"""
+from __future__ import annotations
+
+import uuid
+
+import anyio
+import pytest
+from temporalio import activity
+from temporalio.common import RetryPolicy
+from temporalio.exceptions import ApplicationError
+from temporalio.testing import WorkflowEnvironment
+
+from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.stranded import StrandedProposal, StrandedScanResult
+from orchestrator.temporal.constants import IMPLEMENTATION_TASK_QUEUE
+from orchestrator.temporal.workflows.implement_sweep import (
+    ImplementSweepWorkflow,
+    ImplementSweepWorkflowInput,
+    SweptImplementWorkflow,
+)
+from tests.temporal_harness import Worker  # polls the admission queue too — see #395
+
+pytestmark = pytest.mark.anyio
+
+TASK_QUEUE = "test-mctl-implement-sweep"
+
+
+@pytest.fixture
+async def env():
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        yield env
+
+
+def _candidate(service="mctl-web", slug="issue-10-test") -> StrandedProposal:
+    return StrandedProposal(
+        service=service,
+        slug=slug,
+        updated_at="2026-09-19T18:00:00Z",
+        reason="accepted, no PR, no live DevLoopWorkflow",
+    )
+
+
+def _fake_activities(
+    *,
+    visibility_fails: bool = False,
+    active_ids: list[str] | None = None,
+    stranded: list[StrandedProposal] | None = None,
+    submit_gate: anyio.Event | None = None,
+):
+    received: dict = {"submits": []}
+
+    @activity.defn(name="list_active_dev_loop_ids")
+    async def fake_list_active_dev_loop_ids() -> list[str]:
+        if visibility_fails:
+            raise ApplicationError("visibility unavailable", non_retryable=True)
+        return active_ids or []
+
+    @activity.defn(name="find_stranded_accepted")
+    async def fake_find_stranded_accepted(
+        active_workflow_ids: list[str], grace_minutes: int
+    ) -> StrandedScanResult:
+        received["active_workflow_ids"] = active_workflow_ids
+        received["grace_minutes"] = grace_minutes
+        candidates = stranded if stranded is not None else [_candidate()]
+        return StrandedScanResult(
+            total_accepted=len(candidates), stranded=candidates, skipped=[]
+        )
+
+    @activity.defn(name="submit_and_wait")
+    async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+        if submit_gate is not None:
+            await submit_gate.wait()
+        received["submits"].append(input)
+        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+    return [
+        fake_list_active_dev_loop_ids,
+        fake_find_stranded_accepted,
+        fake_submit_and_wait,
+    ], received
+
+
+async def _run(
+    env,
+    activities,
+    cfg: ImplementSweepWorkflowInput | None = None,
+    *,
+    await_children: list[str] = (),
+):
+    """Run one tick and return its result.
+
+    `await_children` names the child workflow ids (service-slug pairs the
+    tick is expected to have started) to wait on BEFORE the Worker context
+    exits: ImplementSweepWorkflow returns as soon as it starts its
+    ABANDONed children, without waiting for them, so exiting the Worker
+    right after would drain it while a just-started child has not even been
+    dispatched a workflow task yet — a real, observed flake, not a
+    hypothetical one.
+    """
+    async with Worker(
+        env.client,
+        task_queue=TASK_QUEUE,
+        workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+        activities=activities,
+    ):
+        result = await env.client.execute_workflow(
+            ImplementSweepWorkflow.run,
+            cfg,
+            id=f"implement-sweep-test-{uuid.uuid4()}",
+            task_queue=TASK_QUEUE,
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        for child_id in await_children:
+            await env.client.get_workflow_handle(child_id).result()
+        return result
+
+
+class TestVisibilityFailure:
+    async def test_a_failed_visibility_query_starts_zero_children(self, env):
+        activities, received = _fake_activities(visibility_fails=True)
+
+        result = await _run(env, activities)
+
+        assert "active_workflow_ids" not in received, "find_stranded_accepted must not run"
+        assert received["submits"] == []
+        assert result.candidates == 0
+        assert result.submitted == 0
+        assert result.skipped == 0
+        assert result.skipped_reason is not None
+        assert "visibility" in result.skipped_reason
+
+
+class TestSubmitScoping:
+    async def test_the_implement_submit_is_scoped_to_service_and_slug(self, env):
+        """An unscoped submit would let one sweep implement a DIFFERENT
+        proposal — the hazard dev_loop.py documents for #203."""
+        activities, received = _fake_activities(
+            stranded=[_candidate(service="mctl-api", slug="issue-20-widget")]
+        )
+
+        result = await _run(
+            env, activities, await_children=["implement-sweep-mctl-api-issue-20-widget"]
+        )
+
+        assert result.submitted == 1
+        assert len(received["submits"]) == 1
+        submitted = received["submits"][0]
+        assert submitted.operation == "mctl-agents-implement"
+        assert submitted.params == {"service": "mctl-api", "slug": "issue-20-widget"}
+
+    async def test_the_submit_reaches_the_admission_queue(self, env):
+        """Asserted from recorded history, since a fake activity has no
+        notion of which queue it was scheduled on — mirrors
+        test_workflow_replay.py's own routing check."""
+        activities, _ = _fake_activities()
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                ImplementSweepWorkflow.run,
+                None,
+                id=f"implement-sweep-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await handle.result()
+            child = env.client.get_workflow_handle("implement-sweep-mctl-web-issue-10-test")
+            await child.result()
+            history = (await child.fetch_history()).to_json_dict()
+
+        queues = {
+            e["activityTaskScheduledEventAttributes"]["taskQueue"]["name"]
+            for e in history["events"]
+            if e["eventType"] == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+        }
+        assert queues == {IMPLEMENTATION_TASK_QUEUE}
+
+
+class TestGraceAndConfig:
+    async def test_grace_minutes_flows_from_input_to_the_activity(self, env):
+        activities, received = _fake_activities()
+
+        await _run(env, activities, ImplementSweepWorkflowInput(grace_minutes=42, max_submits=5))
+
+        assert received["grace_minutes"] == 42
+
+    async def test_a_default_input_uses_the_module_defaults(self, env):
+        activities, received = _fake_activities()
+
+        await _run(env, activities, None)
+
+        from orchestrator.temporal.constants import DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES
+
+        assert received["grace_minutes"] == DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES
+
+
+class TestPerTickCap:
+    async def test_only_up_to_the_cap_is_submitted_and_the_rest_are_counted(self, env):
+        candidates = [_candidate(service="mctl-web", slug=f"issue-{n}-test") for n in range(1, 4)]
+        activities, received = _fake_activities(stranded=candidates)
+
+        result = await _run(
+            env,
+            activities,
+            ImplementSweepWorkflowInput(grace_minutes=20, max_submits=2),
+            # Only the first two candidates survive the cap — see below.
+            await_children=[
+                "implement-sweep-mctl-web-issue-1-test",
+                "implement-sweep-mctl-web-issue-2-test",
+            ],
+        )
+
+        assert result.candidates == 3
+        assert result.submitted == 2
+        assert result.skipped == 1
+        assert len(received["submits"]) == 2
+
+
+class TestDedup:
+    async def test_a_second_tick_does_not_start_a_second_child(self, env):
+        """USE_EXISTING-equivalent dedup: a second start against a still-
+        RUNNING child id is a no-op, caught as WorkflowAlreadyStartedError.
+
+        One shared Worker context spans both ticks AND the eventual child
+        completion, deliberately: exiting a Worker context drains in-flight
+        activities, and the fake submit_and_wait for the first child is
+        parked on `gate` until this test releases it — draining a second
+        time (via a fresh `_run`) would hang waiting for a gate nothing has
+        set yet.
+        """
+        gate = anyio.Event()
+        activities, received = _fake_activities(submit_gate=gate)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            first = await env.client.execute_workflow(
+                ImplementSweepWorkflow.run,
+                None,
+                id=f"implement-sweep-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            assert first.submitted == 1
+
+            second = await env.client.execute_workflow(
+                ImplementSweepWorkflow.run,
+                None,
+                id=f"implement-sweep-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            assert second.submitted == 0
+            assert second.skipped == 1
+
+            gate.set()
+            child = env.client.get_workflow_handle("implement-sweep-mctl-web-issue-10-test")
+            await child.result()
+
+        assert len(received["submits"]) == 1

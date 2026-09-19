@@ -161,6 +161,11 @@ flowchart LR
 
     S3["schedule 1h<br/>создаётся paused (#179)"] --> INC["IncidentLoopWorkflow"]
     INC --> I["submit_and_wait('mctl-agents-incidents')<br/>SDK работает в Argo, не в воркере (agents#179)"]
+
+    S4["schedule 15m, offset 12<br/>создаётся unpaused (#412)"] --> SWEEP["ImplementSweepWorkflow"]
+    SWEEP --> ST["find_stranded_accepted<br/>accepted, без pr:, без live DevLoopWorkflow,<br/>без свежего attempt, не unrunnable/blocked,<br/>вне грейс-периода updated_at → STRANDED"]
+    SWEEP --> CH["start_child_workflow(SweptImplementWorkflow)<br/>до IMPLEMENT_SWEEP_MAX_SUBMITS за тик, ABANDON"]
+    CH --> SUB2["submit_and_wait('mctl-agents-implement')<br/>{service, slug} на admission-очередь"]
 ```
 
 [исходник](diagrams/temporal-flow-schedules.mmd)
@@ -185,3 +190,14 @@ flowchart LR
   `secondsAfterSuccess: 1800`. Результат нужно сохранять сразу, перечитать позже
   нельзя. Упавшие держатся дольше (`secondsAfterFailure: 259200`), специально —
   чтобы инцидент можно было разобрать на следующий день.
+- **ImplementSweepWorkflow (agents#412)** — единственный путь, которым `accepted`
+  становится actionable queue заново вне живого DevLoopWorkflow: флип
+  `mctl_trigger_approve` и запись `status: accepted` инцидент-респондером сами по
+  себе ничего не запускают. Тик fail-closed относительно visibility-запроса
+  (неизвестный active set → сабмитится ничего) и дедуплицируется id
+  ребёнка (`implement-sweep-{service}-{slug}`, `ALLOW_DUPLICATE` +
+  `WorkflowAlreadyStartedError` пойман как no-op) — без блокировки. Каждый
+  кандидат логируется строкой `STRANDED service=... slug=... reason=...`
+  независимо от того, был он сабмичен, отброшен грейс-периодом/лизой/cap'ом.
+  `cronworkflow-mctl-agents-implement` (Argo, `*/5`) остаётся suspended —
+  замена, а не временная приостановка.

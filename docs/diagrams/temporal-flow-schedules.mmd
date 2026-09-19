@@ -8,3 +8,8 @@ flowchart LR
 
     S3["schedule 1h<br/>создаётся paused (#179)"] --> INC["IncidentLoopWorkflow"]
     INC --> I["submit_and_wait('mctl-agents-incidents')<br/>SDK работает в Argo, не в воркере (agents#179)"]
+
+    S4["schedule 15m, offset 12<br/>создаётся unpaused (#412)"] --> SWEEP["ImplementSweepWorkflow"]
+    SWEEP --> ST["find_stranded_accepted<br/>accepted, без pr:, без live DevLoopWorkflow,<br/>без свежего attempt, не unrunnable/blocked,<br/>вне грейс-периода updated_at → STRANDED"]
+    SWEEP --> CH["start_child_workflow(SweptImplementWorkflow)<br/>до IMPLEMENT_SWEEP_MAX_SUBMITS за тик, ABANDON"]
+    CH --> SUB2["submit_and_wait('mctl-agents-implement')<br/>{service, slug} на admission-очередь"]

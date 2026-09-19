@@ -69,6 +69,64 @@ def test_all_keeps_the_original_control_queue_shape(visibility):
     assert control.max_concurrent_activities is None
 
 
+def test_the_implement_sweep_registers_on_the_control_queue_only(visibility):
+    """The sweep (#412) is a control-queue workflow like the other three —
+    it services no long Argo poll itself and must not land on either split
+    queue, which register no workflows at all."""
+    from orchestrator.temporal.workflows.implement_sweep import (
+        ImplementSweepWorkflow,
+        SweptImplementWorkflow,
+    )
+
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
+    assert ImplementSweepWorkflow in control.workflows
+    assert SweptImplementWorkflow in control.workflows
+    assert "find_stranded_accepted" in control.activity_names
+
+    for role in ("execution", "implementation"):
+        for plan in worker_plans(role, visibility):
+            assert ImplementSweepWorkflow not in plan.workflows
+            assert SweptImplementWorkflow not in plan.workflows
+
+
+def test_implement_sweep_tunables_are_read_from_the_environment(monkeypatch):
+    """Same `_int_env` rule IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES follows
+    (mctl-agents#412): env override, default, refusal on a bad value."""
+    from orchestrator.temporal.constants import (
+        implement_sweep_grace_minutes,
+        implement_sweep_max_submits,
+    )
+
+    monkeypatch.delenv("IMPLEMENT_SWEEP_GRACE_MINUTES", raising=False)
+    monkeypatch.delenv("IMPLEMENT_SWEEP_MAX_SUBMITS", raising=False)
+    assert implement_sweep_grace_minutes() == 20
+    assert implement_sweep_max_submits() == 5
+
+    monkeypatch.setenv("IMPLEMENT_SWEEP_GRACE_MINUTES", "30")
+    monkeypatch.setenv("IMPLEMENT_SWEEP_MAX_SUBMITS", "1")
+    assert implement_sweep_grace_minutes() == 30
+    assert implement_sweep_max_submits() == 1
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
+@pytest.mark.parametrize(
+    "env_var,fn_name",
+    [
+        ("IMPLEMENT_SWEEP_GRACE_MINUTES", "implement_sweep_grace_minutes"),
+        ("IMPLEMENT_SWEEP_MAX_SUBMITS", "implement_sweep_max_submits"),
+    ],
+)
+def test_a_malformed_implement_sweep_tunable_is_refused_at_startup(monkeypatch, bad, env_var, fn_name):
+    """A non-positive or unparseable value must not become a silent default
+    — it is a startup refusal, read where setup_schedules builds the
+    schedule's input, never inside workflow code."""
+    import orchestrator.temporal.constants as constants_module
+
+    monkeypatch.setenv(env_var, bad)
+    with pytest.raises(SystemExit):
+        getattr(constants_module, fn_name)()
+
+
 def test_all_also_polls_every_routed_queue(visibility):
     """`all` is the documented rollback target, so it has to work as one.
 

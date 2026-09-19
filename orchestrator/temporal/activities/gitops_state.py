@@ -37,6 +37,7 @@ import yaml
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from orchestrator.proposal_state import unrunnable_reason
 from orchestrator.temporal.activities.pr_state import _PR_API_URL_RE, _PR_URL_RE
 from orchestrator.temporal.activities.proposals import (
     AGENTS_STATE_PREFIX,
@@ -54,7 +55,8 @@ TREE_URL = (
 # Bound on the blob cache. Well above today's 212 proposals, and small
 # enough that a worker that never restarts cannot grow it without limit.
 _BLOB_CACHE_MAX = 4096
-_blob_cache: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
+_ParsedStatus = tuple[str, str | None, str | None, str | None, bool, bool]
+_blob_cache: OrderedDict[str, _ParsedStatus] = OrderedDict()
 
 # How many blob/PR reads to have in flight at once. The worker shares one
 # GitHub token with every dev loop; a burst of 200 parallel reads would
@@ -74,6 +76,23 @@ class ProposalStateRef:
     slug: str
     status: str
     pr_url: str | None
+    # The four fields below feed the implement-sweep's stranding predicate
+    # (mctl-agents#412, orchestrator/temporal/activities/stranded.py) only;
+    # reconcile/orphans never read them. Defaulted so a result recorded by
+    # a worker before this change still deserializes — the same rule
+    # PRSnapshot.head_sha follows.
+    updated_at: str | None = None
+    #: The `attempt.expires_at` .status.yaml records while an implementer
+    #: run holds this proposal (run_implementer.IMPLEMENT_ATTEMPT_LEASE).
+    #: None when there is no in-flight attempt.
+    attempt_expires_at: str | None = None
+    #: `proposal_state.unrunnable_reason(data) is not None` — a proposal
+    #: that is `accepted` with `control.requires_human_approval` set and no
+    #: verified approver (mctl-agents#349). A submit here could only refuse.
+    unrunnable: bool = False
+    #: Whether a durable `blocked:` marker is present, written once by
+    #: run_implementer for the same permanently-unrunnable condition.
+    blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -120,32 +139,52 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
-def _cache_get(sha: str) -> tuple[str, str | None] | None:
+def _cache_get(sha: str) -> _ParsedStatus | None:
     hit = _blob_cache.get(sha)
     if hit is not None:
         _blob_cache.move_to_end(sha)
     return hit
 
 
-def _cache_put(sha: str, value: tuple[str, str | None]) -> None:
+def _cache_put(sha: str, value: _ParsedStatus) -> None:
     _blob_cache[sha] = value
     _blob_cache.move_to_end(sha)
     while len(_blob_cache) > _BLOB_CACHE_MAX:
         _blob_cache.popitem(last=False)
 
 
-def _parse_status_yaml(text: str) -> tuple[str, str | None]:
-    """Return (status, pr_url) from a .status.yaml body.
+def _parse_status_yaml(text: str) -> _ParsedStatus:
+    """Return (status, pr_url, updated_at, attempt_expires_at, unrunnable,
+    blocked) from a .status.yaml body.
 
     Mirrors run_shepherd._load_status: flat YAML written by the
     investigator, defaulting to "proposed" the way _discover_refs does.
+
+    The last four are read once here, alongside status/pr_url, rather than
+    via a second parse of the same blob: they exist for the implement-sweep's
+    stranding predicate (mctl-agents#412), which needs to tell an `accepted`
+    proposal a live implementer run still holds (`attempt`) or that can never
+    run as written (`unrunnable`/`blocked`) from one a DevLoopWorkflow simply
+    has not reached yet.
     """
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("status file is not a mapping")
     status = str(data.get("status", "proposed"))
     pr = data.get("pr")
-    return status, str(pr) if pr else None
+    updated_at = data.get("updated_at")
+    attempt = data.get("attempt")
+    attempt_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    unrunnable = unrunnable_reason(data) is not None
+    blocked = bool(data.get("blocked"))
+    return (
+        status,
+        str(pr) if pr else None,
+        str(updated_at) if updated_at else None,
+        str(attempt_expires_at) if attempt_expires_at else None,
+        unrunnable,
+        blocked,
+    )
 
 
 async def _resolve_token_async() -> str:
@@ -177,7 +216,7 @@ async def _get_json(client: httpx.AsyncClient, url: str, token: str) -> object:
         raise ProposalListingError(f"non-JSON payload from {url}") from exc
 
 
-async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> tuple[str, str | None]:
+async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> _ParsedStatus:
     cached = _cache_get(sha)
     if cached is not None:
         return cached
@@ -258,7 +297,14 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
         async def one(service: str, slug: str, sha: str) -> ProposalStateRef | None:
             async with semaphore:
                 try:
-                    status, pr_url = await _read_blob(client, sha, token)
+                    (
+                        status,
+                        pr_url,
+                        updated_at,
+                        attempt_expires_at,
+                        unrunnable,
+                        blocked,
+                    ) = await _read_blob(client, sha, token)
                 except (ValueError, yaml.YAMLError) as exc:
                     # One unparseable status file must not blind the sweep to
                     # the other 200 — same tolerance _discover_refs has.
@@ -269,7 +315,16 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                         exc,
                     )
                     return None
-            return ProposalStateRef(service=service, slug=slug, status=status, pr_url=pr_url)
+            return ProposalStateRef(
+                service=service,
+                slug=slug,
+                status=status,
+                pr_url=pr_url,
+                updated_at=updated_at,
+                attempt_expires_at=attempt_expires_at,
+                unrunnable=unrunnable,
+                blocked=blocked,
+            )
 
         results = await _gather_or_raise([one(s, g, sha) for s, g, sha in paths])
 

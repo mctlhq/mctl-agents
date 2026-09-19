@@ -144,6 +144,26 @@ There is no unfiltered `--force` mode or automatic second-account retry.
 An operator retries by reviewing the failure and moving that one proposal
 from `needs-triage` back to `accepted`.
 
+`accepted` is swept, not just processed on request: Temporal's
+`implement-sweep-mctl-agents-schedule` (every 15 min, mctl-agents#412) reads
+every proposal's committed status from gitops `main`, and submits
+`mctl-agents-implement` for any `accepted` proposal that carries no `pr:`,
+no unexpired `attempt` lease, no `blocked`/`approval-missing` marker, whose
+`updated_at` is older than the stranding grace period
+(`IMPLEMENT_SWEEP_GRACE_MINUTES`, default 20), and whose derived
+DevLoopWorkflow id is not in the currently-running set. That last check is
+what makes the sweep safe beside a live DevLoop: `mctl_trigger_approve` and
+the incident responder's direct `status: accepted` write both flip a
+proposal to `accepted` with no owner, and before this the sweep that used to
+promote it (an Argo cron) had been suspended since the Temporal migration —
+so those proposals sat untouched until a human ran `mctl_trigger_implementer`
+by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS` (default 5) proposals are
+submitted per tick, scoped to `{service, slug}` on the same admission queue
+DevLoopWorkflow's own implement step uses; every candidate — submitted or
+skipped — is logged as `STRANDED service=... slug=... reason=...`, and an
+unknown active-DevLoop set (a failed visibility query) skips the whole tick
+rather than risk double-running an implementer.
+
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated
 as a plain skip: `mctl-agents-approve` only performs the `proposed ->

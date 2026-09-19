@@ -361,6 +361,17 @@ def test_every_history_actually_reaches_submit_and_wait(scenario: Scenario) -> N
     )
 
 
+# Fixtures replayed directly by tests/test_implement_sweep_replay.py rather
+# than through the SCENARIOS/prepatch/patched machinery above: #412's
+# ImplementSweepWorkflow has no exec-queue migration to be "prepatch" or
+# "patched" ABOUT (see that file's module docstring for why forcing it into
+# a Scenario fails two of the generic assertions here for reasons that are
+# true of the workflow by design). Named here too so this orphan-fixture
+# guard does not fire against coverage that exists, just not through this
+# module's own abstraction.
+_STANDALONE_FIXTURES = {"implement_sweep.json", "swept_implement.json"}
+
+
 def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     """An orphan fixture is a fixture nothing replays.
 
@@ -370,6 +381,10 @@ def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     from tests.replay_scenarios import HISTORY_DIR
 
     on_disk = {p.name for p in Path(HISTORY_DIR).glob("*.json")}
-    expected = {s.path.name for s in SCENARIOS} | {s.patched_path.name for s in SCENARIOS}
+    expected = (
+        {s.path.name for s in SCENARIOS}
+        | {s.patched_path.name for s in SCENARIOS}
+        | _STANDALONE_FIXTURES
+    )
     assert on_disk == expected
 
