@@ -266,8 +266,62 @@ def _closing_issue_numbers(node: dict[str, Any]) -> tuple[int, ...]:
     return tuple(n["number"] for n in raw if isinstance(n, dict) and isinstance(n.get("number"), int))
 
 
+DEVLOOP_PROBE_MAX_PER_TICK = 20
+"""Hard cap on closing-issue liveness calls ``discover_adoptable`` will make
+in one sweep. ``_OPEN_PRS_QUERY`` lists up to 50 open PRs per repo and each
+carries up to 5 ``closingIssuesReferences`` — with no cap, a single tick
+could fire up to 250 serial ``_dev_loop_owns_answer`` HTTP calls (10s socket
+timeout each, per ``run_shepherd.DEV_LOOP_LIVENESS_TIMEOUT_S``), unlike the
+sweep's own DevLoop filter (``run_shepherd._filter_dev_loop_owned``), which
+is concurrent and wall-clock budgeted. Once spent, remaining candidates are
+treated as unanswerable — fail-closed, same default this gate already
+applies to an UNKNOWN probe.
+"""
+
+
+@dataclass
+class _DevLoopProbeBudget:
+    """Per-tick state threaded through ``_devloop_free``: caps HTTP probes
+    and de-duplicates the two warnings this gate can print, so an operator
+    sees each at most once per tick instead of once per candidate PR.
+    """
+
+    remaining: int = DEVLOOP_PROBE_MAX_PER_TICK
+    warned_no_token: bool = False
+    warned_exhausted: bool = False
+
+    def note_missing_token(self) -> None:
+        if self.warned_no_token:
+            return
+        self.warned_no_token = True
+        print(
+            "warn: MCTL_TOKEN is not set — the DevLoop closing-issue "
+            "liveness probe cannot ask mctl-api, so every PR-adoption "
+            "candidate that closes an issue is refused (fail-closed) until "
+            "MCTL_TOKEN is configured"
+        )
+
+    def take(self) -> bool:
+        if self.remaining <= 0:
+            if not self.warned_exhausted:
+                self.warned_exhausted = True
+                print(
+                    f"warn: dev-loop closing-issue probe budget "
+                    f"({DEVLOOP_PROBE_MAX_PER_TICK}) spent for this tick; "
+                    "remaining PR-adoption candidates are treated as "
+                    "unknown (fail-closed)"
+                )
+            return False
+        self.remaining -= 1
+        return True
+
+
 def _devloop_free(
-    service: str, slug: str, closing_issue_numbers: tuple[int, ...] = ()
+    service: str,
+    slug: str,
+    closing_issue_numbers: tuple[int, ...] = (),
+    *,
+    probe_budget: _DevLoopProbeBudget | None = None,
 ) -> bool:
     """True only on a definite "no live DevLoop". Fails CLOSED on
     LEGACY_UNKNOWN — the opposite of the sweep's fail-open default, because
@@ -284,10 +338,25 @@ def _devloop_free(
     DevLoopWorkflow's id is keyed on. Each linked issue is probed the same
     way the sweep probes a real proposal slug; any one of them being owned or
     unanswerable refuses the whole gate.
+
+    ``probe_budget`` (``discover_adoptable`` creates one per tick and passes
+    it to every candidate) bounds the total number of closing-issue calls
+    this module makes in one sweep and warns once, loudly, when MCTL_TOKEN is
+    absent — without it, every call below already short-circuits to
+    LEGACY_UNKNOWN with no network I/O (``_dev_loop_owns_answer``'s own
+    "Never asked." branch), so this gate silently refused every
+    issue-closing candidate with no clue why until this warning existed
+    (mctlhq/mctl-agents#334 code review). Direct callers that pass no budget
+    (tests, one-off scripts) keep the prior unbounded, unwarned behaviour.
     """
     if run_shepherd._dev_loop_owns_answer(service, slug) != run_shepherd.LEGACY_FREE:
         return False
+    if closing_issue_numbers and not os.environ.get("MCTL_TOKEN", "").strip():
+        if probe_budget is not None:
+            probe_budget.note_missing_token()
     for n in closing_issue_numbers:
+        if probe_budget is not None and not probe_budget.take():
+            return False
         if run_shepherd._dev_loop_owns_answer(service, f"issue-{n}-adopted-pr") != run_shepherd.LEGACY_FREE:
             return False
     return True
@@ -320,6 +389,7 @@ def _refusal_reason(
     node: dict[str, Any],
     pr_url: str,
     known_proposal_pr_urls: frozenset[str],
+    probe_budget: _DevLoopProbeBudget | None = None,
 ) -> str | None:
     """Every gate but the findings check (which needs a PR snapshot fetch),
     in the cheapest-first order design.md §2 specifies. Returns the refusal
@@ -335,7 +405,9 @@ def _refusal_reason(
         return "head branch belongs to the implementer's deterministic prefix"
     if _owned_by_proposal(pr_url, known_proposal_pr_urls):
         return "already owned by an existing proposal"
-    if not _devloop_free(service, slug_for(number), _closing_issue_numbers(node)):
+    if not _devloop_free(
+        service, slug_for(number), _closing_issue_numbers(node), probe_budget=probe_budget
+    ):
         return "a running DevLoopWorkflow may own this entity (fail-closed)"
     if not _mode_permits(service):
         return "service resolves to SKIP (owned by another PR lifecycle)"
@@ -565,6 +637,7 @@ def discover_adoptable(
     *,
     budget: int | None = None,
     dry_run: bool = False,
+    service_filter: str | None = None,
 ) -> list[PRRef]:
     """The whole adoption pipeline for one sweep tick.
 
@@ -574,9 +647,16 @@ def discover_adoptable(
     remaining slots. A PR failing any gate is skipped with a one-line reason
     on stdout. An unreachable ownership store or a failed `gh` call yields
     zero adoptions for that PR/repo and never raises.
+
+    ``service_filter`` narrows the allowlist to one service, matching
+    ``run_shepherd``'s own ``--service`` semantics for proposal discovery
+    (``_discover_refs``) — without it, a targeted ``--service foo`` run still
+    swept every repo in ``SHEPHERD_ADOPT_REPOS``.
     """
     cap = max_prs_per_tick() if budget is None else max(budget, 0)
     repos = adopt_repos()
+    if service_filter:
+        repos = repos & {service_filter}
     if cap <= 0 or not repos:
         return []
 
@@ -588,6 +668,7 @@ def discover_adoptable(
     # Every recorded PR, terminal or not (see _all_adopted_pr_urls) — a
     # `refs`-only guard would miss a `review-stuck` record and re-adopt it.
     known_pr_urls = set(_all_adopted_pr_urls(state_dir, repos))
+    probe_budget = _DevLoopProbeBudget()
 
     for service in sorted(repos & set(SERVICES)):
         if len(refs) >= cap:
@@ -610,6 +691,7 @@ def discover_adoptable(
             reason = _refusal_reason(
                 repo=repo, service=service, number=number, node=node,
                 pr_url=pr_url, known_proposal_pr_urls=known_proposal_pr_urls,
+                probe_budget=probe_budget,
             )
             if reason:
                 print(f"info: {repo}#{number}: not adoptable ({reason})")

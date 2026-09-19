@@ -3395,7 +3395,11 @@ def main() -> None:
     # DevLoop filter above — a targeted --slug run and --reconcile never
     # touch adoption records.
     if adopt_prs and not args.slug and not args.reconcile:
-        refs.extend(pr_adoption.discover_adoptable(state_dir, dry_run=args.dry_run))
+        refs.extend(
+            pr_adoption.discover_adoptable(
+                state_dir, dry_run=args.dry_run, service_filter=args.service or None,
+            )
+        )
 
     if not refs:
         if args.reconcile:

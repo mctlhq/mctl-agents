@@ -277,6 +277,50 @@ def test_devloop_free_true_when_closing_issues_all_free(monkeypatch) -> None:
     assert pr_adoption._devloop_free("mctl-web", "pr-7", (42, 43)) is True
 
 
+def test_devloop_free_missing_token_warns_once(monkeypatch, capsys) -> None:
+    """P2 (code review on issue-334): without MCTL_TOKEN,
+    `_dev_loop_owns_answer` already short-circuits every closing-issue
+    check to LEGACY_UNKNOWN with no network I/O — but silently, once per
+    candidate. A shared `_DevLoopProbeBudget` must print the warning
+    exactly once, however many candidates or closing issues are probed."""
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+
+    def fake_answer(service: str, slug: str) -> str:
+        # Mirrors the real function: a bare "pr-<n>" slug never matches the
+        # issue-(\d+)- probe (structural LEGACY_FREE); a closing-issue slug
+        # does match, and with no MCTL_TOKEN the real function's own "Never
+        # asked." branch answers LEGACY_UNKNOWN.
+        return LEGACY_UNKNOWN if slug.startswith("issue-") else LEGACY_FREE
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", fake_answer)
+    budget = pr_adoption._DevLoopProbeBudget()
+    assert pr_adoption._devloop_free("mctl-web", "pr-7", (42,), probe_budget=budget) is False
+    assert pr_adoption._devloop_free("mctl-web", "pr-8", (43,), probe_budget=budget) is False
+    warnings = [line for line in capsys.readouterr().out.splitlines() if "MCTL_TOKEN is not set" in line]
+    assert len(warnings) == 1
+
+
+def test_devloop_free_probe_budget_caps_calls(monkeypatch) -> None:
+    """P2 (code review on issue-334): closing-issue probes must be bounded
+    per tick — up to 50 candidates x 5 closing issues each was unbounded,
+    serial HTTP. Once the shared budget is spent, remaining candidates fail
+    closed without calling `_dev_loop_owns_answer` for their closing
+    issues."""
+    monkeypatch.setenv("MCTL_TOKEN", "tok")
+    calls: list[str] = []
+
+    def fake_answer(service: str, slug: str) -> str:
+        calls.append(slug)
+        return LEGACY_FREE
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", fake_answer)
+    budget = pr_adoption._DevLoopProbeBudget(remaining=1)
+    assert pr_adoption._devloop_free("mctl-web", "pr-7", (1,), probe_budget=budget) is True
+    assert pr_adoption._devloop_free("mctl-web", "pr-8", (2,), probe_budget=budget) is False
+    assert calls.count("issue-1-adopted-pr") == 1
+    assert "issue-2-adopted-pr" not in calls
+
+
 def test_closing_issue_numbers_extracts_from_node() -> None:
     node = {"closingIssuesReferences": {"nodes": [{"number": 42}, {"number": 43}, {}]}}
     assert pr_adoption._closing_issue_numbers(node) == (42, 43)
@@ -547,6 +591,32 @@ def test_discover_adoptable_per_tick_cap(tmp_path, monkeypatch) -> None:
     # Only one PR's directory was actually written.
     adopted_dirs = list((tmp_path / "mctl-web" / "adopted-prs").iterdir())
     assert len(adopted_dirs) == 1
+
+
+def test_discover_adoptable_service_filter_scopes_to_one_service(tmp_path, monkeypatch) -> None:
+    """P2 (code review on issue-334): `run_shepherd --service foo` must scope
+    adoption the same way it already scopes proposal discovery
+    (`_discover_refs`'s `service_filter`) — not sweep every allowlisted repo.
+    """
+    _discover_env(monkeypatch, repos="mctl-web,mctl-design")
+    monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", lambda repo, number: make_pr(number=number, repo=repo))
+    monkeypatch.setattr(
+        run_shepherd, "read_codex_review",
+        lambda pr: run_shepherd.CodexReview(has_responded=True, findings=[make_finding()]),
+    )
+    listed: list[str] = []
+
+    def _list(repo: str):
+        listed.append(repo)
+        return [_node(7, head_branch="chore/manual")]
+
+    monkeypatch.setattr(pr_adoption, "_list_open_prs", _list)
+
+    refs = pr_adoption.discover_adoptable(tmp_path, service_filter="mctl-design")
+
+    assert listed == ["mctlhq/mctl-design"]
+    assert len(refs) == 1
+    assert refs[0].service == "mctl-design"
 
 
 def test_discover_adoptable_budget_zero_or_no_repos_short_circuits(tmp_path, monkeypatch) -> None:
