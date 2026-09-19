@@ -28,12 +28,12 @@ from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest,
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
-from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.constants import (
     EXECUTION_TASK_QUEUE,
     IMPLEMENTATION_TASK_QUEUE,
     implementation_max_concurrent_activities,
 )
+from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
