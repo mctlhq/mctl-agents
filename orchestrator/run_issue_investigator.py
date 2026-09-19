@@ -72,11 +72,18 @@ import yaml
 # the whole agent stack into that process, which is exactly what #149
 # forbids — the agent itself only ever runs in an Argo sandbox.
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
+from orchestrator.execution_identity import (
+    ExecutionContext,
+    ExecutionIdentityError,
+    load_from_environment,
+    mint_local,
+)
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 
 # subagent_wait defers its own claude_agent_sdk imports (see its module note),
 # so unlike options/mcp_guard below it is safe at module scope here.
+# execution_identity is stdlib-only for the same reason (mctlhq/mctl-agents#196).
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
     OrphanedSubagentError,
@@ -569,16 +576,23 @@ def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
     # on #247).
     source = published.get("source")
     control = published.get("control")
+    execution = published.get("execution")
     if not isinstance(source, dict):
         source = {}
     if not isinstance(control, dict):
         control = {}
+    if not isinstance(execution, dict):
+        execution = {}
     expected = [
         ("status", published.get("status"), "proposed"),
         ("source.repo", source.get("repo"), issue.ref.full_repo),
         ("source.issue", source.get("issue"), issue.ref.number),
         ("source.url", source.get("url"), issue.ref.url),
         ("control.requires_human_approval", control.get("requires_human_approval"), True),
+        # Read-only annotation, never approval/authorization semantics
+        # (mctlhq/mctl-agents#196, ADR 011) — only the fixed literal `agent`
+        # is checked; context_id/trace_id vary run to run by design.
+        ("execution.agent", execution.get("agent"), "issue-investigator"),
     ]
     return [
         f"{STATUS_FILENAME} says {field}={actual!r}, not {wanted!r}"
@@ -976,18 +990,37 @@ def _status_mode(proposal_dir: Path) -> int:
             os.unlink(probe)
 
 
-def write_status_yaml(proposal_dir: Path, issue: IssueData) -> Path:
+def write_status_yaml(
+    proposal_dir: Path, issue: IssueData, context: ExecutionContext | None = None
+) -> Path:
     """Write the initial .status.yaml for an issue-driven proposal.
 
     Status starts at `proposed`. The `source` block links the proposal back
     to the originating GitHub issue — the Tier 2 implementer reads it to add
     `Closes <repo>#<N>` to the PR, and `update_status_yaml` preserves it
-    through every later transition.
+    through every later transition (proposal_state.update_status_file merges
+    by default, so the `execution` block below survives untouched unless a
+    later writer explicitly overrides it).
+
+    `context` is read-only annotation (mctlhq/mctl-agents#196, ADR 011): it
+    names which agent/execution produced this proposal, never an
+    authorization. Callers that already loaded one (investigate()) pass it
+    through so every consumer of this run sees the same identity; callers
+    that did not (direct test calls) get a locally-minted, unverified one.
     """
+    context = context or load_from_environment(
+        executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+    )
     payload = {
         "status": "proposed",
         "updated_at": _now_iso(),
         "updated_by": "mctl-agents[bot]",
+        "execution": {
+            "context_id": context.context_id,
+            "trace_id": context.trace_id,
+            "agent": "issue-investigator",
+            "version": context.executor.version,
+        },
         "source": {
             "type": "github_issue",
             "repo": issue.ref.full_repo,
@@ -1463,6 +1496,28 @@ def investigate(
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
 
+    # Loaded once per run (mctlhq/mctl-agents#196, ADR 011) and reused for
+    # every consumer of this execution's identity — the MCP headers built by
+    # orchestrator.options load their own copy from the same
+    # MCTL_EXECUTION_CONTEXT_FILE, so in the control-plane-asserted case
+    # (once mctl-gitops writes that file) they agree by construction; only
+    # the local-fallback path can differ between independent loads, and that
+    # path is explicitly `unverified` evidence, never the audited value.
+    try:
+        execution_context = load_from_environment(
+            executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+        )
+    except (ExecutionIdentityError, OSError, json.JSONDecodeError) as exc:
+        # Mirrors orchestrator.options._execution_context_headers(): a
+        # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
+        # truncated, or tamper-evidence failure) must not crash the run —
+        # degrade to a locally-minted, explicitly unverified context instead.
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
+        execution_context = mint_local(
+            executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+        )
+    print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
+
     issue = gh_issue_view(issue_url)
     service = issue.ref.repo
     if service not in SERVICES:
@@ -1640,7 +1695,7 @@ def investigate(
         # 5. Write .status.yaml into STAGING as well, so a failure there
         #    publishes nothing at all rather than leaving the new
         #    documents paired with the previous run's status.
-        write_status_yaml(staging, issue)
+        write_status_yaml(staging, issue, execution_context)
 
         # 6. Publish by swapping DIRECTORIES, not file by file. Four
         #    individual os.replace calls are each atomic but the sequence
