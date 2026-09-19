@@ -641,6 +641,28 @@ def test_release_ownership_noop_when_not_owned_by_me(tmp_path, monkeypatch) -> N
     assert client.terminal_calls == []
 
 
+def test_release_ownership_warns_when_get_answers_unknown(tmp_path, monkeypatch, capsys) -> None:
+    """mctlhq/mctl-agents#334 code review: the other half of the `answer.wrote`
+    gap — a `get()` that answers UNKNOWN (store unreachable/uncertain) is not
+    the same as a legitimate UNOWNED/OWNED_BY_OTHER verdict, and must not be
+    treated as 'nothing to close' silently. It has to be logged, or a store
+    outage leaks the row with nothing in the log."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    client = _FakeOwnershipClient(
+        get_answer=OwnershipAnswer(verdict=UNKNOWN, reason="store unreachable"),
+    )
+    monkeypatch.setattr(pr_adoption, "OwnershipClient", _client_factory(client))
+    ref = _terminal_ref(tmp_path, status="merged")
+
+    pr_adoption.release_ownership(ref, reason="adopted PR reached terminal status 'merged'")
+
+    assert client.terminal_calls == []
+    out = capsys.readouterr().out
+    assert "warn:" in out
+    assert "mctlhq/mctl-web#7" in out
+    assert "store unreachable" in out
+
+
 def test_release_ownership_skipped_when_rollout_off(tmp_path, monkeypatch) -> None:
     """Below `records_writes()` no row was ever written, so the store is
     never even consulted — mirrors `_store_permits`'s own rollout-off gate."""

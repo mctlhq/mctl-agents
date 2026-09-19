@@ -40,6 +40,7 @@ from orchestrator.lifecycle.contract import (
     OWNED_BY_ME,
     OWNER_SHEPHERD,
     PHASE_REVIEW_REMEDIATION,
+    UNKNOWN,
     UNOWNED,
     EntityRef,
     Owner,
@@ -664,11 +665,13 @@ def release_ownership(ref: PRRef, *, reason: str) -> None:
     to close. Best-effort and silent on failure — closing a row must never
     fail the status transition it follows, the same rule
     ``run_implementer._release_claim`` already applies to the sibling claim
-    store. "Silent" covers exceptions only: a ``terminal()`` call that
-    returns without raising but did not actually write (``answer.wrote`` is
-    False) is logged with a ``warn:`` line, the same as a transport
-    exception, so a lost race or an unreachable store is at least visible
-    and not indistinguishable from a closed row.
+    store. "Silent" covers exceptions only: a ``get()`` call that answers
+    UNKNOWN (store unreachable/uncertain, not a legitimate UNOWNED/
+    OWNED_BY_OTHER verdict), and a ``terminal()`` call that returns without
+    raising but did not actually write (``answer.wrote`` is False), are both
+    logged with a ``warn:`` line, the same as a transport exception, so a
+    lost race or an unreachable store is at least visible and not
+    indistinguishable from a closed row.
     """
     if not rollout.records_writes():
         return
@@ -676,6 +679,17 @@ def release_ownership(ref: PRRef, *, reason: str) -> None:
     client = OwnershipClient()
     try:
         current = client.get(entity, PHASE_REVIEW_REMEDIATION, asking=_SHEPHERD_OWNER)
+        if current.verdict == UNKNOWN:
+            # The store could not answer at all — not the same as a
+            # legitimate UNOWNED/OWNED_BY_OTHER verdict. Silently returning
+            # here would leak the row on a store outage with nothing in the
+            # log, the other half of the `answer.wrote` gap fixed below
+            # (mctlhq/mctl-agents#334 code review).
+            print(
+                f"warn: {ref.repo}#{ref.number}: could not verify ownership "
+                f"before closing (verdict=unknown, {current.reason or 'store unreachable'})"
+            )
+            return
         if current.verdict != OWNED_BY_ME or current.ownership is None:
             # Nothing to close: never acquired (rollout was off at adoption
             # time), already released/terminal, or the store disagrees about
