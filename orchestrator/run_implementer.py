@@ -70,6 +70,17 @@ Idempotency:
     `--dry-run` reports a blocked proposal in its summary but never writes
     the marker and never changes the exit code.
 
+    A fourth gate sits between the GitHub preflight and the model call: when
+    the preflight finds no existing branch or PR at all, the implementer
+    also reads the proposal's source GitHub issue (`source:` in
+    `.status.yaml`, written by the investigator) and refuses -- writing
+    `needs-triage` with `failure.code` `source-resolved` or
+    `source-not-planned` at `failure.stage: admission` -- if that issue is
+    already closed, so subscription quota is never spent on work that is
+    already done or abandoned (mctl-agents#410). A proposal with no
+    `source` block, or whose issue is still open, is unaffected; an
+    unreadable GitHub leaves it `accepted` and untouched.
+
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
@@ -135,6 +146,7 @@ from orchestrator.proposal_state import (
     now_iso,
     update_status_file,
 )
+from orchestrator.source_issue import SourceIssueVerdict, read_source_issue
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
     OrphanedSubagentError,
@@ -527,6 +539,11 @@ class ImplementResult:
     # `main()` avoid re-failing forever on a permanently blocked proposal.
     blocked_is_new: bool = False
     counts_toward_limit: bool = True
+    # Set only on the admission gate's refusal arm (mctl-agents#410): the
+    # `(code, issue_ref)` pair `main()` prints in `=== Stale source ===`.
+    # Distinct from `blocked` -- this is a `needs-triage` write (the
+    # proposal leaves the accepted queue), not a durable `accepted` park.
+    stale_source: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -2473,6 +2490,107 @@ def _mark_blocked(
     return True
 
 
+def _superseding_pr_urls(repo: str, number: int) -> list[str]:
+    """Best-effort lookup of merged PRs GitHub already recorded as closing
+    `repo#number` (mctl-agents#410, the honest version of "closed but
+    superseded").
+
+    Only called on the closed-as-completed arm -- there is nothing to
+    supersede a `not_planned` issue with. Diagnostics only: any failure
+    (network, JSON, unexpected shape) or an empty result returns `[]`, and
+    the caller must never let that change the admission verdict -- this
+    lookup never runs before the refusal is decided, only after, to build
+    the message.
+    """
+    try:
+        events = _github_json(["gh", "api", f"repos/{repo}/issues/{number}/timeline"])
+    except Exception:  # noqa: BLE001 -- diagnostics only, never propagate
+        return []
+    if not isinstance(events, list):
+        return []
+
+    dated: list[tuple[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("event")
+        if kind == "cross-referenced":
+            source_issue = (event.get("source") or {}).get("issue") or {}
+            pr = source_issue.get("pull_request") or {}
+            merged_at = pr.get("merged_at")
+            url = source_issue.get("html_url")
+            if merged_at and url:
+                dated.append((merged_at, url))
+        elif kind == "closed" and event.get("commit_id"):
+            # A closing commit with no accompanying cross-reference event
+            # still proves supersession -- look up the PR(s) that commit
+            # belongs to. Best-effort per commit: one bad lookup must not
+            # discard URLs already found from other events.
+            try:
+                prs = _github_json(
+                    ["gh", "api", f"repos/{repo}/commits/{event['commit_id']}/pulls"]
+                )
+            except Exception as exc:  # noqa: BLE001 -- diagnostics only
+                print(f"warn: could not look up PRs for commit {event['commit_id']}: {exc}")
+                continue
+            if isinstance(prs, list):
+                for pr in prs:
+                    if not isinstance(pr, dict):
+                        continue
+                    merged_at = pr.get("merged_at")
+                    url = pr.get("html_url")
+                    if merged_at and url:
+                        dated.append((merged_at, url))
+
+    if not dated:
+        return []
+    dated.sort(key=lambda item: item[0], reverse=True)
+    seen: set[str] = set()
+    urls: list[str] = []
+    for _, url in dated:
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) == 3:
+            break
+    return urls
+
+
+def _stale_source_message(ref: ProposalRef, verdict: SourceIssueVerdict) -> str:
+    """Compose the admission-refusal message for a proposal's closed source
+    issue (mctl-agents#410).
+
+    Names the issue reference, close reason and close timestamp, and the
+    one supported recovery -- reopening the issue, or re-publishing the
+    proposal as 'proposed' -- rather than a re-check the implementer would
+    never run on its own. Deterministic for a fixed verdict, and stays
+    comfortably under the 2000-char clamp `_mark_needs_triage` applies to
+    `failure.message`.
+    """
+    not_planned = verdict.state_reason == "not_planned"
+    reason = "not planned" if not_planned else "completed"
+    closed_at = f" (closed {verdict.closed_at})" if verdict.closed_at else ""
+    message = (
+        f"source issue {verdict.issue_ref} is closed as {reason}{closed_at}; "
+        f"admission refused before any model attempt."
+    )
+    if not not_planned:
+        # Nothing to supersede a not-planned issue with -- only look on the
+        # completed arm.
+        source = _load_status(ref.status_path).get("source") or {}
+        repo = source.get("repo")
+        number = source.get("issue")
+        urls = _superseding_pr_urls(repo, number) if repo and number else []
+        if urls:
+            message += " Superseded by: " + ", ".join(urls) + "."
+    message += (
+        " Reopen the issue, or re-publish this proposal as 'proposed', to "
+        "make it runnable again."
+    )
+    return message
+
+
 def _push_and_open_pr(
     repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
 ) -> str:
@@ -2633,6 +2751,48 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             pr_url=existing.pr_url,
             error=existing.reason or "existing result needs triage",
         )
+
+    # Admission gate (mctl-agents#410): only reachable on `existing.action
+    # == "none"` -- no branch, no PR for this proposal at all -- because
+    # every other preflight outcome above already returned. That ordering
+    # matters: a proposal the implementer already carried to a `merged` PR
+    # *has* a closed source issue (the PR body says `Closes <repo>#<N>`),
+    # and gating before the preflight would relabel it stale on the very
+    # tick that re-selects it.
+    #
+    # Spends nothing: no SDK auth, no ExecutionClaim acquire, no `attempt`
+    # lease, no clone -- the whole point is to refuse before any of that,
+    # not after.
+    verdict = read_source_issue(_load_status(ref.status_path), stage="admission")
+    if verdict.linked and not verdict.known:
+        # GitHub did not answer. Not evidence about the proposal -- the
+        # same rule the shepherd's `linked and not known` guard follows.
+        # Leave it `accepted` and untouched; do not charge the batch
+        # budget for a GitHub blip.
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason="source issue unreadable; deferring",
+            counts_toward_limit=False,
+        )
+    if verdict.failure:
+        message = _stale_source_message(ref, verdict)
+        recorded = _mark_needs_triage(
+            ref,
+            code=verdict.failure["code"],
+            stage="admission",
+            message=message,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=_triage_error(message, recorded),
+            counts_toward_limit=False,
+            stale_source=(verdict.failure["code"], verdict.issue_ref or "?"),
+        )
+    # `not verdict.linked` (no usable source block -- incident-responder
+    # shape) or the issue is open: nothing to refuse, fall through to the
+    # model exactly as today.
 
     try:
         ensure_auth_for_sdk()
@@ -3218,6 +3378,12 @@ def main() -> None:
         print("\n=== Blocked ===")
         for result in blocked_results:
             print(f"  {result.ref.service}/{result.ref.slug}: {result.blocked}")
+
+    stale_sources = [(r, r.stale_source) for r in results if r.stale_source]
+    if stale_sources:
+        print("\n=== Stale source ===")
+        for result, (stale_code, issue_ref) in stale_sources:
+            print(f"  {result.ref.service}/{result.ref.slug}: {stale_code} {issue_ref}")
 
     outcome = _batch_outcome(results)
     print(
