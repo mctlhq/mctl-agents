@@ -62,6 +62,15 @@ SWEEP_STEP_TIMEOUT = timedelta(hours=2)
 SWEEP_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 SWEEP_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
+# Bounds how many times a tick will resubmit the SAME (service, slug) child
+# workflow id after prior executions under it ended Failed — mirrors
+# dev_loop.MAX_PRESTART_REQUEUES. Unlike dev_loop's in-loop requeue, this
+# bound is enforced ACROSS ticks (via VisibilityActivities.
+# count_swept_implement_failures), because a `pre_start` outcome touches no
+# `.status.yaml` field, so nothing else removes the proposal from next
+# tick's candidate set (mctl-agents#412 review).
+MAX_SWEEP_PRESTART_ATTEMPTS = 3
+
 # dev_loop.py's ENVIRONMENT / FAST_ACTIVITY_TIMEOUT / FAST_ACTIVITY_RETRY_POLICY,
 # duplicated rather than imported — incidents.py sets the same precedent for
 # its own best-effort record_execution call, for the reason given above.
@@ -246,6 +255,26 @@ class ImplementSweepWorkflow:
                 continue
 
             child_id = f"implement-sweep-{candidate.service}-{candidate.slug}"
+
+            prior_failures: int = await workflow.execute_activity(
+                "count_swept_implement_failures",
+                child_id,
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=ACTIVITY_RETRY_POLICY,
+            )
+            if prior_failures >= MAX_SWEEP_PRESTART_ATTEMPTS:
+                workflow.logger.warning(
+                    "STRANDED service=%s slug=%s reason=%s (%d prior failed sweep "
+                    "attempt(s) under %s; exceeded the retry budget, needs a human, "
+                    "not resubmitted)",
+                    candidate.service,
+                    candidate.slug,
+                    candidate.reason,
+                    prior_failures,
+                    child_id,
+                )
+                continue
+
             try:
                 await workflow.start_child_workflow(
                     SweptImplementWorkflow.run,

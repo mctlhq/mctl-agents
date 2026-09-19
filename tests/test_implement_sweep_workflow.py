@@ -54,6 +54,7 @@ def _fake_activities(
     stranded: list[StrandedProposal] | None = None,
     submit_gate: anyio.Event | None = None,
     submit_result: WorkflowResult | None = None,
+    prior_failures: int = 0,
 ):
     received: dict = {"submits": [], "record_execution": []}
 
@@ -62,6 +63,10 @@ def _fake_activities(
         if visibility_fails:
             raise ApplicationError("visibility unavailable", non_retryable=True)
         return active_ids or []
+
+    @activity.defn(name="count_swept_implement_failures")
+    async def fake_count_swept_implement_failures(workflow_id: str) -> int:
+        return prior_failures
 
     @activity.defn(name="find_stranded_accepted")
     async def fake_find_stranded_accepted(
@@ -89,6 +94,7 @@ def _fake_activities(
 
     return [
         fake_list_active_dev_loop_ids,
+        fake_count_swept_implement_failures,
         fake_find_stranded_accepted,
         fake_submit_and_wait,
         fake_record_execution,
@@ -286,6 +292,37 @@ class TestDedup:
             child = env.client.get_workflow_handle("implement-sweep-mctl-web-issue-10-test")
             await child.result()
 
+        assert len(received["submits"]) == 1
+
+
+class TestPrestartRetryBudget:
+    """mctl-agents#412 review, P1: a `pre_start` outcome touches no
+    `.status.yaml` field, so nothing else removes a proposal stuck that way
+    from the next tick's candidate set — an unbounded resubmit loop unless
+    this tick itself stops after MAX_SWEEP_PRESTART_ATTEMPTS."""
+
+    async def test_a_proposal_over_the_prestart_budget_is_not_resubmitted(self, env):
+        from orchestrator.temporal.workflows.implement_sweep import (
+            MAX_SWEEP_PRESTART_ATTEMPTS,
+        )
+
+        activities, received = _fake_activities(prior_failures=MAX_SWEEP_PRESTART_ATTEMPTS)
+
+        result = await _run(env, activities)
+
+        assert result.submitted == 0
+        assert received["submits"] == []
+
+    async def test_a_proposal_under_the_prestart_budget_is_still_submitted(self, env):
+        from orchestrator.temporal.workflows.implement_sweep import (
+            MAX_SWEEP_PRESTART_ATTEMPTS,
+        )
+
+        activities, received = _fake_activities(prior_failures=MAX_SWEEP_PRESTART_ATTEMPTS - 1)
+
+        result = await _run(env, activities, await_children=["implement-sweep-mctl-web-issue-10-test"])
+
+        assert result.submitted == 1
         assert len(received["submits"]) == 1
 
 

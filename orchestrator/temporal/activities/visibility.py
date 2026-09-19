@@ -35,3 +35,25 @@ class VisibilityActivities:
             ids.append(wf.id)
         activity.logger.info("visibility: %d active DevLoopWorkflow run(s)", len(ids))
         return ids
+
+    @activity.defn
+    async def count_swept_implement_failures(self, workflow_id: str) -> int:
+        """How many prior executions under this exact child workflow id ended Failed.
+
+        mctl-agents#412 review: `ImplementSweepWorkflow` is a fresh execution
+        every 15-minute tick and keeps no state of its own, so a `pre_start`
+        outcome — the one class that touches no `.status.yaml` field, because
+        nothing ever ran — would otherwise be resubmitted forever. The child's
+        workflow id is deterministic per (service, slug) and reused
+        (`id_reuse_policy=ALLOW_DUPLICATE`), so Temporal's own visibility
+        store is the only durable record of how many times a given proposal
+        has already failed to start; `ImplementSweepWorkflow` uses this to
+        stop resubmitting past a bound, the same way `MAX_PRESTART_REQUEUES`
+        bounds `dev_loop._implement`.
+        """
+        count = 0
+        async for _ in self._client.list_workflows(
+            f"WorkflowId = '{workflow_id}' AND ExecutionStatus = 'Failed'"
+        ):
+            count += 1
+        return count

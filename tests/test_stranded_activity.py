@@ -38,6 +38,12 @@ def _ref(service="mctl-web", slug="issue-10-widget", **overrides) -> ProposalSta
         attempt_expires_at=None,
         unrunnable=False,
         blocked=False,
+        # Default fixture models the normal investigator-created proposal,
+        # which always writes `control.requires_human_approval: True`
+        # (run_issue_investigator.py) — the no-control-block path is
+        # exercised explicitly by TestApprovalProvenance below.
+        has_control_block=True,
+        updated_by=None,
     )
     base.update(overrides)
     return ProposalStateRef(**base)
@@ -187,12 +193,50 @@ class TestIncidentSlugs:
         result = await _run(
             env,
             monkeypatch,
-            [_ref(service="mctl-web", slug="incident-2026-09-19-outage")],
+            [
+                _ref(
+                    service="mctl-web",
+                    slug="incident-2026-09-19-outage",
+                    has_control_block=False,
+                    updated_by="_incident-responder",
+                )
+            ],
             active=["dev-loop-mctlhq-mctl-web-10"],
         )
 
         assert len(result.stranded) == 1
         assert result.stranded[0].slug == "incident-2026-09-19-outage"
+
+
+class TestApprovalProvenance:
+    """mctl-agents#412 review, P1: an absent `control` block means "approval
+    was never required" (proposal_state.human_approval_satisfied's write-time
+    default), not "a human approved this". Only a recognised auto-accept
+    writer may skip straight through with no control block."""
+
+    async def test_no_control_block_and_an_unrecognised_writer_is_skipped(self, env, monkeypatch):
+        result = await _run(
+            env,
+            monkeypatch,
+            [_ref(has_control_block=False, updated_by="someone-unexpected")],
+        )
+
+        assert result.stranded == []
+        key, reason = result.skipped[0]
+        assert key == "mctl-web/issue-10-widget"
+        assert "control block" in reason
+
+    async def test_no_control_block_and_no_writer_at_all_is_skipped(self, env, monkeypatch):
+        result = await _run(
+            env,
+            monkeypatch,
+            [_ref(has_control_block=False, updated_by=None)],
+        )
+
+        assert result.stranded == []
+        key, reason = result.skipped[0]
+        assert key == "mctl-web/issue-10-widget"
+        assert "control block" in reason
 
 
 class TestManyProposals:

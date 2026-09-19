@@ -530,6 +530,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         discover_and_project,
         detect_orphans,
         visibility.list_active_dev_loop_ids,
+        visibility.count_swept_implement_failures,
         poll_issues_activity,
         # Bounded GitHub reads, same shape as detect_orphans two lines up —
         # the implement-sweep's stranding scan (mctl-agents#412).

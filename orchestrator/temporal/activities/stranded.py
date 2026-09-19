@@ -13,9 +13,13 @@ hold, checked in this order (design.md §1):
   2. its `attempt` lease has not expired — an implementer run holds it;
   3. it is unrunnable as written (`unrunnable_reason` / a `blocked` marker) —
      a submit here could only refuse (#349);
-  4. its `updated_at` is inside the stranding grace period — a DevLoopWorkflow
+  4. it has no `control` block and its `updated_by` does not name a
+     recognised auto-accept writer — an absent `control` block only means
+     "approval was never required" (a write-time default), not "a human or a
+     recognised auto-accept path put this in `accepted`";
+  5. its `updated_at` is inside the stranding grace period — a DevLoopWorkflow
      may be between its approve flip and its own implement submit;
-  5. its derived DevLoop workflow id is in the caller's active set — a live
+  6. its derived DevLoop workflow id is in the caller's active set — a live
      loop already owns it.
 
 Fail-CLOSED on an unknown active set: unlike `detect_orphans` (whose
@@ -35,6 +39,19 @@ from temporalio import activity
 
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.activities.orphans import expected_dev_loop_id
+
+# Writers allowed to put a proposal in `accepted` with no `control` block at
+# all and still be swept. `human_approval_satisfied` treats an absent
+# `control` block as "approval was never required" (a write-time default so
+# the incident responder's own writes are never refused) — that is not the
+# same fact as "a human, or a recognised auto-accept path, authorised this
+# submission". The investigator always writes `control.requires_human_
+# approval: True` (run_issue_investigator.py), so `has_control_block=False`
+# only ever legitimately comes from the incident responder's template
+# (agents/_incident-responder/CLAUDE.md's `updated_by: _incident-responder`);
+# anything else with no control block is refused a submit here rather than
+# assumed authorised (mctl-agents#412 review).
+_TRUSTED_NO_CONTROL_BLOCK_WRITERS = frozenset({"_incident-responder"})
 
 
 @dataclass(frozen=True)
@@ -107,6 +124,12 @@ def _scan(
             continue
         if ref.blocked:
             skipped.append((key, "a blocked marker is present"))
+            continue
+
+        if not ref.has_control_block and ref.updated_by not in _TRUSTED_NO_CONTROL_BLOCK_WRITERS:
+            skipped.append(
+                (key, "accepted with no control block and no recognised auto-accept writer")
+            )
             continue
 
         updated_at = _parse_iso(ref.updated_at)
