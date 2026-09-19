@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 from unittest import mock
 
-import pytest
 import yaml
 
 from orchestrator import run_implementer
@@ -408,8 +407,11 @@ def test_main_prints_a_stale_source_section(monkeypatch, tmp_path: Path, capsys)
         "sys.argv", ["run_implementer.py", "--state-dir", str(tmp_path)]
     )
 
-    with pytest.raises(SystemExit):
-        run_implementer.main()
+    # A refusal-only batch no longer raises SystemExit (codex P2 follow-up on
+    # mctl-agents#410, PR #416): the `needs-triage` write must reach the
+    # downstream commit-and-push step, which is gated on this step's Argo
+    # status rather than its exit code.
+    run_implementer.main()
 
     output = capsys.readouterr().out
     assert "=== Stale source ===" in output

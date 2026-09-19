@@ -142,12 +142,14 @@ def _stale_source_result(slug: str) -> run_implementer.ImplementResult:
     )
 
 
-def test_main_exits_1_for_a_stale_source_only_batch(monkeypatch, tmp_path, capsys) -> None:
-    # requirements.md's EARS pins this: a refusal-only batch still exits 1.
-    with pytest.raises(SystemExit) as exc_info:
-        _run_main(monkeypatch, tmp_path, [_stale_source_result("stale-only")])
+def test_main_exits_0_for_a_stale_source_only_batch(monkeypatch, tmp_path, capsys) -> None:
+    # codex P2 follow-up on mctl-agents#410 (PR #416): the `needs-triage`
+    # write IS the retirement, and the downstream commit-and-push step is
+    # gated on this step's Argo status, not its exit code, so a non-zero
+    # exit here can lose that write and make the proposal repeat forever.
+    # main() returns normally (no sys.exit) even for a refusal-only batch.
+    _run_main(monkeypatch, tmp_path, [_stale_source_result("stale-only")])
 
-    assert exc_info.value.code == 1
     output = capsys.readouterr().out
     assert "=== Stale source ===" in output
     assert "1 stale source" in output

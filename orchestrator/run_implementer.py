@@ -3429,17 +3429,22 @@ def main() -> None:
     )
     if outcome.failed:
         sys.exit(1)
-    # A refusal-only batch (nothing else in the tick succeeded) still exits
-    # 1, per requirements.md's EARS: "count it as a failed result (exit
-    # 1)". But once ANY proposal in the same batch succeeded, the refusal
-    # is a healthy side effect of that tick -- it retired a stale proposal
-    # instead of burning a model attempt on it -- not evidence anything
-    # went wrong, so it must not turn a green run red (codex P2 follow-up
-    # on mctl-agents#410). `outcome.stale_source` is deliberately excluded
-    # from `outcome.failed` above so a mixed batch reaches this check
-    # instead of the unconditional exit above.
-    if outcome.stale_source and not outcome.succeeded:
-        sys.exit(1)
+    # A refusal-only batch's `needs-triage` write IS the retirement -- unlike
+    # `blocked`'s idempotent diagnostic marker, there is no "same content
+    # next tick" safety net if it never lands. The write only exists on disk
+    # in this step; turning it into an actual gitops commit happens in the
+    # downstream commit-and-push step. Per the EXIT_BLOCKED_ONLY note above,
+    # the CWFT does not special-case any sentinel exit code today -- both its
+    # `when` gates compare Argo step status strings, so ANY non-zero exit
+    # here marks `implement` Failed and can skip that commit, leaving the
+    # proposal `accepted` so the next tick re-selects it, re-reads GitHub,
+    # and repeats forever -- precisely the loop this gate exists to end
+    # (codex P2 follow-up on mctl-agents#410, PR #416). Exit 0 here so the
+    # write is never put at risk; the `=== Stale source ===` section above
+    # plus the committed `.status.yaml` already carry the signal for
+    # operators, the same tradeoff already made for a mixed batch above.
+    # `outcome.stale_source` is deliberately excluded from `outcome.failed`
+    # above for the same reason.
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also
