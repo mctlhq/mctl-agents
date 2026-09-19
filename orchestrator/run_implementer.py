@@ -1389,14 +1389,60 @@ def _build_prompt(
 
     if review_feedback is not None:
         feedback_md = _render_review_feedback(review_feedback)
+        ci_only = _bundle_is_ci_only(review_feedback)
+        # What the run is actually about. Every one of these was hardcoded to
+        # the code-review framing; a CI-only bundle then read as a
+        # self-contradiction (mctl-agents#411 review).
+        work_items = "failing required checks" if ci_only else "codex findings"
+        if ci_only:
+            trigger_line = (
+                "- A required CI check is FAILING on this PR. The code review "
+                "is clean — there are no P1/P2 review findings to address. The "
+                "failing-check evidence is below."
+            )
+            read_line = (
+                "Read the failing-check evidence (below) and the relevant "
+                "lines in the working tree."
+            )
+            apply_line = (
+                "Apply the MINIMAL change that makes each failing check pass. "
+                "Stay in scope —\n   do not refactor outside the touched files."
+            )
+            refusal_line = (
+                "5. If a failing check is not something a code change can fix "
+                "(an infrastructure\n   outage, a flake), is already fixed in "
+                "the working tree, or must NOT be acted\n   on because of an "
+                "explicit operator decision recorded on the PR, do not commit."
+            )
+        else:
+            trigger_line = (
+                "- Code review left P1/P2 findings on this PR — they are listed below."
+            )
+            read_line = (
+                "Read the codex findings (below) and\n   the relevant lines in "
+                "the working tree."
+            )
+            apply_line = (
+                "Apply the MINIMAL change that resolves each finding. Stay in scope —\n"
+                "   do not refactor outside the touched files."
+            )
+            refusal_line = (
+                "5. If a finding is invalid, is already addressed, or must NOT "
+                "be acted on\n   because of an explicit operator decision "
+                "recorded on the PR, do not commit."
+            )
         if adopted:
             number = _adopted_pr_number(ref)
             pr_url = f"https://github.com/mctlhq/{ref.service}/pull/{number}"
-            subject = f"fix(review): address P1/P2 findings on mctlhq/{ref.service}#{number}"
+            subject = (
+                f"fix(ci): fix failing required checks on mctlhq/{ref.service}#{number}"
+                if ci_only
+                else f"fix(review): address P1/P2 findings on mctlhq/{ref.service}#{number}"
+            )
             context_spec_line = (
                 "- `$PROPOSAL_DIR` (env var) holds an adoption record "
                 "(`.prref.yaml`), NOT a requirements/design/tasks triplet — "
-                "this PR has no proposal. Ground yourself in the findings "
+                "this PR has no proposal. Ground yourself in the evidence "
                 "below and the diff on this branch."
             )
             commit_body_line = f"Body should reference the PR: `PR: {pr_url}`."
@@ -1405,7 +1451,11 @@ def _build_prompt(
                 "- Spec files live at `$PROPOSAL_DIR` (env var): "
                 "requirements.md, design.md, tasks.md."
             )
-            subject = f"fix(agents): address P1/P2 codex findings on {ref.slug}"
+            subject = (
+                f"fix(ci): fix failing required checks on {ref.slug}"
+                if ci_only
+                else f"fix(agents): address P1/P2 codex findings on {ref.slug}"
+            )
             commit_body_line = (
                 "Body should reference the proposal: "
                 f"`Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`."
@@ -1415,31 +1465,29 @@ Tier 2 implementer follow-up for proposal `{ref.service}/{ref.slug}`.
 
 Context:
 - Branch `{branch}` is already checked out on the existing PR.
-- Code review left P1/P2 findings on this PR — they are listed below.
+{trigger_line}
 {context_spec_line}
 
 Workflow:
-1. Use the `implementer` sub-agent. Read the codex findings (below) and
-   the relevant lines in the working tree.
-2. Apply the MINIMAL change that resolves each finding. Stay in scope —
-   do not refactor outside the touched files.
+1. Use the `implementer` sub-agent. {read_line}
+2. {apply_line}
 3. Stage and commit on the SAME branch (`{branch}`). Conventional Commits
    subject: `{subject}`.
    {commit_body_line}
 4. DO NOT push and DO NOT open a PR — the orchestrator will push to the
    existing branch after you finish. The PR auto-updates because the
    head ref does not change.
-5. If a finding is invalid, is already addressed, or must NOT be acted on
-   because of an explicit operator decision recorded on the PR, do not
-   commit. Instead write the refusal marker file
+{refusal_line}
+   Instead write the refusal marker file
    `{REFUSAL_MARKER_FILENAME}` in the root of the current working
    directory, with exactly this shape — one line, valid JSON:
 
    {{"refused": true, "reason": "<what you declined, and why>"}}
 
-   In `reason`, give the evidence: quote the operator note, or the code
-   that already satisfies the finding. Explain the same reasoning in your
-   final message.
+   In `reason`, give the evidence: quote the operator note, the code
+   that already satisfies it, or the log line showing the failure is an
+   infrastructure outage rather than a defect. Explain the same reasoning
+   in your final message.
 
    Write this file ONLY when you deliberately decided that changing nothing
    is the correct outcome. Never write it next to a commit, never as a
@@ -1453,7 +1501,7 @@ Workflow:
 
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
-- Stay strictly within scope — fixing the codex findings only.
+- Stay strictly within scope — fixing the {work_items} only.
 - Work ONLY inside the current working directory (the cloned target repo).
   NEVER create, edit, commit, or push files anywhere else — in particular
   the mounted gitops worktree under `/workdir`. If a finding implies a
@@ -1545,10 +1593,16 @@ def _render_ci_failures_section(ci_failures: list) -> str:
     optional (a `StatusContext` has no job/step, some checks have no run
     URL), so every line is rendered defensively.
     """
+    records = [item for item in ci_failures if isinstance(item, dict)]
+    if not records:
+        # The header was emitted before any record was known to render, so a
+        # list whose items are all non-dict produced a bare heading with
+        # nothing under it — and, in a CI-only bundle, a whole prompt telling
+        # the agent to fix checks it is never shown (review P3).
+        return ""
+
     lines: list[str] = ["## Failing required CI checks (fix each)", ""]
-    for i, item in enumerate(ci_failures, 1):
-        if not isinstance(item, dict):
-            continue
+    for i, item in enumerate(records, 1):
         check = item.get("check") or "(unknown check)"
         workflow = item.get("workflow")
         job = item.get("job")
@@ -1571,6 +1625,24 @@ def _render_ci_failures_section(ci_failures: list) -> str:
             lines.append(excerpt)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _bundle_is_ci_only(bundle: dict) -> bool:
+    """True when the bundle carries failing-check evidence and NO review findings.
+
+    mctl-agents#411 made this bundle shape reachable (an actionable required
+    check failed while the review is clean). The prompt built around it has to
+    know, because every sentence of the follow-up variant was written for the
+    other shape: "Code review left P1/P2 findings on this PR", "Read the codex
+    findings (below)", "if a finding is already addressed ... write the refusal
+    marker", "fixing the codex findings only". Spliced above a bundle that says
+    there are no findings, that plausibly produces a refusal (which charges
+    `refusals`) or an empty commit (a deterministic content failure), either of
+    which spends one of MAX_REVIEW_ATTEMPTS — so the check stays red, the same
+    bundle is rebuilt next tick, and the proposal walks to review-stuck over a
+    lint/mypy failure nobody ever asked the implementer to fix.
+    """
+    return not (bundle.get("summaries") or []) and bool(bundle.get("ci_failures") or [])
 
 
 def _render_review_feedback(bundle: dict) -> str:

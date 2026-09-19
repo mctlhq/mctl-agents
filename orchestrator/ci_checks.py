@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -228,13 +227,22 @@ def _fetch_annotations(repo: str, check_run_id: Any) -> list[dict[str, Any]]:
     Never raises: an API/parse failure degrades to an empty list, which the
     caller falls back on (title/summary/text) rather than failing the whole
     probe over one check's annotations being unavailable.
+
+    `Exception`, not an enumerated tuple, for the same reason
+    `read_required_checks` uses one — but the consequence here is worse, not
+    better. A missing or non-executable `gh` raises `OSError`, which
+    `CalledProcessError` does not cover, and `refresh_github_token()` can fail
+    its own way; either one escaping turns a RECOVERABLE "fall back to
+    title/summary" into a full probe outage via the caller's outer catch, so
+    the PR reads as `known=False` and stops being mergeable at all over one
+    check's annotations (mctl-agents#411 review P3).
     """
     try:
         refresh_github_token()
         proc = run_capturing([
             "gh", "api", f"repos/{repo}/check-runs/{check_run_id}/annotations",
         ])
-    except subprocess.CalledProcessError as e:
+    except Exception as e:  # noqa: BLE001 — deliberate: see the docstring
         print(
             f"warn: ci_checks: annotations fetch failed for check-run "
             f"{check_run_id} ({e}); falling back to check output"
@@ -242,7 +250,7 @@ def _fetch_annotations(repo: str, check_run_id: Any) -> list[dict[str, Any]]:
         return []
     try:
         data = json.loads(proc.stdout or "[]")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError, ValueError):
         print(
             f"warn: ci_checks: annotations for check-run {check_run_id} "
             f"returned malformed JSON; falling back to check output"

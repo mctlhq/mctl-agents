@@ -306,6 +306,36 @@ def test_probe_never_raises_when_gh_is_missing() -> None:
     assert status.blockers == ()
 
 
+def test_annotations_degrade_to_the_check_output_rather_than_the_whole_probe() -> None:
+    """`_fetch_annotations` has its own "never raises" contract, and it is the
+    RECOVERABLE one: falling back to title/summary costs an excerpt, while
+    letting the error reach `read_required_checks`' outer catch costs the
+    whole probe — the PR reads `known=False` and stops being mergeable at all
+    over one check's annotations. `OSError` escaped the enumerated tuple here
+    too (review P3).
+    """
+    pr = _FakePR(check_contexts=(_check_run_node(
+        conclusion="FAILURE", title="Run mypy", summary="1 error",
+    ),))
+    with patch.object(ci_checks, "run_capturing", side_effect=FileNotFoundError("gh")):
+        status = read_required_checks(pr)
+
+    assert status.known is True, "one check's annotations must not fail the probe"
+    assert len(status.blockers) == 1
+    assert status.blockers[0].excerpt, "it must have fallen back to title/summary"
+
+
+def test_annotations_degrade_when_refresh_github_token_fails() -> None:
+    pr = _FakePR(check_contexts=(_check_run_node(conclusion="FAILURE", title="Run mypy"),))
+    with patch.object(
+        ci_checks, "refresh_github_token", side_effect=RuntimeError("no token")
+    ):
+        status = read_required_checks(pr)
+
+    assert status.known is True
+    assert len(status.blockers) == 1
+
+
 def test_probe_never_raises_on_unexpected_node_shape() -> None:
     """A malformed/unexpected node must degrade to known=False, not raise."""
     pr = _FakePR(check_contexts=({"__typename": "CheckRun", "_commit_oid": HEAD_SHA},))
