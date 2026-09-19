@@ -95,6 +95,14 @@ agents:
       # per run against the target repo/issue, not fixed at publish time.
       - targetRepo: issue comments (github-issue-comment, via the same `gh issue view --json` call)
       - targetRepo: prior proposal triplet, when re-investigating (proposal-dir)
+      # mctlhq/mctl-agents#305: an explicit, PINNED alternative to the ambient
+      # CLAUDE.md/.claude/ load above. `.mctl/skills/**` at the target repo's
+      # SHA, read only via git object reads (never the worktree), validated
+      # against this agent's tool/permission envelope, and injected once —
+      # empty (and unread) unless ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative
+      # AND ExecutionProfile.spec.serviceSkills.enabled. See
+      # docs/resolver-pilot-status.md's "Service skills" section.
+      - targetRepo: .mctl/skills/** (pinned ServiceSkillSet, declarative mode only)
     modelPolicyTask: service_agent
     budgetEnv: ISSUE_INVESTIGATOR_BUDGET_USD   # default 3.00
     sandbox:
@@ -141,6 +149,15 @@ agents:
       # by the investigator into gitops agents-state and passed via
       # PROPOSAL_DIR, so it is pinned by the gitops commit, not by this file.
       - proposalDir: requirements.md / design.md / tasks.md (via PROPOSAL_DIR)
+      # mctlhq/mctl-agents#305: the pinned, validated alternative to the
+      # ambient CLAUDE.md/.claude/ load two lines up. `.mctl/skills/**`, read
+      # at the merge-base with the default branch (never this agent's own
+      # feat/agents-* HEAD — a skill edit this agent commits cannot become
+      # policy for its own next run without a human merging it first). Empty
+      # unless agents/_manifests/implementer/agent.yaml's
+      # spec.serviceSkills.enabled is true (it is, as of this proposal). See
+      # docs/resolver-pilot-status.md's "Service skills" section.
+      - targetRepo: .mctl/skills/** (pinned ServiceSkillSet, merge-base SHA)
     modelPolicyTask: service_agent
     budgetEnv: IMPLEMENTER_BUDGET_USD          # default 3.00
     sandbox:

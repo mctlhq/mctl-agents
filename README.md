@@ -181,6 +181,35 @@ the computed lease is refused with a log line and the computed one is used,
 so an override can widen a claim but never make it expire under its own run.
 `.env.example` ships them commented out all the same.
 
+#### Service skills
+
+A target repository can declare stable, repository-specific instructions
+(test matrix, generated-file rules, security invariants, build constraints)
+for a named mctl agent under `.mctl/skills/`:
+
+```text
+.mctl/skills/manifest.yaml
+.mctl/skills/<skill-id>/SKILL.md
+```
+
+`manifest.yaml` binds skill ids to agent names (`spec.bindings.implementer:
+[...]`) and names each skill's file (`spec.skills.<id>.path`). Every read
+happens against a pinned target-repository SHA — never the mutable
+worktree — and is validated against the agent's tool/permission envelope
+before injection (see `docs/resolver-pilot-status.md`'s "Service skills"
+section for the full contract, and `orchestrator/service_skills.py`'s module
+docstring for the implementation). A target repository can gate its own
+`.mctl/skills/**` PRs in CI with:
+
+```bash
+python -m orchestrator.service_skills --validate <path-to-clone> [--agent NAME]
+```
+
+which resolves against that clone's worktree HEAD and prints every
+rejection. Disabled by default per-agent (`spec.serviceSkills.enabled` in
+`agents/_manifests/<agent>/agent.yaml`) and globally via
+`MCTL_SERVICE_SKILLS=off`.
+
 ### Tier 3 — PR shepherd
 
 `orchestrator/run_shepherd.py` drives implementer-opened PRs through

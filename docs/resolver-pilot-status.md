@@ -121,6 +121,68 @@ Unchanged: `ISSUE_INVESTIGATOR_RESOLVER_MODE` still defaults to `legacy`, so
 nothing in production resolves declaratively. Shipping the code is not
 activation.
 
+## Service skills (mctlhq/mctl-agents#305)
+
+Before this proposal, both `build_implementer_agent_options` and
+`build_issue_investigator_options` (`orchestrator/options.py`) already set
+`cwd=<target clone>` with `setting_sources=["project"]`, so the Claude Code
+CLI loaded whatever `CLAUDE.md` / `.claude/agents/*.md` / `.claude/skills/**`
+the target repository happened to ship — from the **mutable working tree**,
+with no pin, no hash, no envelope check, and no record of which bytes were
+loaded. `orchestrator/service_skills.py` replaces that ambient channel with
+an explicit `ServiceSkillSet` contract:
+
+- A target repository declares `.mctl/skills/manifest.yaml` (binding named
+  mctl agents to skill ids) and `.mctl/skills/<id>/SKILL.md` files.
+  Deliberately NOT `.claude/skills/`: that root is already loaded ambiently
+  from the mutable worktree, and sharing one root would make "pinned bundle"
+  and "ambient bundle" indistinguishable in both code and audit.
+- Every read goes through `git ls-tree` / `git show` / `git cat-file`
+  against a **pinned SHA**, never `Path.read_*` against the worktree
+  (`service_skills._tree_entries`/`_blob_text`/`_blob_size`).
+- The pinned SHA is `git rev-parse HEAD` for a read-only agent, but the
+  **merge-base with `origin/HEAD`** for an agent-authored branch
+  (`implementer`/`shepherd` on `feat/agents-*`) — `service_skills.pin_sha`
+  — so a skill edit a previous run of the SAME agent committed cannot
+  become policy for the next run without a human merging it into the
+  default branch first.
+- Enablement and ceilings (`enabled`/`root`/`maxSkills`/`maxSkillBytes`/
+  `maxTotalBytes`) are a `spec.serviceSkills` block on the PLATFORM side:
+  `agents/_manifests/<agent>/agent.yaml` for a v1alpha1 agent (shipped here
+  for `implementer`), or `ExecutionProfile.spec.serviceSkills` for a
+  v1alpha2 agent once mctl-gitops's `execution-profile.schema.json` gains
+  the field (a separate mctl-gitops PR — until it lands, `issue-investigator`
+  resolves `enabled: false` and reads nothing, same as any agent that never
+  declared the block). The agent-to-skill BINDING lives in the target repo;
+  the PERMISSION to read it plus its limits lives on the platform side —
+  `ExecutionProfile.spec.skills` (the pre-existing platform-skill mechanism)
+  is unrelated and unchanged.
+- `resolve_bundle()` is a type boundary, not a runtime check: a
+  `ServiceSkillBundle` exposes only skill text and identifiers, never
+  `allowed_tools`/`mcp_servers`/`permission_mode`/`max_budget_usd`/
+  `policyRef`/a mutation scope, so a service skill physically cannot widen
+  what a run may do. A skill's front matter declaring a reserved authority
+  key (`tools`, `permissions`, `budgetUsd`, ...) rejects the whole bundle;
+  `requiresTools` can only ever narrow a run by failing it.
+- `ExecutionPlan` (declarative path) and the implementer's ad hoc call
+  (legacy v1alpha1 path, `run_implementer._resolve_implementer_service_skills`)
+  both record skill id / path / `sha256:`-prefixed content hash / byte
+  count, plus the manifest's own hash and the pinned SHA — but never the
+  skill TEXT, so `ExecutionPlan.to_log_dict()` stays small. New hashes carry
+  the `sha256:` prefix; the pre-existing `skill_hashes` field (bare hex,
+  hashing a platform-skill NAME rather than any content) is left as-is —
+  see "What the version identifiers guarantee" above for the same kind of
+  inconsistency accepted deliberately rather than silently changing an
+  already-asserted value.
+- Kill switch: `MCTL_SERVICE_SKILLS=off` makes every agent resolve an empty
+  bundle and run zero git subprocesses, read fresh per call exactly like
+  `ISSUE_INVESTIGATOR_RESOLVER_MODE` above — no redeploy needed to roll
+  back.
+- CI-usable validator: `python -m orchestrator.service_skills --validate
+  <repo-path> [--agent NAME]` resolves a target repository's
+  `.mctl/skills/**` against its worktree HEAD and prints every rejection, so
+  a target repository can gate its own service-skill PRs before merging.
+
 ## Rollback
 
 Set `ISSUE_INVESTIGATOR_RESOLVER_MODE=legacy` (already the default) —
