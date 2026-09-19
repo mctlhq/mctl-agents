@@ -32,8 +32,8 @@ from temporalio.worker import Worker as _TemporalWorker
 
 from orchestrator.temporal.constants import (
     EXECUTION_TASK_QUEUE,
-    IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
     IMPLEMENTATION_TASK_QUEUE,
+    implementation_max_concurrent_activities,
 )
 
 # The one activity the execution worker registers. Kept as a literal rather
@@ -82,18 +82,31 @@ class Worker:
             if routed
             else None
         )
+        # The admission limit is a default a caller may override, not a
+        # second value for the same keyword: a test that passes
+        # max_concurrent_activities through Worker(...) already reaches the
+        # control and execution workers via **kwargs, and must reach this
+        # one the same way rather than raise TypeError (agy P2 on #397).
+        implementation_kwargs = {
+            "max_concurrent_activities": implementation_max_concurrent_activities(),
+            **kwargs,
+        }
         self._implementation = (
             _TemporalWorker(
                 client,
                 task_queue=IMPLEMENTATION_TASK_QUEUE,
                 activities=routed,
-                max_concurrent_activities=IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
-                **kwargs,
+                **implementation_kwargs,
             )
             if routed
             else None
         )
         self._entered: list[_TemporalWorker] = []
+
+    @property
+    def workers(self) -> list[_TemporalWorker]:
+        """The real SDK workers this harness drives, in start order."""
+        return [w for w in (self._control, self._execution, self._implementation) if w is not None]
 
     async def __aenter__(self) -> Worker:
         # Start them in order and tear down whatever already started if a
@@ -103,20 +116,26 @@ class Worker:
         # suite shows up as an unrelated test hanging on a task some ghost
         # worker already took. Cheap insurance against an expensive symptom
         # (claude P3 on #282).
-        for worker in (self._control, self._execution, self._implementation):
-            if worker is None:
-                continue
+        for worker in self.workers:
             try:
                 await worker.__aenter__()
-            except BaseException:
-                for started in reversed(self._entered):
-                    await started.__aexit__(None, None, None)
-                self._entered.clear()
+            except BaseException as startup_error:
+                # Same unwind as __aexit__: every started worker, even if
+                # one of them refuses to stop (agy P3 on #397). The startup
+                # error is the one worth seeing; a teardown error must not
+                # replace it, so it rides along as context.
+                try:
+                    await self._exit_entered(None, None, None)
+                except BaseException as teardown_error:
+                    raise startup_error from teardown_error
                 raise
             self._entered.append(worker)
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
+        await self._exit_entered(*exc)
+
+    async def _exit_entered(self, *exc: Any) -> None:
         # Reverse order, and every one of them even if an earlier exit
         # raises — a worker left polling is the hang described above.
         first_error: BaseException | None = None

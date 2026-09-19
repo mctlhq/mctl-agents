@@ -92,10 +92,21 @@ def _int_env(name: str, default: int) -> int:
 # are read against — the gitops values file is where N sits next to the
 # schedule-to-start alert that tells you it is wrong.
 #
+# A function, not a module constant, on purpose: a constant would be
+# evaluated on import by EVERY role, so a typo in a shared env would take
+# down control and execution workers that never touch this queue. Only the
+# role that builds the implementation plan pays for a bad value.
+#
 # It is a per-PROCESS limit, not a distributed semaphore: capacity is
 # replicas times N. That is why the implementation deployment is pinned to one
 # replica and mctl-gitops fails CI if that changes (#1285).
-IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES = _int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3)
+IMPLEMENTATION_CAPACITY_ENV = "IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES"
+DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES = 3
+
+
+def implementation_max_concurrent_activities() -> int:
+    return _int_env(IMPLEMENTATION_CAPACITY_ENV, DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES)
+
 
 # Where the Temporal SDK's Prometheus exporter binds (ADR-008 D5, #252).
 #

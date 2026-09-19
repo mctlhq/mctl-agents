@@ -30,10 +30,10 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
-    IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
     IMPLEMENTATION_TASK_QUEUE,
     METRICS_PORT,
     TASK_QUEUE,
+    implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.worker import (
     owns_schedules,
@@ -95,7 +95,7 @@ def test_all_keeps_the_admission_limit_on_the_implementation_queue(visibility):
     plans = worker_plans("all", visibility)
     implementation = next(p for p in plans if p.task_queue == IMPLEMENTATION_TASK_QUEUE)
 
-    assert implementation.max_concurrent_activities == IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES
+    assert implementation.max_concurrent_activities == implementation_max_concurrent_activities()
     assert implementation.activity_names == {"submit_and_wait"}
 
 
@@ -111,7 +111,7 @@ def test_the_implementation_worker_polls_only_the_admission_queue(visibility):
     assert [p.task_queue for p in plans] == [IMPLEMENTATION_TASK_QUEUE]
     assert plans[0].activity_names == {"submit_and_wait"}
     assert plans[0].workflows == []
-    assert plans[0].max_concurrent_activities == IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES
+    assert plans[0].max_concurrent_activities == implementation_max_concurrent_activities()
     assert plans[0].max_concurrent_workflow_tasks is None
 
 
@@ -129,27 +129,39 @@ def test_the_execution_worker_is_untouched_by_the_admission_queue(visibility):
     assert EXECUTION_MAX_CONCURRENT_ACTIVITIES == 40
 
 
-def test_implementation_capacity_is_read_from_the_environment(monkeypatch):
+def test_implementation_capacity_is_read_from_the_environment(monkeypatch, visibility):
     """N is the number an operator moves, so it comes from values.yaml via
     env — not from a constant that needs a code release to change."""
-    from orchestrator.temporal import constants
-
     monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "5")
-    assert constants._int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3) == 5
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 5
 
     monkeypatch.delenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES")
-    assert constants._int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3) == 3
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 3
 
 
 @pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
-def test_a_capacity_that_admits_nothing_is_refused_at_startup(monkeypatch, bad):
+def test_a_capacity_that_admits_nothing_is_refused_at_startup(monkeypatch, visibility, bad):
     """Zero or garbage must not become a worker that polls and admits
     nothing forever — that is a queue nobody reads with extra steps."""
-    from orchestrator.temporal import constants
-
     monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", bad)
     with pytest.raises(SystemExit):
-        constants._int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3)
+        worker_plans("implementation", visibility)
+
+
+@pytest.mark.parametrize("role", ["control", "execution"])
+def test_a_bad_capacity_cannot_take_down_a_role_that_never_admits(monkeypatch, visibility, role):
+    """A typo in a shared env must fail only the admission worker.
+
+    N is read when the implementation plan is built, not on import: a
+    module-level constant would SystemExit every role at import time, so a
+    bad value in a configmap reused across the three deployments would
+    crash-loop control and execution workers that never touch the queue
+    (claude P3 on #397).
+    """
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "nope")
+    plans = worker_plans(role, visibility)
+
+    assert IMPLEMENTATION_TASK_QUEUE not in {p.task_queue for p in plans}
 
 
 def test_the_execution_worker_polls_only_the_new_queue(visibility):

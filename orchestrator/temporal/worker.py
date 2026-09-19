@@ -61,10 +61,10 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
-    IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
     IMPLEMENTATION_TASK_QUEUE,
     METRICS_PORT,
     TASK_QUEUE,
+    implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
@@ -492,17 +492,22 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     )
 
-    implementation_plan = WorkerPlan(
-        task_queue=IMPLEMENTATION_TASK_QUEUE,
-        workflows=[],
-        activities=[submit_and_wait],
-        max_concurrent_activities=IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
-    )
+    # Built lazily: N comes from the environment and a bad value is a
+    # startup refusal, which must only ever hit a role that serves the
+    # admission queue — never a control or execution worker that would
+    # otherwise be perfectly healthy.
+    def implementation_plan() -> WorkerPlan:
+        return WorkerPlan(
+            task_queue=IMPLEMENTATION_TASK_QUEUE,
+            workflows=[],
+            activities=[submit_and_wait],
+            max_concurrent_activities=implementation_max_concurrent_activities(),
+        )
 
     if role == "execution":
         return [execution_plan]
     if role == "implementation":
-        return [implementation_plan]
+        return [implementation_plan()]
     if role == "control":
         return [WorkerPlan(
             task_queue=TASK_QUEUE,
@@ -527,7 +532,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             activities=[*short_activities, submit_and_wait],
         ),
         execution_plan,
-        implementation_plan,
+        implementation_plan(),
     ]
 
 
@@ -557,7 +562,7 @@ async def main() -> None:
         help=(
             "which part of the split this process serves (ADR-008, #395): "
             "'control', 'execution', 'implementation' (the admission queue, "
-            "capacity IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES), or 'all' — "
+            "capacity from env IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES), or 'all' — "
             "one process polling every queue (default)."
         ),
     )
