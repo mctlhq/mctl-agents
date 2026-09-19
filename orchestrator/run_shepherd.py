@@ -2017,10 +2017,14 @@ def decide(
     # hands anything to the implementer -- `ci-infra` only re-runs a workflow,
     # `ci-unknown` only waits -- so nothing about them depends on what the
     # primary reviewer ruled. Gating them behind an on-this-head APPROVED (the
-    # only value that clears both head_verdict checks) made the commonest
-    # infra wedge unreachable: a runner outage hit before codex has even
-    # responded, or while it sits on CHANGES_REQUESTED for an unrelated
-    # reason, never got the retry codex review flagged as a P2. Both arms are
+    # only value that clears both head_verdict checks) made one common infra
+    # wedge unreachable: a runner outage hit while codex sits on
+    # CHANGES_REQUESTED for an unrelated reason never got a retry. This
+    # reorder fixes that case. A runner outage hit before codex has even
+    # responded is a separate wedge that this reorder does NOT touch: it is
+    # still gated by the unconditional `has_responded` check above, which
+    # stays first by design (see design.md's "# unchanged" annotation) and is
+    # covered by its own has_responded=False -> wait test. Both arms here are
     # unreachable when `ci` is None, preserving the pre-#411 decision surface
     # exactly.
     if ci is not None and ci.known and ci.infrastructure:
