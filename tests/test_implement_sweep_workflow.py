@@ -10,16 +10,19 @@ import uuid
 import anyio
 import pytest
 from temporalio import activity
+from temporalio.client import WorkflowFailureError
 from temporalio.common import RetryPolicy
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
+from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.activities.stranded import StrandedProposal, StrandedScanResult
 from orchestrator.temporal.constants import IMPLEMENTATION_TASK_QUEUE
 from orchestrator.temporal.workflows.implement_sweep import (
     ImplementSweepWorkflow,
     ImplementSweepWorkflowInput,
+    SweptImplementInput,
     SweptImplementWorkflow,
 )
 from tests.temporal_harness import Worker  # polls the admission queue too — see #395
@@ -50,8 +53,9 @@ def _fake_activities(
     active_ids: list[str] | None = None,
     stranded: list[StrandedProposal] | None = None,
     submit_gate: anyio.Event | None = None,
+    submit_result: WorkflowResult | None = None,
 ):
-    received: dict = {"submits": []}
+    received: dict = {"submits": [], "record_execution": []}
 
     @activity.defn(name="list_active_dev_loop_ids")
     async def fake_list_active_dev_loop_ids() -> list[str]:
@@ -75,12 +79,19 @@ def _fake_activities(
         if submit_gate is not None:
             await submit_gate.wait()
         received["submits"].append(input)
+        if submit_result is not None:
+            return submit_result
         return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+    @activity.defn(name="record_execution")
+    async def fake_record_execution(record: ExecutionRecord) -> None:
+        received["record_execution"].append(record)
 
     return [
         fake_list_active_dev_loop_ids,
         fake_find_stranded_accepted,
         fake_submit_and_wait,
+        fake_record_execution,
     ], received
 
 
@@ -155,7 +166,12 @@ class TestSubmitScoping:
     async def test_the_submit_reaches_the_admission_queue(self, env):
         """Asserted from recorded history, since a fake activity has no
         notion of which queue it was scheduled on — mirrors
-        test_workflow_replay.py's own routing check."""
+        test_workflow_replay.py's own routing check.
+
+        `record_execution` deliberately stays off this assertion's queue set:
+        exactly like dev_loop._record, it carries no `task_queue` override,
+        so it runs on the child's own (default/control) queue while only
+        `submit_and_wait` is explicitly routed to admission."""
         activities, _ = _fake_activities()
 
         async with Worker(
@@ -175,12 +191,15 @@ class TestSubmitScoping:
             await child.result()
             history = (await child.fetch_history()).to_json_dict()
 
-        queues = {
-            e["activityTaskScheduledEventAttributes"]["taskQueue"]["name"]
+        queues_by_activity = {
+            e["activityTaskScheduledEventAttributes"]["activityType"]["name"]: e[
+                "activityTaskScheduledEventAttributes"
+            ]["taskQueue"]["name"]
             for e in history["events"]
             if e["eventType"] == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
         }
-        assert queues == {IMPLEMENTATION_TASK_QUEUE}
+        assert queues_by_activity["submit_and_wait"] == IMPLEMENTATION_TASK_QUEUE
+        assert queues_by_activity["record_execution"] == TASK_QUEUE
 
 
 class TestGraceAndConfig:
@@ -268,3 +287,163 @@ class TestDedup:
             await child.result()
 
         assert len(received["submits"]) == 1
+
+
+class TestOutcomeClassification:
+    """mctl-agents#412 review, finding 2: the terminal-phase guard must not
+    collapse to `result.phase != "Succeeded"` — that is exactly the
+    reduction implement_outcome.py exists to reject. It has to classify the
+    same way dev_loop._implement does, so a pre-start failure (nothing ever
+    ran), a plain execution failure and a finalization failure each raise
+    their own distinguishable `ApplicationError.type`, not one generic
+    "ImplementationFailed" for every non-Succeeded phase."""
+
+    async def test_a_pre_start_failure_is_reported_as_not_started(self, env):
+        activities, _ = _fake_activities(
+            submit_result=WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=False,
+            )
+        )
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-prestart-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationNotStarted"
+
+    async def test_a_finalization_failure_is_distinguished_from_execution(self, env):
+        activities, _ = _fake_activities(
+            submit_result=WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=True,
+                implementer_phase="Succeeded",
+                finalization_phase="Failed",
+            )
+        )
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-finalization-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationFinalizationFailed"
+
+    async def test_a_plain_execution_failure_still_raises(self, env):
+        activities, _ = _fake_activities(
+            submit_result=WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=True,
+                implementer_phase="Failed",
+            )
+        )
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-execution-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationFailed"
+
+
+class TestRecordExecution:
+    """mctl-agents#412 review, finding 3: a swept implement run must write
+    the same executions-ledger record DevLoopWorkflow's own implement step
+    does (dev_loop._record), so it is visible to
+    mctl_list_recent_agent_runs. Before this, no class of swept run wrote
+    one at all."""
+
+    async def test_a_successful_swept_run_records_its_execution(self, env):
+        activities, received = _fake_activities()
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-record-ok-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            result = await handle.result()
+
+        assert result.phase == "Succeeded"
+        assert len(received["record_execution"]) == 1
+        record = received["record_execution"][0]
+        assert record.agent == "implementer"
+        assert record.target_repo == "mctl-web"
+        assert record.phase == "Succeeded"
+        assert record.argo_workflow_name == result.workflow_name
+
+    async def test_a_failed_swept_run_still_records_its_execution(self, env):
+        activities, received = _fake_activities(
+            submit_result=WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=True,
+                implementer_phase="Failed",
+            )
+        )
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-record-failed-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError):
+                await handle.result()
+
+        assert len(received["record_execution"]) == 1
+        record = received["record_execution"][0]
+        assert record.target_repo == "mctl-web"
+        assert record.phase == "Failed"

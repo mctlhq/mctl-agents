@@ -37,10 +37,11 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
-from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
+from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
+    from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
     from orchestrator.temporal.activities.stranded import StrandedScanResult, find_stranded_accepted
     from orchestrator.temporal.constants import (
         DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES,
@@ -48,6 +49,7 @@ with workflow.unsafe.imports_passed_through():
         IMPLEMENTATION_OPERATION,
         IMPLEMENTATION_TASK_QUEUE,
     )
+    from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
 
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
@@ -60,11 +62,61 @@ SWEEP_STEP_TIMEOUT = timedelta(hours=2)
 SWEEP_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 SWEEP_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
+# dev_loop.py's ENVIRONMENT / FAST_ACTIVITY_TIMEOUT / FAST_ACTIVITY_RETRY_POLICY,
+# duplicated rather than imported — incidents.py sets the same precedent for
+# its own best-effort record_execution call, for the reason given above.
+ENVIRONMENT = "production"
+RECORD_EXECUTION_TIMEOUT = timedelta(seconds=30)
+RECORD_EXECUTION_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
+
 
 @dataclass(frozen=True)
 class SweptImplementInput:
     service: str
     slug: str
+
+
+async def _record_swept_execution(input_data: SweptImplementInput, result: WorkflowResult) -> None:
+    """Best-effort audit-trail write for a swept implement run (mctl-agents#412).
+
+    Mirrors dev_loop.py's `_record` / incidents.py's `_record`: without this,
+    a run submitted by this workflow is invisible to the executions ledger
+    `mctl_list_recent_agent_runs` reads, even though DevLoopWorkflow's own
+    implement step writes one for the exact same operation. No release is
+    resolved before a swept submit (there is no `resolve_agent_release` call
+    here), so `version`/`image_ref` are always empty — the same "no pinned
+    version" fallback `_record` uses when a release exists but carries no
+    `image_ref`.
+
+    Best-effort for the same reason as its siblings: the CWFT being recorded
+    has already finished, and failing this workflow over a missing audit row
+    would turn an mctl-api blip into a false ImplementationFailed.
+    """
+    try:
+        await workflow.execute_activity(
+            record_execution,
+            ExecutionRecord(
+                temporal_workflow_id=workflow.info().workflow_id,
+                agent="implementer",
+                environment=ENVIRONMENT,
+                version="",
+                image_ref="",
+                target_repo=input_data.service,
+                argo_workflow_name=result.workflow_name,
+                phase=result.phase,
+            ),
+            start_to_close_timeout=RECORD_EXECUTION_TIMEOUT,
+            retry_policy=RECORD_EXECUTION_RETRY_POLICY,
+        )
+    except ActivityError:
+        workflow.logger.warning(
+            "record_execution failed after retries for swept implement of "
+            "%s/%s argo_workflow=%s — continuing without a durable execution "
+            "record for this run",
+            input_data.service,
+            input_data.slug,
+            result.workflow_name,
+        )
 
 
 @workflow.defn
@@ -84,18 +136,43 @@ class SweptImplementWorkflow:
             heartbeat_timeout=SWEEP_STEP_HEARTBEAT_TIMEOUT,
             retry_policy=SWEEP_STEP_RETRY_POLICY,
         )
-        if result.phase != "Succeeded":
-            # submit_and_wait returns normally for every terminal Argo phase
-            # (TERMINAL_PHASES includes Failed/Error) — without this, a
-            # swept implement run that actually failed in Argo would still
-            # close this child workflow as Completed.
-            raise ApplicationError(
-                f"swept implement of {input_data.service}/{input_data.slug} ended "
-                f"{result.phase} in Argo workflow {result.workflow_name}",
-                result,
-                type="ImplementationFailed",
-            )
-        return result
+
+        await _record_swept_execution(input_data, result)
+
+        # Classified the same way dev_loop._implement classifies its own
+        # implement submit (implement_outcome.py) — collapsing straight to
+        # `result.phase != "Succeeded"` here would be exactly the reduction
+        # to a bare phase implement_outcome.py exists to reject: `Failed`
+        # alone cannot say whether the implementer ever ran.
+        outcome: Outcome = classify(
+            result.phase,
+            implementer_ran=result.implementer_ran,
+            implementer_phase=result.implementer_phase,
+            finalization_phase=result.finalization_phase,
+        )
+        if outcome == "success":
+            return result
+
+        # No pre-start requeue loop here, unlike dev_loop._implement: a sweep
+        # tick submits each stranded proposal at most once, and the next
+        # 15-minute tick naturally reconsiders a proposal that is still
+        # `accepted` — there is no in-workflow retry budget to spend.
+        error_type = {
+            "pre_start": "ImplementationNotStarted",
+            "execution": "ImplementationFailed",
+            "finalization": "ImplementationFinalizationFailed",
+        }[outcome]
+        raise ApplicationError(
+            f"swept implement of {input_data.service}/{input_data.slug} ended "
+            f"{result.phase} ({outcome}) in Argo workflow {result.workflow_name}"
+            + (
+                f": {finalization_evidence(result.finalization_phase)}"
+                if outcome == "finalization"
+                else ""
+            ),
+            result,
+            type=error_type,
+        )
 
 
 @dataclass(frozen=True)

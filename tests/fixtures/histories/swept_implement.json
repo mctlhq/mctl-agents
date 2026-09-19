@@ -2,13 +2,13 @@
   "events": [
     {
       "eventId": "1",
-      "eventTime": "2026-09-19T20:39:56.816Z",
+      "eventTime": "2026-09-19T22:26:06.830Z",
       "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_STARTED",
       "workflowExecutionStartedEventAttributes": {
         "attempt": 1,
-        "firstExecutionRunId": "200b7eca-8139-4cfc-99f1-c78eb76f807f",
+        "firstExecutionRunId": "47c6ff5f-0d0c-40f0-80b3-40009fdd8801",
         "firstWorkflowTaskBackoff": "0s",
-        "header": {},
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "input": {
           "payloads": [
             {
@@ -19,21 +19,10 @@
             }
           ]
         },
-        "memo": {},
-        "originalExecutionRunId": "200b7eca-8139-4cfc-99f1-c78eb76f807f",
-        "parentWorkflowExecution": {
-          "runId": "d1034065-9d3f-455f-9fb7-b62b4f826dd7",
-          "workflowId": "replay-implement-sweep-b6a0f243-831e-4728-9b99-8e17b7c17543"
-        },
-        "parentWorkflowNamespace": "default",
+        "originalExecutionRunId": "47c6ff5f-0d0c-40f0-80b3-40009fdd8801",
         "priority": {},
-        "rootWorkflowExecution": {
-          "runId": "d1034065-9d3f-455f-9fb7-b62b4f826dd7",
-          "workflowId": "replay-implement-sweep-b6a0f243-831e-4728-9b99-8e17b7c17543"
-        },
         "taskQueue": {
-          "kind": "TASK_QUEUE_KIND_NORMAL",
-          "name": "replay-implement-sweep"
+          "name": "test-mctl-implement-sweep"
         },
         "workflowExecutionTimeout": "315360000s",
         "workflowRunTimeout": "315360000s",
@@ -45,41 +34,40 @@
     },
     {
       "eventId": "2",
-      "eventTime": "2026-09-19T20:39:56.816Z",
+      "eventTime": "2026-09-19T22:26:06.830Z",
       "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
       "workflowTaskScheduledEventAttributes": {
         "attempt": 1,
         "startToCloseTimeout": "10s",
         "taskQueue": {
-          "kind": "TASK_QUEUE_KIND_NORMAL",
-          "name": "replay-implement-sweep"
+          "name": "test-mctl-implement-sweep"
         }
       }
     },
     {
       "eventId": "3",
-      "eventTime": "2026-09-19T20:39:56.816Z",
+      "eventTime": "2026-09-19T22:26:06.831Z",
       "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
       "workflowTaskStartedEventAttributes": {
-        "historySizeBytes": "530",
-        "identity": "632@mctl-agents-implement-66deefb1-run-implementer-521049665",
+        "historySizeBytes": "373",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "scheduledEventId": "2"
       }
     },
     {
       "eventId": "4",
-      "eventTime": "2026-09-19T20:39:56.844Z",
+      "eventTime": "2026-09-19T22:26:06.914Z",
       "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
       "workflowTaskCompletedEventAttributes": {
-        "binaryChecksum": "5e121988aa0f41e7a7f9dd9a15c1c455",
-        "identity": "632@mctl-agents-implement-66deefb1-run-implementer-521049665",
+        "binaryChecksum": "b8413e88258e98f84bc328f4a5ec57e8",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "meteringMetadata": {},
         "scheduledEventId": "2",
         "sdkMetadata": {
           "coreUsedFlags": [
             2,
-            1,
-            3
+            3,
+            1
           ],
           "sdkName": "temporal-python",
           "sdkVersion": "1.31.0"
@@ -121,22 +109,22 @@
         "workflowTaskCompletedEventId": "3"
       },
       "eventId": "5",
-      "eventTime": "2026-09-19T20:39:56.844Z",
+      "eventTime": "2026-09-19T22:26:06.914Z",
       "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
     },
     {
       "activityTaskStartedEventAttributes": {
         "attempt": 1,
-        "identity": "632@mctl-agents-implement-66deefb1-run-implementer-521049665",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "scheduledEventId": "5"
       },
       "eventId": "6",
-      "eventTime": "2026-09-19T20:39:56.844Z",
+      "eventTime": "2026-09-19T22:26:06.914Z",
       "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED"
     },
     {
       "activityTaskCompletedEventAttributes": {
-        "identity": "632@mctl-agents-implement-66deefb1-run-implementer-521049665",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "result": {
           "payloads": [
             {
@@ -151,47 +139,147 @@
         "startedEventId": "6"
       },
       "eventId": "7",
-      "eventTime": "2026-09-19T20:39:56.849Z",
+      "eventTime": "2026-09-19T22:26:06.919Z",
       "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED"
     },
     {
       "eventId": "8",
-      "eventTime": "2026-09-19T20:39:56.849Z",
+      "eventTime": "2026-09-19T22:26:06.919Z",
       "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
       "workflowTaskScheduledEventAttributes": {
         "attempt": 1,
         "startToCloseTimeout": "10s",
         "taskQueue": {
-          "kind": "TASK_QUEUE_KIND_NORMAL",
-          "name": "replay-implement-sweep"
+          "name": "test-mctl-implement-sweep"
         }
       }
     },
     {
       "eventId": "9",
-      "eventTime": "2026-09-19T20:39:56.849Z",
+      "eventTime": "2026-09-19T22:26:06.919Z",
       "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
       "workflowTaskStartedEventAttributes": {
-        "historySizeBytes": "1487",
-        "identity": "632@mctl-agents-implement-66deefb1-run-implementer-521049665",
+        "historySizeBytes": "1319",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "scheduledEventId": "8"
       }
     },
     {
       "eventId": "10",
-      "eventTime": "2026-09-19T20:39:56.864Z",
+      "eventTime": "2026-09-19T22:26:06.938Z",
       "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
       "workflowTaskCompletedEventAttributes": {
-        "binaryChecksum": "5e121988aa0f41e7a7f9dd9a15c1c455",
-        "identity": "632@mctl-agents-implement-66deefb1-run-implementer-521049665",
+        "binaryChecksum": "b8413e88258e98f84bc328f4a5ec57e8",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
         "meteringMetadata": {},
         "scheduledEventId": "8",
         "sdkMetadata": {}
       }
     },
     {
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "2",
+        "activityType": {
+          "name": "record_execution"
+        },
+        "header": {},
+        "heartbeatTimeout": "0s",
+        "input": {
+          "payloads": [
+            {
+              "data": "eyJhZ2VudCI6ImltcGxlbWVudGVyIiwiYXJnb193b3JrZmxvd19uYW1lIjoibWN0bC1hZ2VudHMtaW1wbGVtZW50LWZha2UiLCJlbnZpcm9ubWVudCI6InByb2R1Y3Rpb24iLCJpbWFnZV9yZWYiOiIiLCJwaGFzZSI6IlN1Y2NlZWRlZCIsInRhcmdldF9yZXBvIjoibWN0bC13ZWIiLCJ0ZW1wb3JhbF93b3JrZmxvd19pZCI6ImltcGxlbWVudC1zd2VlcC1tY3RsLXdlYi1pc3N1ZS0xMC1yZXBsYXkiLCJ2ZXJzaW9uIjoiIn0=",
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              }
+            }
+          ]
+        },
+        "priority": {},
+        "retryPolicy": {
+          "backoffCoefficient": 2.0,
+          "initialInterval": "1s",
+          "maximumAttempts": 5,
+          "maximumInterval": "100s"
+        },
+        "scheduleToCloseTimeout": "315360000s",
+        "scheduleToStartTimeout": "315360000s",
+        "startToCloseTimeout": "30s",
+        "taskQueue": {
+          "kind": "TASK_QUEUE_KIND_NORMAL",
+          "name": "test-mctl-implement-sweep"
+        },
+        "workflowTaskCompletedEventId": "9"
+      },
       "eventId": "11",
-      "eventTime": "2026-09-19T20:39:56.864Z",
+      "eventTime": "2026-09-19T22:26:06.938Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+    },
+    {
+      "activityTaskStartedEventAttributes": {
+        "attempt": 1,
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
+        "scheduledEventId": "11"
+      },
+      "eventId": "12",
+      "eventTime": "2026-09-19T22:26:06.939Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_STARTED"
+    },
+    {
+      "activityTaskCompletedEventAttributes": {
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
+        "result": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "YmluYXJ5L251bGw="
+              }
+            }
+          ]
+        },
+        "scheduledEventId": "11",
+        "startedEventId": "12"
+      },
+      "eventId": "13",
+      "eventTime": "2026-09-19T22:26:06.947Z",
+      "eventType": "EVENT_TYPE_ACTIVITY_TASK_COMPLETED"
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-09-19T22:26:06.947Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_SCHEDULED",
+      "workflowTaskScheduledEventAttributes": {
+        "attempt": 1,
+        "startToCloseTimeout": "10s",
+        "taskQueue": {
+          "name": "test-mctl-implement-sweep"
+        }
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-09-19T22:26:06.948Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_STARTED",
+      "workflowTaskStartedEventAttributes": {
+        "historySizeBytes": "2170",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
+        "scheduledEventId": "14"
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-09-19T22:26:06.960Z",
+      "eventType": "EVENT_TYPE_WORKFLOW_TASK_COMPLETED",
+      "workflowTaskCompletedEventAttributes": {
+        "binaryChecksum": "b8413e88258e98f84bc328f4a5ec57e8",
+        "identity": "1587@mctl-agents-shepherd-a0d012ed-run-shepherd-912710545",
+        "meteringMetadata": {},
+        "scheduledEventId": "14",
+        "sdkMetadata": {}
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-09-19T22:26:06.960Z",
       "eventType": "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED",
       "workflowExecutionCompletedEventAttributes": {
         "result": {
@@ -204,7 +292,7 @@
             }
           ]
         },
-        "workflowTaskCompletedEventId": "9"
+        "workflowTaskCompletedEventId": "15"
       }
     }
   ]
