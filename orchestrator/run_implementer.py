@@ -120,6 +120,8 @@ from orchestrator.lifecycle.contract import (
     EntityRef,
     Executor,
 )
+from orchestrator.manifest import MANIFESTS_DIR
+from orchestrator.manifest import load as load_agent_manifest
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
@@ -135,6 +137,10 @@ from orchestrator.proposal_state import (
     now_iso,
     update_status_file,
 )
+from orchestrator.service_skills import ServiceSkillBundle, ServiceSkillError
+from orchestrator.service_skills import is_enabled as is_service_skills_enabled
+from orchestrator.service_skills import pin_sha as service_skill_pin_sha
+from orchestrator.service_skills import resolve_bundle as resolve_service_skill_bundle
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
     OrphanedSubagentError,
@@ -1285,7 +1291,52 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
                 f.write(f"{entry}\n")
 
 
-def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
+def _resolve_implementer_service_skills(target: Path, branch: str) -> ServiceSkillBundle:
+    """mctlhq/mctl-agents#305 (R24): resolve the implementer's
+    `ServiceSkillBundle` even though the implementer is still
+    `agents.mctl.ai/v1alpha1` and has no `ExecutionPlan` — its envelope
+    comes straight from `AgentManifest` (`tool_allow`, and
+    `service_skills` for enablement/ceilings).
+
+    `branch` is `feat/agents-<slug>` on every caller, so
+    `service_skills.pin_sha` always resolves the merge-base with the
+    default branch (R6) rather than HEAD — on a brand-new branch that is
+    the same commit HEAD already is, and on a review-feedback branch it is
+    NOT whatever a previous implementer run committed on top of it.
+
+    Raises `ServiceSkillError` — the caller aborts before
+    `_run_implementer_agent`, so before any commit, push, or PR (R22).
+
+    Checks `service_skills.is_enabled` BEFORE calling `pin_sha` — a
+    disabled policy (the default: no `spec.serviceSkills` block, or
+    `MCTL_SERVICE_SKILLS=off`) must not run `git merge-base` at all (R17),
+    not just skip the eventual `git ls-tree`.
+    """
+    implementer_manifest = load_agent_manifest(MANIFESTS_DIR / "implementer" / "agent.yaml")
+    policy = implementer_manifest.service_skills
+    pinned_sha = (
+        service_skill_pin_sha(target, agent="implementer", branch=branch)
+        if is_service_skills_enabled(policy)
+        else ""
+    )
+    bundle = resolve_service_skill_bundle(
+        agent="implementer",
+        repo_dir=target,
+        policy=policy,
+        tool_allow=implementer_manifest.tool_allow,
+        pinned_sha=pinned_sha,
+    )
+    if bundle.skills:
+        print(
+            f"[service_skills] implementer bundle: {len(bundle.skills)} skill(s) from "
+            f"{bundle.resolved_from_sha[:8]}"
+        )
+    return bundle
+
+
+def _build_prompt(
+    ref: ProposalRef, review_feedback: dict | None = None, service_skills_block: str = ""
+) -> str:
     """Prompt that delegates to the `implementer` sub-agent.
 
     The sub-agent is told (in its frontmatter and body) to read the spec
@@ -1295,8 +1346,13 @@ def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
     When ``review_feedback`` is set the prompt is the follow-up variant:
     the agent is told the branch is already checked out, points to the
     existing PR, and addresses each codex finding from the bundle.
+
+    ``service_skills_block`` is ``""`` unless a non-empty
+    ``ServiceSkillBundle`` was resolved for this run (mctlhq/mctl-agents#305)
+    -- an empty string changes this function's output by zero bytes.
     """
     branch = f"feat/agents-{ref.slug}"
+    skills_section = f"\n{service_skills_block}\n" if service_skills_block else ""
 
     if review_feedback is not None:
         feedback_md = _render_review_feedback(review_feedback)
@@ -1341,7 +1397,7 @@ Workflow:
    marker is ignored.
 
 {feedback_md}
-
+{skills_section}
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
 - Stay strictly within scope — fixing the codex findings only.
@@ -1378,7 +1434,7 @@ Workflow:
    you finish. Just commit.
 5. If the proposal can't be safely implemented (missing context, scope too
    large, blocking dependency), STOP without committing and explain why.
-
+{skills_section}
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
 - Stay strictly within the proposal's scope — no drive-by refactors.
@@ -1718,8 +1774,21 @@ def review_feedback_one(
                 ),
             )
 
+        # 4c. Resolve this run's ServiceSkillBundle (mctlhq/mctl-agents#305,
+        # R24) BEFORE the SDK call — a ServiceSkillError aborts here, before
+        # any commit, push, or PR (R22).
+        try:
+            skill_bundle = _resolve_implementer_service_skills(target, branch)
+        except ServiceSkillError as exc:
+            release_reason = "service skill resolution failed"
+            return ImplementResult(ref=ref, pr_url=None, error=f"service skill resolution failed: {exc}")
+
         # 5. Run the SDK with the bundle baked into the prompt.
-        prompt = _build_prompt(ref, review_feedback=bundle)
+        prompt = _build_prompt(
+            ref,
+            review_feedback=bundle,
+            service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}"),
+        )
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
@@ -2596,8 +2665,30 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # 4. Drop the implementer sub-agent into the clone's .claude/.
         _stage_implementer_agent(target, ref.service)
 
+        # 4b. Resolve this run's ServiceSkillBundle (mctlhq/mctl-agents#305,
+        # R24) BEFORE the SDK call — a ServiceSkillError aborts here, before
+        # any commit, push, or PR (R22).
+        try:
+            skill_bundle = _resolve_implementer_service_skills(target, branch)
+        except ServiceSkillError as exc:
+            recorded = _mark_needs_triage(
+                ref,
+                code="service-skill-error",
+                stage="service-skills",
+                message=f"service skill resolution failed: {exc}",
+                attempt=attempt,
+                claim_context=claim_ctx,
+            )
+            return ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error=_triage_error(f"service skill resolution failed: {exc}", recorded),
+            )
+
         # 5. Run the SDK with PROPOSAL_DIR pointing at the gitops worktree.
-        prompt = _build_prompt(ref)
+        prompt = _build_prompt(
+            ref, service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}")
+        )
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
 
         # 6. Did the agent actually commit something?

@@ -183,6 +183,40 @@ def _target_repository_sha(repo_dir: Path) -> str:
         raise RuntimeError(f"cannot pin target_repository_sha: empty HEAD in {repo_dir}")
     return sha
 
+
+def _service_skills_prompt_block(repo_dir: Path) -> str:
+    """mctlhq/mctl-agents#305 (R23): resolve the issue-investigator's
+    `ServiceSkillBundle` and render it for the prompt — but ONLY in
+    `declarative` resolver mode. `legacy` (the default, and the only mode
+    running in production today — see orchestrator/resolver.py's module
+    docstring) returns `""` without reading the target repository's
+    `.mctl/` root at all.
+
+    Deferred `resolver` import, for the same worker-isolation reason
+    `_run_agent` imports it inside itself rather than at module scope (see
+    that function's comment): resolver.py does not import the SDK, but a
+    module-scope import here would be the one extra line a reader has to
+    check by hand every time test_worker_isolation goes red.
+    """
+    if _resolver_mode() != "declarative":
+        return ""
+    from orchestrator import resolver
+
+    bundle = resolver.resolve_service_skill_bundle(
+        "issue-investigator",
+        resolver.Task(
+            target_repository_sha=_target_repository_sha(repo_dir),
+            target_repo_dir=repo_dir,
+        ),
+    )
+    if bundle.skills:
+        print(
+            f"[service_skills] issue-investigator bundle: {len(bundle.skills)} skill(s) from "
+            f"{bundle.resolved_from_sha[:8]}"
+        )
+    return bundle.to_prompt_block()
+
+
 # A proposal whose .status.yaml is missing or still `proposed` can be
 # (re-)investigated. Anything past that means the implementer/shepherd has
 # taken ownership — re-running the investigator would clobber in-flight work.
@@ -1258,6 +1292,7 @@ def _build_prompt(
     slug: str,
     *,
     context: context_assembly.AssemblyResult | None = None,
+    service_skills_block: str = "",
 ) -> str:
     """Prompt for the investigator SDK agent.
 
@@ -1269,6 +1304,12 @@ def _build_prompt(
     byte-identical to this function's `main`-branch behaviour. In `on` mode
     it appends the `## Assembled context` section above; every other line
     below is unmodified (mctlhq/mctl-agents#265).
+
+    `service_skills_block` is `""` unless
+    `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` resolved a non-empty
+    `ServiceSkillBundle` (mctlhq/mctl-agents#305) — an empty string changes
+    this function's output by zero bytes, so the default/legacy prompt stays
+    byte-identical.
     """
     prompt = f"""\
 **Output language: English only. Write every file in English.**
@@ -1385,6 +1426,15 @@ How to roll back if this goes sideways.
 3-5 lines: the proposal title, the three files you wrote, and anything the
 human reviewer should look at carefully (especially open questions).
 """
+    if service_skills_block:
+        # Spliced in after "## Your working context" and before "## What to
+        # produce" (mctlhq/mctl-agents#305 tasks.md task 9) rather than
+        # appended, unlike the context-assembly section below — via
+        # str.replace on a literal anchor so an empty block (the common/
+        # legacy case) leaves this function byte-identical to before this
+        # parameter existed.
+        anchor = "\n## What to produce\n"
+        prompt = prompt.replace(anchor, f"\n{service_skills_block}\n{anchor.lstrip()}", 1)
     if context is not None and context.mode == "on":
         prompt += _render_assembled_context_section(context)
     return prompt
@@ -1452,7 +1502,10 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     if mode == "declarative":
         plan = resolver.execute(
             "issue-investigator",
-            resolver.Task(target_repository_sha=_target_repository_sha(repo_dir)),
+            resolver.Task(
+                target_repository_sha=_target_repository_sha(repo_dir),
+                target_repo_dir=repo_dir,
+            ),
         )
         plan.log()
         options = build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
@@ -1759,8 +1812,15 @@ def investigate(
             slug=slug,
         )
 
+        # 2c. Resolve this investigation's ServiceSkillBundle
+        #     (mctlhq/mctl-agents#305) — empty unless resolver_mode is
+        #     `declarative`; see _service_skills_prompt_block's docstring.
+        service_skills_block = _service_skills_prompt_block(clone / "repo")
+
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.
-        prompt = _build_prompt(issue, service, slug, context=context)
+        prompt = _build_prompt(
+            issue, service, slug, context=context, service_skills_block=service_skills_block
+        )
         anyio.run(_run_agent, clone / "repo", prompt, staging.resolve())
 
         # 4a. Before looking INSIDE staging, check staging itself is still
