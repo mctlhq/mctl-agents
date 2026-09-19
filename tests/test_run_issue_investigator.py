@@ -3609,3 +3609,165 @@ def test_write_status_yaml_with_a_snapshot_is_additive_and_agrees(tmp_path):
     finally:
         os.close(fd)
     assert reread["context"]["snapshot_id"] == snapshot.snapshot_id
+
+
+# ---------------------------------------------------------------------------
+# Work-context CLI flags (mctlhq/mctl-agents#267) — T8 in the proposal's
+# tasks.md: flag parsing and every rejection path from task 10;
+# investigate(url, tmp_path) positional call still succeeds; provenance is
+# recorded at mode observe and the store is never contacted at mode off.
+# ---------------------------------------------------------------------------
+import argparse  # noqa: E402 — grouped with the other test-only additions below
+
+from orchestrator.work_context import rollout as _work_context_rollout  # noqa: E402
+
+
+def _args(**overrides):
+    base = dict(
+        issue_url="https://github.com/mctlhq/mctl-telegram/issues/1",
+        work_item_id=None,
+        execution_id=None,
+        resume_from_execution_id=None,
+        surface=None,
+        actor_kind=None,
+        actor_id=None,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_resume_from_execution_id_without_work_item_id_exits_nonzero():
+    with pytest.raises(SystemExit, match="work-item-id"):
+        run_issue_investigator._work_context_from_args(
+            _args(resume_from_execution_id="e1", work_item_id=None)
+        )
+
+
+def test_resume_from_execution_id_with_work_item_id_is_accepted():
+    run_issue_investigator._work_context_from_args(
+        _args(resume_from_execution_id="e1", work_item_id="wi-1")
+    )  # must not raise
+
+
+def test_out_of_vocabulary_surface_exits_nonzero():
+    with pytest.raises(SystemExit, match="--surface"):
+        run_issue_investigator._work_context_from_args(_args(surface="carrier-pigeon"))
+
+
+def test_out_of_vocabulary_actor_kind_exits_nonzero():
+    with pytest.raises(SystemExit, match="--actor-kind"):
+        run_issue_investigator._work_context_from_args(_args(actor_kind="alien"))
+
+
+def test_missing_issue_url_without_work_item_id_exits_nonzero(monkeypatch):
+    monkeypatch.delenv(_work_context_rollout.ENV_VAR, raising=False)
+    with pytest.raises(SystemExit, match="--issue-url"):
+        run_issue_investigator._work_context_from_args(_args(issue_url=None, work_item_id=None))
+
+
+def test_missing_issue_url_with_work_item_id_but_not_only_mode_exits_nonzero(monkeypatch):
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.ENFORCE)
+    with pytest.raises(SystemExit, match="--issue-url"):
+        run_issue_investigator._work_context_from_args(_args(issue_url=None, work_item_id="wi-1"))
+
+
+def test_missing_issue_url_with_work_item_id_and_only_mode_is_accepted(monkeypatch):
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.ONLY)
+    run_issue_investigator._work_context_from_args(
+        _args(issue_url=None, work_item_id="wi-1")
+    )  # must not raise
+
+
+def test_investigate_positional_call_still_works(tmp_path, monkeypatch):
+    """The ~170 existing call sites use investigate(url, tmp_path) — the six
+    new parameters are keyword-only and must not disturb that."""
+    issue = _issue(number=99, title="Positional call still works")
+    monkeypatch.setattr("orchestrator.run_issue_investigator.gh_issue_view", lambda url: issue)
+    result = investigate("https://github.com/mctlhq/mctl-telegram/issues/99", tmp_path, True)
+    assert result.skipped_reason == "dry-run"
+
+
+def test_work_item_store_is_never_contacted_at_mode_off(tmp_path, monkeypatch):
+    monkeypatch.delenv(_work_context_rollout.ENV_VAR, raising=False)
+    issue = _issue(number=100, title="Off mode never calls the store")
+    monkeypatch.setattr("orchestrator.run_issue_investigator.gh_issue_view", lambda url: issue)
+
+    def _boom(self, work_item_id):
+        raise AssertionError("the work-item store must not be contacted at mode=off")
+
+    monkeypatch.setattr("orchestrator.work_context.client.WorkItemClient.get", _boom)
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/100",
+        tmp_path,
+        dry_run=True,
+        work_item_id="wi-1",
+    )
+    assert result.skipped_reason == "dry-run"
+
+
+def test_provenance_is_recorded_at_mode_observe(tmp_path, monkeypatch, capsys):
+    from orchestrator.work_context.contract import WORK_ITEM_FOUND, WorkItem, WorkItemAnswer
+
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    issue = _issue(number=101, title="Observe mode logs provenance")
+    monkeypatch.setattr("orchestrator.run_issue_investigator.gh_issue_view", lambda url: issue)
+
+    item = WorkItem(work_item_id="wi-1", state="in-progress", service="mctl-telegram", slug="issue-101-observe")
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/101",
+        tmp_path,
+        dry_run=True,
+        work_item_id="wi-1",
+    )
+    assert result.skipped_reason == "dry-run"  # observe never decides
+    out = capsys.readouterr().out
+    assert "work_item_id=wi-1" in out
+    assert "state=in-progress" in out
+
+
+def test_enforce_mode_vetoes_a_terminal_work_item(tmp_path, monkeypatch, capsys):
+    from orchestrator.work_context.contract import WORK_ITEM_FOUND, WorkItem, WorkItemAnswer
+
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.ENFORCE)
+    issue = _issue(number=102, title="Enforce mode vetoes a terminal item")
+    monkeypatch.setattr("orchestrator.run_issue_investigator.gh_issue_view", lambda url: issue)
+
+    item = WorkItem(work_item_id="wi-1", state="completed", service="mctl-telegram", slug="issue-102-enforce")
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/102",
+        tmp_path,
+        dry_run=True,
+        work_item_id="wi-1",
+    )
+    assert result.skipped_reason != "dry-run"
+    assert "terminal state" in result.skipped_reason
+
+
+def test_enforce_mode_blocks_on_an_unknown_answer(tmp_path, monkeypatch):
+    from orchestrator.work_context.contract import WORK_ITEM_UNKNOWN, WorkItemAnswer
+
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.ENFORCE)
+    monkeypatch.delenv(_work_context_rollout.REQUIRED_ENV_VAR, raising=False)
+    issue = _issue(number=103, title="Enforce mode blocks on unknown")
+    monkeypatch.setattr("orchestrator.run_issue_investigator.gh_issue_view", lambda url: issue)
+
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason="unreachable"),
+    )
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/103",
+        tmp_path,
+        dry_run=True,
+        work_item_id="wi-1",
+    )
+    assert result.skipped_reason != "dry-run"
+    assert "could not be resolved" in result.skipped_reason

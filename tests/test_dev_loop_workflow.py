@@ -3730,6 +3730,239 @@ class TestDevLoopWorkflow:
         assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
 
 
+class TestWorkContextResume:
+    """mctlhq/mctl-agents#267, ADR 011 — T9/T10/T11 in the proposal's
+    tasks.md."""
+
+    async def test_resume_from_a_second_surface_correlates_to_one_work_item(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            before = await handle.query(DevLoopWorkflow.work_context)
+            assert before.work_item_id == "wi-1"
+            assert len(before.executions) == 1
+            seed_execution_id = before.executions[0].execution_id
+
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1",
+                    "execution_id": "e2",
+                    "surface": "telegram",
+                    "actor_kind": "human",
+                    "actor_id": "carol",
+                },
+            )
+
+            after = await handle.query(DevLoopWorkflow.work_context)
+            assert after.work_item_id == "wi-1"
+            assert len(after.executions) == 2
+            assert after.executions[0].execution_id == seed_execution_id
+            assert after.executions[1].execution_id == "e2"
+            assert after.execution_id == "e2"
+            assert after.execution_sequence == 2
+
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_duplicate_resume_is_idempotent(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            payload = {
+                "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                "actor_kind": "human", "actor_id": "carol",
+            }
+            await handle.signal(DevLoopWorkflow.resume, payload)
+            once = await handle.query(DevLoopWorkflow.work_context)
+            assert len(once.executions) == 2
+
+            # The exact same payload again — the deterministic execution_id
+            # means a duplicated signal delivery lands here by construction.
+            await handle.signal(DevLoopWorkflow.resume, payload)
+            twice = await handle.query(DevLoopWorkflow.work_context)
+            assert len(twice.executions) == 2
+            assert twice.resume_rejections == ()
+
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+    async def test_a_differing_execution_id_is_rejected_while_one_resume_is_pending(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            # Accepted: a surface/actor-changing resume, which leaves a
+            # resume pending fresh approval.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "carol",
+                },
+            )
+            # A second, DIFFERENT execution racing in while the first is
+            # still pending fresh approval must be rejected, never forking
+            # the work item into two divergent executions.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e3", "surface": "web",
+                    "actor_kind": "human", "actor_id": "dave",
+                },
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 2  # e3 never joined
+            assert any(
+                r.execution_id == "e3" and r.reason == "resume-already-pending" for r in state.resume_rejections
+            )
+
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+    async def test_a_mismatched_work_item_id_is_rejected(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(
+                DevLoopWorkflow.resume, {"work_item_id": "wi-999", "execution_id": "e2"},
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 1  # never joined
+            assert any(
+                r.execution_id == "e2" and r.reason == "work-item-mismatch" for r in state.resume_rejections
+            )
+
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+    async def test_a_surface_transition_clears_approval_until_a_fresh_approve(self, env):
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+
+            # A resume from a different surface/actor must re-arm the wait —
+            # approval granted by alice on the original surface must not be
+            # silently inherited by bob on telegram.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            # A query forces a round trip through the workflow's event loop,
+            # so by the time it returns, the resume signal above has
+            # definitely been applied — proving the assertion below is not
+            # a race rather than proving the transition happened.
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert state.executions[-1].surface_transition is True
+            assert "mctl-agents-implement" not in calls  # approval cleared, not inherited
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
+            result = await handle.result()
+
+        assert calls.count("mctl-agents-implement") == 1
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_a_same_surface_resume_does_not_clear_approval(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            # First resume establishes github/alice as the current surface
+            # and actor, and leaves a resume pending fresh approval.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "github",
+                    "actor_kind": "human", "actor_id": "alice",
+                },
+            )
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+
+            # A second resume from the SAME surface and actor must not
+            # re-litigate a decision nobody changed.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e3", "surface": "github",
+                    "actor_kind": "human", "actor_id": "alice",
+                },
+            )
+
+            # No second approve is sent; completion proves approval was
+            # never cleared by the same-surface resume.
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+
 SERVICE = "mctl-telegram"
 SLUG = "issue-88-fake-title"
 

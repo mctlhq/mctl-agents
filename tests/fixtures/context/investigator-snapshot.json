@@ -8,7 +8,7 @@
     "used_bytes": 326,
     "used_sources": 4
   },
-  "content_hash": "sha256:de22a552ea05cf198ad582262f8aea1a3c3813272b7854c736e2d8415b8140eb",
+  "content_hash": "sha256:7b19558429ccd6ac6228c41775f5194bd44d1348b1a9eeb70a9a9ecfaacd5dd6",
   "created_at": "2026-09-11T00:00:40Z",
   "evidence_refs": [
     {
@@ -34,7 +34,7 @@
     "class": "execution-record",
     "expires_after_days": 180
   },
-  "snapshot_id": "cs-de22a552ea05cf19",
+  "snapshot_id": "cs-7b19558429ccd6ac",
   "sources": [
     {
       "byte_count": 119,
@@ -205,5 +205,6 @@
     "ranker_name": null,
     "ranker_version": null,
     "version": "1.0.0"
-  }
+  },
+  "work_context": null
 }

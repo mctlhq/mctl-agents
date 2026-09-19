@@ -82,6 +82,12 @@ with workflow.unsafe.imports_passed_through():
     )
     from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
     from orchestrator.temporal.issue_ref import parse_issue_url
+    from orchestrator.work_context.contract import (
+        ActorRef,
+        ExecutionRef,
+        SurfaceRef,
+        execution_id_for,
+    )
 
 ENVIRONMENT = "production"
 
@@ -406,6 +412,13 @@ INCIDENT_POLL_INTERVAL = timedelta(minutes=5)
 @dataclass(frozen=True)
 class IssueRef:
     issue_url: str
+    #: The canonical WorkItem this execution correlates to (mctlhq/mctl-
+    #: agents#267). Defaulted so a history recorded before this field
+    #: existed still deserializes — see workflow.patched's convention at
+    #: `dev_loop.py:864-869`. None means the caller started this loop the
+    #: old way, issue-url-only; the `resume` signal and `work_context`
+    #: query still work in that case, just with no seeded first execution.
+    work_item_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -480,6 +493,34 @@ class LifecycleClaim:
     #: abandonment: the store still shows the row active and this loop is gone.
     last_op_landed: bool = False
     abandoned: bool = False
+
+
+@dataclass(frozen=True)
+class ResumeRejection:
+    """A `resume` signal this workflow declined to apply (mctlhq/mctl-
+    agents#267). Recorded, never silent: a caller polling `work_context`
+    must be able to see that a resume was refused and why, rather than
+    inferring it from the absence of a new execution."""
+
+    execution_id: str = ""
+    work_item_id: str = ""
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class WorkContextState:
+    """The `work_context` query's answer: enough for a trace view to
+    correlate every execution of one `WorkItem`, without exposing anything
+    an authorization decision could read (ADR 009 sec. 5 boundary, extended
+    by ADR 011)."""
+
+    work_item_id: str = ""
+    execution_id: str = ""
+    execution_sequence: int = 0
+    executions: tuple[ExecutionRef, ...] = ()
+    last_surface: SurfaceRef = field(default_factory=SurfaceRef)
+    last_actor: ActorRef = field(default_factory=ActorRef)
+    resume_rejections: tuple[ResumeRejection, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -825,6 +866,18 @@ class DevLoopWorkflow:
         self._last_lifecycle_op = ""
         self._last_lifecycle_op_landed = False
         self._claim_abandoned = False
+        # Work-context resume state (mctlhq/mctl-agents#267, ADR 011).
+        self._work_item_id = ""
+        self._executions: list[ExecutionRef] = []
+        self._seen_execution_ids: set[str] = set()
+        # True from an accepted, surface/actor-changing resume until the
+        # next `approve()` — see `resume`'s docstring for why this is the
+        # window "already pending" means, rather than true concurrency
+        # (Temporal serialises signal delivery to one workflow instance).
+        self._resume_pending = False
+        self._resume_rejections: list[ResumeRejection] = []
+        self._current_surface = SurfaceRef()
+        self._current_actor = ActorRef()
 
     @workflow.query
     def implement_execution(self) -> ImplementExecutionState:
@@ -865,6 +918,24 @@ class DevLoopWorkflow:
             abandoned=self._claim_abandoned,
         )
 
+    @workflow.query
+    def work_context(self) -> WorkContextState:
+        """Correlate every execution of this workflow's `WorkItem`
+        (mctlhq/mctl-agents#267, ADR 011), so a trace view can show two
+        executions started on different surfaces as one task without either
+        execution's own record having been rewritten.
+        """
+        current = self._executions[-1] if self._executions else None
+        return WorkContextState(
+            work_item_id=self._work_item_id,
+            execution_id=current.execution_id if current is not None else "",
+            execution_sequence=current.sequence if current is not None else 0,
+            executions=tuple(self._executions),
+            last_surface=self._current_surface,
+            last_actor=self._current_actor,
+            resume_rejections=tuple(self._resume_rejections),
+        )
+
     @workflow.signal
     def approve(self, *args: object) -> None:
         # Optional payload for the audit trail: legacy senders signal with no
@@ -879,10 +950,133 @@ class DevLoopWorkflow:
             elif isinstance(arg, str) and arg:
                 self._approver = arg
         self._approved = True
+        # A fresh approval closes the "one resume already pending" window
+        # (see `resume`): the actor who just approved is the current one,
+        # and a subsequent resume is free to open a new window of its own.
+        self._resume_pending = False
+
+    @workflow.signal
+    def resume(self, *args: object) -> None:
+        """Pick up this work item's task from a possibly different surface
+        or actor (mctlhq/mctl-agents#267, ADR 011).
+
+        Parses defensively and never raises, exactly like `approve` above.
+        Expected payload: a single dict with `work_item_id`, `execution_id`
+        and optionally `surface`, `actor_kind`, `actor_id`. Anything else —
+        no args, a non-dict arg, a dict missing `work_item_id` or
+        `execution_id` — is silently ignored: a signal handler that raised
+        on a malformed payload would fail the workflow task, and a resume is
+        exactly the kind of externally-triggered input that must never do
+        that (the same reasoning `approve`'s docstring gives).
+
+        Idempotent, never forking: a duplicate `execution_id` (the common
+        case, since `execution_id_for` is deterministic) is a no-op; a
+        DIFFERENT `execution_id` arriving while one accepted resume is still
+        awaiting fresh approval is rejected with `reason=
+        "resume-already-pending"`; a `work_item_id` that disagrees with the
+        one already bound is rejected with `reason="work-item-mismatch"`.
+        Every rejection is recorded, never merely dropped, so `work_context`
+        can surface it.
+
+        An ACCEPTED resume that changes the surface or the actor clears
+        `_approved`/`_approver`, so both of `run`'s `await
+        workflow.wait_condition(lambda: self._approved)` calls — the
+        original gate before the slug/approve-flip/implementer-release
+        chain, and the second one immediately before the implement CWFT is
+        submitted — re-arm, and approval is re-evaluated by the current
+        actor. A same-surface, same-actor resume (e.g. a retry from the
+        same place) never touches approval at all: that would be
+        re-litigating a decision nobody changed.
+        """
+        payload: dict[str, object] | None = None
+        for arg in args:
+            if isinstance(arg, dict):
+                payload = arg
+                break
+        if payload is None:
+            return
+
+        work_item_id = payload.get("work_item_id")
+        execution_id = payload.get("execution_id")
+        if not isinstance(work_item_id, str) or not work_item_id:
+            return
+        if not isinstance(execution_id, str) or not execution_id:
+            return
+
+        if self._work_item_id and work_item_id != self._work_item_id:
+            self._resume_rejections.append(
+                ResumeRejection(execution_id=execution_id, work_item_id=work_item_id, reason="work-item-mismatch")
+            )
+            return
+
+        if execution_id in self._seen_execution_ids:
+            return  # idempotent no-op — the same execution resuming again
+
+        if self._resume_pending:
+            self._resume_rejections.append(
+                ResumeRejection(
+                    execution_id=execution_id, work_item_id=work_item_id, reason="resume-already-pending"
+                )
+            )
+            return
+
+        surface_raw = payload.get("surface")
+        surface = SurfaceRef(kind=surface_raw) if isinstance(surface_raw, str) and surface_raw else SurfaceRef()
+        actor_kind_raw = payload.get("actor_kind")
+        actor_id_raw = payload.get("actor_id")
+        actor = (
+            ActorRef(kind=actor_kind_raw, actor_id=actor_id_raw if isinstance(actor_id_raw, str) else "")
+            if isinstance(actor_kind_raw, str) and actor_kind_raw
+            else ActorRef()
+        )
+
+        self._work_item_id = self._work_item_id or work_item_id
+        self._seen_execution_ids.add(execution_id)
+        surface_transition = bool(self._executions) and (
+            (bool(surface.kind) and surface != self._current_surface)
+            or (bool(actor.kind) and actor != self._current_actor)
+        )
+        self._executions.append(
+            ExecutionRef(
+                execution_id=execution_id,
+                sequence=len(self._executions) + 1,
+                surface=surface,
+                actor=actor,
+                surface_transition=surface_transition,
+            )
+        )
+        if surface.kind:
+            self._current_surface = surface
+        if actor.kind:
+            self._current_actor = actor
+        if surface_transition:
+            self._approved = False
+            self._approver = None
+            self._resume_pending = True
 
     @workflow.run
     async def run(self, issue: IssueRef) -> DevLoopResult:
         target_repo = _target_repo(issue)
+
+        # Work-context seeding (mctlhq/mctl-agents#267, ADR 011): when the
+        # caller supplied a canonical WorkItem, this loop's OWN launch is
+        # execution #1 of it. `workflow.info()` is a local, deterministic
+        # read — no command is scheduled — so this seeding is safe on every
+        # replay, unguarded, exactly like the rest of `resume`'s state
+        # mutations (see that signal's docstring for why no
+        # `workflow.patched` gate is needed here: nothing below schedules a
+        # new command as a result).
+        if issue.work_item_id:
+            self._work_item_id = issue.work_item_id
+            seed_execution_id = execution_id_for(issue.work_item_id, 1, str(workflow.info().attempt))
+            self._seen_execution_ids.add(seed_execution_id)
+            self._executions.append(
+                ExecutionRef(
+                    execution_id=seed_execution_id,
+                    sequence=1,
+                    temporal_workflow_id=workflow.info().workflow_id,
+                )
+            )
 
         # Pin the investigator version ONCE, at the start of this step. A
         # later promote/rollback in the registry must not retroactively
@@ -1034,6 +1228,22 @@ class DevLoopWorkflow:
         if implementer_release and implementer_release.image_ref:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
+
+        # Re-check approval immediately before implementing (mctlhq/mctl-
+        # agents#267, ADR 011). The first `wait_condition` above only proves
+        # SOMEONE had approved by the time this loop started resolving the
+        # slug/approve-flip/implementer-release chain — each of those is a
+        # real await on an activity, and a `resume` signal that changes
+        # surface or actor can land in that gap and clear `_approved` again.
+        # Without this second check, that resume would be recorded but have
+        # no effect: the loop would already be past the only gate that reads
+        # `_approved`. Gated behind the patch marker because it is new
+        # workflow-visible behaviour, even though it is a true no-op for
+        # every history that never calls `resume` — `_approved` is already
+        # True, so `wait_condition` resolves immediately and schedules
+        # nothing, leaving old histories' command stream untouched.
+        if workflow.patched("work-context-resume"):
+            await workflow.wait_condition(lambda: self._approved)
 
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
 
