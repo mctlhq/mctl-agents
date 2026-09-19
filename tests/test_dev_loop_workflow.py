@@ -125,6 +125,14 @@ async def _fake_find_proposal_slug(service: str, issue_number: str) -> str | Non
     return f"issue-{issue_number}-fake-title"
 
 
+@activity.defn(name="find_human_input_request")
+async def _fake_find_human_input_request_none(service: str, slug: str) -> str | None:
+    """No pending clarification — the default every standalone (non-
+    `_fake_activities`) test in this file wants, so the durable-clarification
+    branch (mctlhq/mctl-agents#333) is a same-behaviour no-op for them."""
+    return None
+
+
 pytestmark = pytest.mark.anyio
 
 TASK_QUEUE = "test-mctl-dev-loop"
@@ -172,6 +180,12 @@ def _fake_activities(
     ownership_terminal_fails: bool = False,
     ownership_terminal_fails_once: bool = False,
     ownership_raises: bool = False,
+    # Durable clarification (mctlhq/mctl-agents#333, ADR 011). None (the
+    # default) means "no pending request" — every existing test exercises
+    # exactly today's behaviour without knowing this activity exists at all.
+    # A list lets a test change the answer across repeated calls (e.g. "a
+    # request the first time, none after the model stops asking").
+    human_input_requests: list[str | None] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -267,6 +281,15 @@ def _fake_activities(
 
             raise ApplicationError("incident store down", non_retryable=True)
         return IncidentQueryResult(incidents=list(incidents or []))
+
+    _human_input_index = {"i": 0}
+    _human_input_sequence = human_input_requests if human_input_requests is not None else [None]
+
+    @activity.defn(name="find_human_input_request")
+    async def fake_find_human_input_request(service: str, slug: str) -> str | None:
+        i = min(_human_input_index["i"], len(_human_input_sequence) - 1)
+        _human_input_index["i"] += 1
+        return _human_input_sequence[i]
 
     @activity.defn(name="get_deploy_status")
     async def fake_get_deploy_status(team: str, app: str) -> DeployStatus:
@@ -494,6 +517,7 @@ def _fake_activities(
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        fake_find_human_input_request,
         fake_get_pr_state,
         fake_resolve_deploy_target,
         fake_get_release_after,
@@ -567,6 +591,7 @@ class TestDevLoopWorkflow:
             capturing_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_find_human_input_request_none,
         ]
 
         async with Worker(
@@ -652,6 +677,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_find_human_input_request_none,
         ]
 
         async with Worker(
@@ -699,6 +725,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_find_human_input_request_none,
         ]
 
         async with Worker(
@@ -753,6 +780,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_find_human_input_request_none,
         ]
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -908,6 +936,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             always_failing_record_execution,
             _fake_find_proposal_slug,
+            _fake_find_human_input_request_none,
         ]
 
         async with Worker(
@@ -1022,6 +1051,7 @@ class TestDevLoopWorkflow:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_find_human_input_request_none,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1071,6 +1101,7 @@ class TestDevLoopWorkflow:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_find_human_input_request_none,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1125,6 +1156,7 @@ class TestDevLoopWorkflow:
                 failing_approve_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_find_human_input_request_none,
             ],
         ):
             handle = await env.client.start_workflow(

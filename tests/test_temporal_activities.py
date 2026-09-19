@@ -17,6 +17,10 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
+from orchestrator.temporal.activities.human_input import (
+    HumanInputListingError,
+    find_human_input_request,
+)
 from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
@@ -614,6 +618,84 @@ class TestFindProposalSlug:
         with pytest.raises(ApplicationError, match="listing cap") as excinfo:
             await env.run(find_proposal_slug, "mctl-portal", "80")
         assert excinfo.value.non_retryable
+
+
+class TestFindHumanInputRequest:
+    """T19 (mctlhq/mctl-agents#333): mirrors TestFindProposalSlug's cases —
+    same token resolution, same retryable-vs-404 distinction — for a file
+    read instead of a directory listing."""
+
+    PATH = (
+        "/repos/mctlhq/mctl-gitops/contents/platform-gitops/agents-state/"
+        "mctl-web/proposals/issue-10-test/human-input/request.json"
+    )
+
+    @staticmethod
+    def _file_payload(body: str) -> dict:
+        import base64 as _b64
+
+        return {"type": "file", "encoding": "base64", "content": _b64.b64encode(body.encode()).decode()}
+
+    async def test_404_returns_none(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == self.PATH
+            assert request.url.params["ref"] == "main"
+            assert request.headers["authorization"] == "Bearer gh-test-token"
+            return httpx.Response(404, json={"message": "Not Found"})
+
+        _mock_async_client(monkeypatch, handler)
+        assert await env.run(find_human_input_request, "mctl-web", "issue-10-test") is None
+
+    async def test_file_content_is_decoded(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        body = '{"kind": "HumanInputRequest"}'
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=self._file_payload(body))
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(find_human_input_request, "mctl-web", "issue-10-test")
+        assert result == body
+
+    async def test_server_error_raises_for_retry(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text="bad gateway")
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(HumanInputListingError):
+            await env.run(find_human_input_request, "mctl-web", "issue-10-test")
+
+    async def test_empty_token_raises_instead_of_unauthenticated_404(self, env, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+        requests_made: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests_made.append(str(request.url))
+            return httpx.Response(404)
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(HumanInputListingError, match="no GitHub token available"):
+            await env.run(find_human_input_request, "mctl-web", "issue-10-test")
+        assert requests_made == []
+
+    async def test_unexpected_encoding_raises(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"type": "file", "encoding": "utf-8", "content": "hi"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(HumanInputListingError, match="encoding"):
+            await env.run(find_human_input_request, "mctl-web", "issue-10-test")
 
 
 class TestGetPRState:
