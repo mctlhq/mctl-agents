@@ -70,6 +70,17 @@ Idempotency:
     `--dry-run` reports a blocked proposal in its summary but never writes
     the marker and never changes the exit code.
 
+    A fourth gate sits between the GitHub preflight and the model call: when
+    the preflight finds no existing branch or PR at all, the implementer
+    also reads the proposal's source GitHub issue (`source:` in
+    `.status.yaml`, written by the investigator) and refuses -- writing
+    `needs-triage` with `failure.code` `source-resolved` or
+    `source-not-planned` at `failure.stage: admission` -- if that issue is
+    already closed, so subscription quota is never spent on work that is
+    already done or abandoned (mctl-agents#410). A proposal with no
+    `source` block, or whose issue is still open, is unaffected; an
+    unreadable GitHub leaves it `accepted` and untouched.
+
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
@@ -135,6 +146,7 @@ from orchestrator.proposal_state import (
     now_iso,
     update_status_file,
 )
+from orchestrator.source_issue import SourceIssueVerdict, read_source_issue
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
     OrphanedSubagentError,
@@ -527,6 +539,11 @@ class ImplementResult:
     # `main()` avoid re-failing forever on a permanently blocked proposal.
     blocked_is_new: bool = False
     counts_toward_limit: bool = True
+    # Set only on the admission gate's refusal arm (mctl-agents#410): the
+    # `(code, issue_ref)` pair `main()` prints in `=== Stale source ===`.
+    # Distinct from `blocked` -- this is a `needs-triage` write (the
+    # proposal leaves the accepted queue), not a durable `accepted` park.
+    stale_source: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -537,6 +554,11 @@ class BatchOutcome:
     # Trailing and defaulted so existing positional/keyword constructions
     # (e.g. BatchOutcome(succeeded=1, failed=1, skipped=1)) keep working.
     blocked: int = 0
+    # Admission-gate refusals (mctl-agents#410 codex follow-up). Counted
+    # separately from `failed` so a batch that also implemented a real
+    # proposal on the same tick is not reported red for a refusal that
+    # worked exactly as designed -- see the exit-code comment in `main()`.
+    stale_source: int = 0
 
 
 @dataclass(frozen=True)
@@ -1276,6 +1298,19 @@ def _github_json(cmd: list[str]) -> Any:
         return json.loads(proc.stdout or "null")
     except json.JSONDecodeError as exc:
         raise GitHubPreflightError(f"invalid JSON from {' '.join(cmd[:3])}") from exc
+
+
+def _gh_api_json(args: list[str]) -> Any:
+    """`read_source_issue`'s `gh_api_json` adapter, routed through the
+    bounded `_github_json` (mctl-agents#410 code review).
+
+    `read_source_issue`'s own default reader calls `run_capturing` with
+    `timeout=None` -- unbounded -- and skips `_run`'s token refresh and
+    `$ gh api ...` log line. Passing this adapter instead keeps the
+    admission gate's GitHub read on the same bounded, logged path as every
+    other `gh` call in this module, `_superseding_pr_urls` included.
+    """
+    return _github_json(["gh", "api", *args])
 
 
 def _clone_target(service: str, slug: str) -> Path:
@@ -2473,6 +2508,107 @@ def _mark_blocked(
     return True
 
 
+def _superseding_pr_urls(repo: str, number: int) -> list[str]:
+    """Best-effort lookup of merged PRs GitHub already recorded as closing
+    `repo#number` (mctl-agents#410, the honest version of "closed but
+    superseded").
+
+    Only called on the closed-as-completed arm -- there is nothing to
+    supersede a `not_planned` issue with. Diagnostics only: any failure
+    (network, JSON, unexpected shape) or an empty result returns `[]`, and
+    the caller must never let that change the admission verdict -- this
+    lookup never runs before the refusal is decided, only after, to build
+    the message.
+    """
+    try:
+        events = _github_json(["gh", "api", f"repos/{repo}/issues/{number}/timeline"])
+    except Exception:  # noqa: BLE001 -- diagnostics only, never propagate
+        return []
+    if not isinstance(events, list):
+        return []
+
+    dated: list[tuple[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("event")
+        if kind == "cross-referenced":
+            source_issue = (event.get("source") or {}).get("issue") or {}
+            pr = source_issue.get("pull_request") or {}
+            merged_at = pr.get("merged_at")
+            url = source_issue.get("html_url")
+            if merged_at and url:
+                dated.append((merged_at, url))
+        elif kind == "closed" and event.get("commit_id"):
+            # A closing commit with no accompanying cross-reference event
+            # still proves supersession -- look up the PR(s) that commit
+            # belongs to. Best-effort per commit: one bad lookup must not
+            # discard URLs already found from other events.
+            try:
+                prs = _github_json(
+                    ["gh", "api", f"repos/{repo}/commits/{event['commit_id']}/pulls"]
+                )
+            except Exception as exc:  # noqa: BLE001 -- diagnostics only
+                print(f"warn: could not look up PRs for commit {event['commit_id']}: {exc}")
+                continue
+            if isinstance(prs, list):
+                for pr in prs:
+                    if not isinstance(pr, dict):
+                        continue
+                    merged_at = pr.get("merged_at")
+                    url = pr.get("html_url")
+                    if merged_at and url:
+                        dated.append((merged_at, url))
+
+    if not dated:
+        return []
+    dated.sort(key=lambda item: item[0], reverse=True)
+    seen: set[str] = set()
+    urls: list[str] = []
+    for _, url in dated:
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) == 3:
+            break
+    return urls
+
+
+def _stale_source_message(ref: ProposalRef, verdict: SourceIssueVerdict) -> str:
+    """Compose the admission-refusal message for a proposal's closed source
+    issue (mctl-agents#410).
+
+    Names the issue reference, close reason and close timestamp, and the
+    one supported recovery -- reopening the issue, or re-publishing the
+    proposal as 'proposed' -- rather than a re-check the implementer would
+    never run on its own. Deterministic for a fixed verdict, and stays
+    comfortably under the 2000-char clamp `_mark_needs_triage` applies to
+    `failure.message`.
+    """
+    not_planned = verdict.state_reason == "not_planned"
+    reason = "not planned" if not_planned else "completed"
+    closed_at = f" (closed {verdict.closed_at})" if verdict.closed_at else ""
+    message = (
+        f"source issue {verdict.issue_ref} is closed as {reason}{closed_at}; "
+        f"admission refused before any model attempt."
+    )
+    if not not_planned:
+        # Nothing to supersede a not-planned issue with -- only look on the
+        # completed arm.
+        source = _load_status(ref.status_path).get("source") or {}
+        repo = source.get("repo")
+        number = source.get("issue")
+        urls = _superseding_pr_urls(repo, number) if repo and number else []
+        if urls:
+            message += " Superseded by: " + ", ".join(urls) + "."
+    message += (
+        " Reopen the issue, or re-publish this proposal as 'proposed', to "
+        "make it runnable again."
+    )
+    return message
+
+
 def _push_and_open_pr(
     repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
 ) -> str:
@@ -2633,6 +2769,50 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             pr_url=existing.pr_url,
             error=existing.reason or "existing result needs triage",
         )
+
+    # Admission gate (mctl-agents#410): only reachable on `existing.action
+    # == "none"` -- no branch, no PR for this proposal at all -- because
+    # every other preflight outcome above already returned. That ordering
+    # matters: a proposal the implementer already carried to a `merged` PR
+    # *has* a closed source issue (the PR body says `Closes <repo>#<N>`),
+    # and gating before the preflight would relabel it stale on the very
+    # tick that re-selects it.
+    #
+    # Spends nothing: no SDK auth, no ExecutionClaim acquire, no `attempt`
+    # lease, no clone -- the whole point is to refuse before any of that,
+    # not after.
+    verdict = read_source_issue(
+        _load_status(ref.status_path), stage="admission", gh_api_json=_gh_api_json
+    )
+    if verdict.linked and not verdict.known:
+        # GitHub did not answer. Not evidence about the proposal -- the
+        # same rule the shepherd's `linked and not known` guard follows.
+        # Leave it `accepted` and untouched; do not charge the batch
+        # budget for a GitHub blip.
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason="source issue unreadable; deferring",
+            counts_toward_limit=False,
+        )
+    if verdict.failure:
+        message = _stale_source_message(ref, verdict)
+        recorded = _mark_needs_triage(
+            ref,
+            code=verdict.failure["code"],
+            stage="admission",
+            message=message,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=_triage_error(message, recorded),
+            counts_toward_limit=False,
+            stale_source=(verdict.failure["code"], verdict.issue_ref or "?"),
+        )
+    # `not verdict.linked` (no usable source block -- incident-responder
+    # shape) or the issue is open: nothing to refuse, fall through to the
+    # model exactly as today.
 
     try:
         ensure_auth_for_sdk()
@@ -2982,14 +3162,21 @@ def _implement_refs(
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     """Classify every result; partial success must never mask a failure.
 
-    Order matters: error -> blocked -> skipped_reason -> pr_url. A blocked
-    result also carries a `skipped_reason` (for readers of that channel
-    alone), so it must be classified before the `skipped_reason` branch or
-    it would inflate the skip count.
+    Order matters: stale_source -> error -> blocked -> skipped_reason ->
+    pr_url. A stale-source refusal also carries `error` (for readers of
+    that older channel, and for the per-result "fail" summary line), so it
+    must be classified before the `error` branch or a healthy admission
+    refusal would count toward `failed` and force the whole batch red even
+    when another proposal in the same tick succeeded (codex P2 follow-up on
+    mctl-agents#410). A blocked result also carries a `skipped_reason` (for
+    readers of that channel alone), so it must be classified before the
+    `skipped_reason` branch or it would inflate the skip count.
     """
-    succeeded = failed = skipped = blocked = 0
+    succeeded = failed = skipped = blocked = stale_source = 0
     for result in results:
-        if result.error:
+        if result.stale_source:
+            stale_source += 1
+        elif result.error:
             failed += 1
         elif result.blocked:
             blocked += 1
@@ -2999,7 +3186,13 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
             succeeded += 1
         else:
             failed += 1
-    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped, blocked=blocked)
+    return BatchOutcome(
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        stale_source=stale_source,
+    )
 
 
 def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
@@ -3219,16 +3412,39 @@ def main() -> None:
         for result in blocked_results:
             print(f"  {result.ref.service}/{result.ref.slug}: {result.blocked}")
 
+    stale_sources = [(r, r.stale_source) for r in results if r.stale_source]
+    if stale_sources:
+        print("\n=== Stale source ===")
+        for result, (stale_code, issue_ref) in stale_sources:
+            print(f"  {result.ref.service}/{result.ref.slug}: {stale_code} {issue_ref}")
+
     outcome = _batch_outcome(results)
     print(
         "Totals: "
         f"{outcome.succeeded} succeeded, "
         f"{outcome.failed} failed, "
         f"{outcome.skipped} skipped, "
-        f"{outcome.blocked} blocked"
+        f"{outcome.blocked} blocked, "
+        f"{outcome.stale_source} stale source"
     )
     if outcome.failed:
         sys.exit(1)
+    # A refusal-only batch's `needs-triage` write IS the retirement -- unlike
+    # `blocked`'s idempotent diagnostic marker, there is no "same content
+    # next tick" safety net if it never lands. The write only exists on disk
+    # in this step; turning it into an actual gitops commit happens in the
+    # downstream commit-and-push step. Per the EXIT_BLOCKED_ONLY note above,
+    # the CWFT does not special-case any sentinel exit code today -- both its
+    # `when` gates compare Argo step status strings, so ANY non-zero exit
+    # here marks `implement` Failed and can skip that commit, leaving the
+    # proposal `accepted` so the next tick re-selects it, re-reads GitHub,
+    # and repeats forever -- precisely the loop this gate exists to end
+    # (codex P2 follow-up on mctl-agents#410, PR #416). Exit 0 here so the
+    # write is never put at risk; the `=== Stale source ===` section above
+    # plus the committed `.status.yaml` already carry the signal for
+    # operators, the same tradeoff already made for a mixed batch above.
+    # `outcome.stale_source` is deliberately excluded from `outcome.failed`
+    # above for the same reason.
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also

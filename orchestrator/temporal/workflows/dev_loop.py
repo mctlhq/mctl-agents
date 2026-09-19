@@ -66,6 +66,7 @@ with workflow.unsafe.imports_passed_through():
         IncidentQueryResult,
         list_service_incidents,
     )
+    from orchestrator.temporal.activities.issue_state import IssueState, get_issue_state
     from orchestrator.temporal.activities.lifecycle import (
         OwnershipRequest,
         OwnershipResult,
@@ -906,6 +907,50 @@ class DevLoopWorkflow:
         # "durable per-issue state" the plan's problem statement calls out
         # as missing from the current polling-cron pipeline.
         await workflow.wait_condition(lambda: self._approved)
+
+        # mctl-agents#410: the durable wait above has no upper bound, so the
+        # issue that started this loop can close while it sits parked --
+        # reopened elsewhere, superseded, or resolved directly. Check BEFORE
+        # find_proposal_slug and BEFORE the mctl-agents-approve CWFT below,
+        # so a closed issue is never spent flipping a proposal to `accepted`
+        # (and then implementing it) for a reason that is already gone.
+        #
+        # workflow.patched: get_issue_state is a brand-new command in every
+        # position it could go, so an unpatched (pre-existing) history must
+        # take the legacy branch untouched -- inserting it unconditionally
+        # would be a command mismatch that wedges every in-flight approved
+        # loop on replay, the same hazard slug-scoped-implement's own guard
+        # exists to avoid two paragraphs down.
+        if workflow.patched("stale-issue-admission"):
+            issue_parts = parse_issue_url(issue.issue_url)
+            issue_repo = f"{issue_parts.owner}/{issue_parts.repo}"
+            issue_number_int = int(issue_parts.number)
+            issue_state: IssueState | None = None
+            try:
+                issue_state = await workflow.execute_activity(
+                    get_issue_state,
+                    args=[issue_repo, issue_number_int],
+                    start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                    retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+                )
+            except ActivityError:
+                # Fail-open on the workflow side: the implementer's own
+                # admission gate (mctl-agents#410's other half) is the
+                # authoritative check. Wedging every loop parked at approval
+                # on a GitHub blip here is worse than letting one proceed to
+                # a refusal it would hit downstream anyway.
+                workflow.logger.warning(
+                    "get_issue_state failed after retries for %s#%s -- "
+                    "proceeding without the pre-approve stale-issue check",
+                    issue_repo,
+                    issue_number_int,
+                )
+            if issue_state is not None and issue_state.state == "closed":
+                return DevLoopResult(
+                    investigate=investigate_result,
+                    implement=None,
+                    approve=None,
+                )
 
         # Scoped to this issue's own proposal, not just its repo. Service
         # scoping alone left a same-repo race: two approved loops for the

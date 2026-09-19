@@ -950,6 +950,37 @@ def test_reconcile_relabels_a_proposal_whose_issue_closed_completed(tmp_path) ->
     assert ref.status_path.read_text(encoding="utf-8") == settled
 
 
+def test_reconcile_relabels_a_typeless_source_block_too(tmp_path) -> None:
+    """A `source:` block with `repo` + `issue` but no `type` key still counts.
+
+    `run_shepherd._source_issue_state` never checked `type` before it was
+    extracted into `orchestrator.source_issue.read_source_issue`
+    (mctl-agents#410); a `.status.yaml` written before `type` existed (or
+    by any writer that omits it) must not be silently treated as unlinked.
+    """
+    ref = make_ref(
+        tmp_path, service="mctl-academy", slug="typeless-source",
+        status="implemented", pr_url=None,
+    )
+    status = read_status(ref)
+    status["source"] = {"repo": "mctlhq/mctl-academy", "issue": 21}
+    ref.status_path.write_text(yaml.safe_dump(status, sort_keys=False), encoding="utf-8")
+
+    result, _ = _pr_less_reconcile(
+        ref, issue_payload={"state": "closed", "state_reason": "completed"}
+    )
+
+    final = read_status(ref)
+    assert result.decision == "needs-triage"
+    assert final["failure"]["code"] == "source-resolved"
+
+    # And the one-way-door guard from PR #279 still relabels it back to
+    # missing-pr once the issue is reopened, for the same typeless shape.
+    result2, _ = _pr_less_reconcile(ref, issue_payload={"state": "open", "state_reason": None})
+    assert result2.decision == "needs-triage"
+    assert read_status(ref)["failure"]["code"] == "missing-pr"
+
+
 def test_reconcile_distinguishes_not_planned_from_completed(tmp_path) -> None:
     """Two different reasons a proposal is obsolete, told apart in the file."""
     ref = make_ref(
