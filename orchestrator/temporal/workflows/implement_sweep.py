@@ -42,14 +42,23 @@ from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlrea
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
-    from orchestrator.temporal.activities.stranded import StrandedScanResult, find_stranded_accepted
+    from orchestrator.temporal.activities.stranded import (
+        StrandedProposal,
+        StrandedScanResult,
+        find_stranded_accepted,
+    )
     from orchestrator.temporal.constants import (
         DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES,
         DEFAULT_IMPLEMENT_SWEEP_MAX_SUBMITS,
         IMPLEMENTATION_OPERATION,
         IMPLEMENTATION_TASK_QUEUE,
     )
-    from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
+    from orchestrator.temporal.implement_outcome import (
+        PRE_START_ERROR_TYPE,
+        Outcome,
+        classify,
+        finalization_evidence,
+    )
 
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
@@ -83,6 +92,51 @@ RECORD_EXECUTION_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 class SweptImplementInput:
     service: str
     slug: str
+
+
+async def _record_prestart_budget_exhausted(
+    candidate: StrandedProposal, child_id: str, prior_failures: int
+) -> None:
+    """Durable record for a proposal that exceeded MAX_SWEEP_PRESTART_ATTEMPTS.
+
+    mctl-agents#412 review: a `workflow.logger.warning` line is exactly the
+    invisibility this whole proposal exists to fix — this worker keeps no
+    gitops clone (design.md), so it cannot write `.status.yaml` directly, but
+    `record_execution` already gives every other terminal outcome of a swept
+    submit a durable row in mctl-api's execution ledger
+    (`_record_swept_execution` above). Reused here rather than invented:
+    no Argo workflow was submitted this tick, so `argo_workflow_name` names
+    the would-be child workflow id instead of a real one, and `phase`
+    is "Failed" — the accurate terminal phase for a run that did not happen
+    because prior attempts already exhausted the retry budget.
+    """
+    try:
+        await workflow.execute_activity(
+            record_execution,
+            ExecutionRecord(
+                temporal_workflow_id=workflow.info().workflow_id,
+                agent="implementer",
+                environment=ENVIRONMENT,
+                version="",
+                image_ref="",
+                target_repo=candidate.service,
+                argo_workflow_name=child_id,
+                phase="Failed",
+            ),
+            start_to_close_timeout=RECORD_EXECUTION_TIMEOUT,
+            retry_policy=RECORD_EXECUTION_RETRY_POLICY,
+        )
+    except ActivityError:
+        workflow.logger.warning(
+            "record_execution failed after retries for the exhausted "
+            "pre-start budget of %s/%s (%d prior failures under %s) — "
+            "continuing without a durable execution record for this "
+            "exhaustion",
+            candidate.service,
+            candidate.slug,
+            prior_failures,
+            child_id,
+        )
 
 
 async def _record_swept_execution(input_data: SweptImplementInput, result: WorkflowResult) -> None:
@@ -167,7 +221,7 @@ class SweptImplementWorkflow:
         # 15-minute tick naturally reconsiders a proposal that is still
         # `accepted` — there is no in-workflow retry budget to spend.
         error_type = {
-            "pre_start": "ImplementationNotStarted",
+            "pre_start": PRE_START_ERROR_TYPE,
             "execution": "ImplementationFailed",
             "finalization": "ImplementationFinalizationFailed",
         }[outcome]
@@ -273,6 +327,7 @@ class ImplementSweepWorkflow:
                     prior_failures,
                     child_id,
                 )
+                await _record_prestart_budget_exhausted(candidate, child_id, prior_failures)
                 continue
 
             try:

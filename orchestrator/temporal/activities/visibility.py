@@ -9,7 +9,10 @@ the client it already holds and registers the bound method.
 from __future__ import annotations
 
 from temporalio import activity
-from temporalio.client import Client
+from temporalio.client import Client, WorkflowFailureError
+from temporalio.exceptions import ApplicationError
+
+from orchestrator.temporal.implement_outcome import PRE_START_ERROR_TYPE
 
 # Visibility query for the active DevLoop set. WorkflowType is the
 # @workflow.defn class name; ExecutionStatus 'Running' deliberately excludes
@@ -38,7 +41,7 @@ class VisibilityActivities:
 
     @activity.defn
     async def count_swept_implement_failures(self, workflow_id: str) -> int:
-        """How many prior executions under this exact child workflow id ended Failed.
+        """How many prior executions under this exact child workflow id were pre-start losses.
 
         mctl-agents#412 review: `ImplementSweepWorkflow` is a fresh execution
         every 15-minute tick and keeps no state of its own, so a `pre_start`
@@ -50,10 +53,38 @@ class VisibilityActivities:
         has already failed to start; `ImplementSweepWorkflow` uses this to
         stop resubmitting past a bound, the same way `MAX_PRESTART_REQUEUES`
         bounds `dev_loop._implement`.
+
+        `ExecutionStatus = 'Failed'` alone cannot say WHY: `SweptImplementWorkflow`
+        also ends Failed on an `execution` or `finalization` outcome (both of
+        which the implementer actually ran for), and on `submit_and_wait`
+        itself exhausting its retries against an Argo/mctl-api outage before
+        the implementer ever got a chance to run under a DIFFERENT exception
+        shape. Counting all three against the pre-start budget would let a
+        transient outage, or a real implementer failure, silently spend the
+        budget meant only for "nothing was attempted". So each Failed
+        execution's own terminal error is read back — `.result()` raises the
+        recorded failure — and only the one `SweptImplementWorkflow` raises
+        for a `pre_start` verdict (`ApplicationError.type ==
+        PRE_START_ERROR_TYPE`) is counted; every other failure shape
+        (execution, finalization, an outage, an unrecognised cause) is left
+        out.
         """
         count = 0
-        async for _ in self._client.list_workflows(
+        async for wf in self._client.list_workflows(
             f"WorkflowId = '{workflow_id}' AND ExecutionStatus = 'Failed'"
         ):
-            count += 1
+            handle = self._client.get_workflow_handle(wf.id, run_id=wf.run_id)
+            try:
+                await handle.result()
+            except WorkflowFailureError as exc:
+                cause = exc.cause
+                if isinstance(cause, ApplicationError) and cause.type == PRE_START_ERROR_TYPE:
+                    count += 1
+            except Exception:  # noqa: BLE001 — an unreadable cause is not counted, not raised
+                activity.logger.warning(
+                    "count_swept_implement_failures: could not read the failure "
+                    "cause for %s run_id=%s; not counted as a pre-start loss",
+                    wf.id,
+                    wf.run_id,
+                )
         return count

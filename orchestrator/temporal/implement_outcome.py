@@ -41,6 +41,14 @@ FailureClass = Literal["pre_start", "execution", "finalization"]
 # built from.
 Outcome = Literal["success"] | FailureClass
 
+# The `ApplicationError.type` SweptImplementWorkflow raises for a `pre_start`
+# outcome (implement_sweep.py). Named once here, not spelled out a second
+# time in visibility.py's count_swept_implement_failures, which reads it back
+# off a completed child workflow's failure to count pre-start losses only —
+# an execution/finalization failure, or an outage that fails the submit
+# activity itself, must not consume the same budget (mctl-agents#412 review).
+PRE_START_ERROR_TYPE = "ImplementationNotStarted"
+
 
 @dataclass(frozen=True)
 class ImplementerObservation:
