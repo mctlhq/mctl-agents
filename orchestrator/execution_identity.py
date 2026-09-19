@@ -759,11 +759,25 @@ def load_from_environment(
         # from_dict() only checks shape and vocabulary (see its docstring);
         # this is the one production call site that reads an untrusted
         # document, so verify the tamper evidence ADR 011 promises here.
-        if recompute_content_hash(context) != context.content_hash:
+        expected_content_hash = recompute_content_hash(context)
+        if expected_content_hash != context.content_hash:
             raise ExecutionIdentityError(
                 f"content_hash mismatch for context_id={context.context_id!r} loaded from "
                 f"{MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: document content does not match "
                 "its declared content_hash"
+            )
+        # content_hash is computed over every field except content_hash,
+        # context_id and issued_at itself (_content_payload), so a matching
+        # content_hash alone does not prove context_id was not swapped for
+        # some other (even legitimately sealed) context's id. seal() derives
+        # context_id deterministically as "ex-" + content_hash[7:23]; recheck
+        # that binding explicitly so a tampered context_id is caught too.
+        expected_context_id = "ex-" + expected_content_hash[7:23]
+        if context.context_id != expected_context_id:
+            raise ExecutionIdentityError(
+                f"context_id mismatch loaded from {MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: "
+                f"declared context_id={context.context_id!r} does not match {expected_context_id!r} "
+                "derived from its own content_hash"
             )
         return context
     if os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip():

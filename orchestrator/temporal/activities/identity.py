@@ -142,13 +142,26 @@ async def mint_execution_context(req: MintRequest) -> MintedContext:
         # trace_id failed seal()'s validate() call. Same best-effort degrade
         # as the auth/network branches below, per this module's docstring:
         # this activity never raises.
-        context = mint_local(
-            executor_type=req.executor_type,
-            workflow_type=req.workflow_type,
-            agent=req.executor_agent,
-            version=req.executor_version,
-            trace_id=req.trace_id,
-        )
+        try:
+            # mint_local() always replaces actor.type/actor.verification,
+            # trigger.type and scope.environment with its own hardcoded,
+            # always-valid defaults -- but it forwards executor_type,
+            # workflow_type and trace_id to seal() unchanged. If one of
+            # those three was the field that failed validate() above, this
+            # first attempt re-triggers the identical ExecutionIdentityError
+            # instead of degrading.
+            context = mint_local(
+                executor_type=req.executor_type,
+                workflow_type=req.workflow_type,
+                agent=req.executor_agent,
+                version=req.executor_version,
+                trace_id=req.trace_id,
+            )
+        except ExecutionIdentityError:
+            # Retry with mint_local()'s own known-valid values for the three
+            # fields it does not sanitize, so the degrade path always
+            # succeeds regardless of which caller-supplied field was bad.
+            context = mint_local(executor_type="service-agent", agent=req.executor_agent, version=req.executor_version)
         return MintedContext(
             context_id=context.context_id, trace_id=context.trace_id, content_hash=context.content_hash,
             stored=False,

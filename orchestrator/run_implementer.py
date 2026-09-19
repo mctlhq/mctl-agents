@@ -104,7 +104,7 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
-from orchestrator.execution_identity import load_from_environment
+from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
@@ -2457,9 +2457,17 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # MCP headers (orchestrator.options, loaded from the same
     # MCTL_EXECUTION_CONTEXT_FILE) and the `.status.yaml` execution: block
     # agree by construction whenever a control-plane-minted context exists.
-    execution_context = load_from_environment(
-        executor_type="implementer", workflow_type="implement", agent="implementer"
-    )
+    try:
+        execution_context = load_from_environment(
+            executor_type="implementer", workflow_type="implement", agent="implementer"
+        )
+    except (ExecutionIdentityError, OSError, json.JSONDecodeError) as exc:
+        # Mirrors orchestrator.options._execution_context_headers(): a
+        # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
+        # truncated, or tamper-evidence failure) must not crash the attempt —
+        # degrade to a locally-minted, explicitly unverified context instead.
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
+        execution_context = mint_local(executor_type="implementer", workflow_type="implement", agent="implementer")
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
 
     try:

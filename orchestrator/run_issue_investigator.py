@@ -72,7 +72,12 @@ import yaml
 # the whole agent stack into that process, which is exactly what #149
 # forbids — the agent itself only ever runs in an Argo sandbox.
 from config.settings import SERVICE_AGENT_MODEL, SERVICES
-from orchestrator.execution_identity import ExecutionContext, load_from_environment
+from orchestrator.execution_identity import (
+    ExecutionContext,
+    ExecutionIdentityError,
+    load_from_environment,
+    mint_local,
+)
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 
@@ -1498,9 +1503,19 @@ def investigate(
     # (once mctl-gitops writes that file) they agree by construction; only
     # the local-fallback path can differ between independent loads, and that
     # path is explicitly `unverified` evidence, never the audited value.
-    execution_context = load_from_environment(
-        executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
-    )
+    try:
+        execution_context = load_from_environment(
+            executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+        )
+    except (ExecutionIdentityError, OSError, json.JSONDecodeError) as exc:
+        # Mirrors orchestrator.options._execution_context_headers(): a
+        # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
+        # truncated, or tamper-evidence failure) must not crash the run —
+        # degrade to a locally-minted, explicitly unverified context instead.
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
+        execution_context = mint_local(
+            executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+        )
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
 
     issue = gh_issue_view(issue_url)
