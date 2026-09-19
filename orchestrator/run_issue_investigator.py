@@ -1672,8 +1672,22 @@ def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
     dry_run: bool = False,
+    *,
+    work_item_id: str | None = None,
+    execution_id: str | None = None,
+    resume_from_execution_id: str | None = None,
+    surface: str | None = None,
+    actor_kind: str | None = None,
+    actor_id: str | None = None,
 ) -> InvestigateResult:
-    """Investigate one GitHub issue and write a `proposed` proposal."""
+    """Investigate one GitHub issue and write a `proposed` proposal.
+
+    The six keyword-only parameters are mctlhq/mctl-agents#267's work-context
+    seam. Every existing call site — `investigate(url, tmp_path)` in the
+    tests, and `orchestrator/run_issue_poller.py` — is untouched: none of
+    them is required, all default to None, and at the default
+    `WORK_CONTEXT_ROLLOUT_MODE=off` none of them changes behaviour at all.
+    """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
 
@@ -1702,6 +1716,48 @@ def investigate(
         )
         print(f"warn: {reason}")
         return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+
+    # Work-context seam (mctlhq/mctl-agents#267): resolve the WorkItem and
+    # reconstruct canonical state, but only when a caller actually supplied
+    # one and the rollout is at least `observe`. At the default `off` mode
+    # this whole block is skipped — the store is never contacted and behaviour
+    # is byte-for-byte what it is today. Imported lazily, inside this
+    # function body, never at module scope (see the import-discipline note
+    # at the top of this file and tests/test_worker_isolation.py).
+    if work_item_id:
+        from orchestrator.work_context import rollout as _work_context_rollout
+        from orchestrator.work_context.contract import (
+            TERMINAL_WORK_ITEM_STATES,
+            WORK_ITEM_FOUND,
+            reconstruct_canonical_state,
+        )
+
+        if _work_context_rollout.computes_new_answer():
+            from orchestrator.work_context.client import WorkItemClient
+
+            answer = WorkItemClient().get(work_item_id)
+            if answer.verdict == WORK_ITEM_FOUND and answer.item is not None:
+                canonical = reconstruct_canonical_state(answer.item, proposal_dir, ())
+                print(
+                    "info: work_context "
+                    f"work_item_id={canonical.work_item_id} state={canonical.state} "
+                    f"prior_execution_ids={list(canonical.prior_execution_ids)}"
+                )
+                # `enforce`/`only`: the reconstructed state may VETO this run
+                # (a work item already in a terminal state) but never
+                # LICENSE one the issue path would have refused on its own —
+                # requirements.md's "Rollout staging" acceptance criteria.
+                if _work_context_rollout.new_answer_may_veto() and canonical.state in TERMINAL_WORK_ITEM_STATES:
+                    reason = (
+                        f"work item {work_item_id} is already in terminal state "
+                        f"{canonical.state!r} — refusing to re-investigate"
+                    )
+                    print(f"warn: {reason}")
+                    return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+            elif _work_context_rollout.blocks_on_unknown():
+                reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
+                print(f"warn: {reason}")
+                return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
 
     if issue.state == "CLOSED":
         print(f"warn: issue {issue.ref.full_repo}#{issue.ref.number} is CLOSED — investigating anyway.")
@@ -2305,14 +2361,44 @@ def investigate(
                 pass
 
 
+def _work_context_from_args(args: argparse.Namespace) -> None:
+    """Validate the work-context CLI flags before they reach `investigate()`.
+
+    Exits non-zero (via `SystemExit`, caught by argparse's own convention of
+    letting it propagate out of `main()`) on every documented rejection path;
+    a valid combination returns `None` and has no other side effect.
+    Imported lazily, matching `investigate()`'s own import discipline.
+    """
+    from orchestrator.work_context import rollout as _work_context_rollout
+    from orchestrator.work_context.contract import ACTOR_KINDS, SURFACE_KINDS
+
+    if args.resume_from_execution_id and not args.work_item_id:
+        raise SystemExit("--resume-from-execution-id requires --work-item-id")
+    if args.surface is not None and args.surface not in SURFACE_KINDS:
+        raise SystemExit(f"--surface must be one of {sorted(SURFACE_KINDS)}, got {args.surface!r}")
+    if args.actor_kind is not None and args.actor_kind not in ACTOR_KINDS:
+        raise SystemExit(f"--actor-kind must be one of {sorted(ACTOR_KINDS)}, got {args.actor_kind!r}")
+    if not args.issue_url and not (
+        args.work_item_id and _work_context_rollout.at_least(_work_context_rollout.ONLY)
+    ):
+        raise SystemExit(
+            "--issue-url is required unless --work-item-id is given and "
+            f"{_work_context_rollout.ENV_VAR}={_work_context_rollout.ONLY!r}"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Issue-investigator — turn a GitHub issue into a proposal"
     )
     ap.add_argument(
         "--issue-url",
-        required=True,
-        help="GitHub issue URL, e.g. https://github.com/mctlhq/mctl-telegram/issues/123",
+        default=None,
+        help=(
+            "GitHub issue URL, e.g. https://github.com/mctlhq/mctl-telegram/issues/123. "
+            "Optional only when --work-item-id is given and "
+            "WORK_CONTEXT_ROLLOUT_MODE=only, in which case it is resolved from the work item."
+        ),
     )
     ap.add_argument(
         "--state-dir",
@@ -2324,7 +2410,35 @@ def main() -> None:
         action="store_true",
         help="Resolve issue + slug only; don't clone, run the SDK, or comment",
     )
+    ap.add_argument(
+        "--work-item-id", default=None,
+        help="Canonical WorkItem id to resume against (mctlhq/mctl-agents#267)",
+    )
+    ap.add_argument(
+        "--execution-id", default=None,
+        help="This execution's own id; derived deterministically when omitted",
+    )
+    ap.add_argument(
+        "--resume-from-execution-id", default=None,
+        help="The prior execution this run resumes; requires --work-item-id",
+    )
+    ap.add_argument("--surface", default=None, help="Surface this execution runs on (closed vocabulary)")
+    ap.add_argument("--actor-kind", default=None, help="Kind of actor driving this execution (closed vocabulary)")
+    ap.add_argument("--actor-id", default=None, help="Identity of the actor driving this execution")
     args = ap.parse_args()
+    _work_context_from_args(args)
+
+    issue_url = args.issue_url
+    if not issue_url:
+        # Only reachable once _work_context_from_args has already confirmed
+        # --work-item-id is set and the mode is `only`.
+        from orchestrator.work_context.client import WorkItemClient
+        from orchestrator.work_context.contract import WORK_ITEM_FOUND
+
+        answer = WorkItemClient().get(args.work_item_id)
+        if answer.verdict != WORK_ITEM_FOUND or answer.item is None or not answer.item.issue_url:
+            raise SystemExit(f"could not resolve --issue-url from work item {args.work_item_id!r}: {answer.reason}")
+        issue_url = answer.item.issue_url
 
     # Not in dry-run: it resolves the issue and the slug and stops before
     # the agent, so requiring Claude credentials to do that would break the
@@ -2338,9 +2452,15 @@ def main() -> None:
 
     try:
         result = investigate(
-            issue_url=args.issue_url,
+            issue_url=issue_url,
             state_dir=Path(args.state_dir),
             dry_run=args.dry_run,
+            work_item_id=args.work_item_id,
+            execution_id=args.execution_id,
+            resume_from_execution_id=args.resume_from_execution_id,
+            surface=args.surface,
+            actor_kind=args.actor_kind,
+            actor_id=args.actor_id,
         )
     except ProposalAmbiguityError as exc:
         # The process boundary is where a clean exit belongs — the library

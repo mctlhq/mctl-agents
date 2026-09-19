@@ -60,6 +60,16 @@ SOURCE_KINDS = frozenset({
 })
 RETENTION_CLASSES = frozenset({"telemetry", "execution-record", "gitops"})
 
+# WorkContextRef closed vocabularies (mctlhq/mctl-agents#267, ADR 011).
+# Deliberately duplicated rather than imported from
+# `orchestrator/work_context/contract.py`: that package is the tolerant
+# mctl-api mirror, this module is the strict sealed-document schema, and
+# design.md is explicit that the two are different jobs that must not share
+# an import edge. A vocabulary mismatch between the two is a one-line fix in
+# whichever module is wrong.
+WORK_CONTEXT_SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli"})
+WORK_CONTEXT_ACTOR_KINDS = frozenset({"human", "agent", "system"})
+
 # Bounded-length rule (ADR 009 sec. 7): locator/selector are addresses and
 # slice descriptors, never a place to smuggle a payload. These are sanity
 # ceilings, the same spirit as resolver.py's MAX_BUDGET_USD/MAX_TIMEOUT_SECONDS.
@@ -518,6 +528,95 @@ class StepRef:
 
 
 @dataclass(frozen=True)
+class WorkContextRef:
+    """Correlates one snapshot's execution to the other executions of the
+    same durable `WorkItem` (mctlhq/mctl-agents#267, ADR 011:
+    docs/adr/011-work-item-resume-contract.md).
+
+    This is a SIBLING-correlation axis, deliberately distinct from `StepRef`:
+    `StepRef` chains steps WITHIN one execution and requires a child's
+    `execution` block to equal its parent's (ADR 009 sec. 4); a resume by
+    definition has a DIFFERENT execution, so it is identified by
+    `work_item_id` and `prior_execution_ids` rather than a parent pointer.
+    `resumed_from_snapshot_id` is an optional one-way pointer for convenience
+    only — dropping it changes nothing else this block can prove.
+
+    Provenance metadata only (ADR 009 sec. 5): no field here is ever
+    consumed by an authorization decision, and `validate()` never gates a
+    document's acceptance on any of these values beyond the closed-
+    vocabulary and step-chaining checks below.
+    """
+
+    work_item_id: str
+    work_item_revision: str
+    execution_id: str
+    execution_sequence: int
+    prior_execution_ids: tuple[str, ...] = ()
+    resumed_from_snapshot_id: str | None = None
+    origin_surface: str = ""
+    current_surface: str = ""
+    actor_kind: str = ""
+    actor_id: str = ""
+    surface_transition: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "work_item_id": self.work_item_id,
+            "work_item_revision": self.work_item_revision,
+            "execution_id": self.execution_id,
+            "execution_sequence": self.execution_sequence,
+            "prior_execution_ids": list(self.prior_execution_ids),
+            "resumed_from_snapshot_id": self.resumed_from_snapshot_id,
+            "origin_surface": self.origin_surface,
+            "current_surface": self.current_surface,
+            "actor_kind": self.actor_kind,
+            "actor_id": self.actor_id,
+            "surface_transition": self.surface_transition,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> WorkContextRef:
+        mapping = _require_mapping(data, where="work_context")
+        _reject_unknown_keys(
+            mapping,
+            frozenset({
+                "work_item_id", "work_item_revision", "execution_id", "execution_sequence",
+                "prior_execution_ids", "resumed_from_snapshot_id", "origin_surface",
+                "current_surface", "actor_kind", "actor_id", "surface_transition",
+            }),
+            where="work_context",
+        )
+        prior_raw = mapping.get("prior_execution_ids", [])
+        if not isinstance(prior_raw, list) or not all(isinstance(p, str) for p in prior_raw):
+            raise ContextSnapshotError("work_context.prior_execution_ids must be a list of strings")
+        return cls(
+            work_item_id=_require_str(mapping.get("work_item_id"), where="work_context.work_item_id"),
+            work_item_revision=_require_str(
+                mapping.get("work_item_revision", ""), where="work_context.work_item_revision", allow_empty=True
+            ),
+            execution_id=_require_str(mapping.get("execution_id"), where="work_context.execution_id"),
+            execution_sequence=_require_int(
+                mapping.get("execution_sequence"), where="work_context.execution_sequence"
+            ),
+            prior_execution_ids=tuple(prior_raw),
+            resumed_from_snapshot_id=_optional_str(
+                mapping.get("resumed_from_snapshot_id"), where="work_context.resumed_from_snapshot_id"
+            ),
+            origin_surface=_require_str(
+                mapping.get("origin_surface", ""), where="work_context.origin_surface", allow_empty=True
+            ),
+            current_surface=_require_str(
+                mapping.get("current_surface", ""), where="work_context.current_surface", allow_empty=True
+            ),
+            actor_kind=_require_str(mapping.get("actor_kind", ""), where="work_context.actor_kind", allow_empty=True),
+            actor_id=_require_str(mapping.get("actor_id", ""), where="work_context.actor_id", allow_empty=True),
+            surface_transition=_require_bool(
+                mapping.get("surface_transition", False), where="work_context.surface_transition"
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class ContextStrategy:
     """Which assembler/ranker produced this snapshot. `ranker_name`/
     `ranker_version` stay optional because no ranker exists yet; a future
@@ -647,7 +746,7 @@ class RetentionPolicy:
 
 _SNAPSHOT_KEYS = frozenset({
     "api_version", "kind", "snapshot_id", "content_hash", "created_at",
-    "execution", "step", "strategy", "budget", "sources", "evidence_refs", "retention",
+    "execution", "step", "work_context", "strategy", "budget", "sources", "evidence_refs", "retention",
 })
 
 
@@ -670,6 +769,7 @@ class ContextSnapshot:
     budget: ContextBudget
     retention: RetentionPolicy
     step: StepRef | None = None
+    work_context: WorkContextRef | None = None
     sources: tuple[ContextSource, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
 
@@ -682,6 +782,7 @@ class ContextSnapshot:
             "created_at": self.created_at,
             "execution": self.execution.to_dict(),
             "step": self.step.to_dict() if self.step is not None else None,
+            "work_context": self.work_context.to_dict() if self.work_context is not None else None,
             "strategy": self.strategy.to_dict(),
             "budget": self.budget.to_dict(),
             "sources": [s.to_dict() for s in self.sources],
@@ -717,6 +818,8 @@ class ContextSnapshot:
         execution = ExecutionCorrelation.from_dict(mapping.get("execution"))
         step_raw = mapping.get("step")
         step = StepRef.from_dict(step_raw) if step_raw is not None else None
+        work_context_raw = mapping.get("work_context")
+        work_context = WorkContextRef.from_dict(work_context_raw) if work_context_raw is not None else None
         strategy = ContextStrategy.from_dict(mapping.get("strategy"))
         budget = ContextBudget.from_dict(mapping.get("budget"))
         retention = RetentionPolicy.from_dict(mapping.get("retention"))
@@ -739,6 +842,7 @@ class ContextSnapshot:
             created_at=created_at,
             execution=execution,
             step=step,
+            work_context=work_context,
             strategy=strategy,
             budget=budget,
             sources=sources,
@@ -810,6 +914,24 @@ class ContextSnapshot:
                 f"sources' byte_count ({included_bytes})"
             )
 
+        if self.work_context is not None:
+            wc = self.work_context
+            if wc.origin_surface and wc.origin_surface not in WORK_CONTEXT_SURFACE_KINDS:
+                raise ContextSnapshotError(
+                    f"work_context.origin_surface {wc.origin_surface!r} is not one of "
+                    f"{sorted(WORK_CONTEXT_SURFACE_KINDS)!r}"
+                )
+            if wc.current_surface and wc.current_surface not in WORK_CONTEXT_SURFACE_KINDS:
+                raise ContextSnapshotError(
+                    f"work_context.current_surface {wc.current_surface!r} is not one of "
+                    f"{sorted(WORK_CONTEXT_SURFACE_KINDS)!r}"
+                )
+            if wc.actor_kind and wc.actor_kind not in WORK_CONTEXT_ACTOR_KINDS:
+                raise ContextSnapshotError(
+                    f"work_context.actor_kind {wc.actor_kind!r} is not one of "
+                    f"{sorted(WORK_CONTEXT_ACTOR_KINDS)!r}"
+                )
+
         if parent is not None:
             if self.step is None:
                 raise ContextSnapshotError("a child snapshot must carry a step block to reference a parent")
@@ -820,13 +942,25 @@ class ContextSnapshot:
                 )
             if self.execution != parent.execution:
                 raise ContextSnapshotError("a child snapshot's execution block must equal its parent's")
+            # WorkContextRef is the sibling-correlation axis; StepRef is the
+            # intra-execution axis (see WorkContextRef's docstring). A resume
+            # deliberately produces a DIFFERENT execution, but a step child
+            # is never a resume — extending the parent-equality rule here
+            # keeps both axes independently checkable.
+            if self.work_context != parent.work_context:
+                raise ContextSnapshotError("a child snapshot's work_context block must equal its parent's")
 
     def to_log_dict(self) -> dict[str, Any]:
         """Trace/telemetry-export shape (#195 owns traces): `snapshot_id`,
         `content_hash`, strategy/ranker name+version, counts and byte
         totals only. Never a `locator`, `selector`, or anything derived from
-        a retrieved payload."""
-        return {
+        a retrieved payload.
+
+        When `work_context` is present, also emits `work_item_id`,
+        `execution_id` and `execution_sequence` for #195 trace correlation —
+        and deliberately never `actor_id`, which stays out of the
+        trace/telemetry-export shape (mctlhq/mctl-agents#267, ADR 011)."""
+        log: dict[str, Any] = {
             "snapshot_id": self.snapshot_id,
             "content_hash": self.content_hash,
             "strategy_name": self.strategy.name,
@@ -842,6 +976,11 @@ class ContextSnapshot:
             "used_bytes": self.budget.used_bytes,
             "truncated": self.budget.truncated,
         }
+        if self.work_context is not None:
+            log["work_item_id"] = self.work_context.work_item_id
+            log["execution_id"] = self.work_context.execution_id
+            log["execution_sequence"] = self.work_context.execution_sequence
+        return log
 
 
 def _check_source(source: ContextSource) -> None:
@@ -883,14 +1022,25 @@ def _content_payload(
     sources: Sequence[ContextSource],
     evidence_refs: Sequence[EvidenceRef],
     retention: RetentionPolicy,
+    work_context: WorkContextRef | None = None,
 ) -> dict[str, Any]:
     """Every field that participates in `content_hash` — everything except
-    `content_hash`, `snapshot_id` and `created_at` (ADR 009 sec. 2)."""
+    `content_hash`, `snapshot_id` and `created_at` (ADR 009 sec. 2).
+
+    `work_context` is unconditionally present in the payload (as `null` when
+    absent), exactly like `step` — so two executions of the same work item
+    that differ only in `execution_id` seal to different `snapshot_id`s
+    (mctlhq/mctl-agents#267, ADR 011). This moves every existing
+    `content_hash`, including documents with `work_context=None`; the module
+    has no production producer yet (`:19-21`), so the only casualty is the
+    golden fixture `tests/fixtures/context/investigator-snapshot.json`,
+    re-cut in the same change."""
     return {
         "api_version": API_VERSION,
         "kind": KIND,
         "execution": execution.to_dict(),
         "step": step.to_dict() if step is not None else None,
+        "work_context": work_context.to_dict() if work_context is not None else None,
         "strategy": strategy.to_dict(),
         "budget": budget.to_dict(),
         "sources": [s.to_dict() for s in sources],
@@ -907,6 +1057,7 @@ def seal(
     retention: RetentionPolicy,
     created_at: str,
     step: StepRef | None = None,
+    work_context: WorkContextRef | None = None,
     sources: Sequence[ContextSource] = (),
     evidence_refs: Sequence[EvidenceRef] = (),
 ) -> ContextSnapshot:
@@ -928,6 +1079,7 @@ def seal(
         sources=sources,
         evidence_refs=evidence_refs,
         retention=retention,
+        work_context=work_context,
     )
     content_hash = _hash_bytes(_canonical_json(payload))
     snapshot_id = "cs-" + content_hash[7:23]
@@ -939,6 +1091,7 @@ def seal(
         created_at=created_at,
         execution=execution,
         step=step,
+        work_context=work_context,
         strategy=strategy,
         budget=budget,
         sources=tuple(sources),
@@ -962,6 +1115,7 @@ def recompute_content_hash(snapshot: ContextSnapshot) -> str:
         sources=snapshot.sources,
         evidence_refs=snapshot.evidence_refs,
         retention=snapshot.retention,
+        work_context=snapshot.work_context,
     )
     return _hash_bytes(_canonical_json(payload))
 
