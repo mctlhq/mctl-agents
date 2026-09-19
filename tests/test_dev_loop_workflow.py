@@ -3885,3 +3885,243 @@ class TestTickSettling:
 
         assert "unexpected RuntimeError" in caplog.text
         assert SERVICE in caplog.text and SLUG in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Admission (#395, #396): the implement submit goes to its own queue, waits
+# there when capacity is taken, requeues when nothing ran, and fails the
+# loop honestly when something did.
+# ---------------------------------------------------------------------------
+from orchestrator.temporal.constants import (  # noqa: E402
+    EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_TASK_QUEUE,
+    implementation_max_concurrent_activities,
+)
+
+
+def _admission_activities(implement_results, *, seen_queues=None, running=None):
+    """Fakes for the admission tests.
+
+    `implement_results` is a list of WorkflowResult (or exceptions) the
+    implement submit returns in order; `seen_queues` records which task
+    queue each operation ran on; `running` is an optional gate the
+    implement fake blocks on so concurrency can be observed.
+    """
+    seen_queues = seen_queues if seen_queues is not None else {}
+    implement_calls: list[str] = []
+    records: list[ExecutionRecord] = []
+    investigate_ran = anyio.Event()
+
+    @activity.defn(name="resolve_agent_release")
+    async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+        return ResolvedRelease(
+            agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+        )
+
+    @activity.defn(name="submit_and_wait")
+    async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+        seen_queues.setdefault(input.operation, []).append(activity.info().task_queue)
+        if input.operation == "mctl-agents-investigate":
+            investigate_ran.set()
+            return WorkflowResult(workflow_name="investigate-fake", phase="Succeeded")
+        if input.operation == "mctl-agents-implement":
+            implement_calls.append(activity.info().workflow_id)
+            if running is not None:
+                await running.enter()
+                try:
+                    pass
+                finally:
+                    await running.leave()
+            outcome = implement_results[min(len(implement_calls), len(implement_results)) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+    @activity.defn(name="record_execution")
+    async def fake_record_execution(record: ExecutionRecord) -> None:
+        records.append(record)
+
+    activities = [
+        fake_resolve_agent_release,
+        fake_submit_and_wait,
+        fake_record_execution,
+        _fake_find_proposal_slug,
+    ]
+    return activities, implement_calls, records, investigate_ran
+
+
+class _Gate:
+    """Counts implement fakes inside the critical section and holds them there."""
+
+    def __init__(self) -> None:
+        self.inside = 0
+        self.peak = 0
+        self.entered_total = 0
+        self.release = anyio.Event()
+        self.changed = anyio.Event()
+
+    async def enter(self) -> None:
+        self.inside += 1
+        self.entered_total += 1
+        self.peak = max(self.peak, self.inside)
+        self.changed.set()
+        await self.release.wait()
+
+    async def leave(self) -> None:
+        self.inside -= 1
+
+
+def _implement_result(phase="Succeeded", *, ran=True, implementer_phase=None, finalization=None):
+    return WorkflowResult(
+        workflow_name="mctl-agents-implement-fake",
+        phase=phase,
+        implementer_ran=ran,
+        implementer_phase=implementer_phase or ("Succeeded" if phase == "Succeeded" else "Failed"),
+        finalization_phase=finalization,
+    )
+
+
+async def _start_and_approve(env, issue_number: int):
+    handle = await env.client.start_workflow(
+        DevLoopWorkflow.run,
+        IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue_number}"),
+        id=f"dev-loop-admission-{issue_number}-{uuid.uuid4()}",
+        task_queue=TASK_QUEUE,
+    )
+    return handle
+
+
+class TestImplementationAdmission:
+    async def test_only_the_implement_submit_routes_to_the_admission_queue(self, env):
+        """Investigate and approve stay on exec; implement alone goes to the
+        admission queue. Read off `activity.info().task_queue` — the one
+        place routing is visible from inside a test worker."""
+        seen: dict[str, list[str]] = {}
+        activities, _calls, _records, investigate_ran = _admission_activities(
+            [_implement_result()], seen_queues=seen
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 1)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.succeeded
+        assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE]
+        assert seen["mctl-agents-investigate"] == [EXECUTION_TASK_QUEUE]
+        assert seen["mctl-agents-approve"] == [EXECUTION_TASK_QUEUE]
+
+    async def test_a_burst_of_approvals_is_admitted_n_at_a_time(self, env):
+        """The 2026-09-19 incident as a regression test (#395 DoD).
+
+        Nine loops approved at once, N=3: exactly three implement submits
+        start, six stay Scheduled in Temporal — no submit fake runs for
+        them, which in production is "no Argo workflow exists" — and as
+        the gate opens the rest drain with no intervention. The wait costs
+        no execution budget: nothing here times out.
+        """
+        n = implementation_max_concurrent_activities()
+        assert n == 3, "the DoD is written for N=3; the harness runs the production default"
+        gate = _Gate()
+        seen: dict[str, list[str]] = {}
+        activities, calls, _records, _ = _admission_activities(
+            [_implement_result()], seen_queues=seen, running=gate
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handles = [await _start_and_approve(env, 100 + i) for i in range(9)]
+            for handle in handles:
+                await handle.signal(DevLoopWorkflow.approve)
+
+            # Wait until the pool is full, then hold there long enough for a
+            # fourth to start if admission were not working.
+            with anyio.fail_after(60):
+                while gate.inside < n:
+                    gate.changed = anyio.Event()
+                    await gate.changed.wait()
+            await asyncio.sleep(3)
+            assert gate.inside == n
+            assert gate.entered_total == n, "a queued loop submitted while the pool was full"
+            assert len(calls) == n
+
+            gate.release.set()
+            results = [await handle.result() for handle in handles]
+
+        assert all(r.implement is not None and r.implement.succeeded for r in results)
+        assert gate.peak == n
+        assert len(calls) == 9
+        assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE] * 9
+
+    async def test_a_pre_start_failure_is_requeued_without_an_attempt(self, env):
+        """An implementer that never ran is resubmitted, and the loop then
+        completes on the second submit. Two execution records, because
+        both Argo workflows existed; one attempt, because only one ran."""
+        activities, calls, records, investigate_ran = _admission_activities(
+            [_implement_result("Failed", ran=False), _implement_result()]
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 2)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+            state = await handle.query(DevLoopWorkflow.implement_execution)
+
+        assert result.implement is not None and result.implement.succeeded
+        assert len(calls) == 2
+        assert [r.phase for r in records if r.agent == "implementer"] == ["Failed", "Succeeded"]
+        assert state.stage == "implementer"
+        assert state.prestart_requeues == 1
+        assert state.outcome == "success"
+
+    async def test_pre_start_requeues_are_bounded(self, env):
+        activities, calls, _records, investigate_ran = _admission_activities(
+            [_implement_result("Failed", ran=False)]
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 3)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        assert len(calls) == 1 + dev_loop.MAX_PRESTART_REQUEUES
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationNotStarted"
+
+    @pytest.mark.parametrize(
+        ("result", "error_type"),
+        [
+            (_implement_result("Failed", ran=True), "ImplementationFailed"),
+            (
+                _implement_result("Failed", ran=True, implementer_phase="Succeeded", finalization="Failed"),
+                "ImplementationFinalizationFailed",
+            ),
+            # No node graph: unknown is treated as a run, never requeued.
+            (WorkflowResult(workflow_name="legacy", phase="Failed"), "ImplementationFailed"),
+        ],
+        ids=["execution", "finalization", "unknown"],
+    )
+    async def test_an_implementer_that_ran_and_failed_fails_the_loop(self, env, result, error_type):
+        """Completed-with-Failed-inside is what hid six lost proposals. The
+        loop's terminal status now says what happened, typed by layer."""
+        activities, calls, records, investigate_ran = _admission_activities([result])
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 4)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+            state = await handle.query(DevLoopWorkflow.implement_execution)
+
+        assert len(calls) == 1, "an implementer that ran must never be resubmitted"
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == error_type
+        # The execution record was still written before the loop failed.
+        assert [r.phase for r in records if r.agent == "implementer"] == ["Failed"]
+        assert state.outcome in ("execution", "finalization")

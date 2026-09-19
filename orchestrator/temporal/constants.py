@@ -56,10 +56,11 @@ EXECUTION_MAX_CONCURRENT_ACTIVITIES = 40
 # `mctl-dev-loop-exec` keeps investigate, reconcile and incidents at 40.
 # Lowering that to N would re-couple the workloads ADR-008 separated.
 #
-# Nothing schedules onto this queue yet. The routing flip is a later,
-# separately-releasable step guarded by workflow.patched("implement-queue"),
-# for the same reason as EXECUTION_TASK_QUEUE: the worker has to be polling
-# before any workflow targets it.
+# The implement submit routes here behind workflow.patched("implement-queue")
+# in dev_loop._run_cwft, one release after the worker that polls it was
+# deployed (mctl-gitops#1287) — the worker has to be polling before any
+# workflow targets it, the same order as EXECUTION_TASK_QUEUE. Migration is
+# by attrition: a loop that predates the marker keeps its old routing.
 IMPLEMENTATION_TASK_QUEUE = "mctl-dev-loop-implement"
 
 # The one operation that routes to it. Named once so the routing branch,

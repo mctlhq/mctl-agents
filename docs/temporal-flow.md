@@ -18,7 +18,7 @@ flowchart TB
         MCP["mctl_trigger_issue<br/>(планируемый use_temporal)"]
     end
 
-    subgraph TMP["Temporal · ns=mctl-agents · queue=mctl-dev-loop"]
+    subgraph TMP["Temporal · ns=mctl-agents · queues=mctl-dev-loop / -exec / -implement"]
         direction TB
         DEV["DevLoopWorkflow<br/>id=dev-loop-owner-repo-N<br/>ALLOW_DUPLICATE_FAILED_ONLY + USE_EXISTING"]
         REC["ReconcileWorkflow<br/>schedule 15m"]

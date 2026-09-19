@@ -75,7 +75,7 @@ from temporalio.client import WorkflowHistory
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 
-from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
+from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE, IMPLEMENTATION_TASK_QUEUE
 from tests.replay_scenarios import SCENARIOS, Scenario, record, scenario_by_name
 
 pytestmark = pytest.mark.anyio
@@ -263,6 +263,62 @@ async def test_todays_code_still_routes_and_still_guards() -> None:
         f"today's code schedules {submits}; submit_and_wait must go to "
         f"{EXECUTION_TASK_QUEUE}"
     )
+
+
+def _activity_scheduled_attrs(events: list[dict], name: str) -> list[dict]:
+    return [
+        e["activityTaskScheduledEventAttributes"]
+        for e in events
+        if e["eventType"] == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+        and e["activityTaskScheduledEventAttributes"]["activityType"]["name"] == name
+    ]
+
+
+async def test_todays_dev_loop_admits_the_implement_submit_on_its_own_queue() -> None:
+    """The #395 flip, verified the only way routing can be: from history.
+
+    Three things, each load-bearing on its own:
+
+    - the `implement-queue` marker is recorded, so a rollback replays and
+      the history says which queue this execution used;
+    - the implement submit is scheduled on the admission queue and EVERY
+      other submit_and_wait stays on exec — routing investigate or approve
+      to the admission queue would spend implementer capacity on them;
+    - the implement submit carries NO schedule-to-start and NO
+      schedule-to-close timeout. On the admission queue the schedule-to-
+      start wait is the queue itself; a bound there turns "waiting for
+      capacity" back into a failure, one layer earlier than the bug this
+      fixes. Temporal encodes an unset timeout as zero.
+    """
+    scenario = scenario_by_name("dev_loop_full")
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        handle = await record(env.client, scenario)
+        history = await handle.fetch_history()
+
+    events = history.to_json_dict()["events"]
+    ids = _patch_ids(events)
+    assert "implement-queue" in ids
+    assert "exec-queue" in ids
+
+    submits = [(a, a["taskQueue"]["name"]) for a in _activity_scheduled_attrs(events, "submit_and_wait")]
+    queues = [queue for _, queue in submits]
+    assert IMPLEMENTATION_TASK_QUEUE in queues, f"no submit reached the admission queue: {queues}"
+    assert queues.count(IMPLEMENTATION_TASK_QUEUE) == 1, f"more than the implement submit was admitted: {queues}"
+    assert all(q in (IMPLEMENTATION_TASK_QUEUE, EXECUTION_TASK_QUEUE) for q in queues), queues
+
+    # The server records an UNSET schedule-to-start/close as its own cap
+    # (ten years, 315360000s), not as zero — so "no timeout" is asserted
+    # as "not a bound anyone could hit", one year being far beyond every
+    # deadline in this workflow. A real value set "for safety" would be
+    # hours and fails here.
+    one_year = 365 * 24 * 3600
+    for attrs, queue in submits:
+        for key in ("scheduleToStartTimeout", "scheduleToCloseTimeout"):
+            value = attrs.get(key)
+            seconds = float(value.rstrip("s")) if isinstance(value, str) and value.endswith("s") else 0.0
+            assert value is None or seconds == 0 or seconds >= one_year, (
+                f"submit_and_wait on {queue} has {key}={value!r}; a capacity wait must not be a timeout"
+            )
 
 
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)

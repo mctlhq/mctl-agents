@@ -35,10 +35,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 import httpx
 from temporalio import activity
 
+from orchestrator.temporal.constants import IMPLEMENTATION_OPERATION
+from orchestrator.temporal.implement_outcome import observe_implementer
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -73,10 +76,32 @@ class WorkflowResult:
     phase: str  # Succeeded | Failed | Error
     started_at: str | None = None
     finished_at: str | None = None
+    # What the implementer itself did, for the implement operation only
+    # (#395; see implement_outcome.py). None on every other operation and
+    # on results recorded before these fields existed — which the
+    # classifier treats as "unknown", never as "did not run".
+    implementer_ran: bool | None = None
+    implementer_phase: str | None = None
+    implementer_started_at: str | None = None
+    finalization_phase: str | None = None
 
     @property
     def succeeded(self) -> bool:
         return self.phase == "Succeeded"
+
+
+# Runtime phases an implement submit passes through, published as the
+# second heartbeat detail so Temporal's describe API can project them
+# (mctl-agents#389). This IS the runtime-state surface: Temporal + Argo are
+# the durable runtime state, git is the durable lifecycle state, and no
+# in-progress marker is pushed to git mid-attempt.
+#
+#   admitted   a worker slot took the activity (schedule-to-start is over)
+#   submitted  Argo accepted the workflow; the pod may still be Pending
+#   running    an implementer pod is executing
+PHASE_ADMITTED = "admitted"
+PHASE_SUBMITTED = "submitted"
+PHASE_RUNNING = "running"
 
 
 # Heartbeat sentinel for "the POST succeeded (raise_for_status didn't raise,
@@ -90,6 +115,10 @@ class WorkflowResult:
 _SUBMITTED_UNKNOWN_NAME = "<submitted, workflow name unparseable>"
 
 
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
 @activity.defn
 async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
     headers = auth_headers()
@@ -98,8 +127,20 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
         # already heartbeated a workflow_name once submission succeeded (see
         # below). If this attempt has that detail, the Argo run already
         # exists — go straight to polling instead of POSTing a second one.
-        heartbeat_details = activity.info().heartbeat_details
+        info = activity.info()
+        heartbeat_details = info.heartbeat_details
+        # Detail [0] is the workflow name and is the resume key; everything
+        # else is runtime projection and must never be read back to decide
+        # anything. Keeping the name first keeps a retry of an activity that
+        # heartbeated under the older single-detail shape resumable.
         workflow_name = heartbeat_details[0] if heartbeat_details else None
+        runtime: dict[str, str | None] = {
+            "phase": PHASE_ADMITTED,
+            "admitted_at": info.started_time.isoformat() if info.started_time else None,
+            "submitted_at": None,
+            "implementer_started_at": None,
+        }
+        is_implement = input.operation == IMPLEMENTATION_OPERATION
 
         if workflow_name == _SUBMITTED_UNKNOWN_NAME:
             raise RuntimeError(
@@ -133,7 +174,9 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             # Record the submission immediately, before the first poll, so
             # even a crash on the very next line leaves a retry able to find
             # workflow_name via heartbeat_details above instead of resubmitting.
-            activity.heartbeat(workflow_name)
+            runtime["phase"] = PHASE_SUBMITTED
+            runtime["submitted_at"] = _now_iso()
+            activity.heartbeat(workflow_name, runtime)
 
         consecutive_errors = 0
         while True:
@@ -144,7 +187,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             # activity (worker crash, network partition) instead of the
             # activity looking alive forever because polling itself is
             # still succeeding.
-            activity.heartbeat(workflow_name)
+            activity.heartbeat(workflow_name, runtime)
 
             try:
                 status_resp = await client.get(f"/api/v1/workflows/{workflow_name}", headers=headers)
@@ -175,12 +218,32 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             status_block = live.get("status") or {}
             phase = status_block.get("phase", "")
 
+            observation = observe_implementer(status_block) if is_implement else None
+            if observation is not None and observation.ran and runtime["phase"] != PHASE_RUNNING:
+                # The attempt begins HERE — when a pod is known to have run —
+                # not at approval, not at admission, not at Argo accepting
+                # the workflow. Between submitted and running sits a real
+                # class of failure (accepted, never scheduled), and it is
+                # still pre-start.
+                runtime["phase"] = PHASE_RUNNING
+                runtime["implementer_started_at"] = observation.started_at
+                activity.logger.info(
+                    "%s -> %s: implementer pod running since %s",
+                    input.operation,
+                    workflow_name,
+                    observation.started_at,
+                )
+
             if phase in TERMINAL_PHASES:
                 return WorkflowResult(
                     workflow_name=workflow_name,
                     phase=phase,
                     started_at=status_block.get("startedAt"),
                     finished_at=status_block.get("finishedAt"),
+                    implementer_ran=observation.ran if observation else None,
+                    implementer_phase=observation.phase if observation else None,
+                    implementer_started_at=observation.started_at if observation else None,
+                    finalization_phase=observation.finalization_phase if observation else None,
                 )
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)

@@ -57,6 +57,8 @@ dev_loop:
   - deploy-observation
   - exec-queue
   - fast-shepherd-cadence
+  - implement-outcome
+  - implement-queue
   - incident-watch
   - lifecycle-ownership
   - lifecycle-refusal-backoff
