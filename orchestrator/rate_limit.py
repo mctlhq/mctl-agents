@@ -23,8 +23,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from orchestrator.auth import detect_auth
-
 
 class RateLimitExhaustedError(RuntimeError):
     """The SDK's final ``ResultMessage`` reported an API-level rate/usage-limit
@@ -115,6 +113,8 @@ def account_label() -> str:
     if explicit:
         return explicit
     try:
+        from orchestrator.auth import detect_auth
+
         env_var = detect_auth().env_var
     except Exception:  # noqa: BLE001 — no auth configured; fall through to unknown
         return "unknown"
