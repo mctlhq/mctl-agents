@@ -32,6 +32,7 @@ from orchestrator.execution_identity import (
     Assertions,
     Correlation,
     ExecutionContext,
+    ExecutionIdentityError,
     Executor,
     Scope,
     Trigger,
@@ -133,7 +134,25 @@ async def mint_execution_context(req: MintRequest) -> MintedContext:
     from datetime import UTC, datetime
 
     issued_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    context = _seal_control_plane_context(req, issued_at=issued_at)
+    try:
+        context = _seal_control_plane_context(req, issued_at=issued_at)
+    except ExecutionIdentityError:
+        # A caller-supplied vocabulary field (actor_type, trigger_type,
+        # workflow_type, executor_type, scope_environment) or a malformed
+        # trace_id failed seal()'s validate() call. Same best-effort degrade
+        # as the auth/network branches below, per this module's docstring:
+        # this activity never raises.
+        context = mint_local(
+            executor_type=req.executor_type,
+            workflow_type=req.workflow_type,
+            agent=req.executor_agent,
+            version=req.executor_version,
+            trace_id=req.trace_id,
+        )
+        return MintedContext(
+            context_id=context.context_id, trace_id=context.trace_id, content_hash=context.content_hash,
+            stored=False,
+        )
 
     try:
         headers = auth_headers()

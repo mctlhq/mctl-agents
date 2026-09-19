@@ -755,7 +755,17 @@ def load_from_environment(
     if path:
         text = Path(path).read_text(encoding="utf-8")
         data = json.loads(text)
-        return ExecutionContext.from_dict(data)
+        context = ExecutionContext.from_dict(data)
+        # from_dict() only checks shape and vocabulary (see its docstring);
+        # this is the one production call site that reads an untrusted
+        # document, so verify the tamper evidence ADR 011 promises here.
+        if recompute_content_hash(context) != context.content_hash:
+            raise ExecutionIdentityError(
+                f"content_hash mismatch for context_id={context.context_id!r} loaded from "
+                f"{MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: document content does not match "
+                "its declared content_hash"
+            )
+        return context
     if os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip():
         raise ExecutionIdentityError(
             f"{MCTL_EXECUTION_CONTEXT_FILE_ENV} is not set and {MCTL_REQUIRE_EXECUTION_CONTEXT_ENV} "
