@@ -664,7 +664,11 @@ def release_ownership(ref: PRRef, *, reason: str) -> None:
     to close. Best-effort and silent on failure — closing a row must never
     fail the status transition it follows, the same rule
     ``run_implementer._release_claim`` already applies to the sibling claim
-    store.
+    store. "Silent" covers exceptions only: a ``terminal()`` call that
+    returns without raising but did not actually write (``answer.wrote`` is
+    False) is logged with a ``warn:`` line, the same as a transport
+    exception, so a lost race or an unreachable store is at least visible
+    and not indistinguishable from a closed row.
     """
     if not rollout.records_writes():
         return
@@ -677,10 +681,22 @@ def release_ownership(ref: PRRef, *, reason: str) -> None:
             # time), already released/terminal, or the store disagrees about
             # who holds it — none of those are this call's to fix.
             return
-        client.terminal(
+        answer = client.terminal(
             entity, PHASE_REVIEW_REMEDIATION, _SHEPHERD_OWNER,
             current.ownership.epoch, reason=reason[:200],
         )
+        if not answer.wrote:
+            # A non-2xx from /terminal (lost race, unknown store, whatever) is
+            # indistinguishable from success unless this is checked: `wrote`
+            # is False whenever the write did not land, so the row stays open
+            # and nothing else in the system will ever retry closing it
+            # (mctlhq/mctl-agents#334 code review). Surface it the same way
+            # the transport-failure branch below does, so the next sweep's
+            # operator has something to act on.
+            print(
+                f"warn: {ref.repo}#{ref.number}: could not close ownership record "
+                f"(verdict={answer.verdict}, {answer.reason or 'no reason given'})"
+            )
     except Exception as exc:  # noqa: BLE001 — closing the row must never fail the tick
         print(f"warn: {ref.repo}#{ref.number}: could not close ownership record ({exc})")
 

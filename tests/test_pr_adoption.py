@@ -605,6 +605,29 @@ def test_release_ownership_closes_the_row_when_owned_by_me(tmp_path, monkeypatch
     assert "merged" in reason
 
 
+def test_release_ownership_warns_when_terminal_write_does_not_land(tmp_path, monkeypatch, capsys) -> None:
+    """mctlhq/mctl-agents#334 code review: a `terminal()` call that returns
+    without raising but did not actually write (`answer.wrote` False — a lost
+    race, an unreachable store answering UNKNOWN, ...) must not be treated as
+    a successful close. It has to be logged, the same as a transport
+    exception, so the row is not left open and silently unretriable."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    client = _FakeOwnershipClient(
+        get_answer=OwnershipAnswer(verdict=OWNED_BY_ME, ownership=Ownership(epoch=3, state="active")),
+        terminal_answer=OwnershipAnswer(verdict=UNKNOWN, reason="store unreachable", accepted=False),
+    )
+    monkeypatch.setattr(pr_adoption, "OwnershipClient", _client_factory(client))
+    ref = _terminal_ref(tmp_path, status="merged")
+
+    pr_adoption.release_ownership(ref, reason="adopted PR reached terminal status 'merged'")
+
+    assert len(client.terminal_calls) == 1
+    out = capsys.readouterr().out
+    assert "warn:" in out
+    assert "mctlhq/mctl-web#7" in out
+    assert "store unreachable" in out
+
+
 def test_release_ownership_noop_when_not_owned_by_me(tmp_path, monkeypatch) -> None:
     """A row already released, terminal, or held by somebody else is not
     this call's to close."""
