@@ -269,7 +269,7 @@ pre_start     no run-implementer pod ever ran     → resubmit, ≤ MAX_PRESTART
 execution     the pod ran and did not succeed     → workflow FAILS, ImplementationFailed
 finalization  the pod succeeded, commit/assert    → workflow FAILS, ImplementationFinalizationFailed
               did not
-success
+success       the pod ran and committed           → the loop continues to merge detection
 ```
 
 "Ran" is read from the marks a pod leaves on its node (`hostNodeName`, an

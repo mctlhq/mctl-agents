@@ -74,6 +74,23 @@ def _pod_ran(node: dict[str, Any]) -> bool:
     return node.get("phase") == "Succeeded"
 
 
+def _template_of(node: dict[str, Any]) -> str:
+    """The template a node ran, under either of the two spellings.
+
+    A step resolved through `templateRef` carries `templateRef: {name,
+    template}` and leaves `templateName` empty on the node, so reading only
+    `templateName` would stop recognising the implementer the day the CWFT
+    pulls it in by reference rather than inline.
+    """
+    name = node.get("templateName")
+    if name:
+        return str(name)
+    ref = node.get("templateRef") or {}
+    if isinstance(ref, dict) and ref.get("template"):
+        return str(ref["template"])
+    return ""
+
+
 _PHASE_RANK = {"Succeeded": 3, "Running": 2, "Pending": 1, "Failed": 0, "Error": 0}
 # A step Argo never scheduled (a fallback whose `when` was false, an
 # assertion after a failed commit) says nothing about the run and is left
@@ -98,8 +115,19 @@ def observe_implementer(status_block: dict[str, Any]) -> ImplementerObservation:
         n for n in nodes.values()
         if isinstance(n, dict) and n.get("type") == "Pod" and n.get("phase") not in _NOT_A_VERDICT
     ]
-    implementer = [n for n in pods if n.get("templateName") == IMPLEMENTER_TEMPLATE]
-    finalization = [n for n in pods if n.get("templateName") in FINALIZATION_TEMPLATES]
+    implementer = [n for n in pods if _template_of(n) == IMPLEMENTER_TEMPLATE]
+    finalization = [n for n in pods if _template_of(n) in FINALIZATION_TEMPLATES]
+
+    # A graph with pods in it but none of them the implementer is not proof
+    # that the implementer did not run — it is proof that this module and
+    # the CWFT no longer agree on its name. The template lives in another
+    # repository (cwft-mctl-agents-implement.yaml in mctl-gitops) and no CI
+    # here can see a rename, so the mismatch has to fail closed: reported
+    # unknown, which classifies as an execution failure a human reads,
+    # instead of `ran=False`, which would requeue an implementer that may
+    # have committed and pushed.
+    if pods and not implementer:
+        return ImplementerObservation(ran=None, phase=None, started_at=None, finalization_phase=None)
 
     ran_nodes = [n for n in implementer if _pod_ran(n)]
     phase: str | None = None

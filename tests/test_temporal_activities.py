@@ -1875,6 +1875,29 @@ class TestSubmitAndWaitObservesTheImplementer:
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
         assert result.implementer_ran is None
 
+    async def test_a_graph_without_an_implementer_node_is_unknown(self, env, monkeypatch):
+        """Pods in the graph but none of them the implementer means this
+        module and the CWFT disagree on the template name — a rename or a
+        switch to templateRef, neither of which CI here can see. It must
+        fail closed, or every implement failure would requeue a run that
+        may have committed."""
+        nodes = {"a": _node("some-other-step", "Succeeded", ran=True)}
+        self._run(env, monkeypatch, "Failed", nodes)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is None
+
+    async def test_an_implementer_pulled_in_by_reference_is_still_recognised(self, env, monkeypatch):
+        """Argo leaves `templateName` empty on a node resolved through
+        `templateRef` and records the name under `templateRef.template`."""
+        node = _node("", "Failed", ran=True)
+        node.pop("templateName", None)
+        node["templateRef"] = {"name": "cwft-mctl-agents-implement", "template": "run-implementer"}
+        self._run(env, monkeypatch, "Failed", {"a": node})
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is True
+
     async def test_other_operations_do_not_observe_nodes(self, env, monkeypatch):
         nodes = {"a": _node("run-implementer", "Succeeded", ran=True)}
         self._run(env, monkeypatch, "Succeeded", nodes, operation="mctl-agents-investigate")

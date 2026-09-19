@@ -29,6 +29,11 @@ from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.workflows import dev_loop
+from orchestrator.temporal.constants import (
+    EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_TASK_QUEUE,
+    implementation_max_concurrent_activities,
+)
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
@@ -3892,13 +3897,6 @@ class TestTickSettling:
 # there when capacity is taken, requeues when nothing ran, and fails the
 # loop honestly when something did.
 # ---------------------------------------------------------------------------
-from orchestrator.temporal.constants import (  # noqa: E402
-    EXECUTION_TASK_QUEUE,
-    IMPLEMENTATION_TASK_QUEUE,
-    implementation_max_concurrent_activities,
-)
-
-
 def _admission_activities(implement_results, *, seen_queues=None, running=None):
     """Fakes for the admission tests.
 
