@@ -322,10 +322,13 @@ Decisions:
   terminal `rejected` with the close comment in `notes:`; clears
   `merge_owner` if it was set.
 
-**Required-check classification.** Each failing required check is
-classified `actionable` or `infrastructure`: `CANCELLED`, `TIMED_OUT`,
-`STALE`, `ACTION_REQUIRED`, `SKIPPED`, `NEUTRAL`, and a startup failure are
-always infrastructure; a genuine `FAILURE` with file/line-anchored
+**Required-check classification.** `SKIPPED` and `NEUTRAL` are not
+blockers at all — GitHub does not gate required-check mergeability on
+either, so they are discarded before classification and never reach the
+remediation loop (this repo emits skipped required checks routinely). Each
+*remaining* failing required check is classified `actionable` or
+`infrastructure`: `CANCELLED`, `TIMED_OUT`, `STALE`, `ACTION_REQUIRED` and a
+startup failure are always infrastructure; a genuine `FAILURE` with file/line-anchored
 annotations (exactly what `mypy`/`ruff` produce) is actionable; a `FAILURE`
 with no annotations is infrastructure only if the failure text matches a
 known infra signature (runner lost, rate limited, out of disk, ...) —

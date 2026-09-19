@@ -5911,3 +5911,204 @@ def test_main_adopt_prs_skipped_for_reconcile_and_slug(tmp_path, monkeypatch, ca
     )
     with patch.object(pr_adoption, "discover_adoptable", side_effect=AssertionError("must not be called under --slug")):
         run_shepherd.main()
+
+
+# ---------------------------------------------------------------------------
+# _fetch_pr_snapshot -> ci_checks seam (mctl-agents#411, carried review P2)
+#
+# This walk is the ONLY seam between the GraphQL query and
+# ci_checks.read_required_checks(), and every way it can be wrong is silent
+# and green:
+#   - a wrong key anywhere in the nesting makes check_contexts empty, so the
+#     whole feature is inert and the shepherd merges on pre-#411 behaviour;
+#   - a missing `oid` degrades head pinning to a no-op, so stale contexts
+#     from an earlier head become blockers;
+#   - a mis-nested checkSuite.workflowRun.databaseId gives every
+#     infrastructure blocker run_id=None, so the `ci-infra` arm re-runs
+#     nothing while still burning the attempt budget to review-stuck.
+# None of those raise, so only an assertion on the assembled tuple catches
+# them.
+# ---------------------------------------------------------------------------
+_CTX_OID = "c" * 40
+
+
+def _ctx_pr_payload(*, commit_oid: str = _CTX_OID, nodes: list | None = None,
+                    head_ref_oid: str = _CTX_OID) -> dict:
+    """A PR GraphQL payload carrying per-context check nodes."""
+    if nodes is None:
+        nodes = [{
+            "__typename": "CheckRun",
+            "name": "lint",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://github.com/mctlhq/mctl-web/actions/runs/999",
+            "isRequired": True,
+            "title": "", "summary": "",
+            "databaseId": 555,
+            "checkSuite": {
+                "databaseId": 111,
+                "workflowRun": {
+                    "databaseId": 999,
+                    "url": "https://github.com/mctlhq/mctl-web/actions/runs/999",
+                    "workflow": {"name": "PR validation"},
+                },
+            },
+        }]
+    return {
+        "number": 42, "state": "OPEN", "merged": False, "isDraft": False,
+        "mergeStateStatus": "BLOCKED", "reviewDecision": "", "baseRefName": "main",
+        "headRefOid": head_ref_oid, "mergeCommit": None,
+        "commits": {"nodes": [{"commit": {
+            "oid": commit_oid,
+            "committedDate": "2026-04-29T10:00:00Z",
+            "pushedDate": "2026-04-29T10:00:00Z",
+            "statusCheckRollup": {
+                "state": "FAILURE",
+                "contexts": {"nodes": nodes},
+            },
+        }}]},
+        "timelineItems": {"nodes": []},
+        "statusCheckRollup": {"state": "FAILURE"},
+    }
+
+
+def _route_ctx_gh(pr_payload: dict, *, required: list[str] | None = None,
+                  protection_raises: Exception | None = None):
+    """Route _gh_api_json by query: the PR snapshot vs the branch-protection probe.
+
+    Both go through the same helper, so a bare `return_value` would feed the
+    PR payload to the protection probe as well.
+    """
+    def _side_effect(args: list[str]):
+        query = " ".join(args)
+        if "branchProtectionRule" in query:
+            if protection_raises is not None:
+                raise protection_raises
+            return {"data": {"repository": {"ref": {"branchProtectionRule": {
+                "requiredStatusCheckContexts": required or [],
+            }}}}}
+        return {"data": {"repository": {"pullRequest": pr_payload}}}
+    return _side_effect
+
+
+def test_snapshot_check_contexts_walk_tags_each_node_with_the_commit_oid() -> None:
+    """The happy path: every node survives the walk, tagged with the commit's
+    own oid, with the nesting ci_checks reads still intact."""
+    with patch.object(run_shepherd, "_gh_api_json",
+                      side_effect=_route_ctx_gh(_ctx_pr_payload())):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    assert len(snap.check_contexts) == 1, (
+        "an empty walk makes the whole #411 feature inert and green"
+    )
+    node = snap.check_contexts[0]
+    assert node["_commit_oid"] == _CTX_OID
+    assert node["name"] == "lint"
+    # The nesting ci_checks._normalize_node reads for the ci-infra re-run arm.
+    assert node["checkSuite"]["workflowRun"]["databaseId"] == 999
+
+
+def test_snapshot_check_contexts_feed_read_required_checks_end_to_end() -> None:
+    """The assembled tuple must be directly consumable by ci_checks, with
+    run_id populated — that is what the `ci-infra` re-run arm dispatches on."""
+    from orchestrator import ci_checks
+
+    with patch.object(run_shepherd, "_gh_api_json",
+                      side_effect=_route_ctx_gh(_ctx_pr_payload())):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    with patch.object(ci_checks, "_fetch_annotations", return_value=[]):
+        status = ci_checks.read_required_checks(snap)
+    assert status.known is True
+    assert [b.name for b in status.blockers] == ["lint"]
+    assert status.blockers[0].run_id == "999", (
+        "a mis-nested workflowRun.databaseId leaves run_id=None, so ci-infra "
+        "re-runs nothing while still spending the attempt budget"
+    )
+    assert status.blockers[0].head_sha == _CTX_OID
+
+
+def test_snapshot_check_contexts_pin_to_the_commit_not_the_pr_head_field() -> None:
+    """Head pinning comes from the commit node's own `oid`. When it is absent
+    the walk falls back to head_sha, which must still pin rather than silently
+    admitting contexts from an earlier head."""
+    payload = _ctx_pr_payload(head_ref_oid=HEAD_SHA)
+    del payload["commits"]["nodes"][0]["commit"]["oid"]
+    with patch.object(run_shepherd, "_gh_api_json",
+                      side_effect=_route_ctx_gh(payload)):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    assert snap.check_contexts[0]["_commit_oid"] == HEAD_SHA
+
+
+def test_snapshot_check_contexts_skips_non_dict_nodes() -> None:
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_ctx_gh(_ctx_pr_payload(nodes=["junk", None])),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    assert snap.check_contexts == ()
+
+
+def test_snapshot_check_contexts_empty_when_the_rollup_is_absent() -> None:
+    """No statusCheckRollup on the commit: empty tuple, not a crash. This is
+    the inert-and-green case, pinned so it stays deliberate."""
+    payload = _ctx_pr_payload()
+    del payload["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+    with patch.object(run_shepherd, "_gh_api_json",
+                      side_effect=_route_ctx_gh(payload)):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    assert snap.check_contexts == ()
+
+
+def test_snapshot_required_contexts_come_from_branch_protection() -> None:
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_ctx_gh(_ctx_pr_payload(), required=["lint", "tests"]),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None
+    assert snap.required_contexts == ("lint", "tests")
+
+
+def test_snapshot_survives_a_forbidden_branch_protection_probe() -> None:
+    """`branchProtectionRule` needs admin scope; without it the WHOLE response
+    carries a FORBIDDEN error and `gh` exits non-zero. That must degrade to
+    "no branch-protection fallback" — it must NOT take the PR snapshot, which
+    gates every merge decision, down with it."""
+    import subprocess
+
+    err = subprocess.CalledProcessError(1, ["gh"], stderr="FORBIDDEN")
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        side_effect=_route_ctx_gh(_ctx_pr_payload(), protection_raises=err),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 42)
+
+    assert snap is not None, "a protection-probe failure must not lose the snapshot"
+    assert snap.required_contexts == ()
+    assert len(snap.check_contexts) == 1, "the per-context signal survives independently"
+
+
+def test_required_status_check_contexts_empty_base_ref_skips_the_probe() -> None:
+    with patch.object(run_shepherd, "_gh_api_json",
+                      side_effect=AssertionError("must not probe without a base ref")):
+        assert run_shepherd._fetch_required_status_check_contexts("mctlhq", "mctl-web", "") == ()
+
+
+def test_required_status_check_contexts_null_protection_rule_degrades_to_empty() -> None:
+    """An unprotected base branch returns branchProtectionRule: null."""
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value={"data": {"repository": {"ref": {"branchProtectionRule": None}}}},
+    ):
+        assert run_shepherd._fetch_required_status_check_contexts(
+            "mctlhq", "mctl-web", "main") == ()

@@ -92,6 +92,12 @@ def _status_context_node(
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("conclusion", sorted(ci_checks.CI_INFRA_CONCLUSIONS))
 def test_classify_infra_conclusions_are_always_infrastructure(conclusion: str) -> None:
+    """Unit-level only. NOTE: `SKIPPED`/`NEUTRAL` are members of this set but
+    the pipeline short-circuits them in `_read_required_checks` before
+    `_classify` is ever reached, so this parametrisation does NOT cover them
+    end to end — `test_skipped_and_neutral_required_checks_are_never_blockers`
+    is the test that pins the reachable behaviour.
+    """
     assert _classify(conclusion, "anything at all", has_annotations=True) == "infrastructure"
     assert _classify(conclusion, "", has_annotations=False) == "infrastructure"
 
@@ -225,6 +231,78 @@ def test_status_context_pending_state_sets_pending() -> None:
     pr = _FakePR(check_contexts=(_status_context_node(state="PENDING"),))
     status = read_required_checks(pr)
     assert status.pending is True
+    assert status.blockers == ()
+
+
+@pytest.mark.parametrize("conclusion", ["SKIPPED", "NEUTRAL"])
+def test_skipped_and_neutral_required_checks_are_never_blockers(conclusion: str) -> None:
+    """The short-circuit in `_read_required_checks`, pinned at the pipeline level.
+
+    GitHub does not gate required-check mergeability on `SKIPPED` or
+    `NEUTRAL`, so a required check in either state must produce no blocker at
+    all — not an `infrastructure` one. An infrastructure blocker is not inert:
+    it feeds the shepherd's `ci-infra` re-run arm and spends review attempts,
+    so classifying these as infrastructure wedges a PR GitHub already
+    considers green.
+
+    This repo emits skipped required checks routinely (`diagrams.yml`,
+    `pr-validation.yml`), which is why this is the regression that matters.
+    Deleting the short-circuit leaves every `_classify` test green, so this
+    is the only assertion standing between that line and a silent wedge
+    (mctl-agents#411 review rounds 2-4, carried P2).
+    """
+    pr = _FakePR(check_contexts=(_check_run_node(conclusion=conclusion, is_required=True),))
+    status = read_required_checks(pr)
+    assert status.known is True
+    assert status.blockers == (), (
+        f"a required {conclusion} check must not become a blocker of any kind"
+    )
+    assert status.infrastructure == ()
+    assert status.actionable == ()
+    assert status.pending is False
+
+
+@pytest.mark.parametrize("conclusion", ["SKIPPED", "NEUTRAL"])
+def test_skipped_and_neutral_do_not_mask_a_real_failure(conclusion: str) -> None:
+    """The short-circuit must skip only its own node, not end the walk."""
+    pr = _FakePR(check_contexts=(
+        _check_run_node(name="diagrams", conclusion=conclusion),
+        _check_run_node(name="lint", conclusion="FAILURE"),
+    ))
+    with patch.object(ci_checks, "_fetch_annotations", return_value=[]):
+        status = read_required_checks(pr)
+    assert [b.name for b in status.blockers] == ["lint"]
+
+
+def test_probe_never_raises_on_a_non_dict_node() -> None:
+    """A scalar where a node should be raises AttributeError inside the walk.
+
+    `_normalize_node` calls `node.get(...)` unguarded, so this escaped the old
+    enumerated catch tuple and crashed the shepherd tick for every OTHER
+    proposal in the run, rather than failing closed on this one PR.
+    """
+    pr = _FakePR(check_contexts=("not-a-dict",))
+    status = read_required_checks(pr)
+    assert status.known is False
+    assert status.blockers == ()
+
+
+def test_probe_never_raises_on_a_scalar_check_suite() -> None:
+    """`checkSuite` arriving as a scalar — same AttributeError, one level in."""
+    node = _check_run_node()
+    node["checkSuite"] = "unexpected"
+    pr = _FakePR(check_contexts=(node,))
+    status = read_required_checks(pr)
+    assert status.known is False
+    assert status.blockers == ()
+
+
+def test_probe_never_raises_when_gh_is_missing() -> None:
+    """A missing/non-executable `gh` raises OSError, not CalledProcessError."""
+    pr = _FakePR(check_contexts=(_check_run_node(conclusion="FAILURE"),))
+    with patch.object(ci_checks, "_fetch_annotations", side_effect=FileNotFoundError("gh")):
+        status = read_required_checks(pr)
+    assert status.known is False
     assert status.blockers == ()
 
 

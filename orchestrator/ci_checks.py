@@ -302,10 +302,21 @@ def read_required_checks(pr: _PRLike) -> CIStatus:
     Never raises — a probe failure (malformed data, an unexpectedly-shaped
     node) degrades to `CIStatus(known=False, ...)` so callers fail closed on
     merging rather than crash the shepherd tick.
+
+    The catch is deliberately `Exception` rather than an enumerated tuple.
+    The input is a GraphQL blob whose shape we do not control, walked with
+    `.get()` at four levels: a non-dict node, a scalar where `checkSuite`
+    should be, or a scalar annotation raises `AttributeError`, and a missing
+    or non-executable `gh` inside `_fetch_annotations` raises `OSError` —
+    none of which an enumerated tuple caught, so each one crashed the whole
+    shepherd tick for every OTHER proposal instead of failing closed on this
+    one PR. Enumerating is the wrong shape of guarantee for an untrusted
+    blob; "never raises" is the contract callers depend on to fail closed
+    (mctl-agents#411 review round 4, agy P2).
     """
     try:
         return _read_required_checks(pr)
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+    except Exception as e:  # noqa: BLE001 — deliberate: see the "never raises" contract above
         print(
             f"warn: ci_checks: required-check probe failed for "
             f"{getattr(pr, 'repo', '?')}#{getattr(pr, 'number', '?')} "
