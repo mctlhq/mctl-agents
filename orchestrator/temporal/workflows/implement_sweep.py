@@ -42,11 +42,7 @@ from temporalio.exceptions import ActivityError, ApplicationError, WorkflowAlrea
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
-    from orchestrator.temporal.activities.stranded import (
-        StrandedProposal,
-        StrandedScanResult,
-        find_stranded_accepted,
-    )
+    from orchestrator.temporal.activities.stranded import StrandedScanResult, find_stranded_accepted
     from orchestrator.temporal.constants import (
         DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES,
         DEFAULT_IMPLEMENT_SWEEP_MAX_SUBMITS,
@@ -75,20 +71,22 @@ SWEEP_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 # workflow id after prior executions under it ended Failed — mirrors
 # dev_loop.MAX_PRESTART_REQUEUES. Unlike dev_loop's in-loop requeue, this
 # bound is enforced ACROSS ticks (via VisibilityActivities.
-# count_swept_implement_failures), because a `pre_start` outcome touches no
+# count_swept_prestart_failures), because a `pre_start` outcome touches no
 # `.status.yaml` field, so nothing else removes the proposal from next
 # tick's candidate set (mctl-agents#412 review).
 MAX_SWEEP_PRESTART_ATTEMPTS = 3
 
 
-# Bounds how many `count_swept_implement_failures` visibility queries ONE tick
-# will issue. The budget check sits inside the candidate loop and a budget-skip
-# does not consume `max_submits`, so without this a tick issues one visibility
-# query per candidate before it lands its 5 submits — 71 queries on today's
-# candidate set (review P2). Ticks are 15 minutes apart and the bound is
-# generous relative to `max_submits`, so a real backlog still drains; what it
-# stops is an unbounded query fan-out driven by the size of the backlog.
-MAX_SWEEP_BUDGET_QUERIES = 20
+# The pre-start budget is read for every candidate in ONE visibility query per
+# tick, not one query per candidate.
+#
+# A per-candidate query fanned out with the size of the backlog (71 today)
+# before landing its 5 submits. Capping the number of queries instead was
+# worse, and was the fix a review round caught: `scan.stranded` is rebuilt in
+# stable tree order every tick and an over-budget candidate never leaves it, so
+# once N over-budget proposals precede candidate N+1, that candidate is never
+# queried or submitted again on ANY tick — a permanent starvation of the tail
+# dressed up as "reconsidered next tick".
 
 # dev_loop.py's ENVIRONMENT / FAST_ACTIVITY_TIMEOUT / FAST_ACTIVITY_RETRY_POLICY,
 # duplicated rather than imported — incidents.py sets the same precedent for
@@ -102,51 +100,6 @@ RECORD_EXECUTION_RETRY_POLICY = RetryPolicy(maximum_attempts=5)
 class SweptImplementInput:
     service: str
     slug: str
-
-
-async def _record_prestart_budget_exhausted(
-    candidate: StrandedProposal, child_id: str, prior_failures: int
-) -> None:
-    """Durable record for a proposal that exceeded MAX_SWEEP_PRESTART_ATTEMPTS.
-
-    mctl-agents#412 review: a `workflow.logger.warning` line is exactly the
-    invisibility this whole proposal exists to fix — this worker keeps no
-    gitops clone (design.md), so it cannot write `.status.yaml` directly, but
-    `record_execution` already gives every other terminal outcome of a swept
-    submit a durable row in mctl-api's execution ledger
-    (`_record_swept_execution` above). Reused here rather than invented:
-    no Argo workflow was submitted this tick, so `argo_workflow_name` names
-    the would-be child workflow id instead of a real one, and `phase`
-    is "Failed" — the accurate terminal phase for a run that did not happen
-    because prior attempts already exhausted the retry budget.
-    """
-    try:
-        await workflow.execute_activity(
-            record_execution,
-            ExecutionRecord(
-                temporal_workflow_id=workflow.info().workflow_id,
-                agent="implementer",
-                environment=ENVIRONMENT,
-                version="",
-                image_ref="",
-                target_repo=candidate.service,
-                argo_workflow_name=child_id,
-                phase="Failed",
-            ),
-            start_to_close_timeout=RECORD_EXECUTION_TIMEOUT,
-            retry_policy=RECORD_EXECUTION_RETRY_POLICY,
-        )
-    except ActivityError:
-        workflow.logger.warning(
-            "record_execution failed after retries for the exhausted "
-            "pre-start budget of %s/%s (%d prior failures under %s) — "
-            "continuing without a durable execution record for this "
-            "exhaustion",
-            candidate.service,
-            candidate.slug,
-            prior_failures,
-            child_id,
-        )
 
 
 async def _record_swept_execution(input_data: SweptImplementInput, result: WorkflowResult) -> None:
@@ -274,8 +227,14 @@ class ImplementSweepResult:
     unauthorized: int = 0
     # Candidates that had a live claim to a submit but were held back because
     # they have already burned MAX_SWEEP_PRESTART_ATTEMPTS pre-start attempts.
-    # Also on the result for the same reason: "needs a human" that reaches no
-    # human is not a gate.
+    # On the result because "needs a human" that reaches no human is not a
+    # gate. This is the ONLY report of that state: an earlier round wrote a
+    # `record_execution` row per over-budget candidate per tick instead, which
+    # put 96 rows/day/proposal into the executions ledger carrying
+    # `agent="implementer"`, `phase="Failed"` and a Temporal child id in
+    # `argo_workflow_name` — indistinguishable from a real implementer failure
+    # and naming no Argo workflow, which is exactly the opaque handle this
+    # PR's acceptance criterion was written against.
     #
     # KNOWN LIMIT, stated rather than hidden: this budget is counted out of
     # Temporal visibility, which ADR-007 and ADR-009 both name as the thing
@@ -344,9 +303,40 @@ class ImplementSweepWorkflow:
                 skipped_reason=f"stranded scan failed: {exc}",
             )
 
+        # One query for the whole candidate set, before the loop. Fails the
+        # tick closed rather than per candidate: an unknown prior-failure count
+        # must never read as zero, or the bound it enforces is gone exactly
+        # when visibility is unhealthy — and unlike the per-candidate version,
+        # there is no partial answer to carry on with.
+        child_ids = [
+            f"implement-sweep-{c.service}-{c.slug}" for c in scan.stranded
+        ]
+        prestart_failures: dict[str, int] = {}
+        if child_ids:
+            try:
+                prestart_failures = await workflow.execute_activity(
+                    "count_swept_prestart_failures",
+                    child_ids,
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=ACTIVITY_RETRY_POLICY,
+                )
+            except Exception as exc:  # noqa: BLE001 — ActivityError after retries
+                workflow.logger.warning(
+                    "implement-sweep: count_swept_prestart_failures failed; "
+                    "skipping this tick rather than submitting on an unknown "
+                    "retry budget: %s",
+                    exc,
+                )
+                return ImplementSweepResult(
+                    candidates=len(scan.stranded),
+                    submitted=0,
+                    skipped=len(scan.stranded),
+                    skipped_reason=f"pre-start budget query failed: {exc}",
+                    unauthorized=len(scan.unauthorized),
+                )
+
         submitted = 0
         over_budget = 0
-        budget_queries = 0
         for candidate in scan.stranded:
             if submitted >= cfg.max_submits:
                 workflow.logger.info(
@@ -360,43 +350,7 @@ class ImplementSweepWorkflow:
                 continue
 
             child_id = f"implement-sweep-{candidate.service}-{candidate.slug}"
-
-            if budget_queries >= MAX_SWEEP_BUDGET_QUERIES:
-                workflow.logger.info(
-                    "STRANDED service=%s slug=%s reason=%s (over the %d "
-                    "budget-query cap for this tick; reconsidered next tick)",
-                    candidate.service,
-                    candidate.slug,
-                    candidate.reason,
-                    MAX_SWEEP_BUDGET_QUERIES,
-                )
-                continue
-
-            budget_queries += 1
-            try:
-                prior_failures: int = await workflow.execute_activity(
-                    "count_swept_implement_failures",
-                    child_id,
-                    start_to_close_timeout=ACTIVITY_TIMEOUT,
-                    retry_policy=ACTIVITY_RETRY_POLICY,
-                )
-            except Exception as exc:  # noqa: BLE001 — ActivityError after retries
-                # Fail closed on THIS candidate only: an unknown prior-failure
-                # count must not read as zero, or the bound it enforces is
-                # gone exactly when visibility is unhealthy. The rest of the
-                # tick continues — one bad candidate is not a reason to skip
-                # the others (review P2).
-                workflow.logger.warning(
-                    "STRANDED service=%s slug=%s reason=%s "
-                    "(count_swept_implement_failures failed: %s; not submitted "
-                    "this tick rather than submitting on an unknown budget)",
-                    candidate.service,
-                    candidate.slug,
-                    candidate.reason,
-                    exc,
-                )
-                continue
-
+            prior_failures = prestart_failures.get(child_id, 0)
             if prior_failures >= MAX_SWEEP_PRESTART_ATTEMPTS:
                 over_budget += 1
                 workflow.logger.warning(
@@ -409,7 +363,6 @@ class ImplementSweepWorkflow:
                     prior_failures,
                     child_id,
                 )
-                await _record_prestart_budget_exhausted(candidate, child_id, prior_failures)
                 continue
 
             try:

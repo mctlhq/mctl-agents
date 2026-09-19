@@ -37,7 +37,6 @@ from datetime import UTC, datetime, timedelta
 
 from temporalio import activity
 
-from orchestrator.proposal_state import UNAUTHORIZED_LEGACY_AUTO_ACCEPTED
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.activities.orphans import expected_dev_loop_id
 
@@ -143,10 +142,13 @@ def _scan(
         # "unauthorized" would bury the records that carry no marker at all —
         # which are the ones this census exists to surface.
         if ref.execution_authorization is None:
-            unauthorized.append((key, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED))
-            skipped.append(
-                (key, f"no explicit execution authorization ({UNAUTHORIZED_LEGACY_AUTO_ACCEPTED})")
-            )
+            # The reason comes from the record, not from this call site: a
+            # never-approved record and one a human approved through a path
+            # that dropped the approver identity both land here, and an
+            # operator triaging the quarantine acts on them differently.
+            reason = ref.unauthorized_reason or "no explicit execution authorization"
+            unauthorized.append((key, reason))
+            skipped.append((key, f"no explicit execution authorization ({reason})"))
             continue
 
         updated_at = _parse_iso(ref.updated_at)

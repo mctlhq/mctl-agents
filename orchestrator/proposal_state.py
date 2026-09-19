@@ -151,31 +151,48 @@ AUTHORIZATION_HUMAN_APPROVAL = "human-approval"
 #: the constant exists so the seam has a name and a single place to grow.
 AUTHORIZATION_AUTONOMY_POLICY = "autonomy-policy"
 
-#: Stable reason for a record that carries no execution authorization at all —
-#: the 69 legacy `incident-*` proposals' exact shape. Not an error: it means
-#: this record has never been through a human, so it is quarantined from
-#: execution and belongs in human triage.
+#: Stable reason for a record that carries no approval metadata at all — the
+#: 69 legacy `incident-*` proposals' exact shape. Not an error: it means this
+#: record has never been through a human, so it is quarantined from execution
+#: and belongs in human triage.
 UNAUTHORIZED_LEGACY_AUTO_ACCEPTED = "legacy auto-accepted / unreviewed"
+#: Stable reason for a record that WAS approved, by a path that recorded no
+#: approver identity. A different situation with a different remedy, and it
+#: must not be reported as the one above: `dev_loop` submits the approve CWFT
+#: with `"approver": self._approver or "unknown"`, and a payload-less approve
+#: signal lands the same value, so this is a real human approval whose
+#: identity the approve path dropped — the motivating path for the sweep, not
+#: an August artifact. Refusing to execute it is still right (an approval that
+#: names nobody cannot be audited); telling an operator it is legacy junk is
+#: not, because the fix is to re-approve with an identity, not to triage a
+#: stale proposal.
+UNAUTHORIZED_ANONYMOUS_APPROVER = "approved with no recorded approver identity"
 
 
-def execution_authorization(data: dict[str, Any]) -> str | None:
-    """What explicitly authorizes executing this proposal, or None.
+def execution_authorization(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    """``(authorization, unauthorized_reason)`` for executing this proposal.
 
-    Fail-closed by construction: every path that does not positively identify
-    an authorization returns None. See the block comment above for why this is
-    not `human_approval_satisfied`.
+    Exactly one side is ever set. Fail-closed by construction: every path that
+    does not positively identify an authorization returns ``(None, <reason>)``,
+    and the reason distinguishes the two unauthorized shapes because they have
+    opposite remedies. See the block comment above for why this is not
+    `human_approval_satisfied`.
     """
     approval = data.get("approval")
     if isinstance(approval, dict):
         approved_by = approval.get("approved_by")
-        if (
-            isinstance(approved_by, str)
-            and approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
-        ):
-            return AUTHORIZATION_HUMAN_APPROVAL
+        if isinstance(approved_by, str):
+            if approved_by.strip().lower() not in _ANONYMOUS_APPROVERS:
+                return AUTHORIZATION_HUMAN_APPROVAL, None
+            return None, UNAUTHORIZED_ANONYMOUS_APPROVER
+        if approved_by is not None:
+            # A non-string `approved_by` is a malformed record, not an absent
+            # one — it asked for something unreadable, so it reports as the
+            # anonymous case rather than as never-approved.
+            return None, UNAUTHORIZED_ANONYMOUS_APPROVER
     # The autonomy-policy arm goes here once a policy is defined. Until then
-    # there is deliberately no second way to reach a non-None return.
-    return None
+    # there is deliberately no second way to reach a non-None authorization.
+    return None, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED
 
 
 def unrunnable_reason(data: dict[str, Any]) -> str | None:

@@ -148,10 +148,29 @@ from `needs-triage` back to `accepted`.
 `implement-sweep-mctl-agents-schedule` (every 15 min, mctl-agents#412) reads
 every proposal's committed status from gitops `main`, and submits
 `mctl-agents-implement` for any `accepted` proposal that carries no `pr:`,
-no unexpired `attempt` lease, no `blocked`/`approval-missing` marker, whose
-`updated_at` is older than the stranding grace period
-(`IMPLEMENT_SWEEP_GRACE_MINUTES`, default 20), and whose derived
-DevLoopWorkflow id is not in the currently-running set. That last check is
+no unexpired `attempt` lease, no `blocked`/`approval-missing` marker, that
+carries explicit execution authorization, whose `updated_at` is older than
+the stranding grace period (`IMPLEMENT_SWEEP_GRACE_MINUTES`, default 20),
+and whose derived DevLoopWorkflow id is not in the currently-running set.
+
+Execution authorization is a separate, fail-closed question from the
+write-time `control.requires_human_approval` check, and is deliberately not
+layered on it: an absent `control` block correctly means "this record never
+asked for approval" to a writer checking its own write, but it must never
+mean "approval not required" to something submitting execution on a record
+nobody is watching. Only a verified, non-anonymous `approval.approved_by`
+authorizes a sweep submit today (`proposal_state.execution_authorization`);
+a separately-defined explicit autonomy policy is the reserved second path
+and no policy is defined yet. Provenance of who WROTE a record is not
+authorization — a writer allowlist was tried and rejected by the 2026-09-19
+product decision on mctl-agents#412, and `ProposalStateRef` no longer
+carries `updated_by` at all so one cannot be rebuilt. Unauthorized
+proposals are quarantined from execution with their specs untouched and
+reported on `ImplementSweepResult.unauthorized` for human triage, under two
+distinct reasons: `legacy auto-accepted / unreviewed` (never approved — the
+69 `incident-*` records that have sat in `accepted` since August) and
+`approved with no recorded approver identity` (a real approval whose path
+recorded no approver, fixed by re-approving rather than by triage). That last check is
 what makes the sweep safe beside a live DevLoop: `mctl_trigger_approve` and
 the incident responder's direct `status: accepted` write both flip a
 proposal to `accepted` with no owner, and before this the sweep that used to
@@ -159,10 +178,15 @@ promote it (an Argo cron) had been suspended since the Temporal migration —
 so those proposals sat untouched until a human ran `mctl_trigger_implementer`
 by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS` (default 5) proposals are
 submitted per tick, scoped to `{service, slug}` on the same admission queue
-DevLoopWorkflow's own implement step uses; every candidate — submitted or
-skipped — is logged as `STRANDED service=... slug=... reason=...`, and an
-unknown active-DevLoop set (a failed visibility query) skips the whole tick
-rather than risk double-running an implementer.
+DevLoopWorkflow's own implement step uses. Every candidate that survives the
+scan is logged as `STRANDED service=... slug=... reason=...`, whether it is
+submitted, over the per-tick cap, already being swept, or over its pre-start
+retry budget; proposals the scan itself filtered out are reported in
+`StrandedScanResult.skipped` instead, and the quarantined ones additionally
+on `.unauthorized`. An unknown active-DevLoop set, a failed stranding scan,
+or an unknown pre-start retry budget each skip the whole tick with a
+`skipped_reason` rather than risk double-running an implementer or
+submitting past a bound.
 
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated

@@ -52,7 +52,7 @@ def visibility():
     # that is another MagicMock — so an activity this fixture does not name
     # can never be asserted on, and a dropped registration for it is
     # invisible to this whole suite (review P3 on #412).
-    stub.count_swept_implement_failures = _named_activity("count_swept_implement_failures")
+    stub.count_swept_prestart_failures = _named_activity("count_swept_prestart_failures")
     return stub
 
 
@@ -91,7 +91,7 @@ def test_the_implement_sweep_registers_on_the_control_queue_only(visibility):
     # Both visibility activities are scheduled by STRING name from
     # ImplementSweepWorkflow, so a dropped registration is not a type error
     # anywhere — the tick just fails its budget query every 15 minutes.
-    assert "count_swept_implement_failures" in control.activity_names
+    assert "count_swept_prestart_failures" in control.activity_names
     assert "list_active_dev_loop_ids" in control.activity_names
 
     for role in ("execution", "implementation"):
@@ -550,6 +550,6 @@ def test_the_visibility_activity_names_the_workflow_schedules_by_string_exist():
 
     names = {
         getattr(getattr(VisibilityActivities, attr), "__temporal_activity_definition").name
-        for attr in ("list_active_dev_loop_ids", "count_swept_implement_failures")
+        for attr in ("list_active_dev_loop_ids", "count_swept_prestart_failures")
     }
-    assert names == {"list_active_dev_loop_ids", "count_swept_implement_failures"}
+    assert names == {"list_active_dev_loop_ids", "count_swept_prestart_failures"}

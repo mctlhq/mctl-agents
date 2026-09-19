@@ -1,11 +1,11 @@
 """`VisibilityActivities` — the two visibility reads the sweep runs on (#412).
 
-`count_swept_implement_failures` had no test of its own: its query string and
+`count_swept_prestart_failures` had no test of its own: its query string and
 its counting loop were exercised only through workflow tests that faked the
-whole activity out (review P3). That loop now carries the memo filter the
-pre-start budget depends on, and every way it can be wrong is silent —
-counting too much makes a proposal permanently unsweepable, counting too
-little removes the bound.
+whole activity out (review P3). That loop carries the pre-start filter the
+budget depends on, and every way it can be wrong is silent — counting too much
+makes a proposal permanently unsweepable, counting too little removes the
+bound.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _execution(error_type: str | None, *, unreadable: bool = False):
     different case from a failure with a recognisable non-pre-start type.
     """
     wf = MagicMock()
-    wf.id, wf.run_id = "child", f"run-{error_type}-{unreadable}"
+    wf.id, wf.run_id = CHILD_ID, f"run-{error_type}-{unreadable}"
     if unreadable:
         wf._raise = RuntimeError("history unavailable")
     elif error_type is None:
@@ -77,7 +77,7 @@ def env():
     return ActivityEnvironment()
 
 
-class TestCountSweptImplementFailures:
+class TestCountSweptPrestartFailures:
     async def test_only_prestart_outcomes_are_counted(self, env):
         """The budget is a PRE-START budget. An `execution` or `finalization`
         failure means the implementer ran and already wrote
@@ -92,7 +92,8 @@ class TestCountSweptImplementFailures:
         ])
         acts = VisibilityActivities(client)
 
-        assert await env.run(acts.count_swept_implement_failures, CHILD_ID) == 2
+        counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+        assert counts == {CHILD_ID: 2}
 
     async def test_an_unclassifiable_failure_is_not_counted(self, env):
         """Of the two ways to be wrong about an unclassifiable execution,
@@ -107,24 +108,65 @@ class TestCountSweptImplementFailures:
         ])
         acts = VisibilityActivities(client)
 
-        assert await env.run(acts.count_swept_implement_failures, CHILD_ID) == 1
+        counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+        assert counts == {CHILD_ID: 1}
 
-    async def test_no_failed_executions_is_zero(self, env):
+    async def test_no_failed_executions_is_zero_for_every_id(self, env):
         acts = VisibilityActivities(_client([]))
 
-        assert await env.run(acts.count_swept_implement_failures, CHILD_ID) == 0
+        counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID, "other"])
+        assert counts == {CHILD_ID: 0, "other": 0}, (
+            "every candidate must get an entry — a missing key read as zero "
+            "somewhere else would silently remove the bound"
+        )
 
-    async def test_the_query_is_pinned_to_this_child_id_and_failed_only(self, env):
-        """A query that dropped the WorkflowId clause would count every failed
-        sweep anywhere and freeze the whole mechanism at the first backlog."""
+    async def test_an_empty_candidate_list_issues_no_query(self, env):
         client = _client([])
         acts = VisibilityActivities(client)
 
-        await env.run(acts.count_swept_implement_failures, CHILD_ID)
+        assert await env.run(acts.count_swept_prestart_failures, []) == {}
+        assert client.queries == []
+
+    async def test_one_bulk_query_covers_the_whole_candidate_set(self, env):
+        """One query per TICK, not per candidate.
+
+        The per-candidate version fanned out with the size of the backlog (71),
+        and the cap added to bound that starved the tail of the candidate list
+        permanently — the list is rebuilt in stable order every tick and an
+        over-budget candidate never leaves it (review P2).
+        """
+        client = _client([])
+        acts = VisibilityActivities(client)
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID, "implement-sweep-b"])
+
+        assert len(client.queries) == 1
+        assert client.queries == [
+            f"WorkflowId IN ('{CHILD_ID}', 'implement-sweep-b') "
+            "AND ExecutionStatus = 'Failed'"
+        ]
+
+    async def test_a_quote_in_an_id_is_escaped_for_the_filter(self, env):
+        """These ids come from gitops path segments, not user input, but an
+        unescaped quote would still turn a malformed slug into an
+        InvalidArgument that reads as "no prior failures" to anything that
+        swallowed it (review P3)."""
+        client = _client([])
+        acts = VisibilityActivities(client)
+
+        await env.run(acts.count_swept_prestart_failures, ["implement-sweep-o'brien"])
 
         assert client.queries == [
-            f"WorkflowId = '{CHILD_ID}' AND ExecutionStatus = 'Failed'"
+            "WorkflowId IN ('implement-sweep-o''brien') AND ExecutionStatus = 'Failed'"
         ]
+
+    async def test_an_unrequested_id_in_the_results_is_ignored(self, env):
+        stray = _execution(PRE_START_ERROR_TYPE)
+        stray.id = "implement-sweep-somebody-else"
+        client = _client([stray])
+        acts = VisibilityActivities(client)
+
+        assert await env.run(acts.count_swept_prestart_failures, [CHILD_ID]) == {CHILD_ID: 0}
 
     async def test_a_visibility_error_propagates(self, env):
         """The caller fails closed on this candidate; it can only do that if
@@ -139,7 +181,7 @@ class TestCountSweptImplementFailures:
         acts = VisibilityActivities(client)
 
         with pytest.raises(RuntimeError):
-            await env.run(acts.count_swept_implement_failures, CHILD_ID)
+            await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
 
 
 class TestListActiveDevLoopIds:

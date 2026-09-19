@@ -55,7 +55,9 @@ TREE_URL = (
 # Bound on the blob cache. Well above today's 212 proposals, and small
 # enough that a worker that never restarts cannot grow it without limit.
 _BLOB_CACHE_MAX = 4096
-_ParsedStatus = tuple[str, str | None, str | None, str | None, bool, bool, str | None]
+_ParsedStatus = tuple[
+    str, str | None, str | None, str | None, bool, bool, str | None, str | None
+]
 _blob_cache: OrderedDict[str, _ParsedStatus] = OrderedDict()
 
 # How many blob/PR reads to have in flight at once. The worker shares one
@@ -106,6 +108,12 @@ class ProposalStateRef:
     #: not authorization to execute it, so the sweep is not given the field it
     #: would need to build a writer allowlist out of.
     execution_authorization: str | None = None
+    #: Why nothing authorizes it, when `execution_authorization` is None.
+    #: Two shapes with opposite remedies share that None — a record that was
+    #: never approved at all, and one a human DID approve through a path that
+    #: recorded no identity — and an operator triaging the quarantine needs
+    #: to tell them apart. Exactly one of the two fields is ever set.
+    unauthorized_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -168,7 +176,8 @@ def _cache_put(sha: str, value: _ParsedStatus) -> None:
 
 def _parse_status_yaml(text: str) -> _ParsedStatus:
     """Return (status, pr_url, updated_at, attempt_expires_at, unrunnable,
-    blocked, execution_authorization) from a .status.yaml body.
+    blocked, execution_authorization, unauthorized_reason) from a .status.yaml
+    body.
 
     Mirrors run_shepherd._load_status: flat YAML written by the
     investigator, defaulting to "proposed" the way _discover_refs does.
@@ -191,7 +200,7 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
     attempt_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
     unrunnable = unrunnable_reason(data) is not None
     blocked = bool(data.get("blocked"))
-    authorization = execution_authorization(data)
+    authorization, unauthorized = execution_authorization(data)
     return (
         status,
         str(pr) if pr else None,
@@ -200,6 +209,7 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
         unrunnable,
         blocked,
         authorization,
+        unauthorized,
     )
 
 
@@ -321,6 +331,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                         unrunnable,
                         blocked,
                         authorization,
+                        unauthorized,
                     ) = await _read_blob(client, sha, token)
                 except (ValueError, yaml.YAMLError) as exc:
                     # One unparseable status file must not blind the sweep to
@@ -342,6 +353,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                 unrunnable=unrunnable,
                 blocked=blocked,
                 execution_authorization=authorization,
+                unauthorized_reason=unauthorized,
             )
 
         results = await _gather_or_raise([one(s, g, sha) for s, g, sha in paths])

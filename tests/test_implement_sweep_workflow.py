@@ -68,14 +68,14 @@ def _fake_activities(
             raise ApplicationError("visibility unavailable", non_retryable=True)
         return active_ids or []
 
-    @activity.defn(name="count_swept_implement_failures")
-    async def fake_count_swept_implement_failures(workflow_id: str) -> int:
-        received.setdefault("budget_queries", []).append(workflow_id)
+    @activity.defn(name="count_swept_prestart_failures")
+    async def fake_count_swept_prestart_failures(workflow_ids: list[str]) -> dict[str, int]:
+        received.setdefault("budget_queries", []).append(list(workflow_ids))
         if budget_query_fails:
             raise ApplicationError("visibility unavailable", non_retryable=True)
         if prior_failures_by_id is not None:
-            return prior_failures_by_id.get(workflow_id, 0)
-        return prior_failures
+            return {w: prior_failures_by_id.get(w, 0) for w in workflow_ids}
+        return {w: prior_failures for w in workflow_ids}
 
     @activity.defn(name="find_stranded_accepted")
     async def fake_find_stranded_accepted(
@@ -108,7 +108,7 @@ def _fake_activities(
 
     return [
         fake_list_active_dev_loop_ids,
-        fake_count_swept_implement_failures,
+        fake_count_swept_prestart_failures,
         fake_find_stranded_accepted,
         fake_submit_and_wait,
         fake_record_execution,
@@ -520,10 +520,11 @@ class TestStrandedScanFailure:
 
 
 class TestBudgetQueryFailure:
-    async def test_an_unknown_budget_fails_closed_on_that_candidate_only(self, env):
+    async def test_an_unknown_budget_skips_the_whole_tick(self, env):
         """An unknown prior-failure count must not read as zero — that removes
-        the bound exactly when visibility is unhealthy. The rest of the tick
-        still runs: one bad candidate is not a reason to skip the others."""
+        the bound exactly when visibility is unhealthy. The read covers the
+        whole candidate set in one query, so there is no partial answer to
+        carry on with: the tick reports a skipped_reason and submits nothing."""
         activities, received = _fake_activities(
             budget_query_fails=True,
             stranded=[_candidate(slug="issue-1-a"), _candidate(slug="issue-2-b")],
@@ -534,34 +535,58 @@ class TestBudgetQueryFailure:
         assert received["submits"] == []
         assert result.submitted == 0
         assert result.candidates == 2
-        assert len(received["budget_queries"]) == 2, (
-            "the second candidate must still be considered"
+        assert result.skipped == 2
+        assert result.skipped_reason is not None
+        assert "pre-start budget" in result.skipped_reason
+
+
+class TestBudgetQueryFanOut:
+    """review P2: the budget was read one visibility query per candidate, which
+    fanned out with the size of the backlog (71 today). Capping the number of
+    queries was worse — `scan.stranded` is rebuilt in stable tree order every
+    tick and an over-budget candidate never leaves it, so once the cap's worth
+    of over-budget proposals precede candidate N, N was never queried or
+    submitted again on ANY tick."""
+
+    async def test_one_query_covers_every_candidate(self, env):
+        candidates = [_candidate(slug=f"issue-{i}-x") for i in range(40)]
+        activities, received = _fake_activities(stranded=candidates)
+
+        result = await _run(
+            env,
+            activities,
+            await_children=[f"implement-sweep-mctl-web-issue-{i}-x" for i in range(5)],
         )
 
+        assert len(received["budget_queries"]) == 1, (
+            "one query per tick, not one per candidate"
+        )
+        assert len(received["budget_queries"][0]) == 40, (
+            "and it must cover the whole candidate list, not a truncated head"
+        )
+        assert result.submitted == 5
 
-class TestBudgetQueryCap:
-    """review P2: the budget check sits inside the candidate loop and a
-    budget-skip does not consume `max_submits`, so a tick could issue one
-    visibility query per candidate (71 on the real backlog) before landing
-    its 5 submits."""
-
-    async def test_the_visibility_queries_are_bounded_per_tick(self, env):
-        from orchestrator.temporal.workflows.implement_sweep import MAX_SWEEP_BUDGET_QUERIES
-
-        over = MAX_SWEEP_BUDGET_QUERIES + 15
+    async def test_a_late_candidate_behind_many_over_budget_ones_is_still_reachable(
+        self, env
+    ):
+        """The starvation this replaced: with a query cap, candidate 30 sat
+        behind 30 over-budget ones in a list that never reorders, so it was
+        never reached on any tick."""
+        candidates = [_candidate(slug=f"issue-{i}-x") for i in range(31)]
         activities, received = _fake_activities(
-            stranded=[_candidate(slug=f"issue-{i}-x") for i in range(over)],
+            stranded=candidates,
             prior_failures_by_id={
-                f"implement-sweep-mctl-web-issue-{i}-x": 99 for i in range(over)
+                f"implement-sweep-mctl-web-issue-{i}-x": 99 for i in range(30)
             },
         )
 
-        result = await _run(env, activities)
-
-        assert len(received["budget_queries"]) == MAX_SWEEP_BUDGET_QUERIES, (
-            f"a {over}-candidate backlog must not issue {over} visibility queries"
+        result = await _run(
+            env, activities, await_children=["implement-sweep-mctl-web-issue-30-x"]
         )
-        assert result.submitted == 0
+
+        assert result.over_budget == 30
+        assert result.submitted == 1
+        assert received["submits"][0].params["slug"] == "issue-30-x"
 
 
 class TestOverBudgetIsReported:
@@ -581,6 +606,28 @@ class TestOverBudgetIsReported:
         assert received["submits"] == []
         assert result.over_budget == 2
         assert result.submitted == 0
+
+    async def test_over_budget_writes_no_execution_ledger_row(self, env):
+        """review P1: an earlier round recorded an ExecutionRecord per
+        over-budget candidate per tick. The branch touches no gitops field and
+        does not consume `max_submits`, so the candidate is re-derived every
+        tick — 96 rows/day/proposal carrying `agent="implementer"`,
+        `phase="Failed"` and a Temporal child id in `argo_workflow_name`:
+        indistinguishable from a real implementer failure, naming no Argo
+        workflow. `over_budget` above is the report; the ledger is not."""
+        from orchestrator.temporal.workflows.implement_sweep import MAX_SWEEP_PRESTART_ATTEMPTS
+
+        activities, received = _fake_activities(
+            prior_failures=MAX_SWEEP_PRESTART_ATTEMPTS,
+            stranded=[_candidate(slug="issue-1-a"), _candidate(slug="issue-2-b")],
+        )
+
+        result = await _run(env, activities)
+
+        assert result.over_budget == 2
+        assert received["record_execution"] == [], (
+            "a run that never happened must not appear in the executions ledger"
+        )
 
 
 class TestUnauthorizedIsReported:

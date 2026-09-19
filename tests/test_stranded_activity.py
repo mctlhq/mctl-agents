@@ -14,7 +14,9 @@ from temporalio.testing import ActivityEnvironment
 
 from orchestrator.proposal_state import (
     AUTHORIZATION_HUMAN_APPROVAL,
+    UNAUTHORIZED_ANONYMOUS_APPROVER,
     UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
+    execution_authorization,
 )
 from orchestrator.temporal.activities import stranded as act
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef
@@ -47,6 +49,7 @@ def _ref(service="mctl-web", slug="issue-10-widget", **overrides) -> ProposalSta
         # authorizes execution today. The unauthorized path is exercised
         # explicitly by TestExecutionAuthorization below.
         execution_authorization=AUTHORIZATION_HUMAN_APPROVAL,
+        unauthorized_reason=None,
     )
     base.update(overrides)
     return ProposalStateRef(**base)
@@ -212,6 +215,7 @@ class TestIncidentSlugs:
                     service="mctl-web",
                     slug="incident-2026-09-19-outage",
                     execution_authorization=None,
+                    unauthorized_reason=UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
                 )
             ],
             active=["dev-loop-mctlhq-mctl-web-10"],
@@ -250,7 +254,10 @@ class TestExecutionAuthorization:
     """
 
     async def test_no_authorization_at_all_is_quarantined(self, env, monkeypatch):
-        result = await _run(env, monkeypatch, [_ref(execution_authorization=None)])
+        result = await _run(env, monkeypatch, [_ref(
+            execution_authorization=None,
+            unauthorized_reason=UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
+        )])
 
         assert result.stranded == []
         key, reason = result.skipped[0]
@@ -275,6 +282,29 @@ class TestExecutionAuthorization:
         assert "has_control_block" not in names
         assert "execution_authorization" in names
 
+    async def test_an_anonymous_approval_is_quarantined_under_its_own_reason(
+        self, env, monkeypatch
+    ):
+        """review P2: two shapes with opposite remedies shared one label.
+
+        `dev_loop` submits the approve CWFT with `"approver": self._approver or
+        "unknown"`, and a payload-less approve signal lands the same value — so
+        this is a REAL human approval whose identity the approve path dropped,
+        not an August artifact. Refusing to execute it is right; reporting it
+        to an operator as legacy junk sends them to triage a stale proposal
+        instead of re-approving with an identity.
+        """
+        result = await _run(env, monkeypatch, [_ref(
+            execution_authorization=None,
+            unauthorized_reason=UNAUTHORIZED_ANONYMOUS_APPROVER,
+        )])
+
+        assert result.stranded == []
+        assert result.unauthorized == [
+            ("mctl-web/issue-10-widget", UNAUTHORIZED_ANONYMOUS_APPROVER)
+        ]
+        assert UNAUTHORIZED_LEGACY_AUTO_ACCEPTED not in result.skipped[0][1]
+
     async def test_a_quarantined_record_does_not_block_an_authorized_one(
         self, env, monkeypatch
     ):
@@ -283,9 +313,13 @@ class TestExecutionAuthorization:
             env,
             monkeypatch,
             [
-                _ref(service="mctl-web", slug="incident-a", execution_authorization=None),
+                _ref(service="mctl-web", slug="incident-a",
+                     execution_authorization=None,
+                     unauthorized_reason=UNAUTHORIZED_LEGACY_AUTO_ACCEPTED),
                 _ref(service="mctl-web", slug="issue-2-b"),
-                _ref(service="mctl-api", slug="incident-c", execution_authorization=None),
+                _ref(service="mctl-api", slug="incident-c",
+                     execution_authorization=None,
+                     unauthorized_reason=UNAUTHORIZED_LEGACY_AUTO_ACCEPTED),
             ],
         )
 
@@ -332,3 +366,71 @@ class TestManyProposals:
         assert result.total_accepted == 2
         assert [c.slug for c in result.stranded] == ["issue-1-a"]
         assert len(result.skipped) == 1
+
+
+class TestExecutionAuthorizationPredicate:
+    """`execution_authorization` itself, which nothing exercised directly.
+
+    It is the whole gate: every unauthorized path must return no
+    authorization, and the reason it returns is what an operator acts on.
+    """
+
+    def test_a_named_human_approver_authorizes(self):
+        assert execution_authorization({"approval": {"approved_by": "mashkovd"}}) == (
+            AUTHORIZATION_HUMAN_APPROVAL,
+            None,
+        )
+
+    def test_nothing_at_all_is_legacy_auto_accepted(self):
+        """The 69 incident-* records: `status: accepted`, no control, no
+        approval, written by the responder's own auto-accept."""
+        assert execution_authorization(
+            {"status": "accepted", "updated_by": "_incident-responder"}
+        ) == (None, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED)
+
+    @pytest.mark.parametrize("approver", ["unknown", "UNKNOWN", " none ", "null", ""])
+    def test_an_anonymous_approver_is_its_own_reason(self, approver):
+        assert execution_authorization({"approval": {"approved_by": approver}}) == (
+            None,
+            UNAUTHORIZED_ANONYMOUS_APPROVER,
+        )
+
+    def test_a_non_string_approver_reports_as_anonymous_not_absent(self):
+        """It asked for something unreadable; it did not fail to ask."""
+        assert execution_authorization({"approval": {"approved_by": {"login": "x"}}}) == (
+            None,
+            UNAUTHORIZED_ANONYMOUS_APPROVER,
+        )
+
+    def test_a_non_mapping_approval_block_authorizes_nothing(self):
+        assert execution_authorization({"approval": "mashkovd"}) == (
+            None,
+            UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
+        )
+
+    @pytest.mark.parametrize(
+        "control",
+        [
+            {"requires_human_approval": False},
+            {"requires_human_approval": "false"},
+            {"requires_human_approval": "no"},
+            {},
+        ],
+    )
+    def test_waiving_the_approval_gate_grants_no_authority(self, control):
+        """`requires_human_approval: false` waives a gate; it does not grant
+        permission to execute. This is the split from
+        `human_approval_satisfied`, which answers True for every one of these.
+        """
+        from orchestrator.proposal_state import human_approval_satisfied
+
+        data = {"control": control}
+        assert human_approval_satisfied(data) is True
+        assert execution_authorization(data) == (None, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED)
+
+    def test_an_approval_survives_a_waived_gate(self):
+        """Authorization is read off the approval, not off the gate."""
+        assert execution_authorization({
+            "control": {"requires_human_approval": False},
+            "approval": {"approved_by": "mashkovd"},
+        }) == (AUTHORIZATION_HUMAN_APPROVAL, None)
