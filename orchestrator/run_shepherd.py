@@ -1430,6 +1430,40 @@ def find_pr_for_proposal(
     return _fetch_pr_snapshot(f"{owner}/{repo}", number)
 
 
+def _fetch_required_status_check_contexts(
+    owner: str, repo_name: str, base_ref_name: str
+) -> tuple[str, ...]:
+    """Best-effort fetch of the base branch's required-status-check list.
+
+    `branchProtectionRule` requires admin access to the repository; a token
+    without that scope makes the WHOLE GraphQL response carry a FORBIDDEN
+    error, which `gh api graphql` treats as a failure. Kept in its own call,
+    separate from the PR snapshot query that gates every shepherd decision,
+    so a permission shortfall here degrades to "no branch-protection
+    fallback" instead of failing _fetch_pr_snapshot for every PR
+    (mctl-agents#411 review).
+    """
+    if not base_ref_name:
+        return ()
+    try:
+        resp = _gh_api_json([
+            "graphql", "-f",
+            "query=query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiredStatusCheckContexts}}}}",
+            "-F", f"owner={owner}",
+            "-F", f"repo={repo_name}",
+            "-F", f"ref=refs/heads/{base_ref_name}",
+        ])
+    except subprocess.CalledProcessError as e:
+        print(
+            f"warn: gh graphql branch-protection probe failed for "
+            f"{owner}/{repo_name}@{base_ref_name}: {(e.stderr or '').strip() or e}"
+        )
+        return ()
+    ref = ((resp or {}).get("data") or {}).get("repository") or {}
+    ref = ref.get("ref") or {}
+    return tuple(((ref.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts")) or ())
+
+
 def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     """gh pr view + a small GraphQL probe to assemble a PRSnapshot.
 
@@ -1441,7 +1475,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName baseRef{branchProtectionRule{requiredStatusCheckContexts}} mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -1513,9 +1547,8 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
             tagged = dict(node)
             tagged["_commit_oid"] = commit_oid
             check_contexts.append(tagged)
-    required_contexts = tuple(
-        ((pr.get("baseRef") or {}).get("branchProtectionRule") or {}).get("requiredStatusCheckContexts")
-        or ()
+    required_contexts = _fetch_required_status_check_contexts(
+        repo.split("/")[0], repo.split("/")[1], pr.get("baseRefName") or ""
     )
 
     # Fork check (mctlhq/mctl-agents#334): true when GitHub says so directly,
@@ -2298,7 +2331,14 @@ def apply_followup(
         findings = list(blockers)
         checks = []
 
-    bundle = anyio.run(_format_bundle_via_sdk, findings)
+    if findings:
+        bundle = anyio.run(_format_bundle_via_sdk, findings)
+    else:
+        # CI-only follow-up: skip the summariser SDK call entirely rather
+        # than pay for a round trip over an empty <findings></findings>
+        # block, whose ungrounded output would otherwise be rendered to
+        # the implementer as if it were real review findings.
+        bundle = _fallback_bundle(findings)
     bundle = _augment_bundle_with_ci(bundle, checks)
 
     if skip_subprocess:

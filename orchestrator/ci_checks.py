@@ -358,8 +358,11 @@ def _read_required_checks(pr: _PRLike) -> CIStatus:
             continue
 
         conclusion = node["conclusion"]
-        if conclusion in ("", "SUCCESS"):
-            continue  # passing, or an unrecognised state — not a blocker
+        if conclusion in ("", "SUCCESS", "SKIPPED", "NEUTRAL"):
+            # Passing, an unrecognised state, or SKIPPED/NEUTRAL — GitHub
+            # does not gate required-check mergeability on the latter two,
+            # so they must never become blockers even when required.
+            continue
         if not required:
             continue  # advisory failure — never gates the merge
 
