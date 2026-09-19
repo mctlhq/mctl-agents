@@ -50,6 +50,10 @@ def _candidate(service="mctl-web", slug="issue-10-test") -> StrandedProposal:
 def _fake_activities(
     *,
     visibility_fails: bool = False,
+    scan_fails: bool = False,
+    budget_query_fails: bool = False,
+    unauthorized: list[tuple[str, str]] | None = None,
+    prior_failures_by_id: dict[str, int] | None = None,
     active_ids: list[str] | None = None,
     stranded: list[StrandedProposal] | None = None,
     submit_gate: anyio.Event | None = None,
@@ -66,6 +70,11 @@ def _fake_activities(
 
     @activity.defn(name="count_swept_implement_failures")
     async def fake_count_swept_implement_failures(workflow_id: str) -> int:
+        received.setdefault("budget_queries", []).append(workflow_id)
+        if budget_query_fails:
+            raise ApplicationError("visibility unavailable", non_retryable=True)
+        if prior_failures_by_id is not None:
+            return prior_failures_by_id.get(workflow_id, 0)
         return prior_failures
 
     @activity.defn(name="find_stranded_accepted")
@@ -74,9 +83,14 @@ def _fake_activities(
     ) -> StrandedScanResult:
         received["active_workflow_ids"] = active_workflow_ids
         received["grace_minutes"] = grace_minutes
+        if scan_fails:
+            raise ApplicationError("gitops listing failed", non_retryable=True)
         candidates = stranded if stranded is not None else [_candidate()]
         return StrandedScanResult(
-            total_accepted=len(candidates), stranded=candidates, skipped=[]
+            total_accepted=len(candidates),
+            stranded=candidates,
+            skipped=list(unauthorized or []),
+            unauthorized=list(unauthorized or []),
         )
 
     @activity.defn(name="submit_and_wait")
@@ -484,3 +498,170 @@ class TestRecordExecution:
         record = received["record_execution"][0]
         assert record.target_repo == "mctl-web"
         assert record.phase == "Failed"
+
+
+class TestStrandedScanFailure:
+    """review P2: `list_active_dev_loop_ids` was wrapped and this sibling was
+    not, so a GitHub 5xx or a malformed listing failed the whole SCHEDULED
+    workflow every 15 minutes instead of reporting a skipped tick."""
+
+    async def test_a_failed_scan_reports_a_skipped_tick_instead_of_failing(self, env):
+        activities, received = _fake_activities(scan_fails=True)
+
+        result = await _run(env, activities)
+
+        assert received["submits"] == []
+        assert result.candidates == 0
+        assert result.submitted == 0
+        assert result.skipped_reason is not None, (
+            "the field that exists to say 'did not look' must actually be assigned"
+        )
+        assert "stranded scan" in result.skipped_reason
+
+
+class TestBudgetQueryFailure:
+    async def test_an_unknown_budget_fails_closed_on_that_candidate_only(self, env):
+        """An unknown prior-failure count must not read as zero — that removes
+        the bound exactly when visibility is unhealthy. The rest of the tick
+        still runs: one bad candidate is not a reason to skip the others."""
+        activities, received = _fake_activities(
+            budget_query_fails=True,
+            stranded=[_candidate(slug="issue-1-a"), _candidate(slug="issue-2-b")],
+        )
+
+        result = await _run(env, activities)
+
+        assert received["submits"] == []
+        assert result.submitted == 0
+        assert result.candidates == 2
+        assert len(received["budget_queries"]) == 2, (
+            "the second candidate must still be considered"
+        )
+
+
+class TestBudgetQueryCap:
+    """review P2: the budget check sits inside the candidate loop and a
+    budget-skip does not consume `max_submits`, so a tick could issue one
+    visibility query per candidate (71 on the real backlog) before landing
+    its 5 submits."""
+
+    async def test_the_visibility_queries_are_bounded_per_tick(self, env):
+        from orchestrator.temporal.workflows.implement_sweep import MAX_SWEEP_BUDGET_QUERIES
+
+        over = MAX_SWEEP_BUDGET_QUERIES + 15
+        activities, received = _fake_activities(
+            stranded=[_candidate(slug=f"issue-{i}-x") for i in range(over)],
+            prior_failures_by_id={
+                f"implement-sweep-mctl-web-issue-{i}-x": 99 for i in range(over)
+            },
+        )
+
+        result = await _run(env, activities)
+
+        assert len(received["budget_queries"]) == MAX_SWEEP_BUDGET_QUERIES, (
+            f"a {over}-candidate backlog must not issue {over} visibility queries"
+        )
+        assert result.submitted == 0
+
+
+class TestOverBudgetIsReported:
+    async def test_exhausting_the_prestart_budget_lands_on_the_result(self, env):
+        """review P2: exhaustion was log-only — no result field, tick green —
+        so "needs a human" reached no human and the candidate was re-derived
+        and re-queried every 15 minutes forever."""
+        from orchestrator.temporal.workflows.implement_sweep import MAX_SWEEP_PRESTART_ATTEMPTS
+
+        activities, received = _fake_activities(
+            prior_failures=MAX_SWEEP_PRESTART_ATTEMPTS,
+            stranded=[_candidate(slug="issue-1-a"), _candidate(slug="issue-2-b")],
+        )
+
+        result = await _run(env, activities)
+
+        assert received["submits"] == []
+        assert result.over_budget == 2
+        assert result.submitted == 0
+
+
+class TestUnauthorizedIsReported:
+    async def test_quarantined_proposals_land_on_the_result(self, env):
+        """The 2026-09-19 product decision on #412 requires the legacy
+        auto-accepted records reach a human. A log-only count is
+        indistinguishable from a clean tick to everything that reads a sweep."""
+        activities, _ = _fake_activities(
+            stranded=[],
+            unauthorized=[
+                ("mctl-web/incident-2026-08-01-a", "legacy auto-accepted / unreviewed"),
+                ("mctl-api/incident-2026-08-02-b", "legacy auto-accepted / unreviewed"),
+            ],
+        )
+
+        result = await _run(env, activities)
+
+        assert result.unauthorized == 2
+        assert result.candidates == 0
+        assert result.submitted == 0
+        assert result.skipped_reason is None, (
+            "a quarantine is a tick that looked, not one that declined to look"
+        )
+
+
+class TestPrestartErrorType:
+    """review P2: the pre-start budget must be charged for pre-start losses
+    ONLY. `count_swept_implement_failures` reads each failed execution's own
+    terminal error back and counts just `PRE_START_ERROR_TYPE`, so the three
+    error types are not cosmetic — the bound is enforced through them. If a
+    classification stops producing its own type the counter silently counts
+    zero and the bound is gone."""
+
+    @pytest.mark.parametrize(
+        ("result_kwargs", "expected_type"),
+        [
+            ({"implementer_ran": False}, "ImplementationNotStarted"),
+            (
+                {"implementer_ran": True, "implementer_phase": "Failed"},
+                "ImplementationFailed",
+            ),
+            (
+                {
+                    "implementer_ran": True,
+                    "implementer_phase": "Succeeded",
+                    "finalization_phase": "Failed",
+                },
+                "ImplementationFinalizationFailed",
+            ),
+        ],
+    )
+    async def test_each_outcome_raises_its_own_readable_error_type(
+        self, env, result_kwargs, expected_type
+    ):
+        from orchestrator.temporal.implement_outcome import PRE_START_ERROR_TYPE
+
+        activities, _ = _fake_activities(
+            submit_result=WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                **result_kwargs,
+            )
+        )
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-type-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+            assert excinfo.value.cause.type == expected_type
+            # The exact shape count_swept_implement_failures reads back.
+            assert (excinfo.value.cause.type == PRE_START_ERROR_TYPE) is (
+                result_kwargs.get("implementer_ran") is False
+            )

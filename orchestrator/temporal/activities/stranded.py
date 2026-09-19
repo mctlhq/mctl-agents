@@ -32,26 +32,31 @@ loops anywhere".
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from temporalio import activity
 
+from orchestrator.proposal_state import UNAUTHORIZED_LEGACY_AUTO_ACCEPTED
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.activities.orphans import expected_dev_loop_id
 
-# Writers allowed to put a proposal in `accepted` with no `control` block at
-# all and still be swept. `human_approval_satisfied` treats an absent
-# `control` block as "approval was never required" (a write-time default so
-# the incident responder's own writes are never refused) — that is not the
-# same fact as "a human, or a recognised auto-accept path, authorised this
-# submission". The investigator always writes `control.requires_human_
-# approval: True` (run_issue_investigator.py), so `has_control_block=False`
-# only ever legitimately comes from the incident responder's template
-# (agents/_incident-responder/CLAUDE.md's `updated_by: _incident-responder`);
-# anything else with no control block is refused a submit here rather than
-# assumed authorised (mctl-agents#412 review).
-_TRUSTED_NO_CONTROL_BLOCK_WRITERS = frozenset({"_incident-responder"})
+# The sweep submits execution on records nobody is watching, so it fails
+# closed on authorization: a proposal is swept only when something explicitly
+# authorized executing it (`proposal_state.execution_authorization`).
+#
+# A writer allowlist (`updated_by: _incident-responder` ⇒ trusted) was tried
+# here and rejected by the 2026-09-19 product decision on #412. Provenance of
+# who CREATED an auto-accepted record is not human authorization to execute
+# it — an agent's own auto-accept cannot authorize the agent's own execution,
+# and an allowlist keyed on it is a loop, not a gate. Missing `control` /
+# `approval` metadata must never read as "approval not required" on this
+# path, whatever it means at write time.
+#
+# The 69 legacy `incident-*` proposals that have sat in `accepted` since
+# August are exactly this shape. They are diagnostic artifacts, not approved
+# work: they are quarantined from execution here and reported for human
+# triage, with their requirements/design/tasks preserved and untouched.
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,12 @@ class StrandedScanResult:
     # (service/slug, why it was skipped) for every accepted proposal that is
     # NOT stranded — one entry per filter above that matched.
     skipped: list[tuple[str, str]]
+    # The subset of `skipped` that carries no execution authorization at all:
+    # quarantined from execution and awaiting human triage, NOT a clean skip.
+    # Reported separately because a count that a human can see is the whole
+    # difference between "quarantined" and "silently dropped every 15 minutes
+    # forever" (mctl-agents#412 product decision, point 3).
+    unauthorized: list[tuple[str, str]] = field(default_factory=list)
     # Set when the scan did not run at all (list_proposal_refs failed after
     # its retries), so a caller can tell a skipped tick from a genuinely
     # clean one — the same distinction OrphanDetectionResult.skipped_reason
@@ -106,6 +117,7 @@ def _scan(
     accepted = [r for r in refs if r.status == "accepted"]
     stranded: list[StrandedProposal] = []
     skipped: list[tuple[str, str]] = []
+    unauthorized: list[tuple[str, str]] = []
 
     for ref in accepted:
         key = f"{ref.service}/{ref.slug}"
@@ -126,9 +138,14 @@ def _scan(
             skipped.append((key, "a blocked marker is present"))
             continue
 
-        if not ref.has_control_block and ref.updated_by not in _TRUSTED_NO_CONTROL_BLOCK_WRITERS:
+        # Deliberately AFTER `unrunnable`/`blocked`: those two are already
+        # durable, human-visible markers, so re-reporting them here as
+        # "unauthorized" would bury the records that carry no marker at all —
+        # which are the ones this census exists to surface.
+        if ref.execution_authorization is None:
+            unauthorized.append((key, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED))
             skipped.append(
-                (key, "accepted with no control block and no recognised auto-accept writer")
+                (key, f"no explicit execution authorization ({UNAUTHORIZED_LEGACY_AUTO_ACCEPTED})")
             )
             continue
 
@@ -153,7 +170,12 @@ def _scan(
             )
         )
 
-    return StrandedScanResult(total_accepted=len(accepted), stranded=stranded, skipped=skipped)
+    return StrandedScanResult(
+        total_accepted=len(accepted),
+        stranded=stranded,
+        skipped=skipped,
+        unauthorized=unauthorized,
+    )
 
 
 @activity.defn
@@ -172,9 +194,17 @@ async def find_stranded_accepted(
     refs = await list_proposal_refs()
     result = _scan(refs, set(active_workflow_ids), grace_minutes, datetime.now(UTC))
     activity.logger.info(
-        "implement-sweep: %d accepted proposal(s), %d stranded, %d skipped",
+        "implement-sweep: %d accepted proposal(s), %d stranded, %d skipped, "
+        "%d quarantined unauthorized",
         result.total_accepted,
         len(result.stranded),
         len(result.skipped),
+        len(result.unauthorized),
     )
+    for key, reason in result.unauthorized:
+        activity.logger.warning(
+            "UNAUTHORIZED %s: %s — quarantined from execution, needs human triage",
+            key,
+            reason,
+        )
     return result

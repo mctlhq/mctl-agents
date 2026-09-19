@@ -47,6 +47,12 @@ from orchestrator.temporal.worker import (
 def visibility():
     stub = MagicMock()
     stub.list_active_dev_loop_ids = _named_activity("list_active_dev_loop_ids")
+    # Named too, not left as a bare MagicMock attribute: `activity_names`
+    # reads `__temporal_activity_definition.name`, and on a plain MagicMock
+    # that is another MagicMock — so an activity this fixture does not name
+    # can never be asserted on, and a dropped registration for it is
+    # invisible to this whole suite (review P3 on #412).
+    stub.count_swept_implement_failures = _named_activity("count_swept_implement_failures")
     return stub
 
 
@@ -82,6 +88,11 @@ def test_the_implement_sweep_registers_on_the_control_queue_only(visibility):
     assert ImplementSweepWorkflow in control.workflows
     assert SweptImplementWorkflow in control.workflows
     assert "find_stranded_accepted" in control.activity_names
+    # Both visibility activities are scheduled by STRING name from
+    # ImplementSweepWorkflow, so a dropped registration is not a type error
+    # anywhere — the tick just fails its budget query every 15 minutes.
+    assert "count_swept_implement_failures" in control.activity_names
+    assert "list_active_dev_loop_ids" in control.activity_names
 
     for role in ("execution", "implementation"):
         for plan in worker_plans(role, visibility):
@@ -523,3 +534,22 @@ def test_the_sdk_still_offers_the_run_shutdown_pair_this_module_drives():
         member = getattr(Worker, name, None)
         assert member is not None, f"Worker no longer has {name}()"
         assert inspect.iscoroutinefunction(member), f"Worker.{name}() is no longer awaitable"
+
+
+def test_the_visibility_activity_names_the_workflow_schedules_by_string_exist():
+    """The other half of the registration assertion above.
+
+    `worker_plans` is tested against a MagicMock stub, so it can only pin that
+    whatever the stub exposes gets registered. This pins the real class
+    actually exposes those two activity names — the strings
+    `ImplementSweepWorkflow` schedules by. A rename on either side is silent
+    otherwise: the workflow compiles, the worker starts, and every tick fails
+    its budget query.
+    """
+    from orchestrator.temporal.activities.visibility import VisibilityActivities
+
+    names = {
+        getattr(getattr(VisibilityActivities, attr), "__temporal_activity_definition").name
+        for attr in ("list_active_dev_loop_ids", "count_swept_implement_failures")
+    }
+    assert names == {"list_active_dev_loop_ids", "count_swept_implement_failures"}

@@ -80,6 +80,16 @@ SWEEP_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 # tick's candidate set (mctl-agents#412 review).
 MAX_SWEEP_PRESTART_ATTEMPTS = 3
 
+
+# Bounds how many `count_swept_implement_failures` visibility queries ONE tick
+# will issue. The budget check sits inside the candidate loop and a budget-skip
+# does not consume `max_submits`, so without this a tick issues one visibility
+# query per candidate before it lands its 5 submits — 71 queries on today's
+# candidate set (review P2). Ticks are 15 minutes apart and the bound is
+# generous relative to `max_submits`, so a real backlog still drains; what it
+# stops is an unbounded query fan-out driven by the size of the backlog.
+MAX_SWEEP_BUDGET_QUERIES = 20
+
 # dev_loop.py's ENVIRONMENT / FAST_ACTIVITY_TIMEOUT / FAST_ACTIVITY_RETRY_POLICY,
 # duplicated rather than imported — incidents.py sets the same precedent for
 # its own best-effort record_execution call, for the reason given above.
@@ -220,6 +230,7 @@ class SweptImplementWorkflow:
         # tick submits each stranded proposal at most once, and the next
         # 15-minute tick naturally reconsiders a proposal that is still
         # `accepted` — there is no in-workflow retry budget to spend.
+        #
         error_type = {
             "pre_start": PRE_START_ERROR_TYPE,
             "execution": "ImplementationFailed",
@@ -252,9 +263,28 @@ class ImplementSweepResult:
     candidates: int
     submitted: int
     skipped: int
-    # Set when the tick declined to act at all (the visibility query failed
+    # Set when the tick declined to act at all (a fail-closed read failed
     # after its retries) — see the module docstring's fail-closed stance.
     skipped_reason: str | None = None
+    # `accepted` proposals carrying no execution authorization at all,
+    # quarantined by `stranded._scan` and awaiting human triage. Surfaced on
+    # the RESULT, not only in a log line, because the 2026-09-19 product
+    # decision on #412 requires these reach a human: a log-only count is
+    # indistinguishable from a clean tick to everything that reads a sweep.
+    unauthorized: int = 0
+    # Candidates that had a live claim to a submit but were held back because
+    # they have already burned MAX_SWEEP_PRESTART_ATTEMPTS pre-start attempts.
+    # Also on the result for the same reason: "needs a human" that reaches no
+    # human is not a gate.
+    #
+    # KNOWN LIMIT, stated rather than hidden: this budget is counted out of
+    # Temporal visibility, which ADR-007 and ADR-009 both name as the thing
+    # `ExecutionRecord` exists to OUTLIVE. It resets with the retention
+    # window, so the loop resumes at three attempts per window. Making it
+    # durable needs a `.status.yaml` write the Temporal worker has no path for
+    # today (every needs-triage write lives in run_shepherd, CWFT-side); until
+    # then this field is what makes the exhaustion visible.
+    over_budget: int = 0
 
 
 @workflow.defn
@@ -288,14 +318,35 @@ class ImplementSweepWorkflow:
                 skipped_reason=f"active-DevLoop visibility query failed: {exc}",
             )
 
-        scan: StrandedScanResult = await workflow.execute_activity(
-            find_stranded_accepted,
-            args=[active_ids, cfg.grace_minutes],
-            start_to_close_timeout=ACTIVITY_TIMEOUT,
-            retry_policy=ACTIVITY_RETRY_POLICY,
-        )
+        try:
+            scan: StrandedScanResult = await workflow.execute_activity(
+                find_stranded_accepted,
+                args=[active_ids, cfg.grace_minutes],
+                start_to_close_timeout=ACTIVITY_TIMEOUT,
+                retry_policy=ACTIVITY_RETRY_POLICY,
+            )
+        except Exception as exc:  # noqa: BLE001 — ActivityError after retries
+            # The sibling call above is wrapped and this one was not, so a
+            # GitHub 5xx or a malformed listing failed the whole SCHEDULED
+            # workflow every 15 minutes instead of reporting a skipped tick
+            # (review P2). `skipped_reason` is the field that exists to say
+            # "did not look", as distinct from "looked and found nothing" —
+            # it was documented on two dataclasses and assigned on neither.
+            workflow.logger.warning(
+                "implement-sweep: find_stranded_accepted failed; skipping this "
+                "tick rather than failing the schedule: %s",
+                exc,
+            )
+            return ImplementSweepResult(
+                candidates=0,
+                submitted=0,
+                skipped=0,
+                skipped_reason=f"stranded scan failed: {exc}",
+            )
 
         submitted = 0
+        over_budget = 0
+        budget_queries = 0
         for candidate in scan.stranded:
             if submitted >= cfg.max_submits:
                 workflow.logger.info(
@@ -310,16 +361,47 @@ class ImplementSweepWorkflow:
 
             child_id = f"implement-sweep-{candidate.service}-{candidate.slug}"
 
-            prior_failures: int = await workflow.execute_activity(
-                "count_swept_implement_failures",
-                child_id,
-                start_to_close_timeout=ACTIVITY_TIMEOUT,
-                retry_policy=ACTIVITY_RETRY_POLICY,
-            )
-            if prior_failures >= MAX_SWEEP_PRESTART_ATTEMPTS:
+            if budget_queries >= MAX_SWEEP_BUDGET_QUERIES:
+                workflow.logger.info(
+                    "STRANDED service=%s slug=%s reason=%s (over the %d "
+                    "budget-query cap for this tick; reconsidered next tick)",
+                    candidate.service,
+                    candidate.slug,
+                    candidate.reason,
+                    MAX_SWEEP_BUDGET_QUERIES,
+                )
+                continue
+
+            budget_queries += 1
+            try:
+                prior_failures: int = await workflow.execute_activity(
+                    "count_swept_implement_failures",
+                    child_id,
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=ACTIVITY_RETRY_POLICY,
+                )
+            except Exception as exc:  # noqa: BLE001 — ActivityError after retries
+                # Fail closed on THIS candidate only: an unknown prior-failure
+                # count must not read as zero, or the bound it enforces is
+                # gone exactly when visibility is unhealthy. The rest of the
+                # tick continues — one bad candidate is not a reason to skip
+                # the others (review P2).
                 workflow.logger.warning(
-                    "STRANDED service=%s slug=%s reason=%s (%d prior failed sweep "
-                    "attempt(s) under %s; exceeded the retry budget, needs a human, "
+                    "STRANDED service=%s slug=%s reason=%s "
+                    "(count_swept_implement_failures failed: %s; not submitted "
+                    "this tick rather than submitting on an unknown budget)",
+                    candidate.service,
+                    candidate.slug,
+                    candidate.reason,
+                    exc,
+                )
+                continue
+
+            if prior_failures >= MAX_SWEEP_PRESTART_ATTEMPTS:
+                over_budget += 1
+                workflow.logger.warning(
+                    "STRANDED service=%s slug=%s reason=%s (%d prior pre-start "
+                    "failure(s) under %s; exceeded the retry budget, needs a human, "
                     "not resubmitted)",
                     candidate.service,
                     candidate.slug,
@@ -359,9 +441,20 @@ class ImplementSweepWorkflow:
             )
             submitted += 1
 
+        if scan.unauthorized:
+            workflow.logger.warning(
+                "implement-sweep: %d accepted proposal(s) carry no execution "
+                "authorization and were quarantined from execution; they need "
+                "human triage: %s",
+                len(scan.unauthorized),
+                ", ".join(key for key, _ in scan.unauthorized[:20]),
+            )
+
         return ImplementSweepResult(
             candidates=len(scan.stranded),
             submitted=submitted,
             skipped=len(scan.stranded) - submitted,
             skipped_reason=scan.skipped_reason,
+            unauthorized=len(scan.unauthorized),
+            over_budget=over_budget,
         )

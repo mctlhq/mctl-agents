@@ -28,10 +28,14 @@ directly rather than through machinery that assumes a migration this
 workflow never had.
 
 Regenerating the fixtures (only if this workflow's shape changes in a way
-that is meant to, and never merely to make a red run green): run the
-workflow via `WorkflowEnvironment.start_time_skipping()` against the fakes
-in this file, `fetch_history()` on both the parent handle and the child
-handle (id `implement-sweep-mctl-web-issue-10-replay`), and write
+that is meant to, and never merely to make a red run green): there are no
+fakes in THIS file — the recorded histories come from the harness in
+`tests/test_implement_sweep_workflow.py` (`_fake_activities` / `_run`).
+Run one happy-path tick there under `WorkflowEnvironment.start_time_skipping()`,
+`fetch_history()` on the parent handle and on the child handle — whose id is
+`implement-sweep-<service>-<slug>`, i.e.
+`implement-sweep-mctl-web-issue-10-test` for that file's default candidate,
+which is the id these fixtures actually contain — and write
 `history.to_json_dict()` with `json.dumps(..., indent=2, sort_keys=True)`.
 """
 from __future__ import annotations

@@ -37,7 +37,7 @@ import yaml
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
-from orchestrator.proposal_state import unrunnable_reason
+from orchestrator.proposal_state import execution_authorization, unrunnable_reason
 from orchestrator.temporal.activities.pr_state import _PR_API_URL_RE, _PR_URL_RE
 from orchestrator.temporal.activities.proposals import (
     AGENTS_STATE_PREFIX,
@@ -55,7 +55,7 @@ TREE_URL = (
 # Bound on the blob cache. Well above today's 212 proposals, and small
 # enough that a worker that never restarts cannot grow it without limit.
 _BLOB_CACHE_MAX = 4096
-_ParsedStatus = tuple[str, str | None, str | None, str | None, bool, bool, bool, str | None]
+_ParsedStatus = tuple[str, str | None, str | None, str | None, bool, bool, str | None]
 _blob_cache: OrderedDict[str, _ParsedStatus] = OrderedDict()
 
 # How many blob/PR reads to have in flight at once. The worker shares one
@@ -93,21 +93,19 @@ class ProposalStateRef:
     #: Whether a durable `blocked:` marker is present, written once by
     #: run_implementer for the same permanently-unrunnable condition.
     blocked: bool = False
-    #: `data.get("control") is not None` — whether the proposal ever
-    #: declared an approval requirement at all (the investigator always
-    #: sets `control.requires_human_approval: True`; the incident responder
-    #: never writes a `control` block). `unrunnable` already covers "control
-    #: present, approval missing"; this covers the other half the sweep's
-    #: stranding predicate needs — "control absent" is a write-time default
-    #: meaning "approval not required" (proposal_state.human_approval_satisfied),
-    #: not a submission-time fact that a human (or a recognised auto-accept
-    #: path) ever put this proposal in `accepted`.
-    has_control_block: bool = False
-    #: `data.get("updated_by")` — the actor that wrote the current
-    #: `.status.yaml`. Read only by the stranding predicate, to recognise the
-    #: incident responder's own auto-accept provenance when `has_control_block`
-    #: is False (mctl-agents#412).
-    updated_by: str | None = None
+    #: `proposal_state.execution_authorization(data)` — what explicitly
+    #: authorizes executing this proposal, or None when nothing does. None is
+    #: the fail-closed default and the shape all 69 legacy `incident-*`
+    #: records carry: no `control` block, no `approval`, written by an agent's
+    #: own auto-accept. `unrunnable` covers the neighbouring case (a control
+    #: block that DEMANDS approval and has none); this covers the one that
+    #: demands nothing, which is not the same fact as being authorised
+    #: (mctl-agents#412, the 2026-09-19 product decision).
+    #:
+    #: Note what is deliberately NOT here: `updated_by`. Who wrote a record is
+    #: not authorization to execute it, so the sweep is not given the field it
+    #: would need to build a writer allowlist out of.
+    execution_authorization: str | None = None
 
 
 @dataclass(frozen=True)
@@ -170,19 +168,18 @@ def _cache_put(sha: str, value: _ParsedStatus) -> None:
 
 def _parse_status_yaml(text: str) -> _ParsedStatus:
     """Return (status, pr_url, updated_at, attempt_expires_at, unrunnable,
-    blocked, has_control_block, updated_by) from a .status.yaml body.
+    blocked, execution_authorization) from a .status.yaml body.
 
     Mirrors run_shepherd._load_status: flat YAML written by the
     investigator, defaulting to "proposed" the way _discover_refs does.
 
-    The last six are read once here, alongside status/pr_url, rather than
+    The last five are read once here, alongside status/pr_url, rather than
     via a second parse of the same blob: they exist for the implement-sweep's
     stranding predicate (mctl-agents#412), which needs to tell an `accepted`
     proposal a live implementer run still holds (`attempt`) or that can never
     run as written (`unrunnable`/`blocked`) from one a DevLoopWorkflow simply
-    has not reached yet — and, separately, needs `has_control_block` /
-    `updated_by` to tell "approval was never required" (write-time default)
-    from "a human, or a recognised auto-accept path, actually approved this".
+    has not reached yet — and, separately, needs `execution_authorization` to
+    tell "nothing ever authorised executing this" from "a human did".
     """
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
@@ -194,8 +191,7 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
     attempt_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
     unrunnable = unrunnable_reason(data) is not None
     blocked = bool(data.get("blocked"))
-    has_control_block = data.get("control") is not None
-    updated_by = data.get("updated_by")
+    authorization = execution_authorization(data)
     return (
         status,
         str(pr) if pr else None,
@@ -203,8 +199,7 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
         str(attempt_expires_at) if attempt_expires_at else None,
         unrunnable,
         blocked,
-        has_control_block,
-        str(updated_by) if updated_by else None,
+        authorization,
     )
 
 
@@ -325,8 +320,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                         attempt_expires_at,
                         unrunnable,
                         blocked,
-                        has_control_block,
-                        updated_by,
+                        authorization,
                     ) = await _read_blob(client, sha, token)
                 except (ValueError, yaml.YAMLError) as exc:
                     # One unparseable status file must not blind the sweep to
@@ -347,8 +341,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                 attempt_expires_at=attempt_expires_at,
                 unrunnable=unrunnable,
                 blocked=blocked,
-                has_control_block=has_control_block,
-                updated_by=updated_by,
+                execution_authorization=authorization,
             )
 
         results = await _gather_or_raise([one(s, g, sha) for s, g, sha in paths])

@@ -12,6 +12,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from temporalio.testing import ActivityEnvironment
 
+from orchestrator.proposal_state import (
+    AUTHORIZATION_HUMAN_APPROVAL,
+    UNAUTHORIZED_LEGACY_AUTO_ACCEPTED,
+)
 from orchestrator.temporal.activities import stranded as act
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef
 
@@ -38,12 +42,11 @@ def _ref(service="mctl-web", slug="issue-10-widget", **overrides) -> ProposalSta
         attempt_expires_at=None,
         unrunnable=False,
         blocked=False,
-        # Default fixture models the normal investigator-created proposal,
-        # which always writes `control.requires_human_approval: True`
-        # (run_issue_investigator.py) — the no-control-block path is
-        # exercised explicitly by TestApprovalProvenance below.
-        has_control_block=True,
-        updated_by=None,
+        # Default fixture models a proposal a human actually approved —
+        # `approval.approved_by: <a real login>`, which is the only thing that
+        # authorizes execution today. The unauthorized path is exercised
+        # explicitly by TestExecutionAuthorization below.
+        execution_authorization=AUTHORIZATION_HUMAN_APPROVAL,
     )
     base.update(overrides)
     return ProposalStateRef(**base)
@@ -186,10 +189,21 @@ class TestSkipFilters:
 
 
 class TestIncidentSlugs:
-    async def test_an_incident_slug_is_swept(self, env, monkeypatch):
-        """incident-* never had a DevLoop (expected_dev_loop_id is None), so
-        it is exactly the permanently-stranded case the incident responder's
-        auto-accepted proposals fall into."""
+    async def test_a_legacy_incident_record_is_quarantined_not_swept(self, env, monkeypatch):
+        """The 69 legacy `incident-*` proposals, as they actually exist.
+
+        `incident-*` never had a DevLoop (`expected_dev_loop_id` is None), so
+        every other filter passes it straight through — it IS the permanently
+        stranded shape. What stops it is authorization: the incident
+        responder's template writes `status: accepted` with no `control` block
+        and no `approval`, so nothing ever authorized executing it.
+
+        This test asserted the opposite one commit ago. The 2026-09-19 product
+        decision on #412 settled it: provenance of who created an
+        auto-accepted record is not human authorization to execute it, these
+        69 are diagnostic artifacts, and they belong in human triage rather
+        than in 69 implementer runs on the first tick.
+        """
         result = await _run(
             env,
             monkeypatch,
@@ -197,46 +211,113 @@ class TestIncidentSlugs:
                 _ref(
                     service="mctl-web",
                     slug="incident-2026-09-19-outage",
-                    has_control_block=False,
-                    updated_by="_incident-responder",
+                    execution_authorization=None,
                 )
             ],
             active=["dev-loop-mctlhq-mctl-web-10"],
         )
 
+        assert result.stranded == [], "a legacy incident record must never be submitted"
+        assert result.unauthorized == [
+            ("mctl-web/incident-2026-09-19-outage", UNAUTHORIZED_LEGACY_AUTO_ACCEPTED)
+        ]
+
+    async def test_an_incident_record_a_human_approved_is_swept(self, env, monkeypatch):
+        """Quarantine is about authorization, not about the slug.
+
+        An `incident-*` record that a human HAS approved carries real
+        authorization and must still be swept — otherwise the fix for the 69
+        would silently become a permanent ban on the whole incident path.
+        """
+        result = await _run(
+            env,
+            monkeypatch,
+            [_ref(slug="incident-2026-09-19-outage",
+                  execution_authorization=AUTHORIZATION_HUMAN_APPROVAL)],
+        )
+
         assert len(result.stranded) == 1
-        assert result.stranded[0].slug == "incident-2026-09-19-outage"
+        assert result.unauthorized == []
 
 
-class TestApprovalProvenance:
-    """mctl-agents#412 review, P1: an absent `control` block means "approval
-    was never required" (proposal_state.human_approval_satisfied's write-time
-    default), not "a human approved this". Only a recognised auto-accept
-    writer may skip straight through with no control block."""
+class TestExecutionAuthorization:
+    """mctl-agents#412, the 2026-09-19 product decision.
 
-    async def test_no_control_block_and_an_unrecognised_writer_is_skipped(self, env, monkeypatch):
-        result = await _run(
-            env,
-            monkeypatch,
-            [_ref(has_control_block=False, updated_by="someone-unexpected")],
-        )
+    The sweep submits execution on records nobody is watching, so it fails
+    closed: missing `control`/`approval` metadata must never read as "approval
+    not required" here, and a writer allowlist is not an acceptable stand-in
+    for authorization.
+    """
 
-        assert result.stranded == []
-        key, reason = result.skipped[0]
-        assert key == "mctl-web/issue-10-widget"
-        assert "control block" in reason
-
-    async def test_no_control_block_and_no_writer_at_all_is_skipped(self, env, monkeypatch):
-        result = await _run(
-            env,
-            monkeypatch,
-            [_ref(has_control_block=False, updated_by=None)],
-        )
+    async def test_no_authorization_at_all_is_quarantined(self, env, monkeypatch):
+        result = await _run(env, monkeypatch, [_ref(execution_authorization=None)])
 
         assert result.stranded == []
         key, reason = result.skipped[0]
         assert key == "mctl-web/issue-10-widget"
-        assert "control block" in reason
+        assert UNAUTHORIZED_LEGACY_AUTO_ACCEPTED in reason
+        assert result.unauthorized == [
+            ("mctl-web/issue-10-widget", UNAUTHORIZED_LEGACY_AUTO_ACCEPTED)
+        ]
+
+    async def test_the_scan_has_no_field_to_build_a_writer_allowlist_from(self):
+        """The rejected mechanism is gone, not merely unused.
+
+        `updated_by` was threaded all the way from `_parse_status_yaml` into
+        `ProposalStateRef` for the sole purpose of trusting one writer. Keeping
+        the field would leave the allowlist one line away from coming back, so
+        the field itself is removed and this pins that.
+        """
+        from dataclasses import fields
+
+        names = {f.name for f in fields(ProposalStateRef)}
+        assert "updated_by" not in names
+        assert "has_control_block" not in names
+        assert "execution_authorization" in names
+
+    async def test_a_quarantined_record_does_not_block_an_authorized_one(
+        self, env, monkeypatch
+    ):
+        """The quarantine skips its own record and nothing else."""
+        result = await _run(
+            env,
+            monkeypatch,
+            [
+                _ref(service="mctl-web", slug="incident-a", execution_authorization=None),
+                _ref(service="mctl-web", slug="issue-2-b"),
+                _ref(service="mctl-api", slug="incident-c", execution_authorization=None),
+            ],
+        )
+
+        assert [p.slug for p in result.stranded] == ["issue-2-b"]
+        assert len(result.unauthorized) == 2
+        assert result.total_accepted == 3
+
+
+class TestTimestampParsing:
+    async def test_an_offset_less_timestamp_is_read_as_utc_not_a_crash(
+        self, env, monkeypatch
+    ):
+        """`_parse_iso`'s naive branch: every other fixture goes through
+        `_iso()`, which always emits a `Z`, so the branch that assumes UTC for
+        a hand-edited offset-less timestamp was never executed (review P3).
+        Comparing a naive datetime against the aware `now` raises TypeError,
+        which would take the whole scan down over one `.status.yaml`."""
+        naive_recent = (NOW - timedelta(minutes=1)).replace(tzinfo=None).isoformat()
+        result = await _run(env, monkeypatch, [_ref(updated_at=naive_recent)])
+
+        assert result.stranded == []
+        assert "grace period" in result.skipped[0][1], (
+            "read as UTC, this timestamp is inside the grace window"
+        )
+
+    async def test_an_unparseable_timestamp_is_treated_as_absent(self, env, monkeypatch):
+        result = await _run(env, monkeypatch, [_ref(updated_at="yesterday-ish")])
+
+        assert len(result.stranded) == 1, (
+            "an unparseable timestamp must not take the scan down, and must "
+            "not silently hold a proposal in the grace period forever"
+        )
 
 
 class TestManyProposals:

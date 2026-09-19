@@ -163,7 +163,7 @@ flowchart LR
     INC --> I["submit_and_wait('mctl-agents-incidents')<br/>SDK работает в Argo, не в воркере (agents#179)"]
 
     S4["schedule 15m, offset 12<br/>создаётся unpaused (#412)"] --> SWEEP["ImplementSweepWorkflow"]
-    SWEEP --> ST["find_stranded_accepted<br/>accepted, без pr:, без live DevLoopWorkflow,<br/>без свежего attempt, не unrunnable/blocked,<br/>вне грейс-периода updated_at → STRANDED"]
+    SWEEP --> ST["find_stranded_accepted<br/>accepted, без pr:, без live DevLoopWorkflow,<br/>без свежего attempt, не unrunnable/blocked,<br/>с явной execution authorization,<br/>вне грейс-периода updated_at → STRANDED"]
     SWEEP --> CH["start_child_workflow(SweptImplementWorkflow)<br/>до IMPLEMENT_SWEEP_MAX_SUBMITS за тик, ABANDON"]
     CH --> SUB2["submit_and_wait('mctl-agents-implement')<br/>{service, slug} на admission-очередь"]
 ```
@@ -201,3 +201,32 @@ flowchart LR
   независимо от того, был он сабмичен, отброшен грейс-периодом/лизой/cap'ом.
   `cronworkflow-mctl-agents-implement` (Argo, `*/5`) остаётся suspended —
   замена, а не временная приостановка.
+- **Свип fail-closed по авторизации исполнения (продуктовое решение 19.09.2026
+  по agents#412).** Свип сабмитит исполнение по записям, за которыми никто не
+  следит, поэтому он требует явной авторизации:
+  `proposal_state.execution_authorization` — сегодня это только проверенное
+  человеческое одобрение (`approval.approved_by`, не анонимное). Отсутствие
+  `control` / `approval` здесь **никогда** не читается как «одобрение не
+  требуется», хотя на стороне записи `human_approval_satisfied` именно так и
+  трактует отсутствующий `control` блок: это два разных вопроса. Провенанс
+  автора записи (`updated_by`) авторизацией не является — allowlist писателей
+  был отвергнут явно, и само поле из `ProposalStateRef` убрано, чтобы его
+  нельзя было собрать заново. 69 legacy-записей `incident-*`, лежащих в
+  `accepted` с августа, — ровно эта форма: они карантинируются от исполнения,
+  их requirements/design/tasks сохраняются нетронутыми, а сами они попадают в
+  `ImplementSweepResult.unauthorized` для человеческого разбора.
+  Второй путь авторизации — отдельно определяемая явная autonomy policy —
+  пока не определён (`AUTHORIZATION_AUTONOMY_POLICY` зарезервирован под неё).
+- **Бюджет pre-start попыток.** `MAX_SWEEP_PRESTART_ATTEMPTS` ограничивает
+  повторные сабмиты по одному и тому же child id, и считается **только** по
+  исходу `pre_start` — единственному, который не двигает ни одного поля
+  `.status.yaml`, поэтому ничто другое не убирает предложение из набора
+  кандидатов следующего тика. Visibility не умеет фильтровать по
+  `ApplicationError.type`, поэтому `SweptImplementWorkflow` штампует
+  классифицированный исход в memo (`mctl_sweep_outcome`) перед тем, как упасть,
+  а `count_swept_implement_failures` читает его обратно. Исчерпание бюджета
+  видно в `ImplementSweepResult.over_budget`, а не только в логе. Известное
+  ограничение, названное прямо: бюджет живёт в Temporal visibility, которая
+  сбрасывается вместе с retention-окном, — durable-маркер требует записи в
+  `.status.yaml`, пути к которой у Temporal-воркера сегодня нет (все записи
+  `needs-triage` живут в `run_shepherd`, на стороне CWFT).
