@@ -32,8 +32,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Modules that mean "an agent runs here". claude_agent_sdk is the SDK
 # itself; the two run_* modules are the coding agents that drive it and
-# that carry their own subprocess/credential machinery.
-FORBIDDEN_IN_WORKER = ("claude_agent_sdk", "orchestrator.run_implementer")
+# that carry their own subprocess/credential machinery. orchestrator.auth
+# has a module-level load_dotenv() and reads credential env vars directly
+# (see agents#364, orchestrator/rate_limit.py's account_label(), which
+# imports it lazily specifically to keep it out of this list) -- it must
+# never be reachable from the worker's import graph at module scope.
+FORBIDDEN_IN_WORKER = ("claude_agent_sdk", "orchestrator.run_implementer", "orchestrator.auth")
 
 
 def _modules_imported_by(module: str) -> set[str]:
@@ -73,10 +77,17 @@ def test_the_guard_can_actually_see_the_sdk():
 
     Without this, deleting the SDK from the environment — or a typo in the
     module name above — would turn the real test into a silent pass.
+
+    orchestrator.run_implementer also imports orchestrator.auth at module
+    scope (`from orchestrator.auth import ensure_auth_for_sdk`), so the same
+    probe doubles as the control for that entry in FORBIDDEN_IN_WORKER: it
+    proves the guard can actually see orchestrator.auth too, not just the
+    SDK, before either matters to `test_the_worker_does_not_import_the_agent_stack`.
     """
     loaded = _modules_imported_by("orchestrator.run_implementer")
 
     assert "claude_agent_sdk" in loaded
+    assert "orchestrator.auth" in loaded
 
 
 def test_subagent_wait_is_importable_by_the_worker():
