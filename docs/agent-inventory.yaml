@@ -85,6 +85,16 @@ agents:
       # changing its version — pinned per run by the target git SHA instead.
       - targetRepo: CLAUDE.md
       - targetRepo: source tree (Glob/Grep/Read to ground the design)
+      # mctlhq/mctl-agents#265, ADR 009 follow-up row (a):
+      # orchestrator/context_assembly.py assembles and seals a ContextSnapshot
+      # of these inputs (github-issue, github-issue-comment, target-repo,
+      # proposal-dir, inline-template) — gated by ISSUE_INVESTIGATOR_CONTEXT_MODE
+      # (default off; no collector runs and no snapshot is sealed unless it is
+      # "shadow" or "on"). Recorded here, not in promptSources above, for the
+      # same reason CLAUDE.md is: real prompt/context surface that resolves
+      # per run against the target repo/issue, not fixed at publish time.
+      - targetRepo: issue comments (github-issue-comment, via the same `gh issue view --json` call)
+      - targetRepo: prior proposal triplet, when re-investigating (proposal-dir)
     modelPolicyTask: service_agent
     budgetEnv: ISSUE_INVESTIGATOR_BUDGET_USD   # default 3.00
     sandbox:
