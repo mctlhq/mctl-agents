@@ -254,12 +254,20 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
         # finds the node map gone reports unknown for a pod the loop
         # watched start, and the finalization/execution distinction is lost
         # exactly when a worker restart makes it hardest to reconstruct.
+        #
+        # Keyed on the phase, not on the timestamp: `running` is written
+        # only where a pod was observed to have run, while the timestamp
+        # beside it is whatever Argo had on the node and can legitimately
+        # be absent. Keying on the timestamp would drop the seed for a pod
+        # that ran without a recorded `startedAt` — the reverse of what
+        # this is for. `.get` because a projection restored from an older
+        # or partial detail need not carry every key.
         best: ImplementerObservation | None = None
-        if is_implement and runtime["phase"] == PHASE_RUNNING:
+        if is_implement and runtime.get("phase") == PHASE_RUNNING:
             best = ImplementerObservation(
                 ran=True,
                 phase=None,
-                started_at=runtime["implementer_started_at"],
+                started_at=runtime.get("implementer_started_at"),
                 finalization_phase=None,
             )
         while True:
