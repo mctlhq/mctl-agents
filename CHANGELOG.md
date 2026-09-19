@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.47.0](https://github.com/mctlhq/mctl-agents/compare/1.46.0...1.47.0) (2026-09-19)
+
+
+### Features
+
+* **agents:** issue-352-feat-lifecycle-ownership-add-executor-cl ([2ec3d26](https://github.com/mctlhq/mctl-agents/commit/2ec3d2663a6771ebdca720702630b934f722ff45))
+* **lifecycle-ownership:** reconcile orphaned, stale and conflicting entity owners ([d1c2063](https://github.com/mctlhq/mctl-agents/commit/d1c2063d1e59cd426cf60e0a43befe8dd7593f63))
+* **lifecycle-ownership:** reconcile orphaned, stale and conflicting owners ([12982ca](https://github.com/mctlhq/mctl-agents/commit/12982caa46a215a32b31d9ebd1a9f699221bbf21)), closes [#353](https://github.com/mctlhq/mctl-agents/issues/353)
+* **lifecycle:** add ExecutionClaim, epoch fencing and handoff ([b64b35b](https://github.com/mctlhq/mctl-agents/commit/b64b35b0ba59035f6997289658016f58025d8513))
+* **temporal:** implementation task queue and worker role, routing untouched ([90bd524](https://github.com/mctlhq/mctl-agents/commit/90bd5242a5869f2066aeb1b46d4e5d76a479f93e))
+* **temporal:** implementation task queue and worker role, routing untouched ([c4b6907](https://github.com/mctlhq/mctl-agents/commit/c4b690728493687f2a39d20d0971787631cc189f))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-352-feat-lifecycle-ownership-add-executor-cl ([ddcdb0e](https://github.com/mctlhq/mctl-agents/commit/ddcdb0e6e198954471d49a067a9630ecd7505a8d))
+* **dev-loop:** never tick the shepherd on poll 1 ([451a66b](https://github.com/mctlhq/mctl-agents/commit/451a66bce8733634ee3742ba7183041bf4a32d7b))
+* **dev-loop:** tick the in-loop shepherd every 15 min, not every 4 h ([2433366](https://github.com/mctlhq/mctl-agents/commit/2433366fd20ed52649a42e4598b78683e52474f8))
+* **dev-loop:** tick the in-loop shepherd every 15 min, not every 4 h ([f0c9c62](https://github.com/mctlhq/mctl-agents/commit/f0c9c62555ca59891eaaa4ca90843432cf566a62)), closes [#213](https://github.com/mctlhq/mctl-agents/issues/213)
+* **lifecycle-reconcile:** an unreadable PR is not a finished one ([2feea77](https://github.com/mctlhq/mctl-agents/commit/2feea775dc60273133155e9f46f3afe78df288a4))
+* **lifecycle-reconcile:** stop reading a PR for every proposal each tick ([1d28d32](https://github.com/mctlhq/mctl-agents/commit/1d28d32e1952f0eaa54fe0ba04883babdf0e6dc5))
+* **lifecycle-reconcile:** the P1, the two P2s and the three P3s from review ([3de572b](https://github.com/mctlhq/mctl-agents/commit/3de572b4023dd05ebb9ee4d9ab2baf732616b153))
+* **lifecycle:** accept a recordless 2xx renew and mark the retake in logs ([b362b5e](https://github.com/mctlhq/mctl-agents/commit/b362b5eb71b7043e0b79ecbbd9db66b814773bcb))
+* **lifecycle:** charge the budget and split the refusal by verdict ([af661d7](https://github.com/mctlhq/mctl-agents/commit/af661d74c8d7aae9734688114c071cc4135185eb))
+* **lifecycle:** close the review round on the phase 2 claim wiring ([31232dc](https://github.com/mctlhq/mctl-agents/commit/31232dc00ae86164bfa3751da8adda34ae9f0611))
+* **lifecycle:** hand a proposal back only where the store proves it is free ([0808376](https://github.com/mctlhq/mctl-agents/commit/08083762ab5aabf0ae550a96b1d60c391198c98a))
+* **lifecycle:** log a fenced release as fenced, not released ([61be855](https://github.com/mctlhq/mctl-agents/commit/61be8559bd9cf6c3003c85b02e528b0ba6f607b9))
+* **lifecycle:** log the claim id a recordless outcome was addressed with ([3b4b724](https://github.com/mctlhq/mctl-agents/commit/3b4b7242390dd5bfeed311b199539135880e419c))
+* **lifecycle:** make the attempt compare-and-swap cover the fence arm too ([8ac2080](https://github.com/mctlhq/mctl-agents/commit/8ac2080d41efb13d856e7b40d2b6047a26005316))
+* **lifecycle:** make the renew acknowledgement guard an allow-list ([965f2f0](https://github.com/mctlhq/mctl-agents/commit/965f2f071c5aa3fd106207d9558b5505ee1669e0))
+* **lifecycle:** name what a claim check refused, and never report an outage as a rival ([d5e2a48](https://github.com/mctlhq/mctl-agents/commit/d5e2a483f5308df6c5ff7cd57856636eb071f95c))
+* **lifecycle:** narrow the recordless-renew branch and clamp lease overrides ([f4d0dec](https://github.com/mctlhq/mctl-agents/commit/f4d0deceec6c9646b4932c74ebb2b491a2de2361))
+* **lifecycle:** read a 409 that names this attempt as our own claim ([6794aad](https://github.com/mctlhq/mctl-agents/commit/6794aad0c76cd67da56ba4db92f74e19409470db)), closes [#352](https://github.com/mctlhq/mctl-agents/issues/352)
+* **lifecycle:** renew the claim a 409 retake adopts, and log it renewed ([0af3b38](https://github.com/mctlhq/mctl-agents/commit/0af3b38c8179282870a715f1fc77991a6ea16dae)), closes [#352](https://github.com/mctlhq/mctl-agents/issues/352)
+* **lifecycle:** report each refused claim verdict as itself ([c29195c](https://github.com/mctlhq/mctl-agents/commit/c29195caf4d3c253d694756348c0986ff48bb4d3))
+* **temporal:** read N lazily, merge the harness kwargs, unwind every started worker ([0286957](https://github.com/mctlhq/mctl-agents/commit/0286957229876deb82f53c32446d462ddc004c71))
+
 ## [1.46.0](https://github.com/mctlhq/mctl-agents/compare/1.45.0...1.46.0) (2026-09-14)
 
 
