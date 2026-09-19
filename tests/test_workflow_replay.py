@@ -27,6 +27,17 @@ Measured against these fixtures, on temporalio 1.31.0:
 | `task_queue=` added to an existing activity | invisible |
 | `start_to_close_timeout` changed | invisible |
 | an extra argument added to an existing activity | invisible |
+| a divergence in the LAST recorded workflow task | invisible |
+
+That last row was measured for #395 and is the reason there is no fixture
+here for "a loop that predates `implement-outcome` still completes on a
+failed implement". A history recorded before the marker ends the moment the
+implement fails — completing right there is exactly the old behaviour — so
+the only divergence today's code could produce sits in the final workflow
+task, and replay does not compare it. Verified both ways on temporalio
+1.31.0: the same extra `submit_and_wait` command turns the dev_loop_full
+fixtures red, where it lands mid-history, and replays clean on a history
+that ends at the implement.
 
 Two consequences, both load-bearing:
 
@@ -350,3 +361,4 @@ def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     on_disk = {p.name for p in Path(HISTORY_DIR).glob("*.json")}
     expected = {s.path.name for s in SCENARIOS} | {s.patched_path.name for s in SCENARIOS}
     assert on_disk == expected
+

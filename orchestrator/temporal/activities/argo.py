@@ -41,7 +41,7 @@ import httpx
 from temporalio import activity
 
 from orchestrator.temporal.constants import IMPLEMENTATION_OPERATION
-from orchestrator.temporal.implement_outcome import observe_implementer
+from orchestrator.temporal.implement_outcome import ImplementerObservation, observe_implementer
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -113,6 +113,27 @@ PHASE_RUNNING = "running"
 # fails loudly instead, for manual recovery, which is a strictly better
 # outcome than a silent duplicate.
 _SUBMITTED_UNKNOWN_NAME = "<submitted, workflow name unparseable>"
+
+
+def _merge_observations(
+    best: ImplementerObservation | None, latest: ImplementerObservation
+) -> ImplementerObservation:
+    """Fold a poll's observation into the best one seen so far.
+
+    Only ever adds knowledge. A `ran=True` stays true and keeps the
+    `started_at` and phase that came with it; a later poll that can no
+    longer read the node graph does not erase either.
+    """
+    if best is None:
+        return latest
+    return ImplementerObservation(
+        ran=True if (best.ran or latest.ran) else (None if best.ran is None or latest.ran is None else False),
+        phase=latest.phase if latest.phase is not None else best.phase,
+        started_at=best.started_at if best.started_at is not None else latest.started_at,
+        finalization_phase=(
+            latest.finalization_phase if latest.finalization_phase is not None else best.finalization_phase
+        ),
+    )
 
 
 def _now_iso() -> str:
@@ -212,6 +233,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             activity.heartbeat(workflow_name, dict(runtime))
 
         consecutive_errors = 0
+        best: ImplementerObservation | None = None
         while True:
             # Heartbeat before every poll, not just on change: a stuck
             # mctl-api / cluster makes this loop spin on the `continue`
@@ -252,6 +274,17 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             phase = status_block.get("phase", "")
 
             observation = observe_implementer(status_block) if is_implement else None
+            if observation is not None:
+                # Remember across polls, because the LAST poll is not always
+                # the best-informed one: Argo can offload or prune
+                # `status.nodes` by the time a workflow goes terminal, and
+                # observe_implementer then reports unknown for a pod this
+                # loop already watched run. Keeping what was seen preserves
+                # the execution/finalization distinction the recovery plane
+                # (#353) keys on. `ran` is sticky one way only — a pod that
+                # ran cannot come to have not run — and the rest is kept
+                # from the last poll that could see it.
+                best = _merge_observations(best, observation)
             if observation is not None and observation.ran and runtime["phase"] != PHASE_RUNNING:
                 # The attempt begins HERE — when a pod is known to have run —
                 # not at approval, not at admission, not at Argo accepting
@@ -273,10 +306,10 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
                     phase=phase,
                     started_at=status_block.get("startedAt"),
                     finished_at=status_block.get("finishedAt"),
-                    implementer_ran=observation.ran if observation else None,
-                    implementer_phase=observation.phase if observation else None,
-                    implementer_started_at=observation.started_at if observation else None,
-                    finalization_phase=observation.finalization_phase if observation else None,
+                    implementer_ran=best.ran if best else None,
+                    implementer_phase=best.phase if best else None,
+                    implementer_started_at=best.started_at if best else None,
+                    finalization_phase=best.finalization_phase if best else None,
                 )
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)

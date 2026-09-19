@@ -1898,6 +1898,40 @@ class TestSubmitAndWaitObservesTheImplementer:
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
         assert result.implementer_ran is True
 
+    async def test_an_observation_survives_a_terminal_poll_that_lost_the_graph(self, env, monkeypatch):
+        """The last poll is not always the best-informed one.
+
+        Argo can offload or prune `status.nodes` by the time the workflow
+        goes terminal, and reporting only that poll would throw away a pod
+        this loop watched run — turning a finalization failure into a plain
+        execution failure, which is the pair #353 exists to tell apart.
+        """
+        ran = _node("run-implementer", "Succeeded", ran=True)
+        ran["startedAt"] = "2026-09-19T01:02:00Z"
+        commit = _node("commit-and-push", "Failed", ran=True)
+        polls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "mctl-agents-implement-0eaa9853"}})
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return httpx.Response(200, json=_implement_status("Running", {"a": ran, "b": commit}))
+            # Terminal, with the node map gone.
+            return httpx.Response(200, json=_implement_status("Failed", {}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is True
+        assert result.implementer_phase == "Succeeded"
+        assert result.implementer_started_at == "2026-09-19T01:02:00Z"
+        assert result.finalization_phase == "Failed"
+
     async def test_other_operations_do_not_observe_nodes(self, env, monkeypatch):
         nodes = {"a": _node("run-implementer", "Succeeded", ran=True)}
         self._run(env, monkeypatch, "Succeeded", nodes, operation="mctl-agents-investigate")

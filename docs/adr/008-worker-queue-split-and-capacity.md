@@ -272,6 +272,19 @@ finalization  the pod succeeded, commit/assert    → workflow FAILS, Implementa
 success       the pod ran and committed           → the loop continues to merge detection
 ```
 
+One honest limit of the rollout, measured rather than assumed: nothing in
+CI proves that a loop already running when `implement-outcome` deploys
+still completes on a failed implement. A history recorded before the
+marker ENDS at that failure — completing there is the old behaviour — so
+the only divergence today's code could produce sits in the final workflow
+task, and the replayer does not compare it (the capability table in
+`tests/test_workflow_replay.py` now records this, verified both ways). The
+SDK half of the promise, that an execution which replayed a missing marker
+keeps taking the unpatched branch for life, is covered by
+`tests/test_patch_memoization.py` against a real server. The branch is
+short-lived: once every loop started before the flip has passed
+`MERGE_WATCH_DEADLINE`, the guard and this paragraph go together.
+
 "Ran" is read from the marks a pod leaves on its node (`hostNodeName`, an
 exit code, a Succeeded phase) — never from the node's `startedAt`, which
 Argo stamps at node creation while the node may still be Pending on a

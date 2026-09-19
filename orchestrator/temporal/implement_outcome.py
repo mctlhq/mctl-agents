@@ -161,6 +161,18 @@ def classify(
     the implementer, and resubmitting one that may have run is the
     duplicate-attempt failure the whole resume design exists to prevent;
     a human looking at a Failed loop is the cheaper mistake.
+
+    `finalization` is deliberately "the workflow failed AFTER the
+    implementer succeeded", not "a commit-and-push node reported Failed".
+    It therefore also covers a failing exit handler, a workflow-level
+    deadline that fires past the last step, and a podGC error — none of
+    which touched the implementation. That is the distinction the recovery
+    plane (#353, mctl-api#294) needs from this name: the code was written,
+    so recovery is about the wrap-up and never about re-running the
+    implementer. `finalization_phase` on the observation says which node
+    failed when Argo left one to read, and is carried for the human rather
+    than consulted here, so a missing node graph cannot flip the verdict
+    back onto the implementer.
     """
     if workflow_phase == "Succeeded":
         return "success"
