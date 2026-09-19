@@ -27,6 +27,7 @@ there would cycle.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -254,13 +255,42 @@ def _owned_by_proposal(pr_url: str, known_proposal_pr_urls: frozenset[str]) -> b
     return pr_url in known_proposal_pr_urls
 
 
-def _devloop_free(service: str, slug: str) -> bool:
+def _closing_issue_numbers(node: dict[str, Any]) -> tuple[int, ...]:
+    """Issue numbers off a raw GraphQL PR-list node's ``closingIssuesReferences``
+    (GitHub's own "Closes #N" linkage), when ``_OPEN_PRS_QUERY`` requested it.
+    Absent/malformed data yields ``()`` — the same "never had a DevLoop"
+    answer ``_dev_loop_owns_answer`` already gives a slug with no issue
+    number to check.
+    """
+    raw = ((node.get("closingIssuesReferences") or {}).get("nodes")) or []
+    return tuple(n["number"] for n in raw if isinstance(n, dict) and isinstance(n.get("number"), int))
+
+
+def _devloop_free(
+    service: str, slug: str, closing_issue_numbers: tuple[int, ...] = ()
+) -> bool:
     """True only on a definite "no live DevLoop". Fails CLOSED on
     LEGACY_UNKNOWN — the opposite of the sweep's fail-open default, because
     adoption is discretionary and an unanswerable probe is not evidence of
     vacancy (unlike the sweep, which already owns the work it is checking).
+
+    ``slug`` here is ``slug_for(number)`` ("pr-<n>") — it never matches
+    ``_dev_loop_owns_answer``'s ``issue-(\\d+)-`` probe, so that call alone is
+    structurally a no-op for every adopted PR (mctlhq/mctl-agents#334 code
+    review): the regex short-circuits to LEGACY_FREE before any liveness
+    check runs. ``closing_issue_numbers`` — GitHub's own "Closes #N" linkage
+    off the PR, when the discovery query found any — is the only other data
+    this module has to resolve a proposal-less PR back to the issue a
+    DevLoopWorkflow's id is keyed on. Each linked issue is probed the same
+    way the sweep probes a real proposal slug; any one of them being owned or
+    unanswerable refuses the whole gate.
     """
-    return run_shepherd._dev_loop_owns_answer(service, slug) == run_shepherd.LEGACY_FREE
+    if run_shepherd._dev_loop_owns_answer(service, slug) != run_shepherd.LEGACY_FREE:
+        return False
+    for n in closing_issue_numbers:
+        if run_shepherd._dev_loop_owns_answer(service, f"issue-{n}-adopted-pr") != run_shepherd.LEGACY_FREE:
+            return False
+    return True
 
 
 def _mode_permits(service: str) -> bool:
@@ -305,7 +335,7 @@ def _refusal_reason(
         return "head branch belongs to the implementer's deterministic prefix"
     if _owned_by_proposal(pr_url, known_proposal_pr_urls):
         return "already owned by an existing proposal"
-    if not _devloop_free(service, slug_for(number)):
+    if not _devloop_free(service, slug_for(number), _closing_issue_numbers(node)):
         return "a running DevLoopWorkflow may own this entity (fail-closed)"
     if not _mode_permits(service):
         return "service resolves to SKIP (owned by another PR lifecycle)"
@@ -323,7 +353,8 @@ _OPEN_PRS_QUERY = (
     "query($owner:String!,$repo:String!){repository(owner:$owner,name:$repo)"
     "{pullRequests(states:OPEN,first:50,orderBy:{field:UPDATED_AT,direction:DESC})"
     "{nodes{number headRefOid headRefName isDraft isCrossRepository "
-    "headRepositoryOwner{login} baseRepository{owner{login}}}}}}"
+    "headRepositoryOwner{login} baseRepository{owner{login}} "
+    "closingIssuesReferences(first:5){nodes{number}}}}}}"
 )
 
 
@@ -368,14 +399,15 @@ def _prref_from_data(service: str, entry: Path, data: dict[str, Any]) -> PRRef |
     )
 
 
-def _existing_records(state_dir: Path, repos: frozenset[str]) -> list[PRRef]:
-    """Re-discover non-terminal .prref.yaml records so a record created in an
-    earlier tick keeps its counters — subject to the durability caveat in
-    design.md (adopted-prs/** is not staged back to gitops until
-    mctlhq/mctl-gitops#1278 lands).
+def _iter_prref_data(
+    state_dir: Path, repos: frozenset[str]
+) -> Iterator[tuple[str, Path, dict[str, Any]]]:
+    """Yield ``(service, entry, data)`` for every parseable ``.prref.yaml``
+    under any allowlisted service's ``adopted-prs/``, terminal or not. Shared
+    walk behind ``_existing_records`` (non-terminal only) and
+    ``_all_adopted_pr_urls`` (every record) so the two never drift on what
+    counts as "on disk".
     """
-    accepted_statuses = run_shepherd.SHEPHERD_INPUT_STATUSES | {"adopted"}
-    refs: list[PRRef] = []
     for service in sorted(repos & set(SERVICES)):
         adopted_dir = state_dir / service / ADOPTED_DIRNAME
         if not adopted_dir.is_dir():
@@ -391,12 +423,42 @@ def _existing_records(state_dir: Path, repos: frozenset[str]) -> list[PRRef]:
             except Exception as e:  # noqa: BLE001 — one bad record must not abort discovery
                 print(f"warn: {service}/{entry.name}: failed to parse {PRREF_FILENAME} ({e}); skipping")
                 continue
-            if data.get("status", "adopted") not in accepted_statuses:
-                continue
-            ref = _prref_from_data(service, entry, data)
-            if ref is not None:
-                refs.append(ref)
+            yield service, entry, data
+
+
+def _existing_records(state_dir: Path, repos: frozenset[str]) -> list[PRRef]:
+    """Re-discover non-terminal .prref.yaml records so a record created in an
+    earlier tick keeps its counters — subject to the durability caveat in
+    design.md (adopted-prs/** is not staged back to gitops until
+    mctlhq/mctl-gitops#1278 lands).
+    """
+    accepted_statuses = run_shepherd.SHEPHERD_INPUT_STATUSES | {"adopted"}
+    refs: list[PRRef] = []
+    for service, entry, data in _iter_prref_data(state_dir, repos):
+        if data.get("status", "adopted") not in accepted_statuses:
+            continue
+        ref = _prref_from_data(service, entry, data)
+        if ref is not None:
+            refs.append(ref)
     return refs
+
+
+def _all_adopted_pr_urls(state_dir: Path, repos: frozenset[str]) -> frozenset[str]:
+    """Every ``pr:`` URL recorded under any ``adopted-prs/*/.prref.yaml``,
+    terminal or not.
+
+    ``_existing_records`` filters out terminal records (``review-stuck``,
+    ``merged``, ...) because those no longer need driving — but
+    ``discover_adoptable``'s re-adoption guard must still see them, or a PR a
+    human already parked in ``review-stuck`` gets treated as a brand-new
+    candidate on the very next tick and re-adopted with its counters reset
+    (mctlhq/mctl-agents#334 code review).
+    """
+    return frozenset(
+        data["pr"]
+        for _service, _entry, data in _iter_prref_data(state_dir, repos)
+        if isinstance(data.get("pr"), str) and data["pr"]
+    )
 
 
 def _adopt(
@@ -523,7 +585,9 @@ def discover_adoptable(
         return refs[:cap]
 
     known_proposal_pr_urls = _all_proposal_pr_urls(state_dir)
-    known_pr_urls = {r.pr_url for r in refs if r.pr_url}
+    # Every recorded PR, terminal or not (see _all_adopted_pr_urls) — a
+    # `refs`-only guard would miss a `review-stuck` record and re-adopt it.
+    known_pr_urls = set(_all_adopted_pr_urls(state_dir, repos))
 
     for service in sorted(repos & set(SERVICES)):
         if len(refs) >= cap:

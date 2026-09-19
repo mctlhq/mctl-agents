@@ -258,6 +258,34 @@ def test_devloop_free_true_on_free(monkeypatch) -> None:
     assert pr_adoption._devloop_free("mctl-web", "pr-1") is True
 
 
+def test_devloop_free_checks_closing_issue_numbers(monkeypatch) -> None:
+    """`slug_for(number)` ("pr-<n>") never matches `_dev_loop_owns_answer`'s
+    `issue-(\\d+)-` probe, so the bare-slug check alone is structurally
+    always LEGACY_FREE for an adopted PR (mctlhq/mctl-agents#334 code
+    review). A closing-issue number naming an issue a DevLoopWorkflow owns
+    must still refuse."""
+
+    def fake_answer(service: str, slug: str) -> str:
+        return LEGACY_OWNED if slug.startswith("issue-42-") else LEGACY_FREE
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", fake_answer)
+    assert pr_adoption._devloop_free("mctl-web", "pr-7", (42,)) is False
+
+
+def test_devloop_free_true_when_closing_issues_all_free(monkeypatch) -> None:
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", lambda *a, **kw: LEGACY_FREE)
+    assert pr_adoption._devloop_free("mctl-web", "pr-7", (42, 43)) is True
+
+
+def test_closing_issue_numbers_extracts_from_node() -> None:
+    node = {"closingIssuesReferences": {"nodes": [{"number": 42}, {"number": 43}, {}]}}
+    assert pr_adoption._closing_issue_numbers(node) == (42, 43)
+
+
+def test_closing_issue_numbers_defaults_empty() -> None:
+    assert pr_adoption._closing_issue_numbers({}) == ()
+
+
 def test_mode_permits_false_on_skip(monkeypatch) -> None:
     monkeypatch.setattr(run_shepherd, "_service_mode", lambda service, **kw: run_shepherd.SKIP)
     assert pr_adoption._mode_permits("mctl-gitops") is False
@@ -409,6 +437,24 @@ def test_discover_adoptable_refuses_devloop_owned(tmp_path, monkeypatch) -> None
     assert refs == []
 
 
+def test_discover_adoptable_refuses_devloop_owned_via_closing_issue(tmp_path, monkeypatch) -> None:
+    """`slug_for(number)` never matches `_dev_loop_owns_answer`'s regex, so
+    this candidate would otherwise sail through the DevLoop gate regardless
+    of a live DevLoopWorkflow on its GitHub-linked issue (mctlhq/mctl-agents#334
+    code review). Wired through `_list_open_prs`' `closingIssuesReferences`."""
+    _discover_env(monkeypatch)
+
+    def fake_answer(service: str, slug: str) -> str:
+        return LEGACY_OWNED if slug.startswith("issue-42-") else LEGACY_FREE
+
+    monkeypatch.setattr(run_shepherd, "_dev_loop_owns_answer", fake_answer)
+    node = _node(7)
+    node["closingIssuesReferences"] = {"nodes": [{"number": 42}]}
+    monkeypatch.setattr(pr_adoption, "_list_open_prs", lambda repo: [node])
+    refs = pr_adoption.discover_adoptable(tmp_path)
+    assert refs == []
+
+
 def test_discover_adoptable_refuses_devloop_unknown(tmp_path, monkeypatch) -> None:
     """T3(d): LEGACY_UNKNOWN must also refuse — opposite of the sweep's
     fail-open default."""
@@ -546,6 +592,37 @@ def test_discover_adoptable_skips_terminal_records(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(pr_adoption, "_list_open_prs", lambda repo: [])
     refs = pr_adoption.discover_adoptable(tmp_path)
     assert refs == []
+
+
+def test_discover_adoptable_does_not_readopt_review_stuck_pr(tmp_path, monkeypatch) -> None:
+    """A PR already flipped to the terminal `review-stuck` status must stay
+    put: `_existing_records` (correctly) excludes terminal records from the
+    driven set, but the re-adoption guard still has to see them, or the
+    human-triage terminal state never sticks and the fix loop runs unbounded
+    (mctlhq/mctl-agents#334 code review)."""
+    _discover_env(monkeypatch)
+    path = pr_adoption.record_dir(tmp_path, "mctl-web", 7) / pr_adoption.PRREF_FILENAME
+    pr_adoption.write_prref(
+        path, "review-stuck",
+        kind=pr_adoption.PRREF_KIND, repo="mctlhq/mctl-web", number=7,
+        pr="https://github.com/mctlhq/mctl-web/pull/7", head_sha=HEAD_SHA,
+        head_branch="chore/manual", owner_type="shepherd",
+        review_attempts=5, harness_failures=0, refusals=0,
+    )
+    before = path.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        pr_adoption, "_list_open_prs", lambda repo: [_node(7, head_branch="chore/manual")],
+    )
+    monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", lambda repo, number: make_pr(number=number, repo=repo))
+    monkeypatch.setattr(
+        run_shepherd, "read_codex_review",
+        lambda pr: run_shepherd.CodexReview(has_responded=True, findings=[make_finding()]),
+    )
+
+    refs = pr_adoption.discover_adoptable(tmp_path)
+
+    assert refs == []
+    assert path.read_text(encoding="utf-8") == before
 
 
 # ---------------------------------------------------------------------------
