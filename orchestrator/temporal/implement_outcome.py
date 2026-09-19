@@ -36,7 +36,10 @@ IMPLEMENTER_TEMPLATE = "run-implementer"
 FINALIZATION_TEMPLATES = frozenset({"commit-and-push", "assert-attempt"})
 
 FailureClass = Literal["pre_start", "execution", "finalization"]
-Outcome = Literal["success", "pre_start", "execution", "finalization"]
+# Derived, not spelled out a second time: two independent literals drift,
+# and the one that would drift silently is the one the error types are
+# built from.
+Outcome = Literal["success"] | FailureClass
 
 
 @dataclass(frozen=True)
@@ -154,6 +157,7 @@ def classify(
     *,
     implementer_ran: bool | None,
     implementer_phase: str | None,
+    finalization_phase: str | None = None,
 ) -> Outcome:
     """The decision `DevLoopWorkflow` makes after an implement submit.
 
@@ -169,10 +173,19 @@ def classify(
     which touched the implementation. That is the distinction the recovery
     plane (#353, mctl-api#294) needs from this name: the code was written,
     so recovery is about the wrap-up and never about re-running the
-    implementer. `finalization_phase` on the observation says which node
-    failed when Argo left one to read, and is carried for the human rather
-    than consulted here, so a missing node graph cannot flip the verdict
-    back onto the implementer.
+    implementer.
+
+    `finalization_phase` sharpens the message through
+    `finalization_evidence` when Argo left a node to read, and deliberately
+    does NOT move the verdict to `execution` when it is clean or missing.
+    The two defaults fail in opposite directions and are not equally
+    priced: calling it `finalization` when nothing visibly failed sends
+    recovery looking for a commit that already exists, which is a read;
+    calling it `execution` when the implementer in fact succeeded invites
+    recovery to run the implementer again, which is the duplicate attempt
+    this design exists to prevent. A missing node graph — routine once Argo
+    offloads or prunes `status.nodes` — would take that second branch every
+    time.
     """
     if workflow_phase == "Succeeded":
         return "success"
@@ -181,3 +194,22 @@ def classify(
     if implementer_ran and implementer_phase == "Succeeded":
         return "finalization"
     return "execution"
+
+
+def finalization_evidence(finalization_phase: str | None) -> str:
+    """How a `finalization` verdict was reached, for the human and #353.
+
+    The verdict says the implementation happened and the wrap-up did not
+    finish. This says whether Argo showed a failed finalization node or
+    whether the failure is past the last step it left behind — an exit
+    handler, a workflow deadline, a terminate — so recovery knows whether
+    to expect a missing commit or a complete one.
+    """
+    if finalization_phase in {"Failed", "Error"}:
+        return f"the commit/assert step reported {finalization_phase}"
+    if finalization_phase is None:
+        return "no finalization node was readable, so the failure is somewhere after the implementer"
+    return (
+        f"the finalization steps reported {finalization_phase}, so the failure is past them "
+        "(exit handler, workflow deadline or terminate) and the commit may well exist"
+    )

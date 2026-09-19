@@ -80,7 +80,7 @@ with workflow.unsafe.imports_passed_through():
         IMPLEMENTATION_OPERATION,
         IMPLEMENTATION_TASK_QUEUE,
     )
-    from orchestrator.temporal.implement_outcome import Outcome, classify
+    from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
     from orchestrator.temporal.issue_ref import parse_issue_url
 
 ENVIRONMENT = "production"
@@ -1126,6 +1126,7 @@ class DevLoopWorkflow:
                 result.phase,
                 implementer_ran=result.implementer_ran,
                 implementer_phase=result.implementer_phase,
+                finalization_phase=result.finalization_phase,
             )
             self._implement_state = dataclasses.replace(self._implement_state, outcome=outcome)
 
@@ -1153,7 +1154,12 @@ class DevLoopWorkflow:
             raise ApplicationError(
                 f"implementation of {target_repo} ended {result.phase} ({outcome}) in Argo "
                 f"workflow {result.workflow_name}"
-                + (f" after {requeues} pre-start requeues" if requeues else ""),
+                + (f" after {requeues} pre-start requeues" if requeues else "")
+                + (
+                    f": {finalization_evidence(result.finalization_phase)}"
+                    if outcome == "finalization"
+                    else ""
+                ),
                 result,
                 type=error_type,
                 non_retryable=True,

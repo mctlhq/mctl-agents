@@ -120,14 +120,28 @@ def _merge_observations(
 ) -> ImplementerObservation:
     """Fold a poll's observation into the best one seen so far.
 
-    Only ever adds knowledge. A `ran=True` stays true and keeps the
-    `started_at` and phase that came with it; a later poll that can no
-    longer read the node graph does not erase either.
+    `ran=True` is sticky and keeps the `started_at` and phase that came
+    with it; below that, the newest readable answer wins and unknown never
+    outranks a definite one in either direction.
     """
     if best is None:
         return latest
+    if best.ran is True or latest.ran is True:
+        # A pod that ran cannot come to have not run.
+        ran: bool | None = True
+    elif latest.ran is not None:
+        # The newest READABLE graph wins over an older one and over an
+        # unreadable newer one. Unknown must not be sticky: the first poll
+        # of a fresh workflow routinely sees no node map at all, and
+        # letting that `None` outrank the definite `False` that arrives
+        # once the node appears would classify every implementer killed
+        # while Pending as an execution failure — the 2026-09-19 shape,
+        # which is exactly the one that has to requeue.
+        ran = latest.ran
+    else:
+        ran = best.ran
     return ImplementerObservation(
-        ran=True if (best.ran or latest.ran) else (None if best.ran is None or latest.ran is None else False),
+        ran=ran,
         phase=latest.phase if latest.phase is not None else best.phase,
         started_at=best.started_at if best.started_at is not None else latest.started_at,
         finalization_phase=(

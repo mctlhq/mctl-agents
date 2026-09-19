@@ -1932,6 +1932,58 @@ class TestSubmitAndWaitObservesTheImplementer:
         assert result.implementer_started_at == "2026-09-19T01:02:00Z"
         assert result.finalization_phase == "Failed"
 
+    async def test_an_empty_first_poll_does_not_outrank_a_later_definite_answer(self, env, monkeypatch):
+        """The 2026-09-19 shape, polled the way it actually arrives.
+
+        A freshly submitted workflow has no node map yet, which is unknown
+        — and unknown must not stick, or the deadline-killed Pending node
+        that appears a poll later is never seen and the loop fails as an
+        execution failure instead of requeueing.
+        """
+        pending = _node("run-implementer", "Failed", ran=False)
+        polls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "mctl-agents-implement-0eaa9853"}})
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return httpx.Response(200, json=_implement_status("Running", {}))
+            return httpx.Response(200, json=_implement_status("Failed", {"a": pending}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is False
+
+    async def test_a_definite_no_run_survives_a_terminal_poll_that_lost_the_graph(self, env, monkeypatch):
+        """The same rule in the other direction: the last readable graph
+        said no pod ever ran, and a terminal poll that can no longer read
+        it adds nothing, so the verdict stays requeueable."""
+        pending = _node("run-implementer", "Failed", ran=False)
+        polls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "mctl-agents-implement-0eaa9853"}})
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return httpx.Response(200, json=_implement_status("Running", {"a": pending}))
+            return httpx.Response(200, json=_implement_status("Failed", {}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is False
+
     async def test_other_operations_do_not_observe_nodes(self, env, monkeypatch):
         nodes = {"a": _node("run-implementer", "Succeeded", ran=True)}
         self._run(env, monkeypatch, "Succeeded", nodes, operation="mctl-agents-investigate")
