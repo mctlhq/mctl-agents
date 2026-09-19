@@ -2614,7 +2614,7 @@ def _mark_rate_limited(
     observation: RateLimitObservation,
     attempt_id: str,
     message: str,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Build the durable ``rate_limited`` block and write it, rolling the
     proposal back to ``accepted`` (mctl-agents#364).
 
@@ -2630,7 +2630,17 @@ def _mark_rate_limited(
     a new one every ~30 minutes. (The optional guard in ``implement_one`` is
     what turns a still-open, already-recorded window into a true no-write
     skip, ahead of the ``in-progress`` transition entirely.)
+
+    Same compare-and-swap every other terminal write in ``implement_one``
+    performs (see ``_status_is_still_ours``, and ``_mark_needs_triage``'s use
+    of it): this write carries no ``attempt`` block of its own, but it DOES
+    drop the one this attempt stamped before the SDK ran, and it rolls the
+    proposal back to ``accepted`` — both wrong if a second executor's own
+    `attempt` now occupies `.status.yaml`. Returns ``None`` without writing
+    when the CAS declines, mirroring ``_mark_needs_triage``'s ``False``.
     """
+    if not _status_is_still_ours(ref, attempt_id, doing="recording rate-limited"):
+        return None
     current = _load_status(ref.status_path).get("rate_limited")
     since = None
     if (
@@ -3147,12 +3157,12 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # until the recorded window closes).
         observation = e.observation or build_observation(None, detail=str(e))
         msg = f"{RATE_LIMITED_ERROR_PREFIX} {e}"
-        _mark_rate_limited(ref, observation=observation, attempt_id=attempt_id, message=msg)
+        recorded = _mark_rate_limited(ref, observation=observation, attempt_id=attempt_id, message=msg)
         _release_claim(claim_ctx, reason="rate limited")
         result = ImplementResult(
             ref=ref,
             pr_url=None,
-            error=msg,
+            error=_triage_error(msg, recorded is not None),
             rate_limited=True,
             counts_toward_limit=False,
             rate_limit_observation=observation,

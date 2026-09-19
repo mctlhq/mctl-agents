@@ -295,12 +295,21 @@ def test_repeated_observation_is_idempotent(tmp_path, monkeypatch) -> None:
     ref = make_ref(tmp_path)
     observation = _observation()
 
+    # `_mark_rate_limited` now CASes on `.status.yaml`'s `attempt.id` (mirrors
+    # `_mark_needs_triage`/`_status_is_still_ours`), so each call below stamps
+    # the `attempt` block its own `attempt_id` will match — standing in for
+    # the `in-progress` write `implement_one` makes before every SDK call.
+    def _stamp(attempt_id: str) -> None:
+        run_implementer.update_status_yaml(ref, "in-progress", attempt={"id": attempt_id})
+
+    _stamp("a1")
     run_implementer._mark_rate_limited(
         ref, observation=observation, attempt_id="a1", message="first",
     )
     first_since = read_status(ref)["rate_limited"]["since"]
 
     # Second call: identical account/type/resets_at must preserve `since`.
+    _stamp("a2")
     run_implementer._mark_rate_limited(
         ref, observation=observation, attempt_id="a2", message="second",
     )
@@ -313,12 +322,39 @@ def test_repeated_observation_is_idempotent(tmp_path, monkeypatch) -> None:
     new_observation = _observation(
         resets_at="2026-10-03T00:00:00Z", resets_at_epoch=1790114400,
     )
+    _stamp("a3")
     run_implementer._mark_rate_limited(
         ref, observation=new_observation, attempt_id="a3", message="third",
     )
     third = read_status(ref)["rate_limited"]
     assert third["resets_at"] == "2026-10-03T00:00:00Z"
     assert third["since"] != first_since
+
+
+def test_mark_rate_limited_declines_when_a_second_executor_now_holds_the_proposal(
+    tmp_path,
+) -> None:
+    """The same compare-and-swap `_mark_needs_triage` performs (mctl-agents#364
+    P1 follow-up): between this attempt's own `in-progress` write and the
+    terminal 429, a second executor can legitimately have taken the proposal
+    and stamped its own `attempt` block. Rolling back to `accepted` and
+    dropping THAT block here would erase the second executor's hold and let a
+    third implementer start — the exact bug `_status_is_still_ours` exists to
+    prevent on every other terminal write."""
+    ref = make_ref(tmp_path)
+    run_implementer.update_status_yaml(
+        ref, "in-progress", attempt={"id": "someone-else"},
+    )
+
+    result = run_implementer._mark_rate_limited(
+        ref, observation=_observation(), attempt_id="ours", message="rate limited",
+    )
+
+    assert result is None
+    status = read_status(ref)
+    assert status["status"] == "in-progress"
+    assert status["attempt"]["id"] == "someone-else"
+    assert "rate_limited" not in status
 
 
 def test_rate_limited_block_is_cleared_on_success(tmp_path, monkeypatch) -> None:
