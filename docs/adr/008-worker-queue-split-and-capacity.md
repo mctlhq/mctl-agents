@@ -187,6 +187,72 @@ wrong thing entirely; the right signal is slot availability, which needs
 a custom metrics adapter that does not exist yet. Fixed replicas with a
 visible backlog is honest; an HPA on the wrong metric is not.
 
+**D7 — A third queue for admission, not for holding time (amended
+2026-09-19, mctlhq/mctl-agents#395).** D1's criterion was "can this occupy a
+slot for hours", and by that criterion the implementer submit belongs on
+`mctl-dev-loop-exec` with every other long Argo poll — which is where step 4
+put it. The 2026-09-19 incident showed the criterion is necessary but not
+sufficient for one operation. Nine approvals in twenty minutes produced nine
+`submit_and_wait` activities, all admitted at once by a 40-slot pool, all
+submitted to Argo at once, and then serialised INSIDE Argo on the capacity-1
+mutex `mctl-agents-proposal-claims`. Six of them died of their own workflow
+deadline before reaching the head of that queue, and nothing in Temporal
+knew: the DevLoops completed as `Completed`.
+
+The queue was in the wrong layer. Temporal is the orchestration authority;
+"may this run now" is its decision to make, before Argo sees anything.
+
+So the split gains a queue whose criterion is **admission**:
+
+```text
+mctl-dev-loop             control / short activities
+mctl-dev-loop-exec        every long Argo wait EXCEPT the implementer — stays at 40
+mctl-dev-loop-implement   ONLY mctl-agents-implement, max_concurrent_activities = N
+```
+
+A `--role implementation` worker serves it; the activity is still
+`submit_and_wait`. With no free slot the activity stays Scheduled in
+Temporal — no Argo workflow, no Argo deadline — and the schedule-to-start
+latency on this queue is, by construction, the queue age.
+
+Three things D7 deliberately does not do, each for a reason recorded in
+#395:
+
+- **It does not lower exec from 40.** Investigate, reconcile and incidents
+  are independent of implementer capacity; capping their pool to N would
+  re-couple exactly the workloads D1 separated.
+- **It does not add `schedule_to_start_timeout`** to the implement submit.
+  `submit_and_wait` is scheduled with `start_to_close_timeout` only, so
+  the queue wait neither consumes the execution budget nor is bounded by
+  it. A schedule-to-start timeout would turn a capacity wait into a
+  failure, which is the shape of the bug being fixed one layer earlier.
+- **It does not remove the Argo mutex.** The admin-only direct
+  `mctl_trigger_implementer` bypasses Temporal admission entirely; the
+  mutex still guards that path until ADR-010's server-side claim is at
+  `enforce` (mctlhq/mctl-api#337).
+
+**N is a process limit, not a distributed semaphore.** Capacity is
+`replicas × N`, so the implementation deployment runs one replica as an
+architectural invariant of this phase, and mctl-gitops fails CI if that
+number changes (mctlhq/mctl-gitops#1285). Worker slots are backpressure,
+not a lease: a worker that dies after submitting leaves Argo running while
+Temporal retries the activity on heartbeat timeout, and in that window the
+slot is gone. The contract is therefore "under normal worker operation no
+more than N implementation submissions are actively supervised, and queued
+DevLoops submit no Argo work at all" — not "never more than N implementers
+exist". The hard count across crashes belongs to ADR-010's claims.
+
+N is read from `IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES` in the
+environment (default 3) rather than fixed in `constants.py`, because it is
+the one number D5 expects an operator to move, and the values file that
+sets it is where the queue-age alert that says it is wrong lives.
+
+The rollout repeats steps 1–4 in the same fail-closed order: role and
+queue first (this amendment), the deployment polling an empty queue
+second, the routing flip behind `workflow.patched("implement-queue")`
+third, attrition fourth. Only the implement submit is routed; `incidents.py`
+and `reconcile.py` keep `exec-queue`.
+
 ## Rollout order (fail-closed)
 
 The order matters and it is the reverse of the intuitive one. A worker
@@ -322,5 +388,8 @@ that record the patch, which is why it is alone.
 ## Non-goals
 
 HPA and per-agent quotas/cost budgets (D6 and #152's "per-agent quotas"
-bullet — both need D5's metrics first); splitting reconcile onto a third
-queue; any change to what runs in Argo.
+bullet — both need D5's metrics first); splitting reconcile onto its own
+queue (the third queue D7 adds is for admission of one operation, not a
+further holding-time split); per-service capacity `M` (needs a distributed
+counter, see ADR-010 / mctlhq/mctl-api#337); any change to what runs in
+Argo.

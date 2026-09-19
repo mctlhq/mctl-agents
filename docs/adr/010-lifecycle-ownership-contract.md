@@ -540,6 +540,17 @@ rollout judged by anecdote.
 
 ## Non-goals
 
+> **Amended 2026-09-19 (mctlhq/mctl-agents#395).** Execution *admission* —
+> how many implementer runs may exist at once — is not an `ExecutionClaim`
+> concern and is not built on this contract. It is a Temporal task-queue
+> slot limit (ADR-008 D7). Worker slots give backpressure, not a lease: a
+> hard N across worker crashes and replicas is what the server half of
+> this ADR (mctlhq/mctl-api#337) eventually provides, and if capacity is
+> ever moved into the store it must be one atomic `admit_and_acquire`,
+> never `COUNT → compare → acquire`. Until then the Argo mutex
+> `mctl-agents-proposal-claims` stays, because the admin-only direct
+> implementer trigger bypasses Temporal admission entirely.
+
 - A generic distributed-lock service for arbitrary application code.
 - Replacing Temporal or Argo orchestration, or adding a second scheduler.
 - Making `owner` equivalent to RBAC, approval, or merge authority.
