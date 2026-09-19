@@ -498,7 +498,7 @@ def test_no_credential_material_is_recorded(tmp_path, monkeypatch, capsys) -> No
 # ---------------------------------------------------------------------------
 # T11 — optional skip guard
 # ---------------------------------------------------------------------------
-def test_skip_while_window_open(tmp_path) -> None:
+def test_skip_while_window_open(tmp_path, monkeypatch) -> None:
     ref = make_ref(tmp_path)
     run_implementer.update_status_yaml(
         ref, "accepted",
@@ -515,6 +515,11 @@ def test_skip_while_window_open(tmp_path) -> None:
             "message": "m",
         },
     )
+    monkeypatch.delenv("CLAUDE_OAUTH_ACCOUNT", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY_SECONDARY", raising=False)
     assert run_implementer.account_label() == "unknown"  # no auth configured in test env
     # account_label() answers "unknown" without any auth configured, so this
     # guard must fail OPEN here — matching account is required to skip.
