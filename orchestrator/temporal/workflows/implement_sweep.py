@@ -37,7 +37,7 @@ from datetime import timedelta
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
-from temporalio.exceptions import WorkflowAlreadyStartedError
+from temporalio.exceptions import ApplicationError, WorkflowAlreadyStartedError
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
@@ -73,7 +73,7 @@ class SweptImplementWorkflow:
 
     @workflow.run
     async def run(self, input_data: SweptImplementInput) -> WorkflowResult:
-        return await workflow.execute_activity(
+        result: WorkflowResult = await workflow.execute_activity(
             submit_and_wait,
             SubmitAndWaitInput(
                 operation=IMPLEMENTATION_OPERATION,
@@ -84,6 +84,18 @@ class SweptImplementWorkflow:
             heartbeat_timeout=SWEEP_STEP_HEARTBEAT_TIMEOUT,
             retry_policy=SWEEP_STEP_RETRY_POLICY,
         )
+        if result.phase != "Succeeded":
+            # submit_and_wait returns normally for every terminal Argo phase
+            # (TERMINAL_PHASES includes Failed/Error) — without this, a
+            # swept implement run that actually failed in Argo would still
+            # close this child workflow as Completed.
+            raise ApplicationError(
+                f"swept implement of {input_data.service}/{input_data.slug} ended "
+                f"{result.phase} in Argo workflow {result.workflow_name}",
+                result,
+                type="ImplementationFailed",
+            )
+        return result
 
 
 @dataclass(frozen=True)

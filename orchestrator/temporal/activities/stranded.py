@@ -69,9 +69,15 @@ def _parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    # A naive result (no offset in `value`) would raise on comparison
+    # against the aware `now` both call sites use — assume UTC rather than
+    # let one offset-less `.status.yaml` timestamp take the scan down.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def _scan(
