@@ -270,20 +270,16 @@ def test_batch_stops_after_first_rate_limited_ref(monkeypatch) -> None:
 # Idempotent / self-clearing block
 # ---------------------------------------------------------------------------
 def test_repeated_observation_is_idempotent(tmp_path, monkeypatch) -> None:
-    """`_mark_rate_limited` at the unit level: an identical observation
+    """`_mark_rate_limited` at the unit level: an identical `prior` block
     preserves `since`; a genuinely new one (different `resets_at`) does not.
 
-    Exercised directly against `_mark_rate_limited` rather than through two
-    `implement_one` calls: `implement_one`'s OWN `in-progress` write (taken
-    before every SDK call, since the outcome is not known yet) already passes
-    `rate_limited=None`, so by construction the very next tick's `except
-    RateLimitExhaustedError` branch never sees a PRIOR block to compare
-    against — see `_mark_rate_limited`'s docstring. What keeps a real,
-    continuing outage from restarting `since` on every tick is the task 11
-    guard skipping BEFORE that `in-progress` write ever runs (see
-    `test_skip_while_window_open_fires_on_matching_account` and
-    `test_implement_one_skips_before_clone_when_window_is_open` below) —
-    this test isolates the "preserve since when unchanged" rule on its own.
+    `prior` is passed explicitly here (rather than read from disk inside
+    `_mark_rate_limited`) because that is the real contract now: the caller
+    -- `implement_one` in production, this test standing in for it -- reads
+    `.status.yaml`'s existing `rate_limited` block BEFORE its own
+    `in-progress` write clears it, and threads that snapshot through. See
+    `test_repeated_observation_through_implement_one_preserves_since` below
+    for the same rule exercised through the real `implement_one` call path.
     """
     # `_now_iso()` has one-second resolution, so a bare wall-clock run could
     # produce identical timestamps well within the same second and pass even
@@ -303,32 +299,58 @@ def test_repeated_observation_is_idempotent(tmp_path, monkeypatch) -> None:
         run_implementer.update_status_yaml(ref, "in-progress", attempt={"id": attempt_id})
 
     _stamp("a1")
-    run_implementer._mark_rate_limited(
-        ref, observation=observation, attempt_id="a1", message="first",
+    first_block = run_implementer._mark_rate_limited(
+        ref, observation=observation, attempt_id="a1", message="first", prior=None,
     )
-    first_since = read_status(ref)["rate_limited"]["since"]
+    first_since = first_block["since"]
 
-    # Second call: identical account/type/resets_at must preserve `since`.
+    # Second call: identical account/type/resets_at must preserve `since`,
+    # given the FIRST call's own block as `prior` -- exactly what
+    # `implement_one` would have read off disk right before clearing it.
     _stamp("a2")
-    run_implementer._mark_rate_limited(
-        ref, observation=observation, attempt_id="a2", message="second",
+    second_block = run_implementer._mark_rate_limited(
+        ref, observation=observation, attempt_id="a2", message="second", prior=first_block,
     )
     second = read_status(ref)["rate_limited"]
     assert second["since"] == first_since
     assert second["message"] == "second"  # the rest of the block DOES update
 
     # Third call: a genuinely new observation (different resets_at) must NOT
-    # inherit the stale `since`.
+    # inherit the stale `since`, even though `prior` is passed.
     new_observation = _observation(
         resets_at="2026-10-03T00:00:00Z", resets_at_epoch=1790114400,
     )
     _stamp("a3")
     run_implementer._mark_rate_limited(
-        ref, observation=new_observation, attempt_id="a3", message="third",
+        ref, observation=new_observation, attempt_id="a3", message="third", prior=second_block,
     )
     third = read_status(ref)["rate_limited"]
     assert third["resets_at"] == "2026-10-03T00:00:00Z"
     assert third["since"] != first_since
+
+
+def test_repeated_observation_through_implement_one_preserves_since(tmp_path, monkeypatch) -> None:
+    """The production call path (mctl-agents#364 P2): `implement_one`'s own
+    `in-progress` write clears `rate_limited` from disk before every SDK
+    call, so `_mark_rate_limited` cannot recover the prior block by reading
+    disk at the point it runs. `implement_one` must capture that block ahead
+    of the clearing write and thread it through, so two consecutive
+    rate-limited ticks against the same window still read as one continuing
+    outage instead of restarting `since` every time.
+    """
+    clock = iter(f"2026-09-19T00:00:{i:02d}Z" for i in range(10))
+    monkeypatch.setattr(run_implementer, "_now_iso", lambda: next(clock))
+
+    ref = make_ref(tmp_path)
+    _rig_implement_one_up_to_the_sdk_call(monkeypatch, tmp_path, raiser=_raise_rate_limited())
+
+    run_implementer.implement_one(ref)
+    first_since = read_status(ref)["rate_limited"]["since"]
+
+    run_implementer.implement_one(ref)
+    second = read_status(ref)["rate_limited"]
+
+    assert second["since"] == first_since
 
 
 def test_mark_rate_limited_declines_when_a_second_executor_now_holds_the_proposal(
@@ -347,7 +369,7 @@ def test_mark_rate_limited_declines_when_a_second_executor_now_holds_the_proposa
     )
 
     result = run_implementer._mark_rate_limited(
-        ref, observation=_observation(), attempt_id="ours", message="rate limited",
+        ref, observation=_observation(), attempt_id="ours", message="rate limited", prior=None,
     )
 
     assert result is None
@@ -563,6 +585,26 @@ def test_skip_while_window_open_fails_open_on_unparsable_timestamp(tmp_path, mon
             "account": "primary",
             "rate_limit_type": "seven_day",
             "resets_at": "not-a-timestamp",
+        },
+    )
+    assert run_implementer._skip_while_rate_limited(ref) is None
+
+
+def test_skip_while_window_open_fails_open_on_timezone_naive_timestamp(tmp_path, monkeypatch) -> None:
+    """A `resets_at` with no offset parses fine under `datetime.fromisoformat`
+    but is not valid RFC 3339, and comparing it against the timezone-aware
+    `datetime.now(UTC)` used to raise `TypeError` instead of returning `None`
+    -- breaking the documented "fails open in every ambiguous case" promise
+    and aborting the whole batch (mctl-agents#364 P2)."""
+    ref = make_ref(tmp_path)
+    monkeypatch.setenv("CLAUDE_OAUTH_ACCOUNT", "primary")
+    run_implementer.update_status_yaml(
+        ref, "accepted",
+        rate_limited={
+            "code": "rate-limited",
+            "account": "primary",
+            "rate_limit_type": "seven_day",
+            "resets_at": "2099-01-01T00:00:00",
         },
     )
     assert run_implementer._skip_while_rate_limited(ref) is None

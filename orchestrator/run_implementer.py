@@ -2614,6 +2614,7 @@ def _mark_rate_limited(
     observation: RateLimitObservation,
     attempt_id: str,
     message: str,
+    prior: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
     """Build the durable ``rate_limited`` block and write it, rolling the
     proposal back to ``accepted`` (mctl-agents#364).
@@ -2631,6 +2632,15 @@ def _mark_rate_limited(
     what turns a still-open, already-recorded window into a true no-write
     skip, ahead of the ``in-progress`` transition entirely.)
 
+    ``prior`` -- the ``rate_limited`` block as it read from disk BEFORE this
+    attempt's own ``in-progress`` write cleared it -- is passed in by the
+    caller rather than re-read here on purpose: by the time this function
+    runs, `.status.yaml` on disk no longer carries the previous observation
+    (`implement_one` always writes `rate_limited=None` ahead of the SDK
+    call), so reading it from disk at this point would find nothing and
+    silently restart ``since`` on every tick of a genuinely continuing
+    outage (mctl-agents#364 P2).
+
     Same compare-and-swap every other terminal write in ``implement_one``
     performs (see ``_status_is_still_ours``, and ``_mark_needs_triage``'s use
     of it): this write carries no ``attempt`` block of its own, but it DOES
@@ -2641,16 +2651,15 @@ def _mark_rate_limited(
     """
     if not _status_is_still_ours(ref, attempt_id, doing="recording rate-limited"):
         return None
-    current = _load_status(ref.status_path).get("rate_limited")
     since = None
     if (
-        isinstance(current, dict)
-        and current.get("code") == "rate-limited"
-        and current.get("account") == observation.account
-        and current.get("rate_limit_type") == observation.rate_limit_type
-        and current.get("resets_at") == observation.resets_at
+        isinstance(prior, dict)
+        and prior.get("code") == "rate-limited"
+        and prior.get("account") == observation.account
+        and prior.get("rate_limit_type") == observation.rate_limit_type
+        and prior.get("resets_at") == observation.resets_at
     ):
-        since = current.get("since")
+        since = prior.get("since")
     block: dict[str, Any] = {
         "code": "rate-limited",
         "account": observation.account,
@@ -2681,7 +2690,8 @@ def _skip_while_rate_limited(ref: ProposalRef) -> str | None:
     mctl-agents#364 that changes which proposals run, so it must never
     withhold work on a bad or missing label): no ``rate_limited`` block, an
     ``unknown`` account on either side, a mismatched account, or a
-    ``resets_at`` that does not parse as RFC 3339 all return ``None``.
+    ``resets_at`` that does not parse as RFC 3339 -- including a value with
+    no timezone offset -- all return ``None``.
     """
     current = _load_status(ref.status_path).get("rate_limited")
     if not isinstance(current, dict):
@@ -2698,6 +2708,14 @@ def _skip_while_rate_limited(ref: ProposalRef) -> str | None:
     try:
         resets_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
     except ValueError:
+        return None
+    if resets_dt.tzinfo is None:
+        # RFC 3339 requires an offset; a timezone-naive value cannot be
+        # compared against the timezone-aware `datetime.now(UTC)` below
+        # without raising `TypeError` (mctl-agents#364 P2). Treat it the
+        # same as any other value that does not parse as RFC 3339, so the
+        # "fails open" promise above actually holds instead of crashing the
+        # batch.
         return None
     if resets_dt <= datetime.now(UTC):
         return None
@@ -2948,6 +2966,13 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             started + IMPLEMENT_ATTEMPT_LEASE
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
+    # Captured BEFORE the in-progress write below clears `rate_limited` from
+    # disk: `_mark_rate_limited`'s "preserve `since` on an unchanged
+    # observation" branch needs THIS attempt's own view of the prior block,
+    # because by the time a 429 might land, disk no longer has it
+    # (mctl-agents#364 P2).
+    prior_rate_limited = _load_status(ref.status_path).get("rate_limited")
+
     # Mark in-progress only after GitHub proves there is no prior result AND
     # the claim was not refused above.
     update_status_yaml(
@@ -3157,7 +3182,10 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # until the recorded window closes).
         observation = e.observation or build_observation(None, detail=str(e))
         msg = f"{RATE_LIMITED_ERROR_PREFIX} {e}"
-        recorded = _mark_rate_limited(ref, observation=observation, attempt_id=attempt_id, message=msg)
+        recorded = _mark_rate_limited(
+            ref, observation=observation, attempt_id=attempt_id, message=msg,
+            prior=prior_rate_limited,
+        )
         _release_claim(claim_ctx, reason="rate limited")
         result = ImplementResult(
             ref=ref,
