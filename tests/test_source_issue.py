@@ -107,6 +107,21 @@ def test_non_github_issue_source_type_is_unlinked() -> None:
     assert verdict.linked is False
 
 
+def test_missing_type_key_is_treated_as_an_implicit_github_issue() -> None:
+    # The original run_shepherd._source_issue_state only ever required
+    # `repo` + `issue` on the source block -- it never checked `type` at
+    # all. A `.status.yaml` written before `type` existed (or by any writer
+    # that omits it) must still classify as a usable github-issue link.
+    verdict = read_source_issue(
+        _status({"repo": "mctlhq/mctl-telegram", "issue": 510}),
+        stage="admission",
+        gh_api_json=lambda _args: {"state": "open"},
+    )
+    assert verdict.linked is True
+    assert verdict.known is True
+    assert verdict.issue_ref == "mctlhq/mctl-telegram#510"
+
+
 def test_gh_raising_leaves_the_verdict_unknown_but_linked() -> None:
     def boom(_args):
         raise RuntimeError("gh: connection reset")

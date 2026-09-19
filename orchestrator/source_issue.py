@@ -79,9 +79,12 @@ def read_source_issue(
     which controller refused the proposal.
 
     Returns `linked=False` when `.status.yaml` carries no `source` block, a
-    partial one (missing `repo` or `issue`), or a `type` other than
-    `github_issue` — an absent link is not evidence of staleness, and
-    incident-responder proposals legitimately carry none.
+    partial one (missing `repo` or `issue`), or an explicit `type` other
+    than `github_issue` — an absent link is not evidence of staleness, and
+    incident-responder proposals legitimately carry none. A `source` block
+    with no `type` key at all is treated as an implicit `github_issue`
+    (the original, pre-extraction shape written before `type` existed):
+    only an explicit, different `type` disqualifies it.
 
     Returns `linked=True, known=False` when there IS a usable source link
     but GitHub could not be read (transport error, non-2xx, unparseable
@@ -89,7 +92,10 @@ def read_source_issue(
     GitHub is not evidence about the proposal.
     """
     source = status_data.get("source")
-    if not isinstance(source, dict) or source.get("type") != "github_issue":
+    if not isinstance(source, dict):
+        return SourceIssueVerdict(known=False, failure=None, linked=False)
+    source_type = source.get("type")
+    if source_type is not None and source_type != "github_issue":
         return SourceIssueVerdict(known=False, failure=None, linked=False)
     repo = source.get("repo")
     number = source.get("issue")

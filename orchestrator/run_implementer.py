@@ -554,6 +554,11 @@ class BatchOutcome:
     # Trailing and defaulted so existing positional/keyword constructions
     # (e.g. BatchOutcome(succeeded=1, failed=1, skipped=1)) keep working.
     blocked: int = 0
+    # Admission-gate refusals (mctl-agents#410 codex follow-up). Counted
+    # separately from `failed` so a batch that also implemented a real
+    # proposal on the same tick is not reported red for a refusal that
+    # worked exactly as designed -- see the exit-code comment in `main()`.
+    stale_source: int = 0
 
 
 @dataclass(frozen=True)
@@ -3142,14 +3147,21 @@ def _implement_refs(
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     """Classify every result; partial success must never mask a failure.
 
-    Order matters: error -> blocked -> skipped_reason -> pr_url. A blocked
-    result also carries a `skipped_reason` (for readers of that channel
-    alone), so it must be classified before the `skipped_reason` branch or
-    it would inflate the skip count.
+    Order matters: stale_source -> error -> blocked -> skipped_reason ->
+    pr_url. A stale-source refusal also carries `error` (for readers of
+    that older channel, and for the per-result "fail" summary line), so it
+    must be classified before the `error` branch or a healthy admission
+    refusal would count toward `failed` and force the whole batch red even
+    when another proposal in the same tick succeeded (codex P2 follow-up on
+    mctl-agents#410). A blocked result also carries a `skipped_reason` (for
+    readers of that channel alone), so it must be classified before the
+    `skipped_reason` branch or it would inflate the skip count.
     """
-    succeeded = failed = skipped = blocked = 0
+    succeeded = failed = skipped = blocked = stale_source = 0
     for result in results:
-        if result.error:
+        if result.stale_source:
+            stale_source += 1
+        elif result.error:
             failed += 1
         elif result.blocked:
             blocked += 1
@@ -3159,7 +3171,13 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
             succeeded += 1
         else:
             failed += 1
-    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped, blocked=blocked)
+    return BatchOutcome(
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        stale_source=stale_source,
+    )
 
 
 def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
@@ -3391,9 +3409,21 @@ def main() -> None:
         f"{outcome.succeeded} succeeded, "
         f"{outcome.failed} failed, "
         f"{outcome.skipped} skipped, "
-        f"{outcome.blocked} blocked"
+        f"{outcome.blocked} blocked, "
+        f"{outcome.stale_source} stale source"
     )
     if outcome.failed:
+        sys.exit(1)
+    # A refusal-only batch (nothing else in the tick succeeded) still exits
+    # 1, per requirements.md's EARS: "count it as a failed result (exit
+    # 1)". But once ANY proposal in the same batch succeeded, the refusal
+    # is a healthy side effect of that tick -- it retired a stale proposal
+    # instead of burning a model attempt on it -- not evidence anything
+    # went wrong, so it must not turn a green run red (codex P2 follow-up
+    # on mctl-agents#410). `outcome.stale_source` is deliberately excluded
+    # from `outcome.failed` above so a mixed batch reaches this check
+    # instead of the unconditional exit above.
+    if outcome.stale_source and not outcome.succeeded:
         sys.exit(1)
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
