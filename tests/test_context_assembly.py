@@ -6,6 +6,7 @@ proposal's tasks.md "## Tests" section.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -358,6 +359,59 @@ def test_collect_prior_proposal_reads_the_existing_triplet(tmp_path):
     assert produced[0].kind == "proposal-dir"
     assert produced[0].trust_tier == "corroborated"
     assert produced[0].render_text == "req"
+
+
+# ---------------------------------------------------------------------------
+# _read_prior_proposal_file hardening — three hazards a gitops-published
+# proposal directory (agent-authored, hence untrusted) can pose to the
+# worker reading it (orchestrator/context_assembly.py:508).
+# ---------------------------------------------------------------------------
+def test_read_prior_proposal_file_refuses_a_symlink(tmp_path):
+    """Hazard 1: a symlink planted where a plain triplet file is expected
+    must not be followed — O_NOFOLLOW makes the open() fail closed instead
+    of silently reading whatever the link points at (e.g. a path outside
+    the proposal directory, or elsewhere on the worker's filesystem)."""
+    secret = tmp_path / "secret.txt"
+    secret.write_text("outside the proposal directory")
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    (proposal_dir / "requirements.md").symlink_to(secret)
+
+    assert ca._read_prior_proposal_file(proposal_dir / "requirements.md", max_bytes=1000) is None
+
+    # And the collector treats it exactly like a missing file, not an error.
+    assembly_input = _assembly_input(tmp_path, proposal_dir=proposal_dir)
+    assert ca.collect_prior_proposal(assembly_input) == []
+
+
+def test_read_prior_proposal_file_refuses_a_non_regular_file(tmp_path):
+    """Hazard 2: anything that is not a regular file — a FIFO here, stood
+    in for the class of special files (FIFOs, devices) the fstat check
+    rejects — must not be read, since a FIFO with no writer would block
+    the worker's `open()`/`read()` indefinitely."""
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    fifo_path = proposal_dir / "requirements.md"
+    os.mkfifo(fifo_path)
+
+    # O_NONBLOCK on the open() keeps this from hanging even before fstat
+    # gets a say; the read must still come back None, not block or raise.
+    assert ca._read_prior_proposal_file(fifo_path, max_bytes=1000) is None
+
+
+def test_read_prior_proposal_file_bounds_the_read_below_file_size(tmp_path):
+    """Hazard 3: the read is capped at `max_bytes + 1` regardless of how
+    large the file actually is, so an oversized (or still-growing) triplet
+    file cannot exhaust the worker's memory just by being opened."""
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    big = proposal_dir / "requirements.md"
+    big.write_bytes(b"x" * 10_000)
+
+    result = ca._read_prior_proposal_file(big, max_bytes=100)
+
+    assert result is not None
+    assert len(result) == 101  # max_bytes + 1, not the file's full 10_000 bytes
 
 
 # ---------------------------------------------------------------------------
