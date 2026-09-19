@@ -288,7 +288,9 @@ async def test_todays_dev_loop_admits_the_implement_submit_on_its_own_queue() ->
       schedule-to-close timeout. On the admission queue the schedule-to-
       start wait is the queue itself; a bound there turns "waiting for
       capacity" back into a failure, one layer earlier than the bug this
-      fixes. Temporal encodes an unset timeout as zero.
+      fixes. The server records an unset timeout as its own ten-year cap
+      rather than as zero, so the assertion below tolerates both and
+      rejects only a bound a run could actually hit.
     """
     scenario = scenario_by_name("dev_loop_full")
     async with await WorkflowEnvironment.start_time_skipping() as env:

@@ -114,6 +114,22 @@ SDK_STEP_TIMEOUT = timedelta(hours=2)
 # human. Bounded, because a cluster that cannot start pods at all must
 # eventually surface as a failed loop rather than resubmit forever.
 MAX_PRESTART_REQUEUES = 3
+# ...and waited between, so the bound is a time budget and not a burst.
+# A pre-start cause can be fast: Argo accepts the workflow and the pod is
+# never scheduled (quota, taint, an admission webhook), which comes back in
+# seconds. Requeueing straight away would spend all three tries before the
+# transient condition could clear and fail a loop that a minute of patience
+# would have saved. The sleep costs nothing — a requeue is not an attempt,
+# and the wait does not touch the implementation slot, which the completed
+# activity already released.
+#
+# The budget is also spent by the Argo-side mutex: admission lets N
+# implement submits exist at once, so if the CWFT's `synchronization` mutex
+# is narrower than N, the surplus queues inside Argo against its own
+# deadline and comes back pre_start. That is requeued rather than lost, but
+# N and the mutex capacity have to move together — ADR-008 D7 records that
+# the gitops mutex is expected to be at least N.
+PRESTART_REQUEUE_BACKOFF = timedelta(minutes=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 
 FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
@@ -1126,6 +1142,7 @@ class DevLoopWorkflow:
                     requeues,
                     MAX_PRESTART_REQUEUES,
                 )
+                await workflow.sleep(PRESTART_REQUEUE_BACKOFF)
                 continue
 
             error_type = {

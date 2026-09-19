@@ -116,7 +116,22 @@ _SUBMITTED_UNKNOWN_NAME = "<submitted, workflow name unparseable>"
 
 
 def _now_iso() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return _iso(datetime.now(UTC)) or ""
+
+
+def _iso(moment: datetime | None) -> str | None:
+    """One spelling of an instant across the whole projection.
+
+    `datetime.isoformat()` alone would put `+00:00` on a tz-aware value and
+    no offset at all on a naive one, so the three timestamps in a heartbeat
+    could arrive in three spellings and leave the consumer (#389) parsing
+    all of them.
+    """
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 @activity.defn
@@ -136,7 +151,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
         workflow_name = heartbeat_details[0] if heartbeat_details else None
         runtime: dict[str, str | None] = {
             "phase": PHASE_ADMITTED,
-            "admitted_at": info.started_time.isoformat() if info.started_time else None,
+            "admitted_at": _iso(info.started_time),
             "submitted_at": None,
             "implementer_started_at": None,
         }
@@ -194,7 +209,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             # workflow_name via heartbeat_details above instead of resubmitting.
             runtime["phase"] = PHASE_SUBMITTED
             runtime["submitted_at"] = _now_iso()
-            activity.heartbeat(workflow_name, runtime)
+            activity.heartbeat(workflow_name, dict(runtime))
 
         consecutive_errors = 0
         while True:
@@ -205,7 +220,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             # activity (worker crash, network partition) instead of the
             # activity looking alive forever because polling itself is
             # still succeeding.
-            activity.heartbeat(workflow_name, runtime)
+            activity.heartbeat(workflow_name, dict(runtime))
 
             try:
                 status_resp = await client.get(f"/api/v1/workflows/{workflow_name}", headers=headers)
