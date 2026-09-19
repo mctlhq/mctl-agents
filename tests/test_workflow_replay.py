@@ -328,8 +328,19 @@ async def test_todays_dev_loop_admits_the_implement_submit_on_its_own_queue() ->
     for attrs, queue in submits:
         for key in ("scheduleToStartTimeout", "scheduleToCloseTimeout"):
             value = attrs.get(key)
-            seconds = float(value.rstrip("s")) if isinstance(value, str) and value.endswith("s") else 0.0
-            assert value is None or seconds == 0 or seconds >= one_year, (
+            if value is None:
+                continue
+            # No silent fallback: a shape this parser does not recognise
+            # would otherwise read as 0, i.e. as "no timeout", and the
+            # assertion would pass on exactly the change it exists to
+            # catch. Protobuf JSON writes durations as "<seconds>s", and a
+            # day it stops doing that is a day this test must say so.
+            assert isinstance(value, str) and value.endswith("s"), (
+                f"submit_and_wait on {queue} has {key}={value!r}, which this assertion cannot "
+                "read as a duration; teach it the new shape rather than trusting the default"
+            )
+            seconds = float(value.rstrip("s"))
+            assert seconds == 0 or seconds >= one_year, (
                 f"submit_and_wait on {queue} has {key}={value!r}; a capacity wait must not be a timeout"
             )
 

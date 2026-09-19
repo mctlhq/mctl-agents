@@ -1984,6 +1984,102 @@ class TestSubmitAndWaitObservesTheImplementer:
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
         assert result.implementer_ran is False
 
+    async def test_a_resumed_attempt_keeps_the_pod_it_already_watched_start(self, env, monkeypatch):
+        """The cross-poll fold has to survive a worker restart too.
+
+        The previous attempt heartbeated `running` with a start time; this
+        one restores that projection, so a terminal poll that can no longer
+        read the node map must not report the implementer as unknown.
+        """
+        import dataclasses
+
+        prior = {
+            "phase": "running",
+            "admitted_at": "2026-09-19T01:00:00Z",
+            "submitted_at": "2026-09-19T01:00:05Z",
+            "implementer_started_at": "2026-09-19T01:02:00Z",
+        }
+        env.info = dataclasses.replace(env.info, heartbeat_details=["mctl-agents-implement-0eaa9853", prior])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit on resume")
+            return httpx.Response(200, json=_implement_status("Failed", {}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is True
+        assert result.implementer_started_at == "2026-09-19T01:02:00Z"
+
+    async def test_a_resume_whose_projection_has_no_start_time_still_seeds_the_run(self, env, monkeypatch):
+        """`running` without a timestamp is still a pod that ran.
+
+        Argo does not always leave a `startedAt` on the node, and a
+        projection restored from an older or partial detail need not carry
+        every key. The seed keys on the phase, which is only ever written
+        where a pod was observed to have run, so the run survives and the
+        missing timestamp stays missing rather than crashing the attempt.
+        """
+        import dataclasses
+
+        prior = {"phase": "running", "submitted_at": "2026-09-19T01:00:05Z"}
+        env.info = dataclasses.replace(env.info, heartbeat_details=["mctl-agents-implement-0eaa9853", prior])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit on resume")
+            return httpx.Response(200, json=_implement_status("Failed", {}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is True
+        assert result.implementer_started_at is None
+
+    async def test_a_resume_that_never_saw_a_pod_does_not_invent_one(self, env, monkeypatch):
+        """The seed must not fire on a projection that only got as far as
+        `submitted`: nothing ran, and claiming otherwise would take the
+        requeue away from an implementer that never started."""
+        import dataclasses
+
+        prior = {"phase": "submitted", "submitted_at": "2026-09-19T01:00:05Z"}
+        env.info = dataclasses.replace(env.info, heartbeat_details=["mctl-agents-implement-0eaa9853", prior])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit on resume")
+            return httpx.Response(200, json=_implement_status("Failed", {}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is None
+
+    async def test_a_finalization_step_still_running_is_reported_as_unfinished(self, env, monkeypatch):
+        """A commit step that never finished must not read as one that
+        finished and was followed by something else: the first means the
+        commit may not exist, the second that it probably does."""
+        ran = _node("run-implementer", "Succeeded", ran=True)
+        commit = _node("commit-and-push", "Running", ran=True)
+        self._run(env, monkeypatch, "Failed", {"a": ran, "b": commit})
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is True
+        assert result.finalization_phase == "Running"
+
     async def test_other_operations_do_not_observe_nodes(self, env, monkeypatch):
         nodes = {"a": _node("run-implementer", "Succeeded", ran=True)}
         self._run(env, monkeypatch, "Succeeded", nodes, operation="mctl-agents-investigate")
