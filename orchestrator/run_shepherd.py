@@ -99,6 +99,7 @@ from orchestrator.lifecycle.contract import (
 from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.source_issue import SourceIssueVerdict, read_source_issue
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
 
 # ---------------------------------------------------------------------------
@@ -1244,31 +1245,6 @@ SOURCE_RECHECKED_FAILURE_CODES = frozenset(
 )
 
 
-@dataclass(frozen=True)
-class SourceIssueVerdict:
-    """What the source issue says about a PR-less proposal.
-
-    `known` and `failure` are deliberately two fields rather than one
-    nullable one.  Collapsing them loses the distinction between "GitHub
-    answered: the issue is open" and "GitHub did not answer", and those want
-    opposite handling: the first may rewrite a stale `source-resolved` back
-    to `missing-pr`, the second must not touch the status at all.
-
-    Folding them together is not hypothetical — it was the first version of
-    this code, and agy's P1 on PR #279 caught it: a 502 during a sweep would
-    have flapped every parked `source-resolved` proposal to `missing-pr`,
-    two GitOps commits per proposal per blip, erasing the very signal an
-    operator was reading.
-    """
-
-    known: bool
-    failure: dict[str, str] | None = None
-
-
-_SOURCE_UNKNOWN = SourceIssueVerdict(known=False)
-_SOURCE_ISSUE_OPEN = SourceIssueVerdict(known=True, failure=None)
-
-
 def _source_issue_state(status_data: dict[str, Any]) -> SourceIssueVerdict:
     """Read the proposal's source issue and say what it implies.
 
@@ -1279,52 +1255,20 @@ def _source_issue_state(status_data: dict[str, Any]) -> SourceIssueVerdict:
     accumulates silently — every issue the platform investigates but a human
     then resolves directly produces one (#276).
 
-    Returns `_SOURCE_UNKNOWN` when the question cannot be answered at all:
-    the proposal predates `source:`, the block is partial, or GitHub could
-    not be read.  Callers must treat that as "change nothing", the same
+    A thin wrapper over `orchestrator.source_issue.read_source_issue`
+    (mctl-agents#410), which also backs the Tier 2 implementer's admission
+    gate. `gh_api_json=_gh_api_json` keeps the GitHub read routed through
+    this module's own token-refreshing, logging `_run` wrapper — and keeps
+    it patchable by the existing reconcile tests, which stub
+    `run_shepherd._gh_api_json` rather than the network.
+
+    `known=False` answers "the question cannot be answered at all": the
+    proposal predates `source:`, the block is partial, or GitHub could not
+    be read. Callers must treat that as "change nothing", the same
     reasoning as the `discovered_url` guard in `reconcile_one` — an
     unreadable GitHub is not evidence about the proposal.
     """
-    source = status_data.get("source")
-    if not isinstance(source, dict):
-        return _SOURCE_UNKNOWN
-    repo = source.get("repo")
-    number = source.get("issue")
-    if not repo or not number:
-        return _SOURCE_UNKNOWN
-    try:
-        issue = _gh_api_json([f"repos/{repo}/issues/{number}"])
-    except Exception as exc:  # noqa: BLE001 — any gh/JSON failure is unknown
-        print(f"warn: could not read source issue {repo}#{number}: {exc}")
-        return _SOURCE_UNKNOWN
-    if not isinstance(issue, dict) or "state" not in issue:
-        # A response we cannot interpret is not an answer.  Reading it as
-        # "open" would be a guess dressed up as a fact.
-        print(f"warn: unreadable source issue payload for {repo}#{number}")
-        return _SOURCE_UNKNOWN
-    if issue["state"] != "closed":
-        return _SOURCE_ISSUE_OPEN
-    # state_reason is null on issues closed before GitHub introduced it, and
-    # on some API paths.  Treat "closed, reason unknown" as completed: the
-    # actionable half of the message ("no PR ever existed for this slug, the
-    # issue is closed") is true either way, and the operator confirms.
-    not_planned = issue.get("state_reason") == "not_planned"
-    code = "source-not-planned" if not_planned else "source-resolved"
-    reason = "not planned" if not_planned else "completed"
-    return SourceIssueVerdict(
-        known=True,
-        failure={
-            "code": code,
-            "stage": "reconcile",
-            "message": (
-                f"No canonical PR exists for the deterministic result branch, "
-                f"and the source issue {repo}#{number} is closed as {reason}. "
-                f"The branch is missing because this proposal was abandoned, "
-                f"not because a PR was lost. Retire it with a terminal status "
-                f"(agents-state/OPERATOR.md) or reopen the issue."
-            ),
-        },
-    )
+    return read_source_issue(status_data, stage="reconcile", gh_api_json=_gh_api_json)
 
 
 # ---------------------------------------------------------------------------
