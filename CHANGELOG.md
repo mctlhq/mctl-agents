@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.49.0](https://github.com/mctlhq/mctl-agents/compare/1.48.0...1.49.0) (2026-09-19)
+
+
+### Features
+
+* **agents:** issue-265-feat-context-assemble-investigator-conte ([3490fd9](https://github.com/mctlhq/mctl-agents/commit/3490fd9a66a82c328ddbc3e2e5b54f77ba5f0eb7))
+* **agents:** issue-334-feat-lifecycle-adopt-proposal-less-same ([c6b7df7](https://github.com/mctlhq/mctl-agents/commit/c6b7df7b333791a18bfa758d9fa3135842b87224))
+* **shepherd:** adopt proposal-less same-repo PRs with blocking reviews ([cedf6ca](https://github.com/mctlhq/mctl-agents/commit/cedf6ca768b1100239661271c4cb5e03d011ba7d))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([e909f37](https://github.com/mctlhq/mctl-agents/commit/e909f37a6f4c8e19bdca3f5ebb7ba609c7320aa0))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([319c442](https://github.com/mctlhq/mctl-agents/commit/319c442051e1a5aaebfea1ccceba7dae0986eba2))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([aaa2542](https://github.com/mctlhq/mctl-agents/commit/aaa2542cedc2fc2ff1570d37b572dea7469ed260))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([c9f6abc](https://github.com/mctlhq/mctl-agents/commit/c9f6abc01d2a0c24f3bf60e6d74e1a12dcaf0c62))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([b822f63](https://github.com/mctlhq/mctl-agents/commit/b822f63e157936948d9c557ffb7679919e4151b6))
+
 ## [1.48.0](https://github.com/mctlhq/mctl-agents/compare/1.47.0...1.48.0) (2026-09-19)
 
 
