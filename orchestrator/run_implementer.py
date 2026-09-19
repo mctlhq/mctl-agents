@@ -1300,6 +1300,19 @@ def _github_json(cmd: list[str]) -> Any:
         raise GitHubPreflightError(f"invalid JSON from {' '.join(cmd[:3])}") from exc
 
 
+def _gh_api_json(args: list[str]) -> Any:
+    """`read_source_issue`'s `gh_api_json` adapter, routed through the
+    bounded `_github_json` (mctl-agents#410 code review).
+
+    `read_source_issue`'s own default reader calls `run_capturing` with
+    `timeout=None` -- unbounded -- and skips `_run`'s token refresh and
+    `$ gh api ...` log line. Passing this adapter instead keeps the
+    admission gate's GitHub read on the same bounded, logged path as every
+    other `gh` call in this module, `_superseding_pr_urls` included.
+    """
+    return _github_json(["gh", "api", *args])
+
+
 def _clone_target(service: str, slug: str) -> Path:
     """gh repo clone the target sibling repo to a fresh tmp dir."""
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
@@ -2768,7 +2781,9 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # Spends nothing: no SDK auth, no ExecutionClaim acquire, no `attempt`
     # lease, no clone -- the whole point is to refuse before any of that,
     # not after.
-    verdict = read_source_issue(_load_status(ref.status_path), stage="admission")
+    verdict = read_source_issue(
+        _load_status(ref.status_path), stage="admission", gh_api_json=_gh_api_json
+    )
     if verdict.linked and not verdict.known:
         # GitHub did not answer. Not evidence about the proposal -- the
         # same rule the shepherd's `linked and not known` guard follows.
