@@ -148,12 +148,15 @@ an explicit `ServiceSkillSet` contract:
   default branch first.
 - Enablement and ceilings (`enabled`/`root`/`maxSkills`/`maxSkillBytes`/
   `maxTotalBytes`) are a `spec.serviceSkills` block on the PLATFORM side:
-  `agents/_manifests/<agent>/agent.yaml` for a v1alpha1 agent (shipped here
-  for `implementer`), or `ExecutionProfile.spec.serviceSkills` for a
-  v1alpha2 agent once mctl-gitops's `execution-profile.schema.json` gains
-  the field (a separate mctl-gitops PR — until it lands, `issue-investigator`
-  resolves `enabled: false` and reads nothing, same as any agent that never
-  declared the block). The agent-to-skill BINDING lives in the target repo;
+  `agents/_manifests/<agent>/agent.yaml` for a v1alpha1 agent, or
+  `ExecutionProfile.spec.serviceSkills` for a v1alpha2 agent once
+  mctl-gitops's `execution-profile.schema.json` gains the field (a separate
+  mctl-gitops PR). Neither is declared yet as of this proposal —
+  `agents/_manifests/implementer/agent.yaml` has no `spec.serviceSkills`
+  block (tasks.md task 13 remains open) — so both `implementer` and
+  `issue-investigator` resolve `enabled: false` and read nothing today, same
+  as any agent that never declared the block. The agent-to-skill BINDING
+  lives in the target repo;
   the PERMISSION to read it plus its limits lives on the platform side —
   `ExecutionProfile.spec.skills` (the pre-existing platform-skill mechanism)
   is unrelated and unchanged.

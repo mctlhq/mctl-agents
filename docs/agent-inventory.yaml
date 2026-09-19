@@ -155,8 +155,12 @@ agents:
       # feat/agents-* HEAD — a skill edit this agent commits cannot become
       # policy for its own next run without a human merging it first). Empty
       # unless agents/_manifests/implementer/agent.yaml's
-      # spec.serviceSkills.enabled is true (it is, as of this proposal). See
-      # docs/resolver-pilot-status.md's "Service skills" section.
+      # spec.serviceSkills.enabled is true. NOT true as of this proposal:
+      # that manifest still has no `spec.serviceSkills` block (tasks.md task
+      # 13 remains open), so `ServiceSkillPolicy.from_spec(None)` resolves
+      # `enabled=False` and this path is wired but inert until a follow-up
+      # declares the block. See docs/resolver-pilot-status.md's "Service
+      # skills" section.
       - targetRepo: .mctl/skills/** (pinned ServiceSkillSet, merge-base SHA)
     modelPolicyTask: service_agent
     budgetEnv: IMPLEMENTER_BUDGET_USD          # default 3.00

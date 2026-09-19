@@ -91,6 +91,15 @@ _STRIPPED_TAG = "[tag stripped]"
 # cannot terminate or forge the delimiter block it is rendered inside (R18).
 _FORGED_TAG_RE = re.compile(r"(?i)<[\s/]*service_skills(?![-\w])[^>\n]*>?")
 
+# `skill_id` is rendered verbatim into the prompt block's `### {skill_id}`
+# heading (R18) -- it is never passed through `_neutralize_service_skill_tags`,
+# so unlike skill TEXT it cannot rely on tag-stripping for containment. It
+# must instead be structurally incapable of spelling a delimiter tag: no `<`,
+# `>`, whitespace or newlines, ever. Manifest keys already look like this in
+# every real declaration (`repo-testing`, `generated-files`), so this is not
+# a behavior change for well-formed manifests.
+_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?$")
+
 _FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?\r?\n)---[ \t]*\r?\n?", re.DOTALL)
 
 
@@ -528,6 +537,16 @@ def resolve_bundle(
     ids = bindings.get(agent) or []
     if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
         raise ServiceSkillError(f"{manifest_path}: spec.bindings.{agent} must be a list of skill ids")
+    invalid_ids = sorted({i for i in ids if not _SKILL_ID_RE.match(i)})
+    if invalid_ids:
+        # R18: skill_id is rendered unneutralized into the prompt block's
+        # heading, so an id must not be able to spell a delimiter tag --
+        # reject anything outside the safe identifier charset before it is
+        # ever bound to a skill, rather than trying to sanitize it later.
+        raise ServiceSkillError(
+            f"{manifest_path}: spec.bindings.{agent} has invalid skill id(s) {invalid_ids!r} -- "
+            "skill ids must match ^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?$"
+        )
     seen: set[str] = set()
     duplicates: set[str] = set()
     for skill_id in ids:
