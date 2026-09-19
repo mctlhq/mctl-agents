@@ -314,6 +314,54 @@ class TestSubmitAndWait:
         assert result.workflow_name == "mctl-agents-investigate-ab12cd34"
         assert result.succeeded is True
 
+    async def test_resume_keeps_the_runtime_projection_it_was_left(self, env, monkeypatch):
+        """A retried attempt must not rewind the projection #389 reads.
+
+        The next heartbeat replaces the details wholesale, so a resume that
+        rebuilt a fresh dict would report a workflow that has been running
+        for an hour as freshly `admitted`, and would erase the submit and
+        pod-start timestamps that are the only record of when the attempt
+        actually began."""
+        import dataclasses
+
+        prior = {
+            "phase": "running",
+            "admitted_at": "2026-09-19T01:00:00Z",
+            "submitted_at": "2026-09-19T01:00:05Z",
+            "implementer_started_at": "2026-09-19T01:02:00Z",
+        }
+        env.info = dataclasses.replace(env.info, heartbeat_details=["wf-1", prior])
+        heartbeats = []
+        env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit on resume")
+            return httpx.Response(200, json={"live": {"status": {"phase": "Succeeded"}}})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert heartbeats[0][1] == prior
+
+    async def test_resume_from_the_old_name_only_shape_reports_submitted(self, env, monkeypatch):
+        """An attempt that heartbeated before the projection existed carries
+        the name alone. The resume key proves the POST already happened, so
+        the phase floor is `submitted`, never `admitted`."""
+        import dataclasses
+
+        env.info = dataclasses.replace(env.info, heartbeat_details=["wf-1"])
+        heartbeats = []
+        env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit on resume")
+            return httpx.Response(200, json={"live": {"status": {"phase": "Succeeded"}}})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert heartbeats[0][1]["phase"] == "submitted"
+
     async def test_rides_out_transient_poll_errors(self, env, monkeypatch):
         """A handful of consecutive poll failures (mctl-api 5xx blip) must
         not kill the activity — only a persistent run of them should."""
@@ -1812,6 +1860,17 @@ class TestSubmitAndWaitObservesTheImplementer:
         """No node graph is "could not tell", which the classifier must
         treat as a possible run — never as proof that nothing ran."""
         self._run(env, monkeypatch, "Failed", None)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is None
+
+    async def test_an_empty_node_map_is_unknown_not_not_run(self, env, monkeypatch):
+        """`nodes: {}` is the offloaded/pruned/not-yet-populated shape, not a
+        workflow that ran nothing. Argo moves `status.nodes` out of the
+        object once the graph outgrows the etcd limit and strips it on
+        archival, so an empty map can sit on a workflow whose implementer
+        committed. Calling that "did not run" would requeue it."""
+        self._run(env, monkeypatch, "Failed", {})
 
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
         assert result.implementer_ran is None

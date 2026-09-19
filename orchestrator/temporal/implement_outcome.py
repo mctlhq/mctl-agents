@@ -83,7 +83,15 @@ _NOT_A_VERDICT = frozenset({"Omitted", "Skipped"})
 
 def observe_implementer(status_block: dict[str, Any]) -> ImplementerObservation:
     nodes = status_block.get("nodes")
-    if not isinstance(nodes, dict):
+    # An EMPTY node map is unreadable, not empty-because-nothing-ran. Argo
+    # offloads `status.nodes` to its own store once the graph outgrows the
+    # etcd limit and prunes it on archival, and it is also simply not
+    # populated yet on a freshly accepted workflow — in all three cases the
+    # map is `{}` while a pod may well have run. Reporting that as "did not
+    # run" would requeue an implementer that already produced a commit, so
+    # it is reported as unknown, which `classify` turns into an execution
+    # failure a human looks at rather than a silent second attempt.
+    if not isinstance(nodes, dict) or not nodes:
         return ImplementerObservation(ran=None, phase=None, started_at=None, finalization_phase=None)
 
     pods = [

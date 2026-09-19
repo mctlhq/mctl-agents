@@ -140,6 +140,24 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             "submitted_at": None,
             "implementer_started_at": None,
         }
+        # A resumed attempt starts from the projection the previous attempt
+        # left, not from scratch: the next heartbeat overwrites the details
+        # wholesale, so rebuilding a fresh `admitted` dict here would erase
+        # `submitted_at` and `implementer_started_at` from what #389 reads,
+        # and would report a workflow already running as merely admitted.
+        # Anything unreadable falls through to the fresh dict below, and
+        # only keys this shape defines are taken, so a detail written by a
+        # future version cannot inject fields.
+        prior = heartbeat_details[1] if len(heartbeat_details) > 1 else None
+        if workflow_name:
+            if isinstance(prior, dict):
+                runtime.update({k: v for k, v in prior.items() if k in runtime})
+            # Submitted is a floor on every resume, including one from an
+            # attempt that heartbeated under the older name-only shape: the
+            # resume key exists only because a previous attempt got past the
+            # POST.
+            if runtime["phase"] == PHASE_ADMITTED:
+                runtime["phase"] = PHASE_SUBMITTED
         is_implement = input.operation == IMPLEMENTATION_OPERATION
 
         if workflow_name == _SUBMITTED_UNKNOWN_NAME:
