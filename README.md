@@ -327,3 +327,40 @@ of `decide()`, the head-SHA anchor on stale findings, the
 paths driving `process_one()` against a real `tmp_path` worktree
 fixture with the GitHub API + implementer subprocess mocked at the
 module boundary.
+
+**Adopted PRs (mctlhq/mctl-agents#334).** A pull request opened by hand — or
+by any tool that is not `run_implementer.py` — has no proposal on disk, so
+`_discover_refs` cannot see it even when a gating bot leaves a blocking
+P1/P2 finding on it. `orchestrator/pr_adoption.py` adds a second, lightweight
+durable record beside `proposals/`: a `PRRef` written to
+`agents-state/<service>/adopted-prs/pr-<number>/.prref.yaml`, which the
+existing `process_one` / `run_implementer --review-feedback` path then
+drives exactly like a proposal's PR.
+
+The whole feature is default-off and inert until an operator sets both:
+
+- `SHEPHERD_ADOPT_PRS` (default `false`) — the master switch. `--adopt-prs`
+  forces it on for a single local run.
+- `SHEPHERD_ADOPT_REPOS` (default empty) — the allowlist of repos eligible
+  for adoption. Empty means nothing is adoptable even with the switch on.
+- `SHEPHERD_ADOPT_MAX_PRS_PER_TICK` (default `1`) — bound on adoption
+  records processed per tick, so the loop stays bounded regardless of how
+  many blocking-finding PRs a repo has open.
+
+A candidate PR is adopted only when it is same-repository (never a fork),
+its head branch is not the implementer's own `feat/agents-*` prefix, no
+proposal already owns it, no live `DevLoopWorkflow` owns it, the service
+does not resolve to `SKIP`, and — when the lifecycle ownership rollout is at
+least `observe` — the ownership store admits this shepherd. An adoption
+record is **always `FIX_ONLY`**: `decide()` can only ever return
+`defer-merge` for it, `merge_pr()` is never reached, and adoption therefore
+grants remediation, never merge authority (mctlhq/mctl-agents#344).
+
+**Durability caveat.** The shepherd ClusterWorkflowTemplate in `mctl-gitops`
+stages only `proposals/**` into its gitops commit today; `adopted-prs/**`
+lands separately in `mctlhq/mctl-gitops#1278`. Until that PR merges, every
+`.prref.yaml` this feature writes lives only in the pod's gitops worktree
+and is discarded at the end of each tick — `review_attempts`,
+`harness_failures` and `refusals` reset to zero every run. The shepherd
+prints a startup warning naming both facts whenever adoption is enabled.
+Do not enable `SHEPHERD_ADOPT_PRS` in production until both PRs are merged.
