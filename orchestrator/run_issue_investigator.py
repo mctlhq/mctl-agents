@@ -79,7 +79,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # orchestrator.temporal.issue_ref, neither of which pulls in
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
-from orchestrator import context_assembly
+from orchestrator import context_assembly, rate_limit
 from orchestrator.context_snapshot import ContextSnapshot
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
@@ -1390,17 +1390,20 @@ human reviewer should look at carefully (especially open questions).
     return prompt
 
 
-class RateLimitExhaustedError(RuntimeError):
-    """The SDK's final ResultMessage reported an API-level rate/usage-limit
-    rejection (``is_error`` True, ``api_error_status`` 429) rather than an
-    agent/tooling failure. Distinct from the generic ``Exception`` branch in
-    ``investigate()`` so the resulting ``InvestigateResult.error`` message is
-    unambiguous ("rate/usage limit exhausted" vs. an opaque agent/tooling
-    failure) to whatever's driving this call — the CWFT-level OAuth-fallback
-    retry for a direct/legacy trigger, or (since the phase-5 poller cutover)
-    the account-2 fallback inside the Argo-submitted investigate step that
-    DevLoopWorkflow's submit_and_wait activity kicks off.
-    """
+# Re-exported from the shared classifier (mctl-agents#364) so both agents
+# raise/catch the SAME class rather than two that merely look alike. Every
+# existing `except RateLimitExhaustedError` clause and
+# `tests/test_run_issue_investigator.py`'s import of this name keep working
+# unchanged — an assignment is not a new definition.
+#
+# Distinct from the generic ``Exception`` branch in ``investigate()`` so the
+# resulting ``InvestigateResult.error`` message is unambiguous ("rate/usage
+# limit exhausted" vs. an opaque agent/tooling failure) to whatever's driving
+# this call — the CWFT-level OAuth-fallback retry for a direct/legacy trigger,
+# or (since the phase-5 poller cutover) the account-2 fallback inside the
+# Argo-submitted investigate step that DevLoopWorkflow's submit_and_wait
+# activity kicks off.
+RateLimitExhaustedError = rate_limit.RateLimitExhaustedError
 
 
 class InvestigatorOrphanedSubagent(OrphanedSubagentError):
@@ -1488,11 +1491,7 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
             fallback that exists for exactly this case is never taken.
             """
             print(message)
-            if (
-                isinstance(message, ResultMessage)
-                and message.is_error
-                and message.api_error_status == 429
-            ):
+            if rate_limit.is_rate_limit_result(message):
                 raise RateLimitExhaustedError(
                     f"SDK reported api_error_status=429 (rate/usage limit "
                     f"exhausted): {message.result!r}"

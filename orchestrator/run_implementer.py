@@ -70,6 +70,30 @@ Idempotency:
     `--dry-run` reports a blocked proposal in its summary but never writes
     the marker and never changes the exit code.
 
+    A FOURTH outcome, distinct from the other three: the SDK's terminal
+    `ResultMessage` can report `is_error=True, api_error_status=429` --- the
+    run's OAuth/API-key account had already exhausted its `five_hour` or
+    `seven_day` usage window before the agent got a real turn (mctl-agents#364).
+    That is neither "succeeded" nor "failed" nor "blocked": the proposal did
+    nothing wrong and a human approved nothing incorrectly, so it is classified
+    `rate_limited` and left `status: accepted` (with the in-flight `attempt`
+    lease dropped) rather than parked in the operator-gated `needs-triage`
+    state a genuine no-commit failure gets. A durable, idempotent top-level
+    `rate_limited: {code, account, rate_limit_type, resets_at, resets_at_epoch,
+    overage_disabled_reason, since, observed_at, attempt_id, message}` block is
+    written instead, cleared on the next transition that already clears
+    `failure` (`implemented`/`merged`/`rejected`/`in-progress`). It never
+    counts toward `--max-proposals`, and a batch stops immediately after it --
+    an exhausted account is workflow-global, not proposal-specific. A batch
+    that ends with a rate-limited result and no success exits `EXIT_RATE_LIMITED`
+    and prints one stable stderr line naming the account, limit type and reset
+    time; `--review-feedback` mode classifies the same condition but writes
+    nothing to `.status.yaml` (the shepherd owns status there). See
+    `orchestrator/rate_limit.py`. The optional, non-secret `CLAUDE_OAUTH_ACCOUNT`
+    env var labels which account this process is running as (falls back to
+    deriving `primary`/`secondary` from the active token env var, else
+    `"unknown"`); it names no credential and is safe to set in a workflow spec.
+
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
@@ -134,6 +158,14 @@ from orchestrator.proposal_state import (
     load_status,
     now_iso,
     update_status_file,
+)
+from orchestrator.rate_limit import (
+    RateLimitExhaustedError,
+    RateLimitObservation,
+    account_label,
+    build_observation,
+    is_rate_limit_result,
+    observe_rate_limit_event,
 )
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
@@ -225,6 +257,23 @@ EXIT_FENCED = 48
 # it repeats every tick for the life of a leaked lease (claude P3 on
 # `31232dc`).
 EXIT_CLAIM_REFUSED = 49
+# The account's OAuth/API-key quota window (`five_hour` or `seven_day`) was
+# already exhausted when the SDK ran: the terminal `ResultMessage` reported
+# `is_error=True, api_error_status=429`, so the agent never got a real turn at
+# the proposal (mctl-agents#364). Not a failure of the proposal or the agent --
+# the proposal is left `accepted` rather than parked in `needs-triage`, and is
+# expected to succeed on its own once the window resets. Like 46-49 this is
+# non-charging, but it is DELIBERATELY ABSENT from the shepherd's
+# `deterministic_codes` set (`run_shepherd._followup_code_sets`): an unmapped
+# code already defaults to `kind="transient"` there, which is exactly the
+# "never counted toward the budget" contract
+# `orchestrator.run_issue_investigator.RateLimitExhaustedError` already gives
+# the investigator, so no shepherd-side set needs a new member for it.
+# mctl-gitops#1206 is the tracked follow-up that will teach
+# `cwft-mctl-agents-implement.yaml`'s `assert-attempt` step to key off this
+# code and the stderr line printed alongside it instead of guessing prose for
+# every possible implementer failure.
+EXIT_RATE_LIMITED = 50
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -242,6 +291,9 @@ REFUSAL_ERROR_PREFIX = "deliberate no-op:"
 FENCED_ERROR_PREFIX = "fenced:"
 # Prefix mapped to EXIT_CLAIM_REFUSED, raised by ImplementerClaimRefused.
 CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
+# Prefix mapped to EXIT_RATE_LIMITED, raised by RateLimitExhaustedError
+# (mctl-agents#364).
+RATE_LIMITED_ERROR_PREFIX = "rate limited:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -456,6 +508,14 @@ def _review_feedback_exit_code(error: str) -> int:
         because "a claim stood this attempt down" is what the operator needs
         to read either way.
 
+      - 50: the SDK's terminal ``ResultMessage`` reported ``is_error=True,
+        api_error_status=429`` — the account's usage window was already
+        exhausted before the agent got a real turn (mctl-agents#364). Not
+        reachable from any code the shepherd's ``deterministic_codes`` set
+        lists, so it falls to ``kind="transient"`` there and no
+        ``review_attempts`` slot is charged — re-running is expected to
+        succeed once the window resets on its own.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -477,6 +537,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_FENCED
     if error.startswith(CLAIM_REFUSED_ERROR_PREFIX):
         return EXIT_CLAIM_REFUSED
+    if error.startswith(RATE_LIMITED_ERROR_PREFIX):
+        return EXIT_RATE_LIMITED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -527,6 +589,21 @@ class ImplementResult:
     # `main()` avoid re-failing forever on a permanently blocked proposal.
     blocked_is_new: bool = False
     counts_toward_limit: bool = True
+    # True only for a RateLimitExhaustedError catch (mctl-agents#364): the
+    # account's quota window was already exhausted, not a failure of this
+    # proposal or of the agent. Distinct from `error` being merely truthy —
+    # `error` IS set alongside this (prefixed `RATE_LIMITED_ERROR_PREFIX`, for
+    # `_review_feedback_exit_code()` and any consumer that only reads that
+    # older channel) — so callers that need to single this outcome out (the
+    # batch loop stopping, `_batch_outcome()`'s own bucket) branch on this
+    # flag rather than parsing the message.
+    rate_limited: bool = False
+    # The evidence behind `rate_limited`, when set: the same
+    # `RateLimitObservation` written into `.status.yaml`'s `rate_limited`
+    # block. Carried here (rather than re-parsed from `error`) so `main()`'s
+    # batch summary can print the stable, greppable stderr line without
+    # touching `.status.yaml` again. `None` whenever `rate_limited` is False.
+    rate_limit_observation: RateLimitObservation | None = None
 
 
 @dataclass(frozen=True)
@@ -537,6 +614,9 @@ class BatchOutcome:
     # Trailing and defaulted so existing positional/keyword constructions
     # (e.g. BatchOutcome(succeeded=1, failed=1, skipped=1)) keep working.
     blocked: int = 0
+    # Same trailing-and-defaulted rule, added alongside `blocked` for the same
+    # reason (mctl-agents#364).
+    rate_limited: int = 0
 
 
 @dataclass(frozen=True)
@@ -1614,6 +1694,42 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
     # that point on the work is on disk, so an outer expiry during teardown must
     # not throw it away -- see the TimeoutError handler.
     drain_completed = False
+    # The latest `rejected` RateLimitEvent seen on the stream, if any --
+    # enrichment for the terminal 429 check below, since the CLI is not
+    # guaranteed to emit one before the closing ResultMessage
+    # (mctl-agents#364). `allowed`/`allowed_warning` events are ignored: they
+    # fire on a perfectly healthy run and would otherwise poison the account
+    # label/reset time recorded for an unrelated later failure.
+    last_rate_limit_info: Any | None = None
+
+    def _observe(message: Any) -> None:
+        """Print one message and raise iff it is the terminal 429 frame.
+
+        Shared between the main turn loop and `drain_until_settled`'s
+        `on_message` below, mirroring
+        `run_issue_investigator._run_agent`'s `_note`: a rate limit hit while
+        the drain awaits a delegated child, or on the parent's post-delegation
+        turn, must be classified exactly like one hit on the very first
+        frame -- otherwise the run falls through to `_has_new_commits` and
+        the exhausted account is recorded as `no-commits` instead
+        (mctl-agents#364, mirroring the loss mctl-agents#366 fixed for
+        orphaned sub-agents).
+        """
+        nonlocal last_rate_limit_info
+        print(message)
+        info = observe_rate_limit_event(message)
+        if info is not None and getattr(info, "status", None) == "rejected":
+            last_rate_limit_info = info
+        if is_rate_limit_result(message):
+            raise RateLimitExhaustedError(
+                f"SDK reported api_error_status=429 (rate/usage limit "
+                f"exhausted): {getattr(message, 'result', None)!r}",
+                build_observation(
+                    last_rate_limit_info,
+                    detail="terminal ResultMessage api_error_status=429",
+                ),
+            )
+
     try:
         with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
             async with ClaudeSDKClient(options=options) as client:
@@ -1642,7 +1758,7 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                 )
                 async with aclosing(stream):
                     async for message in stream:
-                        print(message)
+                        _observe(message)
                         ledger.observe(message)
                         # Also stop on stream exhaustion (the `async for` ending
                         # on its own): that means the CLI exited.
@@ -1658,6 +1774,7 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
                                 stream,
                                 ledger,
                                 timeout_s=IMPLEMENTER_DRAIN_TIMEOUT_SECONDS,
+                                on_message=_observe,
                             )
                         except OrphanedSubagentError as exc:
                             raise ImplementerOrphanedSubagent(
@@ -1912,6 +2029,24 @@ def review_feedback_one(
             ref=ref,
             pr_url=None,
             error=f"operation timed out: {e}",
+        )
+        return result
+    except RateLimitExhaustedError as e:
+        # SDK-level 429: the account's quota window is exhausted, not a
+        # failure of these findings (mctl-agents#364). The shepherd owns
+        # `.status.yaml` in review-feedback mode, so nothing is written here —
+        # only the exit code (`EXIT_RATE_LIMITED`, via
+        # `_review_feedback_exit_code()`'s `RATE_LIMITED_ERROR_PREFIX` match)
+        # tells it to treat this as transient and not charge a review attempt.
+        release_reason = "rate limited"
+        observation = e.observation or build_observation(None, detail=str(e))
+        result = ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=f"{RATE_LIMITED_ERROR_PREFIX} {e}",
+            rate_limited=True,
+            counts_toward_limit=False,
+            rate_limit_observation=observation,
         )
         return result
     except subprocess.CalledProcessError as e:
@@ -2473,6 +2608,123 @@ def _mark_blocked(
     return True
 
 
+def _mark_rate_limited(
+    ref: ProposalRef,
+    *,
+    observation: RateLimitObservation,
+    attempt_id: str,
+    message: str,
+    prior: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build the durable ``rate_limited`` block and write it, rolling the
+    proposal back to ``accepted`` (mctl-agents#364).
+
+    Unlike ``_mark_blocked``, this write cannot be skipped outright on an
+    unchanged observation: THIS attempt already stamped ``in-progress`` with
+    its own lease before the SDK ran, and that lease must be dropped or the
+    proposal is stranded out of `find_accepted_proposals`' selection with no
+    PR to trigger the shepherd's dead-letter recovery. What IS mirrored from
+    ``_mark_blocked``'s idempotent-write technique is ``since``: an unchanged
+    ``code``/``account``/``rate_limit_type``/``resets_at`` keeps the original
+    first-seen timestamp instead of restarting the clock on every tick, so a
+    multi-day account outage still reads as one continuous event rather than
+    a new one every ~30 minutes. (The optional guard in ``implement_one`` is
+    what turns a still-open, already-recorded window into a true no-write
+    skip, ahead of the ``in-progress`` transition entirely.)
+
+    ``prior`` -- the ``rate_limited`` block as it read from disk BEFORE this
+    attempt's own ``in-progress`` write cleared it -- is passed in by the
+    caller rather than re-read here on purpose: by the time this function
+    runs, `.status.yaml` on disk no longer carries the previous observation
+    (`implement_one` always writes `rate_limited=None` ahead of the SDK
+    call), so reading it from disk at this point would find nothing and
+    silently restart ``since`` on every tick of a genuinely continuing
+    outage (mctl-agents#364 P2).
+
+    Same compare-and-swap every other terminal write in ``implement_one``
+    performs (see ``_status_is_still_ours``, and ``_mark_needs_triage``'s use
+    of it): this write carries no ``attempt`` block of its own, but it DOES
+    drop the one this attempt stamped before the SDK ran, and it rolls the
+    proposal back to ``accepted`` — both wrong if a second executor's own
+    `attempt` now occupies `.status.yaml`. Returns ``None`` without writing
+    when the CAS declines, mirroring ``_mark_needs_triage``'s ``False``.
+    """
+    if not _status_is_still_ours(ref, attempt_id, doing="recording rate-limited"):
+        return None
+    since = None
+    if (
+        isinstance(prior, dict)
+        and prior.get("code") == "rate-limited"
+        and prior.get("account") == observation.account
+        and prior.get("rate_limit_type") == observation.rate_limit_type
+        and prior.get("resets_at") == observation.resets_at
+    ):
+        since = prior.get("since")
+    block: dict[str, Any] = {
+        "code": "rate-limited",
+        "account": observation.account,
+        "rate_limit_type": observation.rate_limit_type,
+        "resets_at": observation.resets_at,
+        "resets_at_epoch": observation.resets_at_epoch,
+        "overage_disabled_reason": observation.overage_disabled_reason,
+        "since": since or _now_iso(),
+        "observed_at": _now_iso(),
+        "attempt_id": attempt_id,
+        "message": message,
+    }
+    update_status_yaml(ref, "accepted", attempt=None, failure=None, rate_limited=block)
+    return block
+
+
+def _skip_while_rate_limited(ref: ProposalRef) -> str | None:
+    """Optional guard (mctl-agents#364): do not re-run into a known-closed
+    window.
+
+    When this proposal's LAST recorded ``rate_limited`` block names the
+    account THIS run is using, and that block's ``resets_at`` has not passed
+    yet, there is no point spending a clone and an SDK call to learn the same
+    fact again -- so the caller skips before either. Returns a human-readable
+    skip reason, or ``None`` to run normally.
+
+    Fails open in every ambiguous case, by design (this is the only part of
+    mctl-agents#364 that changes which proposals run, so it must never
+    withhold work on a bad or missing label): no ``rate_limited`` block, an
+    ``unknown`` account on either side, a mismatched account, or a
+    ``resets_at`` that does not parse as RFC 3339 -- including a value with
+    no timezone offset -- all return ``None``.
+    """
+    current = _load_status(ref.status_path).get("rate_limited")
+    if not isinstance(current, dict):
+        return None
+    recorded_account = current.get("account")
+    if not isinstance(recorded_account, str) or not recorded_account or recorded_account == "unknown":
+        return None
+    this_account = account_label()
+    if this_account == "unknown" or this_account != recorded_account:
+        return None
+    resets_at = current.get("resets_at")
+    if not isinstance(resets_at, str) or not resets_at:
+        return None
+    try:
+        resets_dt = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if resets_dt.tzinfo is None:
+        # RFC 3339 requires an offset; a timezone-naive value cannot be
+        # compared against the timezone-aware `datetime.now(UTC)` below
+        # without raising `TypeError` (mctl-agents#364 P2). Treat it the
+        # same as any other value that does not parse as RFC 3339, so the
+        # "fails open" promise above actually holds instead of crashing the
+        # batch.
+        return None
+    if resets_dt <= datetime.now(UTC):
+        return None
+    return (
+        f"rate-limited: account {recorded_account} window open until "
+        f"{resets_at}; skipping model call (mctl-agents#364)"
+    )
+
+
 def _push_and_open_pr(
     repo_dir: Path, ref: ProposalRef, *, claim_context: _ClaimContext | None = None
 ) -> str:
@@ -2590,6 +2842,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             blocked=None,
             notes=None,
             attempt=None,
+            rate_limited=None,
         )
         return ImplementResult(ref=ref, pr_url=existing.pr_url)
     if existing.action == "merged":
@@ -2603,6 +2856,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             blocked=None,
             notes=None,
             attempt=None,
+            rate_limited=None,
         )
         return ImplementResult(ref=ref, pr_url=existing.pr_url)
     if existing.action == "closed":
@@ -2614,6 +2868,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             notes="GitHub PR was closed without merging.",
             failure=None,
             blocked=None,
+            rate_limited=None,
         )
         return ImplementResult(
             ref=ref,
@@ -2632,6 +2887,19 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref=ref,
             pr_url=existing.pr_url,
             error=existing.reason or "existing result needs triage",
+        )
+
+    # Optional guard (mctl-agents#364), ahead of auth/claim/clone: this
+    # proposal's own last observation already answered "is the account THIS
+    # run is using still inside its recorded quota window", so do not spend a
+    # clone and an SDK call to learn it again. No `.status.yaml` write here —
+    # the recorded block is left exactly as it is.
+    if (skip_reason := _skip_while_rate_limited(ref)) is not None:
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason=skip_reason,
+            counts_toward_limit=False,
         )
 
     try:
@@ -2698,9 +2966,18 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             started + IMPLEMENT_ATTEMPT_LEASE
         ).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
     }
+    # Captured BEFORE the in-progress write below clears `rate_limited` from
+    # disk: `_mark_rate_limited`'s "preserve `since` on an unchanged
+    # observation" branch needs THIS attempt's own view of the prior block,
+    # because by the time a 429 might land, disk no longer has it
+    # (mctl-agents#364 P2).
+    prior_rate_limited = _load_status(ref.status_path).get("rate_limited")
+
     # Mark in-progress only after GitHub proves there is no prior result AND
     # the claim was not refused above.
-    update_status_yaml(ref, "in-progress", attempt=attempt, failure=None, blocked=None)
+    update_status_yaml(
+        ref, "in-progress", attempt=attempt, failure=None, blocked=None, rate_limited=None,
+    )
 
     target = None
     result: ImplementResult | None = None
@@ -2777,6 +3054,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=completed_attempt,
             failure=None,
             notes=None,
+            rate_limited=None,
         )
         _release_claim(claim_ctx, reason="implemented")
         result = ImplementResult(ref=ref, pr_url=pr_url)
@@ -2888,6 +3166,36 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         )
         result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
         return result
+    except RateLimitExhaustedError as e:
+        # SDK-level 429: the account's quota window is exhausted, not a
+        # failure of THIS proposal or of the agent (mctl-agents#364). Caught
+        # ahead of the generic `except Exception` below, mirroring
+        # `run_issue_investigator.investigate()`'s ordering for the same
+        # exception, so the record this proposal gets says "quota", not
+        # "no-commits" or "unexpected-error".
+        #
+        # Deliberately NOT `_mark_needs_triage`: that state is operator-gated
+        # (README.md) and a quota window resolves itself once it resets. Roll
+        # back to `accepted`, drop this attempt's lease, and leave a durable,
+        # idempotent `rate_limited` block instead so the proposal is
+        # re-selected on the next tick (or, once the guard above fires, held
+        # until the recorded window closes).
+        observation = e.observation or build_observation(None, detail=str(e))
+        msg = f"{RATE_LIMITED_ERROR_PREFIX} {e}"
+        recorded = _mark_rate_limited(
+            ref, observation=observation, attempt_id=attempt_id, message=msg,
+            prior=prior_rate_limited,
+        )
+        _release_claim(claim_ctx, reason="rate limited")
+        result = ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=_triage_error(msg, recorded is not None),
+            rate_limited=True,
+            counts_toward_limit=False,
+            rate_limit_observation=observation,
+        )
+        return result
     except subprocess.CalledProcessError as e:
         msg = f"shell step failed: {' '.join(e.cmd)}\nstdout: {e.stdout}\nstderr: {e.stderr}"
         recorded = _mark_needs_triage(
@@ -2956,7 +3264,9 @@ def _implement_refs(
         outcome = "aborted"
         try:
             result = implement_one(ref, dry_run=dry_run)
-            if result.error:
+            if result.rate_limited:
+                outcome = "rate-limited"
+            elif result.error:
                 outcome = "failed"
             elif result.blocked:
                 outcome = "blocked"
@@ -2974,6 +3284,14 @@ def _implement_refs(
         results.append(result)
         if result.counts_toward_limit:
             handled += 1
+        if result.rate_limited:
+            # An exhausted account is workflow-global, not proposal-specific —
+            # the same reasoning `implement_one` already applies to a failed
+            # SDK-auth check (see the `SystemExit` raise above it). Every
+            # other proposal in this batch shares the same account, so
+            # burning the rest of the queue against it would only reproduce
+            # this result once per remaining proposal (mctl-agents#364).
+            break
         if max_proposals and handled >= max_proposals:
             break
     return results
@@ -2982,14 +3300,17 @@ def _implement_refs(
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     """Classify every result; partial success must never mask a failure.
 
-    Order matters: error -> blocked -> skipped_reason -> pr_url. A blocked
-    result also carries a `skipped_reason` (for readers of that channel
-    alone), so it must be classified before the `skipped_reason` branch or
-    it would inflate the skip count.
+    Order matters: rate_limited -> error -> blocked -> skipped_reason ->
+    pr_url. A rate-limited result also carries `error` (for readers of that
+    older channel alone) and a blocked result also carries a `skipped_reason`
+    (same reason), so both must be classified ahead of the branch they would
+    otherwise double-count into.
     """
-    succeeded = failed = skipped = blocked = 0
+    succeeded = failed = skipped = blocked = rate_limited = 0
     for result in results:
-        if result.error:
+        if result.rate_limited:
+            rate_limited += 1
+        elif result.error:
             failed += 1
         elif result.blocked:
             blocked += 1
@@ -2999,7 +3320,13 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
             succeeded += 1
         else:
             failed += 1
-    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped, blocked=blocked)
+    return BatchOutcome(
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        rate_limited=rate_limited,
+    )
 
 
 def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
@@ -3202,7 +3529,9 @@ def main() -> None:
 
     print("\n=== Summary ===")
     for result in results:
-        if result.error:
+        if result.rate_limited:
+            print(f"  rate-limited {result.ref.service}/{result.ref.slug}: {result.error}")
+        elif result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
         elif result.blocked:
             print(f"  blocked {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
@@ -3225,10 +3554,32 @@ def main() -> None:
         f"{outcome.succeeded} succeeded, "
         f"{outcome.failed} failed, "
         f"{outcome.skipped} skipped, "
-        f"{outcome.blocked} blocked"
+        f"{outcome.blocked} blocked, "
+        f"{outcome.rate_limited} rate-limited"
     )
     if outcome.failed:
         sys.exit(1)
+    # A rate-limited result with no success means the account this run used
+    # was already out of quota before it ever got a real turn — printed as one
+    # stable, greppable stderr line (no emoji, no credential material) naming
+    # the account, limit type and reset time, so mctl-gitops#1206 can teach
+    # `cwft-mctl-agents-implement.yaml`'s `assert-attempt` step to key off it
+    # instead of guessing prose for every possible implementer failure. A
+    # batch that ALSO produced a PR still exits 0, same as the blocked-only
+    # check below, so real work is never reported red.
+    if outcome.rate_limited and not outcome.succeeded:
+        limited = next((r for r in results if r.rate_limited), None)
+        if limited is not None:
+            observation = limited.rate_limit_observation
+            account = observation.account if observation else "unknown"
+            rate_limit_type = observation.rate_limit_type if observation else None
+            resets_at = observation.resets_at if observation else None
+            print(
+                f"error: rate-limited: account={account} type={rate_limit_type} "
+                f"resets_at={resets_at} proposal={limited.ref.service}/{limited.ref.slug}",
+                file=sys.stderr,
+            )
+        sys.exit(EXIT_RATE_LIMITED)
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also
