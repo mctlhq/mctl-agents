@@ -67,8 +67,8 @@ jobs:
           owner: mctlhq
           repositories: mctl-gitops
 
-      # Both worker deployments are named, not just the control one. The
-      # queue split (ADR-008) runs two Deployments off this one image, and
+      # All three worker deployments are named, not just the control one.
+      # The queue split (ADR-008, D7) runs three Deployments off this one image, and
       # values_path names exactly the files to bump: a worker nobody names
       # is bumped by nobody and pins to whatever tag it launched with.
       # That is not a hypothetical — it is what left the shepherd on
@@ -97,7 +97,7 @@ jobs:
             -f team_name=admins \
             -f component_name=mctl-agents \
             -f values_glob="platform-gitops/argo-workflows/cluster-templates/cwft-mctl-agents-*.yaml" \
-            -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml,platform-gitops/services/admins/mctl-agents-worker-exec/values.yaml"
+            -f values_path="platform-gitops/services/admins/mctl-agents-worker/values.yaml,platform-gitops/services/admins/mctl-agents-worker-exec/values.yaml,platform-gitops/services/admins/mctl-agents-worker-implement/values.yaml"
 
       # Refresh the agent registry so DevLoopWorkflow resolves THIS release
       # rather than whatever was published last by hand. Nothing did this

@@ -57,9 +57,10 @@ consequence, not the criterion — a short activity in the critical path and
 a short activity in reconcile belong together.
 
 **D2 — One image, one deployment per role, selected by `--role`.**
-`python -m orchestrator.temporal.worker --role control|execution|all`.
-`all` stays the default so the current single deployment keeps working
-unchanged, and so a rollback is a values edit rather than a code revert.
+`python -m orchestrator.temporal.worker --role control|execution|implementation|all`
+(`implementation` added by D7). `all` stays the default so the current
+single deployment keeps working unchanged, and so a rollback is a values
+edit rather than a code revert.
 
 **D3 — Explicit slot limits per role, in configuration.**
 The point is that capacity is something configuration states and metrics
@@ -248,10 +249,57 @@ the one number D5 expects an operator to move, and the values file that
 sets it is where the queue-age alert that says it is wrong lives.
 
 The rollout repeats steps 1–4 in the same fail-closed order: role and
-queue first (this amendment), the deployment polling an empty queue
-second, the routing flip behind `workflow.patched("implement-queue")`
-third, attrition fourth. Only the implement submit is routed; `incidents.py`
-and `reconcile.py` keep `exec-queue`.
+queue first (mctl-agents#397, 1.47.0), the deployment polling an empty
+queue second (mctl-gitops#1287), the routing flip behind
+`workflow.patched("implement-queue")` third, attrition fourth. Only the
+implement submit is routed; `incidents.py` and `reconcile.py` keep
+`exec-queue`.
+
+**What the flip carries with it, and why it is the same change.** Moving
+the queue alone would have left the other half of the incident in place:
+an implementer that never ran and one that ran and failed both ended the
+loop as `Completed` with `implement.phase == "Failed"`, indistinguishable
+from success in every list of running loops. So the same release, behind
+a second marker `implement-outcome`, reads Argo's node graph for the
+implement operation (`implement_outcome.py`) and classifies the result:
+
+```text
+pre_start     no run-implementer pod ever ran     → resubmit, ≤ MAX_PRESTART_REQUEUES,
+                                                     no attempt counted, no human
+execution     the pod ran and did not succeed     → workflow FAILS, ImplementationFailed
+finalization  the pod succeeded, commit/assert    → workflow FAILS, ImplementationFinalizationFailed
+              did not
+success       the pod ran and committed           → the loop continues to merge detection
+```
+
+One honest limit of the rollout, measured rather than assumed: nothing in
+CI proves that a loop already running when `implement-outcome` deploys
+still completes on a failed implement. A history recorded before the
+marker ENDS at that failure — completing there is the old behaviour — so
+the only divergence today's code could produce sits in the final workflow
+task, and the replayer does not compare it (the capability table in
+`tests/test_workflow_replay.py` now records this, verified both ways). The
+SDK half of the promise, that an execution which replayed a missing marker
+keeps taking the unpatched branch for life, is covered by
+`tests/test_patch_memoization.py` against a real server. The branch is
+short-lived: once every loop started before the flip has passed
+`MERGE_WATCH_DEADLINE`, the guard and this paragraph go together.
+
+"Ran" is read from the marks a pod leaves on its node (`hostNodeName`, an
+exit code, a Succeeded phase) — never from the node's `startedAt`, which
+Argo stamps at node creation while the node may still be Pending on a
+mutex. Unknown (no node graph) is `execution`, because resubmitting an
+implementer that may have run is the duplicate-attempt failure the
+heartbeat-resume design exists to prevent.
+
+The attempt therefore begins when a pod is observed running, not at
+approval, not when a worker slot admits the activity, not when Argo
+accepts the workflow. `submit_and_wait` publishes that progression —
+`admitted → submitted → running`, with timestamps — as its second
+heartbeat detail. That heartbeat, read through Temporal's describe API,
+plus the workflow's `implement_execution` query (queued_at, requeues,
+outcome) is the runtime-state surface mctl-agents#389 projects from. Git
+remains durable lifecycle state; nothing is pushed there mid-attempt.
 
 ## Rollout order (fail-closed)
 

@@ -31,6 +31,7 @@ different issue's — proposal.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -74,7 +75,12 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
-    from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
+    from orchestrator.temporal.constants import (
+        EXECUTION_TASK_QUEUE,
+        IMPLEMENTATION_OPERATION,
+        IMPLEMENTATION_TASK_QUEUE,
+    )
+    from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
     from orchestrator.temporal.issue_ref import parse_issue_url
 
 ENVIRONMENT = "production"
@@ -94,6 +100,36 @@ ENVIRONMENT = "production"
 # retry forever.
 SDK_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 SDK_STEP_TIMEOUT = timedelta(hours=2)
+# Deliberately no schedule_to_start_timeout and no schedule_to_close_timeout
+# on submit_and_wait — see _run_cwft. On the implementation queue (#395) the
+# schedule-to-start wait IS the admission queue: bounding it would turn
+# "waiting for capacity" into a failure, which is the shape of the bug
+# admission exists to remove.
+
+# How many times an implement submit that never started an implementer pod
+# is re-submitted before the loop gives up (#395, implement_outcome.py).
+# A pre-start failure attempted nothing — it waited on capacity or a mutex
+# and was killed by a deadline, or Argo accepted the workflow and never
+# scheduled the pod — so it is not an implementation attempt and needs no
+# human. Bounded, because a cluster that cannot start pods at all must
+# eventually surface as a failed loop rather than resubmit forever.
+MAX_PRESTART_REQUEUES = 3
+# ...and waited between, so the bound is a time budget and not a burst.
+# A pre-start cause can be fast: Argo accepts the workflow and the pod is
+# never scheduled (quota, taint, an admission webhook), which comes back in
+# seconds. Requeueing straight away would spend all three tries before the
+# transient condition could clear and fail a loop that a minute of patience
+# would have saved. The sleep costs nothing — a requeue is not an attempt,
+# and the wait does not touch the implementation slot, which the completed
+# activity already released.
+#
+# The budget is also spent by the Argo-side mutex: admission lets N
+# implement submits exist at once, so if the CWFT's `synchronization` mutex
+# is narrower than N, the surplus queues inside Argo against its own
+# deadline and comes back pre_start. That is requeued rather than lost, but
+# N and the mutex capacity have to move together — ADR-008 D7 records that
+# the gitops mutex is expected to be at least N.
+PRESTART_REQUEUE_BACKOFF = timedelta(minutes=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 
 FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
@@ -496,6 +532,24 @@ async def _run_cwft(
     # MERGE_WATCH_DEADLINE. Only executions started after this deploy route
     # to exec. Pinned by tests/test_patch_memoization.py; the opposite was
     # asserted in ADR-008 until agy caught it on #282.
+    #
+    # ADR-008 D7 (#395): the implement submit alone goes one step further,
+    # to the admission queue. Its slot limit is the number of implementer
+    # runs allowed to exist at once; with no free slot this activity stays
+    # Scheduled in Temporal and no Argo workflow is created. The marker is
+    # consulted only for that operation so other operations' histories do
+    # not record a decision they never make, and it nests under exec-queue
+    # in intent: a loop new enough to route implement is new enough to
+    # route everything else to exec.
+    if operation == IMPLEMENTATION_OPERATION and workflow.patched("implement-queue"):
+        return await workflow.execute_activity(
+            submit_and_wait,
+            SubmitAndWaitInput(operation=operation, params=params),
+            task_queue=IMPLEMENTATION_TASK_QUEUE,
+            start_to_close_timeout=step_timeout,
+            heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
+            retry_policy=SDK_STEP_RETRY_POLICY,
+        )
     if workflow.patched("exec-queue"):
         return await workflow.execute_activity(
             submit_and_wait,
@@ -709,9 +763,31 @@ def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class ImplementExecutionState:
+    """What THIS workflow knows about its implement step, for #389.
+
+    Deliberately only the orchestrator's half. Whether the activity is
+    still Scheduled (waiting on capacity), admitted, submitted or running
+    is Temporal's and Argo's knowledge — `describe_workflow_execution`'s
+    pending activity plus its heartbeat details carry it — and a query
+    that guessed at it would be a second runtime-state surface.
+    """
+
+    # "" before the implement step; "implementer" from the first submit.
+    stage: str = ""
+    # When the current implement submit was scheduled. Admission wait is
+    # measured from here; a pre-start requeue resets it.
+    queued_at: str | None = None
+    prestart_requeues: int = 0
+    # success | pre_start | execution | finalization, once the step ended.
+    outcome: str | None = None
+
+
 @workflow.defn
 class DevLoopWorkflow:
     def __init__(self) -> None:
+        self._implement_state = ImplementExecutionState()
         # Which cadence this execution runs at. Bound for real in _watch_pr,
         # once, off the `fast-shepherd-cadence` marker; CADENCE here so every
         # path that reads it before the watch starts (and every unit test that
@@ -749,6 +825,11 @@ class DevLoopWorkflow:
         self._last_lifecycle_op = ""
         self._last_lifecycle_op_landed = False
         self._claim_abandoned = False
+
+    @workflow.query
+    def implement_execution(self) -> ImplementExecutionState:
+        """The orchestrator's view of the implement step (#389, #395)."""
+        return self._implement_state
 
     @workflow.query
     def shepherd_in_loop(self) -> bool:
@@ -954,8 +1035,7 @@ class DevLoopWorkflow:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
-        implement_result = await _run_cwft("mctl-agents-implement", implement_params)
-        await _record("implementer", implementer_release, implement_result, target_repo)
+        implement_result = await self._implement(implementer_release, implement_params, target_repo)
 
         # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
         # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
@@ -1003,6 +1083,87 @@ class DevLoopWorkflow:
             deploy=deploy,
             incidents=incidents,
         )
+
+    async def _implement(
+        self,
+        implementer_release: ResolvedRelease | None,
+        params: dict[str, str],
+        target_repo: str,
+    ) -> WorkflowResult:
+        """Submit the implementer, requeue pre-start failures, fail loudly.
+
+        Before #395 this was one submit whose result was recorded and then
+        carried to the end of the loop: an implementer that never ran and
+        one that ran and failed both ended the workflow as Completed with
+        `implement.phase == "Failed"`. On 2026-09-19 six such loops read as
+        success while six approved proposals sat untouched.
+
+        Now the outcome is classified (implement_outcome.py) and:
+
+        - `pre_start` is resubmitted, up to MAX_PRESTART_REQUEUES, without
+          counting an implementation attempt — nothing was attempted;
+        - `execution` and `finalization` fail the workflow with a typed
+          ApplicationError carrying the result, so the loop's terminal
+          status is the truth and a human is pointed at the right layer.
+
+        Guarded by `implement-outcome`: an execution that predates the
+        marker keeps the recorded behaviour (single submit, Completed).
+        """
+        requeues = 0
+        while True:
+            self._implement_state = ImplementExecutionState(
+                stage="implementer",
+                queued_at=workflow.now().isoformat().replace("+00:00", "Z"),
+                prestart_requeues=requeues,
+            )
+            result = await _run_cwft(IMPLEMENTATION_OPERATION, params)
+            await _record("implementer", implementer_release, result, target_repo)
+
+            if not workflow.patched("implement-outcome"):
+                return result
+
+            outcome: Outcome = classify(
+                result.phase,
+                implementer_ran=result.implementer_ran,
+                implementer_phase=result.implementer_phase,
+                finalization_phase=result.finalization_phase,
+            )
+            self._implement_state = dataclasses.replace(self._implement_state, outcome=outcome)
+
+            if outcome == "success":
+                return result
+            if outcome == "pre_start" and requeues < MAX_PRESTART_REQUEUES:
+                requeues += 1
+                workflow.logger.warning(
+                    "implementer for %s never started (%s, %s); requeueing %d/%d without "
+                    "counting an attempt",
+                    target_repo,
+                    result.workflow_name,
+                    result.phase,
+                    requeues,
+                    MAX_PRESTART_REQUEUES,
+                )
+                await workflow.sleep(PRESTART_REQUEUE_BACKOFF)
+                continue
+
+            error_type = {
+                "pre_start": "ImplementationNotStarted",
+                "execution": "ImplementationFailed",
+                "finalization": "ImplementationFinalizationFailed",
+            }[outcome]
+            raise ApplicationError(
+                f"implementation of {target_repo} ended {result.phase} ({outcome}) in Argo "
+                f"workflow {result.workflow_name}"
+                + (f" after {requeues} pre-start requeues" if requeues else "")
+                + (
+                    f": {finalization_evidence(result.finalization_phase)}"
+                    if outcome == "finalization"
+                    else ""
+                ),
+                result,
+                type=error_type,
+                non_retryable=True,
+            )
 
     async def _watch_incidents(self, service: str, since: str) -> IncidentWatch:
         """Collect incidents raised against ``service`` during the window.

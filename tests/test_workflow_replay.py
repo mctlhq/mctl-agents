@@ -27,6 +27,17 @@ Measured against these fixtures, on temporalio 1.31.0:
 | `task_queue=` added to an existing activity | invisible |
 | `start_to_close_timeout` changed | invisible |
 | an extra argument added to an existing activity | invisible |
+| a divergence in the LAST recorded workflow task | invisible |
+
+That last row was measured for #395 and is the reason there is no fixture
+here for "a loop that predates `implement-outcome` still completes on a
+failed implement". A history recorded before the marker ends the moment the
+implement fails — completing right there is exactly the old behaviour — so
+the only divergence today's code could produce sits in the final workflow
+task, and replay does not compare it. Verified both ways on temporalio
+1.31.0: the same extra `submit_and_wait` command turns the dev_loop_full
+fixtures red, where it lands mid-history, and replays clean on a history
+that ends at the implement.
 
 Two consequences, both load-bearing:
 
@@ -75,7 +86,7 @@ from temporalio.client import WorkflowHistory
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 
-from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
+from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE, IMPLEMENTATION_TASK_QUEUE
 from tests.replay_scenarios import SCENARIOS, Scenario, record, scenario_by_name
 
 pytestmark = pytest.mark.anyio
@@ -265,6 +276,64 @@ async def test_todays_code_still_routes_and_still_guards() -> None:
     )
 
 
+def _activity_scheduled_attrs(events: list[dict], name: str) -> list[dict]:
+    return [
+        e["activityTaskScheduledEventAttributes"]
+        for e in events
+        if e["eventType"] == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+        and e["activityTaskScheduledEventAttributes"]["activityType"]["name"] == name
+    ]
+
+
+async def test_todays_dev_loop_admits_the_implement_submit_on_its_own_queue() -> None:
+    """The #395 flip, verified the only way routing can be: from history.
+
+    Three things, each load-bearing on its own:
+
+    - the `implement-queue` marker is recorded, so a rollback replays and
+      the history says which queue this execution used;
+    - the implement submit is scheduled on the admission queue and EVERY
+      other submit_and_wait stays on exec — routing investigate or approve
+      to the admission queue would spend implementer capacity on them;
+    - the implement submit carries NO schedule-to-start and NO
+      schedule-to-close timeout. On the admission queue the schedule-to-
+      start wait is the queue itself; a bound there turns "waiting for
+      capacity" back into a failure, one layer earlier than the bug this
+      fixes. The server records an unset timeout as its own ten-year cap
+      rather than as zero, so the assertion below tolerates both and
+      rejects only a bound a run could actually hit.
+    """
+    scenario = scenario_by_name("dev_loop_full")
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        handle = await record(env.client, scenario)
+        history = await handle.fetch_history()
+
+    events = history.to_json_dict()["events"]
+    ids = _patch_ids(events)
+    assert "implement-queue" in ids
+    assert "exec-queue" in ids
+
+    submits = [(a, a["taskQueue"]["name"]) for a in _activity_scheduled_attrs(events, "submit_and_wait")]
+    queues = [queue for _, queue in submits]
+    assert IMPLEMENTATION_TASK_QUEUE in queues, f"no submit reached the admission queue: {queues}"
+    assert queues.count(IMPLEMENTATION_TASK_QUEUE) == 1, f"more than the implement submit was admitted: {queues}"
+    assert all(q in (IMPLEMENTATION_TASK_QUEUE, EXECUTION_TASK_QUEUE) for q in queues), queues
+
+    # The server records an UNSET schedule-to-start/close as its own cap
+    # (ten years, 315360000s), not as zero — so "no timeout" is asserted
+    # as "not a bound anyone could hit", one year being far beyond every
+    # deadline in this workflow. A real value set "for safety" would be
+    # hours and fails here.
+    one_year = 365 * 24 * 3600
+    for attrs, queue in submits:
+        for key in ("scheduleToStartTimeout", "scheduleToCloseTimeout"):
+            value = attrs.get(key)
+            seconds = float(value.rstrip("s")) if isinstance(value, str) and value.endswith("s") else 0.0
+            assert value is None or seconds == 0 or seconds >= one_year, (
+                f"submit_and_wait on {queue} has {key}={value!r}; a capacity wait must not be a timeout"
+            )
+
+
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
 def test_every_history_actually_reaches_submit_and_wait(scenario: Scenario) -> None:
     """Guards against a vacuous fixture.
@@ -292,3 +361,4 @@ def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     on_disk = {p.name for p in Path(HISTORY_DIR).glob("*.json")}
     expected = {s.path.name for s in SCENARIOS} | {s.patched_path.name for s in SCENARIOS}
     assert on_disk == expected
+
