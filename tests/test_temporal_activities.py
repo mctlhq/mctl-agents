@@ -17,6 +17,7 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
+from orchestrator.temporal.activities.identity import MintRequest, mint_execution_context
 from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
@@ -396,6 +397,62 @@ class TestRecordExecution:
                     phase="Succeeded",
                 ),
             )
+
+
+class TestMintExecutionContext:
+    _REQUEST = MintRequest(
+        trace_id="a" * 32,
+        workflow_type="investigate",
+        actor_type="github_user",
+        actor_id="octocat",
+        actor_verification="signal-asserted",
+        executor_type="issue-investigator",
+        trigger_type="github_issue",
+        temporal_workflow_id="dev-loop-mctlhq-mctl-agents-196",
+        executor_agent="issue-investigator",
+        executor_version="1.0.0",
+        argo_workflow_name="mctl-agents-investigate-ab12cd34",
+    )
+
+    async def test_posts_the_sealed_context_and_reports_stored(self, env, monkeypatch):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/api/v1/agents/executions/context"
+            assert request.headers["authorization"] == "Bearer test-token"
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(201, json={"ok": True})
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(mint_execution_context, self._REQUEST)
+
+        assert result.stored is True
+        assert result.context_id == seen["body"]["context_id"]
+        assert result.trace_id == "a" * 32
+        assert seen["body"]["assertions"]["asserted_by"] == "control-plane"
+        assert seen["body"]["actor"]["id"] == "octocat"
+        assert seen["body"]["executor"]["agent"] == "issue-investigator"
+        assert seen["body"]["correlation"]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-agents-196"
+
+    async def test_degrades_to_a_local_unverified_context_on_a_non_2xx_response(self, env, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": "down"})
+
+        _mock_async_client(monkeypatch, handler)
+        result = await env.run(mint_execution_context, self._REQUEST)
+
+        assert result.stored is False
+        assert result.context_id
+        assert result.trace_id == "a" * 32
+
+    async def test_degrades_without_raising_when_mctl_token_is_unset(self, env, monkeypatch):
+        monkeypatch.delenv("MCTL_TOKEN", raising=False)
+
+        result = await env.run(mint_execution_context, self._REQUEST)
+
+        assert result.stored is False
+        assert result.context_id
+        assert result.trace_id == "a" * 32
 
 
 class TestDiscoverAndProject:

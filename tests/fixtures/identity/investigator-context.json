@@ -1,0 +1,55 @@
+{
+  "actor": {
+    "id": "octocat",
+    "type": "github_user",
+    "verification": "control-plane-verified"
+  },
+  "api_version": "identity.mctl.ai/v1alpha1",
+  "assertions": {
+    "asserted_by": "control-plane",
+    "asserted_fields": [
+      "actor",
+      "executor.type",
+      "executor.agent",
+      "executor.version",
+      "correlation"
+    ],
+    "declared_fields": [
+      "scope.target_repository_sha"
+    ]
+  },
+  "content_hash": "sha256:c5618d6437519c299d8bd29f48358e59fe03e42188e274f9e8a97fb12e5a4b07",
+  "context_id": "ex-c5618d6437519c29",
+  "correlation": {
+    "argo_workflow_name": "mctl-agents-investigate-fake",
+    "attempt": 0,
+    "temporal_run_id": "run-1",
+    "temporal_workflow_id": "dev-loop-mctlhq-mctl-agents-196"
+  },
+  "executor": {
+    "agent": "issue-investigator",
+    "binding": "mctl-agents-investigate-fake:issue-investigator",
+    "id": "",
+    "image_ref": "ghcr.io/mctlhq/issue-investigator@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "type": "issue-investigator",
+    "version": "1.0.0"
+  },
+  "issued_at": "2026-09-19T00:00:00Z",
+  "kind": "ExecutionContext",
+  "parent_context_id": null,
+  "scope": {
+    "environment": "production",
+    "repository": "mctlhq/mctl-agents",
+    "service": "mctl-agents",
+    "slug": "",
+    "target_repository_sha": "cccccccccccccccccccccccccccccccccccccccc",
+    "tenant": "mctlhq"
+  },
+  "step_sequence": 0,
+  "trace_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "trigger": {
+    "ref": "https://github.com/mctlhq/mctl-agents/issues/196",
+    "type": "github_issue"
+  },
+  "workflow_type": "investigate"
+}

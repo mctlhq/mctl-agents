@@ -1865,14 +1865,14 @@ def test_a_background_swap_after_the_agent_returns_cannot_redirect_writes(
 
     real_write = run_issue_investigator.write_status_yaml
 
-    def _swap_the_path_the_agent_saw(proposal_dir, issue_data):
+    def _swap_the_path_the_agent_saw(proposal_dir, issue_data, *args):
         # Stands in for a leftover background process: it can only act on
         # the path it observed, which is no longer where the work is.
         old = seen["staging"]
         if old.exists() or old.is_symlink():
             shutil.rmtree(old, ignore_errors=True)
             old.symlink_to(victim)
-        return real_write(proposal_dir, issue_data)
+        return real_write(proposal_dir, issue_data, *args)
 
     monkeypatch.setattr(
         run_issue_investigator, "write_status_yaml", _swap_the_path_the_agent_saw
@@ -1917,10 +1917,10 @@ def test_the_staging_wrapper_is_not_writable_while_the_work_happens(
 
     real_write = run_issue_investigator.write_status_yaml
 
-    def _note_wrapper_mode(proposal_dir, issue_data):
+    def _note_wrapper_mode(proposal_dir, issue_data, *args):
         # proposal_dir here IS staging; its parent is the wrapper.
         observed["mode"] = stat.S_IMODE(proposal_dir.parent.stat().st_mode)
-        return real_write(proposal_dir, issue_data)
+        return real_write(proposal_dir, issue_data, *args)
 
     issue = _investigate_harness(
         tmp_path, monkeypatch, number=52,

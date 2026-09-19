@@ -41,6 +41,7 @@ from orchestrator.temporal.activities.deploy_state import (
     resolve_deploy_target,
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
+from orchestrator.temporal.activities.identity import mint_execution_context
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
@@ -452,6 +453,10 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
     short_activities: list[Callable[..., Any]] = [
         resolve_agent_release,
         record_execution,
+        # mctlhq/mctl-agents#196 (ADR 011): one sub-second HTTP round trip to
+        # mctl-api, same shape as record_execution two lines up — belongs on
+        # the control queue for the same reason.
+        mint_execution_context,
         lifecycle_ownership,
         execution_claim,
         # Short in the sense this list means: bounded GitHub reads plus a

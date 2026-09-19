@@ -438,6 +438,16 @@ future work this ADR fixes the seam for, not work it performs:
 | (d) Emitting `to_log_dict()`'s attributes into #195 traces | mctlhq/mctl-agents#195 |
 | (e) Per-file enumeration of agent-directed reads inside `target-repo` sources, replacing the single `selector.mode: agent-directed` source with a real per-file list (sec. 8) | needs an issue |
 
+`ExecutionCorrelation` now has a producer: ADR 011
+(`docs/adr/011-execution-identity-contract.md`,
+`orchestrator/execution_identity.py`) defines `ExecutionContext.
+to_execution_correlation()`, which projects this block from a sealed
+identity context plus an `ExecutionPlan`'s version/hash fields, so a caller
+holding both no longer hand-builds `ExecutionCorrelation` itself. The
+dependency stays one-way, exactly as this ADR requires: `ExecutionContext`
+projects into `ExecutionCorrelation`, this module is never imported by
+`orchestrator/execution_identity.py` at module scope.
+
 ## Implementation map
 
 This PR changes only:

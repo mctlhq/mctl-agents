@@ -12,6 +12,38 @@ from config.settings import MCTL_MCP_URL
 from orchestrator.resolver import ExecutionPlan
 
 
+def _execution_context_headers() -> dict[str, str]:
+    """`X-Mctl-Execution-Context` / `X-Mctl-Trace-Id` (mctlhq/mctl-agents#196,
+    ADR 011: docs/adr/011-execution-identity-contract.md) — present only when
+    the CWFT actually wrote a sealed context to
+    `MCTL_EXECUTION_CONTEXT_FILE`, absent (never present-but-empty) otherwise,
+    mirroring this module's own convention for MCTL_TOKEN/mctl_mcp_config.
+    Every `mcp__mctl__*` call then carries the identity with zero agent
+    cooperation; a local run or a test with no context file adds nothing.
+
+    Deferred import: orchestrator.execution_identity is stdlib-only and meant
+    to be importable by the long-lived Temporal worker too — nothing here
+    requires importing it at options.py's own module scope.
+    """
+    from orchestrator.execution_identity import (
+        MCTL_EXECUTION_CONTEXT_FILE_ENV,
+        ExecutionIdentityError,
+        load_from_environment,
+    )
+
+    if not os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip():
+        return {}
+    try:
+        # executor_type is only consulted on the local-mint fallback branch,
+        # which this call never takes (the file is present) — the value
+        # passed here is inert.
+        context = load_from_environment(executor_type="system")
+    except ExecutionIdentityError as exc:
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); omitting identity headers.")
+        return {}
+    return {"X-Mctl-Execution-Context": context.context_id, "X-Mctl-Trace-Id": context.trace_id}
+
+
 def mctl_mcp_config(*, always_load: bool = False) -> dict:
     """MCP config for https://api.mctl.ai/mcp.
 
@@ -47,7 +79,7 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     server_config: dict[str, Any] = {
         "type": "http",
         "url": MCTL_MCP_URL,
-        "headers": {"Authorization": f"Bearer {token}"},
+        "headers": {"Authorization": f"Bearer {token}", **_execution_context_headers()},
     }
     if always_load:
         server_config["alwaysLoad"] = True
@@ -227,7 +259,18 @@ async def _audit_pre_tool_use(
     _context: Any,
 ) -> dict[str, Any]:
     """Log Bash invocations. Orchestrator git/gh wrappers already print `$ cmd`;
-    this covers the SDK Bash tool the model runs under acceptEdits (SOC F8)."""
+    this covers the SDK Bash tool the model runs under acceptEdits (SOC F8).
+
+    Reads the execution context id fresh on every call (mctlhq/mctl-agents
+    #196, ADR 011) rather than a value captured in a closure at hook-build
+    time: `_command_audit_hooks()` is called once per `build_*_options()`
+    invocation, and two builders resolving the identical config for the same
+    run must be able to compare `==` (tests/test_options.py's declarative-
+    vs-legacy equivalence tests) — a closure over a freshly-defined inner
+    function breaks that even when its captured value is identical, since two
+    distinct function objects are never `==`. `_execution_context_headers()`
+    reading `os.environ` again per call is cheap next to a Bash tool call.
+    """
     tool_name = ""
     tool_input: dict[str, Any] = {}
     if isinstance(input_data, dict):
@@ -235,10 +278,12 @@ async def _audit_pre_tool_use(
         raw = input_data.get("tool_input") or {}
         if isinstance(raw, dict):
             tool_input = raw
+    execution_context_id = _execution_context_headers().get("X-Mctl-Execution-Context", "")
+    context_suffix = f" execution_context={execution_context_id}" if execution_context_id else ""
     if tool_name == "Bash":
-        print(f"AUDIT tool=Bash cmd={tool_input.get('command', '')!r}")
+        print(f"AUDIT tool=Bash cmd={tool_input.get('command', '')!r}{context_suffix}")
     else:
-        print(f"AUDIT tool={tool_name}")
+        print(f"AUDIT tool={tool_name}{context_suffix}")
     return {}
 
 
