@@ -14,12 +14,21 @@ from pathlib import Path
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from orchestrator.directives import acked_comment_ids, parse_comments
+from orchestrator.run_issue_directive_poller import (
+    TERMINAL_STATUSES as DIRECTIVE_TERMINAL_STATUSES,
+)
+from orchestrator.run_issue_directive_poller import (
+    issue_url_for,
+    read_issue_comments,
+)
 from orchestrator.run_shepherd import (
     RECONCILE_INPUT_STATUSES,
     _discover_refs,
     find_pr_for_proposal,
 )
 from orchestrator.temporal.activities.gitops_state import (
+    ProposalStateRef,
     fetch_pr_snapshots,
     list_proposal_refs,
 )
@@ -36,9 +45,30 @@ class ProposalProjection:
 
 
 @dataclass(frozen=True)
+class StaleDirective:
+    """A directive-shaped comment newer than its proposal's recorded
+    `updated_at`, with no matching acknowledgement — belt-and-braces for the
+    case where `run_issue_directive_poller`'s own scan is broken, down, or
+    capped-out (mctl-agents#417). Report-only: reconcile never dispatches or
+    writes anything for this condition — see ReconcileWorkflow.
+    """
+
+    service: str
+    slug: str
+    issue_url: str
+    comment_id: str
+    author: str
+
+
+@dataclass(frozen=True)
 class ReconcileDiscoveryResult:
     total_inspected: int
     projections: list[ProposalProjection]
+    #: None on a filesystem-backed sweep (`_sync_discover_and_project`,
+    #: which has no `updated_at` to compare against) and on any result
+    #: recorded before this field existed. Populated only on the
+    #: GitHub-backed path (`_discover_from_github`, production).
+    stale_directives: list[StaleDirective] | None = None
 
 
 def _sync_discover_and_project(state_dir: Path) -> ReconcileDiscoveryResult:
@@ -91,8 +121,54 @@ def _project(status: str, merged: bool, closed_unmerged: bool, repo: str, number
     return status, None
 
 
+async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective]:
+    """Every unacked directive-shaped comment newer than its proposal's
+    `updated_at`, across `refs`. One `gh issue view` per ref, same
+    per-issue tolerance `run_issue_directive_poller.scan` has: a `gh`
+    failure on one issue is logged and the sweep continues with the rest.
+
+    `updated_at` missing (a status file older than #417, or one that
+    genuinely never records it) makes ANY unacked directive on that issue
+    stale — there is nothing to compare against, and reporting nothing
+    would be exactly the silence this check exists to catch.
+    """
+    stale: list[StaleDirective] = []
+    for ref in refs:
+        issue_url = issue_url_for(ref.service, ref.slug)
+        if issue_url is None:
+            continue
+        try:
+            comments = await asyncio.to_thread(read_issue_comments, issue_url)
+        except Exception as exc:  # noqa: BLE001 — one issue's comments must not blind the sweep to the rest
+            activity.logger.warning(
+                "reconcile: could not read comments for %s (%s); skipping "
+                "directive-staleness check for this proposal",
+                issue_url,
+                exc,
+            )
+            continue
+
+        acked = acked_comment_ids(comments)
+        for directive in parse_comments(comments):
+            if not directive.comment_id or directive.comment_id in acked:
+                continue
+            if ref.updated_at and directive.created_at and directive.created_at <= ref.updated_at:
+                continue
+            stale.append(
+                StaleDirective(
+                    service=ref.service,
+                    slug=ref.slug,
+                    issue_url=issue_url,
+                    comment_id=directive.comment_id,
+                    author=directive.author,
+                )
+            )
+    return stale
+
+
 async def _discover_from_github() -> ReconcileDiscoveryResult:
-    refs = [r for r in await list_proposal_refs() if r.status in RECONCILE_INPUT_STATUSES]
+    all_refs = await list_proposal_refs()
+    refs = [r for r in all_refs if r.status in RECONCILE_INPUT_STATUSES]
     snapshots = await fetch_pr_snapshots(refs)
 
     projections: list[ProposalProjection] = []
@@ -115,7 +191,17 @@ async def _discover_from_github() -> ReconcileDiscoveryResult:
                 )
             )
 
-    return ReconcileDiscoveryResult(total_inspected=len(refs), projections=projections)
+    # Deliberately a WIDER set than `refs` above: RECONCILE_INPUT_STATUSES
+    # excludes "proposed", which is exactly the status a `reinvestigate`
+    # directive acts on (#395's proposal never left it). Anything not
+    # DIRECTIVE_TERMINAL_STATUSES is a candidate, same filter
+    # run_issue_directive_poller.scan applies.
+    directive_candidates = [r for r in all_refs if r.status not in DIRECTIVE_TERMINAL_STATUSES]
+    stale_directives = await _stale_directives(directive_candidates)
+
+    return ReconcileDiscoveryResult(
+        total_inspected=len(refs), projections=projections, stale_directives=stale_directives
+    )
 
 
 @activity.defn

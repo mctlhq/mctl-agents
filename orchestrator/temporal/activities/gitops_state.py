@@ -54,7 +54,7 @@ TREE_URL = (
 # Bound on the blob cache. Well above today's 212 proposals, and small
 # enough that a worker that never restarts cannot grow it without limit.
 _BLOB_CACHE_MAX = 4096
-_blob_cache: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
+_blob_cache: OrderedDict[str, tuple[str, str | None, str]] = OrderedDict()
 
 # How many blob/PR reads to have in flight at once. The worker shares one
 # GitHub token with every dev loop; a burst of 200 parallel reads would
@@ -74,6 +74,12 @@ class ProposalStateRef:
     slug: str
     status: str
     pr_url: str | None
+    #: The `.status.yaml` `updated_at` string (RFC 3339, or "" when absent
+    #: or unparseable) — a field extraction from the blob already being
+    #: read, not a second fetch. Defaulted so a ref built before this field
+    #: existed still constructs. mctl-agents#417's directive-staleness
+    #: report compares a comment's timestamp against this value.
+    updated_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -120,32 +126,35 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
-def _cache_get(sha: str) -> tuple[str, str | None] | None:
+def _cache_get(sha: str) -> tuple[str, str | None, str] | None:
     hit = _blob_cache.get(sha)
     if hit is not None:
         _blob_cache.move_to_end(sha)
     return hit
 
 
-def _cache_put(sha: str, value: tuple[str, str | None]) -> None:
+def _cache_put(sha: str, value: tuple[str, str | None, str]) -> None:
     _blob_cache[sha] = value
     _blob_cache.move_to_end(sha)
     while len(_blob_cache) > _BLOB_CACHE_MAX:
         _blob_cache.popitem(last=False)
 
 
-def _parse_status_yaml(text: str) -> tuple[str, str | None]:
-    """Return (status, pr_url) from a .status.yaml body.
+def _parse_status_yaml(text: str) -> tuple[str, str | None, str]:
+    """Return (status, pr_url, updated_at) from a .status.yaml body.
 
     Mirrors run_shepherd._load_status: flat YAML written by the
     investigator, defaulting to "proposed" the way _discover_refs does.
+    `updated_at` defaults to "" — a missing or unparseable field is not an
+    error here, it is a status file older than mctl-agents#417.
     """
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("status file is not a mapping")
     status = str(data.get("status", "proposed"))
     pr = data.get("pr")
-    return status, str(pr) if pr else None
+    updated_at = data.get("updated_at")
+    return status, str(pr) if pr else None, str(updated_at) if updated_at else ""
 
 
 async def _resolve_token_async() -> str:
@@ -177,7 +186,7 @@ async def _get_json(client: httpx.AsyncClient, url: str, token: str) -> object:
         raise ProposalListingError(f"non-JSON payload from {url}") from exc
 
 
-async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> tuple[str, str | None]:
+async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> tuple[str, str | None, str]:
     cached = _cache_get(sha)
     if cached is not None:
         return cached
@@ -258,7 +267,7 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
         async def one(service: str, slug: str, sha: str) -> ProposalStateRef | None:
             async with semaphore:
                 try:
-                    status, pr_url = await _read_blob(client, sha, token)
+                    status, pr_url, updated_at = await _read_blob(client, sha, token)
                 except (ValueError, yaml.YAMLError) as exc:
                     # One unparseable status file must not blind the sweep to
                     # the other 200 — same tolerance _discover_refs has.
@@ -269,7 +278,9 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                         exc,
                     )
                     return None
-            return ProposalStateRef(service=service, slug=slug, status=status, pr_url=pr_url)
+            return ProposalStateRef(
+                service=service, slug=slug, status=status, pr_url=pr_url, updated_at=updated_at
+            )
 
         results = await _gather_or_raise([one(s, g, sha) for s, g, sha in paths])
 

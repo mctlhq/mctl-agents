@@ -1763,6 +1763,124 @@ class TestReconcileReadsGitHub:
         with pytest.raises(ProposalListingError):
             await env.run(discover_and_project, "")
 
+    async def test_updated_at_is_extracted_from_the_status_blob(self, env, monkeypatch):
+        """mctlhq/mctl-agents#417: a field extraction from the blob already
+        being read, not a second fetch."""
+        from orchestrator.temporal.activities.gitops_state import list_proposal_refs
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-updated-at")]
+            ),
+            blobs={
+                "sha-updated-at": (
+                    "status: implemented\n"
+                    "updated_at: '2026-09-19T10:00:00Z'\n"
+                )
+            },
+            pulls={},
+        )
+
+        refs = await env.run(list_proposal_refs)
+        assert [r.updated_at for r in refs] == ["2026-09-19T10:00:00Z"]
+
+    async def test_a_status_file_missing_updated_at_yields_empty_string(self, env, monkeypatch):
+        from orchestrator.temporal.activities.gitops_state import list_proposal_refs
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree([("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-old")]),
+            blobs={"sha-old": "status: implemented\n"},
+            pulls={},
+        )
+
+        refs = await env.run(list_proposal_refs)
+        assert refs[0].updated_at == ""
+
+    async def test_a_newer_unacked_directive_is_reported_stale(self, env, monkeypatch):
+        """The condition mctlhq/mctl-agents#417's reconcile report exists
+        for: run_issue_directive_poller's own scan missed it (broken, down,
+        or capped-out), and reconcile is the belt-and-braces that notices."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-proposed")]
+            ),
+            blobs={
+                "sha-proposed": (
+                    "status: proposed\n"
+                    "updated_at: '2026-09-19T10:00:00Z'\n"
+                )
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T12:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [d.comment_id for d in result.stale_directives] == ["c1"]
+        assert result.stale_directives[0].service == "mctl-web"
+        assert result.stale_directives[0].slug == "issue-9-fix"
+        # "proposed" is excluded from RECONCILE_INPUT_STATUSES — the
+        # projection sweep never looks at it — but the directive-staleness
+        # check must, since it is exactly the status a reinvestigate
+        # directive acts on.
+        assert result.total_inspected == 0
+
+    async def test_an_acked_directive_is_not_reported_stale(self, env, monkeypatch):
+        from orchestrator.directives import RawComment, ack_trailer
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-proposed-acked")]
+            ),
+            blobs={
+                "sha-proposed-acked": (
+                    "status: proposed\n"
+                    "updated_at: '2026-09-19T10:00:00Z'\n"
+                )
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T12:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                ),
+                RawComment(
+                    id="ack1", author="mctl-agents[bot]", created_at="2026-09-19T12:05:00Z",
+                    body=f"done\n\n{ack_trailer('c1')}", author_association="NONE",
+                ),
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.stale_directives == []
 
 def _implement_status(phase: str, nodes: dict | None) -> dict:
     status = {"phase": phase, "startedAt": "2026-09-19T00:12:31Z"}

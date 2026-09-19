@@ -45,7 +45,7 @@ from orchestrator.temporal.activities.deploy_state import (
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.incidents import list_service_incidents
-from orchestrator.temporal.activities.issue_poll import poll_issues_activity
+from orchestrator.temporal.activities.issue_poll import directive_scan_activity, poll_issues_activity
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
 from orchestrator.temporal.activities.lifecycle_reconcile import (
     reconcile_lifecycle_ownership,
@@ -480,6 +480,11 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         detect_orphans,
         visibility.list_active_dev_loop_ids,
         poll_issues_activity,
+        # Second pass of the same tick (#417): reads GitHub issue comments
+        # and, at most, POSTs a `gh issue comment` reply plus one mctl-api
+        # submit — the same shape as poll_issues_activity, so it belongs on
+        # the same queue for the same reason.
+        directive_scan_activity,
     ]
     workflows: list[type] = [
         DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow
