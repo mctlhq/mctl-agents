@@ -3395,3 +3395,175 @@ def test_investigator_rate_limit_reaches_investigate_as_rate_limited(tmp_path, m
 
     assert result.rate_limited is True
     assert result.error is not None and "429" in result.error
+
+
+# ---------------------------------------------------------------------------
+# _context_mode / context-assembly wiring (mctlhq/mctl-agents#265)
+# ---------------------------------------------------------------------------
+def test_context_mode_defaults_to_off(monkeypatch):
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", raising=False)
+    assert run_issue_investigator._context_mode() == "off"
+
+
+def test_context_mode_rejects_an_invalid_value(monkeypatch):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", "bogus")
+    with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_CONTEXT_MODE"):
+        run_issue_investigator._context_mode()
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "on"])
+def test_context_mode_accepts_every_documented_value(monkeypatch, mode):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", mode)
+    assert run_issue_investigator._context_mode() == mode
+
+
+def test_build_prompt_with_context_none_matches_the_no_kwarg_call():
+    """T9: the keyword-only `context` parameter defaults to None, and an
+    explicit `context=None` must be byte-identical to the call every
+    existing caller already makes."""
+    issue = _issue(number=265, title="Add context assembly")
+    with_default = run_issue_investigator._build_prompt(issue, "mctl-agents", "issue-265-x")
+    with_explicit_none = run_issue_investigator._build_prompt(
+        issue, "mctl-agents", "issue-265-x", context=None
+    )
+    assert with_default == with_explicit_none
+
+
+def test_legacy_allowed_tools_matches_options_builder(tmp_path, monkeypatch):
+    """Regression guard on the intentional duplication documented at
+    `_LEGACY_ALLOWED_TOOLS`'s definition: the hardcoded legacy tuple must
+    equal `build_issue_investigator_options`'s allowed_tools minus the
+    conditional `mcp__mctl__*` glob (absent here since MCTL_TOKEN is unset)."""
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    from orchestrator.options import build_issue_investigator_options
+
+    options = build_issue_investigator_options(tmp_path, "some-model", tmp_path)
+    assert tuple(options.allowed_tools) == run_issue_investigator._LEGACY_ALLOWED_TOOLS
+
+
+def _shadow_harness(tmp_path, monkeypatch, *, mode, agent):
+    """Like _investigate_harness, but with a real-enough clone directory for
+    `_target_repository_sha` and the context env var set."""
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", mode)
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "a" * 40)
+    return _investigate_harness(tmp_path, monkeypatch, agent=agent, number=265)
+
+
+def test_shadow_mode_prompt_is_byte_identical_to_off_and_seals_a_snapshot(tmp_path, monkeypatch, capsys):
+    """T10."""
+    seen_prompts: list[str] = []
+
+    def agent(repo_dir, prompt, proposal_dir):
+        seen_prompts.append(prompt)
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="shadow", agent=agent)
+    shadow_result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert shadow_result.error is None
+
+    off_prompt = run_issue_investigator._build_prompt(issue, "mctl-telegram", "issue-265-some-feature")
+    assert seen_prompts[0] == off_prompt
+
+    out = capsys.readouterr().out
+    assert "[context] context_assembly=" in out
+    published_status = yaml.safe_load((shadow_result.proposal_dir / ".status.yaml").read_text())
+    assert "context" in published_status
+    assert published_status["context"]["snapshot_id"].startswith("cs-")
+
+
+def test_on_mode_appends_context_and_still_publishes(tmp_path, monkeypatch):
+    seen_prompts: list[str] = []
+
+    def agent(repo_dir, prompt, proposal_dir):
+        seen_prompts.append(prompt)
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="on", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+    assert "## Assembled context" in seen_prompts[0] or seen_prompts[0] == run_issue_investigator._build_prompt(
+        issue, "mctl-telegram", "issue-265-some-feature"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T11 — failure policy
+# ---------------------------------------------------------------------------
+def test_a_context_assembly_failure_in_shadow_mode_still_publishes(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("collector exploded")
+
+    monkeypatch.setattr(run_issue_investigator.context_assembly, "assemble_investigator_context", boom)
+
+    def agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="shadow", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+
+
+def test_a_context_assembly_failure_in_on_mode_fails_the_run(tmp_path, monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("collector exploded")
+
+    monkeypatch.setattr(run_issue_investigator.context_assembly, "assemble_investigator_context", boom)
+
+    def agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="on", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is not None
+    assert "collector exploded" in result.error
+
+
+# ---------------------------------------------------------------------------
+# T12 — status correlation
+# ---------------------------------------------------------------------------
+def test_write_status_yaml_with_a_snapshot_is_additive_and_agrees(tmp_path):
+    from orchestrator import context_snapshot as cs
+
+    proposal_dir = tmp_path / "proposals" / "issue-265-x"
+    execution = cs.ExecutionCorrelation(
+        agent="issue-investigator",
+        environment="production",
+        temporal_workflow_id="dev-loop-mctlhq-mctl-agents-265",
+        target_repository_sha="a" * 40,
+        definition_version="legacy",
+        definition_content_hash="sha256:" + "1a" * 32,
+        profile_version="legacy",
+        profile_content_hash="sha256:" + "2b" * 32,
+        release_revision=0,
+    )
+    snapshot = cs.seal(
+        execution=execution,
+        strategy=cs.ContextStrategy(name="deterministic-fixed-order", version="1.0.0"),
+        budget=cs.ContextBudget(
+            max_sources=12, max_bytes=120000, max_bytes_per_source=50000, used_sources=0, used_bytes=0,
+        ),
+        retention=cs.RetentionPolicy(class_="execution-record", expires_after_days=180),
+        created_at="2026-09-19T00:00:00Z",
+    )
+    status_path = write_status_yaml(proposal_dir, _issue(), snapshot=snapshot)
+
+    published = yaml.safe_load(status_path.read_text())
+    assert published["context"] == {
+        "snapshot_id": snapshot.snapshot_id,
+        "content_hash": snapshot.content_hash,
+        "strategy": "deterministic-fixed-order",
+        "strategy_version": "1.0.0",
+    }
+    assert run_issue_investigator._status_disagreements(published, _issue()) == []
+
+    # Re-reading through the same fstatat-guarded path publish() uses.
+    fd = os.open(str(proposal_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        reread = run_issue_investigator._read_published_status(fd)
+    finally:
+        os.close(fd)
+    assert reread["context"]["snapshot_id"] == snapshot.snapshot_id
