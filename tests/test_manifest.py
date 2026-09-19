@@ -212,6 +212,78 @@ def test_a_missing_gitops_checkout_fails_under_ci(tmp_path, monkeypatch) -> None
     assert errors and "absent" in errors[0]
 
 
+def test_catalog_profile_granting_human_request_input_still_matches(tmp_path, monkeypatch) -> None:
+    """T18 (mctl-agents#333, ADR 011): `_CAPABILITY_TOOLS` excuses exactly
+    the forward-declared capability, and nothing else.
+
+    A profile listing `human.request_input` alongside the real
+    issue-investigator tool grant must still pass — the legacy builder
+    (`build_issue_investigator_options`, what this profile's
+    `runtime.optionsBuilder` names) never emits the capability, and the
+    check subtracts it from both sides before comparing.
+    """
+    from orchestrator.options import build_issue_investigator_options
+
+    # check_catalog_profiles_match_builders forces MCTL_TOKEN to a dummy
+    # value for the duration of its own builder call (see _DUMMY_MCTL_TOKEN);
+    # matching that here keeps "mcp__mctl__*"'s presence in real_tools
+    # independent of whatever MCTL_TOKEN happens to be set to in this process.
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    real_tools = build_issue_investigator_options(
+        tmp_path, "dummy-model", tmp_path / "proposal"
+    ).allowed_tools
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump({
+            "spec": {
+                "tools": [*real_tools, "human.request_input"],
+                "modelPolicyRef": {"task": "service_agent"},
+                "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert errors == [], errors
+
+
+def test_catalog_profile_with_unrelated_extra_tool_still_fails(tmp_path, monkeypatch) -> None:
+    """The other half of T18: `_CAPABILITY_TOOLS` excuses ONLY the one
+    forward-declared entry — a real drift (an unrelated extra tool) must
+    still turn the check red."""
+    from orchestrator.options import build_issue_investigator_options
+
+    # check_catalog_profiles_match_builders forces MCTL_TOKEN to a dummy
+    # value for the duration of its own builder call (see _DUMMY_MCTL_TOKEN);
+    # matching that here keeps "mcp__mctl__*"'s presence in real_tools
+    # independent of whatever MCTL_TOKEN happens to be set to in this process.
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    real_tools = build_issue_investigator_options(
+        tmp_path, "dummy-model", tmp_path / "proposal"
+    ).allowed_tools
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump({
+            "spec": {
+                "tools": [*real_tools, "human.request_input", "NotARealTool"],
+                "modelPolicyRef": {"task": "service_agent"},
+                "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert any("NotARealTool" in e or "spec.tools" in e for e in errors), errors
+
+
 def test_no_duplicate_manifest_names() -> None:
     """load_all() itself raises ManifestError on a duplicate — this test just
     documents that MANIFESTS having loaded at module level is already proof,

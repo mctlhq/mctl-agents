@@ -41,6 +41,7 @@ from orchestrator.temporal.activities.deploy_state import (
     resolve_deploy_target,
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
+from orchestrator.temporal.activities.human_input import find_human_input_request
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
@@ -461,6 +462,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # one — nothing here waits on a mutex or an Argo run.
         reconcile_lifecycle_ownership,
         find_proposal_slug,
+        find_human_input_request,
         get_pr_state,
         resolve_deploy_target,
         get_release_after,

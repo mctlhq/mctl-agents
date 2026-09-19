@@ -59,6 +59,29 @@ def _mctl_tool_globs() -> list[str]:
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
+# The durable human-clarification primitive (mctlhq/mctl-agents#333, ADR 011).
+# A capability entry in `ExecutionPlan.tools`, not an SDK tool name — a model
+# cannot "call" it, so it must never leak into `allowed_tools` (the CLI would
+# hold a dead allow-list entry). See `plan_grants_human_input` and
+# `build_issue_investigator_options_from_plan`'s filtering below, and
+# `orchestrator/validate_manifest.py`'s `_CAPABILITY_TOOLS`, which subtracts
+# it before the two set-equality checks against options.py's real output.
+HUMAN_INPUT_CAPABILITY = "human.request_input"
+
+
+def plan_grants_human_input(plan: ExecutionPlan) -> bool:
+    """Does the resolved plan grant the durable clarification capability?
+
+    True only when `HUMAN_INPUT_CAPABILITY` is literally present in
+    `plan.tools` — the resolved `ExecutionPlan`'s authoritative allow-list
+    (ADR 007). There is no plan at all in `legacy` resolver mode
+    (`build_issue_investigator_options`, the module-constant-driven builder),
+    so the capability is always ungranted there; callers must not invent a
+    truthy answer for that mode.
+    """
+    return HUMAN_INPUT_CAPABILITY in plan.tools
+
+
 def _positive_seconds(name: str, *, default: float) -> float:
     """Read a wall-clock env var, falling back loudly on a non-positive value.
 
@@ -456,7 +479,13 @@ def build_issue_investigator_options_from_plan(
     design (claude P2 on #234, third round; earlier rounds fixed (2) alone).
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
-    allowed_tools = [t for t in plan.tools if t != "mcp__mctl__*"]
+    # HUMAN_INPUT_CAPABILITY is filtered out alongside "mcp__mctl__*": both
+    # are entries in plan.tools that are not literal SDK tool names, so
+    # passing either through to allowed_tools verbatim would leave a dead
+    # entry the CLI can never match against a real tool call.
+    allowed_tools = [
+        t for t in plan.tools if t not in ("mcp__mctl__*", HUMAN_INPUT_CAPABILITY)
+    ]
     if "mcp__mctl__*" in plan.tools:
         allowed_tools += _mctl_tool_globs()
     return ClaudeAgentOptions(
