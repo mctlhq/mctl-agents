@@ -5,7 +5,10 @@ TEMPORAL_NAMESPACE=mctl-agents — see mctl-gitops's
 infra-components/data/temporal/tenant-namespace-job.yaml for the namespace +
 search-attribute registration) and runs DevLoopWorkflow, ReconcileWorkflow,
 IssuePollWorkflow, IncidentLoopWorkflow plus their activities on task queue TASK_QUEUE.
-Deployed as its own service (mctl-agents-worker, ingress disabled).
+Deployed as its own service (mctl-agents-worker, ingress disabled), with the
+long Argo waits served by sibling deployments selected by `--role`:
+`execution` (mctl-dev-loop-exec, ADR-008) and `implementation`
+(mctl-dev-loop-implement, the admission queue of #395).
 """
 from __future__ import annotations
 
@@ -58,6 +61,8 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
+    IMPLEMENTATION_TASK_QUEUE,
     METRICS_PORT,
     TASK_QUEUE,
 )
@@ -352,7 +357,7 @@ async def setup_schedules(client: Client) -> None:
     await _ensure_schedule(client, INCIDENTS_SCHEDULE_ID, incidents_schedule, "IncidentLoopWorkflow")
 
 
-ROLES = ("all", "control", "execution")
+ROLES = ("all", "control", "execution", "implementation")
 
 
 @dataclass(frozen=True)
@@ -429,12 +434,17 @@ def telemetry_config() -> TelemetryConfig:
 def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan]:
     """The queue/registration layout for one role — one plan per queue.
 
-    A list, because `all` must poll BOTH queues. It is the documented
-    rollback target, and after the routing flip patched histories schedule
-    submit_and_wait onto the execution queue: an `all` process listening
-    only on the control queue would leave those activities with no poller
-    until they time out, so collapsing the split deployments back would
-    not be a rollback at all (codex P1 on #249).
+    A list, because `all` must poll EVERY queue. It is the documented
+    rollback target, and after a routing flip patched histories schedule
+    submit_and_wait onto the execution or implementation queue: an `all`
+    process listening only on the control queue would leave those
+    activities with no poller until they time out, so collapsing the split
+    deployments back would not be a rollback at all (codex P1 on #249).
+
+    `implementation` is the admission queue (#395): the same activity as
+    `execution`, on its own queue, with a slot limit that IS the number of
+    implementer runs allowed to exist at once. Only the implement submit
+    routes there; everything else long stays on `execution` at 40.
 
     `all` is the default and is byte-for-byte the single-queue worker this
     repo has always run — same queue, same activities, no slot limits — so
@@ -482,8 +492,17 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     )
 
+    implementation_plan = WorkerPlan(
+        task_queue=IMPLEMENTATION_TASK_QUEUE,
+        workflows=[],
+        activities=[submit_and_wait],
+        max_concurrent_activities=IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
+    )
+
     if role == "execution":
         return [execution_plan]
+    if role == "implementation":
+        return [implementation_plan]
     if role == "control":
         return [WorkerPlan(
             task_queue=TASK_QUEUE,
@@ -496,8 +515,11 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             max_concurrent_activities=CONTROL_MAX_CONCURRENT_ACTIVITIES,
             max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
         )]
-    # `all`: one process, both queues, no limits — the pre-split shape plus
-    # a poller for the queue the routing flip starts using.
+    # `all`: one process, every queue, no limits on the control queue — the
+    # pre-split shape plus a poller for each queue a routing flip uses.
+    # The implementation plan keeps its limit even here: `all` polling the
+    # admission queue unbounded would be a rollback that silently removes
+    # the capacity it exists to impose.
     return [
         WorkerPlan(
             task_queue=TASK_QUEUE,
@@ -505,6 +527,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             activities=[*short_activities, submit_and_wait],
         ),
         execution_plan,
+        implementation_plan,
     ]
 
 
@@ -532,8 +555,10 @@ async def main() -> None:
         default=os.environ.get("WORKER_ROLE", "all"),
         choices=ROLES,
         help=(
-            "which half of the split this process serves (ADR-008). "
-            "'all' — one process, one queue, as before (default)."
+            "which part of the split this process serves (ADR-008, #395): "
+            "'control', 'execution', 'implementation' (the admission queue, "
+            "capacity IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES), or 'all' — "
+            "one process polling every queue (default)."
         ),
     )
     args = parser.parse_args()

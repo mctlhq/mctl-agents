@@ -30,6 +30,8 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES,
+    IMPLEMENTATION_TASK_QUEUE,
     METRICS_PORT,
     TASK_QUEUE,
 )
@@ -67,18 +69,87 @@ def test_all_keeps_the_original_control_queue_shape(visibility):
     assert control.max_concurrent_activities is None
 
 
-def test_all_also_polls_the_execution_queue(visibility):
+def test_all_also_polls_every_routed_queue(visibility):
     """`all` is the documented rollback target, so it has to work as one.
 
-    After the routing flip, patched histories schedule submit_and_wait onto the
-    execution queue. Collapsing the split deployments back to a process
-    that listens only on the control queue would leave those activities
-    with no poller until they time out — a rollback that strands work is
-    not a rollback (codex P1 on #249).
+    After a routing flip, patched histories schedule submit_and_wait onto
+    the execution or implementation queue. Collapsing the split deployments
+    back to a process that listens only on the control queue would leave
+    those activities with no poller until they time out — a rollback that
+    strands work is not a rollback (codex P1 on #249).
     """
     queues = {p.task_queue for p in worker_plans("all", visibility)}
 
-    assert queues == {TASK_QUEUE, EXECUTION_TASK_QUEUE}
+    assert queues == {TASK_QUEUE, EXECUTION_TASK_QUEUE, IMPLEMENTATION_TASK_QUEUE}
+
+
+def test_all_keeps_the_admission_limit_on_the_implementation_queue(visibility):
+    """The one limit `all` must NOT drop.
+
+    Control and execution run unbounded under `all` because their limits
+    are about starvation, and a single dev process has none. The
+    implementation limit is different in kind: it is the admission
+    capacity (#395). An `all` process admitting everything would be a
+    rollback that silently removes the property the queue exists for.
+    """
+    plans = worker_plans("all", visibility)
+    implementation = next(p for p in plans if p.task_queue == IMPLEMENTATION_TASK_QUEUE)
+
+    assert implementation.max_concurrent_activities == IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES
+    assert implementation.activity_names == {"submit_and_wait"}
+
+
+def test_the_implementation_worker_polls_only_the_admission_queue(visibility):
+    """Same activity as execution, different queue, its own capacity.
+
+    It runs no workflows and serves nothing else: a short activity landing
+    here would take an implementation slot from an implementer, and a
+    second long operation would make N mean two things at once.
+    """
+    plans = worker_plans("implementation", visibility)
+
+    assert [p.task_queue for p in plans] == [IMPLEMENTATION_TASK_QUEUE]
+    assert plans[0].activity_names == {"submit_and_wait"}
+    assert plans[0].workflows == []
+    assert plans[0].max_concurrent_activities == IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES
+    assert plans[0].max_concurrent_workflow_tasks is None
+
+
+def test_the_execution_worker_is_untouched_by_the_admission_queue(visibility):
+    """#395 adds a queue; it does not re-shape the one ADR-008 built.
+
+    Lowering exec from 40, or making it poll the admission queue too,
+    would re-couple investigate/reconcile/incidents to implementer
+    capacity — exactly the coupling the split removed.
+    """
+    plans = worker_plans("execution", visibility)
+
+    assert [p.task_queue for p in plans] == [EXECUTION_TASK_QUEUE]
+    assert plans[0].max_concurrent_activities == EXECUTION_MAX_CONCURRENT_ACTIVITIES
+    assert EXECUTION_MAX_CONCURRENT_ACTIVITIES == 40
+
+
+def test_implementation_capacity_is_read_from_the_environment(monkeypatch):
+    """N is the number an operator moves, so it comes from values.yaml via
+    env — not from a constant that needs a code release to change."""
+    from orchestrator.temporal import constants
+
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "5")
+    assert constants._int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3) == 5
+
+    monkeypatch.delenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES")
+    assert constants._int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3) == 3
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
+def test_a_capacity_that_admits_nothing_is_refused_at_startup(monkeypatch, bad):
+    """Zero or garbage must not become a worker that polls and admits
+    nothing forever — that is a queue nobody reads with extra steps."""
+    from orchestrator.temporal import constants
+
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", bad)
+    with pytest.raises(SystemExit):
+        constants._int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3)
 
 
 def test_the_execution_worker_polls_only_the_new_queue(visibility):
@@ -198,6 +269,7 @@ def test_only_workflow_running_roles_own_the_schedules():
     assert owns_schedules("all") is True
     assert owns_schedules("control") is True
     assert owns_schedules("execution") is False
+    assert owns_schedules("implementation") is False
 
 
 def test_no_control_ceiling_is_lowered_before_the_routing_flip():

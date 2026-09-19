@@ -2,6 +2,8 @@
 """
 from __future__ import annotations
 
+import os
+
 TASK_QUEUE = "mctl-dev-loop"
 
 # The second queue from ADR-008. Split by HOLDING TIME, not by importance:
@@ -41,6 +43,59 @@ CONTROL_MAX_CONCURRENT_ACTIVITIES = 100
 CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS: int | None = None
 
 EXECUTION_MAX_CONCURRENT_ACTIVITIES = 40
+
+# The third queue (#395, #396). Split by ADMISSION, not by holding time:
+# it carries exactly one operation, the implementer submit, and its slot
+# limit IS the implementation capacity. An activity scheduled here with no
+# free slot stays Scheduled in Temporal — no Argo workflow is created, no
+# Argo deadline starts — which is the whole point. On 2026-09-19 nine
+# approvals reached Argo at once and queued on a capacity-1 mutex INSIDE
+# the execution layer; six of them died of their own deadline before ever
+# reaching the head of that queue.
+#
+# `mctl-dev-loop-exec` keeps investigate, reconcile and incidents at 40.
+# Lowering that to N would re-couple the workloads ADR-008 separated.
+#
+# Nothing schedules onto this queue yet. The routing flip is a later,
+# separately-releasable step guarded by workflow.patched("implement-queue"),
+# for the same reason as EXECUTION_TASK_QUEUE: the worker has to be polling
+# before any workflow targets it.
+IMPLEMENTATION_TASK_QUEUE = "mctl-dev-loop-implement"
+
+# The one operation that routes to it. Named once so the routing branch,
+# the dev-loop's submit and the tests all spell the same string.
+IMPLEMENTATION_OPERATION = "mctl-agents-implement"
+
+
+def _int_env(name: str, default: int) -> int:
+    """A positive integer from the environment, or the default.
+
+    A malformed or non-positive value is a configuration error, not a
+    reason to run with whatever capacity the parse happens to yield —
+    zero here would be a worker that admits nothing, forever, silently.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise SystemExit(f"{name} must be at least 1, got {value}")
+    return value
+
+
+# Implementation capacity, N. Read from the environment rather than fixed
+# here because it is the one number an operator is expected to move, and
+# ADR-008 D5 says capacity is something configuration states and metrics
+# are read against — the gitops values file is where N sits next to the
+# schedule-to-start alert that tells you it is wrong.
+#
+# It is a per-PROCESS limit, not a distributed semaphore: capacity is
+# replicas times N. That is why the implementation deployment is pinned to one
+# replica and mctl-gitops fails CI if that changes (#1285).
+IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES = _int_env("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", 3)
 
 # Where the Temporal SDK's Prometheus exporter binds (ADR-008 D5, #252).
 #
