@@ -1173,6 +1173,69 @@ def find_accepted_proposals(
     return refs
 
 
+def build_adopted_ref(state_dir: Path, pr_url: str) -> ProposalRef:
+    """Build a ``ProposalRef`` for a proposal-less adopted PR
+    (mctlhq/mctl-agents#334): ``--adopted-pr <url>`` drives an EXISTING
+    adoption record, never creates one — only the shepherd's own discovery
+    pass (``orchestrator.pr_adoption.discover_adoptable``) adopts. A missing
+    record is a hard exit; there is no fallback that invents one here.
+
+    Returns an ordinary ``ProposalRef`` (this module's class, not a
+    ``pr_adoption.PRRef`` — that class lives in a module this one must not
+    import at module level, since ``pr_adoption`` imports ``run_shepherd``,
+    not this file, and duck-typing across the two ``ProposalRef`` shapes is
+    the established pattern here, see ``run_shepherd.reconcile_one``'s
+    cross-module call into this module). ``proposal_dir`` is the record's
+    own directory and ``status_path`` is overridden to point at
+    ``.prref.yaml`` instead of the base class's ``.status.yaml``.
+    """
+    parsed = _parse_pr_url(pr_url)
+    if parsed is None:
+        print(f"--adopted-pr is not a GitHub PR URL: {pr_url!r}", file=sys.stderr)
+        sys.exit(2)
+    repo, number = parsed
+    service = repo.split("/")[-1]
+    proposal_dir = state_dir / service / "adopted-prs" / f"pr-{number}"
+    status_path = proposal_dir / ".prref.yaml"
+    if not status_path.exists():
+        print(
+            f"No adoption record found at {status_path}. The implementer "
+            "never adopts a PR itself — only the shepherd's discovery pass "
+            "does (mctlhq/mctl-agents#334).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    data = load_status(status_path)
+    ref = ProposalRef(
+        service=service,
+        slug=f"pr-{number}",
+        proposal_dir=proposal_dir,
+        status=str(data.get("status", "adopted")),
+    )
+    ref.status_path = status_path
+    return ref
+
+
+def _adopted_pr_is_fork(repo: str, number: int) -> bool:
+    """Second, independent fork check (mctlhq/mctl-agents#334) — defence in
+    depth. The shepherd's own discovery pass already refuses a fork PR; this
+    repeats the check inside the process that will actually push, and
+    immediately before the clone, so the one mutation this feature performs
+    is never gated on the scheduler alone having gotten it right.
+    """
+    data = _github_json(["gh", "api", f"repos/{repo}/pulls/{number}"])
+    if not isinstance(data, dict):
+        raise GitHubPreflightError(f"unexpected response shape for {repo}#{number}")
+    head = data.get("head") or {}
+    head_repo = head.get("repo") or {}
+    if bool(head_repo.get("fork")):
+        return True
+    base_repo = (data.get("base") or {}).get("repo") or {}
+    head_owner = (head_repo.get("owner") or {}).get("login") or ""
+    base_owner = (base_repo.get("owner") or {}).get("login") or ""
+    return bool(head_owner) and head_owner != base_owner
+
+
 # ---------------------------------------------------------------------------
 # Implementation
 # ---------------------------------------------------------------------------
@@ -1285,7 +1348,26 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
                 f.write(f"{entry}\n")
 
 
-def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
+def _adopted_pr_number(ref: ProposalRef) -> int | None:
+    """The PR number for an adopted ref, recovered from `slug = "pr-<n>"`
+    (mctlhq/mctl-agents#334). Kept a pure function of `ref.slug` rather than
+    reading `.prref.yaml` here, so `_build_prompt` stays a pure formatter
+    with no I/O of its own — same contract it already has.
+    """
+    if ref.slug.startswith("pr-"):
+        try:
+            return int(ref.slug[len("pr-"):])
+        except ValueError:
+            return None
+    return None
+
+
+def _build_prompt(
+    ref: ProposalRef,
+    review_feedback: dict | None = None,
+    branch: str | None = None,
+    adopted: bool = False,
+) -> str:
     """Prompt that delegates to the `implementer` sub-agent.
 
     The sub-agent is told (in its frontmatter and body) to read the spec
@@ -1295,18 +1377,46 @@ def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
     When ``review_feedback`` is set the prompt is the follow-up variant:
     the agent is told the branch is already checked out, points to the
     existing PR, and addresses each codex finding from the bundle.
+
+    ``branch`` overrides the deterministic `feat/agents-<slug>` branch name
+    — the adopted-PR path (mctlhq/mctl-agents#334) passes the PR's own head
+    branch, read from `.prref.yaml`, never a model-supplied value.
+    ``adopted`` drops the proposal-spec sentence and commit trailer in
+    favour of a plain PR reference, since an adoption record carries no
+    requirements/design/tasks triplet to read.
     """
-    branch = f"feat/agents-{ref.slug}"
+    branch = branch or f"feat/agents-{ref.slug}"
 
     if review_feedback is not None:
         feedback_md = _render_review_feedback(review_feedback)
+        if adopted:
+            number = _adopted_pr_number(ref)
+            pr_url = f"https://github.com/mctlhq/{ref.service}/pull/{number}"
+            subject = f"fix(review): address P1/P2 findings on mctlhq/{ref.service}#{number}"
+            context_spec_line = (
+                "- `$PROPOSAL_DIR` (env var) holds an adoption record "
+                "(`.prref.yaml`), NOT a requirements/design/tasks triplet — "
+                "this PR has no proposal. Ground yourself in the findings "
+                "below and the diff on this branch."
+            )
+            commit_body_line = f"Body should reference the PR: `PR: {pr_url}`."
+        else:
+            context_spec_line = (
+                "- Spec files live at `$PROPOSAL_DIR` (env var): "
+                "requirements.md, design.md, tasks.md."
+            )
+            subject = f"fix(agents): address P1/P2 codex findings on {ref.slug}"
+            commit_body_line = (
+                "Body should reference the proposal: "
+                f"`Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`."
+            )
         return f"""\
 Tier 2 implementer follow-up for proposal `{ref.service}/{ref.slug}`.
 
 Context:
 - Branch `{branch}` is already checked out on the existing PR.
 - Code review left P1/P2 findings on this PR — they are listed below.
-- Spec files live at `$PROPOSAL_DIR` (env var): requirements.md, design.md, tasks.md.
+{context_spec_line}
 
 Workflow:
 1. Use the `implementer` sub-agent. Read the codex findings (below) and
@@ -1314,9 +1424,8 @@ Workflow:
 2. Apply the MINIMAL change that resolves each finding. Stay in scope —
    do not refactor outside the touched files.
 3. Stage and commit on the SAME branch (`{branch}`). Conventional Commits
-   subject: `fix(agents): address P1/P2 codex findings on {ref.slug}`.
-   Body should reference the proposal:
-   `Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`.
+   subject: `{subject}`.
+   {commit_body_line}
 4. DO NOT push and DO NOT open a PR — the orchestrator will push to the
    existing branch after you finish. The PR auto-updates because the
    head ref does not change.
@@ -1618,14 +1727,20 @@ def review_feedback_one(
     ref: ProposalRef,
     bundle: dict,
     dry_run: bool = False,
+    branch: str | None = None,
 ) -> ImplementResult:
     """Apply code review feedback as a follow-up commit on the existing PR.
 
     Pre-conditions (caller's responsibility):
-    - ``feat/agents-<slug>`` exists on origin (the shepherd only invokes
-      this mode after observing an open PR).
+    - ``feat/agents-<slug>`` (or ``branch``, when set) exists on origin (the
+      shepherd only invokes this mode after observing an open PR).
     - ``ref`` has a ``pr`` URL set in `.status.yaml` (used for logging
       only — we do not re-open a PR).
+
+    ``branch`` overrides the deterministic ``feat/agents-<slug>`` name — the
+    adopted-PR path (mctlhq/mctl-agents#334) passes the PR's own head
+    branch, read from ``.prref.yaml`` by the caller, never a model-supplied
+    value. ``None`` (the default) reproduces today's behaviour exactly.
 
     On success: pushes a follow-up commit to the existing branch and
     returns an ``ImplementResult`` whose ``pr_url`` is the existing PR
@@ -1661,7 +1776,11 @@ def review_feedback_one(
     # answers says who holds the claim, so all three are the case this rule is
     # for. `LIFECYCLE_OWNERSHIP_REQUIRED=false` is the break-glass.
     release_claim = True
-    branch = f"feat/agents-{ref.slug}"
+    # An explicit branch means the caller resolved a PRRef, i.e. the
+    # adopted-PR path (mctlhq/mctl-agents#334) — captured BEFORE the
+    # default-branch fallback below collapses the distinction.
+    adopted = branch is not None
+    branch = branch or f"feat/agents-{ref.slug}"
     try:
         # 1. Clone the sibling repo. The shepherd's bundle path holds the
         # findings; cloning fresh keeps the worktree clean (avoids
@@ -1719,7 +1838,7 @@ def review_feedback_one(
             )
 
         # 5. Run the SDK with the bundle baked into the prompt.
-        prompt = _build_prompt(ref, review_feedback=bundle)
+        prompt = _build_prompt(ref, review_feedback=bundle, branch=branch, adopted=adopted)
         anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
@@ -2941,10 +3060,32 @@ def main() -> None:
             "so omitting this only costs the shepherd the structured copy."
         ),
     )
+    ap.add_argument(
+        "--adopted-pr",
+        default="",
+        metavar="URL",
+        help=(
+            "GitHub PR URL of a proposal-less, adopted PR (see "
+            "orchestrator.pr_adoption, mctlhq/mctl-agents#334). Valid only "
+            "together with --review-feedback; mutually exclusive with "
+            "--slug. Drives the PR's OWN head branch instead of "
+            "feat/agents-<slug>. Never adopts a PR itself — only the "
+            "shepherd's discovery pass does; a missing adoption record "
+            "exits 2."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
         print(f"Unknown service '{args.service}'. Available: {', '.join(SERVICES)}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.adopted_pr and args.slug:
+        print("--adopted-pr is mutually exclusive with --slug", file=sys.stderr)
+        sys.exit(2)
+
+    if args.adopted_pr and not args.review_feedback:
+        print("--adopted-pr is only valid together with --review-feedback", file=sys.stderr)
         sys.exit(2)
 
     state_dir = Path(args.state_dir)
@@ -2952,31 +3093,69 @@ def main() -> None:
     # Review-feedback mode: drive the existing PR's branch with codex findings.
     if args.review_feedback:
         ensure_auth_for_sdk()
-        if not (args.service and args.slug):
-            print(
-                "--review-feedback requires --service AND --slug "
-                "(the shepherd always passes both).",
-                file=sys.stderr,
-            )
-            sys.exit(2)
         bundle = _load_review_feedback(Path(args.review_feedback))
-        # In review-feedback mode the proposal is post-implementation —
-        # status is `implemented` or `review-fixing`. Look it up under
-        # those statuses rather than `accepted`.
-        refs = find_accepted_proposals(
-            state_dir,
-            service_filter=args.service,
-            slug_filter=args.slug,
-            statuses={"implemented", "review-fixing"},
-        )
-        if not refs:
-            print(
-                f"No proposal {args.service}/{args.slug} in implemented/review-fixing status; "
-                f"refusing to apply review feedback.",
-                file=sys.stderr,
+
+        if args.adopted_pr:
+            if not args.service:
+                print("--adopted-pr requires --service", file=sys.stderr)
+                sys.exit(2)
+            parsed_adopted = _parse_pr_url(args.adopted_pr)
+            if parsed_adopted is None:
+                print(f"--adopted-pr is not a GitHub PR URL: {args.adopted_pr!r}", file=sys.stderr)
+                sys.exit(2)
+            adopted_repo, adopted_number = parsed_adopted
+            try:
+                if _adopted_pr_is_fork(adopted_repo, adopted_number):
+                    print(
+                        f"--adopted-pr {args.adopted_pr} is a fork PR; "
+                        "refusing to clone or push to it",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+            except GitHubPreflightError as exc:
+                print(
+                    f"--adopted-pr fork check failed closed: could not "
+                    f"verify {adopted_repo}#{adopted_number} is not a fork "
+                    f"({exc})",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            ref = build_adopted_ref(state_dir, args.adopted_pr)
+            record = load_status(ref.status_path)
+            head_branch = record.get("head_branch") or ""
+            if not head_branch:
+                print(
+                    f"adoption record at {ref.status_path} has no head_branch; refusing",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            result = review_feedback_one(ref, bundle, dry_run=args.dry_run, branch=head_branch)
+        else:
+            if not (args.service and args.slug):
+                print(
+                    "--review-feedback requires --service AND --slug "
+                    "(the shepherd always passes both), or --adopted-pr "
+                    "instead of --slug.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            # In review-feedback mode the proposal is post-implementation —
+            # status is `implemented` or `review-fixing`. Look it up under
+            # those statuses rather than `accepted`.
+            refs = find_accepted_proposals(
+                state_dir,
+                service_filter=args.service,
+                slug_filter=args.slug,
+                statuses={"implemented", "review-fixing"},
             )
-            sys.exit(1)
-        result = review_feedback_one(refs[0], bundle, dry_run=args.dry_run)
+            if not refs:
+                print(
+                    f"No proposal {args.service}/{args.slug} in implemented/review-fixing status; "
+                    f"refusing to apply review feedback.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            result = review_feedback_one(refs[0], bundle, dry_run=args.dry_run)
         print("\n=== Review-feedback summary ===")
         if result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")

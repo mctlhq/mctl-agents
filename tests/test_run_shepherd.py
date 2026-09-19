@@ -25,7 +25,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from orchestrator import run_implementer, run_shepherd
+from orchestrator import pr_adoption, run_implementer, run_shepherd
 from orchestrator.run_shepherd import (
     CodexFinding,
     CodexReview,
@@ -463,7 +463,7 @@ def test_process_one_fix_only_still_applies_review_feedback(tmp_path) -> None:
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None):
         apply_calls.append((service, slug))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
@@ -1775,7 +1775,7 @@ def test_outer_loop_review_stuck_at_max_review_attempts(tmp_path, monkeypatch) -
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None):
         apply_calls.append((service, slug, payload, skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
@@ -1892,7 +1892,7 @@ def test_loop_path_p1_then_followup_then_merge(tmp_path) -> None:
     apply_calls: list[tuple] = []
     trigger_calls: list[PRSnapshot] = []
 
-    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None):
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None):
         apply_calls.append((service, slug, len(payload), skip_subprocess, state_dir))
         return {"p1": True, "p2": False, "summaries": ["fix it"]}
 
@@ -2375,7 +2375,7 @@ def test_process_one_forwards_state_dir(tmp_path) -> None:
 
     captured: dict = {}
 
-    def fake_find(service: str, slug: str, state_dir=None):
+    def fake_find(service: str, slug: str, state_dir=None, status_path=None):
         captured["service"] = service
         captured["slug"] = slug
         captured["state_dir"] = state_dir
@@ -5161,3 +5161,323 @@ def test_the_sweep_and_the_wrapper_share_one_predicate() -> None:
         (run_shepherd.LEGACY_UNKNOWN, False),
     ):
         assert run_shepherd._owns(answer) is want
+
+
+# ---------------------------------------------------------------------------
+# PR adoption (mctlhq/mctl-agents#334) — threading through run_shepherd.py.
+# The feature's own unit tests (flags, PRRef, gates, discovery) live in
+# tests/test_pr_adoption.py; these cover the seams added to THIS module.
+# ---------------------------------------------------------------------------
+def make_adopted_ref(
+    tmp_path: Path,
+    *,
+    number: int = 7,
+    service: str = "mctl-web",
+    review_attempts: int = 0,
+    refusals: int = 0,
+    refusals_head: str | None = None,
+    head_sha: str = HEAD_SHA,
+) -> pr_adoption.PRRef:
+    """A PRRef with a real `.prref.yaml` on disk under `tmp_path`."""
+    pr_url = f"https://github.com/mctlhq/{service}/pull/{number}"
+    path = pr_adoption.record_dir(tmp_path, service, number) / pr_adoption.PRREF_FILENAME
+    pr_adoption.write_prref(
+        path, "adopted",
+        kind=pr_adoption.PRREF_KIND, repo=f"mctlhq/{service}", number=number,
+        pr=pr_url, head_sha=head_sha, head_branch="chore/manual-fix",
+        owner_type="shepherd", review_attempts=review_attempts,
+        harness_failures=0, refusals=refusals, refusals_head=refusals_head,
+    )
+    return pr_adoption.PRRef(
+        service=service, slug=pr_adoption.slug_for(number),
+        proposal_dir=path.parent, status="adopted",
+        review_attempts=review_attempts, refusals=refusals,
+        refusals_head=refusals_head, pr_url=pr_url,
+        repo=f"mctlhq/{service}", number=number, head_branch="chore/manual-fix",
+    )
+
+
+def test_pr_snapshot_new_fields_default_for_backward_compat() -> None:
+    """Task 1 DoD: every existing PRSnapshot(...) construction site keeps
+    constructing without passing head_branch/is_cross_repository."""
+    pr = make_pr()
+    assert pr.head_branch == ""
+    assert pr.is_cross_repository is False
+
+
+def test_fetch_pr_snapshot_populates_adoption_fields(monkeypatch) -> None:
+    """mctlhq/mctl-agents#334: the widened GraphQL query and population
+    for head_branch and is_cross_repository. is_cross_repository is true
+    when GitHub says so directly OR the head/base repository owners differ,
+    even when GitHub's own flag says false."""
+
+    def make_view(*, is_cross_repository: bool, head_owner: str, base_owner: str) -> dict:
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "number": 99,
+                        "state": "OPEN",
+                        "merged": False,
+                        "headRefOid": "f" * 40,
+                        "headRefName": "chore/manual-fix",
+                        "isCrossRepository": is_cross_repository,
+                        "headRepositoryOwner": {"login": head_owner},
+                        "baseRepository": {"owner": {"login": base_owner}},
+                        "mergeCommit": None,
+                        "statusCheckRollup": {"state": "SUCCESS"},
+                        "mergeStateStatus": "CLEAN",
+                        "commits": {"nodes": []},
+                        "timelineItems": {"nodes": []},
+                        "isDraft": False,
+                    }
+                }
+            }
+        }
+
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view(is_cross_repository=True, head_owner="someone", base_owner="mctlhq"),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 99)
+    assert snap.is_cross_repository is True
+    assert snap.head_branch == "chore/manual-fix"
+
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view(is_cross_repository=False, head_owner="someone-else", base_owner="mctlhq"),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 99)
+    assert snap.is_cross_repository is True  # owner mismatch alone is enough
+
+    with patch.object(
+        run_shepherd, "_gh_api_json",
+        return_value=make_view(is_cross_repository=False, head_owner="mctlhq", base_owner="mctlhq"),
+    ):
+        snap = run_shepherd._fetch_pr_snapshot("mctlhq/mctl-web", 99)
+    assert snap.is_cross_repository is False
+
+
+def test_find_pr_for_proposal_status_path_override(tmp_path) -> None:
+    """mctlhq/mctl-agents#334: an explicit status_path (a PRRef's own
+    `.prref.yaml`) is read instead of the default
+    `proposals/<slug>/.status.yaml`."""
+    adopted_path = tmp_path / "adopted-prs" / "pr-7" / ".prref.yaml"
+    adopted_path.parent.mkdir(parents=True)
+    adopted_path.write_text(
+        yaml.safe_dump({"status": "adopted", "pr": "https://github.com/mctlhq/mctl-web/pull/7"}),
+        encoding="utf-8",
+    )
+    captured: dict = {}
+
+    def fake_fetch(repo, number):
+        captured["repo"] = repo
+        captured["number"] = number
+        return "sentinel"
+
+    with patch.object(run_shepherd, "_fetch_pr_snapshot", side_effect=fake_fetch):
+        result = run_shepherd.find_pr_for_proposal("mctl-web", "pr-7", status_path=adopted_path)
+    assert result == "sentinel"
+    assert captured == {"repo": "mctlhq/mctl-web", "number": 7}
+
+
+def test_apply_followup_adopted_pr_substitutes_slug_flag() -> None:
+    """apply_followup(adopted_pr=...) appends --adopted-pr in place of
+    --slug in the subprocess argv, and changes nothing else."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        captured["cmd"] = list(cmd)
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        run_shepherd.apply_followup(
+            "mctl-web", "pr-7", findings,
+            adopted_pr="https://github.com/mctlhq/mctl-web/pull/7",
+        )
+    cmd = captured["cmd"]
+    assert "--adopted-pr" in cmd
+    assert cmd[cmd.index("--adopted-pr") + 1] == "https://github.com/mctlhq/mctl-web/pull/7"
+    assert "--slug" not in cmd
+    assert "--service" in cmd and "mctl-web" in cmd
+    assert "--review-feedback" in cmd
+
+
+def test_apply_followup_without_adopted_pr_keeps_slug_flag() -> None:
+    """T8-adjacent backward-compat pin: adopted_pr=None (the default)
+    reproduces today's argv exactly."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        captured["cmd"] = list(cmd)
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+    cmd = captured["cmd"]
+    assert "--adopted-pr" not in cmd
+    assert "--slug" in cmd and "test-slug" in cmd
+
+
+def test_process_one_adopted_ref_end_to_end_address_review_then_defer_merge(tmp_path) -> None:
+    """T1 (end-to-end): a PRRef with a fresh P1 is driven through
+    process_one to address-review; the implementer fork carries
+    --adopted-pr and NOT --slug. A follow-up tick with a clean review ends
+    in defer-merge with merge_pr never called (T6)."""
+    ref = make_adopted_ref(tmp_path)
+    pr = make_pr(head_sha=HEAD_SHA, head_pushed_at=HEAD_PUSHED_AT)
+    review = CodexReview(has_responded=True, findings=[make_finding()])
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    captured: dict = {}
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        captured["cmd"] = list(cmd)
+        return _Result()
+
+    with patch.object(run_shepherd, "_fetch_pr_snapshot", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                       return_value=run_shepherd.CopilotReview(has_responded=False, findings_count=0)), \
+         patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run), \
+         patch.object(run_shepherd, "trigger_review"):
+        result = process_one(ref, state_dir=tmp_path)
+
+    assert result.decision == "address-review"
+    cmd = captured["cmd"]
+    assert "--adopted-pr" in cmd
+    assert cmd[cmd.index("--adopted-pr") + 1] == ref.pr_url
+    assert "--slug" not in cmd
+
+    # Second tick: clean review on an adopted, FIX_ONLY-forced ref must
+    # defer, never merge — even though decide() would otherwise merge.
+    ref2 = pr_adoption.PRRef(
+        service=ref.service, slug=ref.slug, proposal_dir=ref.proposal_dir,
+        status="implemented", review_attempts=1, pr_url=ref.pr_url,
+        repo=ref.repo, number=ref.number, head_branch=ref.head_branch,
+    )
+    clean_review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
+    with patch.object(run_shepherd, "_fetch_pr_snapshot", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=clean_review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                       return_value=run_shepherd.CopilotReview(has_responded=False, findings_count=0)), \
+         patch.object(run_shepherd, "merge_pr", side_effect=AssertionError("must never merge an adopted ref")):
+        result2 = process_one(ref2, state_dir=tmp_path)
+    assert result2.decision == "defer-merge"
+
+
+def test_process_one_adopted_ref_resets_refusals_on_new_head(tmp_path) -> None:
+    """T4 (second half): a record whose stored head_sha differs from the
+    live head resets the refusal counter before acting — the same generic
+    process_one mechanism a proposal already gets, exercised through a
+    PRRef."""
+    old_head = "b" * 40
+    new_head = "c" * 40
+    ref = make_adopted_ref(tmp_path, refusals=2, refusals_head=old_head, head_sha=old_head)
+    pr = make_pr(head_sha=new_head, head_pushed_at=HEAD_PUSHED_AT)
+    review = CodexReview(has_responded=True, findings=[make_finding(commit_id=new_head)])
+
+    def fake_apply_followup(*a, **kw):
+        raise run_shepherd.FollowupSubprocessError(
+            "declined", kind="refused", reason="already addressed",
+        )
+
+    with patch.object(run_shepherd, "_fetch_pr_snapshot", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                       return_value=run_shepherd.CopilotReview(has_responded=False, findings_count=0)), \
+         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup):
+        result = process_one(ref, state_dir=tmp_path)
+
+    assert result.decision == "wait"
+    data = pr_adoption.load_prref(ref.status_path)
+    assert data["refusals"] == 1  # reset, not 3 — the head moved
+    assert data["refusals_head"] == new_head
+
+
+def test_main_default_off_pr_adoption_is_never_called(tmp_path, monkeypatch, capsys) -> None:
+    """T7: with SHEPHERD_ADOPT_PRS unset and no --adopt-prs, main() never
+    calls pr_adoption.discover_adoptable and prints no adoption warning —
+    run_shepherd's observable behaviour is byte-identical to before this
+    feature existed."""
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+    monkeypatch.delenv("SHEPHERD_ADOPT_PRS", raising=False)
+    monkeypatch.setattr("sys.argv", ["run_shepherd", "--dry-run", "--state-dir", str(state_dir)])
+
+    with patch.object(pr_adoption, "discover_adoptable", side_effect=AssertionError("must not be called")):
+        run_shepherd.main()
+
+    out = capsys.readouterr().out
+    assert "PR adoption" not in out
+
+
+def test_main_adopt_prs_flag_extends_refs_and_warns(tmp_path, monkeypatch, capsys) -> None:
+    """--adopt-prs forces discovery on and prints the durability warning,
+    even with SHEPHERD_ADOPT_PRS unset."""
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+    fake_ref = make_adopted_ref(tmp_path)
+    monkeypatch.delenv("SHEPHERD_ADOPT_PRS", raising=False)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--dry-run", "--adopt-prs", "--state-dir", str(state_dir)],
+    )
+
+    with patch.object(pr_adoption, "discover_adoptable", return_value=[fake_ref]) as mocked:
+        run_shepherd.main()
+
+    mocked.assert_called_once()
+    out = capsys.readouterr().out
+    assert "PR adoption is enabled" in out
+    assert "mctlhq/mctl-gitops#1278" in out
+    assert f"would process {fake_ref.service}/{fake_ref.slug}" in out
+
+
+def test_main_adopt_prs_skipped_for_reconcile_and_slug(tmp_path, monkeypatch, capsys) -> None:
+    """Adoption discovery never runs for --reconcile or a targeted --slug,
+    even with --adopt-prs set."""
+    state_dir = tmp_path / "agents-state"
+    state_dir.mkdir()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--dry-run", "--adopt-prs", "--reconcile", "--state-dir", str(state_dir)],
+    )
+    with patch.object(
+        pr_adoption, "discover_adoptable",
+        side_effect=AssertionError("must not be called under --reconcile"),
+    ):
+        run_shepherd.main()
+
+    monkeypatch.setattr(
+        "sys.argv",
+        ["run_shepherd", "--dry-run", "--adopt-prs", "--service", "mctl-web",
+         "--slug", "some-slug", "--state-dir", str(state_dir)],
+    )
+    with patch.object(pr_adoption, "discover_adoptable", side_effect=AssertionError("must not be called under --slug")):
+        run_shepherd.main()

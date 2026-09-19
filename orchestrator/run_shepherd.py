@@ -862,6 +862,14 @@ class ProposalRef:
     refusals_head: str | None = None
     pr_url: str | None = None
     mode: str = FULL
+    # True for a PRRef adopted via orchestrator.pr_adoption (a proposal-less,
+    # same-repo PR with fresh blocking findings — mctlhq/mctl-agents#334).
+    # Drives one thing here: process_one passes `--adopted-pr <url>` instead
+    # of `--slug` to the implementer. A plain bool rather than an isinstance
+    # check against pr_adoption.PRRef: that module imports THIS one, so a
+    # module-level import the other way would cycle, and this field lets
+    # process_one stay ignorant of pr_adoption's existence entirely.
+    is_adopted: bool = False
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -971,6 +979,11 @@ class PRSnapshot:
     checks_green: bool              # required checks all SUCCESS
     is_draft: bool
     review_decision: str = ""       # APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
+    # The two fields adoption needs (mctlhq/mctl-agents#334). Both default so
+    # every existing PRSnapshot(...) construction site and fixture keeps
+    # constructing unchanged.
+    head_branch: str = ""
+    is_cross_repository: bool = False
 
 
 @dataclass
@@ -1321,15 +1334,21 @@ def find_pr_for_proposal(
     service: str,
     slug: str,
     state_dir: Path | None = None,
+    status_path: Path | None = None,
 ) -> PRSnapshot | None:
     """Read the linked PR for a proposal.
 
     If `.status.yaml` has no `pr:` URL, discover it from the deterministic
     implementer branch. Crucially this does NOT filter to state=open — closed
     and merged PRs are returned too.
+
+    ``status_path`` overrides the default ``proposals/<slug>/.status.yaml``
+    location — a ``pr_adoption.PRRef`` passes its own ``.prref.yaml`` so the
+    ``pr:`` URL resolves from the adoption record instead of a proposal
+    directory that does not exist (mctlhq/mctl-agents#334).
     """
     sd = state_dir or DEFAULT_STATE_DIR
-    status_path = sd / service / "proposals" / slug / ".status.yaml"
+    status_path = status_path or (sd / service / "proposals" / slug / ".status.yaml")
     data = _load_status(status_path)
     pr_url = data.get("pr") or _find_pr_url_by_branch(service, slug)
     if not pr_url:
@@ -1349,7 +1368,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -1403,6 +1422,19 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         )
         head_pushed_at = None
 
+    # Fork check (mctlhq/mctl-agents#334): true when GitHub says so directly,
+    # OR when the head repository's owner differs from the base repository's
+    # — belt-and-braces, since a renamed/transferred fork could in principle
+    # carry a stale isCrossRepository. Base repository owner falls back to
+    # the requested owner when the field is absent (older GraphQL schema).
+    head_repo_owner = (pr.get("headRepositoryOwner") or {}).get("login") or ""
+    base_repo_owner = (
+        (pr.get("baseRepository") or {}).get("owner") or {}
+    ).get("login") or repo.split("/")[0]
+    is_cross_repository = bool(pr.get("isCrossRepository")) or (
+        bool(head_repo_owner) and head_repo_owner != base_repo_owner
+    )
+
     closed_unmerged = state == "CLOSED" and not merged
     close_comment_or_default = (
         "PR was closed without merging."
@@ -1446,6 +1478,8 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         checks_green=checks_green,
         is_draft=bool(pr.get("isDraft")),
         review_decision=(pr.get("reviewDecision") or "").upper(),
+        head_branch=pr.get("headRefName") or "",
+        is_cross_repository=is_cross_repository,
     )
 
 
@@ -2065,6 +2099,7 @@ def apply_followup(
     findings: list[CodexFinding],
     skip_subprocess: bool = False,
     state_dir: Path | None = None,
+    adopted_pr: str | None = None,
 ) -> dict:
     """Bundle findings + invoke the Tier 2 implementer with --review-feedback.
 
@@ -2080,6 +2115,13 @@ def apply_followup(
     and the implementer could not find the proposal in
     ``implemented/review-fixing`` — exiting non-zero and triggering an
     avoidable ``review-stuck`` flip.
+
+    ``adopted_pr`` (a PR URL) substitutes ``--adopted-pr <url>`` for
+    ``--slug`` in the subprocess argv — the proposal-less adoption path
+    (mctlhq/mctl-agents#334). Everything else about this function is
+    unchanged for that path: the bundle, the ``--refusal-out`` temp file,
+    the ``--state-dir`` forwarding and the exit-code classification below
+    all apply identically.
     """
     bundle = anyio.run(_format_bundle_via_sdk, findings)
 
@@ -2124,7 +2166,12 @@ def apply_followup(
         cmd = [
             sys.executable, "-m", "orchestrator.run_implementer",
             "--service", service,
-            "--slug", slug,
+        ]
+        if adopted_pr:
+            cmd += ["--adopted-pr", adopted_pr]
+        else:
+            cmd += ["--slug", slug]
+        cmd += [
             "--review-feedback", bundle_path,
             "--refusal-out", refusal_path,
         ]
@@ -2315,7 +2362,9 @@ def process_one(
     so a non-default ``--state-dir`` is honoured end-to-end and we do
     not silently re-read from the env path.
     """
-    pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+    pr = find_pr_for_proposal(
+        ref.service, ref.slug, state_dir=state_dir, status_path=ref.status_path,
+    )
     if pr is None:
         return ShepherdResult(
             ref=ref,
@@ -2446,6 +2495,7 @@ def process_one(
                 ref.service, ref.slug, payload,
                 skip_subprocess=skip_subprocess,
                 state_dir=state_dir,
+                adopted_pr=(ref.pr_url if ref.is_adopted else None),
             )
         except FollowupSubprocessError as e:
             if e.kind == "refused":
@@ -3254,6 +3304,15 @@ def main() -> None:
             "a blanket override). Cannot be combined with --reconcile."
         ),
     )
+    ap.add_argument(
+        "--adopt-prs", action="store_true",
+        help=(
+            "Force PR-adoption discovery on for this run, regardless of "
+            "SHEPHERD_ADOPT_PRS (mctlhq/mctl-agents#334). Still adopts "
+            "nothing unless SHEPHERD_ADOPT_REPOS names at least one repo. "
+            "A targeted local one-shot; ignored with --reconcile or --slug."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
@@ -3287,6 +3346,23 @@ def main() -> None:
     if budget <= 0:
         print(f"warn: SHEPHERD_BUDGET_USD={budget} is non-positive; nothing will run")
 
+    # PR adoption (mctlhq/mctl-agents#334) — deferred: pr_adoption imports
+    # this module, so a module-level import here would cycle. With neither
+    # SHEPHERD_ADOPT_PRS nor --adopt-prs set, `adopt_prs` is False and
+    # nothing below this point calls pr_adoption at all — run_shepherd's
+    # observable behaviour is therefore byte-identical to before this flag
+    # existed.
+    from orchestrator import pr_adoption  # deferred — pr_adoption imports this module
+
+    adopt_prs = args.adopt_prs or pr_adoption.adoption_enabled()
+    if adopt_prs:
+        print(
+            "warn: PR adoption is enabled (SHEPHERD_ADOPT_PRS/--adopt-prs); "
+            "agents-state/*/adopted-prs/** is not staged back to gitops "
+            "until mctlhq/mctl-gitops#1278 lands, so review_attempts/"
+            "harness_failures/refusals on an adopted PR reset every tick"
+        )
+
     # Skip SDK auth init in dry-run AND reconcile modes: both are read-only
     # (reconcile only reads PR state + writes terminal status) and must work
     # in environments without Claude credentials.
@@ -3314,6 +3390,16 @@ def main() -> None:
     # and terminal states must be projected even for owned slugs).
     if not args.slug and not args.reconcile:
         refs = _filter_dev_loop_owned(refs)
+
+    # PR adoption (mctlhq/mctl-agents#334): sweep mode only, same as the
+    # DevLoop filter above — a targeted --slug run and --reconcile never
+    # touch adoption records.
+    if adopt_prs and not args.slug and not args.reconcile:
+        refs.extend(
+            pr_adoption.discover_adoptable(
+                state_dir, dry_run=args.dry_run, service_filter=args.service or None,
+            )
+        )
 
     if not refs:
         if args.reconcile:
@@ -3377,6 +3463,20 @@ def main() -> None:
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate
+        # PR adoption (mctlhq/mctl-agents#334 code review): `_adopt` acquires
+        # the ownership row directly, but nothing released it once the
+        # remediation loop finished — process_one stays ignorant of
+        # pr_adoption's existence (see ProposalRef.is_adopted's own comment),
+        # so the release lives here instead, in the one function that already
+        # imports pr_adoption and already observes ref.status post-transition.
+        # isinstance, not the bare `is_adopted` bool, so this narrows back to
+        # the `repo`/`number` fields release_ownership needs — safe here (this
+        # import is function-scoped, so it cannot cycle the way a module-level
+        # isinstance check against pr_adoption.PRRef would).
+        if isinstance(ref, pr_adoption.PRRef) and ref.status in pr_adoption.TERMINAL_STATUSES:
+            pr_adoption.release_ownership(
+                ref, reason=f"adopted PR reached terminal status {ref.status!r}"
+            )
 
     _print_summary(results)
 
