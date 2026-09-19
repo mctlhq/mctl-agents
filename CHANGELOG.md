@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.48.0](https://github.com/mctlhq/mctl-agents/compare/1.47.0...1.48.0) (2026-09-19)
+
+
+### Features
+
+* **devloop:** admit the implement submit on its own queue, requeue pre-start, fail honestly ([18a1958](https://github.com/mctlhq/mctl-agents/commit/18a19587581e1a39a400f2e032876edc62d00ad4))
+* **devloop:** admit the implement submit on its own queue, requeue pre-start, fail honestly ([e91033a](https://github.com/mctlhq/mctl-agents/commit/e91033af9f18a9269bb069ff92a1b638a048e337))
+
+
+### Bug Fixes
+
+* **devloop:** a definite observation outranks unknown, and name the finalization evidence ([f7046e6](https://github.com/mctlhq/mctl-agents/commit/f7046e635a76f8f5a688baddac34aa2a201bf2e6))
+* **devloop:** carry the observation across a resume, and stop two assertions passing by default ([5467e45](https://github.com/mctlhq/mctl-agents/commit/5467e45790518706c12a15f61ed6200103d34ec8))
+* **devloop:** carry the observation across a resume, and stop two assertions passing by default ([29d7b51](https://github.com/mctlhq/mctl-agents/commit/29d7b51a8849127d625f15e7ab572a4a6f498999))
+* **devloop:** fail closed when the node graph has no implementer node ([1c35aec](https://github.com/mctlhq/mctl-agents/commit/1c35aecc38948fa9519c6cf15f017d7794587601))
+* **devloop:** keep the best implementer observation, and say what replay cannot check ([3b084c8](https://github.com/mctlhq/mctl-agents/commit/3b084c8e022fca2f1ed8bca1503921bc31be3e67))
+* **devloop:** keep the runtime projection across a resume, and treat an empty node map as unknown ([53a3138](https://github.com/mctlhq/mctl-agents/commit/53a31388408dd6d276769d22a7f84d27c6a51b42))
+* **devloop:** snapshot heartbeat details, one timestamp spelling, wait between requeues ([0324aab](https://github.com/mctlhq/mctl-agents/commit/0324aab016705d4f9746397dde47a451627fb9c5))
+
 ## [1.47.0](https://github.com/mctlhq/mctl-agents/compare/1.46.0...1.47.0) (2026-09-19)
 
 
