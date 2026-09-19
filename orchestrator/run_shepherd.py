@@ -2012,7 +2012,27 @@ def decide(
             return ("address-review", findings)
         return ("address-review", Blockers(list(findings), checks))
 
-    # SECOND, with nothing outstanding, merge on the primary reviewer's ruling
+    # SECOND (mctl-agents#411): non-actionable required-check state, ahead of
+    # the head_verdict gates below on purpose. Neither arm here merges or
+    # hands anything to the implementer -- `ci-infra` only re-runs a workflow,
+    # `ci-unknown` only waits -- so nothing about them depends on what the
+    # primary reviewer ruled. Gating them behind an on-this-head APPROVED (the
+    # only value that clears both head_verdict checks) made the commonest
+    # infra wedge unreachable: a runner outage hit before codex has even
+    # responded, or while it sits on CHANGES_REQUESTED for an unrelated
+    # reason, never got the retry codex review flagged as a P2. Both arms are
+    # unreachable when `ci` is None, preserving the pre-#411 decision surface
+    # exactly.
+    if ci is not None and ci.known and ci.infrastructure:
+        # Only non-actionable (infra) blockers remain — never hand these to
+        # the implementer as a code defect. process_one re-runs them.
+        return ("ci-infra", list(ci.infrastructure))
+    if ci is not None and not ci.known:
+        # The probe failed (API error, malformed response, a truncated
+        # contexts page). Fail closed: no merge/defer-merge this tick.
+        return ("ci-unknown", None)
+
+    # THIRD, with nothing outstanding, merge on the primary reviewer's ruling
     # for this head rather than on the absence of comments. A verdict review is
     # anchored to the commit it judged and is never rewritten afterwards, which
     # is exactly the property the inline anchor lacks.
@@ -2025,17 +2045,6 @@ def decide(
         # ever post findings -- the connector is one -- so this is a normal
         # resting state, not an error.
         return ("wait", None)
-    # THIRD (mctl-agents#411): the current-head required-check state. All
-    # three arms below are unreachable when `ci` is None, preserving the
-    # pre-#411 decision surface exactly.
-    if ci is not None and ci.known and ci.infrastructure:
-        # Only non-actionable (infra) blockers remain — never hand these to
-        # the implementer as a code defect. process_one re-runs them.
-        return ("ci-infra", list(ci.infrastructure))
-    if ci is not None and not ci.known:
-        # The probe failed (API error, malformed response, a truncated
-        # contexts page). Fail closed: no merge/defer-merge this tick.
-        return ("ci-unknown", None)
     if ci is not None and ci.known and ci.pending:
         # A required check is still QUEUED/IN_PROGRESS. Incomplete signal,
         # not evidence of anything — wait, emit nothing.
@@ -2659,14 +2668,26 @@ def process_one(
         f"-> {decision}"
     )
 
-    if not (pr.merged or pr.closed_unmerged):
+    if not (pr.merged or pr.closed_unmerged) and ci.known:
         # Head-pinned CI-blocker projection (mctl-agents#411): written every
         # tick so a follow-up push that turns a required check green clears
         # it with no operator action — self-clearing falls straight out of
         # head pinning, since the next probe only ever reads the new head.
         # Change-only write; a healthy run with nothing outstanding touches
         # .status.yaml zero times.
-        current_ci_names = sorted({_format_check_name(c) for c in ci.actionable}) if ci.known else []
+        #
+        # Gated on `ci.known`: a probe outage carries no information about
+        # this head's checks either way, so it must not touch this
+        # projection at all. Writing `ci_blockers=None` here on an outage
+        # would DELETE whatever blocker names the last successful probe
+        # recorded, and `.status.yaml` would then read "no CI blockers" at
+        # exactly the tick the shepherd knows nothing — the same false
+        # "all clear" this proposal exists to remove from the merge gate.
+        # `ci_probe_failures` (above) is the dedicated unknown-vs-known-empty
+        # signal for the outage itself; skipping the write here just leaves
+        # the last known-good projection standing, stale but not false, until
+        # a successful probe corrects it.
+        current_ci_names = sorted({_format_check_name(c) for c in ci.actionable})
         _update_status_if_changed(
             ref, ref.status,
             ci_blockers_head=(pr.head_sha if current_ci_names else None),

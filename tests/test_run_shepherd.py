@@ -1611,6 +1611,28 @@ def test_decide_ci_infra_only_blocker_is_ci_infra_not_address_review() -> None:
     assert payload == [infra_check]
 
 
+def test_decide_ci_infra_reachable_without_prior_approval_on_this_head() -> None:
+    """codex review follow-up: the ci-infra arm must not require an
+    APPROVED verdict on this exact head — the commonest infra wedge (a
+    runner outage hit before the reviewer has responded, or while it sits
+    on CHANGES_REQUESTED) must still surface a re-run, not `wait`."""
+    pr = make_pr()
+    infra_check = make_check(conclusion="CANCELLED", kind="infrastructure")
+    ci = make_ci(blockers=(infra_check,))
+
+    never_ruled = CodexReview(has_responded=True, findings=[], head_verdict=None)
+    decision, payload = decide(pr, never_ruled, ci=ci)
+    assert decision == "ci-infra"
+    assert payload == [infra_check]
+
+    changes_requested = CodexReview(
+        has_responded=True, findings=[], head_verdict="CHANGES_REQUESTED",
+    )
+    decision, payload = decide(pr, changes_requested, ci=ci)
+    assert decision == "ci-infra"
+    assert payload == [infra_check]
+
+
 def test_decide_ci_unknown_fails_closed_never_merges() -> None:
     """T8: CIStatus(known=False) -> ci-unknown, never merge/defer-merge."""
     pr = make_pr()
@@ -1825,6 +1847,48 @@ def test_process_one_ci_blockers_head_clears_when_fixed(tmp_path) -> None:
     assert "ci_blockers" not in final
     assert "ci_infra_retries" not in final
     assert "ci_infra_head" not in final
+
+
+def test_process_one_probe_outage_preserves_prior_ci_blockers_projection(tmp_path) -> None:
+    """codex review follow-up: a probe outage (`ci.known is False`) must not
+    erase a prior known-populated `ci_blockers` projection. Deleting the
+    keys here would have `.status.yaml` assert "no CI blockers" at exactly
+    the tick the shepherd knows nothing about this head's checks."""
+    ref = make_ref(tmp_path)
+    pr = make_pr()
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
+    broken_check = make_check()
+    ci_broken = make_ci(blockers=(broken_check,))
+
+    apply_calls: list = []
+
+    def fake_apply_followup(service, slug, payload, skip_subprocess=False, state_dir=None, adopted_pr=None):
+        apply_calls.append(payload)
+        return {"p1": False, "p2": False, "summaries": []}
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "read_required_checks", return_value=ci_broken), \
+         patch.object(run_shepherd, "apply_followup", side_effect=fake_apply_followup), \
+         patch.object(run_shepherd, "trigger_review"):
+        process_one(ref, skip_subprocess=True)
+    after_break = read_status(ref)
+    assert after_break.get("ci_blockers_head") == HEAD_SHA
+    assert after_break.get("ci_blockers") == ["PR validation / lint"]
+
+    ref.review_attempts = after_break.get("review_attempts", 0)
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "read_required_checks", return_value=make_ci(known=False)):
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "wait"
+    after_outage = read_status(ref)
+    assert after_outage.get("ci_blockers_head") == HEAD_SHA
+    assert after_outage.get("ci_blockers") == ["PR validation / lint"]
 
 
 def test_decide_keeps_top_level_finding_without_commit_id() -> None:
