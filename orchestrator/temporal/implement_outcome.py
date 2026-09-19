@@ -209,6 +209,11 @@ def finalization_evidence(finalization_phase: str | None) -> str:
         return f"the commit/assert step reported {finalization_phase}"
     if finalization_phase is None:
         return "no finalization node was readable, so the failure is somewhere after the implementer"
+    if finalization_phase in {"Pending", "Running"}:
+        return (
+            f"the commit/assert step was still {finalization_phase} at the last readable poll, so "
+            "the wrap-up was cut short rather than completed and the commit may not exist"
+        )
     return (
         f"the finalization steps reported {finalization_phase}, so the failure is past them "
         "(exit handler, workflow deadline or terminate) and the commit may well exist"

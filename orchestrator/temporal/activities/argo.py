@@ -247,7 +247,21 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             activity.heartbeat(workflow_name, dict(runtime))
 
         consecutive_errors = 0
+        # Seeded, not empty, when a previous attempt already saw the pod
+        # run: that fact is in the projection this attempt just restored,
+        # and it is the same knowledge the cross-poll fold protects one
+        # level down. Without it a resumed attempt whose terminal poll
+        # finds the node map gone reports unknown for a pod the loop
+        # watched start, and the finalization/execution distinction is lost
+        # exactly when a worker restart makes it hardest to reconstruct.
         best: ImplementerObservation | None = None
+        if is_implement and runtime["phase"] == PHASE_RUNNING:
+            best = ImplementerObservation(
+                ran=True,
+                phase=None,
+                started_at=runtime["implementer_started_at"],
+                finalization_phase=None,
+            )
         while True:
             # Heartbeat before every poll, not just on change: a stuck
             # mctl-api / cluster makes this loop spin on the `continue`

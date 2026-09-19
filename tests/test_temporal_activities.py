@@ -1984,6 +1984,38 @@ class TestSubmitAndWaitObservesTheImplementer:
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
         assert result.implementer_ran is False
 
+    async def test_a_resumed_attempt_keeps_the_pod_it_already_watched_start(self, env, monkeypatch):
+        """The cross-poll fold has to survive a worker restart too.
+
+        The previous attempt heartbeated `running` with a start time; this
+        one restores that projection, so a terminal poll that can no longer
+        read the node map must not report the implementer as unknown.
+        """
+        import dataclasses
+
+        prior = {
+            "phase": "running",
+            "admitted_at": "2026-09-19T01:00:00Z",
+            "submitted_at": "2026-09-19T01:00:05Z",
+            "implementer_started_at": "2026-09-19T01:02:00Z",
+        }
+        env.info = dataclasses.replace(env.info, heartbeat_details=["mctl-agents-implement-0eaa9853", prior])
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                raise AssertionError("must not re-submit on resume")
+            return httpx.Response(200, json=_implement_status("Failed", {}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is True
+        assert result.implementer_started_at == "2026-09-19T01:02:00Z"
+
     async def test_other_operations_do_not_observe_nodes(self, env, monkeypatch):
         nodes = {"a": _node("run-implementer", "Succeeded", ran=True)}
         self._run(env, monkeypatch, "Succeeded", nodes, operation="mctl-agents-investigate")
