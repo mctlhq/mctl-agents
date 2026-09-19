@@ -632,6 +632,59 @@ def _adopt(
     return ref
 
 
+# The three statuses `update_status` ever flips an adopted record to that
+# stop the shepherd from acting on it again (requirements.md "Remediation
+# loop"). Same vocabulary `orchestrator.temporal.activities.lifecycle_reconcile
+# .TERMINAL_STATUSES` uses for a proposal — not imported from there, because
+# that module is Temporal-activity code with its own async transport, and this
+# one is a CLI-process synchronous client; duplicating the three literals is
+# cheaper than a cross-transport import.
+TERMINAL_STATUSES = frozenset({"merged", "rejected", "review-stuck"})
+
+
+def release_ownership(ref: PRRef, *, reason: str) -> None:
+    """Close the ownership row ``_adopt`` acquired, now that ``ref`` has
+    reached a terminal status.
+
+    Nothing else in the system ever does this. ``orchestrator/lifecycle/
+    reconciler.py`` only recovers a row whose owner is *dead* per the store's
+    own liveness bound — "closing the row is [the alive owner's] job" per its
+    own comment on ``entity_terminal`` — and the Temporal reconcile activity's
+    ``list_proposal_refs`` walks ``<service>/proposals/*/.status.yaml`` only,
+    never ``adopted-prs/**``, so an adopted PR's row is invisible to that
+    sweep even once its owner does go dead (mctlhq/mctl-agents#334 code
+    review). Called from ``run_shepherd.main()`` right after ``process_one``
+    flips ``ref.status`` to a member of ``TERMINAL_STATUSES`` — the same
+    "caller that already tracks the terminal state" `_adopt` itself has no
+    way to observe, since adoption and completion happen in different, often
+    much later, sweep ticks.
+
+    Gated by ``rollout.records_writes()``, the same switch ``_adopt`` checks
+    before acquiring: below it, no row was ever written, so there is nothing
+    to close. Best-effort and silent on failure — closing a row must never
+    fail the status transition it follows, the same rule
+    ``run_implementer._release_claim`` already applies to the sibling claim
+    store.
+    """
+    if not rollout.records_writes():
+        return
+    entity = EntityRef.for_pull_request(ref.repo, ref.number)
+    client = OwnershipClient()
+    try:
+        current = client.get(entity, PHASE_REVIEW_REMEDIATION, asking=_SHEPHERD_OWNER)
+        if current.verdict != OWNED_BY_ME or current.ownership is None:
+            # Nothing to close: never acquired (rollout was off at adoption
+            # time), already released/terminal, or the store disagrees about
+            # who holds it — none of those are this call's to fix.
+            return
+        client.terminal(
+            entity, PHASE_REVIEW_REMEDIATION, _SHEPHERD_OWNER,
+            current.ownership.epoch, reason=reason[:200],
+        )
+    except Exception as exc:  # noqa: BLE001 — closing the row must never fail the tick
+        print(f"warn: {ref.repo}#{ref.number}: could not close ownership record ({exc})")
+
+
 def discover_adoptable(
     state_dir: Path,
     *,

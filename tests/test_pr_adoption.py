@@ -22,6 +22,7 @@ from orchestrator.lifecycle.contract import (
     OWNED_BY_OTHER,
     UNKNOWN,
     UNOWNED,
+    Ownership,
     OwnershipAnswer,
 )
 from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
@@ -91,10 +92,17 @@ def make_finding(**kwargs) -> run_shepherd.CodexFinding:
 class _FakeOwnershipClient:
     """Injected in place of ``pr_adoption.OwnershipClient``."""
 
-    def __init__(self, get_answer: OwnershipAnswer | None = None, acquire_answer: OwnershipAnswer | None = None):
+    def __init__(
+        self,
+        get_answer: OwnershipAnswer | None = None,
+        acquire_answer: OwnershipAnswer | None = None,
+        terminal_answer: OwnershipAnswer | None = None,
+    ):
         self._get_answer = get_answer or OwnershipAnswer(verdict=UNOWNED)
         self._acquire_answer = acquire_answer or OwnershipAnswer(verdict=OWNED_BY_ME, accepted=True)
+        self._terminal_answer = terminal_answer or OwnershipAnswer(verdict=UNOWNED, accepted=True)
         self.acquire_calls: list = []
+        self.terminal_calls: list = []
 
     def get(self, entity, phase, asking=None):
         return self._get_answer
@@ -102,6 +110,10 @@ class _FakeOwnershipClient:
     def acquire(self, entity, phase, owner, **kwargs):
         self.acquire_calls.append((entity, phase, owner, kwargs))
         return self._acquire_answer
+
+    def terminal(self, entity, phase, owner, epoch, reason=""):
+        self.terminal_calls.append((entity, phase, owner, epoch, reason))
+        return self._terminal_answer
 
 
 def _client_factory(client: _FakeOwnershipClient):
@@ -561,6 +573,74 @@ def test_discover_adoptable_ownership_acquire_failure_downgrades_to_no_adopt(tmp
     assert refs == []
     assert not (tmp_path / "mctl-web" / "adopted-prs").exists()
     assert client.acquire_calls  # the acquire really was attempted
+
+
+def _terminal_ref(tmp_path, *, status: str = "merged") -> pr_adoption.PRRef:
+    return pr_adoption.PRRef(
+        service="mctl-web", slug="pr-7",
+        proposal_dir=pr_adoption.record_dir(tmp_path, "mctl-web", 7),
+        status=status, repo="mctlhq/mctl-web", number=7,
+    )
+
+
+def test_release_ownership_closes_the_row_when_owned_by_me(tmp_path, monkeypatch) -> None:
+    """mctlhq/mctl-agents#334 code review: `_adopt`'s acquire has a matching
+    close once the ref reaches a terminal status — the row is not left
+    ACTIVE forever."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    client = _FakeOwnershipClient(
+        get_answer=OwnershipAnswer(verdict=OWNED_BY_ME, ownership=Ownership(epoch=3, state="active")),
+    )
+    monkeypatch.setattr(pr_adoption, "OwnershipClient", _client_factory(client))
+    ref = _terminal_ref(tmp_path, status="merged")
+
+    pr_adoption.release_ownership(ref, reason="adopted PR reached terminal status 'merged'")
+
+    assert len(client.terminal_calls) == 1
+    entity, phase, owner, epoch, reason = client.terminal_calls[0]
+    assert entity.id == "mctlhq/mctl-web#7"
+    assert phase == pr_adoption.PHASE_REVIEW_REMEDIATION
+    assert owner == pr_adoption._SHEPHERD_OWNER
+    assert epoch == 3
+    assert "merged" in reason
+
+
+def test_release_ownership_noop_when_not_owned_by_me(tmp_path, monkeypatch) -> None:
+    """A row already released, terminal, or held by somebody else is not
+    this call's to close."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+    client = _FakeOwnershipClient(get_answer=OwnershipAnswer(verdict=UNOWNED))
+    monkeypatch.setattr(pr_adoption, "OwnershipClient", _client_factory(client))
+    ref = _terminal_ref(tmp_path, status="rejected")
+
+    pr_adoption.release_ownership(ref, reason="closed")
+
+    assert client.terminal_calls == []
+
+
+def test_release_ownership_skipped_when_rollout_off(tmp_path, monkeypatch) -> None:
+    """Below `records_writes()` no row was ever written, so the store is
+    never even consulted — mirrors `_store_permits`'s own rollout-off gate."""
+    monkeypatch.delenv("LIFECYCLE_ROLLOUT_MODE", raising=False)
+    ref = _terminal_ref(tmp_path, status="review-stuck")
+
+    with patch.object(pr_adoption, "OwnershipClient", side_effect=AssertionError("must not be called")):
+        pr_adoption.release_ownership(ref, reason="stuck")  # must not raise
+
+
+def test_release_ownership_never_raises_on_transport_failure(tmp_path, monkeypatch, capsys) -> None:
+    """Closing a row must never fail the status transition it follows."""
+    monkeypatch.setenv("LIFECYCLE_ROLLOUT_MODE", "observe")
+
+    class _Boom:
+        def get(self, *a, **kw):
+            raise RuntimeError("store unreachable")
+
+    monkeypatch.setattr(pr_adoption, "OwnershipClient", lambda *a, **kw: _Boom())
+    ref = _terminal_ref(tmp_path, status="merged")
+
+    pr_adoption.release_ownership(ref, reason="merged")  # must not raise
+    assert "warn:" in capsys.readouterr().out
 
 
 def test_discover_adoptable_repo_listing_failure_yields_zero_and_no_exception(tmp_path, monkeypatch, capsys) -> None:

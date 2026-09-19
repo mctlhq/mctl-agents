@@ -3463,6 +3463,20 @@ def main() -> None:
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate
+        # PR adoption (mctlhq/mctl-agents#334 code review): `_adopt` acquires
+        # the ownership row directly, but nothing released it once the
+        # remediation loop finished — process_one stays ignorant of
+        # pr_adoption's existence (see ProposalRef.is_adopted's own comment),
+        # so the release lives here instead, in the one function that already
+        # imports pr_adoption and already observes ref.status post-transition.
+        # isinstance, not the bare `is_adopted` bool, so this narrows back to
+        # the `repo`/`number` fields release_ownership needs — safe here (this
+        # import is function-scoped, so it cannot cycle the way a module-level
+        # isinstance check against pr_adoption.PRRef would).
+        if isinstance(ref, pr_adoption.PRRef) and ref.status in pr_adoption.TERMINAL_STATUSES:
+            pr_adoption.release_ownership(
+                ref, reason=f"adopted PR reached terminal status {ref.status!r}"
+            )
 
     _print_summary(results)
 
