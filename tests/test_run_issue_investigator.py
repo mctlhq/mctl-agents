@@ -3473,6 +3473,11 @@ def test_shadow_mode_prompt_is_byte_identical_to_off_and_seals_a_snapshot(tmp_pa
 
 
 def test_on_mode_appends_context_and_still_publishes(tmp_path, monkeypatch):
+    """T10 (on mode). A comment gives `on` mode an actual renderable source
+    (`target-repo`/`inline-template` render nothing and a first
+    investigation has no prior proposal to read), so the assertion below
+    pins down real behaviour instead of passing whether or not anything
+    was ever appended."""
     seen_prompts: list[str] = []
 
     def agent(repo_dir, prompt, proposal_dir):
@@ -3481,11 +3486,19 @@ def test_on_mode_appends_context_and_still_publishes(tmp_path, monkeypatch):
             (proposal_dir / name).write_text(f"v1 {name}")
 
     issue = _shadow_harness(tmp_path, monkeypatch, mode="on", agent=agent)
-    result = investigate(issue.ref.url, state_dir=tmp_path)
-    assert result.error is None
-    assert "## Assembled context" in seen_prompts[0] or seen_prompts[0] == run_issue_investigator._build_prompt(
-        issue, "mctl-telegram", "issue-265-some-feature"
+    commented_issue = IssueData(
+        ref=issue.ref,
+        title=issue.title,
+        body=issue.body,
+        state=issue.state,
+        comments=(("c1", "alice", "2024-01-01T00:00:00Z", "extra context from a comment"),),
     )
+    monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: commented_issue)
+    result = investigate(commented_issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+    assert "## Assembled context" in seen_prompts[0]
+    assert "Comment by alice" in seen_prompts[0]
+    assert "extra context from a comment" in seen_prompts[0]
 
 
 # ---------------------------------------------------------------------------

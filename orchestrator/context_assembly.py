@@ -23,6 +23,7 @@ never authorization".
 from __future__ import annotations
 
 import os
+import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -321,7 +322,13 @@ def deduplicate(candidates: Sequence[CandidateSource]) -> int:
 
 def truncate_to_per_source_limit(candidate: CandidateSource, max_bytes_per_source: int) -> bool:
     """Cut bytes to the limit BEFORE re-hashing, so `content_hash` describes
-    what the model actually saw. Returns True when truncation happened."""
+    what the model actually saw. Returns True when truncation happened.
+
+    `render_text`, when set, is what actually reaches the `on`-mode prompt
+    (`AssemblyResult.rendered`) — cut it to the same byte ceiling too, or a
+    sealed snapshot recording `byte_count=max_bytes_per_source` would still
+    let the untruncated text past `truncate_to_per_source_limit` reach the
+    model, misdescribing what it actually saw."""
     if len(candidate.raw) <= max_bytes_per_source:
         return False
     candidate.raw = candidate.raw[:max_bytes_per_source]
@@ -329,6 +336,10 @@ def truncate_to_per_source_limit(candidate: CandidateSource, max_bytes_per_sourc
     candidate.byte_count = len(candidate.raw)
     candidate.selector = {**candidate.selector, "byte_range": [0, candidate.byte_count]}
     candidate.truncated = True
+    if candidate.render_text is not None:
+        candidate.render_text = candidate.render_text.encode("utf-8")[:max_bytes_per_source].decode(
+            "utf-8", errors="ignore"
+        )
     return True
 
 
@@ -482,17 +493,42 @@ def collect_target_repo(assembly_input: AssemblyInput) -> list[CandidateSource]:
     ]
 
 
+def _read_prior_proposal_file(path: Path, max_bytes: int) -> bytes | None:
+    """Read one triplet file from a published (agent-authored, hence
+    untrusted) proposal directory the way
+    `run_issue_investigator._read_published_status` reads `.status.yaml`
+    (`orchestrator/run_issue_investigator.py:543`): `O_NOFOLLOW` refuses a
+    symlink planted where a plain file is expected, the `fstat` re-check
+    refuses anything but a regular file, and the read is bounded at
+    `max_bytes + 1` so a file (or a writer still appending to one) cannot
+    exhaust the worker's memory. Returns `None` on any of those failures —
+    the caller already treats a missing/unreadable triplet file as "this
+    source does not exist yet" (`OSError` from `read_bytes()` previously)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        with open(fd, "rb", closefd=False) as f:
+            return f.read(max_bytes + 1)
+    finally:
+        os.close(fd)
+
+
 def collect_prior_proposal(assembly_input: AssemblyInput) -> list[CandidateSource]:
     """The existing requirements/design/tasks triplet, when re-investigating
     a `proposed` proposal directory. A first investigation's proposal
     directory does not exist yet (or is empty), so this yields nothing."""
     max_age = assembly_input.config.freshness_table.get("proposal-dir")
+    read_ceiling = assembly_input.config.max_bytes_per_source
     candidates = []
     for name in TRIPLET_FILENAMES:
         path = assembly_input.proposal_dir / name
-        try:
-            raw = path.read_bytes()
-        except OSError:
+        raw = _read_prior_proposal_file(path, read_ceiling)
+        if raw is None:
             continue
         locator = f"gitops://agents-state/{assembly_input.service}/proposals/{assembly_input.slug}/{name}"
         candidates.append(

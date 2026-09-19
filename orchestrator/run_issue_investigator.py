@@ -1179,12 +1179,15 @@ _STRIPPED_TAG = "[tag stripped]"
 
 
 def _neutralize_prompt_tags(text: str) -> str:
-    """Strip forged <issue_title>/<issue_body> (and closing) tags from
-    untrusted issue text so it cannot break out of — or fake — the
-    delimiter blocks _build_prompt wraps it in (agy P1 round 2, PR #212:
-    a body containing `</issue_body>` would end the untrusted block early
+    """Strip forged <issue_title>/<issue_body>/<context_source> (and
+    closing) tags from untrusted text so it cannot break out of — or fake
+    — the delimiter blocks it is wrapped in (agy P1 round 2, PR #212: a
+    body containing `</issue_body>` would end the untrusted block early
     and promote the attacker's remaining text to instruction level).
-    Targeted removal, not blanket angle-bracket escaping: issue bodies
+    `context_source` carries the same untrusted-DATA payloads through
+    `_render_assembled_context_section` in `on` mode (#265) and reopens
+    the identical hole if left out here. Targeted removal, not blanket
+    angle-bracket escaping: issue bodies and prior-proposal text
     legitimately carry code with generics/HTML that must reach the agent
     intact."""
     # Lenient LLM/XML parsers honor a forged tag carrying attributes or junk
@@ -1203,7 +1206,9 @@ def _neutralize_prompt_tags(text: str) -> str:
     # again. A marker between them keeps the halves apart (agy P1, round 2
     # on #248 — same fix in the sibling guard named above).
     return re.sub(
-        r"(?i)<[\s/]*issue_(title|body)(?![-\w])[^>\n]*>?", _STRIPPED_TAG, text or ""
+        r"(?i)<[\s/]*(?:issue_(?:title|body)|context_source)(?![-\w])[^>\n]*>?",
+        _STRIPPED_TAG,
+        text or "",
     )
 
 
