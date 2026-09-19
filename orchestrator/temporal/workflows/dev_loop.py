@@ -964,7 +964,18 @@ class DevLoopWorkflow:
         workflow.logger.info("human_input.requested", extra={"human_input": human_input.request_log_dict(request)})
         workflow.logger.info("human_input.wait_started", extra={"human_input": human_input.request_log_dict(request)})
 
-        expires_at = _as_utc(request.expires_at)
+        try:
+            expires_at = _as_utc(request.expires_at)
+        except (ValueError, TypeError) as exc:
+            # Same failure mode as the malformed-request guard above: an
+            # unhandled exception here is a workflow-task failure that
+            # Temporal retries forever on identical input, not a workflow
+            # failure — a wedged state machine rather than a loud error.
+            raise ApplicationError(
+                f"malformed expires_at for {service}/{slug}: {exc}",
+                type="human_input_malformed",
+                non_retryable=True,
+            ) from exc
         consumed = 0
         while True:
             remaining = (expires_at - workflow.now()).total_seconds()
