@@ -1535,9 +1535,48 @@ def _load_review_feedback(path: Path) -> dict:
     return data
 
 
+def _render_ci_failures_section(ci_failures: list) -> str:
+    """Render the ``## Failing required CI checks (fix each)`` section.
+
+    Deterministic, sourced entirely from `bundle["ci_failures"]` — the
+    shepherd builds these records straight from GitHub check-run data
+    (mctlhq/mctl-agents#411) and never routes them through its summariser
+    SDK, so nothing here is model-rewritten. Each record's fields are
+    optional (a `StatusContext` has no job/step, some checks have no run
+    URL), so every line is rendered defensively.
+    """
+    lines: list[str] = ["## Failing required CI checks (fix each)", ""]
+    for i, item in enumerate(ci_failures, 1):
+        if not isinstance(item, dict):
+            continue
+        check = item.get("check") or "(unknown check)"
+        workflow = item.get("workflow")
+        job = item.get("job")
+        step = item.get("step")
+        conclusion = item.get("conclusion") or "?"
+        url = item.get("url")
+        head = item.get("head_sha")
+        excerpt = (item.get("excerpt") or "").strip()
+        loc_bits = [b for b in (workflow, job, step) if b]
+        loc = " / ".join(loc_bits)
+        header = f"### Check {i}: {check} [{conclusion}]"
+        if loc:
+            header += f" — {loc}"
+        lines.append(header)
+        if head:
+            lines.append(f"Head SHA: {head}")
+        if url:
+            lines.append(f"Run: {url}")
+        if excerpt:
+            lines.append(excerpt)
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _render_review_feedback(bundle: dict) -> str:
     """Format the JSON bundle as a Markdown section for the sub-agent."""
     summaries = bundle.get("summaries") or []
+    ci_failures = bundle.get("ci_failures") or []
     has_p1 = bool(bundle.get("p1"))
     has_p2 = bool(bundle.get("p2"))
 
@@ -1551,24 +1590,34 @@ def _render_review_feedback(bundle: dict) -> str:
     lines.append("")
 
     if not summaries:
-        lines.append("(No summaries in bundle — re-read the PR's code review on GitHub.)")
-        return "\n".join(lines)
-
-    for i, item in enumerate(summaries, 1):
-        if isinstance(item, dict):
-            severity = item.get("severity") or "?"
-            file_ = item.get("file") or item.get("path") or "(top-level comment)"
-            line = item.get("line")
-            body = (item.get("body") or "").strip()
-            loc = file_ + (f":{line}" if line else "")
-            lines.append(f"### Finding {i} [{severity}] — {loc}")
-            if body:
-                lines.append(body)
-            lines.append("")
+        # A CI-only bundle (mctlhq/mctl-agents#411: an actionable required
+        # check failed with a clean review) still has something useful to
+        # say — render the CI section below instead of the old dead end.
+        if ci_failures:
+            lines.append("(No code review findings in this bundle.)")
         else:
-            # Fallback shape: plain string summary.
-            lines.append(f"- {str(item).strip()}")
-    return "\n".join(lines).rstrip() + "\n"
+            lines.append("(No summaries in bundle — re-read the PR's code review on GitHub.)")
+            return "\n".join(lines)
+    else:
+        for i, item in enumerate(summaries, 1):
+            if isinstance(item, dict):
+                severity = item.get("severity") or "?"
+                file_ = item.get("file") or item.get("path") or "(top-level comment)"
+                line = item.get("line")
+                body = (item.get("body") or "").strip()
+                loc = file_ + (f":{line}" if line else "")
+                lines.append(f"### Finding {i} [{severity}] — {loc}")
+                if body:
+                    lines.append(body)
+                lines.append("")
+            else:
+                # Fallback shape: plain string summary.
+                lines.append(f"- {str(item).strip()}")
+
+    rendered = "\n".join(lines).rstrip() + "\n"
+    if ci_failures:
+        rendered += "\n" + _render_ci_failures_section(ci_failures)
+    return rendered
 
 
 def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:

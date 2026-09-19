@@ -247,8 +247,14 @@ from GitHub before the decision loop. Reconcile mode additionally repairs
 `accepted`, `error`, `review-stuck`, `needs-triage`, and terminal drift without
 reviewing, fixing, or merging a PR.
 
+The merge gate is the UNION of two independent blocker sources
+(mctlhq/mctl-agents#411): semantic review findings from the gating bots, and
+failing REQUIRED checks on the PR's current head, read by
+`orchestrator/ci_checks.py::read_required_checks`. A clean review no longer
+merges a PR whose required `lint`/typecheck/test check is red.
+
 ```python
-def decide(pr, codex_review, *, fix_only=False):
+def decide(pr, codex_review, *, fix_only=False, ci=None):
     if pr.merged:
         return "flip-to-merged", pr.merge_commit
     if pr.closed_unmerged:
@@ -256,8 +262,15 @@ def decide(pr, codex_review, *, fix_only=False):
     if pr.is_draft or not codex_review.has_responded:
         return "wait", None
     findings = codex_review.findings_p1_p2(at=pr.head_sha)
-    if findings:
-        return "address-review", findings
+    checks = ci.actionable if (ci and ci.known) else []
+    if findings or checks:
+        return "address-review", Blockers(findings, checks)
+    if ci and ci.known and ci.infrastructure:
+        return "ci-infra", list(ci.infrastructure)
+    if ci and not ci.known:
+        return "ci-unknown", None
+    if ci and ci.known and ci.pending:
+        return "wait", None
     if pr.merge_state_status not in {"CLEAN", "HAS_HOOKS", "UNSTABLE"}:
         return "wait", None
     if not pr.checks_green:
@@ -267,27 +280,41 @@ def decide(pr, codex_review, *, fix_only=False):
 
 Decisions:
 
-- **wait** — codex still reviewing, draft PR, CI not green, or merge
-  state blocked. Leave `.status.yaml` alone; next tick re-evaluates.
+- **wait** — codex still reviewing, draft PR, a required check still
+  QUEUED/IN_PROGRESS, or merge state blocked. Leave `.status.yaml`
+  alone; next tick re-evaluates.
 - **address-review** — codex left P1/P2 findings on the current head
-  SHA. Build a JSON bundle of the findings via the shepherd
-  sub-agent (`agents/_shepherd/shepherd.md`), persist it to a temp
-  file, and fork `run_implementer.py --review-feedback <path>` so it
-  pushes a follow-up commit on the existing branch. Unchanged by
-  fix-only mode — this is the stage the shepherd keeps for
-  steward-owned repos.
-- **merge** — codex clean, CI green, merge state mergeable, and the
-  service is not fix-only or in `NEVER_MERGE_SERVICES`. Calls
+  SHA, and/or a required check failed on it in a way classified as
+  actionable (see below). Build a JSON bundle via the shepherd
+  sub-agent (`agents/_shepherd/shepherd.md`) for the findings, append
+  the CI blocker records deterministically (never through the SDK),
+  persist the bundle to a temp file, and fork
+  `run_implementer.py --review-feedback <path>` so it pushes a
+  follow-up commit on the existing branch. Unchanged by fix-only mode
+  — this is the stage the shepherd keeps for steward-owned repos.
+- **ci-infra** — the only current-head blockers are required checks
+  classified as non-actionable infrastructure failures (cancelled,
+  timed out, runner lost, ...). Re-runs the failing workflow run(s) via
+  `gh run rerun --failed`, bounded per head SHA by
+  `SHEPHERD_CI_INFRA_RERUN_MAX` (default 2). Never charges
+  `review_attempts` — the proposal is blameless.
+- **ci-unknown** — the required-check probe failed (API error,
+  malformed response, a truncated contexts page). Fails closed: no
+  merge/defer-merge this tick. Tracked on `ci_probe_failures`, cleared
+  by any successful probe.
+- **merge** — codex clean, no required check failing, merge state
+  mergeable, and the service is not fix-only or in
+  `NEVER_MERGE_SERVICES`. Calls
   `gh pr merge --merge --delete-branch --match-head-commit <SHA>` so
   a push that lands between review and merge cannot smuggle
   unreviewed code through. On HEAD-SHA mismatch we fall back to
   `wait` and the next tick re-evaluates.
-- **defer-merge** — codex clean, CI green, merge state mergeable, but
-  the service is in fix-only mode: merge is owned by another PR
-  lifecycle. Records `merge_owner: pr-steward` in `.status.yaml`
-  (via the change-only writer, so repeated ticks produce no new
-  gitops commit) and leaves `status` untouched. `merge_pr()` is never
-  called.
+- **defer-merge** — codex clean, no required check failing, merge
+  state mergeable, but the service is in fix-only mode: merge is
+  owned by another PR lifecycle. Records `merge_owner: pr-steward` in
+  `.status.yaml` (via the change-only writer, so repeated ticks
+  produce no new gitops commit) and leaves `status` untouched.
+  `merge_pr()` is never called.
 - **flip-to-merged** — human (or the steward) merged the PR out of
   band. Record `merge_commit` and flip the proposal to terminal
   `merged`; clears `merge_owner` if it was set.
@@ -295,12 +322,29 @@ Decisions:
   terminal `rejected` with the close comment in `notes:`; clears
   `merge_owner` if it was set.
 
+**Required-check classification.** Each failing required check is
+classified `actionable` or `infrastructure`: `CANCELLED`, `TIMED_OUT`,
+`STALE`, `ACTION_REQUIRED`, `SKIPPED`, `NEUTRAL`, and a startup failure are
+always infrastructure; a genuine `FAILURE` with file/line-anchored
+annotations (exactly what `mypy`/`ruff` produce) is actionable; a `FAILURE`
+with no annotations is infrastructure only if the failure text matches a
+known infra signature (runner lost, rate limited, out of disk, ...) —
+otherwise it defaults to actionable, because handing the implementer a real
+defect it cannot fix costs one of five attempts, while silently filing a
+real defect as infrastructure restores the exact silent wedge (#409) this
+mechanism exists to remove. A required check that is failing but NOT
+required to pass (advisory) never enters the blocker set. Staleness is
+enforced at the source: only check/status contexts observed on `pr.head_sha`
+itself are ever read.
+
 **Review-attempt cap.** The outer loop tracks `review_attempts:` in
-`.status.yaml`. After five consecutive `address-review` ticks
-without resolving the findings, the next tick flips the proposal to
-`status: review-stuck` (terminal) instead of forking the
-implementer again. The pure `decide()` function does not see the
-counter — it stays trivially testable with hand-built fixtures.
+`.status.yaml`. After five consecutive `address-review` ticks without
+resolving the current-head blocker set — review findings, failing
+required checks, or both — the next tick flips the proposal to
+`status: review-stuck` (terminal) instead of forking the implementer
+again; the note enumerates what is still unresolved, by reviewer and by
+check name. The pure `decide()` function does not see the counter — it
+stays trivially testable with hand-built fixtures.
 
 **Bot signals.**
 
