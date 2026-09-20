@@ -281,9 +281,17 @@ class TestCheckImplementAdmissionIsSafe:
     agree with the real CWFT in mctl-gitops, and a no-match must never read
     as a pass."""
 
-    def test_the_mutex_on_run_implementer_with_a_long_deadline_is_an_error(self, tmp_path, monkeypatch) -> None:
-        """The #418 shape restated structurally: a lock and a 7200s
-        deadline on the same node."""
+    def test_the_mutex_on_run_implementer_while_admission_is_bound_to_it_is_clean(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The real mctl-gitops@main shape today: the mutex still guards
+        `run-implementer` with its historical 7200s deadline. That is not a
+        fresh violation while the mirror matches it, because
+        `implementation_max_concurrent_activities()` (constants.py) already
+        refuses to start with N above this exact mutex's width — the actual
+        guard against the 2026-09-19 shape. This must stay clean, or every
+        PR-validation run fails until the separate mctl-gitops migration
+        (task 10 of #418) lands, which is not a code bug in this repo."""
         directory = _write_implement_cwft(
             tmp_path,
             [
@@ -297,9 +305,33 @@ class TestCheckImplementAdmissionIsSafe:
         )
         monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
 
+        assert check_implement_admission_is_safe() == []
+
+    def test_a_guarded_template_other_than_run_implementer_with_a_long_deadline_is_an_error(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The exemption above is specific to IMPLEMENTER_TEMPLATE while
+        admission is bound to it — any other guarded template with a long
+        deadline is still the #418 shape and must still error."""
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {"name": "run-implementer", "activeDeadlineSeconds": 7200},
+                {
+                    "name": "commit-and-push",
+                    "synchronization": {"mutex": {"name": "mctl-agents-proposal-claims"}},
+                    "activeDeadlineSeconds": 7200,
+                },
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+        monkeypatch.setattr(
+            "orchestrator.temporal.constants.ARGO_IMPLEMENT_MUTEX_TEMPLATE", "commit-and-push"
+        )
+
         errors = check_implement_admission_is_safe()
 
-        assert any("run-implementer" in e and "7200" in e for e in errors), errors
+        assert any("commit-and-push" in e and "7200" in e for e in errors), errors
 
     def test_the_mutex_on_commit_and_push_with_a_matching_mirror_is_clean(self, tmp_path, monkeypatch) -> None:
         """Once the mirror names `commit-and-push` (the state after the
@@ -407,10 +439,11 @@ class TestCheckImplementAdmissionIsSafe:
         errors = check_implement_admission_is_safe()
 
         # Still recognised as the guarded template (no "no template carries
-        # synchronization.mutex(es)" error) — the only error here is the
-        # long-deadline-behind-a-lock one.
-        assert not any("no template carries" in e for e in errors), errors
-        assert any("7200" in e for e in errors), errors
+        # synchronization.mutex(es)" error), and clean overall —
+        # run-implementer's own deadline is exempt while admission is bound
+        # to it (see
+        # test_the_mutex_on_run_implementer_while_admission_is_bound_to_it_is_clean).
+        assert errors == [], errors
 
     def test_a_missing_gitops_checkout_fails_under_ci(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", tmp_path / "absent")

@@ -386,14 +386,32 @@ def check_implement_admission_is_safe() -> list[str]:
             f"{mutex_template!r}"
         )
 
+    # While the mirror still names IMPLEMENTER_TEMPLATE,
+    # implementation_max_concurrent_activities() (constants.py) refuses to
+    # start the implementation worker at all unless N is at or under this
+    # exact mutex's width — that binding, not a deadline threshold, is what
+    # actually prevents the 2026-09-19 shape. A long deadline on that one
+    # template is the known, still-migrating state this proposal starts
+    # from (mctl-gitops@main today), not a fresh violation; asserting a
+    # threshold on it here would fail every PR-validation run against real,
+    # current, not-yet-migrated gitops content for a risk admission already
+    # closes. It stops being exempt the moment either repo disagrees with
+    # the mirror, which the checks above already catch.
+    admission_bound = temporal_constants.argo_admission_width() is not None
     for name in guarded:
+        if admission_bound and name == implement_outcome.IMPLEMENTER_TEMPLATE:
+            continue
         deadline = by_name[name].get("activeDeadlineSeconds")
-        if isinstance(deadline, int) and deadline > MAX_LOCKED_STEP_DEADLINE_SECONDS:
+        # A no-match must never read as a pass: a missing or non-int
+        # deadline on a guarded template is not evidence of a bounded
+        # budget, so it is reported exactly like one that is too long.
+        if not isinstance(deadline, int) or deadline > MAX_LOCKED_STEP_DEADLINE_SECONDS:
             errors.append(
-                f"{cwft_path}: template {name!r} carries synchronization.mutex {mutex_name!r} AND "
-                f"activeDeadlineSeconds={deadline}, above MAX_LOCKED_STEP_DEADLINE_SECONDS="
-                f"{MAX_LOCKED_STEP_DEADLINE_SECONDS} — a lock wait on this node counts against a "
-                "long deadline, the mctl-agents#418 shape restated structurally"
+                f"{cwft_path}: template {name!r} carries synchronization.mutex {mutex_name!r} with "
+                f"activeDeadlineSeconds={deadline!r}, not an int at or under "
+                f"MAX_LOCKED_STEP_DEADLINE_SECONDS={MAX_LOCKED_STEP_DEADLINE_SECONDS} — a lock wait "
+                "on this node counts against a long (or unreadable) deadline, the mctl-agents#418 "
+                "shape restated structurally"
             )
 
     implementer_template = by_name.get(implement_outcome.IMPLEMENTER_TEMPLATE)

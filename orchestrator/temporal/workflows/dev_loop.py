@@ -1181,10 +1181,13 @@ class DevLoopWorkflow:
             )
             result = await _run_cwft(IMPLEMENTATION_OPERATION, params)
 
-            if not workflow.patched("implement-outcome"):
-                await _record("implementer", implementer_release, result, target_repo)
-                return result
-
+            # classify() and render_pre_start_reason() are pure lookups over
+            # `result` — no workflow command is issued — so computing them
+            # here is safe. What must NOT move is `_record`'s activity
+            # relative to `workflow.patched("implement-outcome")` below: every
+            # workflow already past this point has that activity recorded in
+            # history BEFORE the patch marker, and reordering them makes
+            # replay diverge from history and wedges the workflow.
             outcome: Outcome = classify(
                 result.phase,
                 implementer_ran=result.implementer_ran,
@@ -1195,11 +1198,15 @@ class DevLoopWorkflow:
             # `None` to "unknown", so a success/execution/finalization
             # outcome must not be given a reason it never had.
             reason = render_pre_start_reason(result.pre_start_reason) if outcome == "pre_start" else None
-            self._implement_state = dataclasses.replace(
-                self._implement_state, outcome=outcome, pre_start_reason=reason
-            )
             await _record(
                 "implementer", implementer_release, result, target_repo, outcome=outcome, pre_start_reason=reason
+            )
+
+            if not workflow.patched("implement-outcome"):
+                return result
+
+            self._implement_state = dataclasses.replace(
+                self._implement_state, outcome=outcome, pre_start_reason=reason
             )
 
             if outcome == "success":
