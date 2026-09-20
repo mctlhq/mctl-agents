@@ -224,7 +224,10 @@ Three rules keep that rewrite from being worse than the defect it closes:
   `--rcfile`, `--init-file`, and a cluster ending in `o`) must step over its
   ARGUMENT first, or `bash -o pipefail -c "go test ./... &"` stops on
   `pipefail` and never reaches its `-c`. A multi-call binary names its
-  applet before its flags (`busybox sh -c`). The scan reads an ATTACHED
+  applet before its flags (`busybox sh -c`). An exec WRAPPER — `env`,
+  `nice`, `sudo`, `stdbuf`, with their own options and the ones that take a
+  word — is stepped over before the command word is judged, because the
+  shell it execs still owns the payload. The scan reads an ATTACHED
   value (`bash -c'cmd &'`, one token after lexing) as the payload. Arithmetic expansion is NOT a command
   substitution: `$((a & b))` is a bitwise AND on numbers, so the span reads
   as data — but ONLY when the inner paren closes against a `)`. Bash falls

@@ -293,6 +293,23 @@ _SHELL_C_FLAG_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 # on `68f3a05`, confirmed against bash 5). A cluster ending in `o`/`O`
 # (`-euo pipefail`) consumes one too.
 _OPTIONS_TAKING_A_WORD = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
+# Commands that change HOW a command runs and then exec it, leaving the shell
+# that follows them in charge of the payload. `env` alone was skipped as a
+# bare word, so `env -i bash -c "go test ./... &"` stopped on `-i` and the
+# payload was never scanned -- the same envelope escape #430 exists to close,
+# reached through a wrapper instead of a flag spelling (claude/agy P3 on
+# `24fe327`). Each wrapper's own options are stepped over, including the ones
+# that consume the next word.
+_WRAPPER_OPTIONS_TAKING_A_WORD: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "sudo": frozenset({
+        "-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from",
+        "-D", "--chdir", "-R", "--chroot", "-T", "--command-timeout",
+        "-U", "--other-user", "-r", "--role", "-t", "--type", "-h", "--host",
+    }),
+}
 
 
 def _arithmetic_spans(visible: str) -> list[tuple[int, int]]:
@@ -444,12 +461,23 @@ def _shell_c_payloads(command: str) -> list[str]:
         except ValueError:
             continue
         index = 0
-        # Skip leading `VAR=value` assignments and an `env` wrapper, which
-        # change who runs but not what the command word means.
-        while index < len(words) and (
-            _ASSIGNMENT_RE.match(words[index]) or words[index].split("/")[-1] == "env"
-        ):
+        # Skip leading `VAR=value` assignments and exec wrappers, which change
+        # who runs but not what the command word means.
+        while index < len(words):
+            word = words[index]
+            if _ASSIGNMENT_RE.match(word):
+                index += 1
+                continue
+            takes_a_word = _WRAPPER_OPTIONS_TAKING_A_WORD.get(word.split("/")[-1])
+            if takes_a_word is None:
+                break
             index += 1
+            while (
+                index < len(words)
+                and words[index].startswith("-")
+                and words[index] != "-"
+            ):
+                index += 2 if words[index] in takes_a_word else 1
         if index >= len(words):
             continue
         if words[index].split("/")[-1] not in SHELL_COMMAND_WORDS:

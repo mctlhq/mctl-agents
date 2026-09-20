@@ -559,3 +559,43 @@ def test_an_option_argument_does_not_end_the_flag_scan(command):
 def test_an_option_argument_does_not_manufacture_a_payload():
     """The same walk must not turn a synchronous command into a denial."""
     assert exec_budget.detachment_match('bash -o pipefail -c "go test ./..."') is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'env -i bash -c "go test ./... &"',
+        'env -u HOME bash -c "go test ./... &"',
+        'nice bash -c "go test ./... &"',
+        'nice -n 10 bash -c "go test ./... &"',
+        'sudo bash -c "go test ./... &"',
+        'sudo -u ci bash -c "go test ./... &"',
+        'stdbuf -o0 bash -c "go test ./... &"',
+        'stdbuf -o 0 bash -c "go test ./... &"',
+        # Wrappers compose, and an assignment can sit between them.
+        'env -i FOO=1 nice bash -lc "go test ./... &"',
+    ],
+)
+def test_an_exec_wrapper_does_not_hide_the_payload(command):
+    """A wrapper execs the shell, so the shell still owns the payload.
+
+    `env` was skipped as a bare word, so `env -i bash -c "…"` stopped on
+    `-i` and the payload was never scanned — the same envelope escape #430
+    exists to close, reached through a wrapper rather than a flag spelling
+    (claude/agy P3 on `24fe327`).
+    """
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'env -i bash -c "go test ./..."',
+        'sudo git -c user.name="A & B" commit -m x',
+        "nice go test ./...",
+        # The operand rule still applies on the far side of a wrapper.
+        'env -i bash deploy.sh -ec "restart A & B"',
+    ],
+)
+def test_seeing_through_a_wrapper_does_not_manufacture_a_payload(command):
+    assert exec_budget.detachment_match(command) is None
