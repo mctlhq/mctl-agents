@@ -334,6 +334,21 @@ def test_the_posted_approve_command_is_valid(monkeypatch) -> None:
     assert args.approver == "someone"
 
 
+def test_cli_parses_the_abandon_command() -> None:
+    """mctl-agents#420: `abandon` requires `--reason`, mirroring `approve`'s
+    required `--approver` (a bare signal recorded a reason nobody gave)."""
+    from orchestrator.temporal import cli as temporal_cli
+
+    parser = temporal_cli.build_parser()
+    args = parser.parse_args(["abandon", "dev-loop-mctlhq-mctl-web-1", "--reason", "stuck"])
+    assert args.command == "abandon"
+    assert args.workflow_id == "dev-loop-mctlhq-mctl-web-1"
+    assert args.reason == "stuck"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["abandon", "dev-loop-mctlhq-mctl-web-1"])
+
+
 # --- the write that could erase the requirement ----------------------------
 # These belong with the gate rather than in a general status-file test:
 # what makes the truncation window dangerous is precisely that an empty

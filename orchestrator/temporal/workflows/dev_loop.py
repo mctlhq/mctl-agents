@@ -27,6 +27,16 @@ The implement step stays scoped to this issue's own repo AND its own
 proposal slug (see `_target_repo` and `find_proposal_slug` below), so even
 a mis-signalled approve can never implement a different repo's — or a
 different issue's — proposal.
+
+The approval park is bounded (mctl-agents#420): `run()` no longer parks at
+an unbounded `wait_condition`. Under the `approval-watch` patch it polls
+every `APPROVAL_POLL_INTERVAL`, re-reading the source issue's state and
+ending the execution if the issue closed while parked, and gives up at
+`APPROVAL_WAIT_DEADLINE` if nothing resolves the wait first. An `abandon`
+signal (a graceful, cluster-access-free alternative to Temporal
+`terminate`) ends either this park or an in-progress merge watch at their
+next observation point. Every one of these paths records why it ended in
+`DevLoopResult.ended`.
 """
 from __future__ import annotations
 
@@ -162,6 +172,16 @@ SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
 # its own activeDeadlineSeconds is 600. Anything near SDK_STEP_TIMEOUT here
 # would just mean a wedged mutex holding the loop for hours.
 APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
+
+# mctl-agents#420: the approval park (`workflow.wait_condition` a few lines
+# into `run()`) had no bound of its own -- every other stage in this module
+# does. Matched to `MERGE_WATCH_DEADLINE` so the worst-case lifetime of an
+# execution is two bounded fortnights, not infinity: 56 polls over the
+# deadline is a negligible history footprint against Temporal's 50k event
+# limit, two orders of magnitude below the ~1344 polls `_watch_pr` already
+# budgets for its own 14-day watch.
+APPROVAL_POLL_INTERVAL = timedelta(hours=6)
+APPROVAL_WAIT_DEADLINE = timedelta(days=14)
 
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
 # state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
@@ -484,6 +504,21 @@ class LifecycleClaim:
 
 
 @dataclass(frozen=True)
+class AbandonState:
+    """Whether an operator told this execution to end early, and why.
+
+    mctl-agents#420: a small, dedicated query rather than folding this into
+    `LifecycleClaim` -- that dataclass already uses `abandoned` for a
+    different question (did this loop let go of a lifecycle-ownership row it
+    still held), and conflating the two would make one field answer two
+    unrelated questions depending on which caller is asking.
+    """
+
+    abandoned: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
     # None if approval was never signalled, investigate failed, or the
@@ -506,6 +541,12 @@ class DevLoopResult:
     # Stage 6.4 (ADR-006, #216): incidents raised against the deployed
     # service during the watch window. None when the stage did not run.
     incidents: IncidentWatch | None = None
+    # mctl-agents#420: why this execution ended, when it ended for a reason
+    # other than running the pipeline to the end -- "abandoned: ...",
+    # "source issue closed ..." (pre- or mid-approval-park), or "approval
+    # wait expired". Empty on the full-pipeline path. Defaulted so results
+    # recorded before this field existed still deserialize.
+    ended: str = ""
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -515,6 +556,52 @@ async def _resolve(agent: str) -> ResolvedRelease | None:
         start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
         retry_policy=FAST_ACTIVITY_RETRY_POLICY,
     )
+
+
+def _first_string(args: tuple[object, ...], key: str) -> str | None:
+    """Best-effort extraction of a signal payload's message string.
+
+    Mirrors `approve`'s own defensive parse: a bare non-empty string is
+    used directly, a dict is probed for ``key``, and anything else -- or
+    no args at all -- yields None. Signal handlers must never raise on an
+    unexpected payload shape.
+    """
+    for arg in args:
+        if isinstance(arg, dict):
+            candidate = arg.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        elif isinstance(arg, str) and arg:
+            return arg
+    return None
+
+
+async def _read_issue_state(issue: IssueRef) -> IssueState | None:
+    """Read the source issue's current state, failing open on error.
+
+    Same fail-open rule the `stale-issue-admission` gate below applies: an
+    `ActivityError` after retries (a GitHub blip) must delay the caller's
+    decision by one interval rather than wedge or fail a workflow that only
+    wants to know whether to keep waiting.
+    """
+    issue_parts = parse_issue_url(issue.issue_url)
+    issue_repo = f"{issue_parts.owner}/{issue_parts.repo}"
+    issue_number_int = int(issue_parts.number)
+    try:
+        return await workflow.execute_activity(
+            get_issue_state,
+            args=[issue_repo, issue_number_int],
+            start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+            retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+        )
+    except ActivityError:
+        workflow.logger.warning(
+            "get_issue_state failed after retries for %s#%s -- proceeding "
+            "without this issue-state check",
+            issue_repo,
+            issue_number_int,
+        )
+        return None
 
 
 async def _run_cwft(
@@ -826,6 +913,12 @@ class DevLoopWorkflow:
         self._last_lifecycle_op = ""
         self._last_lifecycle_op_landed = False
         self._claim_abandoned = False
+        # mctl-agents#420: set by the `abandon` signal. Observed by both long
+        # waits (the approval park and _watch_pr's merge watch) so an operator
+        # can end an execution gracefully without Temporal `terminate`, which
+        # would skip _watch_pr's `finally` and its lifecycle-ownership release.
+        self._abandoned = False
+        self._abandon_reason: str | None = None
 
     @workflow.query
     def implement_execution(self) -> ImplementExecutionState:
@@ -866,6 +959,19 @@ class DevLoopWorkflow:
             abandoned=self._claim_abandoned,
         )
 
+    @workflow.query
+    def abandon_state(self) -> AbandonState:
+        """Was this execution told to end early by an operator, and why?
+
+        mctl-agents#420: the `abandon` signal handler below sets this and
+        never raises, so a status reader (`cli.py status`, and eventually
+        mctl-api) can distinguish "still parked" from "an operator ended
+        this" without waiting for the execution to complete.
+        """
+        return AbandonState(
+            abandoned=self._abandoned, reason=self._abandon_reason or ""
+        )
+
     @workflow.signal
     def approve(self, *args: object) -> None:
         # Optional payload for the audit trail: legacy senders signal with no
@@ -880,6 +986,23 @@ class DevLoopWorkflow:
             elif isinstance(arg, str) and arg:
                 self._approver = arg
         self._approved = True
+
+    @workflow.signal
+    def abandon(self, *args: object) -> None:
+        """Gracefully end this execution at its next observation point.
+
+        mctl-agents#420: the operator-driven, cluster-access-free escape
+        hatch for a wedged execution -- deliberately a signal rather than
+        Temporal `terminate`, because `terminate` skips `_watch_pr`'s
+        `finally`, which is where the lifecycle-ownership row is released
+        (see `_ownership`). A signal handler is not a workflow command, so
+        adding this one needs no `workflow.patched` marker and changes no
+        recorded history. Same defensive parse as `approve`: signals must
+        never raise, so an unrecognised payload shape just falls back to a
+        generic reason instead of erroring.
+        """
+        self._abandon_reason = _first_string(args, "reason") or "abandoned by operator"
+        self._abandoned = True
 
     @workflow.run
     async def run(self, issue: IssueRef) -> DevLoopResult:
@@ -900,20 +1023,82 @@ class DevLoopWorkflow:
         await _record("issue-investigator", investigator_release, investigate_result, target_repo)
 
         if not investigate_result.succeeded:
-            return DevLoopResult(investigate=investigate_result, implement=None)
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                ended=f"investigate ended {investigate_result.phase}",
+            )
 
         # Durable wait: this workflow can sit here for days without costing
         # anything beyond Temporal's own history storage — exactly the
         # "durable per-issue state" the plan's problem statement calls out
         # as missing from the current polling-cron pipeline.
-        await workflow.wait_condition(lambda: self._approved)
+        #
+        # mctl-agents#420: an unbounded wait_condition here never released on
+        # its own -- not on the source issue closing, not on an `abandon`
+        # signal, not ever, if `approve` never arrived (see the module
+        # docstring addendum). `approval-watch` bounds the park with a poll
+        # loop that re-reads the issue's state on every boundary and expires
+        # at APPROVAL_WAIT_DEADLINE if nothing resolves it first. The
+        # unpatched branch is byte-identical to the historical call apart
+        # from also observing `_abandoned`, which is not itself a new
+        # command (see `abandon`'s docstring): a parked execution has no
+        # history event to diverge from at this position.
+        approval_ended: str | None = None
+        if workflow.patched("approval-watch"):
+            approval_deadline = workflow.now() + APPROVAL_WAIT_DEADLINE
+            while workflow.now() < approval_deadline:
+                try:
+                    # wait_condition with a timeout raises asyncio.TimeoutError
+                    # on expiry rather than returning False -- it never
+                    # returns a value at all (see its own signature).
+                    await workflow.wait_condition(
+                        lambda: self._approved or self._abandoned,
+                        timeout=APPROVAL_POLL_INTERVAL,
+                    )
+                except TimeoutError:
+                    parked_state = await _read_issue_state(issue)
+                    if parked_state is not None and parked_state.state == "closed":
+                        approval_ended = (
+                            "source issue closed while parked "
+                            f"({parked_state.state_reason or 'completed'})"
+                        )
+                        break
+                    continue
+                break
+            else:
+                approval_ended = "approval wait expired"
+        else:
+            await workflow.wait_condition(lambda: self._approved or self._abandoned)
 
-        # mctl-agents#410: the durable wait above has no upper bound, so the
-        # issue that started this loop can close while it sits parked --
-        # reopened elsewhere, superseded, or resolved directly. Check BEFORE
-        # find_proposal_slug and BEFORE the mctl-agents-approve CWFT below,
-        # so a closed issue is never spent flipping a proposal to `accepted`
-        # (and then implementing it) for a reason that is already gone.
+        # mctl-agents#420: an approve or abandon signal landing while the final
+        # poll's in-flight get_issue_state activity was executing must not be
+        # silently discarded just because the wait deadline was crossed.
+        # But if the source issue was confirmed closed on GitHub, a late
+        # approve must NOT resurrect it.
+        if approval_ended is not None:
+            if approval_ended == "approval wait expired" and (
+                self._approved or self._abandoned
+            ):
+                pass
+            else:
+                return DevLoopResult(
+                    investigate=investigate_result, implement=None, ended=approval_ended
+                )
+
+        if self._abandoned:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                ended=f"abandoned: {self._abandon_reason}",
+            )
+
+        # mctl-agents#410: the issue that started this loop can close between
+        # the approval signal and this point -- reopened elsewhere,
+        # superseded, or resolved directly. Check BEFORE find_proposal_slug
+        # and BEFORE the mctl-agents-approve CWFT below, so a closed issue is
+        # never spent flipping a proposal to `accepted` (and then
+        # implementing it) for a reason that is already gone.
         #
         # workflow.patched: get_issue_state is a brand-new command in every
         # position it could go, so an unpatched (pre-existing) history must
@@ -922,34 +1107,13 @@ class DevLoopWorkflow:
         # loop on replay, the same hazard slug-scoped-implement's own guard
         # exists to avoid two paragraphs down.
         if workflow.patched("stale-issue-admission"):
-            issue_parts = parse_issue_url(issue.issue_url)
-            issue_repo = f"{issue_parts.owner}/{issue_parts.repo}"
-            issue_number_int = int(issue_parts.number)
-            issue_state: IssueState | None = None
-            try:
-                issue_state = await workflow.execute_activity(
-                    get_issue_state,
-                    args=[issue_repo, issue_number_int],
-                    start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-                    retry_policy=FAST_ACTIVITY_RETRY_POLICY,
-                )
-            except ActivityError:
-                # Fail-open on the workflow side: the implementer's own
-                # admission gate (mctl-agents#410's other half) is the
-                # authoritative check. Wedging every loop parked at approval
-                # on a GitHub blip here is worse than letting one proceed to
-                # a refusal it would hit downstream anyway.
-                workflow.logger.warning(
-                    "get_issue_state failed after retries for %s#%s -- "
-                    "proceeding without the pre-approve stale-issue check",
-                    issue_repo,
-                    issue_number_int,
-                )
+            issue_state = await _read_issue_state(issue)
             if issue_state is not None and issue_state.state == "closed":
                 return DevLoopResult(
                     investigate=investigate_result,
                     implement=None,
                     approve=None,
+                    ended=f"source issue closed ({issue_state.state_reason or 'completed'})",
                 )
 
         # Scoped to this issue's own proposal, not just its repo. Service
@@ -1039,6 +1203,7 @@ class DevLoopWorkflow:
                         investigate=investigate_result,
                         implement=None,
                         approve=approve_result,
+                        ended=f"approve flip ended {approve_result.phase}",
                     )
         if atomic_approve:
             # Resolve the implementer only AFTER the approval flip is
@@ -1081,6 +1246,16 @@ class DevLoopWorkflow:
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
+
+        # mctl-agents#420: an abandon signal arriving while _implement was running
+        # ends the loop immediately without entering the merge watch or deploy stages.
+        if self._abandoned:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=implement_result,
+                approve=approve_result,
+                ended=f"abandoned: {self._abandon_reason}",
+            )
 
         # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
         # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
@@ -1127,6 +1302,11 @@ class DevLoopWorkflow:
             pr=pr_state,
             deploy=deploy,
             incidents=incidents,
+            # mctl-agents#420: an `abandon` signal delivered during the merge
+            # watch cuts _watch_pr short (its own `while` condition observes
+            # `_abandoned`) rather than raising, so the only place left to
+            # record it is here, on the result the watch's caller returns.
+            ended=f"abandoned: {self._abandon_reason}" if self._abandoned else "",
         )
 
     async def _implement(
@@ -2438,6 +2618,8 @@ class DevLoopWorkflow:
         instead of failing a loop whose implement already succeeded. Returns
         None when no PR link ever appeared within the grace polls.
         """
+        if self._abandoned:
+            return None
         deadline = workflow.now() + MERGE_WATCH_DEADLINE
         polls_without_pr = 0
         last: PRState | None = None
@@ -2513,7 +2695,12 @@ class DevLoopWorkflow:
         poll_index = 0
         shepherd_ticks = 0
         try:
-            while workflow.now() < deadline:
+            # mctl-agents#420: `and not self._abandoned` lets an `abandon`
+            # signal cut a 14-day merge watch short at its next poll boundary
+            # while still running this `finally` block, so the
+            # lifecycle-ownership row is released rather than left active --
+            # the reason `abandon` is a signal and not a Temporal `terminate`.
+            while workflow.now() < deadline and not self._abandoned:
                 try:
                     state: PRState = await workflow.execute_activity(
                         get_pr_state,

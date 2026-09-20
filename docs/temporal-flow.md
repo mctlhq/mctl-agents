@@ -100,7 +100,7 @@ sequenceDiagram
     alt investigate не Succeeded
         T-->>OP: DevLoopResult(implement=None)
     else Succeeded
-        Note over T,R: await workflow.wait_condition(approved) —<br/>durable-ожидание, может длиться днями
+        Note over T,R: await workflow.wait_condition(approved or abandoned) —<br/>durable-ожидание, но bounded (#420):<br/>опрос issue каждые 6ч, истекает через 14д
         OP->>T: signal approve({approver}?)
         T->>T: find_proposal_slug(repo, N) → slug issue-N-*<br/>(нет слага → non-retryable fail)
         T->>S: submit_and_wait("mctl-agents-approve", {service, slug, approver})
@@ -136,7 +136,11 @@ stateDiagram-v2
     Done --> [*]
 
     note right of AwaitApproval
-      wait_condition — ждём сигнала сколько угодно.
+      Bounded (mctl-agents#420): опрашиваем каждые
+      APPROVAL_POLL_INTERVAL (6h), перечитываем состояние
+      issue и завершаемся, если оно closed; истекает через
+      APPROVAL_WAIT_DEADLINE (14d), если ничего не пришло.
+      Сигнал abandon завершает ожидание досрочно.
       approve() теперь ФЛИПАЕТ .status.yaml:
       CWFT mctl-agents-approve коммитит
       proposed → accepted под mutex (идемпотентно,

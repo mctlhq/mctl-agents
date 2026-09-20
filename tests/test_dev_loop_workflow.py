@@ -44,6 +44,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
+    AbandonState,
     DevLoopWorkflow,
     IssueRef,
 )
@@ -623,6 +624,247 @@ class TestDevLoopWorkflow:
         assert result.approve is not None
         assert result.approve.phase == "Succeeded"
         assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+
+    # --- mctl-agents#420: the approval park is bounded and observant -------
+
+    async def test_abandon_signal_ends_a_parked_loop(self, env):
+        """An `abandon` signal delivered while parked at approval must end
+        the execution gracefully (not fail, not hang) with the reason
+        recorded, and must submit neither the approve nor the implement
+        CWFT."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/420"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            # Query abandon_state while parked before abandon signal
+            state_before = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_before == AbandonState(abandoned=False, reason="")
+
+            # Exercise dict payload {"reason": ...} (mctl-agents#420, mirroring cli.py abandon)
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "operator cleanup"})
+
+            # Query abandon_state immediately after signal while still running
+            state_after = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_after == AbandonState(abandoned=True, reason="operator cleanup")
+
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.approve is None
+        assert result.ended == "abandoned: operator cleanup"
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_parked_loop_ends_when_the_source_issue_closes(self, env):
+        """The direct regression for dev-loop-mctlhq-portfolio-98
+        (mctl-agents#420): a loop that never receives `approve` must not
+        wait forever once GitHub reports the source issue closed. The
+        time-skipping environment fast-forwards the poll interval."""
+        state_calls = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_then_closed(repo: str, issue_number: int) -> IssueState:
+            state_calls["i"] += 1
+            if state_calls["i"] == 1:
+                return IssueState(state="open")
+            return IssueState(state="closed", state_reason="completed")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_then_closed)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/421"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            # Never signal approve -- the loop must end on its own.
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.ended == "source issue closed while parked (completed)"
+        assert calls == ["mctl-agents-investigate"]
+        assert state_calls["i"] >= 2
+
+    async def test_parked_loop_expires_at_the_approval_deadline(self, env):
+        """No signal, an issue that stays open: the park must still end,
+        bounded by APPROVAL_WAIT_DEADLINE, rather than wait forever."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, issue_state="open",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/422"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.ended == "approval wait expired"
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_issue_state_failure_while_parked_keeps_waiting(self, env):
+        """A GitHub blip on the PARKED poll must not end the loop early --
+        matching the fail-open rule the stale-issue-admission gate applies
+        after the wait resolves. An approve signal must still reach
+        implement."""
+        poll_count = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_fail_first_then_open(repo: str, issue_number: int) -> IssueState:
+            poll_count["i"] += 1
+            if poll_count["i"] == 1:
+                # Signal approve right from the first parked poll before raising,
+                # ensuring the parked fail-open branch executes first and the subsequent
+                # wait_condition loop observes the approval.
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.approve)
+                raise ApplicationError("github unreachable", non_retryable=True)
+            return IssueState(state="open")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_fail_first_then_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/423"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+        assert poll_count["i"] >= 2
+
+    async def test_approve_signal_landing_during_final_poll_proceeds_to_implement(self, env):
+        """mctl-agents#420: an approve signal landing while the final poll's
+        get_issue_state activity is in flight must not be discarded just because
+        the deadline was reached. The workflow must proceed to implement."""
+        poll_count = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_signal_on_final(repo: str, issue_number: int) -> IssueState:
+            poll_count["i"] += 1
+            if poll_count["i"] == 56:
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.approve, {"approver": "reviewer"})
+            return IssueState(state="open")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_signal_on_final)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/424"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert result.ended == ""
+        assert "mctl-agents-implement" in calls
+
+    async def test_parked_closed_issue_not_resurrected_by_late_approve(self, env):
+        """mctl-agents#420: if a poll confirms the source issue was closed,
+        a concurrent approve signal landing during that activity must NOT
+        resurrect the closed issue or proceed to implement."""
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_closed_and_signal_approve(repo: str, issue_number: int) -> IssueState:
+            info = activity.info()
+            handle = env.client.get_workflow_handle(info.workflow_id)
+            # Concurrently signal approve while returning closed state
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "late_approver"})
+            return IssueState(state="closed", state_reason="completed")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_closed_and_signal_approve)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/428"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.approve is None
+        assert result.ended == "source issue closed while parked (completed)"
+        assert "mctl-agents-implement" not in calls
 
     async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
         """The implement CWFT must only be allowed to touch proposals under
@@ -1281,6 +1523,182 @@ class TestDevLoopWorkflow:
         assert result.pr.state == "MERGED"
         assert result.pr.merged is True
         assert result.pr.merge_commit == "cafe1234"
+
+    async def test_merged_pr_ends_the_watch_within_one_poll(self, env):
+        """Regression guard (mctl-agents#420) for behaviour that already
+        works: once get_pr_state reports MERGED, _watch_pr returns on that
+        very read rather than polling further."""
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/424"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.state == "MERGED"
+        assert result.pr.merged is True
+
+    async def test_closed_pr_without_merge_ends_the_watch(self, env):
+        """A CLOSED-but-not-merged PR is also terminal for the watch --
+        paired with the MERGED case above so both halves of "reached a
+        terminal pull-request state" are covered."""
+        closed_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="CLOSED",
+            merged=False,
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[closed_pr]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/425"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.state == "CLOSED"
+        assert result.pr.merged is False
+        # Nothing merged, so nothing to deploy or watch for incidents.
+        assert result.deploy is None
+        assert result.incidents is None
+
+    async def test_abandon_signal_cuts_short_a_merge_watch_and_releases_ownership(self, env):
+        """mctl-agents#420: `abandon` must also work on the OTHER unbounded
+        wait -- a merge watch on a PR that stays open. The execution must
+        complete (not fail, not need Temporal `terminate`), and the
+        lifecycle-ownership row must still be released via _watch_pr's
+        `finally` -- the reason `abandon` is a signal and not `terminate`."""
+        open_pr = PRState(
+            found=True,
+            pr_url="https://github.com/mctlhq/mctl-telegram/pull/426",
+            repo="mctlhq/mctl-telegram",
+            number=426,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        base_activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True,
+        )
+        first_poll = anyio.Event()
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_sticky_open(service: str, slug: str) -> PRState:
+            first_poll.set()
+            return open_pr
+
+        activities = [
+            a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"
+        ]
+        activities.append(fake_get_pr_state_sticky_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/426"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            # Wait for at least one PR poll (so ownership is claimed) before
+            # abandoning, or the watch could exit before ever acquiring the
+            # row it is supposed to release.
+            with anyio.fail_after(10):
+                await first_poll.wait()
+            await handle.signal(DevLoopWorkflow.abandon, "operator cleanup")
+            state_after = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_after == AbandonState(abandoned=True, reason="operator cleanup")
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.ended.startswith("abandoned:")
+        assert "operator cleanup" in result.ended
+        assert result.pr is not None
+        assert result.pr.state == "OPEN"
+        assert any(op.op == "release" for op in ownership_ops)
+
+    async def test_abandon_signal_before_pr_watch_terminates_cleanly(self, env):
+        """mctl-agents#420: an abandon signal delivered before _watch_pr begins
+        (while implement is running) must end the execution gracefully
+        without UnboundLocalError, without calling _watch_pr, and without leaking ownership."""
+        base_activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+        )
+        old_submit = next(a for a in base_activities if getattr(a, "__name__", "") == "fake_submit_and_wait")
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait_abandon_on_implement(
+            input: SubmitAndWaitInput,
+        ) -> WorkflowResult:
+            if input.operation == "mctl-agents-implement":
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.abandon, "cleanup during implement")
+            return await old_submit(input)
+
+        activities = [a for a in base_activities if getattr(a, "__name__", "") != "fake_submit_and_wait"] + [
+            fake_submit_and_wait_abandon_on_implement
+        ]
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/427"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.ended == "abandoned: cleanup during implement"
+        assert result.pr is None
 
     async def _run_ownership_loop_with_logs(
         self, env, *, pr_states, issue: int, caplog, **kwargs
