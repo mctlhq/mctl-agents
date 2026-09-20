@@ -7,6 +7,7 @@ it that way.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -159,9 +160,13 @@ def test_wrap_bounded_round_trips_a_multiline_script() -> None:
     assert tokens[-1] == command
 
 
-def test_wrap_bounded_floors_sub_second_budgets_at_one_second() -> None:
+def test_wrap_bounded_renders_sub_second_budgets_fractionally() -> None:
+    """Flooring to 1s here would put the OS bound ABOVE a 0.2s tool timeout
+    and invert the ordering the guard rests on (claude P3 on `aa60779`). GNU
+    `timeout` takes a floating point duration, so the bound stays under the
+    budget instead."""
     wrapped = exec_budget.wrap_bounded("echo hi", 0.2, kill_after_s=0.1)
-    assert wrapped.startswith("timeout --kill-after=1s 1s bash -c ")
+    assert wrapped.startswith("timeout --kill-after=1s 0.16s bash -c ")
 
 
 # ---------------------------------------------------------------------------
@@ -316,23 +321,37 @@ def test_is_shell_state_only_is_conservative_on_unparseable_input():
 # `624a433`): GNU `timeout` must fire STRICTLY FIRST, or the CLI backgrounds
 # a still-live command and the orphan window reopens.
 # ---------------------------------------------------------------------------
+def _rendered_bound(budget_s: float, kill_after_s: float = 5.0) -> float:
+    rendered = exec_budget.wrap_bounded(budget_s=budget_s, command="x", kill_after_s=kill_after_s)
+    found = re.search(r"--kill-after=\d+s ([\d.]+)s bash -c ", rendered)
+    assert found is not None, rendered
+    return float(found.group(1))
+
+
 @pytest.mark.parametrize(
     "budget_s,want_bound",
     [
-        (300.0, 299),   # exact integer: shaved by one so it cannot tie
-        (20.6, 20),     # fractional: floored, never rounded UP past the budget
-        (20.4, 20),
-        (5.0, 4),
-        (1.2, 1),
-        (1.0, 1),       # at the floor a tie is unavoidable; 1s is the minimum
-        (0.2, 1),       # sub-second still renders a valid, non-zero bound
+        (300.0, 299.0),  # exact integer: shaved by one so it cannot tie
+        (20.6, 20.0),    # fractional: floored, never rounded UP past the budget
+        (20.4, 20.0),
+        (5.0, 4.0),
+        (2.0, 1.0),
+        (1.2, 1.0),
+        (1.0, 0.8),      # below the integer grid: rendered fractionally
+        (0.2, 0.16),
     ],
 )
 def test_wrap_bounded_never_exceeds_the_budget(budget_s, want_bound):
-    rendered = exec_budget.wrap_bounded(budget_s=budget_s, command="x", kill_after_s=5.0)
-    assert f" {want_bound}s bash -c " in rendered
+    bound = _rendered_bound(budget_s)
+    assert bound == pytest.approx(want_bound)
     # The invariant the ordering rests on, stated directly.
-    assert want_bound <= budget_s or budget_s < 1.0
+    assert bound < budget_s
+
+
+def test_the_rendered_bound_stays_under_the_budget_across_the_range():
+    """One property, checked over the whole range rather than row by row."""
+    for budget_s in (0.05, 0.2, 0.9, 1.0, 1.5, 2.0, 19.9, 20.0, 119.7, 300.0, 600.0):
+        assert _rendered_bound(budget_s) < budget_s, budget_s
 
 
 def test_wrap_bounded_rounds_the_kill_grace_up_not_down():

@@ -192,7 +192,10 @@ Three rules keep that rewrite from being worse than the defect it closes:
   the bound: requiring `bound + grace <= effective` is unsatisfiable once the
   budget is at or below the grace, and the guarantee that matters is that
   SIGTERM lands before the CLI backgrounds, not that the pathological SIGKILL
-  does too. The Bash tool's own `timeout` ceiling (`BASH_TOOL_MAX_TIMEOUT_MS`,
+  does too. Below one second the whole-second grid cannot express the
+  ordering at all — flooring a 0.2s budget to 1s puts the bound back above
+  the tool timeout — so a fractional duration is rendered there instead,
+  which GNU `timeout` accepts. The Bash tool's own `timeout` ceiling (`BASH_TOOL_MAX_TIMEOUT_MS`,
   600000 ms) binds that effective bound as well: a larger value is silently
   ignored by the tool, so clamping only the injected number would leave the
   OS bound above the CLI's real timer and put the CLI first again.

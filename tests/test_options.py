@@ -1054,13 +1054,13 @@ def test_deadline_guard_composes_with_the_ci_log_guard_and_the_audit_hook(tmp_pa
     assert len(callbacks) == 3  # audit + ci-log + deadline
 
 
-def _os_bound_seconds(rendered: str) -> int:
-    """The `<budget>s` GNU `timeout` was rendered with."""
+def _os_bound_seconds(rendered: str) -> float:
+    """The `<budget>s` GNU `timeout` was rendered with (may be fractional)."""
     import re as _re
 
-    found = _re.search(r"timeout --kill-after=\d+s (\d+)s bash -c ", rendered)
+    found = _re.search(r"timeout --kill-after=\d+s ([\d.]+)s bash -c ", rendered)
     assert found is not None, rendered
-    return int(found.group(1))
+    return float(found.group(1))
 
 
 def _guard_for(tmp_path, ledger, *, work_class="review", remaining=1000.0):
@@ -1160,6 +1160,25 @@ def test_the_bash_tool_ceiling_binds_the_effective_budget_not_just_the_clamp(
         _os_bound_seconds(out["updatedInput"]["command"]) * 1000
         < out["updatedInput"]["timeout"]
     )
+
+
+def test_the_ordering_holds_for_a_sub_second_caller_timeout(tmp_path, monkeypatch):
+    """The one range where the whole-second grid could not express the
+    ordering, so it inverted (claude P3 on `aa60779`)."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    for caller_timeout_ms in (200, 500, 900, 1000):
+        ledger = options.CommandBudgetLedger()
+        cb = _guard_for(tmp_path, ledger)
+        out = _run_guard(
+            cb, {"command": "true", "timeout": caller_timeout_ms}
+        )["hookSpecificOutput"]
+        assert out["updatedInput"]["timeout"] == caller_timeout_ms
+        assert (
+            _os_bound_seconds(out["updatedInput"]["command"]) * 1000
+            < out["updatedInput"]["timeout"]
+        ), caller_timeout_ms
 
 
 def test_deadline_guard_allows_a_quoted_ampersand(tmp_path, monkeypatch):

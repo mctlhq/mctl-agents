@@ -38,6 +38,14 @@ from typing import Any
 # gets the same treatment.
 MAX_LEDGER_COMMAND_CHARS = 200
 
+# Below one second, `wrap_bounded` renders a FRACTIONAL bound rather than
+# flooring to 1s -- flooring there would put the OS bound above the CLI's own
+# tool timeout and invert the ordering the whole guard rests on. The fraction
+# keeps the bound strictly under the budget; the floor keeps it a duration
+# GNU `timeout` will accept rather than an immediate expiry.
+SUB_SECOND_BOUND_FRACTION = 0.8
+MIN_BOUND_SECONDS = 0.001
+
 
 def _truncate_command(command: str) -> str:
     command = " ".join(command.split())
@@ -458,6 +466,13 @@ def wrap_bounded(command: str, budget_s: float, *, kill_after_s: float) -> str:
       second out of a budget whose floor is `IMPLEMENTER_MIN_COMMAND_BUDGET_
       SECONDS` (20s by default) is a rounding error, not a real loss.
 
+    Below one second the whole-second form cannot express the ordering at
+    all -- flooring to 1s puts the bound back ABOVE a 0.2s tool timeout and
+    inverts exactly what this function is for (claude P3 on `aa60779`) -- so
+    a fractional bound is rendered instead. GNU `timeout` takes a floating
+    point duration, and `SUB_SECOND_BOUND_FRACTION` of the budget keeps the
+    bound strictly under it without the integer grid.
+
     The `--kill-after` grace is rounded UP, never down: it is the backstop
     for a command that ignores SIGTERM, and shortening it weakens exactly the
     guarantee it exists to give. It is deliberately NOT subtracted from the
@@ -466,9 +481,16 @@ def wrap_bounded(command: str, budget_s: float, *, kill_after_s: float) -> str:
     guarantee is that SIGTERM lands before the CLI's timer, not that the
     pathological SIGKILL does too.
     """
-    budget = math.floor(budget_s)
-    if budget >= budget_s:
-        budget -= 1
-    budget = max(1, budget)
+    whole = math.floor(budget_s)
+    if whole >= budget_s:
+        whole -= 1
+    if whole >= 1:
+        rendered = f"{whole:d}"
+    else:
+        fractional = max(MIN_BOUND_SECONDS, budget_s * SUB_SECOND_BOUND_FRACTION)
+        rendered = f"{fractional:.3f}".rstrip("0").rstrip(".")
     kill_after = max(1, math.ceil(kill_after_s))
-    return f"timeout --kill-after={kill_after}s {budget}s bash -c {shlex.quote(command)}"
+    return (
+        f"timeout --kill-after={kill_after}s {rendered}s "
+        f"bash -c {shlex.quote(command)}"
+    )
