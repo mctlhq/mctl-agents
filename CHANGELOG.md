@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.51.0](https://github.com/mctlhq/mctl-agents/compare/1.50.0...1.51.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-417-fix-devloop-a-directive-comment-on-an-is ([c5f32c0](https://github.com/mctlhq/mctl-agents/commit/c5f32c04c9521f5ddcbf8b3d090d5d753aa490a3))
+* **agents:** issue-423-fix-devloop-ci-remediation-workload-can ([3ba6190](https://github.com/mctlhq/mctl-agents/commit/3ba6190cf0dfcf162aceeaf1e313d5e72cfdda0f))
+
+
+### Bug Fixes
+
+* **agents-421:** filter terminal-status siblings out of the ambiguity check, dedup stale-directive reports per issue ([6c1aea8](https://github.com/mctlhq/mctl-agents/commit/6c1aea8099ad46743144f871bdb532497921603c))
+* **agents-421:** revert the terminal-sibling matches filter, name the stale directory instead ([f7a42ab](https://github.com/mctlhq/mctl-agents/commit/f7a42ab6801ff1df564f74f36f5f70e962fbd231))
+* **agents-421:** sharpen ambiguous-dispatch classification, dedup stale-directive comment reads ([bdb9e1b](https://github.com/mctlhq/mctl-agents/commit/bdb9e1b64d8a641ac609b56b9eccd2de6f04073c))
+* **agents-421:** the ack-doesn't-retry notice applies to every ambiguous reply, not only the stale-sibling one ([79020fe](https://github.com/mctlhq/mctl-agents/commit/79020feff13208e7511e906a14e27881af2bb596))
+* **agents-421:** the stale-directory remediation must say it won't be retried ([91ebe3e](https://github.com/mctlhq/mctl-agents/commit/91ebe3e6e7b3524e51b4e0ddf748680d20df84c2))
+* **agents:** actually normalize updated_at/expires_at to str, and harden _parse_timestamp ([265b0a4](https://github.com/mctlhq/mctl-agents/commit/265b0a470a8f8b0e4892d6a597fa5886f6103b1b))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([e6b3aca](https://github.com/mctlhq/mctl-agents/commit/e6b3aca4572316e3dbc2a70962b8c1c1f7981e7f))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([a2dbef4](https://github.com/mctlhq/mctl-agents/commit/a2dbef46c49e24d20476624a53088c3a0435ec55))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([a7286e6](https://github.com/mctlhq/mctl-agents/commit/a7286e61dce8ca931267a8ff57ad194b9a7e5c26))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([1591740](https://github.com/mctlhq/mctl-agents/commit/1591740de7119c3f7f2be123c4a179a54e9ce6fa))
+* **agents:** bound CI-log retrieval and derive the implementer envelope from work class ([1fa1842](https://github.com/mctlhq/mctl-agents/commit/1fa1842bc846b67373c23546cf3f74ec2f71e405))
+* **agents:** make dispatch ambiguity explicit and close the round-2 P3s on [#417](https://github.com/mctlhq/mctl-agents/issues/417) ([726fdd5](https://github.com/mctlhq/mctl-agents/commit/726fdd52660a14bee409b66260fa716d968ab6b8))
+* close CI-log-guard bypass via global gh flags / line continuation ([e9a57aa](https://github.com/mctlhq/mctl-agents/commit/e9a57aa31b789b6a27dd53eeab53e3a0f73167d5))
+* **options:** close CI-log-guard bypass via global gh flags / line continuation ([796141c](https://github.com/mctlhq/mctl-agents/commit/796141c97cc51753554c9475d6474fc21f4741d4))
+* **options:** close two more gh-flag-parsing bypasses in the CI-log guard ([fa24cca](https://github.com/mctlhq/mctl-agents/commit/fa24ccafdffbf61964a9ab1ce5acb47bdd8c94da))
+
 ## [1.50.0](https://github.com/mctlhq/mctl-agents/compare/1.49.0...1.50.0) (2026-09-20)
 
 
