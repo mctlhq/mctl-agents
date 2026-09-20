@@ -37,6 +37,30 @@ _ID_CHUNK = 100
 # missing entry as an unknown budget and declines to submit (review P3).
 _SAFE_ID = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
+# How many of one child id's Failed executions this reads before it stops
+# asking. `list_workflows` returns most-recent-first, so these are the N most
+# recent runs of that id, and the count this returns is "pre-start losses among
+# the last N runs" rather than "since the retention window began".
+#
+# Two reasons it must be bounded, not just a bigger timeout (review P2):
+#
+#  1. Nothing bounds how many Failed executions pile up under one child id.
+#     `ALLOW_DUPLICATE` keeps every closed run, and the two failure classes
+#     this deliberately does NOT count — an `ActivityError` cause from a submit
+#     that exhausted its retries, and a cause it cannot read — touch no
+#     `.status.yaml` field, so the candidate is re-derived and a new Failed
+#     execution minted EVERY tick. A prolonged outage is ~480 uncounted
+#     executions/day, each of them re-fetched on every later tick. Unbounded
+#     work to compute a bounded control value is a monotonic self-wedge: once
+#     the cost crosses this activity's start_to_close the tick fails closed,
+#     and the next tick's input is strictly larger, so it never recovers.
+#  2. The caller only ever compares against MAX_SWEEP_PRESTART_ATTEMPTS, so
+#     lifetime precision buys nothing a recency window does not.
+#
+# Set above MAX_SWEEP_PRESTART_ATTEMPTS so that a run of consecutive pre-start
+# losses still reaches the budget even with uncounted failures interleaved.
+_MAX_EXAMINED_PER_ID = 12
+
 
 class VisibilityActivities:
     def __init__(self, client: Client) -> None:
@@ -93,6 +117,16 @@ class VisibilityActivities:
         under-charging costs one extra resubmit while over-charging can make a
         proposal permanently unsweepable.
 
+        BOUNDED, and that matters as much as the bulk query. Only the
+        `_MAX_EXAMINED_PER_ID` most recent runs of each id are read, so what
+        this returns is "pre-start losses among the last N runs", not a
+        lifetime total. The caller only ever compares against
+        MAX_SWEEP_PRESTART_ATTEMPTS, so it cannot use the extra precision —
+        while the unbounded version wedged itself permanently under a long
+        outage (see the constant for the mechanism). The loop heartbeats, and
+        the caller sets a heartbeat timeout, because one RPC per examined
+        execution is exactly the shape that looks hung rather than slow.
+
         Raises on a visibility failure — the caller treats an unknown budget as
         a reason to skip the tick, not to submit on a count of zero. Every id
         this can query gets an entry; an id it cannot query is OMITTED, and the
@@ -113,6 +147,7 @@ class VisibilityActivities:
         if not safe:
             return counts
 
+        examined: dict[str, int] = dict.fromkeys(safe, 0)
         for start in range(0, len(safe), _ID_CHUNK):
             chunk = safe[start:start + _ID_CHUNK]
             quoted = ", ".join(f"'{wf_id}'" for wf_id in chunk)
@@ -121,6 +156,16 @@ class VisibilityActivities:
             ):
                 if wf.id not in counts:
                     continue
+                if examined[wf.id] >= _MAX_EXAMINED_PER_ID:
+                    # Already seen this id's `_MAX_EXAMINED_PER_ID` most recent
+                    # runs. Skipping the rest is what keeps the per-tick cost
+                    # bounded; it costs only precision beyond the window, which
+                    # the caller cannot use.
+                    continue
+                examined[wf.id] += 1
+                # This loop makes one RPC per examined execution, so it must
+                # report progress or a slow Temporal makes it look hung.
+                activity.heartbeat(wf.id)
                 handle = self._client.get_workflow_handle(wf.id, run_id=wf.run_id)
                 try:
                     await handle.result()
@@ -135,6 +180,15 @@ class VisibilityActivities:
                         wf.id,
                         wf.run_id,
                     )
+        capped = sorted(k for k, n in examined.items() if n >= _MAX_EXAMINED_PER_ID)
+        if capped:
+            activity.logger.info(
+                "count_swept_prestart_failures: stopped at the %d most recent "
+                "run(s) for %d id(s): %s",
+                _MAX_EXAMINED_PER_ID,
+                len(capped),
+                capped,
+            )
         activity.logger.info(
             "visibility: pre-start failures across %d candidate id(s) in %d "
             "query/queries: %s",

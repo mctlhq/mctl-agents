@@ -6,6 +6,7 @@ against temporalio's time-skipping test environment, with fake activities.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 import anyio
 import pytest
@@ -129,7 +130,7 @@ async def _run(
     activities,
     cfg: ImplementSweepWorkflowInput | None = None,
     *,
-    await_children: list[str] = (),
+    await_children: Sequence[str] = (),
 ):
     """Run one tick and return its result.
 
@@ -234,13 +235,12 @@ class TestSubmitScoping:
 class TestGraceAndConfig:
     def test_the_default_child_id_matches_the_default_candidate(self):
         """`_DEFAULT_CHILD_ID` is what the two ticks below name in
-        `await_children`. If `_candidate`'s defaults ever move, the name must
-        fail here rather than silently stop awaiting anything — an
-        `await_children` entry that matches no started child waits on nothing
-        and reintroduces the race it was added to close."""
+        `await_children`. Drift already fails loudly — awaiting a handle for a
+        child that was never started raises NOT_FOUND — so what this guard
+        buys is a LEGIBLE failure here instead of an opaque one inside the
+        Worker teardown of whichever test drifted."""
         c = _candidate()
         assert _DEFAULT_CHILD_ID == f"implement-sweep-{c.service}-{c.slug}"
-
 
     async def test_grace_minutes_flows_from_input_to_the_activity(self, env):
         activities, received = _fake_activities()

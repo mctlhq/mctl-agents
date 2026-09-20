@@ -57,6 +57,8 @@ with workflow.unsafe.imports_passed_through():
     )
 
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
+# Heartbeat bound for `count_swept_prestart_failures` only — see its call site.
+BUDGET_QUERY_HEARTBEAT_TIMEOUT = timedelta(seconds=30)
 ACTIVITY_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 
 # Same shape as every other CWFT submit (dev_loop.SDK_STEP_TIMEOUT /
@@ -333,6 +335,14 @@ class ImplementSweepWorkflow:
                     "count_swept_prestart_failures",
                     child_ids,
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    # The only read here that makes an unbounded-in-principle
+                    # number of RPCs (one per examined execution). A heartbeat
+                    # timeout is what turns a wedged Temporal into a fast,
+                    # retryable failure instead of burning the full
+                    # start_to_close on every one of three attempts. The
+                    # activity's own per-id cap is what bounds the work; this
+                    # bounds how long a stall goes unnoticed.
+                    heartbeat_timeout=BUDGET_QUERY_HEARTBEAT_TIMEOUT,
                     retry_policy=ACTIVITY_RETRY_POLICY,
                 )
             except Exception as exc:  # noqa: BLE001 — ActivityError after retries

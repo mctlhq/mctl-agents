@@ -26,6 +26,8 @@ pytestmark = pytest.mark.anyio
 
 CHILD_ID = "implement-sweep-mctl-web-issue-10-widget"
 
+_RUN_SEQ = 0
+
 
 def _execution(error_type: str | None, *, unreadable: bool = False):
     """A listed failed execution whose recorded terminal error is `error_type`.
@@ -35,7 +37,10 @@ def _execution(error_type: str | None, *, unreadable: bool = False):
     different case from a failure with a recognisable non-pre-start type.
     """
     wf = MagicMock()
-    wf.id, wf.run_id = CHILD_ID, f"run-{error_type}-{unreadable}"
+    wf.id = CHILD_ID
+    global _RUN_SEQ
+    _RUN_SEQ += 1
+    wf.run_id = f"run-{error_type}-{unreadable}-{_RUN_SEQ}"
     if unreadable:
         wf._raise = RuntimeError("history unavailable")
     elif error_type is None:
@@ -61,7 +66,10 @@ def _client(executions: list) -> MagicMock:
 
         return _gen()
 
+    fetched: list[str] = []
+
     def get_workflow_handle(wf_id: str, run_id: str | None = None):
+        fetched.append(run_id)
         handle = MagicMock()
         handle.result = AsyncMock(side_effect=by_run[run_id]._raise)
         return handle
@@ -69,12 +77,87 @@ def _client(executions: list) -> MagicMock:
     client.list_workflows = list_workflows
     client.get_workflow_handle = get_workflow_handle
     client.queries = seen
+    client.fetched = fetched
     return client
 
 
 @pytest.fixture
 def env():
     return ActivityEnvironment()
+
+
+class TestTheExaminationBound:
+    """review P2 on `8297c3d`: the per-execution history read was unbounded.
+
+    Nothing bounds how many Failed executions pile up under one child id —
+    `ALLOW_DUPLICATE` keeps every closed run, and the two failure classes this
+    activity deliberately does not count touch no `.status.yaml` field, so the
+    candidate is re-derived and a new Failed execution minted every tick. Each
+    of them was then re-fetched on every later tick. That is unbounded work to
+    compute a bounded control value, and it is a one-way wedge: once the cost
+    crosses the activity's start_to_close the tick fails closed, and the next
+    tick's input is strictly larger.
+    """
+
+    async def test_only_the_most_recent_runs_are_read(self, env):
+        from orchestrator.temporal.activities.visibility import _MAX_EXAMINED_PER_ID
+
+        client = _client([_execution("ImplementationFailed") for _ in range(200)])
+        acts = VisibilityActivities(client)
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+
+        assert len(client.fetched) == _MAX_EXAMINED_PER_ID, (
+            "a long outage must not make the read grow without bound"
+        )
+
+    async def test_the_budget_is_still_reachable_within_the_bound(self, env):
+        """The cap costs precision beyond the window, never the verdict the
+        caller asks for: a run of pre-start losses still reaches
+        MAX_SWEEP_PRESTART_ATTEMPTS with uncounted failures interleaved."""
+        from orchestrator.temporal.workflows.implement_sweep import (
+            MAX_SWEEP_PRESTART_ATTEMPTS,
+        )
+
+        interleaved = []
+        for _ in range(MAX_SWEEP_PRESTART_ATTEMPTS):
+            interleaved.append(_execution(PRE_START_ERROR_TYPE))
+            interleaved.append(_execution("ImplementationFailed"))
+        client = _client(interleaved)
+        acts = VisibilityActivities(client)
+
+        counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+
+        assert counts[CHILD_ID] >= MAX_SWEEP_PRESTART_ATTEMPTS
+
+    async def test_the_bound_is_per_id_not_per_tick(self, env):
+        """Otherwise one noisy id would starve every other candidate's budget
+        read — the prefix-slice shape this PR has removed twice already."""
+        from orchestrator.temporal.activities.visibility import _MAX_EXAMINED_PER_ID
+
+        other = "implement-sweep-mctl-api-issue-11-other"
+        executions = [_execution("ImplementationFailed") for _ in range(50)]
+        for wf in executions[25:]:
+            wf.id = other
+        client = _client(executions)
+        acts = VisibilityActivities(client)
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID, other])
+
+        assert len(client.fetched) == 2 * _MAX_EXAMINED_PER_ID
+
+    async def test_the_loop_heartbeats(self, env):
+        beats: list = []
+        env.on_heartbeat = beats.append
+        client = _client([_execution("ImplementationFailed") for _ in range(3)])
+        acts = VisibilityActivities(client)
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+
+        assert len(beats) == 3, (
+            "one RPC per examined execution is exactly the shape that reads as "
+            "hung rather than slow without a heartbeat"
+        )
 
 
 class TestCountSweptPrestartFailures:

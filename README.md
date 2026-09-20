@@ -215,7 +215,16 @@ reported on `ImplementSweepResult.unknown_budget`. It is kept apart from
 Temporal retention window rolls, while a malformed slug fails every tick
 forever and needs the slug fixed. The budget query itself is chunked at 100
 ids, so an unbounded candidate list cannot get the whole filter rejected on a
-path that fails closed.
+path that fails closed, and only each id's 12 most recent runs are read. That
+last bound is the one that matters operationally: the failure classes the
+budget deliberately does not charge touch no `.status.yaml` field, so during an
+outage the candidate is re-derived and a new Failed execution minted every
+tick — roughly 480 uncounted executions a day, each re-read on every later
+tick. Unbounded work to compute a bounded control value wedges itself one way:
+once the cost crosses the activity's timeout the tick fails closed, and the
+next tick's input is strictly larger. The count is therefore "pre-start losses
+among the last 12 runs", which is all the caller's
+`>= MAX_SWEEP_PRESTART_ATTEMPTS` comparison can use anyway.
 
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated
