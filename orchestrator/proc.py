@@ -160,6 +160,7 @@ def _run_capturing_bounded(
         timer.start()
 
     stderr_chunks: list[bytes] = []
+    stderr_capped = threading.Event()
 
     def _drain_stderr() -> None:
         total = 0
@@ -173,6 +174,14 @@ def _run_capturing_bounded(
             # Same bound as stdout: stop the child from producing (and us
             # from buffering) any more of this stream than we will ever
             # keep (mctl-agents#423 review P2 — stderr had no cap at all).
+            # `stderr_capped` carries this past the thread boundary so the
+            # returncode logic below can give hitting the stderr cap the
+            # same "not a failure" treatment as hitting the stdout cap
+            # (mctl-agents#423 review P2 round 2 — only stdout got that
+            # treatment; a capped stderr fell through to the killed child's
+            # real (non-zero) returncode and turned a successful, merely
+            # truncated fetch into a `CommandFailed`).
+            stderr_capped.set()
             popen.kill()
 
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
@@ -187,7 +196,7 @@ def _run_capturing_bounded(
                 break
             chunks.append(chunk)
             total += len(chunk)
-        capped = total >= max_output_bytes
+        capped = total >= max_output_bytes or stderr_capped.is_set()
         if capped:
             # Stop the child from producing (and us from buffering) any
             # more than we will ever keep.

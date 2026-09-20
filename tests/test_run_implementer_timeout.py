@@ -510,6 +510,66 @@ def test_orphan_teardown_itself_cannot_exceed_the_grace_clamp(tmp_path, monkeypa
     )
 
 
+class _FakeChildProcess:
+    """Stands in for the SDK transport's `_process` -- just enough surface
+    for the belt-and-suspenders check: a `returncode` and a `terminate()`
+    that records whether it fired."""
+
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+
+    def terminate(self):
+        self.terminated = True
+
+
+class _DisconnectHangingClientWithProcess(_DisconnectTrackingClient):
+    """A `_DisconnectTrackingClient` that also exposes `_transport._process`,
+    so the belt-and-suspenders path in the teardown has something to find."""
+
+    def __init__(self, *, options, message_gen, hang_seconds):
+        super().__init__(options=options, message_gen=message_gen, hang_seconds=hang_seconds)
+        self.process = _FakeChildProcess()
+        self._transport = types.SimpleNamespace(_process=self.process)
+
+
+def test_orphan_teardown_terminates_process_when_disconnect_is_cut_short_by_the_grace_clamp(
+    tmp_path, monkeypatch
+) -> None:
+    """mctl-agents#423 review P2 round 2: the belt-and-suspenders
+    `process.terminate()` must fire in exactly the case its own comment
+    names -- a `disconnect()` cut short by the grace clamp -- not only on
+    the untested happy path where `disconnect()` finishes cleanly."""
+    _DisconnectTrackingClient.disconnect_calls = []
+    created: dict = {}
+
+    async def messages():
+        yield _started()
+        await anyio.sleep(10)
+
+    def _factory(*, options):
+        client = _DisconnectHangingClientWithProcess(
+            options=options, message_gen=messages, hang_seconds=30
+        )
+        created["client"] = client
+        return client
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _factory)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", 0.2)
+
+    with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+    assert "completed" not in _DisconnectTrackingClient.disconnect_calls, (
+        "a 30s sleep must not complete inside a 0.2s grace clamp"
+    )
+    assert created["client"].process.terminated, (
+        "process.terminate() must still run when disconnect() itself was "
+        "cancelled by the grace clamp -- it was unreachable before this fix"
+    )
+
+
 def test_orphan_teardown_survives_a_client_with_no_disconnect_method(tmp_path, monkeypatch) -> None:
     """The plain `_FakeClient` (every other test in this file) has no
     `disconnect` at all -- the teardown must degrade to a warning, not an

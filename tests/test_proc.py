@@ -146,6 +146,23 @@ def test_bounded_path_timeout_still_raises_timeout_expired():
         )
 
 
+def test_bounded_path_truncates_stderr_and_does_not_treat_the_cap_as_a_failure():
+    """Same parity the docstring promises for stdout: hitting the cap on
+    stderr alone must still come back as a successful, truncated fetch, not
+    a `CommandFailed` from the killed child's real (non-zero) exit status
+    (mctl-agents#423 review P2 round 2 -- only the stdout cap got this
+    treatment)."""
+    proc = run_capturing(
+        [
+            "python", "-c",
+            "import sys; sys.stderr.write('x' * 100000); sys.stderr.flush(); sys.exit(3)",
+        ],
+        max_output_bytes=100,
+    )
+    assert proc.returncode == 0
+    assert len(proc.stderr) == 100
+
+
 def test_bounded_path_drains_stderr_concurrently_so_a_full_pipe_does_not_deadlock():
     """A child that fills the stderr pipe before ever writing to stdout used
     to deadlock the bounded path: the stdout read loop blocked waiting for

@@ -2008,6 +2008,14 @@ async def _run_implementer_agent(
             if client is not None:
                 with anyio.CancelScope(shield=True):
                     with anyio.move_on_after(IMPLEMENTER_TEARDOWN_GRACE_SECONDS):
+                        # Resolved before disconnect() runs, not after: the
+                        # belt-and-suspenders check below must still have it
+                        # when the grace clamp cancels mid-`disconnect()` --
+                        # the exact case it exists for. Only reached when the
+                        # SDK exposes it -- a fake test client legitimately
+                        # does not.
+                        transport = getattr(client, "_transport", None)
+                        process = getattr(transport, "_process", None)
                         try:
                             await client.disconnect()
                         except Exception as teardown_exc:  # noqa: BLE001 — best-effort teardown
@@ -2015,20 +2023,26 @@ async def _run_implementer_agent(
                                 f"warn: shielded teardown disconnect failed "
                                 f"({type(teardown_exc).__name__}: {teardown_exc})"
                             )
-                        # Belt-and-suspenders: disconnect() above should have
-                        # torn down the transport's CLI child already, but a
-                        # disconnect that itself got cut short by the grace
-                        # clamp (still bounded above, just possibly
-                        # incomplete) must not leave that child running. Only
-                        # reached when the SDK exposes it -- a fake test
-                        # client legitimately does not.
-                        transport = getattr(client, "_transport", None)
-                        process = getattr(transport, "_process", None)
-                        if process is not None and getattr(process, "returncode", None) is None:
-                            try:
-                                process.terminate()
-                            except ProcessLookupError:
-                                pass
+                        finally:
+                            # Belt-and-suspenders: disconnect() above should
+                            # have torn down the transport's CLI child
+                            # already, but a disconnect that itself got cut
+                            # short by the grace clamp (still bounded above,
+                            # just possibly incomplete) must not leave that
+                            # child running. This has to be a `finally`, not
+                            # code after the `try` -- code after the `try`
+                            # is skipped when `move_on_after` cancels
+                            # mid-`disconnect()` (the cancellation is not an
+                            # `Exception`, so it is not caught above, and it
+                            # unwinds straight past anything that isn't a
+                            # `finally`). `process.terminate()` itself has no
+                            # `await`, so it still runs to completion here
+                            # even while the scope is cancelled.
+                            if process is not None and getattr(process, "returncode", None) is None:
+                                try:
+                                    process.terminate()
+                                except ProcessLookupError:
+                                    pass
             # The outer wall-clock bound, not the drain's own -- but the cause
             # is still a child we could not await, so it is charged to the
             # harness, not to the proposal.
