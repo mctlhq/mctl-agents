@@ -9,6 +9,7 @@ bound.
 """
 from __future__ import annotations
 
+from itertools import count
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,7 +27,8 @@ pytestmark = pytest.mark.anyio
 
 CHILD_ID = "implement-sweep-mctl-web-issue-10-widget"
 
-_RUN_SEQ = 0
+#: Unique, not ordered — these ids only have to distinguish runs.
+_run_ids = count()
 
 
 def _execution(error_type: str | None, *, unreadable: bool = False):
@@ -38,9 +40,7 @@ def _execution(error_type: str | None, *, unreadable: bool = False):
     """
     wf = MagicMock()
     wf.id = CHILD_ID
-    global _RUN_SEQ
-    _RUN_SEQ += 1
-    wf.run_id = f"run-{error_type}-{unreadable}-{_RUN_SEQ}"
+    wf.run_id = f"run-{error_type}-{unreadable}-{next(_run_ids)}"
     if unreadable:
         wf._raise = RuntimeError("history unavailable")
     elif error_type is None:
@@ -111,24 +111,46 @@ class TestTheExaminationBound:
             "a long outage must not make the read grow without bound"
         )
 
-    async def test_the_budget_is_still_reachable_within_the_bound(self, env):
-        """The cap costs precision beyond the window, never the verdict the
-        caller asks for: a run of pre-start losses still reaches
-        MAX_SWEEP_PRESTART_ATTEMPTS with uncounted failures interleaved."""
+    async def test_the_budget_is_reachable_across_a_full_window(self, env):
+        """The window is a TOLERANCE, not a guarantee, and this pins its
+        stated size: with the cap fully consumed, the budget is still reached
+        as long as no more than `_MAX_EXAMINED_PER_ID -
+        MAX_SWEEP_PRESTART_ATTEMPTS` uncounted runs are interleaved."""
+        from orchestrator.temporal.activities.visibility import _MAX_EXAMINED_PER_ID
         from orchestrator.temporal.workflows.implement_sweep import (
             MAX_SWEEP_PRESTART_ATTEMPTS,
         )
 
-        interleaved = []
-        for _ in range(MAX_SWEEP_PRESTART_ATTEMPTS):
-            interleaved.append(_execution(PRE_START_ERROR_TYPE))
-            interleaved.append(_execution("ImplementationFailed"))
-        client = _client(interleaved)
+        uncounted = _MAX_EXAMINED_PER_ID - MAX_SWEEP_PRESTART_ATTEMPTS
+        window = [_execution("ImplementationFailed") for _ in range(uncounted)]
+        window += [_execution(PRE_START_ERROR_TYPE) for _ in range(MAX_SWEEP_PRESTART_ATTEMPTS)]
+        assert len(window) == _MAX_EXAMINED_PER_ID, "the fixture must fill the window"
+        client = _client(window)
         acts = VisibilityActivities(client)
 
         counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
 
-        assert counts[CHILD_ID] >= MAX_SWEEP_PRESTART_ATTEMPTS
+        assert counts[CHILD_ID] == MAX_SWEEP_PRESTART_ATTEMPTS
+
+    async def test_beyond_the_tolerance_the_window_evicts_a_loss(self, env):
+        """Stated rather than hidden: one uncounted run past the tolerance and
+        a real pre-start loss falls out of the window, so the verdict can go
+        from exhausted to under-budget. It errs toward one extra resubmit, not
+        toward a permanently unsweepable proposal."""
+        from orchestrator.temporal.activities.visibility import _MAX_EXAMINED_PER_ID
+        from orchestrator.temporal.workflows.implement_sweep import (
+            MAX_SWEEP_PRESTART_ATTEMPTS,
+        )
+
+        over = _MAX_EXAMINED_PER_ID - MAX_SWEEP_PRESTART_ATTEMPTS + 1
+        window = [_execution("ImplementationFailed") for _ in range(over)]
+        window += [_execution(PRE_START_ERROR_TYPE) for _ in range(MAX_SWEEP_PRESTART_ATTEMPTS)]
+        client = _client(window)
+        acts = VisibilityActivities(client)
+
+        counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+
+        assert counts[CHILD_ID] == MAX_SWEEP_PRESTART_ATTEMPTS - 1
 
     async def test_the_bound_is_per_id_not_per_tick(self, env):
         """Otherwise one noisy id would starve every other candidate's budget
@@ -146,18 +168,74 @@ class TestTheExaminationBound:
 
         assert len(client.fetched) == 2 * _MAX_EXAMINED_PER_ID
 
-    async def test_the_loop_heartbeats(self, env):
+    async def test_every_listed_execution_beats_not_only_examined_ones(self, env):
+        """review P2 on `a820c10`: the beat sat BELOW both `continue`s, so the
+        two paths that walk the long tail emitted nothing — while the 30s
+        `heartbeat_timeout` runs from activity start. Bounding the fetches and
+        leaving the traversal silent moved the wedge rather than removing it."""
+        from orchestrator.temporal.activities.visibility import _MAX_EXAMINED_PER_ID
+
+        listed = 40
+        client = _client([_execution("ImplementationFailed") for _ in range(listed)])
+        acts = VisibilityActivities(client)
         beats: list = []
         env.on_heartbeat = beats.append
-        client = _client([_execution("ImplementationFailed") for _ in range(3)])
-        acts = VisibilityActivities(client)
 
         await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
 
-        assert len(beats) == 3, (
-            "one RPC per examined execution is exactly the shape that reads as "
-            "hung rather than slow without a heartbeat"
+        assert len(client.fetched) == _MAX_EXAMINED_PER_ID
+        # one for the listing phase, then one per row actually walked
+        assert len(beats) >= _MAX_EXAMINED_PER_ID + 1
+        assert beats[0].startswith("listing "), (
+            "a healthy tick lists nothing, so the listing phase itself must "
+            "beat or its effective deadline silently drops to the heartbeat one"
         )
+
+    async def test_a_healthy_tick_with_no_failures_still_beats(self, env):
+        client = _client([])
+        acts = VisibilityActivities(client)
+        beats: list = []
+        env.on_heartbeat = beats.append
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+
+        assert beats and beats[0].startswith("listing ")
+
+    async def test_the_listing_stops_once_every_id_in_the_chunk_is_capped(self, env):
+        from orchestrator.temporal.activities.visibility import _MAX_EXAMINED_PER_ID
+
+        client = _client([_execution("ImplementationFailed") for _ in range(500)])
+        acts = VisibilityActivities(client)
+        beats: list = []
+        env.on_heartbeat = beats.append
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID])
+
+        # listing beat + the capped window + the ONE row whose skip discovers
+        # that every id is capped and breaks. The remaining ~487-row tail is
+        # never walked at all, rather than walked cheaply.
+        assert len(beats) == _MAX_EXAMINED_PER_ID + 2
+
+    async def test_the_traversal_has_a_ceiling_even_when_an_id_never_caps(self, env):
+        """The per-id cap alone does not bound the WALK: rows are interleaved
+        by recency, so a quiet id keeps the listing open while a noisy id's
+        ever-growing tail scrolls past. The ceiling is what makes the traversal
+        bounded unconditionally."""
+        from orchestrator.temporal.activities.visibility import _MAX_LISTED_PER_CHUNK
+
+        quiet = "implement-sweep-mctl-api-issue-11-quiet"
+        executions = [_execution("ImplementationFailed") for _ in range(_MAX_LISTED_PER_CHUNK + 50)]
+        # one quiet id that never reaches the cap, so `remaining` never empties
+        executions[0].id = quiet
+        client = _client(executions)
+        acts = VisibilityActivities(client)
+        beats: list = []
+        env.on_heartbeat = beats.append
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID, quiet])
+
+        walked = len(beats) - 1
+        assert walked <= _MAX_LISTED_PER_CHUNK + 1
 
 
 class TestCountSweptPrestartFailures:

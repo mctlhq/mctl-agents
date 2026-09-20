@@ -57,9 +57,28 @@ _SAFE_ID = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 #  2. The caller only ever compares against MAX_SWEEP_PRESTART_ATTEMPTS, so
 #     lifetime precision buys nothing a recency window does not.
 #
-# Set above MAX_SWEEP_PRESTART_ATTEMPTS so that a run of consecutive pre-start
-# losses still reaches the budget even with uncounted failures interleaved.
+# Set above MAX_SWEEP_PRESTART_ATTEMPTS so a run of pre-start losses still
+# reaches the budget with uncounted failures interleaved. State the limit of
+# that plainly (review P3): it is a TOLERANCE of exactly
+# `_MAX_EXAMINED_PER_ID - MAX_SWEEP_PRESTART_ATTEMPTS` (9) interleaved
+# uncounted runs, not a guarantee. Beyond that the window evicts a pre-start
+# loss and the verdict can fall back from exhausted to under-budget. The path
+# is narrow — an over-budget id stops being submitted, so eviction needs the id
+# to be under budget already — but it is real, and it errs toward one extra
+# resubmit rather than toward a permanently unsweepable proposal.
 _MAX_EXAMINED_PER_ID = 12
+
+# Hard ceiling on how many listed rows one chunk's listing walks, examined or
+# skipped. The per-id fetch cap alone does NOT bound the traversal: rows come
+# back interleaved by recency, so an id that is capped and an id that has only
+# a handful of runs coexist, and the second keeps the listing open while the
+# first's ever-growing tail scrolls past. Bounding the FETCHES while leaving
+# the WALK unbounded moves the wedge instead of removing it (review P2).
+#
+# A count short of the true total is the safe direction here and is the same
+# trade the pre-start filter already makes: under-charging the budget costs one
+# extra resubmit, over-charging can make a proposal permanently unsweepable.
+_MAX_LISTED_PER_CHUNK = _ID_CHUNK * _MAX_EXAMINED_PER_ID * 4
 
 
 class VisibilityActivities:
@@ -151,9 +170,31 @@ class VisibilityActivities:
         for start in range(0, len(safe), _ID_CHUNK):
             chunk = safe[start:start + _ID_CHUNK]
             quoted = ", ".join(f"'{wf_id}'" for wf_id in chunk)
+            # Before the listing, not only inside it. `heartbeat_timeout` runs
+            # from activity start, so a chunk that lists nothing at all — the
+            # HEALTHY case — would otherwise spend the whole listing phase in
+            # heartbeat silence under a 30s deadline instead of the 5-minute
+            # start_to_close declared beside it (review P2).
+            activity.heartbeat(f"listing {len(chunk)} id(s)")
+            remaining = set(chunk)
+            walked = 0
             async for wf in self._client.list_workflows(
                 f"WorkflowId IN ({quoted}) AND ExecutionStatus = 'Failed'"
             ):
+                walked += 1
+                if walked > _MAX_LISTED_PER_CHUNK:
+                    activity.logger.warning(
+                        "count_swept_prestart_failures: stopped walking this "
+                        "chunk's listing after %d row(s); counts for its id(s) "
+                        "are lower bounds over the most recent runs seen",
+                        _MAX_LISTED_PER_CHUNK,
+                    )
+                    break
+                # Every listed execution beats, whether or not it is examined.
+                # The skip paths below are exactly the ones that walk the long
+                # tail, so keeping the beat above them is what makes the
+                # traversal safe rather than merely cheap.
+                activity.heartbeat(wf.id)
                 if wf.id not in counts:
                     continue
                 if examined[wf.id] >= _MAX_EXAMINED_PER_ID:
@@ -161,11 +202,15 @@ class VisibilityActivities:
                     # runs. Skipping the rest is what keeps the per-tick cost
                     # bounded; it costs only precision beyond the window, which
                     # the caller cannot use.
+                    remaining.discard(wf.id)
+                    if not remaining:
+                        # Every id in this chunk is capped, so the rest of the
+                        # listing can only be skipped. Bounding the FETCHES
+                        # while still walking an unbounded tail moved the wedge
+                        # instead of removing it (review P2).
+                        break
                     continue
                 examined[wf.id] += 1
-                # This loop makes one RPC per examined execution, so it must
-                # report progress or a slow Temporal makes it look hung.
-                activity.heartbeat(wf.id)
                 handle = self._client.get_workflow_handle(wf.id, run_id=wf.run_id)
                 try:
                     await handle.result()

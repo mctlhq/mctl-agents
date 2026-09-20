@@ -224,7 +224,13 @@ tick. Unbounded work to compute a bounded control value wedges itself one way:
 once the cost crosses the activity's timeout the tick fails closed, and the
 next tick's input is strictly larger. The count is therefore "pre-start losses
 among the last 12 runs", which is all the caller's
-`>= MAX_SWEEP_PRESTART_ATTEMPTS` comparison can use anyway.
+`>= MAX_SWEEP_PRESTART_ATTEMPTS` comparison can use anyway — a tolerance of
+exactly 9 interleaved uncounted runs, not a guarantee. Bounding the per-run
+fetches is not on its own enough: rows come back interleaved by recency, so the
+listing is also stopped once every id in a chunk is capped, and unconditionally
+at a per-chunk ceiling, and every listed row heartbeats — including the listing
+phase itself, so a healthy tick that lists nothing does not silently inherit the
+heartbeat deadline in place of the five-minute one.
 
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated
