@@ -30,13 +30,17 @@ overwritable case submits anything.
 
 One deliberate exception: an issue whose ONLY proposal directory is
 terminal (`TERMINAL_STATUSES` — merged/rejected/review-stuck) never reaches
-`_handle_directive` at all — `scan()`'s own `candidates` filter excludes it
-from `all_refs` before the per-issue grouping even runs, and the
-`_stale_directives` sweep in `orchestrator.temporal.activities.discovery`
-applies the identical filter, so the belt-and-braces report is blind to it
-too. This is a scope decision, not an oversight: a directive on a fully
-closed-out issue has nothing left to reopen through this path (claude P3 on
-head `f7a42ab`).
+`_handle_directive` at all — `scan()` builds its `pending_by_issue` grouping
+by walking `candidates`, the TERMINAL_STATUSES-excluded subset of
+`all_refs`, and an issue with no non-terminal ref never has a candidate to
+walk from in the first place (`all_refs` itself stays unfiltered, and
+`_handle_directive`'s own `matches` is deliberately re-derived from it —
+see the comment where `matches` is computed). The `_stale_directives` sweep
+in `orchestrator.temporal.activities.discovery` applies the identical
+TERMINAL_STATUSES filter to its own input refs, so the belt-and-braces
+report is blind to the same issue too. This is a scope decision, not an
+oversight: a directive on a fully closed-out issue has nothing left to
+reopen through this path (claude P3 on head `f7a42ab`).
 
 This module never starts or signals a DevLoopWorkflow, and never touches
 the `agents:intake` label: the comment path and the label path are
@@ -347,21 +351,27 @@ def _reply_ambiguous(author: str, comment_id: str, matches: list[ProposalStateRe
     if stale:
         stale_statuses = ", ".join(sorted({m.status for m in matches if m.status in TERMINAL_STATUSES}))
         verb = "is" if len(stale) == 1 else "are"
-        # This whole reply goes through `_with_ack` below, so it is
-        # permanently acked — `scan()` never reads this comment again on a
-        # later tick. Telling the operator to remove the stale directory
-        # without also telling them the fix will not retry itself would
-        # promise an outcome they cannot actually trigger by fixing the
-        # state alone (claude P2 on head `f7a42ab`).
         stale_note = (
             f" {', '.join(stale)} {verb} already terminal ({stale_statuses}) and can "
-            "likely be removed from gitops to resolve this. This comment is already "
-            "answered and will not be retried — comment `@MCTL reinvestigate` again "
-            "afterwards."
+            "likely be removed from gitops to resolve this."
         )
+    # Unconditional, not only inside the `stale` branch above (claude P2 on
+    # head `91ebe3e`): EVERY `_reply_ambiguous` outcome goes through
+    # `_with_ack` below, so it is permanently acked regardless of whether
+    # the ambiguity came from a stale terminal sibling or from two
+    # ordinary live proposals (the slug-drift shape
+    # `test_ambiguous_proposal_dirs_are_named_in_the_reply` covers).
+    # Either way, an operator who removes the extra directory (exactly
+    # what `resolve_slug`'s own error text asks for) ends up with one
+    # match and gets silence unless told the fix does not retry itself —
+    # the #395 shape this PR exists to remove.
+    retry_note = (
+        " This comment is already answered and will not be retried — comment "
+        "`@MCTL reinvestigate` again once resolved."
+    )
     return _with_ack(
         f"@{author} this issue has more than one proposal directory ({names}) — "
-        f"refusing to guess which one to rewrite.{stale_note}",
+        f"refusing to guess which one to rewrite.{stale_note}{retry_note}",
         comment_id,
     )
 

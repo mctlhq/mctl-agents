@@ -233,6 +233,14 @@ def test_ambiguous_proposal_dirs_are_named_in_the_reply(monkeypatch):
     assert outcome == "ambiguous"
     assert "issue-9-fix" in replies[0] and "issue-9-fix-renamed" in replies[0]
     assert "mctl-directive-ack: c1" in replies[0]
+    # The ordinary two-LIVE-proposals ambiguity (the slug-drift shape this
+    # test covers, no terminal sibling involved) must ALSO carry the
+    # retry notice — this reply is acked just like the stale-sibling one,
+    # so an operator who deletes the extra directory still needs to be
+    # told the fix will not retry itself (claude P2 on head `91ebe3e`: the
+    # notice previously lived only inside the stale-sibling branch).
+    assert "will not be retried" in replies[0]
+    assert "@MCTL reinvestigate" in replies[0]
 
 
 def test_a_terminal_sibling_is_still_ambiguous_but_named_as_removable(monkeypatch):
