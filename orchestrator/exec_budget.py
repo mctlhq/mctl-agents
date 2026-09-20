@@ -277,6 +277,55 @@ SHELL_COMMAND_WORDS = frozenset({"ash", "bash", "busybox", "dash", "ksh", "sh", 
 MAX_PAYLOAD_DEPTH = 3
 
 _SUBSTITUTION_OPEN_RE = re.compile(r"\$\(")
+_ARITHMETIC_OPEN_RE = re.compile(r"\$\(\(")
+# A shell's `-c` need not be a lone token: `bash -lc`, `sh -ec`, `bash -cl`
+# all take the next word as the command to run. Only applied once the
+# segment's command word is already known to be a shell, so this cannot
+# reopen the `git -c user.name=...` false positive that per-segment
+# scanning fixed (claude P2 on `4449024`).
+_SHELL_C_FLAG_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+
+
+def _arithmetic_spans(visible: str) -> list[tuple[int, int]]:
+    """``(start, end)`` of every `$((...))` arithmetic expansion.
+
+    Arithmetic runs no command of its own: its `&`, `|` and `;` are
+    operators on numbers, so `$((a & b))` is a bitwise AND and not a
+    detachment (claude P3 on `4449024`). Read against an already
+    quote-masked view. A command substitution NESTED inside arithmetic
+    still executes, and `_command_substitutions` keeps scanning through
+    this span so `$(( $(cmd &) ))` is still caught.
+    """
+    spans: list[tuple[int, int]] = []
+    position = 0
+    while True:
+        opened = _ARITHMETIC_OPEN_RE.search(visible, position)
+        if opened is None:
+            return spans
+        depth = 2
+        index = opened.end()
+        while index < len(visible) and depth:
+            if visible[index] == "(":
+                depth += 1
+            elif visible[index] == ")":
+                depth -= 1
+            index += 1
+        if depth:
+            return spans
+        spans.append((opened.start(), index))
+        position = index
+
+
+def _blank_arithmetic(visible: str) -> str:
+    """`visible` with every arithmetic expansion blanked, length preserved."""
+    spans = _arithmetic_spans(visible)
+    if not spans:
+        return visible
+    chars = list(visible)
+    for start, end in spans:
+        for index in range(start, end):
+            chars[index] = " "
+    return "".join(chars)
 
 
 def _command_substitutions(command: str) -> list[str]:
@@ -286,6 +335,7 @@ def _command_substitutions(command: str) -> list[str]:
     quotes are left transparent, because `"$(cmd &)"` does substitute.
     """
     visible = _mask(command, mask_double=False)
+    arithmetic_starts = {start for start, _ in _arithmetic_spans(visible)}
     found: list[str] = []
 
     position = 0
@@ -293,6 +343,11 @@ def _command_substitutions(command: str) -> list[str]:
         opened = _SUBSTITUTION_OPEN_RE.search(visible, position)
         if opened is None:
             break
+        if opened.start() in arithmetic_starts:
+            # Not a command substitution. Advance INTO it rather than past
+            # it, so a `$(cmd)` nested in the arithmetic is still found.
+            position = opened.end()
+            continue
         depth = 1
         index = opened.end()
         while index < len(visible) and depth:
@@ -358,7 +413,7 @@ def _shell_c_payloads(command: str) -> list[str]:
         if words[index].split("/")[-1] not in SHELL_COMMAND_WORDS:
             continue
         for position in range(index + 1, len(words) - 1):
-            if words[position] == "-c":
+            if _SHELL_C_FLAG_RE.match(words[position]):
                 found.append(words[position + 1])
                 break
     return found
@@ -378,7 +433,7 @@ def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
     very masking that fixed the false positives (claude P2 on `624a433`).
     """
     normalized = normalize_shell_command(command)
-    masked = mask_quoted(normalized)
+    masked = _blank_arithmetic(mask_quoted(normalized))
     for label, pattern in DETACH_PATTERNS:
         found = pattern.search(masked)
         if found is None:

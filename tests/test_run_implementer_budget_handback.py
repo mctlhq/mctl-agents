@@ -246,3 +246,49 @@ def test_a_successful_run_clears_the_tally(monkeypatch, tmp_path: Path) -> None:
     after = _read(ref)
     assert after["status"] == "implemented"
     assert after.get("budget_handbacks") in (None, 0), after.get("budget_handbacks")
+
+
+def test_the_hand_back_does_not_turn_the_tick_red(monkeypatch, tmp_path: Path) -> None:
+    """The tally is the only durable bound on the retry loop, so the tick
+    that writes it must exit 0.
+
+    `main()` exits 1 whenever `_batch_outcome` reports anything under
+    `failed`, and the module's own note at the exit-code block says a
+    non-zero exit marks `implement` Failed and can skip the downstream
+    gitops commit. If that commit is skipped the next tick reads
+    `budget_handbacks: 0`, the cap never advances, and the paid loop the cap
+    exists to bound runs forever (claude P2 on `4449024`). `stale_source` is
+    excluded from `failed` for exactly this reason; so is this.
+    """
+    ref = _make_ref(tmp_path)
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    assert result.budget_handback is True
+    outcome = run_implementer._batch_outcome([result])
+    assert outcome.budget_handback == 1
+    assert outcome.failed == 0, "a hand-back must not force the batch red"
+
+
+def test_a_declined_hand_back_is_still_a_failure(monkeypatch, tmp_path: Path) -> None:
+    """Nothing durable was written on this tick, so there is no commit to
+    protect -- and somebody else owns the proposal. Report it honestly."""
+    ref = _make_ref(tmp_path)
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+    monkeypatch.setattr(run_implementer, "_hand_back_if_still_ours", lambda *_a, **_kw: False)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    assert result.budget_handback is False
+    assert run_implementer._batch_outcome([result]).failed == 1

@@ -211,7 +211,14 @@ Three rules keep that rewrite from being worse than the defect it closes:
   payload because some earlier token happened to spell a shell. `bash -c "cmd
   &"` backgrounds inside the inner shell, and GNU `timeout` exits with its
   DIRECT child, so the grandchild survives — the #652 shape reached through a
-  quoted payload rather than a bare one.
+  quoted payload rather than a bare one. The flag is matched as a short-flag
+  CLUSTER containing `c`, not as the lone token `-c`: `bash -lc`, `sh -ec`
+  and `bash -cl` all take the next word as the command, and once the
+  segment's command word is already known to be a shell that looser test
+  cannot reopen the `git -c` false positive. Arithmetic expansion is NOT a
+  command substitution — `$((a & b))` is a bitwise AND on numbers, so the
+  whole `$((...))` span reads as data; a `$(...)` nested inside it still
+  executes and is still scanned.
 - **Shell state survives, but only where it cannot cost time.** A command
   built only from `SHELL_STATE_BUILTINS` (`cd`, `export`, `set`, …) is
   admitted UNWRAPPED, because the Bash tool carries that state — notably the
@@ -280,6 +287,16 @@ needs an operator-reviewed gitops change moving the proposal back to
 `accepted` — so charging a busy runner there parks a sound proposal at a
 human gate for a fact about the runner. A plain no-commit run stays terminal:
 that one IS deterministic, and re-running it buys the same result.
+
+The hand-back tick exits **0**. `budget_handbacks` is the only durable bound
+on this retry loop, and it only becomes durable when the downstream gitops
+commit runs; a non-zero exit marks `implement` Failed and can skip that step,
+so every tick would read `0` and the cap would never be reached —
+reintroducing exactly the unbounded paid loop the cap closes. The arm
+therefore gets its own `BatchOutcome` bucket, excluded from `failed` on the
+same grounds as `stale_source`. A hand-back whose compare-and-swap DECLINED
+wrote nothing and is still counted as a failure: there is no commit to
+protect, and another attempt owns the proposal.
 
 The ledger also OUTRANKS the refusal marker when the two disagree by
 omission. An agent that stops because it ran out of budget but writes a

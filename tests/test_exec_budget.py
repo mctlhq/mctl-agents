@@ -437,3 +437,44 @@ def test_a_non_shell_dash_c_is_not_a_shell_payload(command):
 )
 def test_a_real_shell_payload_is_still_followed_per_segment(command):
     assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'bash -lc "go test ./... &"',
+        'bash -ec "x &"',
+        'sh -xc "y &"',
+        'bash -cl "z &"',
+        'cd /repo && bash -lc "make build &"',
+    ],
+)
+def test_a_bundled_short_flag_is_still_a_shell_payload(command):
+    """`-lc`/`-ec`/`-xc`/`-cl` take the next word exactly as `-c` does.
+
+    Matching the lone token `-c` let `bash -lc "cmd &"` past the payload
+    scan: the inner shell backgrounds and exits, `timeout` reaps its direct
+    child and exits with it, and the grandchild survives reparented -- the
+    mctl-telegram#652 shape reached through a different spelling of the
+    same flag (claude P2 on `4449024`).
+    """
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $((a & b))",
+        "x=$((mask & 0xff)); echo $x",
+        "test $((a | b)) -eq 3",
+        "echo $(( (a & b) | c ))",
+    ],
+)
+def test_arithmetic_expansion_is_not_a_detachment(command):
+    """`$((a & b))` is a bitwise AND on numbers, not a background `&`."""
+    assert exec_budget.detachment_match(command) is None
+
+
+def test_a_command_substitution_nested_in_arithmetic_is_still_caught():
+    """Blanking arithmetic must not hide a substitution that DOES run."""
+    assert exec_budget.detachment_match("echo $(( $(worker &) + 1 ))") is not None
