@@ -208,19 +208,25 @@ class VisibilityActivities:
             ):
                 walked += 1
                 if walked > ceiling:
-                    # Name the ids: this line is the only signal this path
-                    # produces, and "counts are lower bounds" is not actionable
-                    # without knowing WHOSE budgets became lower bounds.
-                    unwalked = sorted(c for c in chunk if examined[c] == 0)
+                    # `examined[c] == 0` does NOT mean "never reached at all" —
+                    # it is equally true of an id with genuinely zero Failed
+                    # executions, which never appears in this listing whether
+                    # the ceiling fires or not. There is no signal here that
+                    # tells the two apart, so the message below does not claim
+                    # to (review P3): naming a healthy id as truncated would be
+                    # routine, misleading log noise on the common case, not the
+                    # rare one this branch exists for.
+                    unaccounted = sorted(c for c in chunk if examined[c] == 0)
                     activity.logger.warning(
                         "count_swept_prestart_failures: stopped walking a "
                         "%d-id chunk's listing after %d row(s); its counts are "
-                        "lower bounds, and %d id(s) were never reached at all: "
-                        "%s",
+                        "lower bounds, and %d id(s) have zero counted losses "
+                        "at the point the walk stopped — some may genuinely "
+                        "have none: %s",
                         len(chunk),
                         ceiling,
-                        len(unwalked),
-                        unwalked,
+                        len(unaccounted),
+                        unaccounted,
                     )
                     break
                 # Every listed execution beats, whether or not it is examined.

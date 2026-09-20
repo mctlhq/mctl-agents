@@ -271,9 +271,15 @@ class TestTheExaminationBound:
         self-corrects. Pinned because the module states the opposite rule twice
         for the other two categories, and nothing said which one governs here.
         """
+        # `quiet` must be the LAST row, not the first: if it is examined even
+        # once before the ceiling fires, its `0` comes from "reached,
+        # classified, not a pre-start loss" — a different, unremarkable case —
+        # and the ceiling branch (`unwalked`) never runs at all. Only an id
+        # that is never listed before the ceiling stops the walk exercises
+        # what this test claims to pin.
         quiet = "implement-sweep-mctl-api-issue-11-quiet"
         executions = [_execution("ImplementationFailed") for _ in range(_ceiling_for(2) + 50)]
-        executions[0].id = quiet
+        executions[-1].id = quiet
         client = _client(executions)
         acts = VisibilityActivities(client)
 

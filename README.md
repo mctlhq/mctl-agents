@@ -228,9 +228,17 @@ among the last 12 runs", which is all the caller's
 exactly 9 interleaved uncounted runs, not a guarantee. Bounding the per-run
 fetches is not on its own enough: rows come back interleaved by recency, so the
 listing is also stopped once every id in a chunk is capped, and unconditionally
-at a per-chunk ceiling, and every listed row heartbeats — including the listing
-phase itself, so a healthy tick that lists nothing does not silently inherit the
-heartbeat deadline in place of the five-minute one.
+at a per-chunk ceiling scaled to the chunk's actual size, and every listed row
+heartbeats — including the listing phase itself, so a healthy tick that lists
+nothing does not silently inherit the heartbeat deadline in place of the
+five-minute one. When that ceiling fires, an id whose Failed executions all
+sat beyond the rows walked reads back as `0` rather than being omitted — the
+one deliberate exception to "an absent count is not a zero count" above,
+because omitting here would be starvation: the listing is most-recent-first
+over a stably rebuilt candidate list, so an omitted id would never be counted
+on any later tick either. Reporting `0` costs one extra submit instead, which
+mints the newest row in the chunk and self-corrects the count within a few
+ticks.
 
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated
