@@ -349,9 +349,17 @@ def test_wrap_bounded_never_exceeds_the_budget(budget_s, want_bound):
 
 
 def test_the_rendered_bound_stays_under_the_budget_across_the_range():
-    """One property, checked over the whole range rather than row by row."""
-    for budget_s in (0.05, 0.2, 0.9, 1.0, 1.5, 2.0, 19.9, 20.0, 119.7, 300.0, 600.0):
-        assert _rendered_bound(budget_s) < budget_s, budget_s
+    """One property, checked over the whole range rather than row by row.
+
+    Compared in MILLISECONDS, the unit the CLI's own tool timeout is set in.
+    In seconds a sub-millisecond fraction hides a tie -- 20.0004s renders
+    `20s` against a 20000 ms CLI timeout -- and a tie is not an ordering
+    (claude P3 on `68f3a05`).
+    """
+    for budget_s in (
+        0.05, 0.2, 0.9, 1.0, 1.5, 2.0, 19.9, 20.0, 20.0004, 119.7, 300.0, 600.0
+    ):
+        assert _rendered_bound(budget_s) * 1000 < int(budget_s * 1000), budget_s
 
 
 def test_wrap_bounded_rounds_the_kill_grace_up_not_down():
@@ -526,3 +534,28 @@ def test_a_flag_after_the_shells_operand_is_not_a_shell_flag(command):
 def test_an_attached_c_value_is_still_a_payload():
     """`bash -c'cmd &'` lexes as one token, `-ccmd &`."""
     assert exec_budget.detachment_match("bash -c'go test ./... &'") is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `pipefail`/`globstar`/`f` are ARGUMENTS of the option before them,
+        # not the shell's operand, so the scan must not stop on them.
+        'bash -o pipefail -c "go test ./... &"',
+        'bash -euo pipefail -c "go test ./... &"',
+        'bash -O globstar -c "go test ./... &"',
+        'bash --rcfile /tmp/rc -c "go test ./... &"',
+        # A multi-call binary names its applet first.
+        'busybox sh -c "go test ./... &"',
+    ],
+)
+def test_an_option_argument_does_not_end_the_flag_scan(command):
+    """Verified against bash 5: `bash -o pipefail -c 'echo A'` prints `A`,
+    so `-c` really is reached and the payload really does execute (claude P2
+    on `68f3a05`)."""
+    assert exec_budget.detachment_match(command) is not None
+
+
+def test_an_option_argument_does_not_manufacture_a_payload():
+    """The same walk must not turn a synchronous command into a denial."""
+    assert exec_budget.detachment_match('bash -o pipefail -c "go test ./..."') is None

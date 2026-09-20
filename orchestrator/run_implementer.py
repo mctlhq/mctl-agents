@@ -4091,7 +4091,13 @@ def main() -> None:
 
     print("\n=== Summary ===")
     for result in results:
-        if result.error:
+        if result.budget_handback or result.budget_terminal:
+            # Not a `fail` line: these arms are excluded from `outcome.failed`
+            # below, and printing them as failures made a proposal retired
+            # cleanly under the cap read one way per result and the opposite
+            # way in `Totals:` (claude P3 on `68f3a05`).
+            print(f"  budget {result.ref.service}/{result.ref.slug}: {result.error}")
+        elif result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
         elif result.blocked:
             print(f"  blocked {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
@@ -4114,10 +4120,10 @@ def main() -> None:
         for result, (stale_code, issue_ref) in stale_sources:
             print(f"  {result.ref.service}/{result.ref.slug}: {stale_code} {issue_ref}")
 
-    handbacks = [r for r in results if r.budget_handback or r.budget_terminal]
-    if handbacks:
+    budget_results = [r for r in results if r.budget_handback or r.budget_terminal]
+    if budget_results:
         print("\n=== Verification budget ===")
-        for result in handbacks:
+        for result in budget_results:
             print(f"  {result.ref.service}/{result.ref.slug}: {result.error}")
 
     outcome = _batch_outcome(results)

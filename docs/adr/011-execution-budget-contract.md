@@ -211,14 +211,21 @@ Three rules keep that rewrite from being worse than the defect it closes:
   payload because some earlier token happened to spell a shell. `bash -c "cmd
   &"` backgrounds inside the inner shell, and GNU `timeout` exits with its
   DIRECT child, so the grandchild survives — the #652 shape reached through a
-  quoted payload rather than a bare one. The flag is matched as a short-flag
+  quoted payload rather than a bare one. The OS bound is compared
+  against the CLI timeout in MILLISECONDS, the unit the CLI is set in: a
+  sub-millisecond fraction otherwise ties the two bounds, and a tie is not
+  an ordering. The flag is matched as a short-flag
   CLUSTER containing `c`, not as the lone token `-c`: `bash -lc`, `sh -ec`
   and `bash -cl` all take the next word as the command, and once the
   segment's command word is already known to be a shell that looser test
   cannot reopen the `git -c` false positive. The scan stops at the shell's
   first OPERAND — after `bash deploy.sh` the word `-ec` is the script's own
-  argv — and reads an ATTACHED value (`bash -c'cmd &'`, one token after
-  lexing) as the payload. Arithmetic expansion is NOT a command
+  argv — but an option that consumes the next word (`-o`, `+o`, `-O`, `+O`,
+  `--rcfile`, `--init-file`, and a cluster ending in `o`) must step over its
+  ARGUMENT first, or `bash -o pipefail -c "go test ./... &"` stops on
+  `pipefail` and never reaches its `-c`. A multi-call binary names its
+  applet before its flags (`busybox sh -c`). The scan reads an ATTACHED
+  value (`bash -c'cmd &'`, one token after lexing) as the payload. Arithmetic expansion is NOT a command
   substitution: `$((a & b))` is a bitwise AND on numbers, so the span reads
   as data — but ONLY when the inner paren closes against a `)`. Bash falls
   back to command substitution otherwise, and runs both commands in

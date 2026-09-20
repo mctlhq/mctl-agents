@@ -287,6 +287,12 @@ _ARITHMETIC_OPEN_RE = re.compile(r"\$\(\(")
 # reopen the `git -c user.name=...` false positive that per-segment
 # scanning fixed (claude P2 on `4449024`).
 _SHELL_C_FLAG_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+# Shell options that consume the NEXT word. Stopping at the first word that
+# does not start with `-` would otherwise end the scan on their ARGUMENT:
+# `bash -o pipefail -c "go test ./... &"` never reaches its `-c` (claude P2
+# on `68f3a05`, confirmed against bash 5). A cluster ending in `o`/`O`
+# (`-euo pipefail`) consumes one too.
+_OPTIONS_TAKING_A_WORD = frozenset({"-o", "+o", "-O", "+O", "--rcfile", "--init-file"})
 
 
 def _arithmetic_spans(visible: str) -> list[tuple[int, int]]:
@@ -448,8 +454,27 @@ def _shell_c_payloads(command: str) -> list[str]:
             continue
         if words[index].split("/")[-1] not in SHELL_COMMAND_WORDS:
             continue
-        for position in range(index + 1, len(words)):
+        position = index + 1
+        # `busybox sh -c ...`: the applet name follows the multi-call binary.
+        if (
+            words[index].split("/")[-1] == "busybox"
+            and position < len(words)
+            and words[position].split("/")[-1] in SHELL_COMMAND_WORDS
+        ):
+            position += 1
+        while position < len(words):
             word = words[position]
+            if word in _OPTIONS_TAKING_A_WORD:
+                position += 2
+                continue
+            if (
+                len(word) > 1
+                and word[0] in "-+"
+                and word[1:].isalpha()
+                and word[-1] in "oO"
+            ):
+                position += 2
+                continue
             if not word.startswith("-") or word == "-":
                 # The shell's first OPERAND. Everything after it is the
                 # script's own argv, where `-ec` is just a string:
@@ -468,6 +493,7 @@ def _shell_c_payloads(command: str) -> list[str]:
             if _SHELL_C_FLAG_RE.match(word) and position + 1 < len(words):
                 found.append(words[position + 1])
                 break
+            position += 1
     return found
 
 
@@ -618,8 +644,13 @@ def wrap_bounded(command: str, budget_s: float, *, kill_after_s: float) -> str:
     guarantee is that SIGTERM lands before the CLI's timer, not that the
     pathological SIGKILL does too.
     """
+    # Compared in MILLISECONDS, because that is the unit the CLI's own tool
+    # timeout is set in: at 20.0004s the floor renders `20s` while the CLI
+    # gets `int(20.0004 * 1000)` = 20000 ms, and the two bounds tie instead
+    # of the OS one landing first (claude P3 on `68f3a05`).
+    budget_ms = int(budget_s * 1000)
     whole = math.floor(budget_s)
-    if whole >= budget_s:
+    if whole * 1000 >= budget_ms:
         whole -= 1
     if whole >= 1:
         rendered = f"{whole:d}"
