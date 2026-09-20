@@ -233,7 +233,9 @@ def _post_reply_with_retries(
             last = e
             if attempt < attempts:
                 time.sleep(delay)
-    assert last is not None  # noqa: S101 — narrows the type for the raise below; attempts >= 1 guarantees this branch always runs at least once
+    # attempts >= 1 guarantees the loop above always runs at least once, so
+    # `last` is always set by the time we get here.
+    assert last is not None  # noqa: S101
     raise last
 
 
@@ -430,8 +432,23 @@ async def _handle_directive(
 def _current_gh_login() -> str:
     """The GitHub login `gh`/`git` subprocess calls in this process actually
     authenticate writes as, per the App-installation token
-    `orchestrator.github_token.refresh_github_token` keeps fresh."""
-    proc = _run(["gh", "api", "user", "--jq", ".login"])
+    `orchestrator.github_token.refresh_github_token` keeps fresh.
+
+    Deliberately GraphQL's `viewer { login }`, not `gh api user` (codex
+    review on #417): REST `/user` requires a user-to-server OAuth token and
+    returns a 403 for a GitHub App installation token — this process
+    authenticates as the app's installation, never as a user, so `gh api
+    user` cannot return this process's own identity at all. GraphQL's
+    `viewer` field is the one GitHub-documented query that DOES resolve for
+    an installation token, and it resolves to the same `<app-slug>[bot]`
+    login GitHub renders on every comment this process posts (see
+    `orchestrator.directives.BOT_LOGINS`'s docstring).
+    """
+    proc = _run([
+        "gh", "api", "graphql",
+        "-f", "query=query { viewer { login } }",
+        "--jq", ".data.viewer.login",
+    ])
     return proc.stdout.strip()
 
 
@@ -440,10 +457,10 @@ async def _verify_bot_identity_once() -> None:
     authenticated login; no-op after the first successful check in this
     process (see `_bot_identity_checked`).
 
-    A `gh api user` call that itself fails (network blip, rate limit) is
-    NOT treated as a mismatch — it only means verification could not run
-    this tick; it is retried on the next one, the same tolerance every
-    other transient `gh` failure in this module gets. Only an actual
+    A `_current_gh_login()` call that itself fails (network blip, rate
+    limit) is NOT treated as a mismatch — it only means verification could
+    not run this tick; it is retried on the next one, the same tolerance
+    every other transient `gh` failure in this module gets. Only an actual
     login mismatch raises.
     """
     global _bot_identity_checked

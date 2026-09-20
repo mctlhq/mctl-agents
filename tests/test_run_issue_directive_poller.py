@@ -53,7 +53,7 @@ class FakeGitHub:
         return cid
 
     def run(self, cmd: list[str]) -> subprocess.CompletedProcess:
-        if cmd[:3] == ["gh", "api", "user"]:
+        if cmd[:3] == ["gh", "api", "graphql"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=self.login + "\n", stderr="")
         if cmd[:3] == ["gh", "issue", "view"]:
             issue_url = cmd[-1]
