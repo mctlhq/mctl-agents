@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.53.0](https://github.com/mctlhq/mctl-agents/compare/1.52.0...1.53.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-420-devloopworkflow-never-completes-on-tempo ([730c525](https://github.com/mctlhq/mctl-agents/commit/730c5257a89a2d70bc1d1baddd9226c269db40a8))
+
+
+### Bug Fixes
+
+* **dev-loop:** bound the approval park and add a graceful abandon signal ([e6ce411](https://github.com/mctlhq/mctl-agents/commit/e6ce411b5cdbd987b8520699100c727fa5ef76a3))
+* **devloop:** address edge cases in abandon handling and closed issue priority ([91d51c1](https://github.com/mctlhq/mctl-agents/commit/91d51c159cd58d3a3f3d32cd0b6f7aea1250292b))
+* **devloop:** address review findings on approval watch and abandon signal ([8bdffd5](https://github.com/mctlhq/mctl-agents/commit/8bdffd5c9837b487f375b077d6f8c58c23dc2df3))
+* **lint:** address ruff findings in cli.py and test_dev_loop_workflow.py ([161908c](https://github.com/mctlhq/mctl-agents/commit/161908c26e6ef50baee533ce11fcd33bbda1ba63))
+
 ## [1.52.0](https://github.com/mctlhq/mctl-agents/compare/1.51.0...1.52.0) (2026-09-20)
 
 
