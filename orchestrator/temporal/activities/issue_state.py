@@ -1,13 +1,13 @@
 """Activity: read a GitHub issue's lifecycle state.
 
-`DevLoopWorkflow` parks at `workflow.wait_condition(lambda: self._approved)`
-for as long as a human takes to review the proposal — durably, with no
-upper bound. The issue that started the loop can be closed while it waits
-(reopened elsewhere, superseded, or resolved directly). This activity lets
-the workflow check, immediately after the wait resolves and before it
-submits the `mctl-agents-approve` CWFT, so a loop is not spent approving
-and implementing a proposal whose reason for existing is already gone
-(mctl-agents#410).
+`DevLoopWorkflow` parks at the approval wait for as long as a human takes to
+review the proposal — durably, and (mctl-agents#420) bounded rather than
+forever: it polls this activity on its own cadence while parked, and this is
+also the same activity the gate immediately after the wait resolves uses.
+The issue that started the loop can be closed while it waits (reopened
+elsewhere, superseded, or resolved directly); either read lets the workflow
+notice, so a loop is not spent approving and implementing a proposal whose
+reason for existing is already gone (mctl-agents#410).
 
 Same worker-side pattern as `activities/proposals.py` and
 `activities/pr_state.py`: `_resolve_token()` off the event loop, `httpx`,
