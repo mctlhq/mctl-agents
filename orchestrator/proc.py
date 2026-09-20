@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from typing import IO, cast
 
 # How much of each stream to keep in the message. Enough for a `gh` or `git`
 # error (which is a line or two), short of pasting a whole build log into every
@@ -123,13 +124,27 @@ def _run_capturing_bounded(
     elapses, which also unblocks a `.read()` call that was stuck waiting on
     a hung child. That is the only job the timer has; the byte cap is
     enforced directly by the read loop below.
+
+    stderr is drained on its own thread, concurrently with the stdout read
+    loop, rather than after it (mctl-agents#423 review P2). Reading only
+    stdout while a child writes enough to stderr fills that pipe's OS
+    buffer; the child then blocks on its next stderr write, and with
+    nothing here reading that pipe, the stdout read loop and the child end
+    up waiting on each other. A `timeout` does not save this on its own —
+    the deadlock is on a blocked child, not merely a slow one — and when
+    `timeout` is `None` (the caller explicitly asking to wait as long as it
+    takes) there is no timer to break it at all, so the hang is permanent.
+    Draining both streams at once removes the deadlock outright, regardless
+    of whether a timeout is set.
     """
     popen = subprocess.Popen(  # noqa: S603 — cmd is the caller's list[str], never shell=True
         cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    # Always present: both were just opened as PIPE above.
-    assert popen.stdout is not None
-    assert popen.stderr is not None
+    # Both were just opened as PIPE above, so both are non-None. `cast`, not
+    # `assert`: ruff's S101 bans `assert` outside tests/ (pyproject.toml),
+    # and a cast is not stripped by `python -O` the way an assert would be.
+    stdout_pipe = cast(IO[bytes], popen.stdout)
+    stderr_pipe = cast(IO[bytes], popen.stderr)
 
     timed_out = threading.Event()
     timer: threading.Timer | None = None
@@ -144,11 +159,23 @@ def _run_capturing_bounded(
         timer = threading.Timer(timeout, _on_timeout)
         timer.start()
 
+    stderr_chunks: list[bytes] = []
+
+    def _drain_stderr() -> None:
+        while True:
+            chunk = stderr_pipe.read(65536)
+            if not chunk:
+                break
+            stderr_chunks.append(chunk)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+
     try:
         chunks: list[bytes] = []
         total = 0
         while total < max_output_bytes:
-            chunk = popen.stdout.read(min(65536, max_output_bytes - total))
+            chunk = stdout_pipe.read(min(65536, max_output_bytes - total))
             if not chunk:
                 break
             chunks.append(chunk)
@@ -159,13 +186,17 @@ def _run_capturing_bounded(
             # more than we will ever keep.
             popen.kill()
         stdout_bytes = b"".join(chunks)
-        stderr_bytes = popen.stderr.read()
         popen.wait()
+        # The child has exited (or was just killed above), so its stderr
+        # end is at EOF or will be shortly — this join does not reintroduce
+        # the wait the draining thread exists to avoid.
+        stderr_thread.join()
+        stderr_bytes = b"".join(stderr_chunks)
     finally:
         if timer is not None:
             timer.cancel()
-        popen.stdout.close()
-        popen.stderr.close()
+        stdout_pipe.close()
+        stderr_pipe.close()
 
     if timed_out.is_set():
         raise subprocess.TimeoutExpired(cmd, timeout_used, output=stdout_bytes)

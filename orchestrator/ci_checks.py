@@ -548,8 +548,13 @@ def _fetch_one_log(repo: str, blocker: CheckBlocker) -> tuple[str | None, str]:
     Primary: `gh api repos/{repo}/actions/jobs/{job_id}/logs`, where
     `job_id` is the CheckRun's own `databaseId` (task 1's finding — it
     coincides with the Actions job id in practice). Fallback:
-    `gh run view <run_id> --log-failed`, covering the case where the primary
-    route 404s or the blocker never carried a check-run id at all.
+    `gh run view <run_id> --repo {repo} --log-failed`, covering the case
+    where the primary route 404s or the blocker never carried a check-run id
+    at all. `--repo` is required here (unlike the primary route, which
+    already embeds the repo in the API path): without it `gh` resolves the
+    run against the CLI's ambient working-directory repo, which is wrong for
+    every service other than the one this process itself happens to be
+    running in (mctl-agents#423 review P2).
     `StatusContext` blockers have neither `check_run_id` nor `run_id` and
     degrade straight to "unavailable" without a `gh` call.
 
@@ -587,7 +592,7 @@ def _fetch_one_log(repo: str, blocker: CheckBlocker) -> tuple[str | None, str]:
     if blocker.run_id:
         try:
             proc = run_capturing(
-                ["gh", "run", "view", blocker.run_id, "--log-failed"],
+                ["gh", "run", "view", blocker.run_id, "--repo", repo, "--log-failed"],
                 timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
                 max_output_bytes=CI_LOG_MAX_FETCH_BYTES,
             )

@@ -97,3 +97,76 @@ def test_describe_output_says_so_when_empty():
 def test_describe_output_accepts_bytes():
     """TimeoutExpired hands back bytes when the child was not started in text mode."""
     assert describe_output(b"out", b"err") == "stdout: out stderr: err"
+
+
+# ---------------------------------------------------------------------------
+# `max_output_bytes` (`_run_capturing_bounded`) — mctl-agents#423 review P2:
+# this path had no test coverage at all.
+# ---------------------------------------------------------------------------
+def test_bounded_path_returns_full_output_under_the_cap():
+    proc = run_capturing(
+        ["python", "-c", "import sys; sys.stdout.write('hi'); sys.stderr.write('warn')"],
+        max_output_bytes=1000,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout == "hi"
+    assert proc.stderr == "warn"
+
+
+def test_bounded_path_still_raises_on_a_real_failure_within_the_cap():
+    with pytest.raises(CommandFailed) as excinfo:
+        run_capturing(
+            ["python", "-c", "import sys; sys.stderr.write('boom'); sys.exit(1)"],
+            max_output_bytes=1000,
+        )
+    assert "boom" in str(excinfo.value)
+
+
+def test_bounded_path_truncates_stdout_and_does_not_treat_the_cap_as_a_failure():
+    """Hitting the cap kills the child rather than draining it to completion,
+    but is NOT a command failure: `returncode=0` even though the child, left
+    to run, would have exited non-zero."""
+    proc = run_capturing(
+        [
+            "python", "-c",
+            "import sys; sys.stdout.write('x' * 100000); sys.stdout.flush(); sys.exit(3)",
+        ],
+        max_output_bytes=100,
+    )
+    assert proc.returncode == 0
+    assert len(proc.stdout) == 100
+
+
+def test_bounded_path_timeout_still_raises_timeout_expired():
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_capturing(
+            ["python", "-c", "import time; time.sleep(5)"],
+            timeout=0.3,
+            max_output_bytes=1000,
+        )
+
+
+def test_bounded_path_drains_stderr_concurrently_so_a_full_pipe_does_not_deadlock():
+    """A child that fills the stderr pipe before ever writing to stdout used
+    to deadlock the bounded path: the stdout read loop blocked waiting for
+    output while the child blocked writing stderr into a full, undrained
+    pipe (mctl-agents#423 review P2). Draining stderr on its own thread lets
+    the child make progress regardless. The 300000-byte stderr write is well
+    past the OS pipe buffer (typically 64KB), so the old implementation
+    would reliably hang here until the `timeout` below killed it and this
+    assertion failed with a `TimeoutExpired`; the fix completes almost
+    immediately with both streams intact.
+    """
+    script = (
+        "import sys; "
+        "sys.stderr.write('e' * 300000); sys.stderr.flush(); "
+        "sys.stdout.write('o' * 300000); sys.stdout.flush()"
+    )
+    proc = run_capturing(
+        ["python", "-c", script],
+        timeout=15,
+        max_output_bytes=1_000_000,
+    )
+    assert proc.returncode == 0
+    assert len(proc.stdout) == 300000
+    assert len(proc.stderr) == 300000

@@ -64,8 +64,28 @@ def test_fetch_falls_back_to_run_view_when_there_is_no_check_run_id() -> None:
     with patch.object(ci_checks, "run_capturing", side_effect=fake_run_capturing):
         result = fetch_failure_logs("mctlhq/mctl-web", (blocker,))
 
-    assert calls == [["gh", "run", "view", "999", "--log-failed"]]
+    assert calls == [["gh", "run", "view", "999", "--repo", "mctlhq/mctl-web", "--log-failed"]]
     assert result[0].log_status == "ok"
+
+
+def test_run_scoped_fallback_targets_the_blocker_repo_not_the_ambient_one() -> None:
+    """mctl-agents#423 review P2: without `--repo`, `gh run view` resolves the
+    run against the CLI's ambient working-directory repo — wrong for every
+    service other than whichever one this process happens to be running in.
+    Pinned against a repo distinct from the job-scoped route's own
+    `mctlhq/mctl-web` so a regression that drops `--repo` again is caught
+    even if it silently defaults to the "right" repo by coincidence."""
+    calls = []
+
+    def fake_run_capturing(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="fallback log", stderr="")
+
+    blocker = _blocker(check_run_id=None, run_id="999")
+    with patch.object(ci_checks, "run_capturing", side_effect=fake_run_capturing):
+        fetch_failure_logs("mctlhq/mctl-agents", (blocker,))
+
+    assert calls == [["gh", "run", "view", "999", "--repo", "mctlhq/mctl-agents", "--log-failed"]]
 
 
 def test_a_status_context_blocker_with_neither_id_is_unavailable_with_no_gh_call() -> None:

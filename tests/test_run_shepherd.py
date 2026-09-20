@@ -3873,6 +3873,70 @@ def test_apply_followup_raises_harness_on_orphaned_subagent() -> None:
     assert exc.value.kind == "harness"
 
 
+def _refusal_out_path(cmd: list[str]) -> str:
+    return cmd[cmd.index("--refusal-out") + 1]
+
+
+def test_apply_followup_reads_the_reason_on_ci_evidence_insufficient() -> None:
+    """mctl-agents#423 review P2, round 2: `run_implementer` writes
+    `--refusal-out` for exit 50 (see its `elif code ==
+    EXIT_CI_EVIDENCE_INSUFFICIENT` branch), but the read here used to be
+    gated on `_refusal_codes()` alone — exit 47 only — so the reason was
+    written and then unlinked, unread, in every real run. This pins the
+    fix: the same file, now actually read back for 50."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(_refusal_out_path(cmd)).write_text(
+            json.dumps({"refused": True, "reason": "excerpt does not show the assertion"}),
+            encoding="utf-8",
+        )
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "harness"
+    assert exc.value.reason == "excerpt does not show the assertion"
+
+
+def test_apply_followup_orphaned_subagent_never_reads_a_reason() -> None:
+    """The gate is on the exit code, not on whether the file happens to hold
+    content — exit 46 never gets a `--refusal-out` write from
+    `run_implementer`, so even a stray non-empty file at that path must not
+    surface as a reason here."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_ORPHANED_SUBAGENT
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(_refusal_out_path(cmd)).write_text(
+            json.dumps({"refused": True, "reason": "should never be read for 46"}),
+            encoding="utf-8",
+        )
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "harness"
+    assert exc.value.reason is None
+
+
 def test_apply_followup_labels_plain_failures_transient_not_harness() -> None:
     """Guards the label from collapsing into "everything non-deterministic is
     a harness failure" — only the sentinel earns that name."""
