@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.49.0](https://github.com/mctlhq/mctl-agents/compare/1.48.0...1.49.0) (2026-09-19)
+
+
+### Features
+
+* **agents:** issue-265-feat-context-assemble-investigator-conte ([3490fd9](https://github.com/mctlhq/mctl-agents/commit/3490fd9a66a82c328ddbc3e2e5b54f77ba5f0eb7))
+* **agents:** issue-334-feat-lifecycle-adopt-proposal-less-same ([c6b7df7](https://github.com/mctlhq/mctl-agents/commit/c6b7df7b333791a18bfa758d9fa3135842b87224))
+* **agents:** issue-410-implementer-admission-must-reject-accept ([231c824](https://github.com/mctlhq/mctl-agents/commit/231c824504a32d0f54592bb56fa354cb088d540b))
+* **agents:** issue-411-fix-shepherd-feed-failing-required-pr-ch ([44af8fb](https://github.com/mctlhq/mctl-agents/commit/44af8fb28bc023c28995da1d32a2a482fe8ef660))
+* **agents:** reject accepted proposals with a closed source issue ([5bff7d3](https://github.com/mctlhq/mctl-agents/commit/5bff7d3ed94c7a6b7072fdfffc4d183630a84311))
+* **shepherd:** adopt proposal-less same-repo PRs with blocking reviews ([cedf6ca](https://github.com/mctlhq/mctl-agents/commit/cedf6ca768b1100239661271c4cb5e03d011ba7d))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([e909f37](https://github.com/mctlhq/mctl-agents/commit/e909f37a6f4c8e19bdca3f5ebb7ba609c7320aa0))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([319c442](https://github.com/mctlhq/mctl-agents/commit/319c442051e1a5aaebfea1ccceba7dae0986eba2))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([aaa2542](https://github.com/mctlhq/mctl-agents/commit/aaa2542cedc2fc2ff1570d37b572dea7469ed260))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([c9f6abc](https://github.com/mctlhq/mctl-agents/commit/c9f6abc01d2a0c24f3bf60e6d74e1a12dcaf0c62))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([b822f63](https://github.com/mctlhq/mctl-agents/commit/b822f63e157936948d9c557ffb7679919e4151b6))
+* **agents:** address P1/P2 codex findings on issue-410-implementer-admission-must-reject-accept ([1af2023](https://github.com/mctlhq/mctl-agents/commit/1af2023b8c6bfa3c0982d0f695d2da418358a165))
+* **agents:** address P1/P2 codex findings on issue-410-implementer-admission-must-reject-accept ([1a58747](https://github.com/mctlhq/mctl-agents/commit/1a5874740221db44ec3cafc847fd8f5ac61c8025))
+* **agents:** address P1/P2 codex findings on issue-410-implementer-admission-must-reject-accept ([036ffca](https://github.com/mctlhq/mctl-agents/commit/036ffcab083e6b9c3e55e458f185691779b195bb))
+* **agents:** address P1/P2 codex findings on issue-411-fix-shepherd-feed-failing-required-pr-ch ([4d59b7c](https://github.com/mctlhq/mctl-agents/commit/4d59b7cf7012a0cf724ddb62b967ba10e50f485e))
+* **agents:** address P1/P2 codex findings on issue-411-fix-shepherd-feed-failing-required-pr-ch ([bf510f7](https://github.com/mctlhq/mctl-agents/commit/bf510f797f314659111ce73281cf83136af68c47))
+* **agents:** address P1/P2 codex findings on issue-411-fix-shepherd-feed-failing-required-pr-ch ([d0d4072](https://github.com/mctlhq/mctl-agents/commit/d0d4072798dc7280c2546fc044ecf482a9fd55fd))
+* **agents:** feed failing required PR checks into shepherd remediation ([72123d1](https://github.com/mctlhq/mctl-agents/commit/72123d1a81b178ec77b76129ee6c7e0c6b3e79de))
+* **implementer:** frame the follow-up prompt around what the bundle holds ([a8bcc3b](https://github.com/mctlhq/mctl-agents/commit/a8bcc3b87f75b1f67dba2bb6775c75e3ecd59fb0)), closes [#411](https://github.com/mctlhq/mctl-agents/issues/411)
+* **shepherd:** close the carried CI-probe review findings on [#411](https://github.com/mctlhq/mctl-agents/issues/411) ([16f4118](https://github.com/mctlhq/mctl-agents/commit/16f411815906228856a85d47d8be87e3d31375c5))
+
 ## [1.48.0](https://github.com/mctlhq/mctl-agents/compare/1.47.0...1.48.0) (2026-09-19)
 
 
