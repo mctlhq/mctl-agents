@@ -47,6 +47,12 @@ from orchestrator.temporal.worker import (
 def visibility():
     stub = MagicMock()
     stub.list_active_dev_loop_ids = _named_activity("list_active_dev_loop_ids")
+    # Named too, not left as a bare MagicMock attribute: `activity_names`
+    # reads `__temporal_activity_definition.name`, and on a plain MagicMock
+    # that is another MagicMock — so an activity this fixture does not name
+    # can never be asserted on, and a dropped registration for it is
+    # invisible to this whole suite (review P3 on #412).
+    stub.count_swept_prestart_failures = _named_activity("count_swept_prestart_failures")
     return stub
 
 
@@ -67,6 +73,69 @@ def test_all_keeps_the_original_control_queue_shape(visibility):
     assert "submit_and_wait" in control.activity_names
     assert "find_proposal_slug" in control.activity_names
     assert control.max_concurrent_activities is None
+
+
+def test_the_implement_sweep_registers_on_the_control_queue_only(visibility):
+    """The sweep (#412) is a control-queue workflow like the other three —
+    it services no long Argo poll itself and must not land on either split
+    queue, which register no workflows at all."""
+    from orchestrator.temporal.workflows.implement_sweep import (
+        ImplementSweepWorkflow,
+        SweptImplementWorkflow,
+    )
+
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
+    assert ImplementSweepWorkflow in control.workflows
+    assert SweptImplementWorkflow in control.workflows
+    assert "find_stranded_accepted" in control.activity_names
+    # Both visibility activities are scheduled by STRING name from
+    # ImplementSweepWorkflow, so a dropped registration is not a type error
+    # anywhere — the tick just fails its budget query every 15 minutes.
+    assert "count_swept_prestart_failures" in control.activity_names
+    assert "list_active_dev_loop_ids" in control.activity_names
+
+    for role in ("execution", "implementation"):
+        for plan in worker_plans(role, visibility):
+            assert ImplementSweepWorkflow not in plan.workflows
+            assert SweptImplementWorkflow not in plan.workflows
+
+
+def test_implement_sweep_tunables_are_read_from_the_environment(monkeypatch):
+    """Same `_int_env` rule IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES follows
+    (mctl-agents#412): env override, default, refusal on a bad value."""
+    from orchestrator.temporal.constants import (
+        implement_sweep_grace_minutes,
+        implement_sweep_max_submits,
+    )
+
+    monkeypatch.delenv("IMPLEMENT_SWEEP_GRACE_MINUTES", raising=False)
+    monkeypatch.delenv("IMPLEMENT_SWEEP_MAX_SUBMITS", raising=False)
+    assert implement_sweep_grace_minutes() == 20
+    assert implement_sweep_max_submits() == 5
+
+    monkeypatch.setenv("IMPLEMENT_SWEEP_GRACE_MINUTES", "30")
+    monkeypatch.setenv("IMPLEMENT_SWEEP_MAX_SUBMITS", "1")
+    assert implement_sweep_grace_minutes() == 30
+    assert implement_sweep_max_submits() == 1
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
+@pytest.mark.parametrize(
+    "env_var,fn_name",
+    [
+        ("IMPLEMENT_SWEEP_GRACE_MINUTES", "implement_sweep_grace_minutes"),
+        ("IMPLEMENT_SWEEP_MAX_SUBMITS", "implement_sweep_max_submits"),
+    ],
+)
+def test_a_malformed_implement_sweep_tunable_is_refused_at_startup(monkeypatch, bad, env_var, fn_name):
+    """A non-positive or unparseable value must not become a silent default
+    — it is a startup refusal, read where setup_schedules builds the
+    schedule's input, never inside workflow code."""
+    import orchestrator.temporal.constants as constants_module
+
+    monkeypatch.setenv(env_var, bad)
+    with pytest.raises(SystemExit):
+        getattr(constants_module, fn_name)()
 
 
 def test_all_also_polls_every_routed_queue(visibility):
@@ -465,3 +534,22 @@ def test_the_sdk_still_offers_the_run_shutdown_pair_this_module_drives():
         member = getattr(Worker, name, None)
         assert member is not None, f"Worker no longer has {name}()"
         assert inspect.iscoroutinefunction(member), f"Worker.{name}() is no longer awaitable"
+
+
+def test_the_visibility_activity_names_the_workflow_schedules_by_string_exist():
+    """The other half of the registration assertion above.
+
+    `worker_plans` is tested against a MagicMock stub, so it can only pin that
+    whatever the stub exposes gets registered. This pins the real class
+    actually exposes those two activity names — the strings
+    `ImplementSweepWorkflow` schedules by. A rename on either side is silent
+    otherwise: the workflow compiles, the worker starts, and every tick fails
+    its budget query.
+    """
+    from orchestrator.temporal.activities.visibility import VisibilityActivities
+
+    names = {
+        getattr(getattr(VisibilityActivities, attr), "__temporal_activity_definition").name
+        for attr in ("list_active_dev_loop_ids", "count_swept_prestart_failures")
+    }
+    assert names == {"list_active_dev_loop_ids", "count_swept_prestart_failures"}
