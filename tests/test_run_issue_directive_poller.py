@@ -338,6 +338,39 @@ def test_max_directives_caps_dispatch_and_reports_deferred(monkeypatch):
     assert len(submitted) == 2
 
 
+def test_max_directives_round_robins_across_issues_not_by_issue_order(monkeypatch):
+    """Distinguishes the round-robin-across-issues cap from a naive
+    prefix-slice over a flat list ordered by issue (codex review on #417):
+    `test_max_directives_caps_dispatch_and_reports_deferred` above gives
+    every issue exactly one pending directive, so a flat prefix slice and a
+    round-robin produce identical output — it cannot tell them apart. Here
+    issue A has three pending directives (a comment burst) and issue B has
+    one; a prefix slice over issue order would drain all of A's queue
+    before B gets a turn, deferring B's only directive entirely. The actual
+    round-robin dispatches to both issues instead.
+    """
+    gh = FakeGitHub()
+    ref_a = _ref(slug="issue-1-a")
+    ref_b = _ref(slug="issue-2-b")
+    url_a = run_issue_directive_poller.issue_url_for(ref_a.service, ref_a.slug)
+    url_b = run_issue_directive_poller.issue_url_for(ref_b.service, ref_b.slug)
+    gh.add_comment(url_a)
+    gh.add_comment(url_a)
+    gh.add_comment(url_a)
+    gh.add_comment(url_b)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref_a, ref_b]))
+    submitted: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submitted))
+
+    result = _run_scan(max_directives=2)
+    assert result.dispatched == 2
+    assert result.deferred == 2
+    dispatched_issue_urls = {issue_url for issue_url, _slug, _requested_by in submitted}
+    assert dispatched_issue_urls == {url_a, url_b}
+
+
 def test_a_gh_failure_on_one_issue_does_not_stop_the_scan(monkeypatch):
     gh = FakeGitHub()
     bad_ref = _ref(slug="issue-1-bad")

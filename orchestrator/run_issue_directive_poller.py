@@ -338,12 +338,36 @@ async def _handle_directive(
                     _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
                 )
             else:
-                await asyncio.to_thread(
-                    _post_reply,
-                    issue_url,
-                    f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
-                    f"{fail_trailer(directive.comment_id)}",
-                )
+                try:
+                    await asyncio.to_thread(
+                        _post_reply,
+                        issue_url,
+                        f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
+                        f"{fail_trailer(directive.comment_id)}",
+                    )
+                except subprocess.CalledProcessError as post_e:
+                    # The retry-marker write itself failed — `prior_failures`
+                    # is only ever recomputed from `fail_trailer` markers
+                    # already posted (there is no other durable store; see
+                    # the module docstring), so letting this exception
+                    # propagate would leave `attempt` unchanged on the next
+                    # tick and retry forever without ever recording progress
+                    # toward the give-up bound — precisely in the
+                    # shared-outage scenario (broken token, network outage)
+                    # this bound exists for (codex review on #417). Escalate
+                    # straight to give-up for this attempt instead of
+                    # silently looping.
+                    print(
+                        f"FAIL: could not post retry marker for directive comment "
+                        f"{directive.comment_id} ({issue_url}) after dispatch attempt "
+                        f"{attempt} ({post_e}) — escalating straight to give-up since "
+                        "progress cannot be recorded without a working GitHub write."
+                    )
+                    await asyncio.to_thread(
+                        _post_reply,
+                        issue_url,
+                        _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
+                    )
             return "dispatch-failed"
         await asyncio.to_thread(
             _post_reply,
