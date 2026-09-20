@@ -295,13 +295,18 @@ minutes, the `attempt` lease it replaces) for the initial implement
 attempt, and `LIFECYCLE_CLAIM_LEASE_SECONDS_REVIEW` for a
 review-remediation follow-up. The review value is a *floor* of `1800`
 (30 minutes, one `MERGE_POLL_INTERVAL`) under
-`IMPLEMENTER_TIMEOUT_SECONDS + 2 x IMPLEMENTER_COMMAND_TIMEOUT_SECONDS`,
-so the lease outlives the run it guards: with the stock `900 + 2 x 300`
-the floor wins at 1800 seconds, and raising `IMPLEMENTER_TIMEOUT_SECONDS`
+`IMPLEMENTER_TIMEOUT_CEILING_SECONDS + 2 x IMPLEMENTER_COMMAND_TIMEOUT_SECONDS`
+(mctl-agents#423 — the ceiling, not `IMPLEMENTER_TIMEOUT_SECONDS` alone,
+since a CI-remediation or mixed follow-up can widen its own envelope up to
+the ceiling before its work class is even known), so the lease outlives the
+run it guards: with the stock `1800 + 2 x 300` the computed bound of 2400
+wins over the 1800 floor, and raising `IMPLEMENTER_TIMEOUT_CEILING_SECONDS`
 raises the lease with it. Both variables are lengthen-only: a value below
 the computed lease is refused with a log line and the computed one is used,
 so an override can widen a claim but never make it expire under its own run.
-`.env.example` ships them commented out all the same.
+`.env.example` ships them commented out all the same. See
+`docs/adr/011-execution-budget-contract.md` for the full execution-budget
+picture this lease sits inside.
 
 ### Tier 3 — PR shepherd
 

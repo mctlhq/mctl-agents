@@ -90,6 +90,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -135,8 +136,11 @@ from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
     IMPLEMENTER_DRAIN_TIMEOUT_SECONDS,
+    IMPLEMENTER_TEARDOWN_GRACE_SECONDS,
+    IMPLEMENTER_TIMEOUT_CEILING_SECONDS,
     IMPLEMENTER_TIMEOUT_SECONDS,
     build_implementer_agent_options,
+    implementer_envelope,
 )
 from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import (
@@ -237,6 +241,19 @@ EXIT_FENCED = 48
 # it repeats every tick for the life of a leaked lease (claude P3 on
 # `31232dc`).
 EXIT_CLAIM_REFUSED = 49
+# The agent ran, but the bounded CI-log evidence the bundle carried could not
+# support a code decision, and it said so via the refusal marker (below),
+# distinguished from a plain refusal by `"insufficient_evidence": true`
+# (mctl-agents#423). Distinct from EXIT_DELIBERATE_NO_OP (47): a 47 means "the
+# findings are addressed, or an operator forbade the change" -- a considered
+# NO on the merits. A 50 means "I cannot tell, on what I was handed" -- the
+# agent never reached a merits decision at all, so charging it to `refusals`
+# (bounded by MAX_REFUSALS) would misrepresent a platform-supplied-evidence
+# gap as the agent repeatedly declining to act. It joins the shepherd's
+# harness set instead: blameless, and bounded by the same
+# MAX_HARNESS_FAILURES an orphaned sub-agent is (see
+# run_shepherd._followup_code_sets).
+EXIT_CI_EVIDENCE_INSUFFICIENT = 50
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -254,6 +271,9 @@ REFUSAL_ERROR_PREFIX = "deliberate no-op:"
 FENCED_ERROR_PREFIX = "fenced:"
 # Prefix mapped to EXIT_CLAIM_REFUSED, raised by ImplementerClaimRefused.
 CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
+# Prefix mapped to EXIT_CI_EVIDENCE_INSUFFICIENT. Same style, used when the
+# refusal marker carries `"insufficient_evidence": true` (mctl-agents#423).
+CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX = "ci-evidence-insufficient:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -270,8 +290,25 @@ MAX_REFUSAL_REASON_CHARS = 600
 MAX_REFUSAL_MARKER_BYTES = 64 * 1024
 
 
-def _read_refusal_marker(repo_dir: Path) -> str | None:
-    """Return the refusal reason iff this run produced a valid refusal marker.
+@dataclass(frozen=True)
+class RefusalMarker:
+    """A validated `.implementer-refusal.json` (see `_read_refusal_marker`).
+
+    `insufficient_evidence` (mctl-agents#423) distinguishes a considered "no"
+    on the merits (the ordinary refusal, exit 47 — findings addressed, or an
+    operator decision forbids the change) from "the bounded CI-log evidence
+    I was handed cannot support a code decision" (exit 50 — the agent never
+    reached a merits decision at all). Both share the same marker shape and
+    the same validation; only the mapped exit code, and therefore the
+    shepherd's charging behaviour, differs.
+    """
+
+    reason: str
+    insufficient_evidence: bool = False
+
+
+def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
+    """Return the refusal marker iff this run produced a valid one.
 
     Every check below exists to make "the agent refused" something that cannot
     be produced by accident:
@@ -398,7 +435,10 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
     if not isinstance(reason, str) or not reason.strip():
         print(f"warn: {REFUSAL_MARKER_FILENAME} carries no reason; ignoring")
         return None
-    return " ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS]
+    return RefusalMarker(
+        reason=" ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS],
+        insufficient_evidence=data.get("insufficient_evidence") is True,
+    )
 
 
 def _write_refusal_out(path: Path, reason: str) -> None:
@@ -468,6 +508,14 @@ def _review_feedback_exit_code(error: str) -> int:
         because "a claim stood this attempt down" is what the operator needs
         to read either way.
 
+      - 50: the bounded CI-log evidence in the bundle could not support a
+        code decision, and the agent said so via the refusal marker's
+        `insufficient_evidence` flag (mctl-agents#423). Distinct from 47: the
+        agent never reached a merits decision, so the shepherd treats it as
+        blameless the way it treats an orphaned sub-agent (its own harness
+        counter, bounded by MAX_HARNESS_FAILURES) rather than charging it to
+        `refusals`.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -489,6 +537,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_FENCED
     if error.startswith(CLAIM_REFUSED_ERROR_PREFIX):
         return EXIT_CLAIM_REFUSED
+    if error.startswith(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):
+        return EXIT_CI_EVIDENCE_INSUFFICIENT
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -742,10 +792,19 @@ REVIEW_CLAIM_LEASE_FLOOR = timedelta(minutes=30)
 def _review_claim_lease_default() -> timedelta:
     """The review lease floor, widened to cover the run it has to outlive.
 
-    `IMPLEMENTER_TIMEOUT_SECONDS` bounds the SDK run; the git work around it
-    is bounded by `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which
-    the clone before and the push after are the two that matter. The margin
-    is deliberately the whole of both rather than a fraction, because the two
+    `IMPLEMENTER_TIMEOUT_CEILING_SECONDS` (mctl-agents#423) bounds the WIDEST
+    envelope any work class can select -- not `IMPLEMENTER_TIMEOUT_SECONDS`
+    alone, which since #423 is only the review-class envelope. A
+    CI-remediation or mixed follow-up can run up to the ceiling, and the
+    lease has to outlive whichever class this attempt turns out to be before
+    the class is even known (the claim is acquired before the bundle's work
+    class is derived) -- so it is sized for the worst case unconditionally,
+    the same way it was sized for the only case before #423 gave the
+    envelope more than one value.
+    The git work around the SDK run is bounded by
+    `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which the clone
+    before and the push after are the two that matter. The margin is
+    deliberately the whole of both rather than a fraction, because the two
     errors are not symmetric in the way they look: expiring EARLY refuses a
     live attempt at its own push, and expiring LATE strands the entity for the
     rest of the lease whenever the holder cannot run its own `finally` — a
@@ -755,7 +814,7 @@ def _review_claim_lease_default() -> timedelta:
     one needs a crash.
     """
     bound = timedelta(
-        seconds=IMPLEMENTER_TIMEOUT_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
+        seconds=IMPLEMENTER_TIMEOUT_CEILING_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
     )
     return max(REVIEW_CLAIM_LEASE_FLOOR, bound)
 
@@ -1495,6 +1554,36 @@ def _build_prompt(
                 "Body should reference the proposal: "
                 f"`Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`."
             )
+        # mctl-agents#423: a bundle carrying CI failures already has the
+        # log evidence it will get — retrieved, bounded and paid for OUTSIDE
+        # this run's own execution envelope. Nothing else can stop the agent
+        # from fetching more itself (the CLI backgrounds a slow Bash command
+        # past its own tool timeout rather than failing it), so the prompt
+        # states the rule and the `_ci_log_guard_hook()` PreToolUse hook
+        # (see options.py) is the actual enforcement.
+        has_ci_failures = bool(review_feedback.get("ci_failures"))
+        ci_log_ground_rule = (
+            "- The log excerpt(s) under \"Log excerpt (bounded, ...)\" above are "
+            "ALL the CI-log evidence you will get for this run — already "
+            "retrieved and bounded before this run started. Do NOT run `gh run "
+            "view --log`/`--log-failed`, `gh api .../logs`, or `curl`/`wget` a "
+            "logs URL to fetch more; those commands are blocked. If the bounded "
+            "excerpt is genuinely insufficient to decide on a code change, do "
+            "not retry the fetch: write the refusal marker with "
+            "`\"insufficient_evidence\": true` (see below) instead.\n"
+            if has_ci_failures
+            else ""
+        )
+        insufficient_evidence_note = (
+            "\n   When the reason is specifically that the bounded CI-log "
+            "evidence above cannot support a code decision (not merely that "
+            "the check is fine or infrastructure-flaky), add "
+            "`\"insufficient_evidence\": true` to the same marker:\n\n"
+            "   {\"refused\": true, \"insufficient_evidence\": true, "
+            "\"reason\": \"<what evidence is missing>\"}\n"
+            if has_ci_failures
+            else ""
+        )
         return f"""\
 Tier 2 implementer follow-up for proposal `{ref.service}/{ref.slug}`.
 
@@ -1523,7 +1612,7 @@ Workflow:
    that already satisfies it, or the log line showing the failure is an
    infrastructure outage rather than a defect. Explain the same reasoning
    in your final message.
-
+{insufficient_evidence_note}
    Write this file ONLY when you deliberately decided that changing nothing
    is the correct outcome. Never write it next to a commit, never as a
    progress note, and never with an empty or placeholder reason: the
@@ -1542,7 +1631,7 @@ Ground rules:
   the mounted gitops worktree under `/workdir`. If a finding implies a
   change in another repository, do NOT make it; describe it in your final
   message so a human can route it.
-- Never defer work to "the background." This run is a single, one-shot
+{ci_log_ground_rule}- Never defer work to "the background." This run is a single, one-shot
   turn — there is no later turn for you to resume into, no polling loop,
   and nothing will notify you when a backgrounded command finishes. Run
   every command synchronously and wait for its result before ending your
@@ -1626,7 +1715,14 @@ def _render_ci_failures_section(ci_failures: list) -> str:
     (mctlhq/mctl-agents#411) and never routes them through its summariser
     SDK, so nothing here is model-rewritten. Each record's fields are
     optional (a `StatusContext` has no job/step, some checks have no run
-    URL), so every line is rendered defensively.
+    URL, a pre-#423 bundle has no `log_*` keys at all), so every line is
+    rendered defensively.
+
+    `log_excerpt`/`log_status`/`log_truncated` (mctl-agents#423) render as a
+    second, clearly bounded block: the CI-variant prompt ground rule tells
+    the agent this is the whole of the evidence it will get and not to fetch
+    more, so the heading has to say plainly that it IS bounded and whether
+    it was truncated, rather than reading like an ordinary quoted excerpt.
     """
     records = [item for item in ci_failures if isinstance(item, dict)]
     if not records:
@@ -1646,6 +1742,9 @@ def _render_ci_failures_section(ci_failures: list) -> str:
         url = item.get("url")
         head = item.get("head_sha")
         excerpt = (item.get("excerpt") or "").strip()
+        log_excerpt = (item.get("log_excerpt") or "").strip()
+        log_status = item.get("log_status") or "skipped"
+        log_truncated = bool(item.get("log_truncated"))
         loc_bits = [b for b in (workflow, job, step) if b]
         loc = " / ".join(loc_bits)
         header = f"### Check {i}: {check} [{conclusion}]"
@@ -1658,6 +1757,22 @@ def _render_ci_failures_section(ci_failures: list) -> str:
             lines.append(f"Run: {url}")
         if excerpt:
             lines.append(excerpt)
+        if log_excerpt:
+            lines.append("")
+            lines.append(f"Log excerpt (bounded, {log_status}):")
+            if log_truncated:
+                lines.append(
+                    "(truncated — this is a head+tail slice of the log, not "
+                    "the whole thing)"
+                )
+            lines.append(log_excerpt)
+        elif log_status != "ok":
+            # mctl-agents#423 review P2: a non-"ok" status with no excerpt
+            # means retrieval was skipped, timed out, or came back
+            # unavailable — say so instead of leaving the agent to guess why
+            # there is no log evidence for this check.
+            lines.append("")
+            lines.append(f"Log excerpt: none ({log_status}).")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -1678,6 +1793,27 @@ def _bundle_is_ci_only(bundle: dict) -> bool:
     lint/mypy failure nobody ever asked the implementer to fix.
     """
     return not (bundle.get("summaries") or []) and bool(bundle.get("ci_failures") or [])
+
+
+def _bundle_work_class(bundle: dict) -> str:
+    """`"ci-remediation"`, `"mixed"` or `"review"` — the work class
+    `implementer_envelope()` derives the execution envelope from
+    (mctl-agents#423).
+
+    Reuses `_bundle_is_ci_only`'s exact predicate for the CI-only case
+    rather than restating it, so the two can never silently diverge: a
+    bundle read the prompt one way and the envelope another would be worse
+    than either one being wrong consistently. `"review"` (plain findings, or
+    a bundle carrying neither — the pre-#411 shape and every pre-#423
+    caller) is the unconditional default: `implementer_envelope("review")`
+    always resolves to the base `IMPLEMENTER_TIMEOUT_SECONDS`, so this is
+    the "nothing changes" branch.
+    """
+    if _bundle_is_ci_only(bundle):
+        return "ci-remediation"
+    if bundle.get("ci_failures"):
+        return "mixed"
+    return "review"
 
 
 def _render_review_feedback(bundle: dict) -> str:
@@ -1758,8 +1894,31 @@ def _push_followup(
     )
 
 
-async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
-    options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
+async def _run_implementer_agent(
+    repo_dir: Path,
+    prompt: str,
+    proposal_dir: Path,
+    *,
+    envelope_s: float | None = None,
+    work_class: str = "review",
+) -> None:
+    """Run the implementer's Claude Code turn under one outer wall-clock bound.
+
+    ``envelope_s``/``work_class`` (mctl-agents#423): the caller derives both
+    from the bundle it is driving (`review_feedback_one` via
+    `_bundle_work_class` + `implementer_envelope`) and passes them through so
+    every failure message below names which budget expired, not just that
+    "N seconds expired". ``envelope_s=None`` (the default -- every plain
+    `implement_one` call, and every existing test that only passes the first
+    three positional args) resolves to `IMPLEMENTER_TIMEOUT_SECONDS` read at
+    CALL time, not at function-definition time, so monkeypatching that module
+    attribute still works exactly as it did before this parameter existed.
+    """
+    if envelope_s is None:
+        envelope_s = IMPLEMENTER_TIMEOUT_SECONDS
+    options = build_implementer_agent_options(
+        repo_dir, SERVICE_AGENT_MODEL, proposal_dir, work_class=work_class
+    )
     mcp_configured = bool(options.mcp_servers)
     # A budget bounds spend but not a stalled network/model stream. Keep one
     # proposal inside the workflow's larger deadline (incident e3649b04).
@@ -1770,8 +1929,12 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
     # that point on the work is on disk, so an outer expiry during teardown must
     # not throw it away -- see the TimeoutError handler.
     drain_completed = False
+    # Bound so mypy (and a human) can see the TimeoutError handler's
+    # `ledger.live` guard makes referencing `client` there safe even though a
+    # deadline that fires during `ClaudeSDKClient.__aenter__` never assigns it.
+    client: Any = None
     try:
-        with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
+        with anyio.fail_after(envelope_s):
             async with ClaudeSDKClient(options=options) as client:
                 if mcp_configured:
                     # fatal=False — see orchestrator/mcp_guard.py. The
@@ -1835,12 +1998,57 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
         # drain, so it exited 44 -- deterministic, charged, MAX_HARNESS_FAILURES
         # bypassed -- for a child that was demonstrably still running.
         if ledger.live:
+            # mctl-agents#423: a shielded, bounded teardown before re-raising.
+            # Without the shield, `client.disconnect()` here awaits inside the
+            # scope `fail_after` just cancelled -- the first checkpoint inside
+            # it raises immediately, the teardown is skipped, and whatever CLI
+            # child the SDK spawned outlives this process. `move_on_after`
+            # bounds the shield itself: a wedged disconnect must not turn a
+            # harness failure into a hang.
+            if client is not None:
+                with anyio.CancelScope(shield=True):
+                    with anyio.move_on_after(IMPLEMENTER_TEARDOWN_GRACE_SECONDS):
+                        # Resolved before disconnect() runs, not after: the
+                        # belt-and-suspenders check below must still have it
+                        # when the grace clamp cancels mid-`disconnect()` --
+                        # the exact case it exists for. Only reached when the
+                        # SDK exposes it -- a fake test client legitimately
+                        # does not.
+                        transport = getattr(client, "_transport", None)
+                        process = getattr(transport, "_process", None)
+                        try:
+                            await client.disconnect()
+                        except Exception as teardown_exc:  # noqa: BLE001 — best-effort teardown
+                            print(
+                                f"warn: shielded teardown disconnect failed "
+                                f"({type(teardown_exc).__name__}: {teardown_exc})"
+                            )
+                        finally:
+                            # Belt-and-suspenders: disconnect() above should
+                            # have torn down the transport's CLI child
+                            # already, but a disconnect that itself got cut
+                            # short by the grace clamp (still bounded above,
+                            # just possibly incomplete) must not leave that
+                            # child running. This has to be a `finally`, not
+                            # code after the `try` -- code after the `try`
+                            # is skipped when `move_on_after` cancels
+                            # mid-`disconnect()` (the cancellation is not an
+                            # `Exception`, so it is not caught above, and it
+                            # unwinds straight past anything that isn't a
+                            # `finally`). `process.terminate()` itself has no
+                            # `await`, so it still runs to completion here
+                            # even while the scope is cancelled.
+                            if process is not None and getattr(process, "returncode", None) is None:
+                                try:
+                                    process.terminate()
+                                except ProcessLookupError:
+                                    pass
             # The outer wall-clock bound, not the drain's own -- but the cause
             # is still a child we could not await, so it is charged to the
             # harness, not to the proposal.
             raise ImplementerOrphanedSubagent(
-                f"orphaned sub-agent: outer timeout of "
-                f"{IMPLEMENTER_TIMEOUT_SECONDS:g}s expired while awaiting "
+                f"orphaned sub-agent: outer timeout of {envelope_s:g}s "
+                f"(work class: {work_class}) expired while awaiting "
                 f"{ledger.describe()}"
             ) from exc
         if drain_completed:
@@ -1854,14 +2062,14 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
             # just spent the whole drain waiting for would go in the bin with the
             # tmp clone. Return instead and let the git check adjudicate.
             print(
-                f"warn: outer bound of {IMPLEMENTER_TIMEOUT_SECONDS:g}s expired "
-                f"after the sub-agent was awaited; proceeding on what is "
+                f"warn: outer bound of {envelope_s:g}s (work class: {work_class}) "
+                f"expired after the sub-agent was awaited; proceeding on what is "
                 f"already in the worktree"
             )
             return
         raise ImplementerOperationTimeout(
-            f"operation exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s "
-            f"(model stream, client construction, or mctl connectivity check)"
+            f"operation exceeded {envelope_s:g}s (work class: {work_class}; "
+            f"model stream, client construction, or mctl connectivity check)"
         ) from exc
 
 
@@ -1993,9 +2201,19 @@ def review_feedback_one(
                 ),
             )
 
-        # 5. Run the SDK with the bundle baked into the prompt.
+        # 5. Run the SDK with the bundle baked into the prompt. The execution
+        # envelope is derived from the work class the bundle actually carries
+        # (mctl-agents#423) -- a CI-remediation or mixed bundle gets a wider,
+        # capped envelope than the review-only default, and its own guard
+        # hook (see build_implementer_agent_options).
+        work_class = _bundle_work_class(bundle)
+        n_checks = len(bundle.get("ci_failures") or [])
+        envelope_s = implementer_envelope(work_class, n_checks=n_checks)
         prompt = _build_prompt(ref, review_feedback=bundle, branch=branch, adopted=adopted)
-        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
+        anyio.run(
+            functools.partial(_run_implementer_agent, envelope_s=envelope_s, work_class=work_class),
+            target, prompt, ref.proposal_dir.resolve(),
+        )
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
         if not _has_new_commits(target, base=old_head):
@@ -2004,11 +2222,21 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
+                if refusal.insufficient_evidence:
+                    # mctl-agents#423: the bounded CI-log evidence could not
+                    # support a code decision -- distinct from an ordinary
+                    # refusal (see EXIT_CI_EVIDENCE_INSUFFICIENT's comment).
+                    release_reason = "no follow-up: ci evidence insufficient"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=f"{CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} {refusal.reason}",
+                    )
                 release_reason = "no follow-up: refused"
                 return ImplementResult(
                     ref=ref,
                     pr_url=None,
-                    error=f"{REFUSAL_ERROR_PREFIX} {refusal}",
+                    error=f"{REFUSAL_ERROR_PREFIX} {refusal.reason}",
                 )
             release_reason = "no follow-up commits"
             return ImplementResult(
@@ -3479,11 +3707,22 @@ def main() -> None:
             # errors continue to exit 1 so the shepherd's transient-failure
             # path is unchanged.
             code = _review_feedback_exit_code(result.error)
-            if code == EXIT_DELIBERATE_NO_OP and args.refusal_out:
-                _write_refusal_out(
-                    Path(args.refusal_out),
-                    result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
-                )
+            if args.refusal_out:
+                if code == EXIT_DELIBERATE_NO_OP:
+                    _write_refusal_out(
+                        Path(args.refusal_out),
+                        result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
+                    )
+                elif code == EXIT_CI_EVIDENCE_INSUFFICIENT:
+                    # mctl-agents#423 review P2: `result.error` already carries
+                    # the agent's reason (see the insufficient_evidence branch
+                    # above), but this write used to be gated to
+                    # EXIT_DELIBERATE_NO_OP only, so it never reached
+                    # `--refusal-out` and the reason was silently dropped.
+                    _write_refusal_out(
+                        Path(args.refusal_out),
+                        result.error[len(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):].strip(),
+                    )
             sys.exit(code)
         if result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
