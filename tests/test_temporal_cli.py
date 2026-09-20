@@ -75,3 +75,16 @@ def test_status_says_nothing_when_still_running_and_not_abandoned(monkeypatch, c
 
     handle.query.assert_awaited_once()
     assert "abandoned:" not in capsys.readouterr().out
+
+
+def test_status_skips_query_when_terminated_or_failed(monkeypatch, capsys):
+    """mctl-agents#420: status must only query abandon_state on RUNNING workflows,
+    avoiding WorkflowQueryFailedError on TERMINATED or FAILED executions."""
+    connect, handle = _stub_client(desc_status_name="TERMINATED", abandoned=False)
+    monkeypatch.setattr(cli, "connect", connect)
+
+    _run(cli.status("dev-loop-mctlhq-mctl-agents-420"))
+
+    handle.query.assert_not_awaited()
+    handle.result.assert_not_awaited()
+    assert "TERMINATED" in capsys.readouterr().out

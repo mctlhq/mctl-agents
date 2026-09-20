@@ -827,6 +827,45 @@ class TestDevLoopWorkflow:
         assert result.ended == ""
         assert "mctl-agents-implement" in calls
 
+    async def test_parked_closed_issue_not_resurrected_by_late_approve(self, env):
+        """mctl-agents#420: if a poll confirms the source issue was closed,
+        a concurrent approve signal landing during that activity must NOT
+        resurrect the closed issue or proceed to implement."""
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_closed_and_signal_approve(repo: str, issue_number: int) -> IssueState:
+            info = activity.info()
+            handle = env.client.get_workflow_handle(info.workflow_id)
+            # Concurrently signal approve while returning closed state
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "late_approver"})
+            return IssueState(state="closed", state_reason="completed")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_closed_and_signal_approve)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/428"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.approve is None
+        assert result.ended == "source issue closed while parked (completed)"
+        assert "mctl-agents-implement" not in calls
+
     async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
         """The implement CWFT must only be allowed to touch proposals under
         this issue's own repo (the `service` param) — otherwise approve()
@@ -1616,6 +1655,50 @@ class TestDevLoopWorkflow:
         assert result.pr is not None
         assert result.pr.state == "OPEN"
         assert any(op.op == "release" for op in ownership_ops)
+
+    async def test_abandon_signal_before_pr_watch_terminates_cleanly(self, env):
+        """mctl-agents#420: an abandon signal delivered before _watch_pr begins
+        (while implement is running) must end the execution gracefully
+        without UnboundLocalError, without calling _watch_pr, and without leaking ownership."""
+        base_activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True,
+        )
+        old_submit = next(a for a in base_activities if getattr(a, "__name__", "") == "fake_submit_and_wait")
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait_abandon_on_implement(
+            input: SubmitAndWaitInput,
+        ) -> WorkflowResult:
+            if input.operation == "mctl-agents-implement":
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.abandon, "cleanup during implement")
+            return await old_submit(input)
+
+        activities = [a for a in base_activities if getattr(a, "__name__", "") != "fake_submit_and_wait"] + [
+            fake_submit_and_wait_abandon_on_implement
+        ]
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/427"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.ended == "abandoned: cleanup during implement"
+        assert result.pr is None
 
     async def _run_ownership_loop_with_logs(
         self, env, *, pr_states, issue: int, caplog, **kwargs

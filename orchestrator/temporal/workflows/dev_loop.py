@@ -1073,11 +1073,18 @@ class DevLoopWorkflow:
 
         # mctl-agents#420: an approve or abandon signal landing while the final
         # poll's in-flight get_issue_state activity was executing must not be
-        # silently discarded just because the deadline was crossed.
-        if approval_ended is not None and not (self._approved or self._abandoned):
-            return DevLoopResult(
-                investigate=investigate_result, implement=None, ended=approval_ended
-            )
+        # silently discarded just because the wait deadline was crossed.
+        # But if the source issue was confirmed closed on GitHub, a late
+        # approve must NOT resurrect it.
+        if approval_ended is not None:
+            if approval_ended == "approval wait expired" and (
+                self._approved or self._abandoned
+            ):
+                pass
+            else:
+                return DevLoopResult(
+                    investigate=investigate_result, implement=None, ended=approval_ended
+                )
 
         if self._abandoned:
             return DevLoopResult(
@@ -1239,6 +1246,16 @@ class DevLoopWorkflow:
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
+
+        # mctl-agents#420: an abandon signal arriving while _implement was running
+        # ends the loop immediately without entering the merge watch or deploy stages.
+        if self._abandoned:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=implement_result,
+                approve=approve_result,
+                ended=f"abandoned: {self._abandon_reason}",
+            )
 
         # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
         # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
@@ -2601,6 +2618,8 @@ class DevLoopWorkflow:
         instead of failing a loop whose implement already succeeded. Returns
         None when no PR link ever appeared within the grace polls.
         """
+        if self._abandoned:
+            return None
         deadline = workflow.now() + MERGE_WATCH_DEADLINE
         polls_without_pr = 0
         last: PRState | None = None
