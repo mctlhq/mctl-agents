@@ -1896,6 +1896,52 @@ class TestReconcileReadsGitHub:
 
         assert result.stale_directives == []
 
+    async def test_two_sibling_refs_sharing_an_issue_report_the_stale_directive_once(
+        self, env, monkeypatch
+    ):
+        """Two proposal directories resolving to the same GitHub issue (a
+        re-intake that left its old slug's directory behind) must not
+        report the same unanswered directive comment twice — once per
+        sibling ref — nor fetch that issue's comments twice (claude P3 on
+        #421, on top of the earlier agy P3 that only deduped the `gh`
+        call)."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [
+                    ("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-live"),
+                    ("mctl-web/proposals/issue-9-fix-old/.status.yaml", "sha-old"),
+                ]
+            ),
+            blobs={
+                "sha-live": "status: proposed\nupdated_at: '2026-09-19T10:00:00Z'\n",
+                "sha-old": "status: proposed\nupdated_at: '2026-09-18T10:00:00Z'\n",
+            },
+            pulls={},
+        )
+        calls = []
+
+        def _recording_read(issue_url):
+            calls.append(issue_url)
+            return [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T12:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ]
+
+        monkeypatch.setattr(discovery_mod, "read_issue_comments", _recording_read)
+
+        result = await env.run(discover_and_project, "")
+
+        assert len(calls) == 1
+        assert [d.comment_id for d in result.stale_directives] == ["c1"]
+
     async def test_stale_directive_scan_honours_the_feature_kill_switch(
         self, env, monkeypatch
     ):

@@ -235,6 +235,20 @@ def test_ambiguous_proposal_dirs_are_named_in_the_reply(monkeypatch):
     assert "mctl-directive-ack: c1" in replies[0]
 
 
+def test_a_terminal_sibling_is_not_ambiguous(monkeypatch):
+    """A merged/rejected/review-stuck proposal directory left behind by a
+    re-intake must not count toward the ambiguity check — `scan()` already
+    excludes TERMINAL_STATUSES refs from its own candidate set, and
+    `_handle_directive` must agree, or an issue with exactly one live
+    proposal gets permanently stuck replying "ambiguous" because of a dead
+    sibling directory (claude P2 on #421)."""
+    live = _ref(slug="issue-9-fix")
+    dead = _ref(slug="issue-9-fix-old", status="merged")
+    outcome, replies = _handle(_directive(), live, [live, dead], monkeypatch)
+    assert outcome != "ambiguous"
+    assert replies == [] or "more than one proposal" not in replies[0].lower()
+
+
 def test_non_overwritable_status_is_named_in_the_reply(monkeypatch):
     ref = _ref(status="accepted")
     outcome, replies = _handle(_directive(), ref, [ref], monkeypatch)
@@ -461,7 +475,16 @@ def test_persistent_marker_post_failure_still_escalates_to_give_up(monkeypatch):
     bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
     give_up_comments = [c for c in bot_comments if "mctl-directive-ack" in c["body"]]
     assert give_up_comments, "persistent marker-post failure must still escalate to give-up"
-    assert "giving up" in give_up_comments[-1]["body"].lower()
+    body = give_up_comments[-1]["body"].lower()
+    assert "giving up" in body
+    # Not `_reply_dispatch_gave_up` (claude P3 on #421): a marker-write
+    # failure is a single dispatch attempt whose *record* of failing could
+    # not be written, not `attempts` repeated dispatch failures — the two
+    # replies must stay textually distinguishable, or this test would pass
+    # unchanged if the marker-write-failure branch reverted to reusing the
+    # wrong reply.
+    assert "recording this attempt also failed" in body
+    assert "in a row" not in body
 
 
 def test_bot_identity_mismatch_raises_and_does_not_dispatch(monkeypatch):
@@ -900,3 +923,44 @@ def test_a_persistent_ack_post_failure_after_successful_dispatch_is_reported_not
     assert result.dispatched == 0
     assert result.failed == 1
     assert comment_calls["n"] == run_issue_directive_poller.MARKER_POST_ATTEMPTS
+
+
+def test_a_persistent_ack_post_failure_after_an_ambiguous_outcome_is_reported_not_silent(monkeypatch):
+    """Mirrors `test_a_persistent_ack_post_failure_after_successful_dispatch_is_reported_not_silent`
+    for the ambiguous-outcome branch: if the ack write for a
+    DispatchOutcomeAmbiguous fails on every in-process retry, the comment
+    must stay unacked (so an operator notices) but the tick must still
+    report it as a counted failure, not swallow the exception (claude P3 on
+    #421 — this branch previously had no dedicated test)."""
+    monkeypatch.setattr(run_issue_directive_poller.time, "sleep", lambda _s: None)
+
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    comment_calls = {"n": 0}
+
+    def flaky_run(cmd):
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            comment_calls["n"] += 1
+            raise subprocess.CalledProcessError(1, cmd, stderr="persistent outage")
+        return gh.run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    async def ambiguous_submit(*_args, **_kwargs):
+        raise DispatchOutcomeAmbiguous("mctl-api may already have started the workflow")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", ambiguous_submit)
+
+    result = _run_scan(max_directives=10)
+
+    assert result.dispatched == 0
+    assert result.failed == 1
+    assert comment_calls["n"] == run_issue_directive_poller.MARKER_POST_ATTEMPTS
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    assert not any("mctl-directive-ack" in c["body"] for c in bot_comments), (
+        "the ambiguous ack must not appear as posted when every write attempt failed"
+    )

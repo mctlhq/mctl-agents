@@ -271,42 +271,51 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
 
     stale: list[StaleDirective] = []
     # Several refs can resolve to the same issue_url (e.g. a re-published
-    # proposal keeping its old slug's sibling around) — cache each issue's
-    # comments so a shared issue_url costs one `gh issue view` call, not one
-    # per ref, mirroring `run_issue_directive_poller.scan`'s own
-    # `seen_issue_urls` dedup for the identical call (agy P3 on #421).
-    comments_by_issue_url: dict[str, list | None] = {}
+    # proposal keeping its old slug's sibling around) — group them so both
+    # the `gh issue view` call AND the staleness verdict happen once per
+    # issue, not once per sibling ref. Deduping only the `gh` call (an
+    # earlier round of this fix) still let the same unanswered directive
+    # comment surface as a separate `StaleDirective` for every sibling ref
+    # sharing the issue (claude P3 on #421).
+    refs_by_issue_url: dict[str, list[ProposalStateRef]] = {}
     for ref in refs:
         issue_url = issue_url_for(ref.service, ref.slug)
         if issue_url is None:
             continue
-        if issue_url not in comments_by_issue_url:
-            try:
-                comments_by_issue_url[issue_url] = await asyncio.to_thread(read_issue_comments, issue_url)
-            except Exception as exc:  # noqa: BLE001 — one issue's comments must not blind the sweep to the rest
-                activity.logger.warning(
-                    "reconcile: could not read comments for %s (%s); skipping "
-                    "directive-staleness check for this proposal",
-                    issue_url,
-                    exc,
-                )
-                comments_by_issue_url[issue_url] = None
-        comments = comments_by_issue_url[issue_url]
-        if comments is None:
+        refs_by_issue_url.setdefault(issue_url, []).append(ref)
+
+    for issue_url, issue_refs in refs_by_issue_url.items():
+        try:
+            comments = await asyncio.to_thread(read_issue_comments, issue_url)
+        except Exception as exc:  # noqa: BLE001 — one issue's comments must not blind the sweep to the rest
+            activity.logger.warning(
+                "reconcile: could not read comments for %s (%s); skipping "
+                "directive-staleness check for this proposal",
+                issue_url,
+                exc,
+            )
             continue
 
         acked = acked_comment_ids(comments)
+        # Compare against whichever sibling ref was updated most recently:
+        # the one least likely to falsely call a directive stale when the
+        # ref that actually incorporated it is a different sibling than the
+        # one iteration happened to reach first.
+        representative = max(
+            issue_refs,
+            key=lambda r: _parse_timestamp(r.updated_at) or datetime.min.replace(tzinfo=UTC),
+        )
         for directive in parse_comments(comments):
             if not directive.comment_id or directive.comment_id in acked:
                 continue
-            ref_updated_at = _parse_timestamp(ref.updated_at)
+            ref_updated_at = _parse_timestamp(representative.updated_at)
             directive_created_at = _parse_timestamp(directive.created_at)
             if ref_updated_at and directive_created_at and directive_created_at <= ref_updated_at:
                 continue
             stale.append(
                 StaleDirective(
-                    service=ref.service,
-                    slug=ref.slug,
+                    service=representative.service,
+                    slug=representative.slug,
                     issue_url=issue_url,
                     comment_id=directive.comment_id,
                     author=directive.author,

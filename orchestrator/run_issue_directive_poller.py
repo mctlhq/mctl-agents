@@ -468,7 +468,19 @@ async def _handle_directive(
         outcome, body = "unrecognised", _reply_unrecognised(directive.author, directive.comment_id)
     else:
         number = _issue_number(ref.slug)
-        matches = [r for r in all_refs if r.service == ref.service and _issue_number(r.slug) == number]
+        # `scan()` already excludes TERMINAL_STATUSES refs from `candidates`
+        # before this is called, but `all_refs` here is unfiltered — without
+        # the same filter, a merged/rejected/review-stuck sibling directory
+        # left behind by a re-intake (e.g. a retitled issue re-proposed under
+        # a new slug) permanently counts toward `len(matches) > 1`, so every
+        # directive on that issue gets stuck replying "ambiguous" forever,
+        # even though exactly one proposal is actually live (claude P2 on
+        # #421).
+        matches = [
+            r
+            for r in all_refs
+            if r.service == ref.service and _issue_number(r.slug) == number and r.status not in TERMINAL_STATUSES
+        ]
         if not matches:
             outcome, body = "no-proposal", _reply_no_proposal(directive.author, directive.comment_id)
         elif len(matches) > 1:
