@@ -170,6 +170,102 @@ There is no unfiltered `--force` mode or automatic second-account retry.
 An operator retries by reviewing the failure and moving that one proposal
 from `needs-triage` back to `accepted`.
 
+`accepted` is swept, not just processed on request: Temporal's
+`implement-sweep-mctl-agents-schedule` (every 15 min, mctl-agents#412) reads
+every proposal's committed status from gitops `main`, and submits
+`mctl-agents-implement` for any `accepted` proposal that carries no `pr:`,
+no unexpired `attempt` lease, no `blocked`/`approval-missing` marker, that
+carries explicit execution authorization, whose `updated_at` is older than
+the stranding grace period (`IMPLEMENT_SWEEP_GRACE_MINUTES`, default 20),
+and whose derived DevLoopWorkflow id is not in the currently-running set.
+
+Execution authorization is a separate, fail-closed question from the
+write-time `control.requires_human_approval` check, and is deliberately not
+layered on it: an absent `control` block correctly means "this record never
+asked for approval" to a writer checking its own write, but it must never
+mean "approval not required" to something submitting execution on a record
+nobody is watching. Only a verified, non-anonymous `approval.approved_by`
+authorizes a sweep submit today (`proposal_state.execution_authorization`);
+a separately-defined explicit autonomy policy is the reserved second path
+and no policy is defined yet. Provenance of who WROTE a record is not
+authorization — a writer allowlist was tried and rejected by the 2026-09-19
+product decision on mctl-agents#412, and `ProposalStateRef` no longer
+carries `updated_by` at all so one cannot be rebuilt. Unauthorized
+proposals are quarantined from execution with their specs untouched and
+reported on `ImplementSweepResult.unauthorized` for human triage, under two
+distinct reasons: `legacy auto-accepted / unreviewed` (never approved — the
+69 `incident-*` records that have sat in `accepted` since August) and
+`approved with no recorded approver identity` (a real approval whose path
+recorded no approver, fixed by re-approving rather than by triage).
+
+**Operational consequence, measured rather than asserted:** a survey of the
+379 `.status.yaml` records on `mctl-gitops` `main` (2026-09-20) found 71
+proposals in `accepted`. Of those, 69 carry no `approval` block at all — the
+`incident-*` records that have sat in `accepted` since August — and 2 carry a
+named approver (`mashkovd`, on `mctl-telegram/issue-591` and
+`mctl-agents/issue-418`). So the gate quarantines 69 of 71 and lets 2 through;
+it is a near-total but not total stop on the existing backlog.
+
+The anonymous-approver reason is therefore latent rather than observed today:
+no current record carries `approved_by: unknown`. It is still reachable,
+because `dev_loop` submits the approve CWFT with
+`"approver": self._approver or "unknown"` and a payload-less approve signal
+lands that same value (mctl-gitops#1206) — so it is reported separately, with
+re-approval rather than triage as its remedy. Either way nothing is executed
+until an approve path records who approved it; every unauthorized candidate is
+reported on `ImplementSweepResult.unauthorized` rather than submitted.
+
+The not-in-the-active-DevLoop-set check is what makes the sweep safe beside a
+live DevLoop: `mctl_trigger_approve` and the incident responder's direct
+`status: accepted` write both flip a proposal to `accepted` with no owner, and
+before this the sweep that used to promote it (an Argo cron) had been suspended
+since the Temporal migration — so those proposals sat untouched until a human
+ran `mctl_trigger_implementer` by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS`
+(default 5) proposals are submitted per tick, scoped to `{service, slug}` on
+the same admission queue DevLoopWorkflow's own implement step uses. Every
+candidate that survives the scan is logged as
+`STRANDED service=... slug=... reason=...`, whether it is submitted, over the
+per-tick cap, already being swept, over its pre-start retry budget, or of
+unknown budget; proposals the scan itself filtered out are reported in
+`StrandedScanResult.skipped` instead, and the quarantined ones additionally
+on `.unauthorized`.
+
+Two failure scopes, deliberately different. An unknown active-DevLoop set, a
+failed stranding scan or a FAILED budget query each skip the WHOLE tick with a
+`skipped_reason`, because none of them can be attributed to one candidate. A
+budget the activity declined to read for ONE id — its workflow id falls outside
+`[A-Za-z0-9._-]`, so it was refused a visibility query and omitted from the
+result rather than returned as zero — skips only THAT candidate, and is
+reported on `ImplementSweepResult.unknown_budget`. It is kept apart from
+`over_budget` because the remedies differ: an exhausted budget clears when the
+Temporal retention window rolls, while a malformed slug fails every tick
+forever and needs the slug fixed. The budget query itself is chunked at 100
+ids, so an unbounded candidate list cannot get the whole filter rejected on a
+path that fails closed, and only each id's 12 most recent runs are read. That
+last bound is the one that matters operationally: the failure classes the
+budget deliberately does not charge touch no `.status.yaml` field, so during an
+outage the candidate is re-derived and a new Failed execution minted every
+tick — roughly 480 uncounted executions a day, each re-read on every later
+tick. Unbounded work to compute a bounded control value wedges itself one way:
+once the cost crosses the activity's timeout the tick fails closed, and the
+next tick's input is strictly larger. The count is therefore "pre-start losses
+among the last 12 runs", which is all the caller's
+`>= MAX_SWEEP_PRESTART_ATTEMPTS` comparison can use anyway — a tolerance of
+exactly 9 interleaved uncounted runs, not a guarantee. Bounding the per-run
+fetches is not on its own enough: rows come back interleaved by recency, so the
+listing is also stopped once every id in a chunk is capped, and unconditionally
+at a per-chunk ceiling scaled to the chunk's actual size, and every listed row
+heartbeats — including the listing phase itself, so a healthy tick that lists
+nothing does not silently inherit the heartbeat deadline in place of the
+five-minute one. When that ceiling fires, an id whose Failed executions all
+sat beyond the rows walked reads back as `0` rather than being omitted — the
+one deliberate exception to "an absent count is not a zero count" above,
+because omitting here would be starvation: the listing is most-recent-first
+over a stably rebuilt candidate list, so an omitted id would never be counted
+on any later tick either. Reporting `0` costs one extra submit instead, which
+mints the newest row in the chunk and self-corrects the count within a few
+ticks.
+
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated
 as a plain skip: `mctl-agents-approve` only performs the `proposed ->
@@ -273,8 +369,14 @@ from GitHub before the decision loop. Reconcile mode additionally repairs
 `accepted`, `error`, `review-stuck`, `needs-triage`, and terminal drift without
 reviewing, fixing, or merging a PR.
 
+The merge gate is the UNION of two independent blocker sources
+(mctlhq/mctl-agents#411): semantic review findings from the gating bots, and
+failing REQUIRED checks on the PR's current head, read by
+`orchestrator/ci_checks.py::read_required_checks`. A clean review no longer
+merges a PR whose required `lint`/typecheck/test check is red.
+
 ```python
-def decide(pr, codex_review, *, fix_only=False):
+def decide(pr, codex_review, *, fix_only=False, ci=None):
     if pr.merged:
         return "flip-to-merged", pr.merge_commit
     if pr.closed_unmerged:
@@ -282,8 +384,15 @@ def decide(pr, codex_review, *, fix_only=False):
     if pr.is_draft or not codex_review.has_responded:
         return "wait", None
     findings = codex_review.findings_p1_p2(at=pr.head_sha)
-    if findings:
-        return "address-review", findings
+    checks = ci.actionable if (ci and ci.known) else []
+    if findings or checks:
+        return "address-review", Blockers(findings, checks)
+    if ci and ci.known and ci.infrastructure:
+        return "ci-infra", list(ci.infrastructure)
+    if ci and not ci.known:
+        return "ci-unknown", None
+    if ci and ci.known and ci.pending:
+        return "wait", None
     if pr.merge_state_status not in {"CLEAN", "HAS_HOOKS", "UNSTABLE"}:
         return "wait", None
     if not pr.checks_green:
@@ -293,27 +402,41 @@ def decide(pr, codex_review, *, fix_only=False):
 
 Decisions:
 
-- **wait** — codex still reviewing, draft PR, CI not green, or merge
-  state blocked. Leave `.status.yaml` alone; next tick re-evaluates.
+- **wait** — codex still reviewing, draft PR, a required check still
+  QUEUED/IN_PROGRESS, or merge state blocked. Leave `.status.yaml`
+  alone; next tick re-evaluates.
 - **address-review** — codex left P1/P2 findings on the current head
-  SHA. Build a JSON bundle of the findings via the shepherd
-  sub-agent (`agents/_shepherd/shepherd.md`), persist it to a temp
-  file, and fork `run_implementer.py --review-feedback <path>` so it
-  pushes a follow-up commit on the existing branch. Unchanged by
-  fix-only mode — this is the stage the shepherd keeps for
-  steward-owned repos.
-- **merge** — codex clean, CI green, merge state mergeable, and the
-  service is not fix-only or in `NEVER_MERGE_SERVICES`. Calls
+  SHA, and/or a required check failed on it in a way classified as
+  actionable (see below). Build a JSON bundle via the shepherd
+  sub-agent (`agents/_shepherd/shepherd.md`) for the findings, append
+  the CI blocker records deterministically (never through the SDK),
+  persist the bundle to a temp file, and fork
+  `run_implementer.py --review-feedback <path>` so it pushes a
+  follow-up commit on the existing branch. Unchanged by fix-only mode
+  — this is the stage the shepherd keeps for steward-owned repos.
+- **ci-infra** — the only current-head blockers are required checks
+  classified as non-actionable infrastructure failures (cancelled,
+  timed out, runner lost, ...). Re-runs the failing workflow run(s) via
+  `gh run rerun --failed`, bounded per head SHA by
+  `SHEPHERD_CI_INFRA_RERUN_MAX` (default 2). Never charges
+  `review_attempts` — the proposal is blameless.
+- **ci-unknown** — the required-check probe failed (API error,
+  malformed response, a truncated contexts page). Fails closed: no
+  merge/defer-merge this tick. Tracked on `ci_probe_failures`, cleared
+  by any successful probe.
+- **merge** — codex clean, no required check failing, merge state
+  mergeable, and the service is not fix-only or in
+  `NEVER_MERGE_SERVICES`. Calls
   `gh pr merge --merge --delete-branch --match-head-commit <SHA>` so
   a push that lands between review and merge cannot smuggle
   unreviewed code through. On HEAD-SHA mismatch we fall back to
   `wait` and the next tick re-evaluates.
-- **defer-merge** — codex clean, CI green, merge state mergeable, but
-  the service is in fix-only mode: merge is owned by another PR
-  lifecycle. Records `merge_owner: pr-steward` in `.status.yaml`
-  (via the change-only writer, so repeated ticks produce no new
-  gitops commit) and leaves `status` untouched. `merge_pr()` is never
-  called.
+- **defer-merge** — codex clean, no required check failing, merge
+  state mergeable, but the service is in fix-only mode: merge is
+  owned by another PR lifecycle. Records `merge_owner: pr-steward` in
+  `.status.yaml` (via the change-only writer, so repeated ticks
+  produce no new gitops commit) and leaves `status` untouched.
+  `merge_pr()` is never called.
 - **flip-to-merged** — human (or the steward) merged the PR out of
   band. Record `merge_commit` and flip the proposal to terminal
   `merged`; clears `merge_owner` if it was set.
@@ -321,12 +444,32 @@ Decisions:
   terminal `rejected` with the close comment in `notes:`; clears
   `merge_owner` if it was set.
 
+**Required-check classification.** `SKIPPED` and `NEUTRAL` are not
+blockers at all — GitHub does not gate required-check mergeability on
+either, so they are discarded before classification and never reach the
+remediation loop (this repo emits skipped required checks routinely). Each
+*remaining* failing required check is classified `actionable` or
+`infrastructure`: `CANCELLED`, `TIMED_OUT`, `STALE`, `ACTION_REQUIRED` and a
+startup failure are always infrastructure; a genuine `FAILURE` with file/line-anchored
+annotations (exactly what `mypy`/`ruff` produce) is actionable; a `FAILURE`
+with no annotations is infrastructure only if the failure text matches a
+known infra signature (runner lost, rate limited, out of disk, ...) —
+otherwise it defaults to actionable, because handing the implementer a real
+defect it cannot fix costs one of five attempts, while silently filing a
+real defect as infrastructure restores the exact silent wedge (#409) this
+mechanism exists to remove. A required check that is failing but NOT
+required to pass (advisory) never enters the blocker set. Staleness is
+enforced at the source: only check/status contexts observed on `pr.head_sha`
+itself are ever read.
+
 **Review-attempt cap.** The outer loop tracks `review_attempts:` in
-`.status.yaml`. After five consecutive `address-review` ticks
-without resolving the findings, the next tick flips the proposal to
-`status: review-stuck` (terminal) instead of forking the
-implementer again. The pure `decide()` function does not see the
-counter — it stays trivially testable with hand-built fixtures.
+`.status.yaml`. After five consecutive `address-review` ticks without
+resolving the current-head blocker set — review findings, failing
+required checks, or both — the next tick flips the proposal to
+`status: review-stuck` (terminal) instead of forking the implementer
+again; the note enumerates what is still unresolved, by reviewer and by
+check name. The pure `decide()` function does not see the counter — it
+stays trivially testable with hand-built fixtures.
 
 **Bot signals.**
 

@@ -208,6 +208,7 @@ releases_seen:
   mctlhq/mctl-portal: 4.15.0
   mctlhq/mctl-telegram: 0.59.0
 schedules:
+  ImplementSweepWorkflow: 15 min
   IncidentLoopWorkflow: 1 h
   IssuePollWorkflow: 15 min
   ReconcileWorkflow: 15 min
@@ -233,6 +234,8 @@ shepherd:
   - review-fixing
 workflows:
 - DevLoopWorkflow
+- ImplementSweepWorkflow
 - IncidentLoopWorkflow
 - IssuePollWorkflow
 - ReconcileWorkflow
+- SweptImplementWorkflow
