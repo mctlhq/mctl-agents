@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.50.0](https://github.com/mctlhq/mctl-agents/compare/1.49.0...1.50.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-412-an-approval-outside-a-live-devloopworkfl ([9314f7d](https://github.com/mctlhq/mctl-agents/commit/9314f7dd12c7ef0af31d2138f07d9333d49618c3))
+
+
+### Bug Fixes
+
+* **agents:** await the started child and stop documenting the rejected design ([5a1a859](https://github.com/mctlhq/mctl-agents/commit/5a1a8591c68593428dd6a10bd2ebad33216962e1))
+* **agents:** bound the pre-start budget read to each id's recent runs ([a820c10](https://github.com/mctlhq/mctl-agents/commit/a820c10b80608e0282163f9d935b0ad0daac9d78))
+* **agents:** bound the traversal too, not only the per-run fetches ([66fd212](https://github.com/mctlhq/mctl-agents/commit/66fd21263827f243d6ef72657d59c23c9c6796e5))
+* **agents:** close the last two unawaited children and drop a field nothing writes ([8297c3d](https://github.com/mctlhq/mctl-agents/commit/8297c3dd3d152a4672e065c674293b9f707bee8d))
+* **agents:** delete the unreachable old budget query and split unknown from exhausted ([d1aae8f](https://github.com/mctlhq/mctl-agents/commit/d1aae8fe5d6f0954d6013751dba1ed40203f886e))
+* **agents:** make the ceiling test actually reach the ceiling, and stop overclaiming why an id is unaccounted ([61652e8](https://github.com/mctlhq/mctl-agents/commit/61652e8ecff92ea6f819ac8f4432a1dbba9e1259))
+* **agents:** scale the traversal ceiling to the chunk and settle the third omission case ([17a2cea](https://github.com/mctlhq/mctl-agents/commit/17a2cead5a0fb40cdf4bec715fc50545ea71dbf1))
+
 ## [1.49.0](https://github.com/mctlhq/mctl-agents/compare/1.48.0...1.49.0) (2026-09-19)
 
 
