@@ -410,6 +410,227 @@ def test_the_other_two_drain_timeouts_default_to_five_minutes():
     assert options.ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS == 300.0
 
 
+# ---------------------------------------------------------------------------
+# Work-class-derived execution envelope (mctl-agents#423) — T3
+# ---------------------------------------------------------------------------
+def test_implementer_envelope_review_class_is_the_base_unconditionally():
+    assert options.implementer_envelope("review") == options.IMPLEMENTER_TIMEOUT_SECONDS
+    assert options.implementer_envelope("review", n_checks=99) == options.IMPLEMENTER_TIMEOUT_SECONDS
+    assert options.implementer_envelope("something-else") == options.IMPLEMENTER_TIMEOUT_SECONDS
+
+
+def test_implementer_envelope_ci_class_widens_per_check_and_caps_at_the_ceiling(monkeypatch):
+    monkeypatch.setattr(options, "IMPLEMENTER_TIMEOUT_SECONDS", 900.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_CI_ANALYSIS_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", 1800.0)
+
+    assert options.implementer_envelope("ci-remediation", n_checks=0) == 900.0
+    assert options.implementer_envelope("ci-remediation", n_checks=1) == 1020.0
+    assert options.implementer_envelope("ci-remediation", n_checks=3) == 1260.0
+    assert options.implementer_envelope("mixed", n_checks=3) == 1260.0
+
+    # A per-check analysis budget large enough to exceed the ceiling even at
+    # the (CI_LOG_MAX_CHECKS-capped) check count: capped, not extrapolated.
+    monkeypatch.setattr(options, "IMPLEMENTER_CI_ANALYSIS_SECONDS", 1000.0)
+    assert options.implementer_envelope("ci-remediation", n_checks=3) == 1800.0
+
+
+def test_implementer_envelope_caps_n_checks_at_ci_log_max_checks(monkeypatch):
+    """A bundle claiming more checks than fetch_failure_logs() would ever
+    retrieve must not widen the envelope past what CI_LOG_MAX_CHECKS funds."""
+    monkeypatch.setattr(options, "IMPLEMENTER_TIMEOUT_SECONDS", 900.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_CI_ANALYSIS_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", 100000.0)
+
+    at_cap = options.implementer_envelope("ci-remediation", n_checks=options.CI_LOG_MAX_CHECKS)
+    beyond_cap = options.implementer_envelope("ci-remediation", n_checks=options.CI_LOG_MAX_CHECKS + 50)
+    assert at_cap == beyond_cap
+
+
+@pytest.mark.parametrize("name", (
+    "IMPLEMENTER_CI_ANALYSIS_SECONDS",
+    "IMPLEMENTER_TIMEOUT_CEILING_SECONDS",
+    "IMPLEMENTER_MUTATION_RESERVE_SECONDS",
+    "IMPLEMENTER_TEARDOWN_GRACE_SECONDS",
+))
+def test_new_budget_knobs_clamp_hostile_env_values(monkeypatch, capsys, name):
+    """Same `_positive_seconds` contract as the pre-existing drain knobs."""
+    import importlib
+
+    defaults = {
+        "IMPLEMENTER_CI_ANALYSIS_SECONDS": 120.0,
+        "IMPLEMENTER_TIMEOUT_CEILING_SECONDS": 1800.0,
+        "IMPLEMENTER_MUTATION_RESERVE_SECONDS": 180.0,
+        "IMPLEMENTER_TEARDOWN_GRACE_SECONDS": 15.0,
+    }
+    for bad in ("0", "-5", "not-a-number", "nan", "inf", "-inf"):
+        monkeypatch.setenv(name, bad)
+        reloaded = importlib.reload(options)
+        try:
+            assert getattr(reloaded, name) == defaults[name], bad
+            assert name in capsys.readouterr().err
+        finally:
+            monkeypatch.delenv(name, raising=False)
+            importlib.reload(options)
+
+
+def test_new_budget_knobs_honour_their_env_override(monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("IMPLEMENTER_CI_ANALYSIS_SECONDS", "42")
+    monkeypatch.setenv("IMPLEMENTER_TIMEOUT_CEILING_SECONDS", "4200")
+    monkeypatch.setenv("IMPLEMENTER_MUTATION_RESERVE_SECONDS", "99")
+    monkeypatch.setenv("IMPLEMENTER_TEARDOWN_GRACE_SECONDS", "7")
+    reloaded = importlib.reload(options)
+    try:
+        assert reloaded.IMPLEMENTER_CI_ANALYSIS_SECONDS == 42.0
+        assert reloaded.IMPLEMENTER_TIMEOUT_CEILING_SECONDS == 4200.0
+        assert reloaded.IMPLEMENTER_MUTATION_RESERVE_SECONDS == 99.0
+        assert reloaded.IMPLEMENTER_TEARDOWN_GRACE_SECONDS == 7.0
+    finally:
+        for name in (
+            "IMPLEMENTER_CI_ANALYSIS_SECONDS", "IMPLEMENTER_TIMEOUT_CEILING_SECONDS",
+            "IMPLEMENTER_MUTATION_RESERVE_SECONDS", "IMPLEMENTER_TEARDOWN_GRACE_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        importlib.reload(options)
+
+
+# ---------------------------------------------------------------------------
+# Budget-contract invariant (mctl-agents#423) — T8
+# ---------------------------------------------------------------------------
+def test_validate_budget_contract_holds_for_every_work_class_at_defaults():
+    """With the shipped defaults, no work class needs clamping at all."""
+    required = 2 * options.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS + options.IMPLEMENTER_MUTATION_RESERVE_SECONDS
+    for work_class in ("review", "ci-remediation", "mixed"):
+        envelope = options.implementer_envelope(work_class, n_checks=options.CI_LOG_MAX_CHECKS)
+        assert envelope >= required, work_class
+
+
+def test_validate_budget_contract_clamps_the_drain_when_the_envelope_is_too_tight(monkeypatch, capsys):
+    """A pathologically small ceiling must clamp the drain sub-budget rather
+    than silently leaving no mutation reserve."""
+    monkeypatch.setattr(options, "IMPLEMENTER_TIMEOUT_SECONDS", 10.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", 10.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_CI_ANALYSIS_SECONDS", 0.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MUTATION_RESERVE_SECONDS", 2.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_DRAIN_TIMEOUT_SECONDS", 300.0)
+
+    options.validate_budget_contract()
+
+    # envelope (10) < 2*300+2 -> clamp: (10 - 2) / 2 = 4.0
+    assert options.IMPLEMENTER_DRAIN_TIMEOUT_SECONDS == 4.0
+    assert "clamping IMPLEMENTER_DRAIN_TIMEOUT_SECONDS" in capsys.readouterr().err
+
+
+def test_review_claim_lease_covers_the_widest_possible_envelope(monkeypatch):
+    """T8's second half: the lease must never be outlived by the widest
+    envelope any work class could select, plus clone/push time."""
+    from orchestrator import run_implementer
+
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", 1800.0)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+
+    lease = run_implementer._review_claim_lease_default()
+    widest = options.implementer_envelope("ci-remediation", n_checks=options.CI_LOG_MAX_CHECKS)
+    assert lease.total_seconds() >= widest + 2 * run_implementer.IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# CI-log guard hook (mctl-agents#423) — T6 / T7 (containment)
+# ---------------------------------------------------------------------------
+def test_ci_log_guard_hook_denies_gh_run_view_log_failed():
+    import anyio
+
+    result = anyio.run(
+        options._ci_log_guard_hook,
+        {"tool_name": "Bash", "tool_input": {"command": "gh run view 123 --log-failed"}},
+        None,
+        None,
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "bounded" in result["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_ci_log_guard_hook_denies_gh_api_logs_route():
+    import anyio
+
+    result = anyio.run(
+        options._ci_log_guard_hook,
+        {"tool_name": "Bash", "tool_input": {"command": "gh api repos/o/r/actions/jobs/1/logs"}},
+        None, None,
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_ci_log_guard_hook_denies_curl_and_wget_of_a_logs_url():
+    import anyio
+
+    for cmd in (
+        "curl -sL https://example.com/actions/runs/1/logs -o out.txt",
+        "wget https://example.com/actions/runs/1/logs",
+    ):
+        result = anyio.run(
+            options._ci_log_guard_hook,
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            None, None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+
+
+def test_ci_log_guard_hook_allows_ordinary_commands():
+    import anyio
+
+    for cmd in ("pytest -q", "npm test", "git status", "gh pr view 1", "gh run view 123"):
+        result = anyio.run(
+            options._ci_log_guard_hook,
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            None, None,
+        )
+        assert result == {}, cmd
+
+
+def test_ci_log_guard_hook_ignores_non_bash_tools():
+    import anyio
+
+    result = anyio.run(
+        options._ci_log_guard_hook,
+        {"tool_name": "Read", "tool_input": {"file_path": "x"}},
+        None, None,
+    )
+    assert result == {}
+
+
+def test_build_implementer_agent_options_installs_the_guard_hook_for_ci_classes(tmp_path):
+    for work_class in ("ci-remediation", "mixed"):
+        built = options.build_implementer_agent_options(tmp_path, "test-model", work_class=work_class)
+        matchers = (built.hooks or {}).get("PreToolUse") or []
+        callbacks = [h for m in matchers for h in m.hooks]
+        assert options._ci_log_guard_hook in callbacks, work_class
+        # Composed WITH, not instead of, the audit hook.
+        assert options._audit_pre_tool_use in callbacks, work_class
+
+
+def test_build_implementer_agent_options_omits_the_guard_hook_for_review(tmp_path):
+    built = options.build_implementer_agent_options(tmp_path, "test-model", work_class="review")
+    matchers = (built.hooks or {}).get("PreToolUse") or []
+    callbacks = [h for m in matchers for h in m.hooks]
+    assert options._ci_log_guard_hook not in callbacks
+    assert options._audit_pre_tool_use in callbacks
+    # Default work_class (no kwarg at all) matches "review" — every pre-#423 caller.
+    default_built = options.build_implementer_agent_options(tmp_path, "test-model")
+    default_callbacks = [h for m in ((default_built.hooks or {}).get("PreToolUse") or []) for h in m.hooks]
+    assert options._ci_log_guard_hook not in default_callbacks
+
+
+def test_ci_builder_still_keeps_hooks_truthy_for_the_366_drain(tmp_path):
+    """The guard hook must be composed WITH _command_audit_hooks(), never
+    replace it — subagent_wait.drain_until_settled's precondition is that
+    `hooks` stays truthy on every drainable driver."""
+    built = options.build_implementer_agent_options(tmp_path, "test-model", work_class="ci-remediation")
+    assert built.hooks
+
+
 @pytest.mark.parametrize("name", _DRAIN_TIMEOUT_ENV_VARS)
 def test_every_drain_timeout_honours_its_env_override(monkeypatch, name):
     """Pins the env-var NAME, which the driver tests cannot.

@@ -99,7 +99,7 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator.ci_checks import CheckBlocker, CIStatus, read_required_checks
+from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout, shadow
 from orchestrator.lifecycle.claim import ClaimClient
@@ -667,6 +667,11 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
       reproduces it, so these consume a ``MAX_REVIEW_ATTEMPTS`` slot.
     - harness: our own plumbing lost the work before the agent could finish
       (mctl-agents#366). The proposal is blameless — never charge it an attempt.
+      ``EXIT_CI_EVIDENCE_INSUFFICIENT`` (mctl-agents#423) joins this set: the
+      agent did run, but the bounded log evidence it was handed could not
+      support a code decision — a platform-supplied-evidence gap, not a
+      proposal defect, so it is blameless the same way an orphaned sub-agent
+      is, bounded by the same ``MAX_HARNESS_FAILURES``.
     """
     from orchestrator import run_implementer  # deferred — see apply_followup
 
@@ -675,7 +680,10 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
         run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
         run_implementer.EXIT_OPERATION_TIMEOUT,
     })
-    harness = frozenset({run_implementer.EXIT_ORPHANED_SUBAGENT})
+    harness = frozenset({
+        run_implementer.EXIT_ORPHANED_SUBAGENT,
+        run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
+    })
     return deterministic, harness
 
 
@@ -2222,6 +2230,13 @@ def _augment_bundle_with_ci(bundle: dict, checks: list[CheckBlocker]) -> dict:
     tag-neutralised the same way review-finding text is before it reaches
     any prompt: check output is attacker-influenceable on a fork PR the
     same way a review comment body is.
+
+    mctl-agents#423: also emits the bounded CI-log evidence
+    (`fetch_failure_logs()` has already run on `checks` by the time this is
+    called — see `apply_followup`) plus top-level `work_class` and
+    `budget_report`, both consumed by `run_implementer` to derive its
+    execution envelope and to log a one-line operator-facing attribution for
+    a future timeout.
     """
     if not checks:
         return bundle
@@ -2238,9 +2253,19 @@ def _augment_bundle_with_ci(bundle: dict, checks: list[CheckBlocker]) -> dict:
             "run_id": c.run_id,
             "head_sha": c.head_sha,
             "excerpt": _neutralize_findings_tags(c.excerpt),
+            "log_excerpt": _neutralize_findings_tags(c.log_excerpt),
+            "log_status": c.log_status,
+            "log_truncated": c.log_truncated,
         }
         for c in checks
     ]
+    bundle["work_class"] = "mixed" if (bundle.get("summaries") or []) else "ci-remediation"
+    bundle["budget_report"] = {
+        "n_checks": len(checks),
+        "log_statuses": [c.log_status for c in checks],
+        "log_bytes_total": sum(c.log_bytes for c in checks),
+        "log_excerpt_chars_total": sum(len(c.log_excerpt) for c in checks),
+    }
     return bundle
 
 
@@ -2251,6 +2276,7 @@ def apply_followup(
     skip_subprocess: bool = False,
     state_dir: Path | None = None,
     adopted_pr: str | None = None,
+    repo: str | None = None,
 ) -> dict:
     """Bundle findings + CI blockers, invoke the Tier 2 implementer with
     --review-feedback.
@@ -2280,6 +2306,14 @@ def apply_followup(
     unchanged for that path: the bundle, the ``--refusal-out`` temp file,
     the ``--state-dir`` forwarding and the exit-code classification below
     all apply identically.
+
+    ``repo`` (mctl-agents#423) is the ``owner/name`` string CI-log retrieval
+    fetches against — ``process_one`` passes ``pr.repo`` (the actual repo the
+    PR lives in, which differs from the deterministic ``mctlhq/<service>``
+    guess for an adopted PR). Falls back to ``mctlhq/{service}`` when unset
+    (every existing direct caller, including the many tests that construct a
+    bare ``list[CodexFinding]`` and therefore never reach the CI branch at
+    all).
     """
     if isinstance(blockers, Blockers):
         findings = blockers.findings
@@ -2287,6 +2321,14 @@ def apply_followup(
     else:
         findings = list(blockers)
         checks = []
+
+    if checks:
+        # Bounded, best-effort log retrieval — in THIS process, before the
+        # implementer subprocess below is forked, so the cost is paid
+        # outside the execution envelope it used to threaten (mctl-agents#423).
+        # Never raises (see fetch_failure_logs' docstring); a review-only
+        # bundle (checks == []) never reaches this line at all.
+        checks = list(fetch_failure_logs(repo or f"mctlhq/{service}", tuple(checks)))
 
     if findings:
         bundle = anyio.run(_format_bundle_via_sdk, findings)
@@ -2833,6 +2875,7 @@ def process_one(
                 skip_subprocess=skip_subprocess,
                 state_dir=state_dir,
                 adopted_pr=(ref.pr_url if ref.is_adopted else None),
+                repo=pr.repo,
             )
         except FollowupSubprocessError as e:
             if e.kind == "refused":

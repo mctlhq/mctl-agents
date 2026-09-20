@@ -1,6 +1,7 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -9,6 +10,7 @@ from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
 from config.settings import MCTL_MCP_URL
+from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
 from orchestrator.resolver import ExecutionPlan
 
 
@@ -176,6 +178,113 @@ ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
 IMPLEMENTER_COMMAND_TIMEOUT_SECONDS = float(
     os.getenv("IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", "300")
 )
+# ---------------------------------------------------------------------------
+# Work-class-derived execution envelope (mctl-agents#423).
+#
+# #411 made a failing required CI check a first-class review-remediation
+# blocker, but the implementer's whole execution still ran inside the ONE
+# IMPLEMENTER_TIMEOUT_SECONDS envelope sized for "read a handful of review
+# findings and edit a few lines". A CI-remediation bundle is genuinely more
+# work (analysing a bounded log excerpt per failing check, on top of the
+# fix), and — now that ci_checks.fetch_failure_logs() moves log retrieval
+# OUT of the envelope and into the shepherd tick (see orchestrator/ci_checks.py)
+# — that extra work is the only thing left for the envelope to fund.
+# ---------------------------------------------------------------------------
+# Per-check analysis budget added to the base envelope for a CI-remediation or
+# mixed run, capped at CI_LOG_MAX_CHECKS checks (see implementer_envelope()).
+IMPLEMENTER_CI_ANALYSIS_SECONDS = _positive_seconds(
+    "IMPLEMENTER_CI_ANALYSIS_SECONDS", default=120.0
+)
+# Hard ceiling on the derived envelope, whatever work class or check count
+# produced it. Never exceeded — this is the number an operator can point to
+# and say "no single implementer run can run longer than this".
+IMPLEMENTER_TIMEOUT_CEILING_SECONDS = _positive_seconds(
+    "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", default=1800.0
+)
+# The slice of any envelope that must survive drain/teardown so a run that
+# analysed its evidence still has time left to actually mutate code and
+# commit. validate_budget_contract() (below) asserts every work class's
+# envelope leaves at least this much after 2x the drain sub-budget.
+IMPLEMENTER_MUTATION_RESERVE_SECONDS = _positive_seconds(
+    "IMPLEMENTER_MUTATION_RESERVE_SECONDS", default=180.0
+)
+# Bound on the shielded teardown _run_implementer_agent performs when the
+# outer envelope expires with a delegated task still live: disconnect the SDK
+# client and terminate its CLI child before the process exits, rather than
+# abandoning them (mctl-agents#423).
+IMPLEMENTER_TEARDOWN_GRACE_SECONDS = _positive_seconds(
+    "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", default=15.0
+)
+
+
+def implementer_envelope(work_class: str, n_checks: int = 0) -> float:
+    """The outer `anyio.fail_after` bound for one implementer run.
+
+    `work_class` is `"review"` (the pre-#423 default — the base envelope,
+    unconditionally), `"ci-remediation"` (CI failures only) or `"mixed"`
+    (CI failures plus review findings) — see
+    `run_implementer._bundle_work_class`. For the latter two, the envelope
+    widens by `IMPLEMENTER_CI_ANALYSIS_SECONDS` per failing check actually
+    carried in the bundle, capped at `CI_LOG_MAX_CHECKS` (retrieval itself
+    never fetches more than that many logs, so analysing more than that
+    many is not a cost this formula needs to fund) and at
+    `IMPLEMENTER_TIMEOUT_CEILING_SECONDS` overall.
+
+    Deliberately NOT a blanket timeout increase (see design.md's rejected
+    alternative 1): a `"review"` bundle keeps the exact pre-#423 envelope,
+    the widening is proportional to a bounded count of bounded evidence, and
+    it is capped and logged rather than silently unbounded.
+    """
+    if work_class not in ("ci-remediation", "mixed"):
+        return IMPLEMENTER_TIMEOUT_SECONDS
+    n = max(0, min(n_checks, CI_LOG_MAX_CHECKS))
+    return min(
+        IMPLEMENTER_TIMEOUT_CEILING_SECONDS,
+        IMPLEMENTER_TIMEOUT_SECONDS + n * IMPLEMENTER_CI_ANALYSIS_SECONDS,
+    )
+
+
+def validate_budget_contract() -> None:
+    """Assert every work class's envelope leaves room for drain + mutation.
+
+    `2 * IMPLEMENTER_DRAIN_TIMEOUT_SECONDS` because `drain_until_settled` can
+    restart its own clock once on a second delegation observed mid-drain (see
+    the IMPLEMENTER_DRAIN_TIMEOUT_SECONDS comment above); the reserve on top of
+    that is what `_run_implementer_agent` needs left over to actually commit.
+
+    Matches `_positive_seconds`'s "loud and harmless" policy rather than
+    raising: this runs at import time, so a raise here would make a bad
+    combination of env vars a hard startup failure for every mode that
+    imports this module, not just the implementer. Instead it logs the
+    violation and clamps `IMPLEMENTER_DRAIN_TIMEOUT_SECONDS` down just enough
+    for the mutation reserve to survive, for the tightest work class it
+    checked — clamping the ceiling or the reserve itself would silently erode
+    the two guarantees (a hard cap, and code-mutation time) this contract
+    exists to protect.
+    """
+    global IMPLEMENTER_DRAIN_TIMEOUT_SECONDS
+    for work_class in ("review", "ci-remediation", "mixed"):
+        envelope = implementer_envelope(work_class, n_checks=CI_LOG_MAX_CHECKS)
+        required = 2 * IMPLEMENTER_DRAIN_TIMEOUT_SECONDS + IMPLEMENTER_MUTATION_RESERVE_SECONDS
+        if envelope >= required:
+            continue
+        clamped_drain = max(0.0, (envelope - IMPLEMENTER_MUTATION_RESERVE_SECONDS) / 2)
+        print(
+            f"warn: implementer envelope for work_class={work_class!r} "
+            f"({envelope:g}s) cannot satisfy 2*drain+mutation-reserve "
+            f"({required:g}s); clamping IMPLEMENTER_DRAIN_TIMEOUT_SECONDS "
+            f"{IMPLEMENTER_DRAIN_TIMEOUT_SECONDS:g}s -> {clamped_drain:g}s so the "
+            f"mutation reserve survives",
+            file=sys.stderr,
+        )
+        IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = clamped_drain
+
+
+# Run at import time, not lazily: a bad combination of env vars must be loud
+# the moment this module loads, in whichever process imported it (implementer,
+# shepherd, or a test), not only the first time an implementer run happens to
+# need the clamped value.
+validate_budget_contract()
 # Tier 3 shepherd budget — soft cap per shepherd tick.
 # Covers the shepherd's own spend only: the sub-agent classification call
 # that turns codex findings into the bundle, plus the small amount of
@@ -264,6 +373,95 @@ def _command_audit_hooks() -> dict[HookEventName, list[HookMatcher]]:
     }
 
 
+# Bash command shapes that fetch a CI log with no bound of their own
+# (mctl-agents#423). Matched against the raw command string a Bash tool call
+# would run — case-insensitive, since `gh`/`curl`/`wget` invocations are
+# lowercase by convention but a model can capitalise anything.
+_CI_LOG_DENY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bgh\s+run\s+view\b[^&|;\n]*--log(-failed)?\b",
+        r"\bgh\s+api\b[^&|;\n]*/logs\b",
+        r"\b(curl|wget)\b[^&|;\n]*/logs\b",
+    )
+)
+
+
+async def _ci_log_guard_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: Any,
+) -> dict[str, Any]:
+    """Deny unbounded CI-log retrieval on a CI-remediation or mixed run.
+
+    The bundle these runs receive already carries a bounded log excerpt per
+    failing check (`ci_checks.fetch_failure_logs()`, fetched in the shepherd
+    process, outside this run's own envelope) — see
+    `run_implementer._render_ci_failures_section`. Nothing in the prompt can
+    reliably stop the agent from fetching the log itself anyway: the CLI's
+    own Bash-tool timeout backgrounds a slow command rather than failing it
+    (mctlhq/mctl-telegram#652), so a ground rule alone cannot prevent the
+    orphaned-subagent failure this proposal exists to fix. Denying the
+    command before it starts is the only control that actually holds.
+
+    Returns a deny decision (see `claude_agent_sdk.types.
+    PreToolUseHookSpecificOutput`) whose reason points the agent at the
+    bundle's own evidence and at the refusal marker as the correct escape
+    when that evidence is genuinely insufficient.
+    """
+    tool_name = ""
+    command = ""
+    if isinstance(input_data, dict):
+        tool_name = str(input_data.get("tool_name") or "")
+        raw = input_data.get("tool_input") or {}
+        if isinstance(raw, dict):
+            command = str(raw.get("command") or "")
+    if tool_name != "Bash" or not command:
+        return {}
+    if any(p.search(command) for p in _CI_LOG_DENY_PATTERNS):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Unbounded CI-log retrieval is disabled on this run "
+                    "(mctl-agents#423). The bundle already carries a bounded "
+                    "log excerpt for each failing check under 'Log excerpt "
+                    "(bounded, ...)' — use that evidence; it is what exists. "
+                    "If it is genuinely insufficient for a code decision, do "
+                    "not retry the fetch: stop and write the refusal marker "
+                    "instead, explaining what is missing."
+                ),
+            }
+        }
+    return {}
+
+
+def _ci_log_guard_hooks() -> dict[HookEventName, list[HookMatcher]]:
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="Bash", hooks=[cast(Any, _ci_log_guard_hook)]),
+        ],
+    }
+
+
+def _compose_hooks(
+    *hook_maps: dict[HookEventName, list[HookMatcher]],
+) -> dict[HookEventName, list[HookMatcher]]:
+    """Merge hook maps additively: every matcher from every map is kept, on
+    whichever event name it was registered under. Used to add the CI-log
+    guard hook to a builder WITHOUT dropping `_command_audit_hooks()` —
+    `subagent_wait.drain_until_settled`'s precondition is that `hooks` stays
+    truthy on every drainable driver, so replacing rather than composing
+    would silently break the #366 drain for every CI-remediation run.
+    """
+    merged: dict[HookEventName, list[HookMatcher]] = {}
+    for hook_map in hook_maps:
+        for event, matchers in hook_map.items():
+            merged.setdefault(event, []).extend(matchers)
+    return merged
+
+
 def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     """For services that scan sibling repos, expand the workspace to include them."""
     if service_name not in SERVICES_NEEDING_SIBLING_ACCESS:
@@ -297,7 +495,13 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
     )
 
 
-def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Path | None = None) -> ClaudeAgentOptions:
+def build_implementer_agent_options(
+    repo_dir: Path,
+    model: str,
+    proposal_dir: Path | None = None,
+    *,
+    work_class: str = "review",
+) -> ClaudeAgentOptions:
     """Options for the Tier 2 implementer agent.
 
     Runs with cwd inside the cloned sibling repo (not agents/<svc>/).
@@ -313,10 +517,18 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Pa
     GITHUB_TOKEN is forwarded from the parent env — the gh CLI in the
     Python wrapper needs it for clone + pr create, but the SDK agent
     itself does not (the agent commits, never pushes).
+
+    ``work_class`` (mctl-agents#423): ``"ci-remediation"`` or ``"mixed"``
+    additionally install `_ci_log_guard_hook()`, composed WITH (never
+    replacing) `_command_audit_hooks()` — see that function's docstring for
+    why. ``"review"`` (the default — every pre-#423 caller) is unaffected.
     """
     env = {**os.environ}
     if proposal_dir is not None:
         env["PROPOSAL_DIR"] = str(proposal_dir)
+    hooks = _command_audit_hooks()
+    if work_class in ("ci-remediation", "mixed"):
+        hooks = _compose_hooks(hooks, _ci_log_guard_hooks())
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
@@ -327,7 +539,7 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Pa
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
         env=env,
-        hooks=_command_audit_hooks(),
+        hooks=hooks,
     )
 
 

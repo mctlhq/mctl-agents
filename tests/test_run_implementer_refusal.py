@@ -54,9 +54,10 @@ def test_valid_marker_yields_the_reason(repo) -> None:
         "refused": True,
         "reason": "Finding 2 is out of scope by explicit operator decision.",
     })
-    assert run_implementer._read_refusal_marker(repo) == (
+    assert run_implementer._read_refusal_marker(repo).reason == (
         "Finding 2 is out of scope by explicit operator decision."
     )
+    assert run_implementer._read_refusal_marker(repo).insufficient_evidence is False
 
 
 def test_no_marker_is_not_a_refusal(repo) -> None:
@@ -98,11 +99,34 @@ def test_a_committed_marker_is_ignored(repo) -> None:
 
 def test_reason_is_normalised_and_bounded(repo) -> None:
     _write_marker(repo, {"refused": True, "reason": "a\n\n  b\t c " + "x" * 5000})
-    reason = run_implementer._read_refusal_marker(repo)
-    assert reason is not None
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker is not None
+    reason = marker.reason
     assert reason.startswith("a b c ")
     assert "\n" not in reason
     assert len(reason) == run_implementer.MAX_REFUSAL_REASON_CHARS
+
+
+def test_insufficient_evidence_flag_is_carried_on_the_marker(repo) -> None:
+    """mctl-agents#423: `insufficient_evidence: true` distinguishes "the
+    bounded CI-log evidence cannot support a code decision" from an ordinary
+    refusal — both share the same marker shape and validation."""
+    _write_marker(repo, {
+        "refused": True,
+        "insufficient_evidence": True,
+        "reason": "the excerpt does not show which assertion failed",
+    })
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker.insufficient_evidence is True
+    assert marker.reason == "the excerpt does not show which assertion failed"
+
+
+def test_insufficient_evidence_defaults_to_false(repo) -> None:
+    """An ordinary refusal marker (no `insufficient_evidence` key at all,
+    every pre-#423 marker) must not be misread as evidence-insufficient."""
+    _write_marker(repo, {"refused": True, "reason": "already fixed on this head"})
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker.insufficient_evidence is False
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +136,20 @@ def test_refusal_error_maps_to_47() -> None:
     assert run_implementer._review_feedback_exit_code(
         f"{run_implementer.REFUSAL_ERROR_PREFIX} operator said no"
     ) == run_implementer.EXIT_DELIBERATE_NO_OP
+
+
+def test_ci_evidence_insufficient_error_maps_to_50() -> None:
+    """mctl-agents#423: the dedicated bounded sentinel, distinct from 47."""
+    assert run_implementer._review_feedback_exit_code(
+        f"{run_implementer.CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} cannot tell from this excerpt"
+    ) == run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT
+    assert run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT == 50
+    assert run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT not in {
+        run_implementer.EXIT_DELIBERATE_NO_OP,
+        run_implementer.EXIT_ORPHANED_SUBAGENT,
+        run_implementer.EXIT_FENCED,
+        run_implementer.EXIT_CLAIM_REFUSED,
+    }
 
 
 def test_existing_sentinels_are_unchanged() -> None:
@@ -325,7 +363,7 @@ def test_excluded_marker_survives_git_add_dash_a(repo) -> None:
     assert "src.txt" in staged
     assert run_implementer.REFUSAL_MARKER_FILENAME not in staged
     # ... and the marker is therefore still honoured on the next run.
-    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert run_implementer._read_refusal_marker(repo).reason == "r"
 
 
 def test_staging_is_idempotent(repo) -> None:
@@ -404,7 +442,7 @@ def test_exit_one_is_still_honoured_as_untracked(repo, monkeypatch) -> None:
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(run_implementer, "_run", fake_run)
-    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert run_implementer._read_refusal_marker(repo).reason == "r"
 
 
 def test_subagent_definitions_exclude_the_blocked_case() -> None:
@@ -469,7 +507,7 @@ def test_the_read_itself_is_bounded(repo, monkeypatch) -> None:
         return _CountingHandle(real_open(self, *a, **kw))
 
     monkeypatch.setattr(Path, "open", counting_open)
-    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert run_implementer._read_refusal_marker(repo).reason == "r"
     assert requested == [cap + 1], (
         "the marker must be read with an explicit bound, never to EOF"
     )
@@ -518,7 +556,7 @@ def test_a_marker_at_the_cap_is_still_honoured(repo) -> None:
     path.write_text(padded, encoding="utf-8")
     assert path.stat().st_size == run_implementer.MAX_REFUSAL_MARKER_BYTES
 
-    assert run_implementer._read_refusal_marker(repo) == "operator decision"
+    assert run_implementer._read_refusal_marker(repo).reason == "operator decision"
 
 
 def _deeply_nested_marker(repo: Path, depth: int = 20_000) -> Path:

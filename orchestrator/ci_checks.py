@@ -21,9 +21,14 @@ this module exists to remove.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
+import math
 import os
 import re
+import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -44,6 +49,71 @@ CI_MAX_EXCERPT_CHARS = 1500
 # issues. Returning exactly this many nodes is treated as "might be
 # truncated" — see read_required_checks.
 _CI_CONTEXTS_PAGE_SIZE = 100
+
+# ---------------------------------------------------------------------------
+# Bounded CI-log retrieval (mctl-agents#423).
+#
+# #411 handed the implementer a check name, a conclusion, a run URL and an
+# annotation-derived excerpt bounded to CI_MAX_EXCERPT_CHARS -- but for a
+# check whose failure is not annotation-anchored (a cross-platform test
+# failure, not a mypy/ruff error) that excerpt is empty or uninformative, and
+# nothing stopped the implementer from fetching the real CI log itself,
+# inside its own execution envelope, with no bound on size or time. One
+# incident (mctlhq/mctl-telegram#652) put ~64.6 KB and an unbounded `gh` read
+# inside a 900s budget also expected to cover analysis and code mutation.
+#
+# fetch_failure_logs() retrieves the log in the SHEPHERD process, before the
+# implementer subprocess is forked, so the cost is paid outside the budget it
+# used to threaten.
+CI_LOG_MAX_CHARS = 8000
+CI_LOG_TOTAL_MAX_CHARS = 24000
+CI_LOG_MAX_CHECKS = 3
+
+
+def _positive_seconds(name: str, *, default: float) -> float:
+    """Local copy of `orchestrator.options._positive_seconds`'s clamp policy
+    (a bad value is loud and harmless, never silent and unbounded).
+
+    Duplicated rather than imported: this module's whole point is staying
+    import-light (`#149`, pinned indirectly by
+    tests/test_worker_isolation.py's `orchestrator.temporal.worker` check,
+    since `run_shepherd` -- which the worker reuses read-only helpers from --
+    imports this module). `orchestrator.options` imports `claude_agent_sdk`
+    at module scope, so importing it here would be exactly the regression
+    this module's docstring warns against.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"warn: ci_checks: {name}={raw!r} is not a number; using {default:g}s")
+        return default
+    if not (value > 0) or math.isinf(value):
+        print(f"warn: ci_checks: {name}={raw!r} is not a positive finite number; using {default:g}s")
+        return default
+    return value
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    """A simple on/off kill switch, defaulting on. `0`/`false`/`no`/`off`
+    (case-insensitive) turn it off; anything else (including unset) leaves
+    it on."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+# Per-fetch and per-bundle wall-clock bounds. Read once at import time, same
+# as every other tunable in this module family -- a shepherd tick is a fresh
+# process, so "read once" and "read per tick" coincide.
+SHEPHERD_CI_LOG_TIMEOUT_SECONDS = _positive_seconds("SHEPHERD_CI_LOG_TIMEOUT_SECONDS", default=45.0)
+SHEPHERD_CI_LOG_BUDGET_SECONDS = _positive_seconds("SHEPHERD_CI_LOG_BUDGET_SECONDS", default=120.0)
+# Kill switch: SHEPHERD_CI_LOG_FETCH=0 restores the pre-#423 annotation-only
+# shape without a redeploy.
+SHEPHERD_CI_LOG_FETCH = _env_flag("SHEPHERD_CI_LOG_FETCH", default=True)
 
 # Conclusions that are never actionable code defects, regardless of excerpt
 # content. STARTUP_FAILURE covers a runner that never got the job started.
@@ -109,6 +179,26 @@ class CheckBlocker:
     excerpt: str
     kind: str  # "actionable" | "infrastructure"
     required: bool
+    # The Actions JOB id -- for a `CheckRun` node this coincides with the
+    # check-run's own `databaseId` (mctl-agents#423 task 1's finding), which
+    # is what `gh api repos/{repo}/actions/jobs/{id}/logs` wants. `None` for
+    # a `StatusContext` (no annotations/logs API at all) and defaulted so
+    # every pre-#423 constructor keeps compiling.
+    check_run_id: str | None = None
+    # Bounded CI-log evidence (mctl-agents#423), fetched by
+    # `fetch_failure_logs()` in the shepherd process -- OUTSIDE the
+    # implementer's execution envelope. All defaulted: a blocker that never
+    # went through retrieval (fetch skipped, disabled, or budget-exhausted)
+    # still constructs and renders exactly as it did pre-#423.
+    log_excerpt: str = ""
+    log_truncated: bool = False
+    log_bytes: int = 0
+    # "skipped" (fetch never attempted for this blocker -- fetch disabled,
+    # or this blocker was never handed to fetch_failure_logs at all),
+    # "skipped-budget" (the per-bundle time/count budget was exhausted before
+    # this blocker's turn), "ok", "timeout", or "unavailable" (fetch failed
+    # or returned something unusable).
+    log_status: str = "skipped"
 
 
 @dataclass(frozen=True)
@@ -239,9 +329,14 @@ def _fetch_annotations(repo: str, check_run_id: Any) -> list[dict[str, Any]]:
     """
     try:
         refresh_github_token()
-        proc = run_capturing([
-            "gh", "api", f"repos/{repo}/check-runs/{check_run_id}/annotations",
-        ])
+        proc = run_capturing(
+            ["gh", "api", f"repos/{repo}/check-runs/{check_run_id}/annotations"],
+            # mctl-agents#423: this call had no timeout at all before — the
+            # same unbounded-retrieval defect fetch_failure_logs() exists to
+            # remove, one layer down. `subprocess.TimeoutExpired` is caught by
+            # the broad handler below, same as every other failure mode here.
+            timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
+        )
     except Exception as e:  # noqa: BLE001 — deliberate: see the docstring
         print(
             f"warn: ci_checks: annotations fetch failed for check-run "
@@ -400,7 +495,168 @@ def _read_required_checks(pr: _PRLike) -> CIStatus:
                 excerpt=excerpt,
                 kind=kind,
                 required=required,
+                check_run_id=(
+                    str(node["check_run_id"])
+                    if node.get("check_run_id") is not None
+                    else None
+                ),
             )
         )
 
     return CIStatus(known=True, head_sha=pr.head_sha, pending=pending, blockers=tuple(blockers))
+
+
+# ---------------------------------------------------------------------------
+# Bounded CI-log retrieval (mctl-agents#423).
+# ---------------------------------------------------------------------------
+def _bound_log(text: str, max_chars: int) -> tuple[str, bool]:
+    """Head+tail excerpt of `text`, bounded to at most `max_chars`.
+
+    A build log puts the failure at the END, so a head-only truncation (like
+    `_bound_excerpt`, built for the much shorter annotation text) would keep
+    the setup noise and drop exactly the useful part. The elision marker
+    between the two halves states what was removed rather than silently
+    stitching them together.
+    """
+    text = text or ""
+    if max_chars <= 0:
+        return "", bool(text)
+    if len(text) <= max_chars:
+        return text, False
+    # Fixed, generous budget for the marker text itself so the final result
+    # never exceeds max_chars regardless of how large `text` is.
+    marker_budget = 40
+    content_budget = max(0, max_chars - marker_budget)
+    head = content_budget // 2
+    tail = content_budget - head
+    elided = len(text) - head - tail
+    marker = f"\n...({elided} bytes elided)...\n"
+    bounded = text[:head] + marker + (text[-tail:] if tail else "")
+    return bounded[:max_chars], True
+
+
+def _fetch_one_log(repo: str, blocker: CheckBlocker) -> tuple[str | None, str]:
+    """One bounded `gh` read for one blocker's CI log.
+
+    Primary: `gh api repos/{repo}/actions/jobs/{job_id}/logs`, where
+    `job_id` is the CheckRun's own `databaseId` (task 1's finding — it
+    coincides with the Actions job id in practice). Fallback:
+    `gh run view <run_id> --log-failed`, covering the case where the primary
+    route 404s or the blocker never carried a check-run id at all.
+    `StatusContext` blockers have neither `check_run_id` nor `run_id` and
+    degrade straight to "unavailable" without a `gh` call.
+
+    Never raises: every failure mode (missing/non-executable `gh`, a
+    non-zero exit, a timed-out child, malformed/non-UTF8 output) degrades to
+    `(None, "timeout" | "unavailable")` so the caller's bundle-level budget
+    accounting is the only thing that can stop retrieval early.
+    """
+    try:
+        refresh_github_token()
+    except Exception as e:  # noqa: BLE001 — see docstring: never raises
+        print(f"warn: ci_checks: could not refresh github token for log fetch ({e})")
+        return None, "unavailable"
+
+    if blocker.check_run_id:
+        try:
+            proc = run_capturing(
+                ["gh", "api", f"repos/{repo}/actions/jobs/{blocker.check_run_id}/logs"],
+                timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
+            )
+            return proc.stdout, "ok"
+        except subprocess.TimeoutExpired:
+            print(
+                f"warn: ci_checks: log fetch timed out for check-run "
+                f"{blocker.check_run_id} ({repo})"
+            )
+            return None, "timeout"
+        except Exception as e:  # noqa: BLE001 — see docstring: never raises
+            print(
+                f"warn: ci_checks: job-scoped log fetch failed for check-run "
+                f"{blocker.check_run_id} ({repo}: {e}); trying run-scoped fallback"
+            )
+
+    if blocker.run_id:
+        try:
+            proc = run_capturing(
+                ["gh", "run", "view", blocker.run_id, "--log-failed"],
+                timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
+            )
+            return proc.stdout, "ok"
+        except subprocess.TimeoutExpired:
+            print(f"warn: ci_checks: log fetch timed out for run {blocker.run_id} ({repo})")
+            return None, "timeout"
+        except Exception as e:  # noqa: BLE001 — see docstring: never raises
+            print(f"warn: ci_checks: run-scoped log fetch failed for run {blocker.run_id} ({repo}: {e})")
+            return None, "unavailable"
+
+    return None, "unavailable"
+
+
+def fetch_failure_logs(
+    repo: str,
+    blockers: tuple[CheckBlocker, ...],
+    *,
+    now: Callable[[], float] = time.monotonic,
+) -> tuple[CheckBlocker, ...]:
+    """Bounded, best-effort CI-log retrieval for one bundle's blockers.
+
+    Run in the shepherd process, BEFORE the implementer subprocess is
+    forked (mctl-agents#423) — the cost this used to pay inside the
+    implementer's `anyio.fail_after` envelope is now paid here instead,
+    where a shepherd tick has no such outer bound of its own.
+
+    Stops early on either bound, whichever comes first: at most
+    `CI_LOG_MAX_CHECKS` checks are fetched, and no fetch is STARTED once the
+    cumulative wall-clock (per `now`) reaches `SHEPHERD_CI_LOG_BUDGET_SECONDS`.
+    Every blocker skipped for either reason is marked `log_status =
+    "skipped-budget"` rather than silently left at its input state, so the
+    bundle always says why a check has no log evidence.
+
+    The running total of excerpt characters across the whole bundle is kept
+    at or under `CI_LOG_TOTAL_MAX_CHARS`: each check's own bound is
+    `min(CI_LOG_MAX_CHARS, <remaining total budget>)`, so a handful of large
+    logs cannot together blow the bundle-wide cap even though each
+    individually fits under the per-check one.
+
+    Never raises — this module's whole `read_required_checks` contract
+    (fail closed on the KNOWN/UNKNOWN axis, never crash the tick) extends to
+    retrieval: every path through `_fetch_one_log` already degrades to
+    `(None, "timeout" | "unavailable")` rather than propagating.
+
+    `SHEPHERD_CI_LOG_FETCH=0` (or an empty `blockers`) returns `blockers`
+    completely unchanged — the pre-#423 annotation-only shape.
+    """
+    if not blockers or not SHEPHERD_CI_LOG_FETCH:
+        return blockers
+
+    start = now()
+    fetched = 0
+    total_chars = 0
+    out: list[CheckBlocker] = []
+    for blocker in blockers:
+        elapsed = now() - start
+        remaining_total = CI_LOG_TOTAL_MAX_CHARS - total_chars
+        if fetched >= CI_LOG_MAX_CHECKS or elapsed >= SHEPHERD_CI_LOG_BUDGET_SECONDS or remaining_total <= 0:
+            out.append(dataclasses.replace(blocker, log_status="skipped-budget"))
+            continue
+
+        raw, status = _fetch_one_log(repo, blocker)
+        fetched += 1
+        if raw is None:
+            out.append(dataclasses.replace(blocker, log_status=status))
+            continue
+
+        per_check_cap = min(CI_LOG_MAX_CHARS, remaining_total)
+        excerpt, truncated = _bound_log(raw, per_check_cap)
+        total_chars += len(excerpt)
+        out.append(
+            dataclasses.replace(
+                blocker,
+                log_excerpt=excerpt,
+                log_truncated=truncated,
+                log_bytes=len(raw.encode("utf-8", errors="replace")),
+                log_status=status,
+            )
+        )
+    return tuple(out)
