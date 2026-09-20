@@ -1054,6 +1054,15 @@ def test_deadline_guard_composes_with_the_ci_log_guard_and_the_audit_hook(tmp_pa
     assert len(callbacks) == 3  # audit + ci-log + deadline
 
 
+def _os_bound_seconds(rendered: str) -> int:
+    """The `<budget>s` GNU `timeout` was rendered with."""
+    import re as _re
+
+    found = _re.search(r"timeout --kill-after=\d+s (\d+)s bash -c ", rendered)
+    assert found is not None, rendered
+    return int(found.group(1))
+
+
 def _guard_for(tmp_path, ledger, *, work_class="review", remaining=1000.0):
     built = options.build_implementer_agent_options(
         tmp_path, "test-model", work_class=work_class,
@@ -1079,10 +1088,13 @@ def test_deadline_guard_bounds_the_wrapper_at_the_caller_timeout_not_the_envelop
     out = result["hookSpecificOutput"]
     assert out["permissionDecision"] == "allow"
     assert out["updatedInput"]["timeout"] == 5000
-    # The OS-level bound must be the SAME 5s, not the 300s ceiling.
-    assert "timeout --kill-after=5s 5s bash -c" in out["updatedInput"]["command"]
+    # The OS-level bound comes from the SAME 5s, not the 300s ceiling -- and
+    # lands strictly BELOW it so GNU `timeout` fires before the CLI's own
+    # timer (agy P2 on `624a433`).
+    assert "timeout --kill-after=5s 4s bash -c" in out["updatedInput"]["command"]
     assert "300s" not in out["updatedInput"]["command"]
     assert ledger.last_bound_s == 5.0
+    assert _os_bound_seconds(out["updatedInput"]["command"]) * 1000 < out["updatedInput"]["timeout"]
 
 
 def test_deadline_guard_still_uses_the_envelope_bound_without_a_caller_timeout(
@@ -1098,7 +1110,37 @@ def test_deadline_guard_still_uses_the_envelope_bound_without_a_caller_timeout(
         cb = _guard_for(tmp_path, ledger)
         out = _run_guard(cb, dict(tool_input))["hookSpecificOutput"]
         assert out["updatedInput"]["timeout"] == 300 * 1000, tool_input
-        assert "timeout --kill-after=5s 300s bash -c" in out["updatedInput"]["command"]
+        assert "timeout --kill-after=5s 299s bash -c" in out["updatedInput"]["command"]
+        assert (
+            _os_bound_seconds(out["updatedInput"]["command"]) * 1000
+            < out["updatedInput"]["timeout"]
+        ), tool_input
+
+
+def test_the_os_bound_always_fires_before_the_cli_tool_timeout(tmp_path, monkeypatch):
+    """The ordering invariant itself, across the whole useful budget range.
+
+    If the CLI's timer wins, it BACKGROUNDS the still-live command (ADR-011
+    "Containment") and the orphaned-process window reopens -- which is the
+    single thing this guard exists to prevent (agy P2 on `624a433`)."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    for caller_timeout_ms in (None, 20_600, 25_000, 60_000, 299_000, 1_000_000):
+        ledger = options.CommandBudgetLedger()
+        cb = _guard_for(tmp_path, ledger)
+        tool_input = {"command": "pytest -q"}
+        if caller_timeout_ms is not None:
+            tool_input["timeout"] = caller_timeout_ms
+        out = _run_guard(cb, tool_input)["hookSpecificOutput"]
+        rendered = out["updatedInput"]["command"]
+        assert rendered.startswith("timeout --kill-after="), caller_timeout_ms
+        assert (
+            _os_bound_seconds(rendered) * 1000 < out["updatedInput"]["timeout"]
+        ), caller_timeout_ms
+        # And the clamp is still one-directional.
+        if caller_timeout_ms is not None:
+            assert out["updatedInput"]["timeout"] <= caller_timeout_ms
 
 
 def test_deadline_guard_allows_a_quoted_ampersand(tmp_path, monkeypatch):

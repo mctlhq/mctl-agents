@@ -25,6 +25,7 @@ and reads the ledger back out.
 """
 from __future__ import annotations
 
+import math
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -341,11 +342,33 @@ def wrap_bounded(command: str, budget_s: float, *, kill_after_s: float) -> str:
     "Containment") while `timeout` sits on the process group until the wider
     bound, so the process escapes for the difference (agy P2 on `630ac27`).
 
-    Both bounds are rounded up to whole seconds (`timeout`'s own resolution)
-    and floored at 1s so a sub-second budget still renders a valid,
-    non-zero invocation rather than `timeout 0s ...`, which fires
-    immediately.
+    The rendered bound is ``floor(budget_s)`` whole seconds, shaved by one
+    more second when that floor lands exactly on ``budget_s``, and floored at
+    1s. Two reasons, both about ORDERING rather than precision:
+
+    - It must never EXCEED ``budget_s``. Rounding to nearest (`round`) does
+      exceed it for e.g. 20.6s -> 21s, which puts the CLI's own tool timeout
+      (set from the same 20.6s) FIRST -- and the CLI backgrounds rather than
+      fails, so the command escapes for the difference. That is the defect
+      this module exists to close, reintroduced by a rounding mode (agy P2 on
+      `624a433`).
+    - It must not merely TIE with it either. At an exact integer budget both
+      timers fire in the same instant and which one wins is unspecified; one
+      second of headroom makes GNU `timeout` deterministically first, and one
+      second out of a budget whose floor is `IMPLEMENTER_MIN_COMMAND_BUDGET_
+      SECONDS` (20s by default) is a rounding error, not a real loss.
+
+    The `--kill-after` grace is rounded UP, never down: it is the backstop
+    for a command that ignores SIGTERM, and shortening it weakens exactly the
+    guarantee it exists to give. It is deliberately NOT subtracted from the
+    bound as well -- requiring `bound + grace <= budget_s` is unsatisfiable
+    whenever the budget is at or below the grace, and the meaningful
+    guarantee is that SIGTERM lands before the CLI's timer, not that the
+    pathological SIGKILL does too.
     """
-    budget = max(1, round(budget_s))
-    kill_after = max(1, round(kill_after_s))
+    budget = math.floor(budget_s)
+    if budget >= budget_s:
+        budget -= 1
+    budget = max(1, budget)
+    kill_after = max(1, math.ceil(kill_after_s))
     return f"timeout --kill-after={kill_after}s {budget}s bash -c {shlex.quote(command)}"

@@ -174,12 +174,21 @@ tool-input clamping alone, by rewriting the command under `timeout
 
 Three rules keep that rewrite from being worse than the defect it closes:
 
-- **One effective bound, not two.** The wrapper and the tool-input clamp use
-  the SAME number — the envelope-derived budget narrowed against any
-  caller-supplied tool timeout. Deriving them separately lets the CLI
-  background the command at the narrower bound while `timeout` holds the
-  process group until the wider one, reopening the orphan window for the
-  difference.
+- **One effective bound, not two — and the OS timer strictly first.** The
+  wrapper and the tool-input clamp use the SAME number: the envelope-derived
+  budget narrowed against any caller-supplied tool timeout. Deriving them
+  separately lets the CLI background the command at the narrower bound while
+  `timeout` holds the process group until the wider one, reopening the orphan
+  window for the difference. The rendered `timeout` bound is then
+  `floor(effective)` whole seconds, shaved by one more when that floor lands
+  exactly on `effective`, so GNU `timeout` fires deterministically BEFORE the
+  CLI's timer rather than merely tying with it — rounding to nearest put a
+  20.6s budget at 21s, i.e. the wrong side of that ordering. The
+  `--kill-after` grace rounds UP and is deliberately NOT also subtracted from
+  the bound: requiring `bound + grace <= effective` is unsatisfiable once the
+  budget is at or below the grace, and the guarantee that matters is that
+  SIGTERM lands before the CLI backgrounds, not that the pathological SIGKILL
+  does too.
 - **Shell structure, not text.** Detachment patterns and command-word scans
   read the QUOTE-MASKED command (`exec_budget.mask_quoted()`), so `git commit
   -m "A & B"` and `echo 'nohup'` carry those characters as data and are
@@ -234,7 +243,18 @@ writing `needs-triage`. `needs-triage` is terminal by contract — a retry
 needs an operator-reviewed gitops change moving the proposal back to
 `accepted` — so charging a busy runner there parks a sound proposal at a
 human gate for a fact about the runner. A plain no-commit run stays terminal:
-that one IS deterministic, and re-running it buys the same result. A run that DOES produce a commit still pushes and
+that one IS deterministic, and re-running it buys the same result.
+
+The ledger also OUTRANKS the refusal marker when the two disagree by
+omission. An agent that stops because it ran out of budget but writes a
+marker without `verification_budget_exhausted` would otherwise fall through
+to `EXIT_DELIBERATE_NO_OP` (47) — a decision on the merits, charged to
+`review_attempts` — so a missing optional boolean in model-authored JSON
+would charge the proposal for a fact about the runner. The orchestrator-owned
+ledger is the evidence of record precisely so that model prose cannot decide
+blame; the agent's own reason still rides along with the exit-51 result. An
+ordinary refusal, with no exhausted ledger behind it, stays exit 47 and stays
+charged. A run that DOES produce a commit still pushes and
 exits `EXIT_OK` even if some verification was cut short along the way — the
 commit is the outcome; the ledger's clamp/deny counts are printed to the Argo
 log either way, so the truncation stays visible without gating success on it.

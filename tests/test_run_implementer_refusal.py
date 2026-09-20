@@ -821,6 +821,51 @@ def test_no_commits_with_an_exhausted_ledger_and_no_marker_maps_to_51(repo, monk
     assert result.budget_ledger.exhausted is True
 
 
+def test_an_exhausted_ledger_beats_a_marker_that_omitted_the_flag(repo, monkeypatch) -> None:
+    """Structured orchestrator evidence outranks model prose.
+
+    The agent stopped and wrote a refusal marker but left
+    `verification_budget_exhausted` unset, while the deadline guard's ledger
+    recorded the budget running out. Falling through to the generic refusal
+    would map this to EXIT_DELIBERATE_NO_OP (47), which the shepherd charges
+    to `review_attempts` as a decision on the merits -- charging the proposal
+    for a fact about the runner because a model omitted an optional boolean
+    (agy P2 on `624a433`)."""
+    _stub_review_feedback(monkeypatch, repo)
+    _write_marker(repo, {"refused": True, "reason": "ran out of command budget"})
+
+    def fake_anyio_run(func, *args, **kwargs):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    monkeypatch.setattr(run_implementer.anyio, "run", fake_anyio_run)
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
+    assert run_implementer._review_feedback_exit_code(result.error) == 51
+    # The agent's own reason is preserved, not discarded for the ledger's.
+    assert "ran out of command budget" in result.error
+    assert "denied_exhausted=1" in result.error
+    assert result.budget_ledger is not None
+
+
+def test_a_plain_refusal_without_an_exhausted_ledger_is_still_a_merits_no_op(
+    repo, monkeypatch
+) -> None:
+    """The override is scoped to an EXHAUSTED ledger. An ordinary refusal on
+    the merits stays exit 47 and stays charged."""
+    _stub_review_feedback(monkeypatch, repo)
+    _write_marker(repo, {"refused": True, "reason": "the requested change is wrong"})
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.REFUSAL_ERROR_PREFIX)
+    assert run_implementer._review_feedback_exit_code(result.error) == run_implementer.EXIT_DELIBERATE_NO_OP
+
+
 def test_a_commit_beats_an_exhausted_ledger(repo, monkeypatch) -> None:
     """A commit is the outcome, even if some verification was cut short
     along the way (EARS: 'a run ends with new commits ... push and exit OK
@@ -831,7 +876,7 @@ def test_a_commit_beats_an_exhausted_ledger(repo, monkeypatch) -> None:
     monkeypatch.setattr(run_implementer, "_load_status", lambda *_a: {"pr": "https://pr"})
 
     def fake_anyio_run(func, *args, **kwargs):
-        func.keywords["budget_ledger"].record_clamped("go test ./...", 42.0)
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
         return None
 
     monkeypatch.setattr(run_implementer.anyio, "run", fake_anyio_run)

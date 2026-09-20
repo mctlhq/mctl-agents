@@ -125,8 +125,12 @@ def test_is_detached_returns_none_for_an_ordinary_command() -> None:
 # wrap_bounded — T3
 # ---------------------------------------------------------------------------
 def test_wrap_bounded_always_carries_kill_after() -> None:
+    # 29s, not 30s: an exact-integer budget is shaved by one second so GNU
+    # `timeout` fires deterministically BEFORE the CLI's own tool timeout,
+    # which is set from the same budget and backgrounds rather than fails
+    # (agy P2 on `624a433`).
     wrapped = exec_budget.wrap_bounded("pytest -q", 30.0, kill_after_s=5.0)
-    assert wrapped.startswith("timeout --kill-after=5s 30s bash -c ")
+    assert wrapped.startswith("timeout --kill-after=5s 29s bash -c ")
 
 
 def test_wrap_bounded_round_trips_a_heredoc() -> None:
@@ -286,3 +290,33 @@ def test_is_shell_state_only_rejects_anything_that_also_runs_work(command):
 
 def test_is_shell_state_only_is_conservative_on_unparseable_input():
     assert exec_budget.is_shell_state_only('cd "/repo') is False
+
+
+# ---------------------------------------------------------------------------
+# Ordering between the OS bound and the CLI's own tool timeout (agy P2 on
+# `624a433`): GNU `timeout` must fire STRICTLY FIRST, or the CLI backgrounds
+# a still-live command and the orphan window reopens.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "budget_s,want_bound",
+    [
+        (300.0, 299),   # exact integer: shaved by one so it cannot tie
+        (20.6, 20),     # fractional: floored, never rounded UP past the budget
+        (20.4, 20),
+        (5.0, 4),
+        (1.2, 1),
+        (1.0, 1),       # at the floor a tie is unavoidable; 1s is the minimum
+        (0.2, 1),       # sub-second still renders a valid, non-zero bound
+    ],
+)
+def test_wrap_bounded_never_exceeds_the_budget(budget_s, want_bound):
+    rendered = exec_budget.wrap_bounded(budget_s=budget_s, command="x", kill_after_s=5.0)
+    assert f" {want_bound}s bash -c " in rendered
+    # The invariant the ordering rests on, stated directly.
+    assert want_bound <= budget_s or budget_s < 1.0
+
+
+def test_wrap_bounded_rounds_the_kill_grace_up_not_down():
+    """Shortening the SIGKILL backstop weakens the one guarantee it gives."""
+    rendered = exec_budget.wrap_bounded(budget_s=300.0, command="x", kill_after_s=4.2)
+    assert "--kill-after=5s" in rendered

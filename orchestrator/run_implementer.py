@@ -2366,6 +2366,28 @@ def review_feedback_one(
                         pr_url=None,
                         error=f"{CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} {refusal.reason}",
                     )
+                if budget_ledger.exhausted:
+                    # The agent wrote a marker but left
+                    # `verification_budget_exhausted` unset, while the
+                    # ORCHESTRATOR's own ledger recorded the budget running
+                    # out. Falling through to the generic refusal would map
+                    # this to EXIT_DELIBERATE_NO_OP (47), which the shepherd
+                    # charges to `review_attempts` as a decision on the
+                    # merits -- charging the proposal for a fact about the
+                    # runner because a model omitted an optional boolean
+                    # (agy P2 on `624a433`). Structured orchestrator evidence
+                    # outranks model prose, which is the whole reason the
+                    # ledger exists; the agent's own reason still rides along.
+                    release_reason = "no follow-up: verification budget exhausted"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=(
+                            f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} "
+                            f"{refusal.reason} [{budget_ledger.describe()}]"
+                        ),
+                        budget_ledger=budget_ledger,
+                    )
                 release_reason = "no follow-up: refused"
                 return ImplementResult(
                     ref=ref,
