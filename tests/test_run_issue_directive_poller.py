@@ -288,6 +288,46 @@ def test_dispatch_failure_leaves_no_ack_and_retries_next_tick(monkeypatch):
     assert result.failed == 1
 
 
+def test_log_dispatch_error_fires_on_attempts_1_and_2_not_only_give_up(monkeypatch, capsys):
+    """claude P3 on #421: `_log_dispatch_error` was added so an operator can
+    tell a 401 from a 404 from a 503 well before the retry budget runs out
+    -- this pins that it actually fires on the FIRST failed attempt, not
+    only the terminal give-up one."""
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    async def failing_submit(*_args, **_kwargs):
+        raise RuntimeError("mctl-api unreachable")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", failing_submit)
+
+    _run_scan(max_directives=10)
+
+    out = capsys.readouterr().out
+    assert "dispatch attempt 1/" in out, "the first failed attempt must be logged, not only give-up"
+    assert "mctl-api unreachable" in out
+
+
+def test_log_dispatch_error_includes_status_and_body_for_an_http_status_error(capsys):
+    """claude P3 on #421: `_log_dispatch_error`'s `httpx.HTTPStatusError`
+    branch (status code + response body) was unreachable from any existing
+    test, since every dispatch-failure test raises a bare `RuntimeError`."""
+    request = httpx.Request("POST", "https://mctl-api.internal/api/v1/operations/x/execute")
+    response = httpx.Response(503, request=request, text="upstream unavailable")
+    error = httpx.HTTPStatusError("503 Server Error", request=request, response=response)
+
+    run_issue_directive_poller._log_dispatch_error("test context", error)
+
+    out = capsys.readouterr().out
+    assert "status=503" in out
+    assert "upstream unavailable" in out
+
+
 def test_dispatch_failure_gives_up_after_max_attempts_and_acks(monkeypatch):
     """The give-up bound (MAX_DISPATCH_ATTEMPTS): once a comment id's
     dispatch has failed that many times in a row, the scan must stop
@@ -680,6 +720,48 @@ def test_submit_investigate_on_a_read_timeout_raises_ambiguous(monkeypatch):
 
     with pytest.raises(DispatchOutcomeAmbiguous):
         _submit(monkeypatch, handler)
+
+
+def test_submit_investigate_on_a_remote_protocol_error_raises_ambiguous(monkeypatch):
+    """claude P2 on #421 (carried from the previous round): a dropped
+    connection mid-response — the everyday shape of an mctl-api pod restart
+    or ingress drop — happens at or after the request reaches the server,
+    same as a ReadTimeout, so it must be classified as ambiguous too, not
+    fall through to a plain retry-safe failure."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("Server disconnected without sending a response", request=request)
+
+    with pytest.raises(DispatchOutcomeAmbiguous):
+        _submit(monkeypatch, handler)
+
+
+def test_submit_investigate_on_a_read_error_raises_ambiguous(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadError("connection reset", request=request)
+
+    with pytest.raises(DispatchOutcomeAmbiguous):
+        _submit(monkeypatch, handler)
+
+
+def test_submit_investigate_on_a_connect_error_is_not_ambiguous(monkeypatch):
+    """The connection never reached mctl-api at all — a plain retry is
+    genuinely safe here, unlike every other transport error above. Must
+    propagate unchanged, never wrapped as DispatchOutcomeAmbiguous."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(httpx.ConnectError) as exc_info:
+        _submit(monkeypatch, handler)
+    assert not isinstance(exc_info.value, DispatchOutcomeAmbiguous)
+
+
+def test_submit_investigate_on_a_connect_timeout_is_not_ambiguous(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectTimeout("connect timed out", request=request)
+
+    with pytest.raises(httpx.ConnectTimeout) as exc_info:
+        _submit(monkeypatch, handler)
+    assert not isinstance(exc_info.value, DispatchOutcomeAmbiguous)
 
 
 # ---------------------------------------------------------------------------

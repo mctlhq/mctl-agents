@@ -270,19 +270,29 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
         refs = _rotate_window(refs, MAX_STALE_DIRECTIVE_CANDIDATES)
 
     stale: list[StaleDirective] = []
+    # Several refs can resolve to the same issue_url (e.g. a re-published
+    # proposal keeping its old slug's sibling around) — cache each issue's
+    # comments so a shared issue_url costs one `gh issue view` call, not one
+    # per ref, mirroring `run_issue_directive_poller.scan`'s own
+    # `seen_issue_urls` dedup for the identical call (agy P3 on #421).
+    comments_by_issue_url: dict[str, list | None] = {}
     for ref in refs:
         issue_url = issue_url_for(ref.service, ref.slug)
         if issue_url is None:
             continue
-        try:
-            comments = await asyncio.to_thread(read_issue_comments, issue_url)
-        except Exception as exc:  # noqa: BLE001 — one issue's comments must not blind the sweep to the rest
-            activity.logger.warning(
-                "reconcile: could not read comments for %s (%s); skipping "
-                "directive-staleness check for this proposal",
-                issue_url,
-                exc,
-            )
+        if issue_url not in comments_by_issue_url:
+            try:
+                comments_by_issue_url[issue_url] = await asyncio.to_thread(read_issue_comments, issue_url)
+            except Exception as exc:  # noqa: BLE001 — one issue's comments must not blind the sweep to the rest
+                activity.logger.warning(
+                    "reconcile: could not read comments for %s (%s); skipping "
+                    "directive-staleness check for this proposal",
+                    issue_url,
+                    exc,
+                )
+                comments_by_issue_url[issue_url] = None
+        comments = comments_by_issue_url[issue_url]
+        if comments is None:
             continue
 
         acked = acked_comment_ids(comments)

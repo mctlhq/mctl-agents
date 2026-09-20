@@ -118,12 +118,15 @@ class DispatchOutcomeAmbiguous(Exception):
     """Raised by `submit_investigate` when the POST to mctl-api may already
     have crossed the remote side-effect boundary (an Argo workflow may
     already be running) but this process cannot confirm either way — a 2xx
-    response whose body does not parse to a workflow identity, or a
-    `httpx.ReadTimeout` that could have landed server-side before it fired.
+    response whose body does not parse to a workflow identity, or any
+    `httpx.HTTPError` that occurs at or after the request reaches the
+    server (a read/write failure, a dropped connection mid-response, a
+    proxy error — not only `ReadTimeout`).
 
     Deliberately a distinct type from every other `submit_investigate`
     failure: those are safe to retry on the next tick (mctl-api definitely
-    rejected the request, or the connection never reached it), while this
+    rejected the request with a 4xx/5xx, or a `ConnectError`/`ConnectTimeout`/
+    `PoolTimeout` means the connection never reached it at all), while this
     one is NOT — blindly resubmitting could start a second, real, paid Argo
     run for the same directive. Mirrors the refusal `orchestrator.temporal.
     activities.argo`'s `submit_and_wait` already applies to the identical
@@ -210,11 +213,21 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     poller can send `requested_by` again.
 
     Raises `DispatchOutcomeAmbiguous` — never a plain `httpx`/parsing
-    exception — for the two cases where mctl-api may already have started
-    the workflow but this call cannot confirm it: a `ReadTimeout` (the
-    request may have been received before the read timed out) and a 2xx
-    response whose body does not parse to a workflow identity (mctl-api
-    accepted the operation; only the reply describing it is malformed). A
+    exception — for the cases where mctl-api may already have started the
+    workflow but this call cannot confirm it, expressed positively rather
+    than by enumeration (claude P2 on #421, carried from the previous
+    round: only `ReadTimeout` was wrapped, leaving `RemoteProtocolError` —
+    the everyday shape of an mctl-api pod restart or ingress drop mid
+    response — and every other post-connect transport error to fall
+    through to a plain retry): any `httpx.ConnectError`/`ConnectTimeout`/
+    `PoolTimeout` means the connection never reached mctl-api at all, so a
+    retry is genuinely safe and those propagate unchanged; every other
+    `httpx.HTTPError` `client.post()` can raise happens at or after the
+    request reached the server (a read/write failure, a dropped connection
+    mid-response, a proxy error) and is therefore unconfirmable by
+    construction. A 2xx response whose body does not parse to a workflow
+    identity is the same ambiguous case for the same reason: mctl-api
+    accepted the operation, only the reply describing it is malformed. A
     `raise_for_status()` failure (any 4xx/5xx) is left as a plain
     `httpx.HTTPStatusError` — mctl-api affirmatively rejected the request,
     so nothing could have started and the caller's normal retry is safe.
@@ -227,10 +240,13 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
                 json=params,
                 headers=auth_headers(),
             )
-        except httpx.ReadTimeout as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            raise
+        except httpx.HTTPError as exc:
             raise DispatchOutcomeAmbiguous(
-                f"timed out waiting for mctl-api's response to {INVESTIGATE_OPERATION} for "
-                f"{issue_url} — the request may already have been received and started"
+                f"a transport error occurred waiting for mctl-api's response to "
+                f"{INVESTIGATE_OPERATION} for {issue_url} ({type(exc).__name__}) — the request "
+                "may already have reached the server and started"
             ) from exc
         response.raise_for_status()
         try:
@@ -361,10 +377,28 @@ def _reply_dispatch_gave_up(author: str, error: Exception, attempts: int) -> str
     #
     # Same reasoning as `_reply_dispatch_failed` above: only the exception's
     # type name is public, never its message.
+    plural = "time" if attempts == 1 else "times"
     return (
         f"@{author} the re-investigation dispatch failed ({type(error).__name__}) "
-        f"{attempts} times in a row. Giving up — this directive will not be retried "
+        f"{attempts} {plural} in a row. Giving up — this directive will not be retried "
         "automatically; an operator must check mctl-api and resubmit manually."
+    )
+
+
+def _reply_dispatch_marker_write_failed(author: str, error: Exception) -> str:
+    # Distinct from `_reply_dispatch_gave_up` (claude P3 on #421): that
+    # message says the dispatch itself failed N times, which is not true
+    # here — dispatch attempt `attempt` failed once, same as any other, but
+    # the RETRY MARKER for it could not be written, so `prior_failures`
+    # would never advance and the next tick would retry the same attempt
+    # forever without recording progress. Escalating to give-up is correct,
+    # but the reply should say why: a GitHub write failure, not repeated
+    # dispatch exhaustion.
+    return (
+        f"@{author} the re-investigation dispatch failed ({type(error).__name__}), and "
+        "recording this attempt also failed — giving up now instead of retrying forever "
+        "without a way to track progress. An operator must check mctl-api and GitHub, "
+        "then resubmit manually."
     )
 
 
@@ -465,11 +499,30 @@ async def _handle_directive(
                 f"ambiguous dispatch outcome for directive comment {directive.comment_id} ({issue_url})",
                 e,
             )
-            await asyncio.to_thread(
-                _post_reply_with_retries,
-                issue_url,
-                _with_ack(_reply_dispatch_ambiguous(directive.author, e), directive.comment_id),
-            )
+            try:
+                await asyncio.to_thread(
+                    _post_reply_with_retries,
+                    issue_url,
+                    _with_ack(_reply_dispatch_ambiguous(directive.author, e), directive.comment_id),
+                )
+            except subprocess.CalledProcessError as post_e:
+                # The exact residual `_reply_dispatched`'s handler below
+                # guards against, on the branch this exception class exists
+                # specifically to protect (claude P3 on #421): mctl-api may
+                # already have started a workflow for this directive, but
+                # if the ack write itself now also fails, the comment stays
+                # unacked and the next tick silently re-enters `dispatch` —
+                # exactly the blind resubmit `DispatchOutcomeAmbiguous` was
+                # introduced to prevent. Loud and specific for the same
+                # reason the dispatched-path handler is.
+                print(
+                    f"FAIL: directive comment {directive.comment_id} ({issue_url}) had an "
+                    f"ambiguous dispatch outcome ({type(e).__name__}) and posting the ambiguous "
+                    f"acknowledgement reply also failed after retries ({post_e.stderr or post_e}) — "
+                    "this comment remains unacked and WILL be re-dispatched next tick unless an "
+                    f"operator posts a comment containing `{ack_trailer(directive.comment_id)}` first."
+                )
+                raise
             return "dispatch-ambiguous"
         except Exception as e:  # noqa: BLE001 — surfaced as a per-directive failure, comment kept unacked for retry
             attempt = prior_failures + 1
@@ -511,11 +564,15 @@ async def _handle_directive(
                     # the module docstring), so letting this exception
                     # propagate would leave `attempt` unchanged on the next
                     # tick and retry forever without ever recording progress
-                    # toward the give-up bound — precisely in the
-                    # shared-outage scenario (broken token, network outage)
-                    # this bound exists for (codex review on #417). Escalate
-                    # straight to give-up for this attempt instead of
-                    # silently looping.
+                    # toward the give-up bound. This is a distinct failure
+                    # from ordinary dispatch exhaustion — a GitHub write
+                    # failure, not `MAX_DISPATCH_ATTEMPTS` genuinely being
+                    # reached (claude P3 on #421: the previous reply here
+                    # reused `_reply_dispatch_gave_up`, whose wording claims
+                    # the dispatch itself failed `attempt` times, which
+                    # is not what happened). Escalate straight to give-up
+                    # for this attempt instead of silently looping, but say
+                    # why with `_reply_dispatch_marker_write_failed`.
                     print(
                         f"FAIL: could not post retry marker for directive comment "
                         f"{directive.comment_id} ({issue_url}) after dispatch attempt "
@@ -525,7 +582,9 @@ async def _handle_directive(
                     await asyncio.to_thread(
                         _post_reply,
                         issue_url,
-                        _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
+                        _with_ack(
+                            _reply_dispatch_marker_write_failed(directive.author, e), directive.comment_id
+                        ),
                     )
             return "dispatch-failed"
         try:
