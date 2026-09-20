@@ -2988,9 +2988,11 @@ def process_one(
                 # re-clone the repo and re-run a paid SDK call every tick with
                 # no terminal state.
                 new_failures = ref.harness_failures + 1
-                # `e.reason` is only set for `EXIT_CI_EVIDENCE_INSUFFICIENT`
-                # (mctl-agents#423 review P2) — `EXIT_ORPHANED_SUBAGENT` never
-                # carries one, so this is a no-op suffix on that path.
+                # `e.reason` is set for `EXIT_CI_EVIDENCE_INSUFFICIENT`
+                # (mctl-agents#423 review P2) and for
+                # `EXIT_VERIFICATION_BUDGET_EXHAUSTED` (mctl-agents#430, which
+                # carries the ledger summary) — `EXIT_ORPHANED_SUBAGENT` never
+                # carries one, so this is a no-op suffix on that path only.
                 reason_suffix = f" Reason: {e.reason}" if e.reason else ""
                 print(
                     f"warn: {ref.service}/{ref.slug}: harness failure — not "

@@ -1238,15 +1238,33 @@ def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> b
     return False
 
 
-def _hand_back_if_still_ours(ref: ProposalRef, attempt_id: str) -> bool:
+def _hand_back_if_still_ours(
+    ref: ProposalRef, attempt_id: str, *, budget_handbacks: int | None = None
+) -> bool:
     """Restore `accepted` only while `.status.yaml` still names our attempt.
 
-    Returns True when the hand-back was written.
+    Returns True when the hand-back was written. ``budget_handbacks``
+    (mctl-agents#430) records how many times THIS proposal has been handed
+    back for an exhausted verification budget, so the retry it enables stays
+    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`.
     """
     if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
         return False
-    update_status_yaml(ref, "accepted", attempt=None, failure=None)
+    fields: dict[str, Any] = {"attempt": None, "failure": None}
+    if budget_handbacks is not None:
+        fields["budget_handbacks"] = budget_handbacks
+    update_status_yaml(ref, "accepted", **fields)
     return True
+
+
+# How many times one proposal may be handed back to `accepted` because its
+# implement run exhausted the per-command verification budget. The implement
+# driver has no `review_attempts`/`harness_failures` budget of its own -- the
+# sibling `except ImplementerOrphanedSubagent` arm stays terminal for exactly
+# that reason -- so an unconditional hand-back would trade a wrong terminal
+# state for an unbounded PAID retry loop (claude P2 on `624a433`). Mirrors
+# `run_shepherd.MAX_HARNESS_FAILURES`: blameless, but not infinite.
+IMPLEMENT_MAX_BUDGET_HANDBACKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -3433,6 +3451,9 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
             if budget_ledger.exhausted:
+                prior_handbacks = int(
+                    _load_status(ref.status_path).get("budget_handbacks", 0) or 0
+                )
                 # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
                 # prose -- observed the per-command budget run out with
                 # nothing committed. That is a fact about THIS RUN's envelope,
@@ -3446,12 +3467,42 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 # restore `accepted` under the same compare-and-swap the
                 # claim-vanished arm uses, so the next attempt re-runs
                 # against the current world.
+                if prior_handbacks + 1 >= IMPLEMENT_MAX_BUDGET_HANDBACKS:
+                    # The hand-back budget is spent. Blamelessness does not
+                    # mean "retry forever at cost": record it terminally, but
+                    # under its OWN code so the proposal's history still says
+                    # "the runner ran out of budget", not "this proposal
+                    # produces no commits".
+                    exhausted_msg = (
+                        "verification budget exhausted on "
+                        f"{prior_handbacks + 1} consecutive attempts "
+                        f"({IMPLEMENT_MAX_BUDGET_HANDBACKS} allowed): "
+                        f"{budget_ledger.describe()}"
+                    )
+                    recorded = _mark_needs_triage(
+                        ref,
+                        code="verification-budget-exhausted",
+                        stage="agent",
+                        message=exhausted_msg,
+                        attempt=attempt,
+                        claim_context=claim_ctx,
+                    )
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=_triage_error(exhausted_msg, recorded),
+                        budget_ledger=budget_ledger,
+                    )
                 _release_claim(claim_ctx, reason="agent: verification budget exhausted")
                 message = (
                     "implementer produced no commits: "
-                    f"{budget_ledger.describe()}"
+                    f"{budget_ledger.describe()} "
+                    f"(hand-back {prior_handbacks + 1} of "
+                    f"{IMPLEMENT_MAX_BUDGET_HANDBACKS})"
                 )
-                if not _hand_back_if_still_ours(ref, attempt_id):
+                if not _hand_back_if_still_ours(
+                    ref, attempt_id, budget_handbacks=prior_handbacks + 1
+                ):
                     # The CAS declined -- somebody else's attempt is in the
                     # file, so nothing was handed back and the next tick will
                     # not retry it. Two different outcomes must not read
@@ -3521,6 +3572,10 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=completed_attempt,
             failure=None,
             notes=None,
+            # A run that got through clears the hand-back tally: the cap
+            # bounds CONSECUTIVE budget-exhausted attempts, not the lifetime
+            # of the proposal (mctl-agents#430).
+            budget_handbacks=None,
         )
         _release_claim(claim_ctx, reason="implemented")
         result = ImplementResult(ref=ref, pr_url=pr_url)

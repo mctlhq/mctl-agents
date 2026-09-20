@@ -189,10 +189,16 @@ Three rules keep that rewrite from being worse than the defect it closes:
   budget is at or below the grace, and the guarantee that matters is that
   SIGTERM lands before the CLI backgrounds, not that the pathological SIGKILL
   does too.
-- **Shell structure, not text.** Detachment patterns and command-word scans
-  read the QUOTE-MASKED command (`exec_budget.mask_quoted()`), so `git commit
-  -m "A & B"` and `echo 'nohup'` carry those characters as data and are
-  admitted. A backslash-escaped operator outside quotes is masked too.
+- **Shell structure, not text — and quoted is not the same as inert.**
+  Detachment patterns and command-word scans read the QUOTE-MASKED command
+  (`exec_budget.mask_quoted()`), so `git commit -m "A & B"` and `echo 'nohup'`
+  carry those characters as data and are admitted. A backslash-escaped
+  operator outside quotes is masked too. But quoted text the shell will
+  EXECUTE is scanned recursively at its own level: a `bash -c` payload and
+  the contents of `$(...)`/backticks, to `MAX_PAYLOAD_DEPTH`. `bash -c "cmd
+  &"` backgrounds inside the inner shell, and GNU `timeout` exits with its
+  DIRECT child, so the grandchild survives — the #652 shape reached through a
+  quoted payload rather than a bare one.
 - **Shell state survives.** A command built only from `SHELL_STATE_BUILTINS`
   (`cd`, `export`, `source`, …) is admitted UNWRAPPED, because the Bash tool
   carries that state — notably the working directory — across calls and
@@ -239,7 +245,14 @@ harness set: blameless (never charges `review_attempts`), still bounded by
 the review path: an implement run that ends with no commit and an exhausted
 ledger hands the proposal back to `accepted` (`_hand_back_if_still_ours`,
 under the same compare-and-swap the claim-vanished arm uses) instead of
-writing `needs-triage`. `needs-triage` is terminal by contract — a retry
+writing `needs-triage` — but only `IMPLEMENT_MAX_BUDGET_HANDBACKS` (3) times
+in a row, tallied in `.status.yaml`'s `budget_handbacks` and cleared by any
+run that gets through. The implement driver has no `review_attempts` or
+`harness_failures` budget of its own, which is why its sibling
+orphaned-subagent arm stays terminal; an unconditional hand-back would
+therefore trade a wrong terminal state for an unbounded PAID retry loop. At
+the cap the run is recorded terminally under `verification-budget-exhausted`,
+never `no-commits`, so the proposal's history still says what happened. `needs-triage` is terminal by contract — a retry
 needs an operator-reviewed gitops change moving the proposal back to
 `accepted` — so charging a busy runner there parks a sound proposal at a
 human gate for a fact about the runner. A plain no-commit run stays terminal:

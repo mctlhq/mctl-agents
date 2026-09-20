@@ -252,6 +252,12 @@ IMPLEMENTER_TEARDOWN_RESERVE_SECONDS = _positive_seconds(
 IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS = _positive_seconds(
     "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", default=20.0
 )
+# The Claude Code Bash tool's own ceiling for its `timeout` input, in
+# milliseconds. A larger value is not honoured, so injecting one would leave
+# the tool-input clamp inoperative and put the whole bound on the OS wrapper
+# alone (claude P3 on `624a433`).
+BASH_TOOL_MAX_TIMEOUT_MS = 600_000
+
 # `timeout --kill-after=<this>s` on every wrapped command: SIGTERM first, then
 # SIGKILL after this much longer if the process group ignored it. Keeps the
 # "no live child remains" guarantee even against a command that traps SIGTERM.
@@ -262,9 +268,9 @@ IMPLEMENTER_COMMAND_KILL_GRACE_SECONDS = _positive_seconds(
 # under `timeout` while leaving the tool-input clamp and the detachment
 # denials in place. Rollback lever named in the proposal's design, not a
 # knob a normal run should ever need to touch.
-IMPLEMENTER_BOUND_COMMANDS = os.getenv("IMPLEMENTER_BOUND_COMMANDS", "1") not in (
-    "0", "false", "False", "",
-)
+IMPLEMENTER_BOUND_COMMANDS = os.getenv(
+    "IMPLEMENTER_BOUND_COMMANDS", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
 
 
 def implementer_envelope(work_class: str, n_checks: int = 0) -> float:
@@ -673,14 +679,18 @@ def _deadline_guard_hook(
         # wider one -- the orphaned-background-process defect this guard
         # exists to close, reopened inside the guard itself (agy P2 on
         # `630ac27`). Clamping stays one-directional: `min` never widens.
-        effective_s = budget_s
+        # The Bash tool's own ceiling binds the EFFECTIVE budget, not just
+        # the number written into `timeout`. Clamping only the tool input
+        # would leave the OS bound above the CLI's real timer and put the CLI
+        # first again -- the ordering this guard depends on.
+        effective_s = min(budget_s, BASH_TOOL_MAX_TIMEOUT_MS / 1000.0)
         existing_timeout_ms = tool_input.get("timeout")
         if (
             isinstance(existing_timeout_ms, int | float)
             and not isinstance(existing_timeout_ms, bool)
             and existing_timeout_ms > 0
         ):
-            effective_s = min(budget_s, float(existing_timeout_ms) / 1000.0)
+            effective_s = min(effective_s, float(existing_timeout_ms) / 1000.0)
 
         ledger.record_clamped(command, effective_s)
         updated_input = dict(tool_input)

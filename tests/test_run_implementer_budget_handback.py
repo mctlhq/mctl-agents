@@ -135,3 +135,82 @@ def test_the_hand_back_says_so_when_the_compare_and_swap_declines(
     assert result.error is not None
     assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
     assert "attempt that now holds it" in result.error
+
+
+def test_the_hand_back_is_bounded_and_turns_terminal_at_the_cap(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Blameless is not the same as infinite.
+
+    The implement driver has no `review_attempts`/`harness_failures` budget --
+    the sibling orphaned-subagent arm stays terminal for exactly that reason
+    -- so an unconditional hand-back would trade a wrong terminal state for an
+    unbounded PAID retry loop (claude P2 on `624a433`). At the cap the run is
+    recorded terminally, but under its own code, so the history still says
+    what actually happened."""
+    ref = _make_ref(tmp_path)
+    # Two hand-backs already spent; this attempt is the third and last.
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    status["budget_handbacks"] = run_implementer.IMPLEMENT_MAX_BUDGET_HANDBACKS - 1
+    ref.status_path.write_text(yaml.safe_dump(status), encoding="utf-8")
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    after = _read(ref)
+    assert after["status"] == "needs-triage"
+    assert after["failure"]["code"] == "verification-budget-exhausted"
+    assert after["failure"]["code"] != "no-commits", "must not read as a bad proposal"
+    assert result.error is not None
+    assert "verification budget exhausted" in result.error
+
+
+def test_each_hand_back_increments_the_tally(monkeypatch, tmp_path: Path) -> None:
+    ref = _make_ref(tmp_path)
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    after = _read(ref)
+    assert after["status"] == "accepted"
+    assert after["budget_handbacks"] == 1
+    # The operator reading the batch summary can see how much rope is left.
+    assert result.error is not None
+    assert (
+        f"hand-back 1 of {run_implementer.IMPLEMENT_MAX_BUDGET_HANDBACKS}"
+        in result.error
+    )
+
+
+def test_a_successful_run_clears_the_tally(monkeypatch, tmp_path: Path) -> None:
+    """The cap bounds CONSECUTIVE exhausted attempts, not the proposal's
+    lifetime -- a run that got through must not leave the next one closer to
+    a terminal state."""
+    ref = _make_ref(tmp_path)
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    status["budget_handbacks"] = 2
+    ref.status_path.write_text(yaml.safe_dump(status), encoding="utf-8")
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        run_implementer, "_push_and_open_pr",
+        lambda *_a, **_kw: "https://github.com/mctlhq/mctl-telegram/pull/1",
+    )
+
+    run_implementer.implement_one(ref, dry_run=False)
+
+    after = _read(ref)
+    assert after["status"] == "implemented"
+    assert after.get("budget_handbacks") in (None, 0), after.get("budget_handbacks")

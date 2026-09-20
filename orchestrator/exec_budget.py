@@ -179,6 +179,39 @@ def normalize_shell_command(command: str) -> str:
     return re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", command)
 
 
+def _mask(command: str, *, mask_double: bool) -> str:
+    """The shared quote scanner. See `mask_quoted` for the contract."""
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for ch in command:
+        if escaped:
+            out.append("x" if (quote != '"' or mask_double) else ch)
+            escaped = False
+            continue
+        if quote is None:
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch in ("'", '"'):
+                quote = ch
+                out.append(ch)
+            else:
+                out.append(ch)
+            continue
+        if ch == quote:
+            quote = None
+            out.append(ch)
+        elif quote == '"' and ch == "\\":
+            out.append("x" if mask_double else ch)
+            escaped = True
+        elif quote == '"' and not mask_double:
+            out.append(ch)
+        else:
+            out.append("x")
+    return "".join(out)
+
+
 def mask_quoted(command: str) -> str:
     """Replace every quoted character with ``x``, preserving length.
 
@@ -193,35 +226,13 @@ def mask_quoted(command: str) -> str:
 
     Exists because every detachment pattern here, and every command-word scan
     below, must read the command's SHELL STRUCTURE rather than its data.
+
+    Masking is the right reading for OPERATORS only. Quoted text can still be
+    a shell program in its own right -- `bash -c "cmd &"`, `"$(cmd &)"` -- so
+    `detachment_match` additionally recurses into those payloads rather than
+    treating "quoted" as "inert" (claude P2 on `624a433`).
     """
-    out: list[str] = []
-    quote: str | None = None
-    escaped = False
-    for ch in command:
-        if escaped:
-            out.append("x")
-            escaped = False
-            continue
-        if quote is None:
-            if ch == "\\":
-                out.append(ch)
-                escaped = True
-            elif ch in ("'", '"'):
-                quote = ch
-                out.append(ch)
-            else:
-                out.append(ch)
-            continue
-        # Inside quotes. Single quotes have no escapes at all.
-        if ch == quote:
-            quote = None
-            out.append(ch)
-        elif quote == '"' and ch == "\\":
-            out.append("x")
-            escaped = True
-        else:
-            out.append("x")
-    return "".join(out)
+    return _mask(command, mask_double=True)
 
 
 # Shell builtins whose whole point is to mutate the SHELL's own state. The
@@ -240,12 +251,79 @@ _SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|;|\||\n")
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
 
 
-def detachment_match(command: str) -> tuple[str, str] | None:
+# Command words whose `-c` argument is a shell PROGRAM, not data. A `&` in
+# there backgrounds inside the inner shell, and GNU `timeout` exits with its
+# DIRECT child, so the grandchild survives -- the mctl-telegram#652 shape
+# reached through a quoted payload (claude P2 on `624a433`).
+SHELL_COMMAND_WORDS = frozenset({"ash", "bash", "busybox", "dash", "ksh", "sh", "zsh"})
+
+# How far to follow nested payloads (`bash -c "bash -c '...'"`). Three is well
+# past anything legitimate; the cap only stops a pathological input from
+# costing unbounded work.
+MAX_PAYLOAD_DEPTH = 3
+
+_SUBSTITUTION_OPEN_RE = re.compile(r"\$\(")
+
+
+def _command_substitutions(command: str) -> list[str]:
+    """Contents of every `$(...)` and backtick pair that the shell would run.
+
+    Single-quoted regions are masked (no substitution happens there); DOUBLE
+    quotes are left transparent, because `"$(cmd &)"` does substitute.
+    """
+    visible = _mask(command, mask_double=False)
+    found: list[str] = []
+
+    position = 0
+    while True:
+        opened = _SUBSTITUTION_OPEN_RE.search(visible, position)
+        if opened is None:
+            break
+        depth = 1
+        index = opened.end()
+        while index < len(visible) and depth:
+            if visible[index] == "(":
+                depth += 1
+            elif visible[index] == ")":
+                depth -= 1
+            index += 1
+        if depth == 0:
+            found.append(command[opened.end():index - 1])
+        position = opened.end()
+
+    backticks = [i for i, ch in enumerate(visible) if ch == "`"]
+    for start, end in zip(backticks[::2], backticks[1::2], strict=False):
+        found.append(command[start + 1:end])
+    return found
+
+
+def _shell_c_payloads(command: str) -> list[str]:
+    """The argument of a `-c` flag passed to a shell, if any."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return []
+    found: list[str] = []
+    for index, word in enumerate(words):
+        if word != "-c" or index + 1 >= len(words):
+            continue
+        if any(earlier.split("/")[-1] in SHELL_COMMAND_WORDS for earlier in words[:index]):
+            found.append(words[index + 1])
+    return found
+
+
+def detachment_match(command: str, _depth: int = 0) -> tuple[str, str] | None:
     """``(label, fragment)`` for the first detachment form found, else None.
 
     ``fragment`` is the offending text with a little surrounding context,
     so a denial can quote what actually tripped it instead of leaving the
     agent to guess which part of a long command was the problem.
+
+    Operators are read against the quote-masked command, so quoted text is
+    data. But quoted text that the shell will EXECUTE -- a `bash -c` payload,
+    a command substitution -- is scanned recursively at its own level, so
+    `bash -c "cmd &"` and `"$(cmd &)"` are caught rather than admitted by the
+    very masking that fixed the false positives (claude P2 on `624a433`).
     """
     normalized = normalize_shell_command(command)
     masked = mask_quoted(normalized)
@@ -261,6 +339,16 @@ def detachment_match(command: str) -> tuple[str, str] | None:
         if end < len(normalized):
             fragment = fragment + "…"
         return label, fragment
+
+    if _depth >= MAX_PAYLOAD_DEPTH:
+        return None
+    for payload in _command_substitutions(normalized) + _shell_c_payloads(normalized):
+        if not payload:
+            continue
+        nested = detachment_match(payload, _depth + 1)
+        if nested is not None:
+            label, fragment = nested
+            return label, f"{fragment} (inside an executed payload)"
     return None
 
 

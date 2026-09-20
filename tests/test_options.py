@@ -1143,6 +1143,25 @@ def test_the_os_bound_always_fires_before_the_cli_tool_timeout(tmp_path, monkeyp
             assert out["updatedInput"]["timeout"] <= caller_timeout_ms
 
 
+def test_the_bash_tool_ceiling_binds_the_effective_budget_not_just_the_clamp(
+    tmp_path, monkeypatch
+):
+    """claude P3 on `624a433`: the Bash tool ignores a `timeout` above its own
+    ceiling. Clamping only the tool input would leave the OS bound ABOVE the
+    CLI's real timer, putting the CLI first again."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 900.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    ledger = options.CommandBudgetLedger()
+    cb = _guard_for(tmp_path, ledger, remaining=5000.0)
+    out = _run_guard(cb, {"command": "pytest -q"})["hookSpecificOutput"]
+    assert out["updatedInput"]["timeout"] == options.BASH_TOOL_MAX_TIMEOUT_MS
+    assert (
+        _os_bound_seconds(out["updatedInput"]["command"]) * 1000
+        < out["updatedInput"]["timeout"]
+    )
+
+
 def test_deadline_guard_allows_a_quoted_ampersand(tmp_path, monkeypatch):
     """claude P2 on `630ac27`: `&` inside quotes is data, not the async-list
     operator, and denying it blocked ordinary commits."""

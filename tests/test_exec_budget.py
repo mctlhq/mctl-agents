@@ -320,3 +320,52 @@ def test_wrap_bounded_rounds_the_kill_grace_up_not_down():
     """Shortening the SIGKILL backstop weakens the one guarantee it gives."""
     rendered = exec_budget.wrap_bounded(budget_s=300.0, command="x", kill_after_s=4.2)
     assert "--kill-after=5s" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Quoted text that the shell EXECUTES (claude P2 on `624a433`): masking is the
+# right reading for operators, but a `bash -c` payload or a command
+# substitution is a shell program, and GNU `timeout` exits with its DIRECT
+# child -- so a backgrounded grandchild in there is the #652 shape again.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        'bash -c "cmd &"',
+        "bash -c 'go test ./... &'",
+        "sh -c 'nohup ./run.sh'",
+        "/bin/bash -c 'setsid ./run.sh'",
+        'echo "$(cmd &)"',
+        "X=`slow &` echo hi",
+        'bash -c "bash -c \'x &\'"',
+    ],
+)
+def test_detachment_match_follows_executed_payloads(command):
+    found = exec_budget.detachment_match(command)
+    assert found is not None, command
+    assert "inside an executed payload" in found[1]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "A & B"',
+        "bash -c 'echo \"A & B\"'",
+        'echo "$(date)"',
+        "grep -r 'disown' .",
+        'python -c "print(1) # setsid"',
+    ],
+)
+def test_executed_payload_recursion_does_not_reintroduce_false_positives(command):
+    assert exec_budget.detachment_match(command) is None
+
+
+def test_payload_recursion_is_depth_bounded():
+    """A pathological nest must cost bounded work, not unbounded."""
+    nested = "cmd &"
+    for _ in range(exec_budget.MAX_PAYLOAD_DEPTH + 3):
+        nested = f"bash -c {nested!r}"
+    # Either it is caught within the cap or it is not; what must not happen is
+    # recursion without a limit.
+    exec_budget.detachment_match(nested)
+    assert exec_budget.MAX_PAYLOAD_DEPTH >= 1
