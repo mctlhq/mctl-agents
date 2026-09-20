@@ -297,9 +297,17 @@ def _reply_dispatch_failed(author: str, error: Exception, attempt: int) -> str:
     # Deliberately NOT carrying the ack trailer — see the module docstring.
     # Carries a fail_trailer instead (appended by the caller) so the retry
     # budget below can be counted across ticks.
+    #
+    # Only `type(error).__name__` goes into the reply, never `str(error)`
+    # (claude P3 on #421): an `httpx.HTTPStatusError`/`ConnectError` message
+    # can carry `MCTL_API_BASE_URL`'s host, port and route — internal
+    # topology on a self-hosted deployment, published permanently to a
+    # public, indexed GitHub comment. The full exception still goes to the
+    # poller's own log stream (the `print` at the call site), where an
+    # operator actually debugs from.
     return (
-        f"@{author} the re-investigation dispatch failed ({error}). This will be "
-        f"retried on the next poll tick ({attempt}/{MAX_DISPATCH_ATTEMPTS})."
+        f"@{author} the re-investigation dispatch failed ({type(error).__name__}). This "
+        f"will be retried on the next poll tick ({attempt}/{MAX_DISPATCH_ATTEMPTS})."
     )
 
 
@@ -307,10 +315,13 @@ def _reply_dispatch_gave_up(author: str, error: Exception, attempts: int) -> str
     # Carries the ack trailer — this IS the give-up: no further tick may
     # retry a comment id that has already failed MAX_DISPATCH_ATTEMPTS
     # times, or the failure becomes an unbounded comment-spam loop.
+    #
+    # Same reasoning as `_reply_dispatch_failed` above: only the exception's
+    # type name is public, never its message.
     return (
-        f"@{author} the re-investigation dispatch failed ({error}) {attempts} times in a "
-        "row. Giving up — this directive will not be retried automatically; an operator "
-        "must check mctl-api and resubmit manually."
+        f"@{author} the re-investigation dispatch failed ({type(error).__name__}) "
+        f"{attempts} times in a row. Giving up — this directive will not be retried "
+        "automatically; an operator must check mctl-api and resubmit manually."
     )
 
 
@@ -497,13 +508,31 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
     # applied round-robin across issues instead of by proposal order — see
     # the cap loop's comment for why a flat ordering starves every issue
     # after the first noisy one.
-    pending_by_issue: dict[tuple[str, str], list[tuple[ProposalStateRef, str, Directive, int]]] = {}
-    issue_order: list[tuple[str, str]] = []
+    #
+    # Keyed by `issue_url`, NOT `(ref.service, ref.slug)`: the ambiguous
+    # case (one issue backing multiple proposal directories, handled below
+    # via `_handle_directive`'s own `matches` lookup) means several refs in
+    # `candidates` can resolve to the same `issue_url`. Keying by proposal
+    # made `read_issue_comments` run once per proposal sharing that issue
+    # instead of once per issue, and put the same unacked directive comment
+    # into multiple buckets — each processed independently by
+    # `_handle_directive`, which posted a duplicate `_reply_ambiguous` reply
+    # per proposal and charged the per-tick `--max-directives` budget once
+    # per duplicate instead of once per actual dispatch decision (agy P2 /
+    # claude P3 on #421). `matches` is re-derived from the issue number
+    # inside `_handle_directive` regardless of which of the tied refs is
+    # passed in, so any one representative ref for the issue is sufficient.
+    pending_by_issue: dict[str, list[tuple[ProposalStateRef, str, Directive, int]]] = {}
+    issue_order: list[str] = []
+    seen_issue_urls: set[str] = set()
     failed = 0
     for ref in candidates:
         issue_url = issue_url_for(ref.service, ref.slug)
         if issue_url is None:
             continue
+        if issue_url in seen_issue_urls:
+            continue
+        seen_issue_urls.add(issue_url)
         try:
             # Off the event loop: this scan can make one `gh issue view`
             # call per non-terminal proposal (tens of them at production
@@ -531,14 +560,13 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
 
         acked = acked_comment_ids(comments)
         fail_counts = failed_attempt_counts(comments)
-        key = (ref.service, ref.slug)
         for directive in parse_comments(comments):
             if not directive.comment_id or directive.comment_id in acked:
                 continue
-            if key not in pending_by_issue:
-                pending_by_issue[key] = []
-                issue_order.append(key)
-            pending_by_issue[key].append(
+            if issue_url not in pending_by_issue:
+                pending_by_issue[issue_url] = []
+                issue_order.append(issue_url)
+            pending_by_issue[issue_url].append(
                 (ref, issue_url, directive, fail_counts.get(directive.comment_id, 0))
             )
 

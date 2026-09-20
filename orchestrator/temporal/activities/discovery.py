@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 from temporalio import activity
@@ -19,6 +20,7 @@ from orchestrator.run_issue_directive_poller import (
     TERMINAL_STATUSES as DIRECTIVE_TERMINAL_STATUSES,
 )
 from orchestrator.run_issue_directive_poller import (
+    _scan_disabled,
     issue_url_for,
     read_issue_comments,
 )
@@ -134,6 +136,73 @@ def _project(status: str, merged: bool, closed_unmerged: bool, repo: str, number
     return status, None
 
 
+def _parse_timestamp(value: str | None) -> datetime | None:
+    """Parse an RFC 3339 / ISO 8601 timestamp into a timezone-aware
+    `datetime`, or None when unparseable or absent.
+
+    Never compare `ref.updated_at`/`directive.created_at` as raw strings:
+    GitHub's `createdAt` uses a `Z` suffix (`...T...Z`), while an unquoted
+    `.status.yaml` timestamp parses to a native `datetime.datetime` whose
+    `str()` form uses a space separator and a `+00:00` offset
+    (`gitops_state._parse_status_yaml`). Because `'T' > ' '` and `'Z' > '+'`
+    in ASCII, `<=` on the two raw strings gives the wrong answer across that
+    format boundary — a directive from earlier the same day can compare as
+    "newer" than it is, so this must always go through actual `datetime`
+    values instead.
+
+    An unquoted `.status.yaml` timestamp with no offset at all (PyYAML
+    parses e.g. `2026-09-19 10:00:00` to a naive `datetime`, and `str()` of
+    that drops no information there is none of) yields a naive result here
+    too; assumed UTC, since every timestamp this module ever writes or reads
+    (GitHub's `createdAt`, this repo's own `updated_at` writers) is UTC.
+    Comparing a naive and an aware `datetime` raises `TypeError`, which
+    would turn one proposal's odd status file into a sweep-ending crash
+    (the same class of thing `list_proposal_refs`' per-file tolerance
+    exists to prevent) rather than the report-only best-effort this is.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+# Rotates the `_stale_directives` scan window across ticks so every
+# candidate is eventually examined, instead of the same alphabetically-first
+# `MAX_STALE_DIRECTIVE_CANDIDATES` forever. `list_proposal_refs` returns
+# proposals in stable git-tree order every tick and this activity is
+# read-only and stateless — no cursor, offset, or persisted progress marker
+# — so a fixed prefix slice permanently starves everything past index
+# `MAX_STALE_DIRECTIVE_CANDIDATES` (agy P2 on #421; the same class of bug
+# PR #415 fixed in visibility.py's per-id traversal, and #417's own earlier
+# review before that). This cursor is process-lifetime state, the same
+# category `_blob_cache` already is — not durable across a worker restart,
+# but a restart also empties `_blob_cache` and the sweep still converges,
+# just from position zero again.
+_stale_directive_cursor = 0
+
+
+def _rotate_window(items: list[ProposalStateRef], cap: int) -> list[ProposalStateRef]:
+    """Up to `cap` items starting at the module cursor, wrapping around, and
+    advance the cursor so the next call continues where this one left off —
+    every item is examined within ceil(len(items) / cap) ticks rather than
+    never, once the list exceeds `cap`.
+    """
+    global _stale_directive_cursor
+    n = len(items)
+    if n <= cap:
+        _stale_directive_cursor = 0
+        return items
+    start = _stale_directive_cursor % n
+    window = [items[(start + i) % n] for i in range(cap)]
+    _stale_directive_cursor = (start + cap) % n
+    return window
+
+
 async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective]:
     """Every unacked directive-shaped comment newer than its proposal's
     `updated_at`, across `refs`. One `gh issue view` per ref, same
@@ -145,20 +214,34 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
     stale — there is nothing to compare against, and reporting nothing
     would be exactly the silence this check exists to catch.
 
-    Bounded at `MAX_STALE_DIRECTIVE_CANDIDATES`: this is a report-only,
-    best-effort sweep, not the reason `discover_and_project` exists, and an
-    unbounded sequential `gh` sweep here would sit on the critical path of
-    the whole reconcile tick (codex review on #417). Candidates beyond the
-    cap are skipped this tick and picked up by a later one.
+    Bounded at `MAX_STALE_DIRECTIVE_CANDIDATES` per tick via a rotating
+    window (`_rotate_window`): this is a report-only, best-effort sweep, not
+    the reason `discover_and_project` exists, and an unbounded sequential
+    `gh` sweep here would sit on the critical path of the whole reconcile
+    tick (codex review on #417) — but the window's start position advances
+    every tick rather than staying pinned to the same prefix, so every
+    candidate is eventually examined instead of the ones past the cap being
+    permanently skipped.
+
+    Consults `run_issue_directive_poller._scan_disabled()`
+    (`MCTL_DIRECTIVE_SCAN_ENABLED=false`) first: that env var is documented
+    as the feature's "fastest kill, no deploy" switch, and this sweep is
+    part of the same feature (mctl-agents#417) — flipping the switch must
+    stop it from making `gh` calls too, not just `run_issue_directive_poller
+    .scan()` (claude P3, repeated across rounds on #421).
     """
+    if _scan_disabled():
+        return []
     if len(refs) > MAX_STALE_DIRECTIVE_CANDIDATES:
         activity.logger.warning(
-            "reconcile: %d directive-staleness candidate(s) found — capping this "
-            "tick's sweep at %d; the rest are picked up by a later tick",
+            "reconcile: %d directive-staleness candidate(s) found — scanning a "
+            "rotating window of %d this tick; every candidate is covered "
+            "within %d tick(s)",
             len(refs),
             MAX_STALE_DIRECTIVE_CANDIDATES,
+            -(-len(refs) // MAX_STALE_DIRECTIVE_CANDIDATES),
         )
-        refs = refs[:MAX_STALE_DIRECTIVE_CANDIDATES]
+        refs = _rotate_window(refs, MAX_STALE_DIRECTIVE_CANDIDATES)
 
     stale: list[StaleDirective] = []
     for ref in refs:
@@ -180,7 +263,9 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
         for directive in parse_comments(comments):
             if not directive.comment_id or directive.comment_id in acked:
                 continue
-            if ref.updated_at and directive.created_at and directive.created_at <= ref.updated_at:
+            ref_updated_at = _parse_timestamp(ref.updated_at)
+            directive_created_at = _parse_timestamp(directive.created_at)
+            if ref_updated_at and directive_created_at and directive_created_at <= ref_updated_at:
                 continue
             stale.append(
                 StaleDirective(

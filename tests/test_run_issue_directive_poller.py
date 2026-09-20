@@ -499,6 +499,43 @@ def test_max_directives_round_robins_across_issues_not_by_issue_order(monkeypatc
     assert dispatched_issue_urls == {url_a, url_b}
 
 
+def test_ambiguous_same_issue_proposals_are_scanned_and_replied_once(monkeypatch):
+    """Two proposal directories that both resolve to the same GitHub issue
+    (the ambiguous case `_handle_directive` detects via `matches`) must be
+    treated as ONE pending bucket, not two: `pending_by_issue` used to be
+    keyed by `(ref.service, ref.slug)`, so `read_issue_comments` ran once
+    per proposal sharing the issue and the same unacked comment was queued
+    under both keys — producing a duplicate `_reply_ambiguous` reply and
+    burning two `--max-directives` slots for what is a single dispatch
+    decision (agy P2 / claude P3 on #421)."""
+    gh = FakeGitHub()
+    ref_a = _ref(slug="issue-9-fix")
+    ref_b = _ref(slug="issue-9-fix-renamed")
+    issue_url = run_issue_directive_poller.issue_url_for(ref_a.service, ref_a.slug)
+    assert issue_url == run_issue_directive_poller.issue_url_for(ref_b.service, ref_b.slug)
+    gh.add_comment(issue_url)
+
+    read_calls: list[str] = []
+    real_run = gh.run
+
+    def counting_run(cmd):
+        if cmd[:3] == ["gh", "issue", "view"]:
+            read_calls.append(cmd[-1])
+        return real_run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", counting_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref_a, ref_b]))
+    submitted: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submitted))
+
+    result = _run_scan(max_directives=10)
+
+    assert read_calls == [issue_url], "read_issue_comments must run once per issue, not once per proposal"
+    assert result.replied == 1, "the same directive comment must be actioned once, not once per proposal"
+    assert result.dispatched == 0
+    assert len(gh.comments[issue_url]) == 2, "seed comment + exactly one ambiguous reply"
+
+
 def test_a_gh_failure_on_one_issue_does_not_stop_the_scan(monkeypatch):
     gh = FakeGitHub()
     bad_ref = _ref(slug="issue-1-bad")
