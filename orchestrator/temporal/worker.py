@@ -47,6 +47,7 @@ from orchestrator.temporal.activities.deploy_state import (
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.incidents import list_service_incidents
 from orchestrator.temporal.activities.issue_poll import poll_issues_activity
+from orchestrator.temporal.activities.issue_state import get_issue_state
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
 from orchestrator.temporal.activities.lifecycle_reconcile import (
     reconcile_lifecycle_ownership,
@@ -523,6 +524,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         reconcile_lifecycle_ownership,
         find_proposal_slug,
         get_pr_state,
+        get_issue_state,
         resolve_deploy_target,
         get_release_after,
         get_deploy_status,

@@ -189,6 +189,32 @@ def test_prepatch_histories_predate_the_exec_queue_flip(scenario: Scenario) -> N
     )
 
 
+def test_dev_loop_prepatch_history_predates_the_stale_issue_gate() -> None:
+    """mctl-agents#410: `dev_loop_full.prepatch.json` is also the fixture
+    proving `workflow.patched("stale-issue-admission")` guards correctly.
+
+    Recorded long before this change, its history carries no marker for the
+    new patch id -- so `test_recorded_history_replays_against_current_definitions`
+    replaying it clean (above, parametrized over every scenario) is exactly
+    the "old history takes the legacy branch" guarantee task 8 asks for: the
+    new `get_issue_state` command never gets scheduled against this history,
+    or replay would have raised NondeterminismError.
+    """
+    scenario = scenario_by_name("dev_loop_full")
+    events = _events(scenario)
+    assert "stale-issue-admission" not in _patch_ids(events), (
+        f"{scenario.path.name} records the stale-issue-admission patch, so "
+        "it no longer exercises the unpatched branch this test is about. "
+        "Restore it from git rather than re-recording."
+    )
+    assert not any(
+        name == "get_issue_state" for name, _queue in _scheduled_activities(events)
+    ), (
+        f"{scenario.path.name} schedules get_issue_state -- a pre-patch "
+        "history must not, or it was recorded after this change landed."
+    )
+
+
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
 async def test_patched_history_replays_against_current_definitions(
     scenario: Scenario,

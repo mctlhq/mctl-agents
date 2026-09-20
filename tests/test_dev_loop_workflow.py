@@ -24,6 +24,7 @@ from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
+from orchestrator.temporal.activities.issue_state import IssueState
 from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest, OwnershipResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
@@ -130,6 +131,14 @@ async def _fake_find_proposal_slug(service: str, issue_number: str) -> str | Non
     return f"issue-{issue_number}-fake-title"
 
 
+@activity.defn(name="get_issue_state")
+async def _fake_get_issue_state_open(repo: str, issue_number: int) -> IssueState:
+    """The stale-issue gate's default fake for tests that build their own
+    activity list by hand (mctl-agents#410): open, so the gate never fires
+    and every existing test's command sequence is unaffected."""
+    return IssueState(state="open")
+
+
 pytestmark = pytest.mark.anyio
 
 TASK_QUEUE = "test-mctl-dev-loop"
@@ -145,6 +154,11 @@ def _fake_activities(
     *,
     released: bool,
     investigate_phase: str = "Succeeded",
+    # mctl-agents#410: defaults to "open" so every pre-existing test in this
+    # module (none of which cares about the stale-issue gate) reaches
+    # find_proposal_slug/approve exactly as before.
+    issue_state: str = "open",
+    issue_state_raises: bool = False,
     pr_states: list[PRState] | None = None,
     pr_state_raises_after: int | None = None,
     pr_state_error_type: str | None = None,
@@ -207,6 +221,16 @@ def _fake_activities(
         if agent in (unpinned or set()):
             return None
         return resolved.get(agent) if released else None
+
+    @activity.defn(name="get_issue_state")
+    async def fake_get_issue_state(repo: str, issue_number: int) -> IssueState:
+        if issue_state_raises:
+            raise ApplicationError("github unreachable", non_retryable=True)
+        return IssueState(
+            state=issue_state,
+            state_reason="completed" if issue_state == "closed" else None,
+            closed_at="2026-09-06T00:00:00Z" if issue_state == "closed" else None,
+        )
 
     calls: list[str] = []
     ownership_ops: list[OwnershipRequest] = []
@@ -499,6 +523,7 @@ def _fake_activities(
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        fake_get_issue_state,
         fake_get_pr_state,
         fake_resolve_deploy_target,
         fake_get_release_after,
@@ -539,6 +564,66 @@ class TestDevLoopWorkflow:
         assert result.approve.phase == "Succeeded"
         assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
 
+    async def test_closed_issue_skips_approve_and_implement(self, env):
+        """mctl-agents#410: an issue closed while this loop sat at the
+        approval wait must stop the loop right there -- no approve CWFT, no
+        implement CWFT, and a result that carries no PR/implement outcome."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, issue_state="closed",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/510"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.investigate.phase == "Succeeded"
+        assert result.implement is None
+        assert result.approve is None
+        # Neither approve nor implement were ever submitted to Argo.
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_get_issue_state_failure_fails_open(self, env):
+        """A GitHub blip on the stale-issue check must never wedge the loop
+        -- the implementer's own admission gate is the authoritative check,
+        so this side proceeds exactly as if the issue were open."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, issue_state_raises=True,
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/511"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+
     async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
         """The implement CWFT must only be allowed to touch proposals under
         this issue's own repo (the `service` param) — otherwise approve()
@@ -572,6 +657,7 @@ class TestDevLoopWorkflow:
             capturing_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -657,6 +743,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -704,6 +791,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -758,6 +846,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -913,6 +1002,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             always_failing_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -975,6 +1065,7 @@ class TestDevLoopWorkflow:
                 fake_submit_and_wait,
                 fake_record_execution,
                 missing_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1027,6 +1118,7 @@ class TestDevLoopWorkflow:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1076,6 +1168,7 @@ class TestDevLoopWorkflow:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1130,6 +1223,7 @@ class TestDevLoopWorkflow:
                 failing_approve_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
