@@ -63,7 +63,7 @@ async def status(workflow_id: str) -> None:
             abandon_state = await handle.query(DevLoopWorkflow.abandon_state)
             if abandon_state.abandoned:
                 print(f"  abandoned:   {abandon_state.reason}")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — query failure must not fail status print
             pass
     if desc.status is not None and desc.status.name == "COMPLETED":
         result: DevLoopResult = await handle.result()

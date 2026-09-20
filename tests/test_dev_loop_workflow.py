@@ -1660,7 +1660,7 @@ class TestDevLoopWorkflow:
         """mctl-agents#420: an abandon signal delivered before _watch_pr begins
         (while implement is running) must end the execution gracefully
         without UnboundLocalError, without calling _watch_pr, and without leaking ownership."""
-        base_activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+        base_activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
             released=True,
         )
         old_submit = next(a for a in base_activities if getattr(a, "__name__", "") == "fake_submit_and_wait")
