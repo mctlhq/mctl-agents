@@ -387,7 +387,17 @@ def _command_audit_hooks() -> dict[HookEventName, list[HookMatcher]]:
 # explicitly) is exactly the "exact textual spelling instead of command
 # semantics" mistake this pattern exists to avoid (mctl-agents#423
 # fix-forward, verified Agy P2 on PR #425's merged head).
-_GH_GLOBAL_FLAG = r"(?:-[A-Za-z]|--[A-Za-z][\w-]*)(?:[=\s]\S+)?"
+#
+# The short-flag branch is `-[A-Za-z]\S*` rather than a bare `-[A-Za-z]`: gh
+# (Go's pflag) accepts an attached shorthand value with no separator at all
+# (`-Rowner/repo`), and `\S*` swallows it as part of the flag token so it is
+# never mistaken for the subcommand. The value branch is `=\S*|\s+\S+`
+# rather than `[=\s]\S+`: the latter treats `=`/whitespace as a single
+# interchangeable character, so `-R  owner/repo` (two spaces — including a
+# continuation normalized to more than one space) left `owner/repo`
+# unconsumed once the first space was spent on `[=\s]` (verified Agy P2,
+# round 2, on this same PR).
+_GH_GLOBAL_FLAG = r"(?:-[A-Za-z]\S*|--[A-Za-z][\w-]*)(?:=\S*|\s+\S+)?"
 _GH_PREFIX = rf"\bgh\b(?:\s+{_GH_GLOBAL_FLAG})*"
 
 # Bash command shapes that fetch a CI log with no bound of their own
@@ -408,7 +418,7 @@ _CI_LOG_DENY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 
 
 def _normalize_shell_command(command: str) -> str:
-    """Collapse backslash-newline line continuations to a single space.
+    """Collapse backslash-newline line continuations the way the shell does.
 
     A deny pattern anchored on adjacent tokens (`gh run view`) can otherwise
     be defeated by splitting the invocation across lines with a trailing
@@ -417,7 +427,17 @@ def _normalize_shell_command(command: str) -> str:
     (mctl-agents#423 fix-forward, verified Agy P2 on PR #425's merged head).
     Real (non-continued) newlines are left alone: they are genuine command
     boundaries and `[^&|;\n]*` is deliberately still stopped by those.
+
+    POSIX line continuation (`\\<newline>`) is removed with nothing inserted
+    in its place — the two lines it joins become one unbroken token. A first
+    pass therefore strips a continuation sitting directly between two
+    non-whitespace characters (`vi\\\new` -> `view`) with no replacement; a
+    plain space there would silently split a token the shell reassembles
+    (verified Agy P2, round 2, on this same PR). A continuation with
+    whitespace on at least one side is a token boundary either way, and
+    collapses to a single space as before.
     """
+    command = re.sub(r"(?<=\S)\\[ \t]*\r?\n(?=\S)", "", command)
     return re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", command)
 
 
