@@ -86,6 +86,16 @@ def env():
     return ActivityEnvironment()
 
 
+def _ceiling_for(n_ids: int) -> int:
+    """The activity's own per-chunk traversal ceiling for a chunk of `n_ids`."""
+    from orchestrator.temporal.activities.visibility import (
+        _LISTED_PER_ID_HEADROOM,
+        _MAX_EXAMINED_PER_ID,
+    )
+
+    return n_ids * _MAX_EXAMINED_PER_ID * _LISTED_PER_ID_HEADROOM
+
+
 class TestTheExaminationBound:
     """review P2 on `8297c3d`: the per-execution history read was unbounded.
 
@@ -221,10 +231,9 @@ class TestTheExaminationBound:
         by recency, so a quiet id keeps the listing open while a noisy id's
         ever-growing tail scrolls past. The ceiling is what makes the traversal
         bounded unconditionally."""
-        from orchestrator.temporal.activities.visibility import _MAX_LISTED_PER_CHUNK
-
+        ceiling = _ceiling_for(2)
         quiet = "implement-sweep-mctl-api-issue-11-quiet"
-        executions = [_execution("ImplementationFailed") for _ in range(_MAX_LISTED_PER_CHUNK + 50)]
+        executions = [_execution("ImplementationFailed") for _ in range(ceiling + 50)]
         # one quiet id that never reaches the cap, so `remaining` never empties
         executions[0].id = quiet
         client = _client(executions)
@@ -235,7 +244,43 @@ class TestTheExaminationBound:
         await env.run(acts.count_swept_prestart_failures, [CHILD_ID, quiet])
 
         walked = len(beats) - 1
-        assert walked <= _MAX_LISTED_PER_CHUNK + 1
+        assert walked <= ceiling + 1
+
+    async def test_the_ceiling_scales_with_the_actual_chunk_size(self, env):
+        """Derived from `len(chunk)`, not `_ID_CHUNK`. The shape the ceiling
+        exists for — one quiet id holding the listing open while a noisy id's
+        tail scrolls past — happens in SMALL chunks, so a ceiling sized for a
+        full 100-id chunk would be loosest exactly where it has to work."""
+        client = _client([_execution("ImplementationFailed") for _ in range(_ceiling_for(1) + 200)])
+        acts = VisibilityActivities(client)
+        beats: list = []
+        env.on_heartbeat = beats.append
+
+        await env.run(acts.count_swept_prestart_failures, [CHILD_ID, "implement-sweep-x-quiet"])
+
+        assert len(beats) - 1 <= _ceiling_for(2) + 1
+
+    async def test_an_id_the_ceiling_never_reached_reads_as_zero_not_unknown(self, env):
+        """The deliberate exception to "an absent count is not a zero count".
+
+        Omitting here would be STABLE starvation: the listing is most-recent
+        first and the candidate list is rebuilt in the same order every tick, so
+        an id beyond the ceiling would be omitted forever and never submitted
+        again. Reporting zero submits it once more, and that submit mints a
+        fresh pre-start row that is the newest in the chunk, so the count
+        self-corrects. Pinned because the module states the opposite rule twice
+        for the other two categories, and nothing said which one governs here.
+        """
+        quiet = "implement-sweep-mctl-api-issue-11-quiet"
+        executions = [_execution("ImplementationFailed") for _ in range(_ceiling_for(2) + 50)]
+        executions[0].id = quiet
+        client = _client(executions)
+        acts = VisibilityActivities(client)
+
+        counts = await env.run(acts.count_swept_prestart_failures, [CHILD_ID, quiet])
+
+        assert quiet in counts, "an unreached id is reported, not omitted"
+        assert counts[quiet] == 0
 
 
 class TestCountSweptPrestartFailures:

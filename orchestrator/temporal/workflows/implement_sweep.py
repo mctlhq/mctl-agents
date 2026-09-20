@@ -335,13 +335,19 @@ class ImplementSweepWorkflow:
                     "count_swept_prestart_failures",
                     child_ids,
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
-                    # The only read here that makes an unbounded-in-principle
-                    # number of RPCs (one per examined execution). A heartbeat
-                    # timeout is what turns a wedged Temporal into a fast,
-                    # retryable failure instead of burning the full
-                    # start_to_close on every one of three attempts. The
-                    # activity's own per-id cap is what bounds the work; this
-                    # bounds how long a stall goes unnoticed.
+                    # The read here that makes the most RPCs (one per examined
+                    # execution). A heartbeat timeout turns a wedged Temporal
+                    # into a fast, retryable failure instead of burning the full
+                    # start_to_close on every one of three attempts.
+                    #
+                    # The activity bounds its own work with THREE limits, not
+                    # one: a per-id cap on history fetches, a break once every
+                    # id in a chunk is capped, and an unconditional per-chunk
+                    # traversal ceiling — bounding the fetches while leaving the
+                    # walk unbounded only moved the wedge. Its listing phase
+                    # also beats before its first row, so a chunk that lists
+                    # nothing does not inherit this 30s deadline in place of the
+                    # 5-minute start_to_close above.
                     heartbeat_timeout=BUDGET_QUERY_HEARTBEAT_TIMEOUT,
                     retry_policy=ACTIVITY_RETRY_POLICY,
                 )

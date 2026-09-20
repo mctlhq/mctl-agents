@@ -78,7 +78,28 @@ _MAX_EXAMINED_PER_ID = 12
 # A count short of the true total is the safe direction here and is the same
 # trade the pre-start filter already makes: under-charging the budget costs one
 # extra resubmit, over-charging can make a proposal permanently unsweepable.
-_MAX_LISTED_PER_CHUNK = _ID_CHUNK * _MAX_EXAMINED_PER_ID * 4
+#
+# WHAT THIS DOES TO AN ID IT NEVER REACHED, settled deliberately, because the
+# rest of this module states the opposite rule twice (`_SAFE_ID` above, and the
+# docstring below: "an absent count is not a zero count"). The ceiling creates a
+# THIRD category — queried, but not walked far enough to have looked — and it
+# reports those ids as `0`, the permissive value, rather than omitting them.
+#
+# That is the right side here, and for a reason that does not apply to the
+# other two: omitting would be STABLE starvation. The listing is most-recent
+# first and the candidate list is rebuilt in the same order every tick, so an
+# id whose rows all sit beyond the ceiling would be omitted on every tick
+# forever and never submitted again — the exact anti-pattern this PR removed
+# twice. Reporting `0` submits it once more, and that submit mints a fresh
+# pre-start row which is the NEWEST row in the chunk, so the count self-corrects
+# within a few ticks. One extra submit versus permanent starvation.
+#
+# Scaled by the ACTUAL chunk size, not `_ID_CHUNK` (its maximum), or the
+# backstop is loosest exactly where it has to work. The shape `remaining`
+# cannot catch is one quiet id holding the listing open while a noisy id's tail
+# scrolls past — and a chunk with two ids is a SMALL chunk, which a ceiling
+# sized for 100 ids would let walk 200x its own window instead of 4x.
+_LISTED_PER_ID_HEADROOM = 4
 
 
 class VisibilityActivities:
@@ -176,18 +197,30 @@ class VisibilityActivities:
             # heartbeat silence under a 30s deadline instead of the 5-minute
             # start_to_close declared beside it (review P2).
             activity.heartbeat(f"listing {len(chunk)} id(s)")
+            # Two different scopes, easy to misread as one: `examined` is per
+            # id and persists ACROSS chunks, while `walked` and its ceiling are
+            # per chunk and reset with each listing.
             remaining = set(chunk)
             walked = 0
+            ceiling = len(chunk) * _MAX_EXAMINED_PER_ID * _LISTED_PER_ID_HEADROOM
             async for wf in self._client.list_workflows(
                 f"WorkflowId IN ({quoted}) AND ExecutionStatus = 'Failed'"
             ):
                 walked += 1
-                if walked > _MAX_LISTED_PER_CHUNK:
+                if walked > ceiling:
+                    # Name the ids: this line is the only signal this path
+                    # produces, and "counts are lower bounds" is not actionable
+                    # without knowing WHOSE budgets became lower bounds.
+                    unwalked = sorted(c for c in chunk if examined[c] == 0)
                     activity.logger.warning(
-                        "count_swept_prestart_failures: stopped walking this "
-                        "chunk's listing after %d row(s); counts for its id(s) "
-                        "are lower bounds over the most recent runs seen",
-                        _MAX_LISTED_PER_CHUNK,
+                        "count_swept_prestart_failures: stopped walking a "
+                        "%d-id chunk's listing after %d row(s); its counts are "
+                        "lower bounds, and %d id(s) were never reached at all: "
+                        "%s",
+                        len(chunk),
+                        ceiling,
+                        len(unwalked),
+                        unwalked,
                     )
                     break
                 # Every listed execution beats, whether or not it is examined.
