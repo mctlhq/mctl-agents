@@ -18,6 +18,7 @@ from orchestrator.directives import (
     RawComment,
     ack_trailer,
     acked_comment_ids,
+    bot_login_mismatch,
     fail_trailer,
     failed_attempt_counts,
     parse_comment,
@@ -144,12 +145,39 @@ def test_parse_comments_drops_non_directives():
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "comment_id",
-    ["IC_kwDOAbC1Y87abc123", "with-dash", "with_underscore", "mixed-id_123"],
+    [
+        "IC_kwDOAbC1Y87abc123",
+        "with-dash",
+        "with_underscore",
+        "mixed-id_123",
+        # GitHub's older opaque node id scheme: standard base64, which can
+        # carry `+`, `/` and trailing `=` padding — none of which the
+        # `-`/`_`-only charset a prior round of this regex used would match
+        # (claude P3 on #421).
+        "MDEyOklzc3VlQ29tbWVudDM4NTIwNjc2NTU=",
+        "abc+def/ghi==",
+        # A plain REST numeric comment id, the other shape `gh issue view`
+        # can return.
+        "2345678901",
+    ],
 )
 def test_ack_trailer_round_trips(comment_id):
     trailer = ack_trailer(comment_id)
     ids = acked_comment_ids([_comment(f"reply text\n\n{trailer}", author=_BOT_LOGIN)])
     assert ids == {comment_id}
+
+
+@pytest.mark.parametrize(
+    "comment_id",
+    ["MDEyOklzc3VlQ29tbWVudDM4NTIwNjc2NTU=", "abc+def/ghi==", "2345678901"],
+)
+def test_fail_trailer_round_trips_every_real_id_shape(comment_id):
+    """A generated trailer for any id shape `gh issue view` can actually
+    return must always be matched back out by `_FAIL_RE` — an unmatchable
+    fail marker silently resets the give-up counter to zero forever
+    (claude P3 on #421)."""
+    trailer = fail_trailer(comment_id)
+    assert failed_attempt_counts([_comment(f"reply\n\n{trailer}", author=_BOT_LOGIN)]) == {comment_id: 1}
 
 
 def test_a_quoted_trailer_inside_a_fenced_code_block_still_counts_as_acked():
@@ -218,3 +246,36 @@ def test_directive_is_a_frozen_dataclass():
     d = Directive(comment_id="1", author="a", created_at="t", verb=None, authorized=False)
     with pytest.raises(dataclasses.FrozenInstanceError):
         d.verb = "reinvestigate"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# bot_login_mismatch — table-driven per its own docstring ("pure so it can
+# be exhaustively unit-tested"), which had no direct test of its own before
+# (claude/agy P3 on #421; only exercised indirectly via
+# tests/test_run_issue_directive_poller.py's integration test).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("actual_login", "expect_mismatch"),
+    [
+        (_BOT_LOGIN, False),
+        (_BOT_LOGIN.upper(), False),  # case-insensitive match
+        (f"  {_BOT_LOGIN}  ", False),  # whitespace-stripped match
+        ("mctl-app", True),  # the customer-facing App, never trusted
+        ("someone-else", True),
+        ("", True),
+    ],
+)
+def test_bot_login_mismatch_table(actual_login, expect_mismatch):
+    result = bot_login_mismatch(actual_login)
+    if expect_mismatch:
+        assert result is not None
+        assert actual_login.strip() in result or repr(actual_login) in result
+    else:
+        assert result is None
+
+
+def test_bot_login_mismatch_message_names_both_the_actual_and_trusted_logins():
+    result = bot_login_mismatch("mctl-app")
+    assert result is not None
+    assert "mctl-app" in result
+    assert _BOT_LOGIN in result

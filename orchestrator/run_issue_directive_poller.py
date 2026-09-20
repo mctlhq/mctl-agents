@@ -114,6 +114,23 @@ _SUBMIT_TIMEOUT_SECONDS = 30.0
 _SLUG_ISSUE_RE = re.compile(r"^issue-(\d+)-")
 
 
+class DispatchOutcomeAmbiguous(Exception):
+    """Raised by `submit_investigate` when the POST to mctl-api may already
+    have crossed the remote side-effect boundary (an Argo workflow may
+    already be running) but this process cannot confirm either way — a 2xx
+    response whose body does not parse to a workflow identity, or a
+    `httpx.ReadTimeout` that could have landed server-side before it fired.
+
+    Deliberately a distinct type from every other `submit_investigate`
+    failure: those are safe to retry on the next tick (mctl-api definitely
+    rejected the request, or the connection never reached it), while this
+    one is NOT — blindly resubmitting could start a second, real, paid Argo
+    run for the same directive. Mirrors the refusal `orchestrator.temporal.
+    activities.argo`'s `submit_and_wait` already applies to the identical
+    parse-failure shape (`argo.py`, "would duplicate the real SDK run").
+    """
+
+
 def _scan_disabled() -> bool:
     """Fastest kill, no deploy: MCTL_DIRECTIVE_SCAN_ENABLED=false on the
     Temporal worker reverts the tick to label-only dispatch — nothing else
@@ -191,16 +208,39 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     `request` block. Threading the requester through to `.status.yaml`
     needs a follow-up change to the CWFT manifest in mctl-gitops before this
     poller can send `requested_by` again.
+
+    Raises `DispatchOutcomeAmbiguous` — never a plain `httpx`/parsing
+    exception — for the two cases where mctl-api may already have started
+    the workflow but this call cannot confirm it: a `ReadTimeout` (the
+    request may have been received before the read timed out) and a 2xx
+    response whose body does not parse to a workflow identity (mctl-api
+    accepted the operation; only the reply describing it is malformed). A
+    `raise_for_status()` failure (any 4xx/5xx) is left as a plain
+    `httpx.HTTPStatusError` — mctl-api affirmatively rejected the request,
+    so nothing could have started and the caller's normal retry is safe.
     """
     params = {"issue_url": issue_url}
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=_SUBMIT_TIMEOUT_SECONDS) as client:
-        response = await client.post(
-            f"/api/v1/operations/{INVESTIGATE_OPERATION}/execute",
-            json=params,
-            headers=auth_headers(),
-        )
+        try:
+            response = await client.post(
+                f"/api/v1/operations/{INVESTIGATE_OPERATION}/execute",
+                json=params,
+                headers=auth_headers(),
+            )
+        except httpx.ReadTimeout as exc:
+            raise DispatchOutcomeAmbiguous(
+                f"timed out waiting for mctl-api's response to {INVESTIGATE_OPERATION} for "
+                f"{issue_url} — the request may already have been received and started"
+            ) from exc
         response.raise_for_status()
-        return response.json()["workflow"]["workflowName"]
+        try:
+            return response.json()["workflow"]["workflowName"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DispatchOutcomeAmbiguous(
+                f"mctl-api accepted {INVESTIGATE_OPERATION} for {issue_url} (status "
+                f"{response.status_code}) but its response body could not be parsed for the "
+                f"workflow name: {exc!r}"
+            ) from exc
 
 
 def _post_reply(issue_url: str, body: str) -> None:
@@ -302,9 +342,12 @@ def _reply_dispatch_failed(author: str, error: Exception, attempt: int) -> str:
     # (claude P3 on #421): an `httpx.HTTPStatusError`/`ConnectError` message
     # can carry `MCTL_API_BASE_URL`'s host, port and route — internal
     # topology on a self-hosted deployment, published permanently to a
-    # public, indexed GitHub comment. The full exception still goes to the
-    # poller's own log stream (the `print` at the call site), where an
-    # operator actually debugs from.
+    # public, indexed GitHub comment. The full exception (type, message, and
+    # for an `httpx.HTTPStatusError` the status code and response body) goes
+    # to the poller's own log stream instead, via `_log_dispatch_error`,
+    # called at every attempt below — not only the give-up one — since an
+    # operator needs to tell a 401 from a 404 from a 503 well before the
+    # retry budget runs out (claude P2 on #421).
     return (
         f"@{author} the re-investigation dispatch failed ({type(error).__name__}). This "
         f"will be retried on the next poll tick ({attempt}/{MAX_DISPATCH_ATTEMPTS})."
@@ -323,6 +366,39 @@ def _reply_dispatch_gave_up(author: str, error: Exception, attempts: int) -> str
         f"{attempts} times in a row. Giving up — this directive will not be retried "
         "automatically; an operator must check mctl-api and resubmit manually."
     )
+
+
+def _reply_dispatch_ambiguous(author: str, error: Exception) -> str:
+    # Carries the ack trailer immediately, on the FIRST ambiguous outcome —
+    # unlike `_reply_dispatch_failed`, there is no retry budget to spend
+    # here: mctl-api may already have started the workflow, so automatically
+    # resubmitting on a later tick (what a fail_trailer's retry-and-count
+    # path would eventually do) risks a second, real, paid Argo run for the
+    # same directive. Only the exception's type name is public, same
+    # reasoning as the two replies above.
+    return (
+        f"@{author} the re-investigation dispatch outcome is unknown ({type(error).__name__}): "
+        "mctl-api may already have accepted the request and started an Argo workflow, so this "
+        "will NOT be retried automatically. An operator must check Argo for a workflow already "
+        "running for this issue before resubmitting manually."
+    )
+
+
+def _log_dispatch_error(context: str, error: Exception) -> None:
+    """Full, unsanitized diagnostic evidence for a dispatch failure, printed
+    to the poller's own log stream — the only place it survives, since every
+    public GitHub reply carries `type(error).__name__` only (see
+    `_reply_dispatch_failed`'s docstring). Called on EVERY failed dispatch
+    attempt, not only the terminal give-up one (claude P2 on #421): without
+    this, the first two of three attempts left no record anywhere of
+    whether mctl-api returned a 401, a 404 on a renamed operation, or a
+    503 — the difference between broken auth, contract drift and a
+    transient outage.
+    """
+    detail = repr(error)
+    if isinstance(error, httpx.HTTPStatusError):
+        detail = f"{detail} status={error.response.status_code} body={error.response.text[:500]!r}"
+    print(f"FAIL: {context}: {detail}")
 
 
 @dataclass(frozen=True)
@@ -344,7 +420,8 @@ async def _handle_directive(
 ) -> str:
     """Run the decision table for one unacked directive. Returns one of:
     "unauthorized", "unrecognised", "no-proposal", "ambiguous",
-    "not-overwritable", "dispatched", "dispatch-failed", or "dry-run".
+    "not-overwritable", "dispatched", "dispatch-failed",
+    "dispatch-ambiguous", or "dry-run".
 
     `prior_failures` is the number of previously recorded dispatch-failure
     attempts for this exact comment id (`orchestrator.directives.
@@ -377,8 +454,30 @@ async def _handle_directive(
     if outcome == "dispatch":
         try:
             workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+        except DispatchOutcomeAmbiguous as e:
+            # mctl-api may already have started the workflow — resubmitting
+            # blindly on a later tick would duplicate a real, paid Argo run,
+            # so this acks immediately (no retry budget spent) instead of
+            # going through the fail_trailer/MAX_DISPATCH_ATTEMPTS path
+            # (claude P2 on #421; mirrors argo.py's refusal to resubmit
+            # after the identical parse-failure shape).
+            _log_dispatch_error(
+                f"ambiguous dispatch outcome for directive comment {directive.comment_id} ({issue_url})",
+                e,
+            )
+            await asyncio.to_thread(
+                _post_reply_with_retries,
+                issue_url,
+                _with_ack(_reply_dispatch_ambiguous(directive.author, e), directive.comment_id),
+            )
+            return "dispatch-ambiguous"
         except Exception as e:  # noqa: BLE001 — surfaced as a per-directive failure, comment kept unacked for retry
             attempt = prior_failures + 1
+            _log_dispatch_error(
+                f"dispatch attempt {attempt}/{MAX_DISPATCH_ATTEMPTS} failed for directive comment "
+                f"{directive.comment_id} ({issue_url})",
+                e,
+            )
             if attempt >= MAX_DISPATCH_ATTEMPTS:
                 # Visible in the poller's own log stream, not only in the
                 # buried GitHub comment: this is the permanent give-up path
@@ -388,7 +487,7 @@ async def _handle_directive(
                 # having to notice the GitHub comment (codex review on #417).
                 print(
                     f"FAIL: giving up on directive comment {directive.comment_id} "
-                    f"({issue_url}) after {attempt} dispatch attempts ({e}) — "
+                    f"({issue_url}) after {attempt} dispatch attempts — "
                     "acking; an operator must resubmit manually."
                 )
                 await asyncio.to_thread(
@@ -429,11 +528,34 @@ async def _handle_directive(
                         _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
                     )
             return "dispatch-failed"
-        await asyncio.to_thread(
-            _post_reply,
-            issue_url,
-            _reply_dispatched(directive.author, directive.comment_id, workflow_name, ref.service, ref.slug),
-        )
+        try:
+            # `_post_reply_with_retries`, not bare `_post_reply` (agy P2 on
+            # #421): the ack trailer this reply carries is the ONLY record
+            # that this comment was already dispatched — a transient
+            # `gh`/GitHub write blip here, on a genuinely successful submit,
+            # is otherwise indistinguishable on the next tick from "never
+            # dispatched", and would resubmit into Argo a second time for
+            # the same directive.
+            await asyncio.to_thread(
+                _post_reply_with_retries,
+                issue_url,
+                _reply_dispatched(directive.author, directive.comment_id, workflow_name, ref.service, ref.slug),
+            )
+        except subprocess.CalledProcessError as post_e:
+            # Even MARKER_POST_ATTEMPTS in-process retries could not write
+            # the ack — the workflow is already running in Argo, but this
+            # comment remains unacked and WILL be resubmitted next tick
+            # (there is no other durable store; see the module docstring).
+            # Loud and specific so an operator can ack it manually before
+            # that happens, rather than discovering a duplicate run.
+            print(
+                f"FAIL: directive comment {directive.comment_id} ({issue_url}) dispatched "
+                f"successfully (Argo workflow {workflow_name!r} started) but posting the "
+                f"acknowledgement reply failed after retries ({post_e.stderr or post_e}) — "
+                "this comment remains unacked and WILL be resubmitted next tick unless an "
+                f"operator posts a comment containing `{ack_trailer(directive.comment_id)}` first."
+            )
+            raise
         return "dispatched"
 
     await asyncio.to_thread(_post_reply, issue_url, body)
@@ -615,7 +737,7 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
         if outcome == "dispatched":
             dispatched += 1
             replied += 1
-        elif outcome == "dispatch-failed":
+        elif outcome in ("dispatch-failed", "dispatch-ambiguous"):
             failed += 1
         else:
             replied += 1

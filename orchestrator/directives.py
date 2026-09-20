@@ -97,9 +97,20 @@ _MENTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# `<!-- mctl-directive-ack: <comment-id> -->` — GraphQL comment node ids can
-# contain `-` and `_`, so both are in the id charset.
-_ACK_RE = re.compile(r"<!--\s*mctl-directive-ack:\s*([A-Za-z0-9_-]+)\s*-->")
+# `<!-- mctl-directive-ack: <comment-id> -->`. `comment_id` is always
+# `RawComment.id` round-tripped verbatim from whatever `gh issue view`
+# returned (`run_issue_directive_poller.read_issue_comments`) — modern
+# GraphQL node ids use the base64url alphabet (`-`/`_`, no padding), but
+# GitHub's older opaque node id scheme is standard base64, which can carry
+# `+`, `/` and trailing `=` padding. A charset restricted to `-`/`_` alone
+# fails to match one of those older ids, and an unmatchable ack/fail marker
+# means `acked_comment_ids`/`failed_attempt_counts` never recognise a
+# directive as already handled — a silent, unbounded, paid redispatch loop
+# (claude P3 on #421). The id itself never contains whitespace, so matching
+# everything up to the mandatory space before `-->` is the precise charset
+# actually written, not a guess at which punctuation GitHub might use.
+_ID_RE = r"[^\s]+"
+_ACK_RE = re.compile(r"<!--\s*mctl-directive-ack:\s*(" + _ID_RE + r")\s*-->")
 
 
 @dataclass(frozen=True)
@@ -232,7 +243,7 @@ def fail_trailer(comment_id: str) -> str:
     return f"<!-- mctl-directive-fail: {comment_id} -->"
 
 
-_FAIL_RE = re.compile(r"<!--\s*mctl-directive-fail:\s*([A-Za-z0-9_-]+)\s*-->")
+_FAIL_RE = re.compile(r"<!--\s*mctl-directive-fail:\s*(" + _ID_RE + r")\s*-->")
 
 
 def failed_attempt_counts(comments) -> dict[str, int]:

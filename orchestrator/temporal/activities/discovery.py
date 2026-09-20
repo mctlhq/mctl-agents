@@ -188,9 +188,19 @@ _stale_directive_cursor = 0
 
 def _rotate_window(items: list[ProposalStateRef], cap: int) -> list[ProposalStateRef]:
     """Up to `cap` items starting at the module cursor, wrapping around, and
-    advance the cursor so the next call continues where this one left off —
-    every item is examined within ceil(len(items) / cap) ticks rather than
-    never, once the list exceeds `cap`.
+    advance the cursor so the next call continues where this one left off.
+
+    The real, honest property this gives: no candidate can be stably
+    starved (the window's start position always moves forward), and
+    traversal converges fairly over time under a reasonably stable
+    candidate set. It is NOT an exact ceil(len(items) / cap)-tick coverage
+    bound — `items` is `list_proposal_refs()`'s current snapshot, which can
+    gain or lose entries between ticks (a proposal created, merged, or
+    rejected), and this cursor has no memory of which items it has already
+    covered, only a position modulo the current `len(items)`; a churning
+    candidate set can shift or reorder the window's contents from what a
+    static-list tick-count bound would predict (claude P3 on #421 — an
+    earlier round of this comment/tests overclaimed the precise bound).
     """
     global _stale_directive_cursor
     n = len(items)
@@ -203,7 +213,7 @@ def _rotate_window(items: list[ProposalStateRef], cap: int) -> list[ProposalStat
     return window
 
 
-async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective]:
+async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective] | None:
     """Every unacked directive-shaped comment newer than its proposal's
     `updated_at`, across `refs`. One `gh issue view` per ref, same
     per-issue tolerance `run_issue_directive_poller.scan` has: a `gh`
@@ -229,17 +239,26 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
     part of the same feature (mctl-agents#417) — flipping the switch must
     stop it from making `gh` calls too, not just `run_issue_directive_poller
     .scan()` (claude P3, repeated across rounds on #421).
+
+    Returns None, not `[]`, when the kill switch is on: `[]` already means
+    "swept every candidate, found nothing stale", the same meaning
+    `ReconcileDiscoveryResult.stale_directives`'s own `None` sentinel
+    describes as "not checked" (its docstring: "None on a filesystem-backed
+    sweep ... Populated only on the GitHub-backed path"). Returning `[]`
+    here for "not checked because the switch is off" would read to any
+    consumer of that field as a clean sweep instead of a skipped one
+    (claude P3 on #421).
     """
     if _scan_disabled():
-        return []
+        return None
     if len(refs) > MAX_STALE_DIRECTIVE_CANDIDATES:
         activity.logger.warning(
             "reconcile: %d directive-staleness candidate(s) found — scanning a "
-            "rotating window of %d this tick; every candidate is covered "
-            "within %d tick(s)",
+            "rotating window of %d this tick; the window advances every tick so no "
+            "candidate is stably starved, though under a churning candidate set this "
+            "is not an exact per-tick coverage guarantee",
             len(refs),
             MAX_STALE_DIRECTIVE_CANDIDATES,
-            -(-len(refs) // MAX_STALE_DIRECTIVE_CANDIDATES),
         )
         refs = _rotate_window(refs, MAX_STALE_DIRECTIVE_CANDIDATES)
 

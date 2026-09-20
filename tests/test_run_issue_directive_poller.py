@@ -13,12 +13,32 @@ import asyncio
 import json
 import subprocess
 
+import httpx
 import pytest
 
 from orchestrator import run_issue_directive_poller
 from orchestrator.directives import Directive
-from orchestrator.run_issue_directive_poller import DirectiveScanResult, _handle_directive, scan
+from orchestrator.run_issue_directive_poller import (
+    DirectiveScanResult,
+    DispatchOutcomeAmbiguous,
+    _handle_directive,
+    scan,
+    submit_investigate,
+)
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef
+
+
+def _mock_async_client(monkeypatch, handler):
+    """Force every httpx.AsyncClient(...) constructed by submit_investigate
+    to route through a MockTransport, mirroring
+    tests/test_temporal_activities.py's identically-named helper."""
+    real_client_cls = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client_cls(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
 
 
 class FakeGitHub:
@@ -603,3 +623,198 @@ def test_issue_url_for(service, slug, expected):
 
 def test_issue_url_for_a_non_issue_slug_is_none():
     assert run_issue_directive_poller.issue_url_for("mctl-web", "adopted-pr-12") is None
+
+
+# ---------------------------------------------------------------------------
+# submit_investigate — direct tests of the real function (claude/agy P2 on
+# #421: every existing test above monkeypatches submit_investigate away, so
+# nothing exercised the real HTTP/parsing logic or the three-way outcome
+# classification it is responsible for).
+# ---------------------------------------------------------------------------
+def _submit(monkeypatch, handler):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    _mock_async_client(monkeypatch, handler)
+    return asyncio.run(submit_investigate("https://github.com/mctlhq/mctl-web/issues/9", "issue-9-fix", "octocat"))
+
+
+def test_submit_investigate_on_a_definite_rejection_raises_http_status_error_not_ambiguous(monkeypatch):
+    """A clean 4xx/5xx before any workflow could have started — mctl-api
+    affirmatively rejected the request, so the caller's normal retry is
+    safe. Must NOT be classified as DispatchOutcomeAmbiguous."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"detail": "operation not found"})
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        _submit(monkeypatch, handler)
+    assert not isinstance(exc_info.value, DispatchOutcomeAmbiguous)
+
+
+def test_submit_investigate_on_a_clean_success_returns_the_workflow_name(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["authorization"] == "Bearer test-token"
+        body = json.loads(request.content)
+        assert body == {"issue_url": "https://github.com/mctlhq/mctl-web/issues/9"}
+        return httpx.Response(200, json={"workflow": {"workflowName": "wf-abc123"}})
+
+    assert _submit(monkeypatch, handler) == "wf-abc123"
+
+
+def test_submit_investigate_on_a_2xx_malformed_body_raises_ambiguous_not_dispatch_failed(monkeypatch):
+    """mctl-api returned 2xx (accepted the request — a real Argo workflow
+    may already be running) but the body this code walks to find the
+    workflow name doesn't have the expected shape. This must be classified
+    as ambiguous, never as a plain retry-safe failure (claude P2 on #421)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    with pytest.raises(DispatchOutcomeAmbiguous):
+        _submit(monkeypatch, handler)
+
+
+def test_submit_investigate_on_a_read_timeout_raises_ambiguous(monkeypatch):
+    """A timeout during the request cannot distinguish 'mctl-api never
+    received it' from 'mctl-api received and is processing it' — must be
+    classified as ambiguous, same as the malformed-2xx-body case."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with pytest.raises(DispatchOutcomeAmbiguous):
+        _submit(monkeypatch, handler)
+
+
+# ---------------------------------------------------------------------------
+# Ambiguous dispatch outcome — the poller-level behavior around
+# DispatchOutcomeAmbiguous: ack immediately (no resubmit budget), never
+# resubmit automatically on a later tick.
+# ---------------------------------------------------------------------------
+def test_ambiguous_dispatch_outcome_acks_immediately_and_is_not_resubmitted(monkeypatch):
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    attempts = {"n": 0}
+
+    async def ambiguous_submit(*_args, **_kwargs):
+        attempts["n"] += 1
+        raise DispatchOutcomeAmbiguous("mctl-api accepted it but the body was unparseable")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", ambiguous_submit)
+
+    result = _run_scan(max_directives=10)
+    assert attempts["n"] == 1
+    assert result.dispatched == 0
+    assert result.failed == 1
+
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    assert bot_comments, "the ambiguous outcome must still reply"
+    assert any("mctl-directive-ack" in c["body"] for c in bot_comments), (
+        "an ambiguous outcome must ack immediately, on the very first occurrence — "
+        "there is no safe retry budget to spend here"
+    )
+    assert any("unknown" in c["body"].lower() for c in bot_comments)
+
+    # A further tick must NOT resubmit: mctl-api may already have started
+    # the workflow, so a blind retry could duplicate a real, paid Argo run.
+    result = _run_scan(max_directives=10)
+    assert attempts["n"] == 1, "an acked ambiguous outcome must never be resubmitted"
+    assert result.dispatched == 0
+
+
+def test_ambiguous_dispatch_outcome_is_distinct_from_plain_dispatch_failure(monkeypatch):
+    """A plain (non-ambiguous) failure must still go through the normal
+    retry-then-give-up path unchanged — this pins that the new
+    DispatchOutcomeAmbiguous branch does not swallow ordinary failures."""
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    async def failing_submit(*_args, **_kwargs):
+        raise RuntimeError("mctl-api unreachable")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", failing_submit)
+
+    result = _run_scan(max_directives=10)
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    assert all("mctl-directive-ack" not in c["body"] for c in bot_comments), (
+        "a plain (non-ambiguous) failure must NOT ack immediately — it still gets "
+        "a bounded number of retries first"
+    )
+    assert result.failed == 1
+
+
+# ---------------------------------------------------------------------------
+# Dispatch-ack write resilience (agy P2 on #421): a successful submit whose
+# ack-post transiently fails must not resurface as "never dispatched".
+# ---------------------------------------------------------------------------
+def test_a_transient_ack_post_blip_after_successful_dispatch_is_absorbed(monkeypatch):
+    monkeypatch.setattr(run_issue_directive_poller.time, "sleep", lambda _s: None)
+
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    comment_calls = {"n": 0}
+
+    def flaky_run(cmd):
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            comment_calls["n"] += 1
+            if comment_calls["n"] == 1:
+                raise subprocess.CalledProcessError(1, cmd, stderr="transient blip")
+        return gh.run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit([]))
+
+    result = _run_scan(max_directives=10)
+
+    assert result.dispatched == 1
+    assert comment_calls["n"] == 2, "the first (failed) ack write must be retried in-process"
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    assert any("mctl-directive-ack" in c["body"] for c in bot_comments)
+
+    # Already acked — a further tick must not resubmit.
+    calls = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(calls))
+    _run_scan(max_directives=10)
+    assert calls == [], "an already-acked dispatch must never be resubmitted"
+
+
+def test_a_persistent_ack_post_failure_after_successful_dispatch_is_reported_not_silent(monkeypatch):
+    """If posting the dispatch-ack fails on every MARKER_POST_ATTEMPTS
+    in-process retry (a truly broken write path), the failure must
+    propagate as a reported, counted failure — never silently swallowed —
+    even though the underlying Argo workflow already started."""
+    monkeypatch.setattr(run_issue_directive_poller.time, "sleep", lambda _s: None)
+
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    comment_calls = {"n": 0}
+
+    def flaky_run(cmd):
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            comment_calls["n"] += 1
+            raise subprocess.CalledProcessError(1, cmd, stderr="persistent outage")
+        return gh.run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit([]))
+
+    result = _run_scan(max_directives=10)
+
+    assert result.dispatched == 0
+    assert result.failed == 1
+    assert comment_calls["n"] == run_issue_directive_poller.MARKER_POST_ATTEMPTS

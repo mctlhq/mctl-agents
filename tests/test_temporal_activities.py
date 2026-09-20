@@ -1307,6 +1307,20 @@ class TestReconcileReadsGitHub:
 
     STATUS_SHA = "sha-implemented"
 
+    @pytest.fixture(autouse=True)
+    def _reset_stale_directive_cursor(self):
+        """`discovery._stale_directive_cursor` is process-lifetime module
+        state (see its own comment) — left dirty by one test it silently
+        changes which window a LATER test's rotation sees, an ordering
+        dependency the sibling `_bot_identity_checked` global already avoids
+        via its own autouse fixture (tests/test_run_issue_directive_poller.py)
+        (claude P3 on #421)."""
+        from orchestrator.temporal.activities import discovery as discovery_mod
+
+        discovery_mod._stale_directive_cursor = 0
+        yield
+        discovery_mod._stale_directive_cursor = 0
+
     def _tree(self, paths, truncated=False):
         return {
             "truncated": truncated,
@@ -1910,7 +1924,11 @@ class TestReconcileReadsGitHub:
 
         result = await env.run(discover_and_project, "")
 
-        assert result.stale_directives == []
+        # None, not [] — the kill switch means the sweep was never run, not
+        # that it ran and found nothing stale; `[]` already means the
+        # latter, and ReconcileDiscoveryResult.stale_directives already has
+        # None as its "not checked" sentinel (claude P3 on #421).
+        assert result.stale_directives is None
 
     async def test_an_unquoted_yaml_timestamp_still_suppresses_an_earlier_directive(
         self, env, monkeypatch
@@ -1971,7 +1989,6 @@ class TestReconcileReadsGitHub:
             discover_and_project,
         )
 
-        discovery_mod._stale_directive_cursor = 0
         total = MAX_STALE_DIRECTIVE_CANDIDATES + 1
         entries = [
             (f"mctl-web/proposals/issue-{i}-x/.status.yaml", f"sha-{i}")
