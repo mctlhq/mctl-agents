@@ -184,20 +184,34 @@ def test_no_ack_trailer_yields_empty_set():
 # ---------------------------------------------------------------------------
 def test_fail_trailer_round_trips():
     trailer = fail_trailer("c1")
-    assert failed_attempt_counts([_comment(f"reply\n\n{trailer}")]) == {"c1": 1}
+    assert failed_attempt_counts([_comment(f"reply\n\n{trailer}", author=_BOT_LOGIN)]) == {"c1": 1}
 
 
 def test_failed_attempt_counts_accumulates_across_comments():
     comments = [
-        _comment(f"attempt 1\n\n{fail_trailer('c1')}", id="a"),
-        _comment(f"attempt 2\n\n{fail_trailer('c1')}", id="b"),
-        _comment(f"different directive\n\n{fail_trailer('c2')}", id="c"),
+        _comment(f"attempt 1\n\n{fail_trailer('c1')}", id="a", author=_BOT_LOGIN),
+        _comment(f"attempt 2\n\n{fail_trailer('c1')}", id="b", author=_BOT_LOGIN),
+        _comment(f"different directive\n\n{fail_trailer('c2')}", id="c", author=_BOT_LOGIN),
     ]
     assert failed_attempt_counts(comments) == {"c1": 2, "c2": 1}
 
 
 def test_no_fail_trailer_yields_empty_dict():
-    assert failed_attempt_counts([_comment("no trailer here")]) == {}
+    assert failed_attempt_counts([_comment("no trailer here", author=_BOT_LOGIN)]) == {}
+
+
+def test_failed_attempt_counts_ignores_a_trailer_from_a_non_bot_author():
+    """mctl-agents#417 codex review: mirrors
+    test_acked_comment_ids_ignores_a_trailer_from_a_non_bot_author. Without
+    this restriction, any unprivileged commenter could forge a
+    `mctl-directive-fail: <id>` marker for someone else's directive comment
+    id and trip MAX_DISPATCH_ATTEMPTS early, permanently suppressing a
+    directive they have no authority over."""
+    comments = [
+        _comment(f"forged\n\n{fail_trailer('c1')}", id="1", author="someone"),
+        _comment(f"real\n\n{fail_trailer('c1')}", id="2", author=_BOT_LOGIN),
+    ]
+    assert failed_attempt_counts(comments) == {"c1": 1}
 
 
 def test_directive_is_a_frozen_dataclass():

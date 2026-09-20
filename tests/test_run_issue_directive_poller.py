@@ -258,6 +258,47 @@ def test_dispatch_failure_leaves_no_ack_and_retries_next_tick(monkeypatch):
     assert result.failed == 1
 
 
+def test_dispatch_failure_gives_up_after_max_attempts_and_acks(monkeypatch):
+    """The give-up bound (MAX_DISPATCH_ATTEMPTS): once a comment id's
+    dispatch has failed that many times in a row, the scan must stop
+    retrying it — but must do so visibly (a reply naming the give-up,
+    carrying the ack trailer) rather than either spamming forever or
+    silently losing the directive (codex review on #417)."""
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    attempts = {"n": 0}
+
+    async def failing_submit(*_args, **_kwargs):
+        attempts["n"] += 1
+        raise RuntimeError("mctl-api unreachable")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", failing_submit)
+
+    for _ in range(run_issue_directive_poller.MAX_DISPATCH_ATTEMPTS):
+        _run_scan(max_directives=10)
+
+    assert attempts["n"] == run_issue_directive_poller.MAX_DISPATCH_ATTEMPTS
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    give_up_comments = [c for c in bot_comments if "mctl-directive-ack" in c["body"]]
+    assert give_up_comments, "the give-up reply must carry the ack trailer, not vanish silently"
+    assert "giving up" in give_up_comments[-1]["body"].lower()
+
+    # A further tick must not resubmit: the comment is now acked, so the
+    # directive is not retried forever, but the give-up reply above is the
+    # durable, visible record that it happened (not a silent drop).
+    result = _run_scan(max_directives=10)
+    assert attempts["n"] == run_issue_directive_poller.MAX_DISPATCH_ATTEMPTS, (
+        "the give-up bound must stop further retries once hit"
+    )
+    assert result.dispatched == 0
+
+
 # ---------------------------------------------------------------------------
 # T6 — dry-run / cap / per-issue tolerance at the scan() level
 # ---------------------------------------------------------------------------
@@ -308,6 +349,34 @@ def test_a_gh_failure_on_one_issue_does_not_stop_the_scan(monkeypatch):
     def flaky_run(cmd):
         if cmd[:3] == ["gh", "issue", "view"] and cmd[-1] == bad_url:
             raise subprocess.CalledProcessError(1, cmd, stderr="boom")
+        return gh.run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([bad_ref, good_ref]))
+    submitted: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submitted))
+
+    result = _run_scan(max_directives=10)
+    assert result.failed == 1
+    assert result.dispatched == 1
+
+
+def test_a_malformed_gh_payload_does_not_stop_the_scan(monkeypatch):
+    """A `gh issue view` reply that is not valid JSON (a bad/unexpected `gh`
+    payload) must be a per-issue failure, not a tick-ending crash — mirrors
+    test_a_gh_failure_on_one_issue_does_not_stop_the_scan but for a
+    JSONDecodeError instead of a CalledProcessError (codex review on
+    #417)."""
+    gh = FakeGitHub()
+    bad_ref = _ref(slug="issue-1-bad")
+    good_ref = _ref(slug="issue-2-good")
+    bad_url = run_issue_directive_poller.issue_url_for(bad_ref.service, bad_ref.slug)
+    good_url = run_issue_directive_poller.issue_url_for(good_ref.service, good_ref.slug)
+    gh.add_comment(good_url)
+
+    def flaky_run(cmd):
+        if cmd[:3] == ["gh", "issue", "view"] and cmd[-1] == bad_url:
+            return subprocess.CompletedProcess(cmd, 0, stdout="not valid json", stderr="")
         return gh.run(cmd)
 
     monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)

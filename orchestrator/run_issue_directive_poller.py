@@ -156,17 +156,27 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     reply with — the investigation itself runs independently in Argo, the
     same as every other consumer of this operation.
 
-    `slug` is accepted for the caller's own logging/reply purposes only and
-    is NOT sent as a CWFT parameter (codex review on #417): the operation's
-    only other caller, `orchestrator.temporal.workflows.dev_loop`'s
-    `_run_cwft("mctl-agents-investigate", investigate_params)`, sends only
-    `issue_url` (plus optional release-pinning fields this poller does not
-    set) — `run_issue_investigator.main()` has no `--slug` flag at all and
-    always re-derives the slug from `issue_url` via `resolve_slug()`, so a
-    `slug` key here would be a parameter nothing on the other end reads
-    (see design.md's open question, resolved against sending it).
+    `slug` and `requested_by` are both accepted for the caller's own
+    logging/reply purposes only and are NOT sent as CWFT parameters (codex
+    review on #417): the operation's only other caller, `orchestrator.
+    temporal.workflows.dev_loop`'s `_run_cwft("mctl-agents-investigate",
+    investigate_params)`, sends only `issue_url` (plus optional
+    release-pinning fields this poller does not set) — `run_issue_
+    investigator.main()` has no `--slug` flag at all and always re-derives
+    the slug from `issue_url` via `resolve_slug()`, so a `slug` key here
+    would be a parameter nothing on the other end reads (see design.md's
+    open question, resolved against sending it). `requested_by` DOES have a
+    `--requested-by` flag on the investigator's own CLI, but nothing in
+    this repo declares `requested_by` as a parameter of the
+    `mctl-agents-investigate` ClusterWorkflowTemplate (that manifest lives
+    in mctl-gitops) or wires an Argo input through to that flag — sending it
+    here would be a value mctl-api and/or the CWFT either drops silently or
+    rejects outright, not a value that ever reaches `write_status_yaml`'s
+    `request` block. Threading the requester through to `.status.yaml`
+    needs a follow-up change to the CWFT manifest in mctl-gitops before this
+    poller can send `requested_by` again.
     """
-    params = {"issue_url": issue_url, "requested_by": requested_by}
+    params = {"issue_url": issue_url}
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=_SUBMIT_TIMEOUT_SECONDS) as client:
         response = await client.post(
             f"/api/v1/operations/{INVESTIGATE_OPERATION}/execute",
@@ -311,24 +321,38 @@ async def _handle_directive(
         except Exception as e:  # noqa: BLE001 — surfaced as a per-directive failure, comment kept unacked for retry
             attempt = prior_failures + 1
             if attempt >= MAX_DISPATCH_ATTEMPTS:
-                _post_reply(
+                # Visible in the poller's own log stream, not only in the
+                # buried GitHub comment: this is the permanent give-up path
+                # (the reply below carries the ack trailer, so no later tick
+                # retries this comment id) — an operator monitoring the
+                # poller's logs must be able to see it happened without
+                # having to notice the GitHub comment (codex review on #417).
+                print(
+                    f"FAIL: giving up on directive comment {directive.comment_id} "
+                    f"({issue_url}) after {attempt} dispatch attempts ({e}) — "
+                    "acking; an operator must resubmit manually."
+                )
+                await asyncio.to_thread(
+                    _post_reply,
                     issue_url,
                     _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
                 )
             else:
-                _post_reply(
+                await asyncio.to_thread(
+                    _post_reply,
                     issue_url,
                     f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
                     f"{fail_trailer(directive.comment_id)}",
                 )
             return "dispatch-failed"
-        _post_reply(
+        await asyncio.to_thread(
+            _post_reply,
             issue_url,
             _reply_dispatched(directive.author, directive.comment_id, workflow_name, ref.service, ref.slug),
         )
         return "dispatched"
 
-    _post_reply(issue_url, body)
+    await asyncio.to_thread(_post_reply, issue_url, body)
     return outcome
 
 
@@ -369,6 +393,15 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
             comments = await asyncio.to_thread(read_issue_comments, issue_url)
         except subprocess.CalledProcessError as e:
             print(f"WARN: could not read comments for {issue_url}: {e.stderr or e}")
+            failed += 1
+            continue
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            # A malformed/unexpected `gh` payload (bad JSON, a missing key,
+            # a shape `read_issue_comments` cannot parse) is a per-issue
+            # failure, not a tick-ending crash — same tolerance as a
+            # `CalledProcessError`, so one bad payload cannot take down
+            # every other candidate's scan this tick (codex review on #417).
+            print(f"WARN: malformed gh payload for {issue_url}: {e}")
             failed += 1
             continue
 

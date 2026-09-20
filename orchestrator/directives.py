@@ -193,13 +193,21 @@ _FAIL_RE = re.compile(r"<!--\s*mctl-directive-fail:\s*([A-Za-z0-9_-]+)\s*-->")
 
 
 def failed_attempt_counts(comments) -> dict[str, int]:
-    """How many `fail_trailer` markers exist per comment id, across ANY
-    comment body — mirrors `acked_comment_ids`'s conservative "scan every
-    comment" reading, since a fail-trailer only ever suppresses further
-    spam, never a dispatch.
+    """How many `fail_trailer` markers exist per comment id, restricted to
+    comments authored by the platform bot identity (`BOT_LOGINS`) — the
+    same restriction `acked_comment_ids` applies (mctl-agents#417 codex
+    review). Without it, any unprivileged commenter could paste a forged
+    `mctl-directive-fail: <id>` marker to inflate another user's failure
+    count and trip `MAX_DISPATCH_ATTEMPTS` early, permanently suppressing
+    (via the give-up reply's ack trailer) a directive they have no
+    authority to touch. The bot is the only author that ever has reason to
+    post one, exactly as for `acked_comment_ids`.
     """
+    ids = {b.lower() for b in BOT_LOGINS}
     counts: dict[str, int] = {}
     for comment in comments:
+        if (comment.author or "").lower() not in ids:
+            continue
         for match in _FAIL_RE.finditer(comment.body or ""):
             cid = match.group(1)
             counts[cid] = counts.get(cid, 0) + 1
