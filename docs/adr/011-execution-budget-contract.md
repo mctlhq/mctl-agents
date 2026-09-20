@@ -2,10 +2,10 @@
 
 > **Status:** proposed
 > **Date:** 2026-09-20
-> **Issue:** mctlhq/mctl-agents#423
+> **Issue:** mctlhq/mctl-agents#423, mctlhq/mctl-agents#430
 > **Supersedes:** nothing. It records the boundary this proposal draws
-> between three related-but-distinct invariants (#411, #418, #423) so future
-> changes to any one of them do not accidentally reopen another.
+> between four related-but-distinct invariants (#411, #418, #423, #430) so
+> future changes to any one of them do not accidentally reopen another.
 
 ## Context
 
@@ -51,21 +51,45 @@ confused with one another.
    the SDK run is ever entered. A slow claim store must delay the START of a
    run, not eat into the wall-clock the run itself gets once it starts.
 
-3. **#423 (this ADR) — work newly added INSIDE the execution must fit, or
-   explicitly negotiate, the envelope.** #411 added real work (reading and
-   acting on CI evidence) to the thing #418 already protects the boundary of.
-   Nothing forced that new work to declare its own cost, so it silently
-   borrowed from the review-findings budget until the budget ran out. This
-   proposal is the negotiation: move the unbounded part (log retrieval)
-   OUTSIDE the envelope entirely (mirroring #418's shape — pay the cost before
-   the SDK run starts, not during it), and let the bounded part (analysing a
-   fixed number of fixed-size excerpts) widen the envelope by a declared,
-   capped, logged amount.
+3. **#423 — work newly added INSIDE the execution must fit, or explicitly
+   negotiate, the envelope.** #411 added real work (reading and acting on CI
+   evidence) to the thing #418 already protects the boundary of. Nothing
+   forced that new work to declare its own cost, so it silently borrowed from
+   the review-findings budget until the budget ran out. This proposal is the
+   negotiation: move the unbounded part (log retrieval) OUTSIDE the envelope
+   entirely (mirroring #418's shape — pay the cost before the SDK run starts,
+   not during it), and let the bounded part (analysing a fixed number of
+   fixed-size excerpts) widen the envelope by a declared, capped, logged
+   amount.
+
+4. **#430 (this ADR) — work the agent chooses to do INSIDE the execution
+   must derive its bound FROM the envelope, not carry an independent one.**
+   #423 closed the specific hole of unbounded CI-log retrieval, but live
+   acceptance on mctlhq/mctl-telegram#652 showed a second, distinct one:
+   legitimate local verification (`go test -race ./... > /tmp/test-race.log
+   2>&1 &`, then polling that background shell) that #423's containment does
+   not touch at all. Nothing inside a running implementer knew how much of
+   its envelope was left, so an agent-issued Bash command was bounded only
+   by the Claude Code CLI's own tool timeout — which backgrounds a slow
+   command rather than failing it (see "Containment" below) — and an
+   explicit `cmd &` escapes task accounting entirely
+   (`subagent_wait.AWAITED_TASK_TYPES` deliberately excludes background
+   shells). The outer envelope then expired with the delegated child still
+   live, and the run exited `EXIT_ORPHANED_SUBAGENT` — correctly classified,
+   but as the NORMAL result of a slow test suite rather than the safety net
+   it is meant to be. #430 makes every agent-issued Bash command derive its
+   own bound from the REMAINING envelope minus a teardown reserve, denies
+   detached launches that would escape that bound, and turns the exhausted
+   case into a structured, blameless outcome (`EXIT_VERIFICATION_BUDGET_
+   EXHAUSTED`) instead.
 
 Confusing any two of these has a specific failure shape: folding #423 into
 #411 would mean "ingestion" quietly grows an unbounded retrieval step;
 folding #423 into #418 would mean claim/lock waiting time trades against
-code-mutation time, which is the opposite of what #418 established.
+code-mutation time, which is the opposite of what #418 established; folding
+#430 into #423 would mean the per-command bound only applies to CI-remediation
+runs, when the defect it fixes (a command outliving the remaining envelope)
+is generic over the `Bash` tool and every work class.
 
 ## Coverage table
 
@@ -77,7 +101,12 @@ code-mutation time, which is the opposite of what #418 established.
 | Clone, fetch, push | `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command | no |
 | Model turns, delegated sub-agents, drain | `implementer_envelope(work_class, n_checks)` | yes |
 | Awaiting one delegated child | `IMPLEMENTER_DRAIN_TIMEOUT_SECONDS` | yes (nested) |
+| Agent-issued Bash command | `min(IMPLEMENTER_COMMAND_TIMEOUT_SECONDS, remaining - IMPLEMENTER_TEARDOWN_RESERVE_SECONDS)`, OS-enforced | yes (nested) |
 | Teardown after expiry | `IMPLEMENTER_TEARDOWN_GRACE_SECONDS` (shielded) | no (after) |
+
+No row is left unbounded: every operation that can consume wall-clock time
+between admission and teardown is either OUTSIDE the envelope with its own
+independent bound, or INSIDE it with a bound derived from what remains.
 
 ## The envelope formula
 
@@ -126,6 +155,29 @@ command that exceeds its own tool timeout rather than failing it, so a ground
 rule cannot stop the #652 pattern from recurring — only denying the command
 before it starts can.
 
+`options._deadline_guard_hook()` (mctl-agents#430) is the generic form of the
+same lesson, installed for EVERY work class when the caller supplies both a
+`deadline_monotonic` and a `CommandBudgetLedger`
+(`orchestrator/exec_budget.py`). Per `Bash` tool call, before the command
+starts: deny a detached launch (a trailing async-list `&`, `nohup`, `setsid`,
+`disown`, or `run_in_background: true`) with a reason naming the form; deny
+outright once `command_budget()` — `min(IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
+remaining_envelope - IMPLEMENTER_TEARDOWN_RESERVE_SECONDS)` — cannot clear
+`IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS`; otherwise allow, with the derived
+bound applied BOTH to the tool-input `timeout` (narrowed only — clamping is
+one-directional) AND, unless the `IMPLEMENTER_BOUND_COMMANDS=0` break-glass
+or a missing `timeout` binary falls back to tool-input clamping alone, by
+rewriting the command under `timeout --kill-after=<k>s <budget>s bash -c
+<quoted command>` (`exec_budget.wrap_bounded()`). GNU `timeout` signals the
+command's whole PROCESS GROUP, so this is OS-level enforcement, not only the
+CLI's own Bash-tool timeout that backgrounds rather than fails an
+over-running command. Every decision (clamped, denied-background,
+denied-exhausted, the bound applied, a truncated command label) is recorded
+on the orchestrator-owned `CommandBudgetLedger` — never in model prose — and,
+when a run ends with no commit and the ledger shows the budget exhausted,
+`run_implementer` exits `EXIT_VERIFICATION_BUDGET_EXHAUSTED` (51) and writes
+the ledger summary as JSON to `--refusal-out`.
+
 When the outer envelope expires with a delegated task still live,
 `_run_implementer_agent`'s `TimeoutError` handler performs a shielded,
 bounded teardown (`anyio.CancelScope(shield=True)` +
@@ -135,12 +187,24 @@ its CLI child if the transport exposes it, rather than abandoning them.
 Without the shield, that disconnect would await inside the very scope
 `fail_after` just cancelled, and the first checkpoint inside it would raise
 immediately — skipping the teardown and letting the child outlive the
-process.
+process. `EXIT_ORPHANED_SUBAGENT` remains this safety net — the per-command
+deadline guard is what keeps a slow, legitimate verification step from being
+the thing that reaches it in the normal case.
 
 ## Blamelessness
 
 `EXIT_CI_EVIDENCE_INSUFFICIENT` (50) lets a run end deliberately and
-boundedly when the bounded log excerpt cannot support a code decision. It
-joins `EXIT_ORPHANED_SUBAGENT` (46) in `run_shepherd._followup_code_sets()`'s
+boundedly when the bounded log excerpt cannot support a code decision.
+`EXIT_VERIFICATION_BUDGET_EXHAUSTED` (51, mctl-agents#430) is the same shape
+for local verification: the run stayed inside its own envelope the whole
+time, and a structured, orchestrator-derived ledger — never model prose —
+recorded the per-command budget running out before a commit or a merits
+decision was reached, either because the deadline guard denied one more
+command outright or because the agent itself recorded the same fact via the
+refusal marker's `verification_budget_exhausted` flag. Both join
+`EXIT_ORPHANED_SUBAGENT` (46) in `run_shepherd._followup_code_sets()`'s
 harness set: blameless (never charges `review_attempts`), still bounded by
-`MAX_HARNESS_FAILURES`.
+`MAX_HARNESS_FAILURES`. A run that DOES produce a commit still pushes and
+exits `EXIT_OK` even if some verification was cut short along the way — the
+commit is the outcome; the ledger's clamp/deny counts are printed to the Argo
+log either way, so the truncation stays visible without gating success on it.

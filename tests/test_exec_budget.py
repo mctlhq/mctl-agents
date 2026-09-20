@@ -1,0 +1,203 @@
+"""Unit tests for orchestrator.exec_budget (mctl-agents#430).
+
+Pure-logic module -- no `claude_agent_sdk` import at any scope, so these
+tests exercise it directly rather than through a hook. See
+tests/test_worker_isolation.py for the module-import-graph guard that keeps
+it that way.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+from orchestrator import exec_budget
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_module_does_not_import_the_agent_sdk() -> None:
+    """Importable by the Temporal worker, and unit-testable without the SDK.
+
+    A fresh subprocess, not an in-process `sys.modules` check: pytest has
+    already imported half the codebase (including the SDK, via other test
+    modules) by the time this runs in the same session, so `sys.modules`
+    here would prove nothing — see tests/test_worker_isolation.py, whose
+    module docstring explains the same thing about its own check.
+    """
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import orchestrator.exec_budget, sys; "
+            "assert 'claude_agent_sdk' not in sys.modules",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+# ---------------------------------------------------------------------------
+# command_budget — T1
+# ---------------------------------------------------------------------------
+def test_command_budget_early_in_the_envelope_clamps_to_the_ceiling() -> None:
+    # 1000s remaining, reserve 120 -> 880 available, but the ceiling (300)
+    # is narrower.
+    assert exec_budget.command_budget(
+        1000.0, 0.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) == 300.0
+
+
+def test_command_budget_mid_envelope_clamps_to_remaining_minus_reserve() -> None:
+    # 1000s deadline, 700s elapsed -> 300s remaining, minus 120s reserve = 180s,
+    # narrower than the 300s ceiling.
+    assert exec_budget.command_budget(
+        1000.0, 700.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) == 180.0
+
+
+def test_command_budget_below_the_floor_denies() -> None:
+    # 1000s deadline, 995s elapsed -> 5s remaining, minus 120s reserve is
+    # negative, well under the 20s floor.
+    assert exec_budget.command_budget(
+        1000.0, 995.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) is None
+
+
+def test_command_budget_exactly_at_the_floor_is_admitted() -> None:
+    # remaining - reserve == floor exactly -> admitted, not denied.
+    assert exec_budget.command_budget(
+        1000.0, 860.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) == 20.0
+
+
+def test_command_budget_never_widens_above_the_ceiling() -> None:
+    """Clamping is one-directional (EARS: 'never widen a command's bound')."""
+    huge_remaining = exec_budget.command_budget(
+        1_000_000.0, 0.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    )
+    assert huge_remaining == 300.0
+
+
+# ---------------------------------------------------------------------------
+# is_detached — T2
+# ---------------------------------------------------------------------------
+def test_is_detached_matches_the_production_shape_from_mctl_telegram_652() -> None:
+    assert exec_budget.is_detached(
+        "go test -race ./... > /tmp/test-race.log 2>&1 &"
+    ) is not None
+
+
+def test_is_detached_matches_nohup_setsid_disown() -> None:
+    assert exec_budget.is_detached("nohup ./run.sh") is not None
+    assert exec_budget.is_detached("setsid ./run.sh") is not None
+    assert exec_budget.is_detached("./run.sh & disown") is not None
+
+
+def test_is_detached_matches_a_backslash_continued_trailing_ampersand() -> None:
+    assert exec_budget.is_detached("go test ./... \\\n  &") is not None
+
+
+def test_is_detached_does_not_match_logical_and() -> None:
+    assert exec_budget.is_detached("a && b") is None
+
+
+def test_is_detached_does_not_match_redirect_merges() -> None:
+    assert exec_budget.is_detached("cmd 2>&1") is None
+    assert exec_budget.is_detached("cmd 1>&2") is None
+    assert exec_budget.is_detached("go test -race ./... > /tmp/test-race.log 2>&1") is None
+
+
+def test_is_detached_does_not_match_a_quoted_ampersand() -> None:
+    assert exec_budget.is_detached("grep '&' file") is None
+
+
+def test_is_detached_returns_none_for_an_ordinary_command() -> None:
+    assert exec_budget.is_detached("pytest -q") is None
+    assert exec_budget.is_detached("git status") is None
+
+
+# ---------------------------------------------------------------------------
+# wrap_bounded — T3
+# ---------------------------------------------------------------------------
+def test_wrap_bounded_always_carries_kill_after() -> None:
+    wrapped = exec_budget.wrap_bounded("pytest -q", 30.0, kill_after_s=5.0)
+    assert wrapped.startswith("timeout --kill-after=5s 30s bash -c ")
+
+
+def test_wrap_bounded_round_trips_a_heredoc() -> None:
+    command = "cat <<'EOF'\nhello\nEOF"
+    wrapped = exec_budget.wrap_bounded(command, 10.0, kill_after_s=5.0)
+    # The whole original command must be a single shlex-quoted argument to
+    # `bash -c`, preserving the heredoc verbatim.
+    import shlex
+    tokens = shlex.split(wrapped)
+    assert tokens[-1] == command
+
+
+def test_wrap_bounded_round_trips_a_pipeline_and_and_chain() -> None:
+    command = "echo hi | grep h && echo done"
+    wrapped = exec_budget.wrap_bounded(command, 10.0, kill_after_s=5.0)
+    import shlex
+    tokens = shlex.split(wrapped)
+    assert tokens[-1] == command
+
+
+def test_wrap_bounded_round_trips_a_multiline_script() -> None:
+    command = "set -e\ncd /tmp\nls -la"
+    wrapped = exec_budget.wrap_bounded(command, 10.0, kill_after_s=5.0)
+    import shlex
+    tokens = shlex.split(wrapped)
+    assert tokens[-1] == command
+
+
+def test_wrap_bounded_floors_sub_second_budgets_at_one_second() -> None:
+    wrapped = exec_budget.wrap_bounded("echo hi", 0.2, kill_after_s=0.1)
+    assert wrapped.startswith("timeout --kill-after=1s 1s bash -c ")
+
+
+# ---------------------------------------------------------------------------
+# CommandBudgetLedger
+# ---------------------------------------------------------------------------
+def test_ledger_records_clamped_commands() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_clamped("pytest -q", 42.0)
+    assert ledger.clamped == 1
+    assert ledger.last_bound_s == 42.0
+    assert ledger.last_command == "pytest -q"
+    assert ledger.exhausted is False
+
+
+def test_ledger_records_denied_background() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_denied_background("cmd &", "trailing background (`&`)")
+    assert ledger.denied_background == 1
+    assert ledger.exhausted is False
+
+
+def test_ledger_records_denied_exhausted_and_sets_exhausted() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_denied_exhausted("go test ./...")
+    assert ledger.denied_exhausted == 1
+    assert ledger.exhausted is True
+
+
+def test_ledger_as_dict_is_machine_readable_and_bounded() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_denied_exhausted("x" * 10_000)
+    payload = ledger.as_dict()
+    assert payload["exhausted"] is True
+    assert payload["verification_budget_exhausted"] is True
+    assert payload["denied_exhausted"] == 1
+    assert len(payload["last_command"]) <= exec_budget.MAX_LEDGER_COMMAND_CHARS + 1
+    assert isinstance(payload["reason"], str)
+
+
+def test_ledger_describe_is_a_short_summary_line() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    assert "clamped=0" in ledger.describe()
+    assert "exhausted=true" not in ledger.describe()
+    ledger.record_denied_exhausted("cmd")
+    assert "exhausted=true" in ledger.describe()

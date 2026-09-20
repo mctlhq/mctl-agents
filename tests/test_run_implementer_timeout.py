@@ -621,3 +621,70 @@ def test_outer_timeout_after_the_drain_keeps_the_work_instead_of_charging(
     anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
 
     assert "after the sub-agent was awaited" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Per-command execution budget wiring (mctl-agents#430)
+# ---------------------------------------------------------------------------
+def test_run_implementer_agent_wires_the_deadline_and_ledger_into_the_builder(
+    tmp_path, monkeypatch,
+) -> None:
+    """The absolute deadline handed to `build_implementer_agent_options` must
+    be on the SAME monotonic clock `anyio.fail_after` uses, and the ledger
+    passed through unchanged."""
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+
+    captured: dict = {}
+    real_builder = run_implementer.build_implementer_agent_options
+
+    def spy_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "build_implementer_agent_options", spy_builder)
+
+    ledger = run_implementer.CommandBudgetLedger()
+    before = None
+
+    async def _run():
+        nonlocal before
+        before = anyio.current_time()
+        await run_implementer._run_implementer_agent(
+            tmp_path, "prompt", tmp_path, budget_ledger=ledger,
+        )
+
+    anyio.run(_run)
+
+    assert captured["budget_ledger"] is ledger
+    assert captured["deadline_monotonic"] is not None
+    # Deadline should be ~5s after the call started, not e.g. `inf` or 0.
+    assert before < captured["deadline_monotonic"] <= before + 5 + 1
+
+
+def test_run_implementer_agent_omits_the_ledger_when_the_caller_does_not_pass_one(
+    tmp_path, monkeypatch,
+) -> None:
+    """Every pre-#430 caller (no `budget_ledger` kwarg) must resolve options
+    with the guard omitted -- byte-identical to today's behaviour."""
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+    # Must not raise -- and, since no guard is installed, no Bash tool is
+    # ever invoked by this fake stream, so nothing to assert beyond "it ran".
+
+
+def test_run_implementer_agent_warns_once_when_the_timeout_binary_is_absent(
+    tmp_path, monkeypatch, capsys,
+) -> None:
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(run_implementer.shutil, "which", lambda _name: None)
+
+    anyio.run(
+        run_implementer._run_implementer_agent,
+        tmp_path, "prompt", tmp_path,
+    )
+
+    assert "timeout" in capsys.readouterr().err

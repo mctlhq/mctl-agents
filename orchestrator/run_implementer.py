@@ -116,6 +116,7 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
@@ -254,6 +255,17 @@ EXIT_CLAIM_REFUSED = 49
 # MAX_HARNESS_FAILURES an orphaned sub-agent is (see
 # run_shepherd._followup_code_sets).
 EXIT_CI_EVIDENCE_INSUFFICIENT = 50
+# The run ended with the per-command execution budget exhausted: every
+# agent-issued Bash command is bounded to what remains of the run's envelope
+# (mctl-agents#430, `orchestrator/exec_budget.py`'s deadline guard), and this
+# run ran out of budget for another command before it could commit or refuse
+# on the merits. Distinct from EXIT_ORPHANED_SUBAGENT (46): 46 means our own
+# handoff lost a live child; 51 means the run stayed inside its envelope the
+# whole time and the STRUCTURED ledger (never model prose) says so -- the
+# same "no live agent-launched child process survives" guarantee, reached
+# deliberately instead of by a hard cancellation. Joins the shepherd's
+# harness set: blameless, bounded by the same MAX_HARNESS_FAILURES.
+EXIT_VERIFICATION_BUDGET_EXHAUSTED = 51
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -274,6 +286,11 @@ CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
 # Prefix mapped to EXIT_CI_EVIDENCE_INSUFFICIENT. Same style, used when the
 # refusal marker carries `"insufficient_evidence": true` (mctl-agents#423).
 CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX = "ci-evidence-insufficient:"
+# Prefix mapped to EXIT_VERIFICATION_BUDGET_EXHAUSTED (mctl-agents#430). Used
+# both when the ORCHESTRATOR-derived ledger reports `exhausted` with no
+# commit and no other refusal, and when the agent's own marker carries
+# `"verification_budget_exhausted": true`.
+VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX = "verification-budget-exhausted:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -301,10 +318,18 @@ class RefusalMarker:
     reached a merits decision at all). Both share the same marker shape and
     the same validation; only the mapped exit code, and therefore the
     shepherd's charging behaviour, differs.
+
+    `verification_budget_exhausted` (mctl-agents#430) is the third form: the
+    agent decided, on its own, that the remaining per-command execution
+    budget could not fit another verification step and recorded that
+    deliberately rather than being cut off by the deadline guard's own
+    denial. Maps to the same EXIT_VERIFICATION_BUDGET_EXHAUSTED the
+    ORCHESTRATOR-derived ledger produces when it observes the same fact.
     """
 
     reason: str
     insufficient_evidence: bool = False
+    verification_budget_exhausted: bool = False
 
 
 def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
@@ -438,6 +463,7 @@ def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
     return RefusalMarker(
         reason=" ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS],
         insufficient_evidence=data.get("insufficient_evidence") is True,
+        verification_budget_exhausted=data.get("verification_budget_exhausted") is True,
     )
 
 
@@ -459,6 +485,34 @@ def _write_refusal_out(path: Path, reason: str) -> None:
         # an escape would replace a correctly-classified refusal with an
         # uncaught traceback and exit 1 — the counter-less transient arm. The
         # reason is advisory; the exit code is what matters.
+        print(
+            f"warn: could not write refusal reason to {path} "
+            f"({type(e).__name__}: {e}); the exit code still carries the decision",
+            file=sys.stderr,
+        )
+
+
+def _write_verification_budget_exhausted_out(
+    path: Path, reason: str, ledger: CommandBudgetLedger | None,
+) -> None:
+    """Hand the ORCHESTRATOR-derived ledger summary to the shepherd as JSON
+    (mctl-agents#430) — the structured evidence `EXIT_VERIFICATION_BUDGET_
+    EXHAUSTED` exists to provide, not model prose. `reason` overrides the
+    ledger's own `describe()` text: for the marker-derived path it is the
+    agent's own (capped) explanation, which is more useful to an operator
+    than the orchestrator's clamp/deny counters alone; those counters still
+    ride along from `ledger.as_dict()` when a ledger is available.
+
+    Best-effort, same as `_write_refusal_out`: the exit code alone already
+    carries the decision that matters.
+    """
+    payload: dict[str, Any] = ledger.as_dict() if ledger is not None else {}
+    payload["reason"] = reason
+    payload["refused"] = True
+    payload["verification_budget_exhausted"] = True
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — advisory write; see _write_refusal_out
         print(
             f"warn: could not write refusal reason to {path} "
             f"({type(e).__name__}: {e}); the exit code still carries the decision",
@@ -516,6 +570,15 @@ def _review_feedback_exit_code(error: str) -> int:
         counter, bounded by MAX_HARNESS_FAILURES) rather than charging it to
         `refusals`.
 
+      - 51: the run ended with the per-command execution budget exhausted
+        (mctl-agents#430) — every agent-issued Bash command is bounded to
+        what remains of the run's envelope, and either the orchestrator's
+        own ledger observed that budget run out with no commit produced, or
+        the agent recorded the same fact itself via the refusal marker's
+        `verification_budget_exhausted` flag. Blameless the same way 46 and
+        50 are: the run stayed inside its envelope and said so structurally,
+        rather than being cut off by the outer bound.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -539,6 +602,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_CLAIM_REFUSED
     if error.startswith(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):
         return EXIT_CI_EVIDENCE_INSUFFICIENT
+    if error.startswith(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):
+        return EXIT_VERIFICATION_BUDGET_EXHAUSTED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -594,6 +659,11 @@ class ImplementResult:
     # Distinct from `blocked` -- this is a `needs-triage` write (the
     # proposal leaves the accepted queue), not a durable `accepted` park.
     stale_source: tuple[str, str] | None = None
+    # Set only on the EXIT_VERIFICATION_BUDGET_EXHAUSTED path (mctl-agents#430):
+    # the ledger `_run_implementer_agent`'s deadline guard populated, carried
+    # here so `main()` can write its structured counts (not just `error`'s
+    # reason text) to `--refusal-out`. `None` on every other path.
+    budget_ledger: CommandBudgetLedger | None = None
 
 
 @dataclass(frozen=True)
@@ -1638,6 +1708,16 @@ Ground rules:
   turn. A slow build or test is fine — wait for it inline. Do NOT end your
   turn saying you will "keep working" or "report back once it's done":
   ending the turn ends the run, and anything not committed by then is lost.
+- Every command you run is bounded automatically to what remains of this
+  run's execution budget — you do not choose the bound and cannot widen it.
+  Backgrounding (a trailing `&`), `nohup`, `setsid`, `disown`, and starting a
+  background process to poll it in a loop are BLOCKED outright, not merely
+  discouraged: the tool call is denied. If the remaining budget cannot fit
+  another command, you will be told so; at that point, commit what is
+  already proven correct and say so in your final message, or — if nothing
+  is safe to commit — write the refusal marker with
+  `{{"refused": true, "verification_budget_exhausted": true, "reason":
+  "<what you could not verify>"}}`.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -1676,6 +1756,13 @@ Ground rules:
   turn. A slow build or test is fine — wait for it inline. Do NOT end your
   turn saying you will "keep working" or "report back once it's done":
   ending the turn ends the run, and anything not committed by then is lost.
+- Every command you run is bounded automatically to what remains of this
+  run's execution budget — you do not choose the bound and cannot widen it.
+  Backgrounding (a trailing `&`), `nohup`, `setsid`, `disown`, and starting a
+  background process to poll it in a loop are BLOCKED outright, not merely
+  discouraged: the tool call is denied. If the remaining budget cannot fit
+  another command, commit what is already proven correct and say so in your
+  final message.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -1901,6 +1988,7 @@ async def _run_implementer_agent(
     *,
     envelope_s: float | None = None,
     work_class: str = "review",
+    budget_ledger: CommandBudgetLedger | None = None,
 ) -> None:
     """Run the implementer's Claude Code turn under one outer wall-clock bound.
 
@@ -1913,11 +2001,38 @@ async def _run_implementer_agent(
     three positional args) resolves to `IMPLEMENTER_TIMEOUT_SECONDS` read at
     CALL time, not at function-definition time, so monkeypatching that module
     attribute still works exactly as it did before this parameter existed.
+
+    ``budget_ledger`` (mctl-agents#430): when supplied, every agent-issued
+    Bash command is bounded to what remains of THIS run's envelope via
+    `options._deadline_guard_hook` -- see `build_implementer_agent_options`.
+    The absolute deadline is computed HERE, immediately before
+    `anyio.fail_after(envelope_s)` below, on the SAME monotonic clock
+    (`anyio.current_time()`) that call uses, so the guard's remaining-budget
+    arithmetic and the outer bound agree on what "now" and "the deadline"
+    mean. ``budget_ledger=None`` (every caller and test that predates this
+    parameter) omits the guard entirely and reproduces today's behaviour
+    byte-for-byte -- see `build_implementer_agent_options`'s docstring.
     """
     if envelope_s is None:
         envelope_s = IMPLEMENTER_TIMEOUT_SECONDS
+    deadline_monotonic = anyio.current_time() + envelope_s
+    # One-shot probe, not per-command: `shutil.which` is cheap but there is no
+    # reason to pay it once per Bash call, and the fallback (skip wrapping,
+    # keep the tool-input clamp and the detachment denials) is a property of
+    # the whole run, not of any one command.
+    timeout_available = shutil.which("timeout") is not None
+    if not timeout_available:
+        print(
+            "warn: `timeout` binary not found on PATH; falling back to "
+            "tool-input clamping and detachment denials only -- commands are "
+            "no longer bounded at the OS level (mctl-agents#430)",
+            file=sys.stderr,
+        )
     options = build_implementer_agent_options(
-        repo_dir, SERVICE_AGENT_MODEL, proposal_dir, work_class=work_class
+        repo_dir, SERVICE_AGENT_MODEL, proposal_dir, work_class=work_class,
+        deadline_monotonic=deadline_monotonic,
+        budget_ledger=budget_ledger,
+        timeout_available=timeout_available,
     )
     mcp_configured = bool(options.mcp_servers)
     # A budget bounds spend but not a stalled network/model stream. Keep one
@@ -2205,13 +2320,20 @@ def review_feedback_one(
         # envelope is derived from the work class the bundle actually carries
         # (mctl-agents#423) -- a CI-remediation or mixed bundle gets a wider,
         # capped envelope than the review-only default, and its own guard
-        # hook (see build_implementer_agent_options).
+        # hook (see build_implementer_agent_options). `budget_ledger`
+        # (mctl-agents#430) is populated by the deadline guard as the run
+        # progresses -- created here, before the SDK call, so it is
+        # available below regardless of how the run ends.
         work_class = _bundle_work_class(bundle)
         n_checks = len(bundle.get("ci_failures") or [])
         envelope_s = implementer_envelope(work_class, n_checks=n_checks)
+        budget_ledger = CommandBudgetLedger()
         prompt = _build_prompt(ref, review_feedback=bundle, branch=branch, adopted=adopted)
         anyio.run(
-            functools.partial(_run_implementer_agent, envelope_s=envelope_s, work_class=work_class),
+            functools.partial(
+                _run_implementer_agent,
+                envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
+            ),
             target, prompt, ref.proposal_dir.resolve(),
         )
 
@@ -2222,6 +2344,18 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
+                if refusal.verification_budget_exhausted:
+                    # mctl-agents#430: the agent itself decided the remaining
+                    # command budget could not fit another verification step
+                    # -- the same outcome the ledger reports below, recorded
+                    # deliberately rather than observed by the guard's denial.
+                    release_reason = "no follow-up: verification budget exhausted"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {refusal.reason}",
+                        budget_ledger=budget_ledger,
+                    )
                 if refusal.insufficient_evidence:
                     # mctl-agents#423: the bounded CI-log evidence could not
                     # support a code decision -- distinct from an ordinary
@@ -2237,6 +2371,20 @@ def review_feedback_one(
                     ref=ref,
                     pr_url=None,
                     error=f"{REFUSAL_ERROR_PREFIX} {refusal.reason}",
+                )
+            if budget_ledger.exhausted:
+                # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
+                # prose -- observed the command budget run out with nothing
+                # committed and no marker written. Distinct from a plain
+                # EXIT_NO_FOLLOWUP_COMMITS: re-running with a bigger reserve
+                # or a faster verification step may still make progress,
+                # whereas a plain no-commit is deterministic.
+                release_reason = "no follow-up: verification budget exhausted"
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {budget_ledger.describe()}",
+                    budget_ledger=budget_ledger,
                 )
             release_reason = "no follow-up commits"
             return ImplementResult(
@@ -2254,9 +2402,13 @@ def review_feedback_one(
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
+        # Print the ledger summary even on success (mctl-agents#430): commits
+        # present is EXIT_OK regardless of any clamping/truncation along the
+        # way, but that truncation must still be visible in the Argo log.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
         release_reason = "follow-up pushed"
+        print(f"info: command budget ledger: {budget_ledger.describe()}")
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
@@ -3245,8 +3397,16 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         _stage_implementer_agent(target, ref.service)
 
         # 5. Run the SDK with PROPOSAL_DIR pointing at the gitops worktree.
+        # `budget_ledger` (mctl-agents#430): the same per-command deadline
+        # guard `review_feedback_one` wires in -- the boundary this proposal
+        # draws is generic over the driver, not review-remediation-only.
         prompt = _build_prompt(ref)
-        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
+        budget_ledger = CommandBudgetLedger()
+        anyio.run(
+            functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
+            target, prompt, ref.proposal_dir.resolve(),
+        )
+        print(f"info: command budget ledger: {budget_ledger.describe()}")
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
@@ -3722,6 +3882,16 @@ def main() -> None:
                     _write_refusal_out(
                         Path(args.refusal_out),
                         result.error[len(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):].strip(),
+                    )
+                elif code == EXIT_VERIFICATION_BUDGET_EXHAUSTED:
+                    # mctl-agents#430: the structured ledger summary (clamp/
+                    # deny counts, not just the reason text) so the shepherd
+                    # -- and an operator reading the log -- can tell a busy
+                    # runner apart from a reserve tuned too tight.
+                    _write_verification_budget_exhausted_out(
+                        Path(args.refusal_out),
+                        result.error[len(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):].strip(),
+                        result.budget_ledger,
                     )
             sys.exit(code)
         if result.skipped_reason:
