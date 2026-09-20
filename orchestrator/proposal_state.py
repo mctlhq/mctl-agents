@@ -181,15 +181,19 @@ def execution_authorization(data: dict[str, Any]) -> tuple[str | None, str | Non
     approval = data.get("approval")
     if isinstance(approval, dict):
         approved_by = approval.get("approved_by")
-        if isinstance(approved_by, str):
-            if approved_by.strip().lower() not in _ANONYMOUS_APPROVERS:
-                return AUTHORIZATION_HUMAN_APPROVAL, None
-            return None, UNAUTHORIZED_ANONYMOUS_APPROVER
-        if approved_by is not None:
-            # A non-string `approved_by` is a malformed record, not an absent
-            # one — it asked for something unreadable, so it reports as the
-            # anonymous case rather than as never-approved.
-            return None, UNAUTHORIZED_ANONYMOUS_APPROVER
+        if (
+            isinstance(approved_by, str)
+            and approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
+        ):
+            return AUTHORIZATION_HUMAN_APPROVAL, None
+        # The presence of an `approval` block is what separates the two
+        # reasons, not the readability of the identity inside it. `approval:
+        # {}`, a missing key, an explicit null and a non-string are all the
+        # same situation: SOME approve path ran and recorded no usable
+        # approver. That is the anonymous case, whose remedy is to re-approve.
+        # Routing it to `legacy auto-accepted / unreviewed` would send a real
+        # approval to human triage as if it had never been reviewed (agy P2).
+        return None, UNAUTHORIZED_ANONYMOUS_APPROVER
     # The autonomy-policy arm goes here once a policy is defined. Until then
     # there is deliberately no second way to reach a non-None authorization.
     return None, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED

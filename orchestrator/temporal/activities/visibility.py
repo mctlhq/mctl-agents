@@ -100,8 +100,9 @@ class VisibilityActivities:
         a zero count).
         """
         safe = [wf_id for wf_id in workflow_ids if _SAFE_ID.match(wf_id)]
+        queryable = set(safe)
         for wf_id in workflow_ids:
-            if wf_id not in set(safe):
+            if wf_id not in queryable:
                 activity.logger.warning(
                     "count_swept_prestart_failures: %r is not a queryable "
                     "workflow id; omitting it rather than reporting zero prior "
@@ -139,38 +140,6 @@ class VisibilityActivities:
             "query/queries: %s",
             len(safe),
             (len(safe) + _ID_CHUNK - 1) // _ID_CHUNK,
-            {k: v for k, v in counts.items() if v},
-        )
-        return counts
-
-        # Quoted for the visibility filter's own string syntax. These ids are
-        # built from gitops path segments, not from user input, but an
-        # unescaped quote would still turn a malformed slug into an
-        # InvalidArgument that reads as "no prior failures" to anything that
-        # swallowed it (review P3).
-        quoted = ", ".join("'" + wf_id.replace("'", "''") + "'" for wf_id in workflow_ids)
-        async for wf in self._client.list_workflows(
-            f"WorkflowId IN ({quoted}) AND ExecutionStatus = 'Failed'"
-        ):
-            if wf.id not in counts:
-                continue
-            handle = self._client.get_workflow_handle(wf.id, run_id=wf.run_id)
-            try:
-                await handle.result()
-            except WorkflowFailureError as exc:
-                cause = exc.cause
-                if isinstance(cause, ApplicationError) and cause.type == PRE_START_ERROR_TYPE:
-                    counts[wf.id] += 1
-            except Exception:  # noqa: BLE001 — an unreadable cause is not counted, not raised
-                activity.logger.warning(
-                    "count_swept_prestart_failures: could not read the failure "
-                    "cause for %s run_id=%s; not counted as a pre-start loss",
-                    wf.id,
-                    wf.run_id,
-                )
-        activity.logger.info(
-            "visibility: pre-start failures across %d candidate id(s): %s",
-            len(workflow_ids),
             {k: v for k, v in counts.items() if v},
         )
         return counts

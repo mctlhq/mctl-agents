@@ -402,6 +402,25 @@ class TestExecutionAuthorizationPredicate:
             UNAUTHORIZED_ANONYMOUS_APPROVER,
         )
 
+    @pytest.mark.parametrize(
+        "approval",
+        [
+            pytest.param({}, id="empty-approval-block"),
+            pytest.param({"approved_by": None}, id="explicit-null-approver"),
+            pytest.param({"approved_at": "2026-09-19T00:00:00Z"}, id="approver-key-absent"),
+        ],
+    )
+    def test_an_approval_block_with_no_usable_identity_is_anonymous_not_legacy(self, approval):
+        """agy P2 on `51ce44f`. These fell through to the legacy reason, which
+        sends a REAL approval to human triage as if it had never been
+        reviewed. What separates the two reasons is the presence of an
+        `approval` block, not the readability of what is inside it: some
+        approve path ran, so the remedy is to re-approve."""
+        assert execution_authorization({"status": "accepted", "approval": approval}) == (
+            None,
+            UNAUTHORIZED_ANONYMOUS_APPROVER,
+        )
+
     def test_a_non_mapping_approval_block_authorizes_nothing(self):
         assert execution_authorization({"approval": "mashkovd"}) == (
             None,

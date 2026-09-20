@@ -244,6 +244,15 @@ class ImplementSweepResult:
     # today (every needs-triage write lives in run_shepherd, CWFT-side); until
     # then this field is what makes the exhaustion visible.
     over_budget: int = 0
+    # Candidates whose pre-start budget could not be READ — the activity
+    # refused them a visibility query and omitted them from its result, so
+    # their count is unknown rather than zero. Its own field, not folded into
+    # `over_budget`, because the two have opposite remedies and opposite
+    # lifetimes: an exhausted budget clears when the retention window rolls,
+    # while a slug that fails the id charset fails it EVERY tick forever and
+    # needs the slug fixed. Log-only reporting here would repeat exactly the
+    # gap this PR closed for `over_budget` (agy/claude P3 on `51ce44f`).
+    unknown_budget: int = 0
 
 
 @workflow.defn
@@ -450,4 +459,5 @@ class ImplementSweepWorkflow:
             skipped_reason=scan.skipped_reason,
             unauthorized=len(scan.unauthorized),
             over_budget=len(over_budget_ids),
+            unknown_budget=len(unknown_budget_ids),
         )

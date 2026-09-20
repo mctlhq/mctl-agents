@@ -74,7 +74,13 @@ def _fake_activities(
         if budget_query_fails:
             raise ApplicationError("visibility unavailable", non_retryable=True)
         if prior_failures_by_id is not None:
-            return {w: prior_failures_by_id.get(w, 0) for w in workflow_ids}
+            # `None` means the activity refused to vouch for this id and
+            # OMITTED it, which is not the same as reporting zero.
+            return {
+                w: prior_failures_by_id.get(w, 0)
+                for w in workflow_ids
+                if prior_failures_by_id.get(w, 0) is not None
+            }
         return {w: prior_failures for w in workflow_ids}
 
     @activity.defn(name="find_stranded_accepted")
@@ -628,6 +634,70 @@ class TestOverBudgetIsReported:
         assert received["record_execution"] == [], (
             "a run that never happened must not appear in the executions ledger"
         )
+
+
+class TestUnknownBudgetIsNotZero:
+    """The consumer half of the omission contract (review P2 on `51ce44f`).
+
+    `count_swept_prestart_failures` OMITS an id it could not query rather than
+    reporting zero for it. Until now the producer half was pinned in
+    `test_visibility_activity.py` and the consumer half only by prose in two
+    docstrings — the fake answered for every requested id, so this branch was
+    dead in every workflow test. If it regresses, `.get(child_id, 0)` yields 0,
+    the id reads as "never failed to start", and the unbounded pre-start
+    resubmit the budget exists to stop returns for exactly the ids the activity
+    refused to vouch for — with the tick green and `over_budget` at 0.
+    """
+
+    async def test_an_omitted_id_is_not_submitted(self, env):
+        activities, received = _fake_activities(
+            stranded=[_candidate(slug="issue-1-a")],
+            prior_failures_by_id={"implement-sweep-mctl-web-issue-1-a": None},
+        )
+
+        result = await _run(env, activities)
+
+        assert received["submits"] == []
+        assert result.submitted == 0
+
+    async def test_an_omitted_id_is_not_counted_as_over_budget(self, env):
+        """An unreadable budget is not an exhausted one: it has a different
+        remedy (a slug that fails the id charset fails it every tick forever),
+        so folding it into `over_budget` would misreport it."""
+        activities, _ = _fake_activities(
+            stranded=[_candidate(slug="issue-1-a")],
+            prior_failures_by_id={"implement-sweep-mctl-web-issue-1-a": None},
+        )
+
+        result = await _run(env, activities)
+
+        assert result.over_budget == 0
+        assert result.unknown_budget == 1, (
+            "an unreadable budget needs its own report: unlike an exhausted "
+            "one it never clears on its own"
+        )
+
+    async def test_an_omitted_id_does_not_starve_its_neighbours(self, env):
+        """The omitted id must not consume a submit slot either — the same
+        ordering rule the rest of this PR enforces."""
+        activities, received = _fake_activities(
+            stranded=[_candidate(slug="issue-1-a"), _candidate(slug="issue-2-b")],
+            prior_failures_by_id={
+                "implement-sweep-mctl-web-issue-1-a": None,
+                "implement-sweep-mctl-web-issue-2-b": 0,
+            },
+        )
+
+        result = await _run(env, activities)
+
+        assert result.submitted == 1
+        assert result.candidates == 2
+        assert received["budget_queries"] == [
+            [
+                "implement-sweep-mctl-web-issue-1-a",
+                "implement-sweep-mctl-web-issue-2-b",
+            ]
+        ], "both candidates must be asked about in the one bulk query"
 
 
 class TestUnauthorizedIsReported:

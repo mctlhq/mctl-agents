@@ -194,17 +194,28 @@ live DevLoop: `mctl_trigger_approve` and the incident responder's direct
 `status: accepted` write both flip a proposal to `accepted` with no owner, and
 before this the sweep that used to promote it (an Argo cron) had been suspended
 since the Temporal migration — so those proposals sat untouched until a human
-ran `mctl_trigger_implementer` by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS` (default 5) proposals are
-submitted per tick, scoped to `{service, slug}` on the same admission queue
-DevLoopWorkflow's own implement step uses. Every candidate that survives the
-scan is logged as `STRANDED service=... slug=... reason=...`, whether it is
-submitted, over the per-tick cap, already being swept, or over its pre-start
-retry budget; proposals the scan itself filtered out are reported in
+ran `mctl_trigger_implementer` by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS`
+(default 5) proposals are submitted per tick, scoped to `{service, slug}` on
+the same admission queue DevLoopWorkflow's own implement step uses. Every
+candidate that survives the scan is logged as
+`STRANDED service=... slug=... reason=...`, whether it is submitted, over the
+per-tick cap, already being swept, over its pre-start retry budget, or of
+unknown budget; proposals the scan itself filtered out are reported in
 `StrandedScanResult.skipped` instead, and the quarantined ones additionally
-on `.unauthorized`. An unknown active-DevLoop set, a failed stranding scan,
-or an unknown pre-start retry budget each skip the whole tick with a
-`skipped_reason` rather than risk double-running an implementer or
-submitting past a bound.
+on `.unauthorized`.
+
+Two failure scopes, deliberately different. An unknown active-DevLoop set, a
+failed stranding scan or a FAILED budget query each skip the WHOLE tick with a
+`skipped_reason`, because none of them can be attributed to one candidate. A
+budget the activity declined to read for ONE id — its workflow id falls outside
+`[A-Za-z0-9._-]`, so it was refused a visibility query and omitted from the
+result rather than returned as zero — skips only THAT candidate, and is
+reported on `ImplementSweepResult.unknown_budget`. It is kept apart from
+`over_budget` because the remedies differ: an exhausted budget clears when the
+Temporal retention window rolls, while a malformed slug fails every tick
+forever and needs the slug fixed. The budget query itself is chunked at 100
+ids, so an unbounded candidate list cannot get the whole filter rejected on a
+path that fails closed.
 
 An `accepted` proposal whose `control.requires_human_approval` is set but
 carries no verified `approval.approved_by` is neither retried nor treated
