@@ -60,6 +60,19 @@ class StaleDirective:
     author: str
 
 
+# The staleness sweep is one sequential `gh issue view` per non-terminal,
+# non-directive-terminal proposal — report-only, and NOT the reason this
+# activity exists (the projection sweep above is). Left unbounded it grows
+# with the live proposal count and sits on the critical path of the whole
+# reconcile tick (`discover_and_project`), delaying `projections` — which
+# ReconcileWorkflow does act on — behind an arbitrarily long, purely
+# advisory sweep (codex review on #417). Bounded the same way
+# run_issue_directive_poller.DEFAULT_MAX_DIRECTIVES bounds its own scan:
+# candidates beyond the cap are skipped this tick and picked up by a later
+# one, same as a directive beyond that cap is.
+MAX_STALE_DIRECTIVE_CANDIDATES = 25
+
+
 @dataclass(frozen=True)
 class ReconcileDiscoveryResult:
     total_inspected: int
@@ -131,7 +144,22 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
     genuinely never records it) makes ANY unacked directive on that issue
     stale — there is nothing to compare against, and reporting nothing
     would be exactly the silence this check exists to catch.
+
+    Bounded at `MAX_STALE_DIRECTIVE_CANDIDATES`: this is a report-only,
+    best-effort sweep, not the reason `discover_and_project` exists, and an
+    unbounded sequential `gh` sweep here would sit on the critical path of
+    the whole reconcile tick (codex review on #417). Candidates beyond the
+    cap are skipped this tick and picked up by a later one.
     """
+    if len(refs) > MAX_STALE_DIRECTIVE_CANDIDATES:
+        activity.logger.warning(
+            "reconcile: %d directive-staleness candidate(s) found — capping this "
+            "tick's sweep at %d; the rest are picked up by a later tick",
+            len(refs),
+            MAX_STALE_DIRECTIVE_CANDIDATES,
+        )
+        refs = refs[:MAX_STALE_DIRECTIVE_CANDIDATES]
+
     stale: list[StaleDirective] = []
     for ref in refs:
         issue_url = issue_url_for(ref.service, ref.slug)

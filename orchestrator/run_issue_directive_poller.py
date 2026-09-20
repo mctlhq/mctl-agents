@@ -57,6 +57,8 @@ from orchestrator.directives import (
     RawComment,
     ack_trailer,
     acked_comment_ids,
+    fail_trailer,
+    failed_attempt_counts,
     parse_comments,
 )
 from orchestrator.run_issue_investigator import _OVERWRITABLE_STATUSES, _run
@@ -70,6 +72,13 @@ from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 # comment unacked and are picked up by a later tick. Matches the spirit of
 # run_issue_poller.DEFAULT_MAX_ISSUES = 5.
 DEFAULT_MAX_DIRECTIVES = 3
+
+# A persistent dispatch failure (mctl-api down, broken auth) must not turn
+# into an unbounded comment-spam loop: after this many failed attempts for
+# the same comment id, the scan gives up — posts one final reply carrying
+# the ack trailer (so no further tick retries it) instead of a fresh
+# "will retry" comment every 15 minutes forever (codex review on #417).
+MAX_DISPATCH_ATTEMPTS = 3
 
 # Statuses a proposal never leaves — a directive on one of these is not
 # worth even reading comments for. Everything else (including "proposed",
@@ -146,8 +155,18 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     runs synchronously inside a 15-minute tick and only needs the name to
     reply with — the investigation itself runs independently in Argo, the
     same as every other consumer of this operation.
+
+    `slug` is accepted for the caller's own logging/reply purposes only and
+    is NOT sent as a CWFT parameter (codex review on #417): the operation's
+    only other caller, `orchestrator.temporal.workflows.dev_loop`'s
+    `_run_cwft("mctl-agents-investigate", investigate_params)`, sends only
+    `issue_url` (plus optional release-pinning fields this poller does not
+    set) — `run_issue_investigator.main()` has no `--slug` flag at all and
+    always re-derives the slug from `issue_url` via `resolve_slug()`, so a
+    `slug` key here would be a parameter nothing on the other end reads
+    (see design.md's open question, resolved against sending it).
     """
-    params = {"issue_url": issue_url, "slug": slug, "requested_by": requested_by}
+    params = {"issue_url": issue_url, "requested_by": requested_by}
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=_SUBMIT_TIMEOUT_SECONDS) as client:
         response = await client.post(
             f"/api/v1/operations/{INVESTIGATE_OPERATION}/execute",
@@ -216,11 +235,24 @@ def _reply_dispatched(author: str, comment_id: str, workflow_name: str, service:
     )
 
 
-def _reply_dispatch_failed(author: str, error: Exception) -> str:
+def _reply_dispatch_failed(author: str, error: Exception, attempt: int) -> str:
     # Deliberately NOT carrying the ack trailer — see the module docstring.
+    # Carries a fail_trailer instead (appended by the caller) so the retry
+    # budget below can be counted across ticks.
     return (
         f"@{author} the re-investigation dispatch failed ({error}). This will be "
-        "retried on the next poll tick."
+        f"retried on the next poll tick ({attempt}/{MAX_DISPATCH_ATTEMPTS})."
+    )
+
+
+def _reply_dispatch_gave_up(author: str, error: Exception, attempts: int) -> str:
+    # Carries the ack trailer — this IS the give-up: no further tick may
+    # retry a comment id that has already failed MAX_DISPATCH_ATTEMPTS
+    # times, or the failure becomes an unbounded comment-spam loop.
+    return (
+        f"@{author} the re-investigation dispatch failed ({error}) {attempts} times in a "
+        "row. Giving up — this directive will not be retried automatically; an operator "
+        "must check mctl-api and resubmit manually."
     )
 
 
@@ -239,10 +271,16 @@ async def _handle_directive(
     ref: ProposalStateRef,
     all_refs: list[ProposalStateRef],
     dry_run: bool,
+    prior_failures: int = 0,
 ) -> str:
     """Run the decision table for one unacked directive. Returns one of:
     "unauthorized", "unrecognised", "no-proposal", "ambiguous",
     "not-overwritable", "dispatched", "dispatch-failed", or "dry-run".
+
+    `prior_failures` is the number of previously recorded dispatch-failure
+    attempts for this exact comment id (`orchestrator.directives.
+    failed_attempt_counts`) — the bound that keeps a persistent dispatch
+    failure from spamming a fresh "will retry" comment every tick forever.
     """
     if not directive.authorized:
         outcome, body = "unauthorized", _reply_unauthorized(directive.author, directive.comment_id)
@@ -271,7 +309,18 @@ async def _handle_directive(
         try:
             workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
         except Exception as e:  # noqa: BLE001 — surfaced as a per-directive failure, comment kept unacked for retry
-            _post_reply(issue_url, _reply_dispatch_failed(directive.author, e))
+            attempt = prior_failures + 1
+            if attempt >= MAX_DISPATCH_ATTEMPTS:
+                _post_reply(
+                    issue_url,
+                    _with_ack(_reply_dispatch_gave_up(directive.author, e, attempt), directive.comment_id),
+                )
+            else:
+                _post_reply(
+                    issue_url,
+                    f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
+                    f"{fail_trailer(directive.comment_id)}",
+                )
             return "dispatch-failed"
         _post_reply(
             issue_url,
@@ -296,42 +345,80 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
     all_refs = await list_proposal_refs()
     candidates = [r for r in all_refs if r.status not in TERMINAL_STATUSES]
 
-    pending: list[tuple[ProposalStateRef, str, Directive]] = []
+    # Grouped by issue (not a flat list) so the per-tick cap below can be
+    # applied round-robin across issues instead of by proposal order — see
+    # the cap loop's comment for why a flat ordering starves every issue
+    # after the first noisy one.
+    pending_by_issue: dict[tuple[str, str], list[tuple[ProposalStateRef, str, Directive, int]]] = {}
+    issue_order: list[tuple[str, str]] = []
     failed = 0
     for ref in candidates:
         issue_url = issue_url_for(ref.service, ref.slug)
         if issue_url is None:
             continue
         try:
-            comments = read_issue_comments(issue_url)
+            # Off the event loop: this scan can make one `gh issue view`
+            # call per non-terminal proposal (tens of them at production
+            # scale), and each is a blocking subprocess round-trip. Run
+            # synchronously inside this coroutine it would freeze the
+            # Temporal worker's asyncio event loop for the sum of all of
+            # them, stalling every other activity/workflow task the same
+            # worker process is scheduling (codex review on #417) — the
+            # same `asyncio.to_thread` wrapping activities/discovery.py
+            # already uses for the identical call.
+            comments = await asyncio.to_thread(read_issue_comments, issue_url)
         except subprocess.CalledProcessError as e:
             print(f"WARN: could not read comments for {issue_url}: {e.stderr or e}")
             failed += 1
             continue
 
         acked = acked_comment_ids(comments)
+        fail_counts = failed_attempt_counts(comments)
+        key = (ref.service, ref.slug)
         for directive in parse_comments(comments):
             if not directive.comment_id or directive.comment_id in acked:
                 continue
-            pending.append((ref, issue_url, directive))
+            if key not in pending_by_issue:
+                pending_by_issue[key] = []
+                issue_order.append(key)
+            pending_by_issue[key].append(
+                (ref, issue_url, directive, fail_counts.get(directive.comment_id, 0))
+            )
 
-    if max_directives > 0 and len(pending) > max_directives:
-        actionable = pending[:max_directives]
-        deferred_count = len(pending) - max_directives
+    total_pending = sum(len(v) for v in pending_by_issue.values())
+
+    if max_directives > 0 and total_pending > max_directives:
+        # Round-robin across issues, one directive at a time, rather than
+        # draining the first issue's queue before moving to the next: a
+        # flat cap applied to a list ordered by proposal lets one issue
+        # with many pending directives (a comment burst) consume the whole
+        # tick's budget and starve every other issue's directive out of
+        # every tick (codex review on #417).
+        buckets = [pending_by_issue[key] for key in issue_order]
+        actionable: list[tuple[ProposalStateRef, str, Directive, int]] = []
+        while len(actionable) < max_directives and any(buckets):
+            for bucket in buckets:
+                if not bucket:
+                    continue
+                actionable.append(bucket.pop(0))
+                if len(actionable) >= max_directives:
+                    break
+        deferred_count = total_pending - len(actionable)
         print(
-            f"WARN: {len(pending)} directive(s) found this tick — capping at "
+            f"WARN: {total_pending} directive(s) found this tick — capping at "
             f"--max-directives={max_directives}; {deferred_count} deferred to a later tick."
         )
     else:
-        actionable = pending
+        actionable = [item for key in issue_order for item in pending_by_issue[key]]
         deferred_count = 0
 
     dispatched = 0
     replied = 0
-    for ref, issue_url, directive in actionable:
+    for ref, issue_url, directive, fail_count in actionable:
         try:
             outcome = await _handle_directive(
-                directive, issue_url=issue_url, ref=ref, all_refs=all_refs, dry_run=dry_run
+                directive, issue_url=issue_url, ref=ref, all_refs=all_refs, dry_run=dry_run,
+                prior_failures=fail_count,
             )
         except subprocess.CalledProcessError as e:
             print(f"FAIL: could not reply on {issue_url}: {e.stderr or e}")

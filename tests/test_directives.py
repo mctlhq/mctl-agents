@@ -18,9 +18,13 @@ from orchestrator.directives import (
     RawComment,
     ack_trailer,
     acked_comment_ids,
+    fail_trailer,
+    failed_attempt_counts,
     parse_comment,
     parse_comments,
 )
+
+_BOT_LOGIN = next(iter(BOT_LOGINS))
 
 
 def _comment(
@@ -144,7 +148,7 @@ def test_parse_comments_drops_non_directives():
 )
 def test_ack_trailer_round_trips(comment_id):
     trailer = ack_trailer(comment_id)
-    ids = acked_comment_ids([_comment(f"reply text\n\n{trailer}")])
+    ids = acked_comment_ids([_comment(f"reply text\n\n{trailer}", author=_BOT_LOGIN)])
     assert ids == {comment_id}
 
 
@@ -152,24 +156,48 @@ def test_a_quoted_trailer_inside_a_fenced_code_block_still_counts_as_acked():
     """The conservative direction: a false 'already acked' costs one
     missed retry; a false 'not acked' costs a duplicate SDK run."""
     body = "some text\n```\n" + ack_trailer("c42") + "\n```\nmore text"
-    assert acked_comment_ids([_comment(body)]) == {"c42"}
+    assert acked_comment_ids([_comment(body, author=_BOT_LOGIN)]) == {"c42"}
 
 
 def test_a_comment_carrying_two_trailers_yields_both_ids():
     body = ack_trailer("c1") + "\n" + ack_trailer("c2")
-    assert acked_comment_ids([_comment(body)]) == {"c1", "c2"}
+    assert acked_comment_ids([_comment(body, author=_BOT_LOGIN)]) == {"c1", "c2"}
 
 
-def test_acked_comment_ids_scans_every_comment_not_just_bot_ones():
+def test_acked_comment_ids_ignores_a_trailer_from_a_non_bot_author():
+    """mctl-agents#417 codex review: honouring an ack trailer from ANY
+    author would let an unprivileged commenter forge one and silently
+    suppress a maintainer's directive. Only the bot's own comments count."""
     comments = [
         _comment(f"whatever\n\n{ack_trailer('x1')}", id="1", author="someone"),
-        _comment("nothing here", id="2"),
+        _comment(f"whatever\n\n{ack_trailer('x2')}", id="2", author=_BOT_LOGIN),
     ]
-    assert acked_comment_ids(comments) == {"x1"}
+    assert acked_comment_ids(comments) == {"x2"}
 
 
 def test_no_ack_trailer_yields_empty_set():
-    assert acked_comment_ids([_comment("no trailer here")]) == set()
+    assert acked_comment_ids([_comment("no trailer here", author=_BOT_LOGIN)]) == set()
+
+
+# ---------------------------------------------------------------------------
+# fail_trailer / failed_attempt_counts
+# ---------------------------------------------------------------------------
+def test_fail_trailer_round_trips():
+    trailer = fail_trailer("c1")
+    assert failed_attempt_counts([_comment(f"reply\n\n{trailer}")]) == {"c1": 1}
+
+
+def test_failed_attempt_counts_accumulates_across_comments():
+    comments = [
+        _comment(f"attempt 1\n\n{fail_trailer('c1')}", id="a"),
+        _comment(f"attempt 2\n\n{fail_trailer('c1')}", id="b"),
+        _comment(f"different directive\n\n{fail_trailer('c2')}", id="c"),
+    ]
+    assert failed_attempt_counts(comments) == {"c1": 2, "c2": 1}
+
+
+def test_no_fail_trailer_yields_empty_dict():
+    assert failed_attempt_counts([_comment("no trailer here")]) == {}
 
 
 def test_directive_is_a_frozen_dataclass():

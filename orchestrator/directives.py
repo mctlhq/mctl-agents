@@ -154,14 +154,53 @@ def ack_trailer(comment_id: str) -> str:
 
 def acked_comment_ids(comments) -> set[str]:
     """Every comment id already acknowledged, per `ack_trailer` markers
-    found in ANY comment body — deliberately not restricted to bot-authored
-    comments. A comment that merely quotes the trailer (e.g. inside a
-    fenced code block) is still read as acked: the conservative direction,
-    since a false "already acked" costs one missed retry and a false "not
-    acked" costs a duplicate SDK run.
+    found in a comment authored by the platform bot identity (`BOT_LOGINS`).
+
+    Restricted to the bot author (mctl-agents#417 codex review): an ack
+    permanently suppresses a directive's dispatch, so honouring a trailer
+    posted by ANY commenter would let an unprivileged GitHub user silently
+    suppress a maintainer's directive just by pasting the marker syntax
+    into their own comment — the bot is the only author that ever has
+    reason to post one. A comment that merely quotes the trailer (e.g.
+    inside a fenced code block) is still read as acked when the bot is the
+    one who posted it: the conservative direction, since a false "already
+    acked" costs one missed retry and a false "not acked" costs a
+    duplicate SDK run.
     """
     ids: set[str] = set()
+    bot_logins = {b.lower() for b in BOT_LOGINS}
     for comment in comments:
+        if (comment.author or "").lower() not in bot_logins:
+            continue
         for match in _ACK_RE.finditer(comment.body or ""):
             ids.add(match.group(1))
     return ids
+
+
+def fail_trailer(comment_id: str) -> str:
+    """Marker appended to a dispatch-failed reply that has not yet
+    exhausted the retry budget (`run_issue_directive_poller.
+    MAX_DISPATCH_ATTEMPTS`) — counts prior failed attempts for a comment id
+    without acknowledging it, so a persistent dispatch failure (mctl-api
+    down, broken auth) cannot turn into an unbounded comment-spam loop
+    (mctl-agents#417 codex review): after the budget is exhausted the scan
+    gives up and writes the ack itself instead of retrying forever.
+    """
+    return f"<!-- mctl-directive-fail: {comment_id} -->"
+
+
+_FAIL_RE = re.compile(r"<!--\s*mctl-directive-fail:\s*([A-Za-z0-9_-]+)\s*-->")
+
+
+def failed_attempt_counts(comments) -> dict[str, int]:
+    """How many `fail_trailer` markers exist per comment id, across ANY
+    comment body — mirrors `acked_comment_ids`'s conservative "scan every
+    comment" reading, since a fail-trailer only ever suppresses further
+    spam, never a dispatch.
+    """
+    counts: dict[str, int] = {}
+    for comment in comments:
+        for match in _FAIL_RE.finditer(comment.body or ""):
+            cid = match.group(1)
+            counts[cid] = counts.get(cid, 0) + 1
+    return counts
