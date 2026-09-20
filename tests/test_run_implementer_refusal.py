@@ -656,6 +656,57 @@ def test_a_failing_refusal_write_still_exits_47(tmp_path, monkeypatch) -> None:
     assert exc.value.code == run_implementer.EXIT_DELIBERATE_NO_OP
 
 
+def test_main_writes_refusal_out_and_exits_50_on_insufficient_ci_evidence(
+    tmp_path, monkeypatch,
+) -> None:
+    """mctl-agents#423 fix-forward: end-to-end `insufficient_evidence` path.
+
+    `RefusalMarker(insufficient_evidence=True)` -> `ImplementResult.error`
+    prefixed with `CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX` -> `main()` maps it
+    to exit 50 AND writes the stripped reason to `--refusal-out`. The pieces
+    were each unit-tested individually; this pins them wired together, since
+    that wiring is exactly what regressed once before (see the P2 note on
+    the `EXIT_CI_EVIDENCE_INSUFFICIENT` branch above).
+    """
+    ref = _ref(tmp_path)
+    bundle = tmp_path / "feedback.json"
+    bundle.write_text("{}", encoding="utf-8")
+    refusal_out = tmp_path / "refusal.json"
+
+    monkeypatch.setattr("sys.argv", [
+        "run_implementer.py",
+        "--service", "mctl-web",
+        "--slug", "test-slug",
+        "--state-dir", str(tmp_path),
+        "--review-feedback", str(bundle),
+        "--refusal-out", str(refusal_out),
+    ])
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(run_implementer, "_load_review_feedback", lambda _p: {})
+    monkeypatch.setattr(
+        run_implementer, "find_accepted_proposals", lambda *_a, **_kw: [ref],
+    )
+    monkeypatch.setattr(
+        run_implementer, "review_feedback_one",
+        lambda *_a, **_kw: run_implementer.ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=(
+                f"{run_implementer.CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} "
+                "bounded excerpt does not show the failing assertion"
+            ),
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        run_implementer.main()
+
+    assert exc.value.code == run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT
+    assert exc.value.code == 50
+    written = json.loads(refusal_out.read_text(encoding="utf-8"))
+    assert written["reason"] == "bounded excerpt does not show the failing assertion"
+
+
 def test_a_missing_git_binary_is_not_a_refusal(repo, monkeypatch) -> None:
     """`FileNotFoundError` from a missing binary is not a return code.
 

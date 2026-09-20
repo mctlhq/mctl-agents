@@ -563,6 +563,122 @@ def test_ci_log_guard_hook_denies_gh_api_logs_route():
     assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+def test_ci_log_guard_hook_denies_gh_run_view_with_a_global_repo_flag():
+    """mctl-agents#423 fix-forward: verified Agy P2 on PR #425's merged head.
+
+    `-R owner/repo` (and `--repo`/`--repo=owner/repo`) sit between `gh` and
+    `run`, which used to break the `\\bgh\\s+run\\s+view\\b` anchor and let
+    the fetch through undenied. Each form must still be denied.
+    """
+    import anyio
+
+    for cmd in (
+        "gh -R o/r run view 123 --log-failed",
+        "gh --repo o/r run view 123 --log-failed",
+        "gh --repo=o/r run view 123 --log-failed",
+        "gh -R o/r api repos/o/r/actions/jobs/1/logs",
+    ):
+        result = anyio.run(
+            options._ci_log_guard_hook,
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            None, None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+
+
+def test_ci_log_guard_hook_denies_a_line_continued_gh_run_view():
+    """mctl-agents#423 fix-forward: verified Agy P2 on PR #425's merged head.
+
+    A trailing `\\` before the newline is a shell line continuation — the
+    shell joins the lines before running the command — but the deny
+    pattern's `[^&|;\\n]*` used to stop at the literal `\\n` in the tool-call
+    string, before ever reaching `--log-failed`.
+    """
+    import anyio
+
+    result = anyio.run(
+        options._ci_log_guard_hook,
+        {"tool_name": "Bash", "tool_input": {"command": "gh run view \\\n  123 --log-failed"}},
+        None, None,
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_ci_log_guard_hook_denies_gh_run_view_with_odd_flag_spacing():
+    """mctl-agents#423 fix-forward, round 2: verified Agy P2 on this PR.
+
+    `[=\\s]\\S+` treats `=`/whitespace as a single interchangeable
+    character, so two spaces (or an attached shorthand value with none)
+    between a global flag and its argument left the argument unconsumed and
+    broke the `run\\s+view` anchor downstream. Each form must still deny.
+    """
+    import anyio
+
+    for cmd in (
+        "gh -R  o/r run view 123 --log-failed",
+        "gh -Ro/r run view 123 --log-failed",
+        "gh --repo  o/r run view 123 --log-failed",
+    ):
+        result = anyio.run(
+            options._ci_log_guard_hook,
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            None, None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+
+
+def test_ci_log_guard_hook_denies_a_mid_token_line_continuation():
+    """mctl-agents#423 fix-forward, round 2: verified Agy P2 on this PR.
+
+    A continuation with no whitespace on either side (`vi\\\\\\new`) is
+    POSIX line-continuation *inside* a token — the shell rejoins it with
+    nothing inserted. Collapsing it to a space instead mutated `view` into
+    `vi ew`, which no longer matches `run\\s+view` and slipped past.
+    """
+    import anyio
+
+    for cmd in (
+        "gh run vi\\\new 123 --log-failed",
+        "gh run view 123 --log-\\\nfailed",
+    ):
+        result = anyio.run(
+            options._ci_log_guard_hook,
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            None, None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+
+
+def test_ci_log_guard_hook_still_allows_unrelated_gh_commands_with_global_flags():
+    """Skipping `gh` global flags to find the subcommand must not turn into
+    over-matching unrelated commands that merely happen to carry a flag."""
+    import anyio
+
+    for cmd in (
+        "gh -R o/r pr view 1",
+        "gh --repo o/r issue list",
+        "gh --hostname example.com run view 123",
+    ):
+        result = anyio.run(
+            options._ci_log_guard_hook,
+            {"tool_name": "Bash", "tool_input": {"command": cmd}},
+            None, None,
+        )
+        assert result == {}, cmd
+
+
+def test_normalize_shell_command_joins_continuations_but_keeps_real_boundaries():
+    assert options._normalize_shell_command("gh run view \\\n  123") == "gh run view  123"
+    assert options._normalize_shell_command("echo a\necho b") == "echo a\necho b"
+
+
+def test_normalize_shell_command_rejoins_a_mid_token_continuation_with_no_space():
+    """A continuation with no whitespace on either side must vanish entirely
+    (POSIX semantics), not become a space that splits the token in two."""
+    assert options._normalize_shell_command("gh run vi\\\new 123") == "gh run view 123"
+    assert options._normalize_shell_command("--log-\\\nfailed") == "--log-failed"
+
+
 def test_ci_log_guard_hook_denies_curl_and_wget_of_a_logs_url():
     import anyio
 
