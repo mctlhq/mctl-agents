@@ -53,7 +53,7 @@ def _fake_activities(
     scan_fails: bool = False,
     budget_query_fails: bool = False,
     unauthorized: list[tuple[str, str]] | None = None,
-    prior_failures_by_id: dict[str, int] | None = None,
+    prior_failures_by_id: dict[str, int | None] | None = None,
     active_ids: list[str] | None = None,
     stranded: list[StrandedProposal] | None = None,
     submit_gate: anyio.Event | None = None,
@@ -76,11 +76,8 @@ def _fake_activities(
         if prior_failures_by_id is not None:
             # `None` means the activity refused to vouch for this id and
             # OMITTED it, which is not the same as reporting zero.
-            return {
-                w: prior_failures_by_id.get(w, 0)
-                for w in workflow_ids
-                if prior_failures_by_id.get(w, 0) is not None
-            }
+            resolved = {w: prior_failures_by_id.get(w, 0) for w in workflow_ids}
+            return {w: n for w, n in resolved.items() if n is not None}
         return {w: prior_failures for w in workflow_ids}
 
     @activity.defn(name="find_stranded_accepted")
@@ -688,7 +685,9 @@ class TestUnknownBudgetIsNotZero:
             },
         )
 
-        result = await _run(env, activities)
+        result = await _run(
+            env, activities, await_children=["implement-sweep-mctl-web-issue-2-b"]
+        )
 
         assert result.submitted == 1
         assert result.candidates == 2

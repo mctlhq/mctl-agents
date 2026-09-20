@@ -13,10 +13,14 @@ hold, checked in this order (design.md §1):
   2. its `attempt` lease has not expired — an implementer run holds it;
   3. it is unrunnable as written (`unrunnable_reason` / a `blocked` marker) —
      a submit here could only refuse (#349);
-  4. it has no `control` block and its `updated_by` does not name a
-     recognised auto-accept writer — an absent `control` block only means
-     "approval was never required" (a write-time default), not "a human or a
-     recognised auto-accept path put this in `accepted`";
+  4. it carries no execution authorization — `execution_authorization` finds
+     no non-anonymous `approval.approved_by`. An absent `control` block only
+     means "approval was never required" (a write-time default), not "someone
+     authorized this to run", so it is never read as consent. Provenance of
+     the WRITER is deliberately not part of this: a writer allowlist was tried
+     and rejected by the 2026-09-19 product decision on mctl-agents#412, and
+     `ProposalStateRef` no longer carries `updated_by` at all (see the block
+     comment below);
   5. its `updated_at` is inside the stranding grace period — a DevLoopWorkflow
      may be between its approve flip and its own implement submit;
   6. its derived DevLoop workflow id is in the caller's active set — a live

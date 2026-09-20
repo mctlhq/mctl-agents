@@ -160,4 +160,3 @@ def implement_sweep_max_submits() -> int:
 # Binding here makes the declared port real and lets a native VMServiceScrape
 # target `port: http` with no chart change at all.
 METRICS_PORT = 8080
-
