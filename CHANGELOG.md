@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.52.0](https://github.com/mctlhq/mctl-agents/compare/1.51.0...1.52.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-430-fix-implementer-bound-long-running-local ([99d61f9](https://github.com/mctlhq/mctl-agents/commit/99d61f9423bac5409287d6f406e1ba0c6121dba3))
+
+
+### Bug Fixes
+
+* **agents:** bound implementer commands to the remaining envelope ([630ac27](https://github.com/mctlhq/mctl-agents/commit/630ac27b59c17fee341e554998a2371ea50c4ab4))
+* **agents:** close the five P2 findings on the execution-budget guard ([624a433](https://github.com/mctlhq/mctl-agents/commit/624a4337fc30b827f1ec31f3bf561380364f1207))
+* **agents:** keep the timer ordering below a one-second budget ([a4674cc](https://github.com/mctlhq/mctl-agents/commit/a4674ccdef4e300442845fe99e035e0357265892))
+* **agents:** make the OS timer fire first and let the ledger outrank the marker ([aa60779](https://github.com/mctlhq/mctl-agents/commit/aa60779d8d9129cf5f333b733c69a77f09bee416))
+* **agents:** scan executed payloads and bound the implement-path hand-back ([166133b](https://github.com/mctlhq/mctl-agents/commit/166133b74508be8f85745870fb56e9db900d48b7))
+* **agents:** scope `-c` to its segment and write status before releasing the claim ([4449024](https://github.com/mctlhq/mctl-agents/commit/444902429ffea13165b370b65f68b9e4284f0141))
+* **agents:** withhold the shell-state exemption from anything that can run long ([61595a0](https://github.com/mctlhq/mctl-agents/commit/61595a05ad2933d4719f30378ee4cb10ad26070e))
+* **implementer:** see through exec wrappers when scanning for a shell payload ([fc84dc5](https://github.com/mctlhq/mctl-agents/commit/fc84dc5efa97c97e63ac853f9f6cd99755496471))
+* **implementer:** step over option arguments in the flag scan, order the bounds in milliseconds ([24fe327](https://github.com/mctlhq/mctl-agents/commit/24fe3274228a6022b4764bca8956d260b5ef9cd9))
+
 ## [1.51.0](https://github.com/mctlhq/mctl-agents/compare/1.50.0...1.51.0) (2026-09-20)
 
 
