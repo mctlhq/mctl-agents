@@ -1257,13 +1257,21 @@ def _hand_back_if_still_ours(
     return True
 
 
-# How many times one proposal may be handed back to `accepted` because its
-# implement run exhausted the per-command verification budget. The implement
-# driver has no `review_attempts`/`harness_failures` budget of its own -- the
-# sibling `except ImplementerOrphanedSubagent` arm stays terminal for exactly
-# that reason -- so an unconditional hand-back would trade a wrong terminal
-# state for an unbounded PAID retry loop (claude P2 on `624a433`). Mirrors
-# `run_shepherd.MAX_HARNESS_FAILURES`: blameless, but not infinite.
+# The consecutive budget-exhausted attempt at which an implement run stops
+# being handed back and becomes terminal. Read it exactly as
+# `run_shepherd.MAX_HARNESS_FAILURES`, which it mirrors down to the
+# comparison (`new >= MAX`): the Nth occurrence is the one that stops the
+# loop, so N-1 hand-backs actually happen. Deliberately the same shape rather
+# than the more obvious "N hand-backs allowed" -- two sibling caps that read
+# alike but count differently is a worse trap than one slightly terse rule
+# (agy P2 on `61595a0` read it the other way, which is the evidence that the
+# wording, not the comparison, was what needed fixing).
+#
+# A cap is needed at all because the implement driver has no
+# `review_attempts`/`harness_failures` budget of its own -- the sibling
+# `except ImplementerOrphanedSubagent` arm stays terminal for exactly that
+# reason -- so an unconditional hand-back would trade a wrong terminal state
+# for an unbounded PAID retry loop (claude P2 on `624a433`).
 IMPLEMENT_MAX_BUDGET_HANDBACKS = 3
 
 
@@ -3476,7 +3484,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                     exhausted_msg = (
                         "verification budget exhausted on "
                         f"{prior_handbacks + 1} consecutive attempts "
-                        f"({IMPLEMENT_MAX_BUDGET_HANDBACKS} allowed): "
+                        f"(limit {IMPLEMENT_MAX_BUDGET_HANDBACKS}): "
                         f"{budget_ledger.describe()}"
                     )
                     recorded = _mark_needs_triage(
@@ -3493,16 +3501,24 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                         error=_triage_error(exhausted_msg, recorded),
                         budget_ledger=budget_ledger,
                     )
-                _release_claim(claim_ctx, reason="agent: verification budget exhausted")
                 message = (
                     "implementer produced no commits: "
                     f"{budget_ledger.describe()} "
-                    f"(hand-back {prior_handbacks + 1} of "
+                    f"(attempt {prior_handbacks + 1} of "
                     f"{IMPLEMENT_MAX_BUDGET_HANDBACKS})"
                 )
-                if not _hand_back_if_still_ours(
+                # Status first, claim second -- the order every sibling arm
+                # uses (`_mark_needs_triage`, the `implemented` write). The
+                # reverse frees mutual exclusion while `.status.yaml` still
+                # names our live attempt, so a second executor can acquire
+                # the claim inside that window and either lose its own write
+                # to our hand-back or make our compare-and-swap decline
+                # (agy P2 on `61595a0`).
+                handed_back = _hand_back_if_still_ours(
                     ref, attempt_id, budget_handbacks=prior_handbacks + 1
-                ):
+                )
+                _release_claim(claim_ctx, reason="agent: verification budget exhausted")
+                if not handed_back:
                     # The CAS declined -- somebody else's attempt is in the
                     # file, so nothing was handed back and the next tick will
                     # not retry it. Two different outcomes must not read

@@ -205,7 +205,10 @@ Three rules keep that rewrite from being worse than the defect it closes:
   carry those characters as data and are admitted. A backslash-escaped
   operator outside quotes is masked too. But quoted text the shell will
   EXECUTE is scanned recursively at its own level: a `bash -c` payload and
-  the contents of `$(...)`/backticks, to `MAX_PAYLOAD_DEPTH`. `bash -c "cmd
+  the contents of `$(...)`/backticks, to `MAX_PAYLOAD_DEPTH`. A `-c` flag
+  belongs to its own SEGMENT, never to the command line: judged line-wide,
+  `cd /repo/bash && git -c user.name="A & B" commit` read `git -c` as a shell
+  payload because some earlier token happened to spell a shell. `bash -c "cmd
   &"` backgrounds inside the inner shell, and GNU `timeout` exits with its
   DIRECT child, so the grandchild survives — the #652 shape reached through a
   quoted payload rather than a bare one.
@@ -262,7 +265,12 @@ ledger hands the proposal back to `accepted` (`_hand_back_if_still_ours`,
 under the same compare-and-swap the claim-vanished arm uses) instead of
 writing `needs-triage` — but only `IMPLEMENT_MAX_BUDGET_HANDBACKS` (3) times
 in a row, tallied in `.status.yaml`'s `budget_handbacks` and cleared by any
-run that gets through. The implement driver has no `review_attempts` or
+run that gets through. The cap counts like `MAX_HARNESS_FAILURES`, which it
+mirrors down to the comparison: the Nth consecutive occurrence is the one
+that stops the loop, so N-1 hand-backs actually happen. The hand-back writes
+`.status.yaml` BEFORE releasing the claim, the order every other terminal arm
+uses — the reverse frees mutual exclusion while the file still names a live
+attempt. The implement driver has no `review_attempts` or
 `harness_failures` budget of its own, which is why its sibling
 orphaned-subagent arm stays terminal; an unconditional hand-back would
 therefore trade a wrong terminal state for an unbounded PAID retry loop. At

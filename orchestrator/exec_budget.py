@@ -311,18 +311,56 @@ def _command_substitutions(command: str) -> list[str]:
     return found
 
 
+def _segments(command: str) -> list[str]:
+    """Split on unquoted `&&`, `||`, `;`, `|` and newlines.
+
+    Shared by `_shell_c_payloads` and `is_shell_state_only` so both judge a
+    COMMAND, not a whole command line: `shlex.split` does not partition on
+    separators, so scanning the line as one token list lets a token from an
+    unrelated segment decide another segment's meaning.
+    """
+    masked = mask_quoted(command)
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for separator in _SEGMENT_SPLIT_RE.finditer(masked):
+        bounds.append((start, separator.start()))
+        start = separator.end()
+    bounds.append((start, len(masked)))
+    return [command[lo:hi].strip() for lo, hi in bounds]
+
+
 def _shell_c_payloads(command: str) -> list[str]:
-    """The argument of a `-c` flag passed to a shell, if any."""
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        return []
+    """The argument of a `-c` flag passed to a SHELL, if any.
+
+    Judged per segment, and only when the segment's own command word is a
+    shell. Scanning the whole line instead let `cd /repo/bash && git -c
+    user.name="A & B" commit` read `git -c` as a shell payload -- and since
+    `shlex.split` unquotes, the extracted "payload" was `user.name=A & B`,
+    whose now-bare `&` tripped the detachment deny (agy P2 on `166133b`).
+    """
     found: list[str] = []
-    for index, word in enumerate(words):
-        if word != "-c" or index + 1 >= len(words):
+    for segment in _segments(command):
+        if not segment:
             continue
-        if any(earlier.split("/")[-1] in SHELL_COMMAND_WORDS for earlier in words[:index]):
-            found.append(words[index + 1])
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            continue
+        index = 0
+        # Skip leading `VAR=value` assignments and an `env` wrapper, which
+        # change who runs but not what the command word means.
+        while index < len(words) and (
+            _ASSIGNMENT_RE.match(words[index]) or words[index].split("/")[-1] == "env"
+        ):
+            index += 1
+        if index >= len(words):
+            continue
+        if words[index].split("/")[-1] not in SHELL_COMMAND_WORDS:
+            continue
+        for position in range(index + 1, len(words) - 1):
+            if words[position] == "-c":
+                found.append(words[position + 1])
+                break
     return found
 
 
@@ -385,17 +423,9 @@ def is_shell_state_only(command: str) -> bool:
     normalized = normalize_shell_command(command)
     if _command_substitutions(normalized):
         return False
-    masked = mask_quoted(normalized)
-    bounds: list[tuple[int, int]] = []
-    start = 0
-    for separator in _SEGMENT_SPLIT_RE.finditer(masked):
-        bounds.append((start, separator.start()))
-        start = separator.end()
-    bounds.append((start, len(masked)))
 
     saw_a_word = False
-    for lo, hi in bounds:
-        segment = normalized[lo:hi].strip()
+    for segment in _segments(normalized):
         if not segment:
             continue
         try:

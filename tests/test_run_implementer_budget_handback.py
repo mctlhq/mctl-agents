@@ -187,9 +187,41 @@ def test_each_hand_back_increments_the_tally(monkeypatch, tmp_path: Path) -> Non
     # The operator reading the batch summary can see how much rope is left.
     assert result.error is not None
     assert (
-        f"hand-back 1 of {run_implementer.IMPLEMENT_MAX_BUDGET_HANDBACKS}"
+        f"attempt 1 of {run_implementer.IMPLEMENT_MAX_BUDGET_HANDBACKS}"
         in result.error
     )
+
+
+def test_the_status_is_written_before_the_claim_is_released(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Releasing first frees mutual exclusion while `.status.yaml` still
+    names our live attempt, so a second executor can acquire the claim inside
+    that window (agy P2 on `61595a0`). Every sibling arm writes first."""
+    ref = _make_ref(tmp_path)
+    order: list[str] = []
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+
+    real_hand_back = run_implementer._hand_back_if_still_ours
+
+    def spy_hand_back(*args, **kwargs):
+        order.append("status")
+        return real_hand_back(*args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "_hand_back_if_still_ours", spy_hand_back)
+    monkeypatch.setattr(
+        run_implementer, "_release_claim",
+        lambda *_a, **_kw: order.append("release"),
+    )
+
+    run_implementer.implement_one(ref, dry_run=False)
+
+    assert order == ["status", "release"], order
 
 
 def test_a_successful_run_clears_the_tally(monkeypatch, tmp_path: Path) -> None:

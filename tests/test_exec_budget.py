@@ -407,3 +407,33 @@ def test_payload_recursion_is_depth_bounded():
     # recursion without a limit.
     exec_budget.detachment_match(nested)
     assert exec_budget.MAX_PAYLOAD_DEPTH >= 1
+
+
+# ---------------------------------------------------------------------------
+# `-c` belongs to a SEGMENT, not to a command line (agy P2 on `166133b`).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A shell NAME appearing as a path elsewhere must not make `git -c`
+        # a shell payload -- and `shlex.split` unquotes, so the bogus payload
+        # `user.name=A & B` used to trip the detachment deny.
+        'cd /repo/bash && git -c user.name="A & B" commit -m x',
+        "echo sh && git -c core.pager=less log",
+        'git -c user.name="A & B" commit -m x',
+    ],
+)
+def test_a_non_shell_dash_c_is_not_a_shell_payload(command):
+    assert exec_budget.detachment_match(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cd /repo && bash -c "go test ./... &"',
+        'env FOO=1 bash -c "x &"',
+        '/usr/bin/sh -c "nohup y"',
+    ],
+)
+def test_a_real_shell_payload_is_still_followed_per_segment(command):
+    assert exec_budget.detachment_match(command) is not None
