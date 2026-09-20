@@ -158,19 +158,23 @@ before it starts can.
 `options._deadline_guard_hook()` (mctl-agents#430) is the generic form of the
 same lesson, installed for EVERY work class when the caller supplies both a
 `deadline_monotonic` and a `CommandBudgetLedger`
-(`orchestrator/exec_budget.py`). Per `Bash` tool call, before the command
-starts: deny a detached launch (a trailing async-list `&`, `nohup`, `setsid`,
-`disown`, or `run_in_background: true`) with a reason naming the form AND
-quoting the fragment that tripped it; deny outright once `command_budget()` —
-`min(IMPLEMENTER_COMMAND_TIMEOUT_SECONDS, remaining_envelope -
-IMPLEMENTER_TEARDOWN_RESERVE_SECONDS)` — cannot clear
-`IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS`; otherwise allow, with the EFFECTIVE
-bound applied BOTH to the tool-input `timeout` (narrowed only — clamping is
-one-directional) AND, unless the `IMPLEMENTER_BOUND_COMMANDS=0` break-glass,
-a missing `timeout` binary, or a shell-state-only command falls back to
-tool-input clamping alone, by rewriting the command under `timeout
---kill-after=<k>s <budget>s bash -c <quoted command>`
-(`exec_budget.wrap_bounded()`).
+(`orchestrator/exec_budget.py`). Every `Bash` tool call takes exactly one of
+three decisions, before the command starts:
+
+1. **Deny a detached launch** — a trailing async-list `&`, `nohup`, `setsid`,
+   `disown`, or `run_in_background: true` — with a reason that both names the
+   form and quotes the fragment that tripped it.
+2. **Deny outright** once `command_budget()` —
+   `min(IMPLEMENTER_COMMAND_TIMEOUT_SECONDS, remaining_envelope -
+   IMPLEMENTER_TEARDOWN_RESERVE_SECONDS)` — cannot clear
+   `IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS`.
+3. **Allow, bounded.** The EFFECTIVE bound is applied to the tool-input
+   `timeout` (narrowed only — clamping is one-directional) and, by rewriting
+   the command under `timeout --kill-after=<k>s <budget>s bash -c <quoted
+   command>` (`exec_budget.wrap_bounded()`), at the OS level too. The rewrite
+   is skipped — leaving the tool-input clamp alone in force — for the
+   `IMPLEMENTER_BOUND_COMMANDS=0` break-glass, a missing `timeout` binary, or
+   a shell-state-only command.
 
 Three rules keep that rewrite from being worse than the defect it closes:
 
@@ -188,7 +192,10 @@ Three rules keep that rewrite from being worse than the defect it closes:
   the bound: requiring `bound + grace <= effective` is unsatisfiable once the
   budget is at or below the grace, and the guarantee that matters is that
   SIGTERM lands before the CLI backgrounds, not that the pathological SIGKILL
-  does too.
+  does too. The Bash tool's own `timeout` ceiling (`BASH_TOOL_MAX_TIMEOUT_MS`,
+  600000 ms) binds that effective bound as well: a larger value is silently
+  ignored by the tool, so clamping only the injected number would leave the
+  OS bound above the CLI's real timer and put the CLI first again.
 - **Shell structure, not text — and quoted is not the same as inert.**
   Detachment patterns and command-word scans read the QUOTE-MASKED command
   (`exec_budget.mask_quoted()`), so `git commit -m "A & B"` and `echo 'nohup'`
@@ -199,13 +206,18 @@ Three rules keep that rewrite from being worse than the defect it closes:
   &"` backgrounds inside the inner shell, and GNU `timeout` exits with its
   DIRECT child, so the grandchild survives — the #652 shape reached through a
   quoted payload rather than a bare one.
-- **Shell state survives.** A command built only from `SHELL_STATE_BUILTINS`
-  (`cd`, `export`, `source`, …) is admitted UNWRAPPED, because the Bash tool
-  carries that state — notably the working directory — across calls and
-  `bash -c` would discard it. Such a command cannot run long, so the OS-level
-  bound buys nothing. A compound that also runs real work (`cd /repo && go
-  test ./...`) IS wrapped: bounding the test matters more, and there the `cd`
-  was written as a prefix to that command anyway. GNU `timeout` signals the
+- **Shell state survives, but only where it cannot cost time.** A command
+  built only from `SHELL_STATE_BUILTINS` (`cd`, `export`, `set`, …) is
+  admitted UNWRAPPED, because the Bash tool carries that state — notably the
+  working directory — across calls and `bash -c` would discard it. The
+  exemption is justified entirely by those commands being instantaneous, so
+  it is withheld from anything that can run long: `source`/`.` execute an
+  arbitrary script and are NOT in the set, and any command carrying a
+  substitution (`export FOO=$(slow)`) is refused the exemption however it is
+  spelled. A compound that also runs real work (`cd /repo && go test ./...`)
+  is wrapped for the same reason. The accepted cost: a sourced virtualenv no
+  longer survives to the next call, so an agent invokes the interpreter by
+  path rather than activating it. GNU `timeout` signals the
 command's whole PROCESS GROUP, so this is OS-level enforcement, not only the
 CLI's own Bash-tool timeout that backgrounds rather than fails an
 over-running command. Every decision (clamped, denied-background,

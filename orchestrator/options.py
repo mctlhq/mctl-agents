@@ -366,9 +366,30 @@ def validate_budget_contract() -> None:
                 f"budget+mutation-reserve ({required_reserve:g}s); clamping "
                 f"IMPLEMENTER_TEARDOWN_RESERVE_SECONDS "
                 f"{IMPLEMENTER_TEARDOWN_RESERVE_SECONDS:g}s -> {clamped_reserve:g}s "
-                f"so the mutation reserve survives",
+                f"so the minimum command budget and the mutation reserve survive",
                 file=sys.stderr,
             )
+            if clamped_reserve <= 0.0:
+                # Not the same event as an ordinary clamp, and the drain
+                # clamp's wording does not describe it (claude P3 on
+                # `624a433`). A zero reserve means `command_budget()` hands
+                # the WHOLE remaining envelope to one command, leaving the
+                # run nothing in which to cancel it, write its marker and
+                # return -- so the outer bound, not the guard, becomes what
+                # ends the run, which is the failure mode mctl-agents#430
+                # exists to remove. Still a clamp rather than a raise, to
+                # match this function's standing policy, but it must not be
+                # mistaken for a routine adjustment.
+                print(
+                    f"warn: IMPLEMENTER_TEARDOWN_RESERVE_SECONDS is now 0s for "
+                    f"work_class={work_class!r}: the per-command deadline guard "
+                    f"can no longer hold anything back for teardown, so a run "
+                    f"may be cut off by its outer bound before it can record "
+                    f"its outcome. Raise the envelope or lower "
+                    f"IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS/"
+                    f"IMPLEMENTER_MUTATION_RESERVE_SECONDS.",
+                    file=sys.stderr,
+                )
             IMPLEMENTER_TEARDOWN_RESERVE_SECONDS = clamped_reserve
 
 

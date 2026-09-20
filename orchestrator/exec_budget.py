@@ -242,9 +242,15 @@ def mask_quoted(command: str) -> str:
 # (claude P2 on `630ac27`). A command built only from these is left unwrapped:
 # it cannot run long, so the OS-level bound buys nothing, while wrapping it
 # costs a behaviour change the agent has no way to see.
+# Deliberately EXCLUDES `source`/`.`: those execute an arbitrary script, so
+# they can run for arbitrarily long, and an unwrapped long command is the
+# exact hole this module closes. The cost is real and accepted -- a sourced
+# virtualenv no longer survives to the next Bash call, so an agent must
+# invoke the interpreter by path (`.venv/bin/python`) instead of activating
+# it (claude P3 on `624a433`).
 SHELL_STATE_BUILTINS = frozenset({
-    ".", "alias", "cd", "export", "popd", "pushd", "set", "shopt",
-    "source", "umask", "unalias", "unset",
+    "alias", "cd", "export", "popd", "pushd", "set", "shopt",
+    "umask", "unalias", "unset",
 })
 
 _SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|;|\||\n")
@@ -361,10 +367,16 @@ def is_shell_state_only(command: str) -> bool:
     shape, the agent wrote as a prefix to THIS command anyway). Callers use
     this to decide whether `wrap_bounded` may rewrite the command at all.
 
+    A command carrying a command substitution is never exempt, however it is
+    spelled: `export FOO=$(slow)` is a builtin by command word and an
+    unbounded subprocess in fact (claude P3 on `624a433`).
+
     A command this cannot parse (unbalanced quotes) returns False -- the
     conservative direction, since False only means "bound it as usual".
     """
     normalized = normalize_shell_command(command)
+    if _command_substitutions(normalized):
+        return False
     masked = mask_quoted(normalized)
     bounds: list[tuple[int, int]] = []
     start = 0

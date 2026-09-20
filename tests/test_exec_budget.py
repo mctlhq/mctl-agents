@@ -274,7 +274,7 @@ def test_mask_quoted_masks_an_unterminated_quote_to_end_of_string():
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize(
     "command",
-    ["cd /repo", "cd /repo && cd src", "export FOO=1", "FOO=1", "source .venv/bin/activate"],
+    ["cd /repo", "cd /repo && cd src", "export FOO=1", "FOO=1", "umask 022"],
 )
 def test_is_shell_state_only_accepts_pure_state_commands(command):
     assert exec_budget.is_shell_state_only(command) is True
@@ -285,6 +285,25 @@ def test_is_shell_state_only_accepts_pure_state_commands(command):
     ["cd /repo && go test ./...", "pytest -q", "cd /repo; make check", ""],
 )
 def test_is_shell_state_only_rejects_anything_that_also_runs_work(command):
+    assert exec_budget.is_shell_state_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `source`/`.` execute an arbitrary script: state-mutating AND
+        # potentially long, so the exemption would reopen the hole.
+        "source .venv/bin/activate",
+        ". ./env.sh",
+        # A builtin by command word, an unbounded subprocess in fact.
+        "export FOO=$(slow)",
+        "export FOO=`slow`",
+        "cd $(find / -name x)",
+    ],
+)
+def test_is_shell_state_only_refuses_state_commands_that_can_run_long(command):
+    """claude P3 on `624a433`: the exemption exists because these commands
+    cannot run long. One that can must not get it."""
     assert exec_budget.is_shell_state_only(command) is False
 
 
