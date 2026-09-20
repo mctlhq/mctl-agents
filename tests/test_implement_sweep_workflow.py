@@ -47,6 +47,12 @@ def _candidate(service="mctl-web", slug="issue-10-test") -> StrandedProposal:
     )
 
 
+#: The child id a bare `_fake_activities()` tick starts — `_candidate`'s
+#: defaults. Named so the `await_children` call sites below cannot drift away
+#: from those defaults without failing loudly.
+_DEFAULT_CHILD_ID = "implement-sweep-mctl-web-issue-10-test"
+
+
 def _fake_activities(
     *,
     visibility_fails: bool = False,
@@ -226,17 +232,32 @@ class TestSubmitScoping:
 
 
 class TestGraceAndConfig:
+    def test_the_default_child_id_matches_the_default_candidate(self):
+        """`_DEFAULT_CHILD_ID` is what the two ticks below name in
+        `await_children`. If `_candidate`'s defaults ever move, the name must
+        fail here rather than silently stop awaiting anything — an
+        `await_children` entry that matches no started child waits on nothing
+        and reintroduces the race it was added to close."""
+        c = _candidate()
+        assert _DEFAULT_CHILD_ID == f"implement-sweep-{c.service}-{c.slug}"
+
+
     async def test_grace_minutes_flows_from_input_to_the_activity(self, env):
         activities, received = _fake_activities()
 
-        await _run(env, activities, ImplementSweepWorkflowInput(grace_minutes=42, max_submits=5))
+        await _run(
+            env,
+            activities,
+            ImplementSweepWorkflowInput(grace_minutes=42, max_submits=5),
+            await_children=[_DEFAULT_CHILD_ID],
+        )
 
         assert received["grace_minutes"] == 42
 
     async def test_a_default_input_uses_the_module_defaults(self, env):
         activities, received = _fake_activities()
 
-        await _run(env, activities, None)
+        await _run(env, activities, None, await_children=[_DEFAULT_CHILD_ID])
 
         from orchestrator.temporal.constants import DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES
 

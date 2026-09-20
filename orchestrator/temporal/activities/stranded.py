@@ -83,11 +83,6 @@ class StrandedScanResult:
     # difference between "quarantined" and "silently dropped every 15 minutes
     # forever" (mctl-agents#412 product decision, point 3).
     unauthorized: list[tuple[str, str]] = field(default_factory=list)
-    # Set when the scan did not run at all (list_proposal_refs failed after
-    # its retries), so a caller can tell a skipped tick from a genuinely
-    # clean one — the same distinction OrphanDetectionResult.skipped_reason
-    # makes.
-    skipped_reason: str | None = None
 
 
 def _parse_iso(value: str | None) -> datetime | None:

@@ -79,7 +79,6 @@ class TestStranding:
         assert candidate.slug == "issue-10-widget"
         assert candidate.reason == "accepted, no PR, no live DevLoopWorkflow"
         assert result.skipped == []
-        assert result.skipped_reason is None
 
     async def test_a_non_accepted_proposal_is_not_a_candidate(self, env, monkeypatch):
         result = await _run(env, monkeypatch, [_ref(status="proposed")])

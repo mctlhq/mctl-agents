@@ -218,6 +218,12 @@ class ImplementSweepResult:
     skipped: int
     # Set when the tick declined to act at all (a fail-closed read failed
     # after its retries) — see the module docstring's fail-closed stance.
+    # Written ONLY by this workflow's own except blocks. The three reads all
+    # raise rather than return a reason, so there is no second writer:
+    # `StrandedScanResult` carried a `skipped_reason` field of its own that
+    # nothing ever assigned, which promised a path the activity had already
+    # chosen not to take. It has been removed rather than left as a field
+    # documenting behaviour the code does not have (review P3).
     skipped_reason: str | None = None
     # `accepted` proposals carrying no execution authorization at all,
     # quarantined by `stranded._scan` and awaiting human triage. Surfaced on
@@ -456,7 +462,6 @@ class ImplementSweepWorkflow:
             candidates=len(scan.stranded),
             submitted=submitted,
             skipped=len(scan.stranded) - submitted,
-            skipped_reason=scan.skipped_reason,
             unauthorized=len(scan.unauthorized),
             over_budget=len(over_budget_ids),
             unknown_budget=len(unknown_budget_ids),
