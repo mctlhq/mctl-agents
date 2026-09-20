@@ -378,6 +378,25 @@ there until timeout.
    worker was polling an empty queue while every activity still went to
    control, and a reader of steps 3–4 marked "done" would reasonably have
    assumed otherwise. Merged is not deployed.
+6. **mctl-gitops, ahead of the mctl-agents release carrying #418:** set
+   `IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES` to `1` (or unset it) in
+   `services/admins/mctl-agents-worker-implement/values.yaml`, and confirm
+   that value is deployed. That file currently pins it to `3` — the old
+   default — and `implementation_max_concurrent_activities()` now raises
+   `SystemExit` for any N above the mirrored mutex width (`1`, while the
+   mutex still guards `run-implementer`). `worker.py`'s lazy plan
+   construction confines a bad N to the implementation role, but that role
+   is the one doing the work: the deployment would crash-loop and admit
+   zero implements. This is a prerequisite, not a follow-up — unlike the
+   mutex relocation (task 10 of #418), which is genuinely one.
+
+   The reverse direction is also unstated elsewhere: once that follow-up
+   gitops PR moves the mutex onto `commit-and-push`,
+   `check_implement_admission_is_safe` reports drift on every mctl-agents
+   PR (`guarded == ["commit-and-push"] != ["run-implementer"]`) until the
+   `ARGO_IMPLEMENT_MUTEX_TEMPLATE` mirror flip merges — that mirror-flip PR
+   is the only one that can be green in that window. Fail-closed by
+   design, but only if whoever runs it knows the order.
 
 ### The pre-flip baseline, measured
 

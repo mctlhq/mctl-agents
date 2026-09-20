@@ -316,6 +316,19 @@ def _mutex_names(template: dict[str, Any]) -> set[str]:
     Accepts both the long-standing `synchronization.mutex` (singular) shape
     and Argo 3.6's `synchronization.mutexes` list — a CWFT that migrates to
     the list form must not silently stop being checked.
+
+    Deliberately does not read workflow-level `spec.synchronization`: the
+    real cwft-mctl-agents-implement.yaml declares
+    `mctl-agents-proposal-claims` per-template, on `run-implementer` alone
+    (asserted against the live file by
+    test_the_real_implement_cwft_satisfies_the_mirror), so a workflow-level
+    lock is not a shape this check has ever had to distinguish. If a future
+    CWFT moves the lock to `spec.synchronization`, every template's
+    `_mutex_names` here returns empty, `guarded` is empty, and
+    `check_implement_admission_is_safe` reports it as the mutex having
+    disappeared — a loud drift error, not a silent pass — rather than
+    resolving the workflow-level shape correctly. That is a known gap, not
+    an unconsidered one.
     """
     sync = template.get("synchronization")
     if not isinstance(sync, dict):

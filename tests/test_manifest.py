@@ -455,6 +455,31 @@ class TestCheckImplementAdmissionIsSafe:
         errors = check_implement_admission_is_safe()
         assert errors and "absent" in errors[0]
 
+    def test_the_real_implement_cwft_satisfies_the_mirror(self) -> None:
+        """The fixtures above exercise the check's logic against synthetic
+        CWFTs written under `monkeypatch.setattr(..., GITOPS_CWFT_DIR, ...)`.
+        None of them ever call `check_implement_admission_is_safe()` against
+        the real, unpatched `GITOPS_CWFT_DIR` — so nothing here proved the
+        check runs at all against the file it exists to verify (codex P1:
+        `pr-validation.yml` gates on `pytest`, not on
+        `validate_manifest.main()`, and no other test reads this path
+        unpatched). Same shape as `test_every_real_binding_pin_matches_its_definition`
+        and `test_every_real_catalog_profile_names_a_resolvable_model_task`.
+
+        `pytest.fail` under CI, not `pytest.skip`: a missing checkout under
+        CI must not read as a pass, or this test verifies nothing the one
+        time it matters (mctl-agents#277 shape).
+        """
+        cwft_path = validate_manifest_module.GITOPS_CWFT_DIR / IMPLEMENT_CWFT_FILENAME
+        if not cwft_path.is_file():
+            if os.environ.get("CI"):
+                pytest.fail(
+                    f"{cwft_path} not checked out under CI — the implement admission mutex "
+                    "binding is not verified against a real file, and this check verified nothing"
+                )
+            pytest.skip(f"mctl-gitops not checked out at {cwft_path}")
+        assert check_implement_admission_is_safe() == []
+
 
 def test_inventory_binding_mismatch_is_rejected() -> None:
     """check_manifests_match_inventory must compare more than the agent name
