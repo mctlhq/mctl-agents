@@ -68,6 +68,13 @@ _CI_CONTEXTS_PAGE_SIZE = 100
 CI_LOG_MAX_CHARS = 8000
 CI_LOG_TOTAL_MAX_CHARS = 24000
 CI_LOG_MAX_CHECKS = 3
+# Caps the `gh` READ itself (review P2 on mctl-agents#423): the excerpt
+# bound above only trims the log AFTER the whole thing has already been
+# buffered into this process's memory. 20 MB is generous headroom over any
+# real job log (the telegram#652 incident log was ~64.6 KB) — it exists to
+# stop a runaway/pathological log from being read in full, not to affect
+# the head+tail excerpting of an ordinary one.
+CI_LOG_MAX_FETCH_BYTES = 20_000_000
 
 
 def _positive_seconds(name: str, *, default: float) -> float:
@@ -562,6 +569,7 @@ def _fetch_one_log(repo: str, blocker: CheckBlocker) -> tuple[str | None, str]:
             proc = run_capturing(
                 ["gh", "api", f"repos/{repo}/actions/jobs/{blocker.check_run_id}/logs"],
                 timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
+                max_output_bytes=CI_LOG_MAX_FETCH_BYTES,
             )
             return proc.stdout, "ok"
         except subprocess.TimeoutExpired:
@@ -581,6 +589,7 @@ def _fetch_one_log(repo: str, blocker: CheckBlocker) -> tuple[str | None, str]:
             proc = run_capturing(
                 ["gh", "run", "view", blocker.run_id, "--log-failed"],
                 timeout=SHEPHERD_CI_LOG_TIMEOUT_SECONDS,
+                max_output_bytes=CI_LOG_MAX_FETCH_BYTES,
             )
             return proc.stdout, "ok"
         except subprocess.TimeoutExpired:

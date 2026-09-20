@@ -1766,6 +1766,13 @@ def _render_ci_failures_section(ci_failures: list) -> str:
                     "the whole thing)"
                 )
             lines.append(log_excerpt)
+        elif log_status != "ok":
+            # mctl-agents#423 review P2: a non-"ok" status with no excerpt
+            # means retrieval was skipped, timed out, or came back
+            # unavailable — say so instead of leaving the agent to guess why
+            # there is no log evidence for this check.
+            lines.append("")
+            lines.append(f"Log excerpt: none ({log_status}).")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -3686,11 +3693,22 @@ def main() -> None:
             # errors continue to exit 1 so the shepherd's transient-failure
             # path is unchanged.
             code = _review_feedback_exit_code(result.error)
-            if code == EXIT_DELIBERATE_NO_OP and args.refusal_out:
-                _write_refusal_out(
-                    Path(args.refusal_out),
-                    result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
-                )
+            if args.refusal_out:
+                if code == EXIT_DELIBERATE_NO_OP:
+                    _write_refusal_out(
+                        Path(args.refusal_out),
+                        result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
+                    )
+                elif code == EXIT_CI_EVIDENCE_INSUFFICIENT:
+                    # mctl-agents#423 review P2: `result.error` already carries
+                    # the agent's reason (see the insufficient_evidence branch
+                    # above), but this write used to be gated to
+                    # EXIT_DELIBERATE_NO_OP only, so it never reached
+                    # `--refusal-out` and the reason was silently dropped.
+                    _write_refusal_out(
+                        Path(args.refusal_out),
+                        result.error[len(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):].strip(),
+                    )
             sys.exit(code)
         if result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
