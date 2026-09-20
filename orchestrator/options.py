@@ -380,18 +380,45 @@ def _command_audit_hooks() -> dict[HookEventName, list[HookMatcher]]:
     }
 
 
+# A `gh` global option (`-R owner/repo`, `--repo=owner/repo`, `--hostname
+# x`, boolean flags like `-h`) between `gh` and its subcommand. Matched
+# against tokens, not enumerated by name, so any current or future gh global
+# flag is skipped the same way — the alternative (naming `-R`/`--repo`
+# explicitly) is exactly the "exact textual spelling instead of command
+# semantics" mistake this pattern exists to avoid (mctl-agents#423
+# fix-forward, verified Agy P2 on PR #425's merged head).
+_GH_GLOBAL_FLAG = r"(?:-[A-Za-z]|--[A-Za-z][\w-]*)(?:[=\s]\S+)?"
+_GH_PREFIX = rf"\bgh\b(?:\s+{_GH_GLOBAL_FLAG})*"
+
 # Bash command shapes that fetch a CI log with no bound of their own
 # (mctl-agents#423). Matched against the raw command string a Bash tool call
 # would run — case-insensitive, since `gh`/`curl`/`wget` invocations are
-# lowercase by convention but a model can capitalise anything.
+# lowercase by convention but a model can capitalise anything. The command is
+# normalized (see `_normalize_shell_command`) before matching so a
+# backslash-continued multiline invocation cannot slip past `[^&|;\n]*`
+# stopping at the embedded newline.
 _CI_LOG_DENY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p, re.IGNORECASE)
     for p in (
-        r"\bgh\s+run\s+view\b[^&|;\n]*--log(-failed)?\b",
-        r"\bgh\s+api\b[^&|;\n]*/logs\b",
+        rf"{_GH_PREFIX}\s+run\s+view\b[^&|;\n]*--log(-failed)?\b",
+        rf"{_GH_PREFIX}\s+api\b[^&|;\n]*/logs\b",
         r"\b(curl|wget)\b[^&|;\n]*/logs\b",
     )
 )
+
+
+def _normalize_shell_command(command: str) -> str:
+    """Collapse backslash-newline line continuations to a single space.
+
+    A deny pattern anchored on adjacent tokens (`gh run view`) can otherwise
+    be defeated by splitting the invocation across lines with a trailing
+    `\\` — the shell joins the lines before running it, but the deny
+    pattern's `[^&|;\n]*` stops at the literal `\n` in the tool-call string
+    (mctl-agents#423 fix-forward, verified Agy P2 on PR #425's merged head).
+    Real (non-continued) newlines are left alone: they are genuine command
+    boundaries and `[^&|;\n]*` is deliberately still stopped by those.
+    """
+    return re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", command)
 
 
 async def _ci_log_guard_hook(
@@ -425,7 +452,8 @@ async def _ci_log_guard_hook(
             command = str(raw.get("command") or "")
     if tool_name != "Bash" or not command:
         return {}
-    if any(p.search(command) for p in _CI_LOG_DENY_PATTERNS):
+    normalized = _normalize_shell_command(command)
+    if any(p.search(normalized) for p in _CI_LOG_DENY_PATTERNS):
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
