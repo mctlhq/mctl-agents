@@ -146,19 +146,46 @@ class TestCountSweptPrestartFailures:
             "AND ExecutionStatus = 'Failed'"
         ]
 
-    async def test_a_quote_in_an_id_is_escaped_for_the_filter(self, env):
-        """These ids come from gitops path segments, not user input, but an
-        unescaped quote would still turn a malformed slug into an
-        InvalidArgument that reads as "no prior failures" to anything that
-        swallowed it (review P3)."""
+    async def test_an_unqueryable_id_is_omitted_rather_than_reported_as_zero(self, env):
+        """These ids come from gitops path segments, not user input, but a
+        malformed slug carrying a quote would otherwise be spliced into the
+        filter. Rather than guess the filter dialect's escaping, such an id is
+        refused a query — and crucially it is OMITTED from the result, not
+        reported as zero prior failures, because a zero would read as "never
+        failed to start" and license an unbounded resubmit (review P3)."""
         client = _client([])
         acts = VisibilityActivities(client)
 
-        await env.run(acts.count_swept_prestart_failures, ["implement-sweep-o'brien"])
+        counts = await env.run(
+            acts.count_swept_prestart_failures, ["implement-sweep-o'brien", CHILD_ID]
+        )
 
+        assert "implement-sweep-o'brien" not in counts
+        assert counts == {CHILD_ID: 0}
         assert client.queries == [
-            "WorkflowId IN ('implement-sweep-o''brien') AND ExecutionStatus = 'Failed'"
+            f"WorkflowId IN ('{CHILD_ID}') AND ExecutionStatus = 'Failed'"
         ]
+
+    async def test_every_id_being_unqueryable_asks_nothing_at_all(self, env):
+        client = _client([])
+        acts = VisibilityActivities(client)
+
+        assert await env.run(acts.count_swept_prestart_failures, ["bad'id"]) == {}
+        assert client.queries == []
+
+    async def test_a_long_candidate_list_is_chunked(self, env):
+        """The candidate list is one entry per stranded proposal and unbounded,
+        while the whole filter is a single string — an unchunked query can be
+        rejected outright, on a path that now fails the whole tick closed."""
+        ids = [f"implement-sweep-svc-{n:03d}" for n in range(250)]
+        client = _client([])
+        acts = VisibilityActivities(client)
+
+        counts = await env.run(acts.count_swept_prestart_failures, ids)
+
+        assert counts == dict.fromkeys(ids, 0)
+        assert len(client.queries) == 3
+        assert sum(q.count("implement-sweep-svc-") for q in client.queries) == 250
 
     async def test_an_unrequested_id_in_the_results_is_ignored(self, env):
         stray = _execution(PRE_START_ERROR_TYPE)

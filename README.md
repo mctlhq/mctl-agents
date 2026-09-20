@@ -170,13 +170,31 @@ reported on `ImplementSweepResult.unauthorized` for human triage, under two
 distinct reasons: `legacy auto-accepted / unreviewed` (never approved — the
 69 `incident-*` records that have sat in `accepted` since August) and
 `approved with no recorded approver identity` (a real approval whose path
-recorded no approver, fixed by re-approving rather than by triage). That last check is
-what makes the sweep safe beside a live DevLoop: `mctl_trigger_approve` and
-the incident responder's direct `status: accepted` write both flip a
-proposal to `accepted` with no owner, and before this the sweep that used to
-promote it (an Argo cron) had been suspended since the Temporal migration —
-so those proposals sat untouched until a human ran `mctl_trigger_implementer`
-by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS` (default 5) proposals are
+recorded no approver, fixed by re-approving rather than by triage).
+
+**Operational consequence, measured rather than asserted:** a survey of the
+379 `.status.yaml` records on `mctl-gitops` `main` (2026-09-20) found 71
+proposals in `accepted`. Of those, 69 carry no `approval` block at all — the
+`incident-*` records that have sat in `accepted` since August — and 2 carry a
+named approver (`mashkovd`, on `mctl-telegram/issue-591` and
+`mctl-agents/issue-418`). So the gate quarantines 69 of 71 and lets 2 through;
+it is a near-total but not total stop on the existing backlog.
+
+The anonymous-approver reason is therefore latent rather than observed today:
+no current record carries `approved_by: unknown`. It is still reachable,
+because `dev_loop` submits the approve CWFT with
+`"approver": self._approver or "unknown"` and a payload-less approve signal
+lands that same value (mctl-gitops#1206) — so it is reported separately, with
+re-approval rather than triage as its remedy. Either way nothing is executed
+until an approve path records who approved it; every unauthorized candidate is
+reported on `ImplementSweepResult.unauthorized` rather than submitted.
+
+The not-in-the-active-DevLoop-set check is what makes the sweep safe beside a
+live DevLoop: `mctl_trigger_approve` and the incident responder's direct
+`status: accepted` write both flip a proposal to `accepted` with no owner, and
+before this the sweep that used to promote it (an Argo cron) had been suspended
+since the Temporal migration — so those proposals sat untouched until a human
+ran `mctl_trigger_implementer` by hand. Up to `IMPLEMENT_SWEEP_MAX_SUBMITS` (default 5) proposals are
 submitted per tick, scoped to `{service, slug}` on the same admission queue
 DevLoopWorkflow's own implement step uses. Every candidate that survives the
 scan is logged as `STRANDED service=... slug=... reason=...`, whether it is

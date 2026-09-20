@@ -335,9 +335,65 @@ class ImplementSweepWorkflow:
                     unauthorized=len(scan.unauthorized),
                 )
 
-        submitted = 0
-        over_budget = 0
+        # The over-budget census is taken over the WHOLE candidate set, before
+        # the loop, not accumulated inside it.
+        #
+        # `over_budget` is the only report of an exhausted pre-start budget, and
+        # incrementing it inside the loop made it a report of "exhausted AND
+        # reached this tick". Once `max_submits` submittable candidates precede
+        # the stuck ones in tree order — the ordinary case while a backlog
+        # drains — every over-budget proposal after them takes the cap branch
+        # instead, so the count came back 0 and the per-candidate "needs a
+        # human" warning never fired for them either. A report that goes quiet
+        # exactly when the queue is busy is the failure this PR keeps removing
+        # (review P2). `prestart_failures` already covers every child id, so
+        # this costs no extra query.
+        over_budget_ids = {
+            child_id
+            for child_id in child_ids
+            if prestart_failures.get(child_id, 0) >= MAX_SWEEP_PRESTART_ATTEMPTS
+        }
+        # An id the activity could not query is OMITTED from its result, not
+        # returned as zero — so a missing entry is an unknown budget, and an
+        # unknown budget must never read as "no prior failures". Kept distinct
+        # from `over_budget_ids`: this is not an exhausted budget, it is an
+        # unreadable one, and it does not belong in that census.
+        unknown_budget_ids = {c for c in child_ids if c not in prestart_failures}
         for candidate in scan.stranded:
+            child_id = f"implement-sweep-{candidate.service}-{candidate.slug}"
+            if child_id in over_budget_ids:
+                workflow.logger.warning(
+                    "STRANDED service=%s slug=%s reason=%s (%d prior pre-start "
+                    "failure(s) under %s; exceeded the retry budget, needs a "
+                    "human, not resubmitted)",
+                    candidate.service,
+                    candidate.slug,
+                    candidate.reason,
+                    prestart_failures.get(child_id, 0),
+                    child_id,
+                )
+
+        submitted = 0
+        for candidate in scan.stranded:
+            child_id = f"implement-sweep-{candidate.service}-{candidate.slug}"
+            if child_id in over_budget_ids:
+                # Already logged in the census above; skipped here so it does
+                # not consume a submit slot. Checked BEFORE the per-tick cap so
+                # the two branches cannot mask each other.
+                continue
+
+            if child_id in unknown_budget_ids:
+                workflow.logger.warning(
+                    "STRANDED service=%s slug=%s reason=%s (pre-start budget "
+                    "could not be read for %s; not submitted this tick rather "
+                    "than submitting on an unknown budget)",
+                    candidate.service,
+                    candidate.slug,
+                    candidate.reason,
+                    child_id,
+                )
+                continue
+
             if submitted >= cfg.max_submits:
                 workflow.logger.info(
                     "STRANDED service=%s slug=%s reason=%s (over the "
@@ -346,22 +402,6 @@ class ImplementSweepWorkflow:
                     candidate.slug,
                     candidate.reason,
                     cfg.max_submits,
-                )
-                continue
-
-            child_id = f"implement-sweep-{candidate.service}-{candidate.slug}"
-            prior_failures = prestart_failures.get(child_id, 0)
-            if prior_failures >= MAX_SWEEP_PRESTART_ATTEMPTS:
-                over_budget += 1
-                workflow.logger.warning(
-                    "STRANDED service=%s slug=%s reason=%s (%d prior pre-start "
-                    "failure(s) under %s; exceeded the retry budget, needs a human, "
-                    "not resubmitted)",
-                    candidate.service,
-                    candidate.slug,
-                    candidate.reason,
-                    prior_failures,
-                    child_id,
                 )
                 continue
 
@@ -409,5 +449,5 @@ class ImplementSweepWorkflow:
             skipped=len(scan.stranded) - submitted,
             skipped_reason=scan.skipped_reason,
             unauthorized=len(scan.unauthorized),
-            over_budget=over_budget,
+            over_budget=len(over_budget_ids),
         )

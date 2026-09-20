@@ -655,7 +655,7 @@ class TestUnauthorizedIsReported:
 
 class TestPrestartErrorType:
     """review P2: the pre-start budget must be charged for pre-start losses
-    ONLY. `count_swept_implement_failures` reads each failed execution's own
+    ONLY. `count_swept_prestart_failures` reads each failed execution's own
     terminal error back and counts just `PRE_START_ERROR_TYPE`, so the three
     error types are not cosmetic — the bound is enforced through them. If a
     classification stops producing its own type the counter silently counts
@@ -708,7 +708,7 @@ class TestPrestartErrorType:
                 await handle.result()
 
             assert excinfo.value.cause.type == expected_type
-            # The exact shape count_swept_implement_failures reads back.
+            # The exact shape count_swept_prestart_failures reads back.
             assert (excinfo.value.cause.type == PRE_START_ERROR_TYPE) is (
                 result_kwargs.get("implementer_ran") is False
             )
