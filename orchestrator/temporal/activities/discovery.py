@@ -164,7 +164,14 @@ def _parse_timestamp(value: str | None) -> datetime | None:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+    except (ValueError, TypeError):
+        # TypeError alongside ValueError: `value` is typed `str | None`, and
+        # `gitops_state._parse_status_yaml` normalizes `updated_at` to
+        # `str(...)` precisely so it always is — but this function is the
+        # one place that assumption gets exercised, so a caller that (now
+        # or later) hands it a raw PyYAML `datetime` must degrade to the
+        # same report-only "unparseable" outcome as a malformed string,
+        # not crash the whole reconcile tick on a bad `.replace()` call.
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)

@@ -214,9 +214,11 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
         raise ValueError("status file is not a mapping")
     status = str(data.get("status", "proposed"))
     pr = data.get("pr")
-    updated_at = data.get("updated_at")
+    raw_updated_at = data.get("updated_at")
+    updated_at = str(raw_updated_at) if raw_updated_at is not None else None
     attempt = data.get("attempt")
-    attempt_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    raw_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    attempt_expires_at = str(raw_expires_at) if raw_expires_at is not None else None
     unrunnable = unrunnable_reason(data) is not None
     blocked = bool(data.get("blocked"))
     authorization, unauthorized = execution_authorization(data)

@@ -2350,3 +2350,90 @@ class TestSubmitAndWaitObservesTheImplementer:
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
         assert result.implementer_ran is None
         assert result.succeeded
+
+
+class TestParseTimestampAndRotateWindow:
+    """Direct unit tests for `discovery._parse_timestamp` and
+    `discovery._rotate_window` (agy P3 on #421) — both are pure and were
+    previously exercised only indirectly through `_stale_directives`."""
+
+    def test_parses_a_z_suffixed_rfc3339_string(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("2026-09-19T08:00:00Z") == datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)
+
+    def test_parses_an_offset_suffixed_string(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("2026-09-19T08:00:00+00:00") == datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)
+
+    def test_a_naive_string_is_assumed_utc(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("2026-09-19 08:00:00") == datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)
+
+    def test_none_and_empty_are_unparseable(self):
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp(None) is None
+        assert _parse_timestamp("") is None
+
+    def test_a_malformed_string_is_unparseable_not_a_crash(self):
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("not-a-timestamp") is None
+
+    def test_a_raw_datetime_degrades_to_unparseable_not_a_typeerror(self):
+        # Defense in depth (agy P2 on #421): `gitops_state._parse_status_yaml`
+        # normalizes `updated_at` to `str(...)` so this shouldn't happen in
+        # practice, but `_parse_timestamp` must not crash the whole reconcile
+        # tick if a caller ever hands it a raw PyYAML `datetime` again.
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp(datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)) is None  # type: ignore[arg-type]
+
+    def test_rotate_window_wraps_around(self):
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import _rotate_window
+
+        items = list(range(5))
+        discovery_mod._stale_directive_cursor = 3
+        try:
+            window = _rotate_window(items, cap=3)
+        finally:
+            discovery_mod._stale_directive_cursor = 0
+        assert window == [3, 4, 0]
+
+    def test_rotate_window_advances_the_cursor(self):
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import _rotate_window
+
+        items = list(range(10))
+        discovery_mod._stale_directive_cursor = 0
+        try:
+            _rotate_window(items, cap=4)
+            assert discovery_mod._stale_directive_cursor == 4
+        finally:
+            discovery_mod._stale_directive_cursor = 0
+
+    def test_rotate_window_covers_every_item_across_enough_ticks(self):
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import _rotate_window
+
+        items = list(range(7))
+        discovery_mod._stale_directive_cursor = 0
+        seen: set[int] = set()
+        try:
+            for _ in range(4):  # ceil(7/2) = 4 ticks at cap=2 covers everything
+                seen.update(_rotate_window(items, cap=2))
+        finally:
+            discovery_mod._stale_directive_cursor = 0
+        assert seen == set(items)
