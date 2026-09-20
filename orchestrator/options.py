@@ -234,9 +234,16 @@ def implementer_envelope(work_class: str, n_checks: int = 0) -> float:
     alternative 1): a `"review"` bundle keeps the exact pre-#423 envelope,
     the widening is proportional to a bounded count of bounded evidence, and
     it is capped and logged rather than silently unbounded.
+
+    `IMPLEMENTER_TIMEOUT_CEILING_SECONDS` bounds every work class, `"review"`
+    included -- `_review_claim_lease_default()` derives its lease from the
+    ceiling alone on the assumption that no class's envelope can exceed it
+    (mctl-agents#423 review P2: a `"review"` run used to return
+    `IMPLEMENTER_TIMEOUT_SECONDS` uncapped, so an env override raising that
+    past the ceiling would silently outlive the lease sized from it).
     """
     if work_class not in ("ci-remediation", "mixed"):
-        return IMPLEMENTER_TIMEOUT_SECONDS
+        return min(IMPLEMENTER_TIMEOUT_CEILING_SECONDS, IMPLEMENTER_TIMEOUT_SECONDS)
     n = max(0, min(n_checks, CI_LOG_MAX_CHECKS))
     return min(
         IMPLEMENTER_TIMEOUT_CEILING_SECONDS,

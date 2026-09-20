@@ -86,16 +86,16 @@ def run_capturing(
     `check=True` raises `CommandFailed`, so the reason survives into whatever
     logs the exception.
 
-    `max_output_bytes`, when given, caps how much of stdout this process
-    ever reads into memory: the read stops at that many bytes instead of
-    buffering the child's entire output first (what plain
+    `max_output_bytes`, when given, caps how much of stdout AND stderr this
+    process ever reads into memory: each stream's read stops at that many
+    bytes instead of buffering the child's entire output first (what plain
     `capture_output=True` does) and trimming it down only afterward — the
     gap an unbounded CI log fetch can walk right through (mctl-agents#423
-    review P2). Hitting the cap kills the child rather than draining it to
-    completion, but is NOT treated as a command failure: the caller gets
-    back the (truncated) bytes it already read with `returncode=0`, same as
-    a `check=True` success. A `timeout` breach still raises
-    `subprocess.TimeoutExpired`, same as the plain path above.
+    review P2). Hitting the cap on either stream kills the child rather than
+    draining it to completion, but is NOT treated as a command failure: the
+    caller gets back the (truncated) bytes it already read with
+    `returncode=0`, same as a `check=True` success. A `timeout` breach still
+    raises `subprocess.TimeoutExpired`, same as the plain path above.
     """
     if max_output_bytes is None:
         proc = subprocess.run(  # noqa: S603 — cmd is the caller's list[str], never shell=True
@@ -162,11 +162,18 @@ def _run_capturing_bounded(
     stderr_chunks: list[bytes] = []
 
     def _drain_stderr() -> None:
-        while True:
-            chunk = stderr_pipe.read(65536)
+        total = 0
+        while total < max_output_bytes:
+            chunk = stderr_pipe.read(min(65536, max_output_bytes - total))
             if not chunk:
                 break
             stderr_chunks.append(chunk)
+            total += len(chunk)
+        if total >= max_output_bytes:
+            # Same bound as stdout: stop the child from producing (and us
+            # from buffering) any more of this stream than we will ever
+            # keep (mctl-agents#423 review P2 — stderr had no cap at all).
+            popen.kill()
 
     stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
     stderr_thread.start()
