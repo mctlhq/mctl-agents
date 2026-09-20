@@ -81,7 +81,14 @@ with workflow.unsafe.imports_passed_through():
         IMPLEMENTATION_OPERATION,
         IMPLEMENTATION_TASK_QUEUE,
     )
-    from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
+    from orchestrator.temporal.implement_outcome import (
+        Outcome,
+        classify,
+        finalization_evidence,
+    )
+    from orchestrator.temporal.implement_outcome import (
+        pre_start_reason as render_pre_start_reason,
+    )
     from orchestrator.temporal.issue_ref import parse_issue_url
 
 ENVIRONMENT = "production"
@@ -577,7 +584,13 @@ def _target_repo(issue: IssueRef) -> str:
 
 
 async def _record(
-    agent: str, release: ResolvedRelease | None, result: WorkflowResult, target_repo: str
+    agent: str,
+    release: ResolvedRelease | None,
+    result: WorkflowResult,
+    target_repo: str,
+    *,
+    outcome: str | None = None,
+    pre_start_reason: str | None = None,
 ) -> None:
     # A release with no image_ref means resolve_agent_release found nothing
     # to pin, so the CWFT ran its own baked-in default image instead (see
@@ -605,6 +618,8 @@ async def _record(
                 target_repo=target_repo,
                 argo_workflow_name=result.workflow_name,
                 phase=result.phase,
+                outcome=outcome or "",
+                pre_start_reason=pre_start_reason or "",
             ),
             start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
             retry_policy=FAST_ACTIVITY_RETRY_POLICY,
@@ -783,6 +798,9 @@ class ImplementExecutionState:
     prestart_requeues: int = 0
     # success | pre_start | execution | finalization, once the step ended.
     outcome: str | None = None
+    # Set only alongside outcome == "pre_start": lock_wait, unscheduled or
+    # unknown (#418, implement_outcome.py). None otherwise.
+    pre_start_reason: str | None = None
 
 
 @workflow.defn
@@ -1162,9 +1180,9 @@ class DevLoopWorkflow:
                 prestart_requeues=requeues,
             )
             result = await _run_cwft(IMPLEMENTATION_OPERATION, params)
-            await _record("implementer", implementer_release, result, target_repo)
 
             if not workflow.patched("implement-outcome"):
+                await _record("implementer", implementer_release, result, target_repo)
                 return result
 
             outcome: Outcome = classify(
@@ -1173,18 +1191,28 @@ class DevLoopWorkflow:
                 implementer_phase=result.implementer_phase,
                 finalization_phase=result.finalization_phase,
             )
-            self._implement_state = dataclasses.replace(self._implement_state, outcome=outcome)
+            # Only meaningful alongside a pre_start verdict: render() maps
+            # `None` to "unknown", so a success/execution/finalization
+            # outcome must not be given a reason it never had.
+            reason = render_pre_start_reason(result.pre_start_reason) if outcome == "pre_start" else None
+            self._implement_state = dataclasses.replace(
+                self._implement_state, outcome=outcome, pre_start_reason=reason
+            )
+            await _record(
+                "implementer", implementer_release, result, target_repo, outcome=outcome, pre_start_reason=reason
+            )
 
             if outcome == "success":
                 return result
             if outcome == "pre_start" and requeues < MAX_PRESTART_REQUEUES:
                 requeues += 1
                 workflow.logger.warning(
-                    "implementer for %s never started (%s, %s); requeueing %d/%d without "
+                    "implementer for %s never started (%s, %s, %s); requeueing %d/%d without "
                     "counting an attempt",
                     target_repo,
                     result.workflow_name,
                     result.phase,
+                    reason,
                     requeues,
                     MAX_PRESTART_REQUEUES,
                 )
@@ -1200,6 +1228,7 @@ class DevLoopWorkflow:
                 f"implementation of {target_repo} ended {result.phase} ({outcome}) in Argo "
                 f"workflow {result.workflow_name}"
                 + (f" after {requeues} pre-start requeues" if requeues else "")
+                + (f" ({reason})" if outcome == "pre_start" else "")
                 + (
                     f": {finalization_evidence(result.finalization_phase)}"
                     if outcome == "finalization"

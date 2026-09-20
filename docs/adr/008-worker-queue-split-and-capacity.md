@@ -244,9 +244,11 @@ DevLoops submit no Argo work at all" — not "never more than N implementers
 exist". The hard count across crashes belongs to ADR-010's claims.
 
 N is read from `IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES` in the
-environment (default 3) rather than fixed in `constants.py`, because it is
-the one number D5 expects an operator to move, and the values file that
-sets it is where the queue-age alert that says it is wrong lives.
+environment (default 3, see the 2026-09-19 amendment below for the
+mutex-bound default that now applies while `run-implementer` is still
+guarded) rather than fixed in `constants.py`, because it is the one number
+D5 expects an operator to move, and the values file that sets it is where
+the queue-age alert that says it is wrong lives.
 
 The rollout repeats steps 1–4 in the same fail-closed order: role and
 queue first (mctl-agents#397, 1.47.0), the deployment polling an empty
@@ -300,6 +302,37 @@ heartbeat detail. That heartbeat, read through Temporal's describe API,
 plus the workflow's `implement_execution` query (queued_at, requeues,
 outcome) is the runtime-state surface mctl-agents#389 projects from. Git
 remains durable lifecycle state; nothing is pushed there mid-attempt.
+
+> **Amended 2026-09-19 (mctlhq/mctl-agents#418).** "N and the mutex
+> capacity have to move together" above was prose, and prose that nothing
+> checked: N defaulted to 3 while the mutex admitted 1, so two of every
+> three admitted implement submits still queued INSIDE Argo against
+> `run-implementer`'s `activeDeadlineSeconds` — the exact 2026-09-19 shape,
+> just smaller, reproduced by the admission queue this decision record adds.
+>
+> The binding is now code, not a comment. `orchestrator/temporal/constants.py`
+> mirrors the CWFT's lock as `ARGO_IMPLEMENT_MUTEX_NAME`,
+> `ARGO_IMPLEMENT_MUTEX_TEMPLATE` and `ARGO_IMPLEMENT_MUTEX_WIDTH` (the worker
+> deployment has no gitops checkout to read them from live), and
+> `implementation_max_concurrent_activities()` refuses to start an
+> `implementation`-role worker whose N exceeds the mirrored width while the
+> mutex still guards `run-implementer` — naming both numbers rather than
+> silently clamping one that would then lie about capacity. What keeps the
+> mirror honest against the real file is
+> `orchestrator/validate_manifest.py::check_implement_admission_is_safe`,
+> which fails mctl-agents' own PR-validation CI on any disagreement,
+> including the mutex moving off `run-implementer` without the mirror
+> following.
+>
+> The ceiling lifts once the mutex itself moves: a follow-up mctl-gitops PR
+> relocates `synchronization.mutex: mctl-agents-proposal-claims` from
+> `run-implementer` onto `commit-and-push` — a step measured in seconds, not
+> the two-hour implementation budget — after which `ARGO_IMPLEMENT_MUTEX_TEMPLATE`
+> flips to match and N is restored to 3. `implement_outcome.py` also now
+> records WHY a `pre_start` verdict never started — `lock_wait`,
+> `unscheduled` or `unknown` — so the recovery plane (#353, mctl-api#294)
+> can tell a capacity problem from a cluster one instead of collapsing both
+> into the same unexplained `pre_start`.
 
 ## Rollout order (fail-closed)
 

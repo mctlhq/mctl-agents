@@ -34,6 +34,8 @@ from orchestrator.manifest import (
     ManifestError,
     load,
 )
+from orchestrator.temporal import constants as temporal_constants
+from orchestrator.temporal import implement_outcome
 
 MODEL_POLICY = REPO_ROOT / "config" / "model-policy.yaml"
 INVENTORY = REPO_ROOT / "docs" / "agent-inventory.yaml"
@@ -293,6 +295,121 @@ def _check_cluster_workflow_template(manifest: AgentManifest) -> list[str]:
             f"not found among {sorted(names)}"
         ]
     return []
+
+
+# The #418 shape restated structurally: a lock and a long deadline on the
+# same node. 1800s (30 min) rather than 0 — a guarded step is still allowed
+# a real budget, just not one long enough that queueing behind the lock can
+# burn hours of it the way run-implementer's 7200s did on 2026-09-19.
+MAX_LOCKED_STEP_DEADLINE_SECONDS = 1800
+
+# The one CWFT this check reads — named explicitly rather than globbed like
+# _check_cluster_workflow_template's `cwft-*.yaml`, because this check
+# verifies ONE specific mutex/template relationship, not "does some CWFT
+# somewhere mention this name".
+IMPLEMENT_CWFT_FILENAME = "cwft-mctl-agents-implement.yaml"
+
+
+def _mutex_names(template: dict[str, Any]) -> set[str]:
+    """Every mutex name a template's `synchronization` block declares.
+
+    Accepts both the long-standing `synchronization.mutex` (singular) shape
+    and Argo 3.6's `synchronization.mutexes` list — a CWFT that migrates to
+    the list form must not silently stop being checked.
+    """
+    sync = template.get("synchronization")
+    if not isinstance(sync, dict):
+        return set()
+    names: set[str] = set()
+    mutex = sync.get("mutex")
+    if isinstance(mutex, dict) and mutex.get("name"):
+        names.add(str(mutex["name"]))
+    mutexes = sync.get("mutexes")
+    if isinstance(mutexes, list):
+        for entry in mutexes:
+            if isinstance(entry, dict) and entry.get("name"):
+                names.add(str(entry["name"]))
+    return names
+
+
+def check_implement_admission_is_safe() -> list[str]:
+    """Keep `orchestrator/temporal/constants.py`'s ARGO_IMPLEMENT_MUTEX_*
+    mirror honest against the real CWFT in mctl-gitops (mctl-agents#418).
+
+    ADR-008 D7 bound the implementation queue's admission width N to the
+    Argo mutex width (`orchestrator.temporal.constants.argo_admission_width`),
+    but that binding is only as true as the mirror it reads: NAME, TEMPLATE
+    and WIDTH are copied from `cwft-mctl-agents-implement.yaml` because the
+    worker deployment has no gitops checkout to read them from live (see
+    that module's docstring). This is what makes the copy checkable — the
+    same "mirror plus CI check" shape `orchestrator/resolver.py` already
+    uses for `validate-agent-platform.py`'s COMPAT_RE.
+
+    A no-match here must never read as a pass: absence of the mutex
+    entirely, a guarded template that disagrees with the mirror, and a
+    deadline the mirror's own claim already contradicts are ALL reported as
+    errors — trusting an unreadable or restructured file would be the exact
+    silent no-op `_gitops_missing` exists to prevent one level up.
+    """
+    if not GITOPS_CWFT_DIR.is_dir():
+        return _gitops_missing(GITOPS_CWFT_DIR, "the implement admission mutex binding (mctl-agents#418)")
+
+    cwft_path = GITOPS_CWFT_DIR / IMPLEMENT_CWFT_FILENAME
+    if not cwft_path.is_file():
+        return [f"{cwft_path} not found; cannot verify the implement admission mutex binding"]
+
+    try:
+        document = yaml.safe_load(cwft_path.read_text(encoding="utf-8"))
+        templates = (document.get("spec") or {}).get("templates")
+        if not isinstance(templates, list):
+            raise ManifestError("spec.templates is missing or not a list")
+    except Exception as exc:  # noqa: BLE001 - report as this check's failure, not a crash
+        return [f"{cwft_path}: {exc}"]
+
+    errors: list[str] = []
+    by_name = {t["name"]: t for t in templates if isinstance(t, dict) and t.get("name")}
+
+    mutex_name = temporal_constants.ARGO_IMPLEMENT_MUTEX_NAME
+    mutex_template = temporal_constants.ARGO_IMPLEMENT_MUTEX_TEMPLATE
+    guarded = sorted(name for name, template in by_name.items() if mutex_name in _mutex_names(template))
+
+    if not guarded:
+        errors.append(
+            f"{cwft_path}: no template carries synchronization.mutex(es) named {mutex_name!r}, "
+            f"but orchestrator/temporal/constants.py's ARGO_IMPLEMENT_MUTEX_TEMPLATE mirror still "
+            f"names {mutex_template!r} as the guarded template"
+        )
+    elif guarded != [mutex_template]:
+        errors.append(
+            f"{cwft_path}: synchronization.mutex {mutex_name!r} guards {guarded}, but "
+            f"orchestrator/temporal/constants.py's ARGO_IMPLEMENT_MUTEX_TEMPLATE mirror names "
+            f"{mutex_template!r}"
+        )
+
+    for name in guarded:
+        deadline = by_name[name].get("activeDeadlineSeconds")
+        if isinstance(deadline, int) and deadline > MAX_LOCKED_STEP_DEADLINE_SECONDS:
+            errors.append(
+                f"{cwft_path}: template {name!r} carries synchronization.mutex {mutex_name!r} AND "
+                f"activeDeadlineSeconds={deadline}, above MAX_LOCKED_STEP_DEADLINE_SECONDS="
+                f"{MAX_LOCKED_STEP_DEADLINE_SECONDS} — a lock wait on this node counts against a "
+                "long deadline, the mctl-agents#418 shape restated structurally"
+            )
+
+    implementer_template = by_name.get(implement_outcome.IMPLEMENTER_TEMPLATE)
+    if implementer_template is None:
+        errors.append(
+            f"{cwft_path}: no template named {implement_outcome.IMPLEMENTER_TEMPLATE!r} — this "
+            "check is asserting against a file that has been restructured underneath it"
+        )
+    elif implementer_template.get("activeDeadlineSeconds") is None:
+        errors.append(
+            f"{cwft_path}: template {implement_outcome.IMPLEMENTER_TEMPLATE!r} carries no "
+            "activeDeadlineSeconds at all — this check is asserting against a file that has been "
+            "restructured underneath it"
+        )
+
+    return errors
 
 
 def _resolve_builder_module_with_clean_env(manifest: AgentManifest) -> tuple[Callable[..., Any], ModuleType]:
@@ -866,6 +983,13 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             print("FAIL mctl-gitops release bindings <-> agents/_manifests/:")
             for error in pin_errors:
+                print(f"  - {error}")
+
+        admission_errors = check_implement_admission_is_safe()
+        if admission_errors:
+            exit_code = 1
+            print("FAIL implement admission mutex binding (mctl-agents#418):")
+            for error in admission_errors:
                 print(f"  - {error}")
 
     return exit_code

@@ -41,6 +41,20 @@ FailureClass = Literal["pre_start", "execution", "finalization"]
 # built from.
 Outcome = Literal["success"] | FailureClass
 
+# WHY a pre_start verdict never started, for #418. "Killed while queued on
+# the mutex" and "Argo accepted the workflow and never scheduled the pod"
+# both classify() to `pre_start`, but only the first is the 2026-09-19
+# deadline-vs-lock shape the recovery plane (#353, mctl-api#294) needs to
+# tell apart from a cluster scheduling problem.
+#
+#   lock_wait    a node was seen Pending on the synchronization lock.
+#   unscheduled  the node graph was readable and showed no lock wait either
+#                — Argo accepted the workflow and never scheduled a pod.
+#   unknown      the node graph itself was not readable. Absence of
+#                evidence about the cluster is not evidence about the
+#                cluster, so this must never be reported as `unscheduled`.
+PreStartReason = Literal["lock_wait", "unscheduled", "unknown"]
+
 
 @dataclass(frozen=True)
 class ImplementerObservation:
@@ -60,6 +74,43 @@ class ImplementerObservation:
     started_at: str | None
     # Phase of the finalization steps, worst-of.
     finalization_phase: str | None
+    # Set only where `ran` is definitely False. None otherwise — including
+    # when `ran` is None (unreadable graph) or True (it ran).
+    pre_start_reason: PreStartReason | None = None
+
+
+def _lock_waiting(node: dict[str, object]) -> bool:
+    """Was this node blocked on the mctl-agents-proposal-claims mutex?
+
+    Reads the structured mark first — `synchronizationStatus.waiting`, which
+    Argo sets on a node Pending on a lock — and falls back to the node
+    `message`, matching the shape the issue quotes verbatim ("Waiting for
+    argo-workflows/Mutex/mctl-agents-proposal-claims. Lock status: 0/1").
+    The message is a fallback only: it is advisory, and an undetected
+    lock_wait degrades to `unscheduled`/`unknown`, changing nothing about
+    `classify`'s verdict or the requeue.
+    """
+    sync_status = node.get("synchronizationStatus")
+    if isinstance(sync_status, dict) and sync_status.get("waiting"):
+        return True
+    message = node.get("message")
+    if isinstance(message, str) and ("Mutex/" in message or "Lock status:" in message):
+        return True
+    return False
+
+
+def pre_start_reason(reason: str | None) -> str:
+    """Render the reason for a human or an error message. `None` — an
+    unreadable node graph — renders as `unknown`, never as `unscheduled`:
+    the absence of evidence about the cluster is not evidence about it.
+
+    Takes `str | None` rather than `PreStartReason | None`: the caller in
+    `dev_loop.py` reads this off `WorkflowResult.pre_start_reason`, which is
+    plain `str | None` because it crosses the Temporal activity payload
+    boundary (the same reason every sibling field on that dataclass —
+    `phase`, `finalization_phase` — is `str` rather than a Literal).
+    """
+    return reason if reason is not None else "unknown"
 
 
 def _pod_ran(node: dict[str, Any]) -> bool:
@@ -112,7 +163,9 @@ def observe_implementer(status_block: dict[str, Any]) -> ImplementerObservation:
     # it is reported as unknown, which `classify` turns into an execution
     # failure a human looks at rather than a silent second attempt.
     if not isinstance(nodes, dict) or not nodes:
-        return ImplementerObservation(ran=None, phase=None, started_at=None, finalization_phase=None)
+        return ImplementerObservation(
+            ran=None, phase=None, started_at=None, finalization_phase=None, pre_start_reason=None
+        )
 
     pods = [
         n for n in nodes.values()
@@ -130,7 +183,9 @@ def observe_implementer(status_block: dict[str, Any]) -> ImplementerObservation:
     # instead of `ran=False`, which would requeue an implementer that may
     # have committed and pushed.
     if pods and not implementer:
-        return ImplementerObservation(ran=None, phase=None, started_at=None, finalization_phase=None)
+        return ImplementerObservation(
+            ran=None, phase=None, started_at=None, finalization_phase=None, pre_start_reason=None
+        )
 
     ran_nodes = [n for n in implementer if _pod_ran(n)]
     phase: str | None = None
@@ -144,11 +199,20 @@ def observe_implementer(status_block: dict[str, Any]) -> ImplementerObservation:
             (str(n.get("phase") or "Pending") for n in finalization), key=lambda p: _PHASE_RANK.get(p, 1)
         )
 
+    ran = bool(ran_nodes)
+    # Only set where `ran` is definitely False — a pod that ran needs no
+    # explanation for why it "never started", and this branch is reached
+    # with a readable graph, so `unknown` never applies here.
+    reason: PreStartReason | None = None
+    if not ran:
+        reason = "lock_wait" if any(_lock_waiting(n) for n in implementer) else "unscheduled"
+
     return ImplementerObservation(
-        ran=bool(ran_nodes),
+        ran=ran,
         phase=phase,
         started_at=started[0] if started else None,
         finalization_phase=fin_phase,
+        pre_start_reason=reason,
     )
 
 

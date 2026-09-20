@@ -27,10 +27,12 @@ from orchestrator import validate_manifest as validate_manifest_module
 from orchestrator.manifest import AgentManifest, ManifestError, load, load_all
 from orchestrator.validate_manifest import (
     GITOPS_CATALOG_PROFILES_DIR,
+    IMPLEMENT_CWFT_FILENAME,
     _check_legacy_env_override,
     _check_prompt_sources,
     check_binding_pins_match_definitions,
     check_catalog_profiles_match_builders,
+    check_implement_admission_is_safe,
     check_manifests_match_inventory,
     validate,
 )
@@ -261,6 +263,164 @@ def test_legacy_env_override_typo_is_rejected() -> None:
     errors = _check_legacy_env_override(typo)
     assert len(errors) == 1
     assert "TYPO_VAR" in errors[0]
+
+
+def _cwft(templates: list[dict]) -> dict:
+    return {"metadata": {"name": "mctl-agents-implement"}, "spec": {"templates": templates}}
+
+
+def _write_implement_cwft(tmp_path, templates: list[dict]):
+    directory = tmp_path / "cluster-templates"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / IMPLEMENT_CWFT_FILENAME).write_text(yaml.safe_dump(_cwft(templates)), encoding="utf-8")
+    return directory
+
+
+class TestCheckImplementAdmissionIsSafe:
+    """T6 (#418): the mirror in orchestrator/temporal/constants.py must
+    agree with the real CWFT in mctl-gitops, and a no-match must never read
+    as a pass."""
+
+    def test_the_mutex_on_run_implementer_with_a_long_deadline_is_an_error(self, tmp_path, monkeypatch) -> None:
+        """The #418 shape restated structurally: a lock and a 7200s
+        deadline on the same node."""
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {
+                    "name": "run-implementer",
+                    "synchronization": {"mutex": {"name": "mctl-agents-proposal-claims"}},
+                    "activeDeadlineSeconds": 7200,
+                },
+                {"name": "commit-and-push"},
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+
+        errors = check_implement_admission_is_safe()
+
+        assert any("run-implementer" in e and "7200" in e for e in errors), errors
+
+    def test_the_mutex_on_commit_and_push_with_a_matching_mirror_is_clean(self, tmp_path, monkeypatch) -> None:
+        """Once the mirror names `commit-and-push` (the state after the
+        mctl-gitops PR lands), a mutex there with a modest deadline and a
+        deadline-bearing run-implementer produces no errors."""
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {"name": "run-implementer", "activeDeadlineSeconds": 7200},
+                {
+                    "name": "commit-and-push",
+                    "synchronization": {"mutex": {"name": "mctl-agents-proposal-claims"}},
+                    "activeDeadlineSeconds": 300,
+                },
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+        monkeypatch.setattr(
+            "orchestrator.temporal.constants.ARGO_IMPLEMENT_MUTEX_TEMPLATE", "commit-and-push"
+        )
+
+        assert check_implement_admission_is_safe() == []
+
+    def test_the_mutex_removed_entirely_while_the_mirror_still_names_a_template_errors(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {"name": "run-implementer", "activeDeadlineSeconds": 7200},
+                {"name": "commit-and-push"},
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+
+        errors = check_implement_admission_is_safe()
+
+        assert any("mctl-agents-proposal-claims" in e for e in errors), errors
+
+    def test_a_guarded_template_other_than_the_mirror_is_an_error(self, tmp_path, monkeypatch) -> None:
+        """The mirror still says `run-implementer`, but the mutex has moved
+        to `commit-and-push` without the mirror following — the disagreement
+        this whole check exists to catch."""
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {"name": "run-implementer", "activeDeadlineSeconds": 7200},
+                {
+                    "name": "commit-and-push",
+                    "synchronization": {"mutex": {"name": "mctl-agents-proposal-claims"}},
+                    "activeDeadlineSeconds": 300,
+                },
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+
+        errors = check_implement_admission_is_safe()
+
+        assert any("commit-and-push" in e and "run-implementer" in e for e in errors), errors
+
+    def test_run_implementer_missing_entirely_is_an_error(self, tmp_path, monkeypatch) -> None:
+        """A restructure that drops run-implementer must not read as a
+        pass just because nothing else disagreed."""
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {
+                    "name": "some-other-step",
+                    "synchronization": {"mutex": {"name": "mctl-agents-proposal-claims"}},
+                }
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+
+        errors = check_implement_admission_is_safe()
+
+        assert any("run-implementer" in e for e in errors), errors
+
+    def test_run_implementer_with_no_deadline_at_all_is_an_error(self, tmp_path, monkeypatch) -> None:
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {"name": "run-implementer", "synchronization": {"mutex": {"name": "mctl-agents-proposal-claims"}}},
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+
+        errors = check_implement_admission_is_safe()
+
+        assert any("activeDeadlineSeconds" in e for e in errors), errors
+
+    def test_the_argo_3_6_mutexes_list_form_is_recognised(self, tmp_path, monkeypatch) -> None:
+        directory = _write_implement_cwft(
+            tmp_path,
+            [
+                {
+                    "name": "run-implementer",
+                    "synchronization": {"mutexes": [{"name": "mctl-agents-proposal-claims"}]},
+                    "activeDeadlineSeconds": 7200,
+                },
+            ],
+        )
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", directory)
+
+        errors = check_implement_admission_is_safe()
+
+        # Still recognised as the guarded template (no "no template carries
+        # synchronization.mutex(es)" error) — the only error here is the
+        # long-deadline-behind-a-lock one.
+        assert not any("no template carries" in e for e in errors), errors
+        assert any("7200" in e for e in errors), errors
+
+    def test_a_missing_gitops_checkout_fails_under_ci(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(validate_manifest_module, "GITOPS_CWFT_DIR", tmp_path / "absent")
+
+        monkeypatch.delenv("CI", raising=False)
+        assert check_implement_admission_is_safe() == []
+
+        monkeypatch.setenv("CI", "true")
+        errors = check_implement_admission_is_safe()
+        assert errors and "absent" in errors[0]
 
 
 def test_inventory_binding_mismatch_is_rejected() -> None:

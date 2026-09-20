@@ -131,12 +131,14 @@ def test_the_execution_worker_is_untouched_by_the_admission_queue(visibility):
 
 def test_implementation_capacity_is_read_from_the_environment(monkeypatch, visibility):
     """N is the number an operator moves, so it comes from values.yaml via
-    env — not from a constant that needs a code release to change."""
-    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "5")
-    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 5
+    env — not from a constant that needs a code release to change. Bounded
+    at 1 while the mirror still names run-implementer (#418) — see
+    TestImplementationCapacityIsBoundToTheMutex for the ceiling itself."""
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "1")
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 1
 
     monkeypatch.delenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES")
-    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 3
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 1
 
 
 @pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
@@ -146,6 +148,42 @@ def test_a_capacity_that_admits_nothing_is_refused_at_startup(monkeypatch, visib
     monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", bad)
     with pytest.raises(SystemExit):
         worker_plans("implementation", visibility)
+
+
+class TestImplementationCapacityIsBoundToTheMutex:
+    """T5 (#418): N cannot silently exceed the Argo mutex width while that
+    mutex still guards the timed `run-implementer` step — the 2026-09-19
+    shape, reproduced at a smaller N. `worker_plans` reads the ceiling
+    through `implementation_max_concurrent_activities()`, so patching the
+    constants module's mirror is enough to drive both states.
+    """
+
+    def test_n_above_the_mutex_width_is_refused_naming_both_numbers(self, monkeypatch, visibility):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        with pytest.raises(SystemExit) as excinfo:
+            worker_plans("implementation", visibility)
+        message = str(excinfo.value)
+        assert "3" in message
+        assert "1" in message
+
+    def test_all_is_refused_the_same_way(self, monkeypatch, visibility):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        with pytest.raises(SystemExit):
+            worker_plans("all", visibility)
+
+    def test_control_and_execution_are_unaffected(self, monkeypatch, visibility):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        assert worker_plans("control", visibility)
+        assert worker_plans("execution", visibility)
+
+    def test_n_above_the_width_is_accepted_once_the_mutex_moves_off_run_implementer(
+        self, monkeypatch, visibility
+    ):
+        from orchestrator.temporal import constants as temporal_constants
+
+        monkeypatch.setattr(temporal_constants, "ARGO_IMPLEMENT_MUTEX_TEMPLATE", "commit-and-push")
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 3
 
 
 @pytest.mark.parametrize("role", ["control", "execution"])
