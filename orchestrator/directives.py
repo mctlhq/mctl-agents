@@ -61,6 +61,32 @@ VERBS = frozenset({"reinvestigate"})
 # never posts as — the opposite of the security intent above.
 BOT_LOGINS = frozenset({"mctl-agents[bot]"})
 
+
+def bot_login_mismatch(actual_login: str) -> str | None:
+    """None if `actual_login` is a trusted `BOT_LOGINS` member; otherwise a
+    human-readable description of the mismatch.
+
+    Pure so it can be exhaustively unit-tested without a live `gh` call.
+    `BOT_LOGINS` is the TRUSTED-author set the whole ack/fail-trailer dedup
+    mechanism rests on (see the module docstring) — nothing at runtime
+    previously verified that constant actually named the identity `gh`
+    subprocess calls authenticate writes as. If it ever drifted (a
+    misconfigured secret, an App rename), the poller's own ack markers
+    would stop being recognised as trusted and every pending directive
+    would be silently redispatched — a real, paid SDK run — every tick
+    forever, with no error anywhere (codex review on #417). Call this once
+    per process with the actually-authenticated login so drift is reported
+    instead of silently eaten.
+    """
+    if (actual_login or "").strip().lower() in {b.lower() for b in BOT_LOGINS}:
+        return None
+    return (
+        f"authenticated GitHub login {actual_login!r} is not in BOT_LOGINS "
+        f"{sorted(BOT_LOGINS)!r} — the ack/fail-trailer dedup this process "
+        "relies on would silently stop recognising its own markers"
+    )
+
+
 # GitHub's own `author_association` values that may trigger a paid SDK run.
 PRIVILEGED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 

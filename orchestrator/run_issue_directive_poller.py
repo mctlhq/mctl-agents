@@ -47,6 +47,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -57,6 +58,7 @@ from orchestrator.directives import (
     RawComment,
     ack_trailer,
     acked_comment_ids,
+    bot_login_mismatch,
     fail_trailer,
     failed_attempt_counts,
     parse_comments,
@@ -73,12 +75,26 @@ from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 # run_issue_poller.DEFAULT_MAX_ISSUES = 5.
 DEFAULT_MAX_DIRECTIVES = 3
 
+# Set True once this process has verified `directives.BOT_LOGINS` against
+# the actually-authenticated `gh` login (see `_verify_bot_identity_once`).
+# Checked once per process, not once per tick: this poller's process lives
+# for many scan() calls inside one long-lived Temporal worker.
+_bot_identity_checked = False
+
 # A persistent dispatch failure (mctl-api down, broken auth) must not turn
 # into an unbounded comment-spam loop: after this many failed attempts for
 # the same comment id, the scan gives up — posts one final reply carrying
 # the ack trailer (so no further tick retries it) instead of a fresh
 # "will retry" comment every 15 minutes forever (codex review on #417).
 MAX_DISPATCH_ATTEMPTS = 3
+
+# A single transient `gh`/GitHub API blip while posting the retry-marker
+# reply below must not by itself convert into permanently giving up on a
+# maintainer's directive at the very first dispatch attempt — retry that
+# one write a few times in-process before escalating (codex review on
+# #417).
+MARKER_POST_ATTEMPTS = 3
+MARKER_POST_RETRY_DELAY_SECONDS = 1.0
 
 # Statuses a proposal never leaves — a directive on one of these is not
 # worth even reading comments for. Everything else (including "proposed",
@@ -189,6 +205,36 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
 
 def _post_reply(issue_url: str, body: str) -> None:
     _run(["gh", "issue", "comment", issue_url, "--body", body])
+
+
+def _post_reply_with_retries(
+    issue_url: str,
+    body: str,
+    attempts: int = MARKER_POST_ATTEMPTS,
+    delay: float = MARKER_POST_RETRY_DELAY_SECONDS,
+) -> None:
+    """`_post_reply`, retried a few times before the caller treats the write
+    as failed.
+
+    Only used for the dispatch-failure retry-marker post: a single
+    transient `gh`/GitHub API error there must not by itself escalate to
+    the permanent give-up path (codex review on #417) — a handful of
+    immediate in-process retries absorb a one-off blip without needing
+    another poll tick, while staying bounded so a truly broken write path
+    (dead token, outage) still reaches the give-up path instead of retrying
+    forever.
+    """
+    last: subprocess.CalledProcessError | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _post_reply(issue_url, body)
+            return
+        except subprocess.CalledProcessError as e:
+            last = e
+            if attempt < attempts:
+                time.sleep(delay)
+    assert last is not None  # noqa: S101 — narrows the type for the raise below; attempts >= 1 guarantees this branch always runs at least once
+    raise last
 
 
 def _with_ack(body: str, comment_id: str) -> str:
@@ -340,14 +386,15 @@ async def _handle_directive(
             else:
                 try:
                     await asyncio.to_thread(
-                        _post_reply,
+                        _post_reply_with_retries,
                         issue_url,
                         f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
                         f"{fail_trailer(directive.comment_id)}",
                     )
                 except subprocess.CalledProcessError as post_e:
-                    # The retry-marker write itself failed — `prior_failures`
-                    # is only ever recomputed from `fail_trailer` markers
+                    # Even after MARKER_POST_ATTEMPTS in-process retries, the
+                    # retry-marker write itself failed — `prior_failures` is
+                    # only ever recomputed from `fail_trailer` markers
                     # already posted (there is no other durable store; see
                     # the module docstring), so letting this exception
                     # propagate would leave `attempt` unchanged on the next
@@ -380,15 +427,51 @@ async def _handle_directive(
     return outcome
 
 
+def _current_gh_login() -> str:
+    """The GitHub login `gh`/`git` subprocess calls in this process actually
+    authenticate writes as, per the App-installation token
+    `orchestrator.github_token.refresh_github_token` keeps fresh."""
+    proc = _run(["gh", "api", "user", "--jq", ".login"])
+    return proc.stdout.strip()
+
+
+async def _verify_bot_identity_once() -> None:
+    """Raise if `directives.BOT_LOGINS` has drifted from the actually
+    authenticated login; no-op after the first successful check in this
+    process (see `_bot_identity_checked`).
+
+    A `gh api user` call that itself fails (network blip, rate limit) is
+    NOT treated as a mismatch — it only means verification could not run
+    this tick; it is retried on the next one, the same tolerance every
+    other transient `gh` failure in this module gets. Only an actual
+    login mismatch raises.
+    """
+    global _bot_identity_checked
+    if _bot_identity_checked:
+        return
+    try:
+        login = await asyncio.to_thread(_current_gh_login)
+    except subprocess.CalledProcessError as e:
+        print(f"WARN: could not verify bot identity ({e.stderr or e}); will retry next tick")
+        return
+    mismatch = bot_login_mismatch(login)
+    if mismatch is not None:
+        raise RuntimeError(f"BOT_LOGINS mismatch: {mismatch}")
+    _bot_identity_checked = True
+
+
 async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIVES) -> DirectiveScanResult:
     """Run one directive-scan tick. Returns dispatched/replied/deferred/failed
     counts. A `gh` failure reading one issue's comments is logged and the
     scan continues with the rest; the tick raises only on a global failure
-    (the gitops proposal-set read itself).
+    (the gitops proposal-set read itself, or a detected BOT_LOGINS identity
+    mismatch).
     """
     if _scan_disabled():
         print("MCTL_DIRECTIVE_SCAN_ENABLED=false — directive scan disabled, skipping")
         return DirectiveScanResult()
+
+    await _verify_bot_identity_once()
 
     all_refs = await list_proposal_refs()
     candidates = [r for r in all_refs if r.status not in TERMINAL_STATUSES]

@@ -31,6 +31,7 @@ class FakeGitHub:
         self.comments: dict[str, list[dict]] = {}
         self.edit_calls: list[list[str]] = []
         self._next_id = 1
+        self.login = "mctl-agents[bot]"
 
     def add_comment(
         self,
@@ -52,6 +53,8 @@ class FakeGitHub:
         return cid
 
     def run(self, cmd: list[str]) -> subprocess.CompletedProcess:
+        if cmd[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.login + "\n", stderr="")
         if cmd[:3] == ["gh", "issue", "view"]:
             issue_url = cmd[-1]
             payload = {
@@ -96,6 +99,13 @@ def _recording_submit(calls: list):
 
 def _run_scan(**kwargs) -> DirectiveScanResult:
     return asyncio.run(scan(**kwargs))
+
+
+@pytest.fixture(autouse=True)
+def _reset_bot_identity_cache():
+    run_issue_directive_poller._bot_identity_checked = False
+    yield
+    run_issue_directive_poller._bot_identity_checked = False
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +307,124 @@ def test_dispatch_failure_gives_up_after_max_attempts_and_acks(monkeypatch):
         "the give-up bound must stop further retries once hit"
     )
     assert result.dispatched == 0
+
+
+def test_transient_marker_post_failure_does_not_escalate_to_give_up(monkeypatch):
+    """A one-off blip posting the retry-marker reply (the write that records
+    a dispatch-failure attempt) must not by itself escalate straight to the
+    permanent give-up path on the very first dispatch attempt — it must be
+    absorbed by the bounded in-process retries in `_post_reply_with_retries`
+    (codex review on #417)."""
+    monkeypatch.setattr(run_issue_directive_poller.time, "sleep", lambda _s: None)
+
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    comment_calls = {"n": 0}
+
+    def flaky_run(cmd):
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            comment_calls["n"] += 1
+            if comment_calls["n"] == 1:
+                raise subprocess.CalledProcessError(1, cmd, stderr="transient blip")
+        return gh.run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    attempts = {"n": 0}
+
+    async def failing_submit(*_args, **_kwargs):
+        attempts["n"] += 1
+        raise RuntimeError("mctl-api unreachable")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", failing_submit)
+
+    result = _run_scan(max_directives=10)
+
+    assert attempts["n"] == 1
+    assert result.dispatched == 0
+    assert comment_calls["n"] == 2, "the first (failed) attempt must be retried in-process"
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    assert bot_comments, "the retry-marker reply must have been posted after the retry"
+    assert all("mctl-directive-ack" not in c["body"] for c in bot_comments), (
+        "a transient marker-post blip must not escalate to the give-up (acked) reply"
+    )
+
+    result = _run_scan(max_directives=10)
+    assert attempts["n"] == 2, "the directive must still be retried on the next tick"
+
+
+def test_persistent_marker_post_failure_still_escalates_to_give_up(monkeypatch):
+    """If posting the retry-marker reply fails on every one of
+    `MARKER_POST_ATTEMPTS` in-process retries (a truly broken write path —
+    dead token, outage), the escalation to the give-up path must still
+    happen, same as before this change, just after the extra retries
+    (codex review on #417)."""
+    monkeypatch.setattr(run_issue_directive_poller.time, "sleep", lambda _s: None)
+
+    gh = FakeGitHub()
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    comment_calls = {"n": 0}
+
+    def flaky_run(cmd):
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            comment_calls["n"] += 1
+            if comment_calls["n"] <= run_issue_directive_poller.MARKER_POST_ATTEMPTS:
+                raise subprocess.CalledProcessError(1, cmd, stderr="persistent outage")
+        return gh.run(cmd)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", flaky_run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    attempts = {"n": 0}
+
+    async def failing_submit(*_args, **_kwargs):
+        attempts["n"] += 1
+        raise RuntimeError("mctl-api unreachable")
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", failing_submit)
+
+    result = _run_scan(max_directives=10)
+
+    assert attempts["n"] == 1
+    assert result.dispatched == 0
+    assert comment_calls["n"] == run_issue_directive_poller.MARKER_POST_ATTEMPTS + 1, (
+        "the marker post must be retried MARKER_POST_ATTEMPTS times before the give-up "
+        "reply (which succeeds) is posted"
+    )
+    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    give_up_comments = [c for c in bot_comments if "mctl-directive-ack" in c["body"]]
+    assert give_up_comments, "persistent marker-post failure must still escalate to give-up"
+    assert "giving up" in give_up_comments[-1]["body"].lower()
+
+
+def test_bot_identity_mismatch_raises_and_does_not_dispatch(monkeypatch):
+    """If the actually-authenticated `gh` login has drifted from
+    `directives.BOT_LOGINS`, the scan must fail loudly (raise) rather than
+    silently redispatching every pending directive forever (codex review
+    on #417)."""
+    gh = FakeGitHub()
+    gh.login = "mctl-app"
+    ref = _ref()
+    issue_url = run_issue_directive_poller.issue_url_for(ref.service, ref.slug)
+    gh.add_comment(issue_url)
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", gh.run)
+    monkeypatch.setattr(run_issue_directive_poller, "list_proposal_refs", _refs_stub([ref]))
+
+    submits: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submits))
+
+    with pytest.raises(RuntimeError, match="BOT_LOGINS mismatch"):
+        _run_scan(max_directives=10)
+
+    assert submits == []
 
 
 # ---------------------------------------------------------------------------
