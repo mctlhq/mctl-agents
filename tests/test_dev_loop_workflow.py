@@ -44,6 +44,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
+    AbandonState,
     DevLoopWorkflow,
     IssueRef,
 )
@@ -646,13 +647,23 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.abandon, "operator cleanup")
+
+            # Query abandon_state while parked before abandon signal
+            state_before = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_before == AbandonState(abandoned=False, reason="")
+
+            # Exercise dict payload {"reason": ...} (mctl-agents#420, mirroring cli.py abandon)
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "operator cleanup"})
+
+            # Query abandon_state immediately after signal while still running
+            state_after = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_after == AbandonState(abandoned=True, reason="operator cleanup")
+
             result = await handle.result()
 
         assert result.implement is None
         assert result.approve is None
-        assert result.ended.startswith("abandoned:")
-        assert "operator cleanup" in result.ended
+        assert result.ended == "abandoned: operator cleanup"
         assert calls == ["mctl-agents-investigate"]
 
     async def test_parked_loop_ends_when_the_source_issue_closes(self, env):
@@ -728,9 +739,27 @@ class TestDevLoopWorkflow:
         matching the fail-open rule the stale-issue-admission gate applies
         after the wait resolves. An approve signal must still reach
         implement."""
-        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
-            released=True, issue_state_raises=True,
-        )
+        poll_count = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_fail_first_then_open(repo: str, issue_number: int) -> IssueState:
+            poll_count["i"] += 1
+            if poll_count["i"] == 1:
+                # Signal approve right from the first parked poll before raising,
+                # ensuring the parked fail-open branch executes first and the subsequent
+                # wait_condition loop observes the approval.
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.approve)
+                raise ApplicationError("github unreachable", non_retryable=True)
+            return IssueState(state="open")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_fail_first_then_open)
+
         async with Worker(
             env.client,
             task_queue=TASK_QUEUE,
@@ -745,7 +774,6 @@ class TestDevLoopWorkflow:
             )
             with anyio.fail_after(10):
                 await investigate_ran.wait()
-            await handle.signal(DevLoopWorkflow.approve)
             result = await handle.result()
 
         assert result.implement is not None
@@ -753,6 +781,51 @@ class TestDevLoopWorkflow:
         assert result.approve is not None
         assert result.approve.phase == "Succeeded"
         assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+        assert poll_count["i"] >= 2
+
+    async def test_approve_signal_landing_during_final_poll_proceeds_to_implement(self, env):
+        """mctl-agents#420: an approve signal landing while the final poll's
+        get_issue_state activity is in flight must not be discarded just because
+        the deadline was reached. The workflow must proceed to implement."""
+        poll_count = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_signal_on_final(repo: str, issue_number: int) -> IssueState:
+            poll_count["i"] += 1
+            if poll_count["i"] == 56:
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.approve, {"approver": "reviewer"})
+            return IssueState(state="open")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_signal_on_final)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/424"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert result.ended == ""
+        assert "mctl-agents-implement" in calls
 
     async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
         """The implement CWFT must only be allowed to touch proposals under
@@ -1533,6 +1606,8 @@ class TestDevLoopWorkflow:
             with anyio.fail_after(10):
                 await first_poll.wait()
             await handle.signal(DevLoopWorkflow.abandon, "operator cleanup")
+            state_after = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_after == AbandonState(abandoned=True, reason="operator cleanup")
             result = await handle.result()
 
         assert result.implement is not None and result.implement.phase == "Succeeded"

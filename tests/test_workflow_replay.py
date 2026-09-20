@@ -251,22 +251,21 @@ async def test_parked_history_replays_against_current_definitions() -> None:
     timeout, so no timer command, so the last recorded workflow task carries
     no commands at all.
 
-    This assertion is real but DELIBERATELY WEAK evidence, and the module
-    docstring's own capability table says why: "a divergence confined to the
-    LAST recorded workflow task is invisible" to `Replayer`. That last task
-    is exactly where `workflow.patched("approval-watch")` gets evaluated for
-    the first time against this history. Today's code, replaying it,
-    schedules a NEW timer there (the bounded poll's `APPROVAL_POLL_INTERVAL`
-    wait) that the recording does not contain -- and `Replayer` not flagging
-    that is this test's actual (indirect) evidence for the retroactivity
-    claim: the SDK tolerates a new command appended at exactly the boundary
-    a resumed, still-Running execution would extend from next. It falls
-    short of literally proving a live worker resumes and completes on the
-    new branch -- that needs a persistent test server outliving one
-    recording script, which this repo's harness does not set up for a CLI
-    run -- so the `abandon` signal (task 1) remains the unconditional
-    fallback for the executions already stuck, exactly as design.md's own
-    open question anticipates either answer being.
+    This assertion confirms that `dev_loop_parked.json` replays clean against
+    current definitions: because `workflow.patched(id)` is
+    `not is_replaying or id in patches_notified`, replaying this unpatched
+    history has `is_replaying=True` with no `"approval-watch"` marker, so
+    `patched("approval-watch")` returns False and takes the legacy branch.
+    No timer is scheduled during replay, guaranteeing that unpatched
+    histories remain byte-compatible without nondeterminism.
+
+    The practical consequence for operators: a live execution already
+    parked at the unbounded `wait_condition` has no pending timer or activity,
+    so deploying this change will not cause a worker to spontaneously re-enter
+    `run()` and pick up the bounded poll loop. `abandon` (task 1) is not
+    just a fallback — it is the explicit mechanism that moves such an execution
+    (delivering the signal schedules a workflow task, replay takes the legacy
+    branch, and the wait condition observes `_abandoned`).
     """
     from tests.replay_scenarios import HISTORY_DIR
 

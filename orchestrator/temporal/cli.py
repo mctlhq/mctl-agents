@@ -52,6 +52,16 @@ async def status(workflow_id: str) -> None:
     handle = client.get_workflow_handle(workflow_id)
     desc = await handle.describe()
     print(f"{workflow_id}: {desc.status}")
+    if desc.status is not None and desc.status.name != "COMPLETED":
+        # mctl-agents#420: the whole point of a dedicated query is telling
+        # "still parked" apart from "an operator ended this" WITHOUT waiting
+        # for the execution to complete (see `abandon_state`'s docstring) --
+        # once it has completed, `result.ended` below already carries the
+        # same "abandoned: <reason>" text, so querying again would just
+        # print it twice.
+        abandon_state = await handle.query(DevLoopWorkflow.abandon_state)
+        if abandon_state.abandoned:
+            print(f"  abandoned:   {abandon_state.reason}")
     if desc.status is not None and desc.status.name == "COMPLETED":
         result: DevLoopResult = await handle.result()
         # mctl-agents#420: why this execution ended, when it ended for a

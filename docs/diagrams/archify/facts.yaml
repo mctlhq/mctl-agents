@@ -46,6 +46,8 @@ cwfts:
 - mctl-agents-run
 - mctl-agents-shepherd
 dev_loop:
+  approval_poll_interval: 6 h
+  approval_wait_deadline: 14 d
   approve_step_timeout: 15 min
   deploy_verify_deadline: 45 min
   incident_watch_window: 30 min

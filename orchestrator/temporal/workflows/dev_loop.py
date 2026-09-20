@@ -1071,7 +1071,10 @@ class DevLoopWorkflow:
         else:
             await workflow.wait_condition(lambda: self._approved or self._abandoned)
 
-        if approval_ended is not None:
+        # mctl-agents#420: an approve or abandon signal landing while the final
+        # poll's in-flight get_issue_state activity was executing must not be
+        # silently discarded just because the deadline was crossed.
+        if approval_ended is not None and not (self._approved or self._abandoned):
             return DevLoopResult(
                 investigate=investigate_result, implement=None, ended=approval_ended
             )
