@@ -105,6 +105,7 @@ agents:
     triggeredBy:
       - mctl_trigger_issue (MCP, admin-only)
       - orchestrator/run_issue_poller.py (agents:intake label)
+      - orchestrator/run_issue_directive_poller.py (@MCTL reinvestigate comment)
     notes: >-
       cwd is a throwaway shallow clone of the target repo, so the SDK picks up
       no mctl-agents-owned prompt files at all: the inline template is this

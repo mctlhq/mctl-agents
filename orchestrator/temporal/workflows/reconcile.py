@@ -17,7 +17,11 @@ from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
-    from orchestrator.temporal.activities.discovery import ReconcileDiscoveryResult, discover_and_project
+    from orchestrator.temporal.activities.discovery import (
+        ReconcileDiscoveryResult,
+        StaleDirective,
+        discover_and_project,
+    )
     from orchestrator.temporal.activities.lifecycle_reconcile import (
         LifecycleReconcileResult,
         reconcile_lifecycle_ownership,
@@ -70,6 +74,11 @@ class ReconcileWorkflowResult:
     # lifecycle-reconcile patch existed, or took the unpatched replay branch
     # where the active DevLoop set is unknown and the sweep must not run.
     lifecycle: LifecycleReconcileResult | None = None
+    # Directive-shaped comments the comment-driven trigger
+    # (run_issue_directive_poller) has not yet acknowledged (#417). None
+    # means the tick ran before the directive-staleness patch existed, or
+    # took its unpatched replay branch — report-only, never gates a write.
+    stale_directives: list[StaleDirective] | None = None
 
 
 @workflow.defn
@@ -85,6 +94,20 @@ class ReconcileWorkflow:
             start_to_close_timeout=ACTIVITY_TIMEOUT,
             retry_policy=ACTIVITY_RETRY_POLICY,
         )
+
+        # Called once, unconditionally, right after the activity that
+        # computed it — not inside either branch below — so every replay of
+        # this execution calls `patched()` the same number of times
+        # regardless of which branch it later takes (mirrors the
+        # `orphan-active-ids` / `reconcile-apply` discipline just below).
+        stale_directives = (
+            discovery_result.stale_directives if workflow.patched("directive-staleness") else None
+        )
+        if stale_directives:
+            workflow.logger.info(
+                "reconcile: %d stale directive(s) found (unacked by run_issue_directive_poller)",
+                len(stale_directives),
+            )
 
         if workflow.patched("orphan-active-ids"):
             try:
@@ -119,6 +142,7 @@ class ReconcileWorkflow:
                         if workflow.patched("reconcile-apply")
                         else None
                     ),
+                    stale_directives=stale_directives,
                 )
 
             orphans_result: OrphanDetectionResult = await workflow.execute_activity(
@@ -183,6 +207,7 @@ class ReconcileWorkflow:
             orphans=orphans_result,
             applied=applied,
             lifecycle=lifecycle_result,
+            stale_directives=stale_directives,
         )
 
     async def _apply(self, discovery: ReconcileDiscoveryResult) -> WorkflowResult | None:

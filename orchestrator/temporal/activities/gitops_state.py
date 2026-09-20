@@ -78,12 +78,18 @@ class ProposalStateRef:
     slug: str
     status: str
     pr_url: str | None
-    # The four fields below feed the implement-sweep's stranding predicate
-    # (mctl-agents#412, orchestrator/temporal/activities/stranded.py) only;
-    # reconcile/orphans never read them. Defaulted so a result recorded by
-    # a worker before this change still deserializes — the same rule
-    # PRSnapshot.head_sha follows.
+    #: The `.status.yaml` `updated_at` field — a field extraction from the
+    #: blob already being read, not a second fetch. Defaulted so a ref
+    #: built before this field existed still constructs. Two independent
+    #: consumers read it: the implement-sweep's stranding predicate
+    #: (mctl-agents#412, orchestrator/temporal/activities/stranded.py) and
+    #: mctl-agents#417's directive-staleness report, which compares a
+    #: comment's timestamp against this value.
     updated_at: str | None = None
+    # The three fields below feed only the implement-sweep's stranding
+    # predicate; reconcile/orphans never read them. Defaulted so a result
+    # recorded by a worker before this change still deserializes — the
+    # same rule PRSnapshot.head_sha follows.
     #: The `attempt.expires_at` .status.yaml records while an implementer
     #: run holds this proposal (run_implementer.IMPLEMENT_ATTEMPT_LEASE).
     #: None when there is no in-flight attempt.
@@ -181,6 +187,10 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
 
     Mirrors run_shepherd._load_status: flat YAML written by the
     investigator, defaulting to "proposed" the way _discover_refs does.
+    `updated_at` is None when absent or unparseable — a status file older
+    than mctl-agents#417, whose directive-staleness report is the other
+    consumer of this field alongside the implement-sweep's stranding
+    predicate below.
 
     The last five are read once here, alongside status/pr_url, rather than
     via a second parse of the same blob: they exist for the implement-sweep's
@@ -189,15 +199,26 @@ def _parse_status_yaml(text: str) -> _ParsedStatus:
     run as written (`unrunnable`/`blocked`) from one a DevLoopWorkflow simply
     has not reached yet — and, separately, needs `execution_authorization` to
     tell "nothing ever authorised executing this" from "a human did".
+
+    `updated_at`/`attempt_expires_at` are normalized to `str(...)` here
+    rather than left as whatever PyYAML produced: an unquoted timestamp in
+    `.status.yaml` parses to a native `datetime.datetime`, and `str()` on
+    that yields a space-separated, `+00:00`-suffixed form that is NOT
+    directly comparable, lexicographically, to GitHub's `T`/`Z`-suffixed
+    RFC 3339 strings — callers that compare these against another
+    timestamp (`discovery._stale_directives`) must parse both sides into
+    `datetime` objects first, never compare the raw strings.
     """
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("status file is not a mapping")
     status = str(data.get("status", "proposed"))
     pr = data.get("pr")
-    updated_at = data.get("updated_at")
+    raw_updated_at = data.get("updated_at")
+    updated_at = str(raw_updated_at) if raw_updated_at is not None else None
     attempt = data.get("attempt")
-    attempt_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    raw_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    attempt_expires_at = str(raw_expires_at) if raw_expires_at is not None else None
     unrunnable = unrunnable_reason(data) is not None
     blocked = bool(data.get("blocked"))
     authorization, unauthorized = execution_authorization(data)

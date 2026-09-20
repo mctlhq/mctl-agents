@@ -1307,6 +1307,20 @@ class TestReconcileReadsGitHub:
 
     STATUS_SHA = "sha-implemented"
 
+    @pytest.fixture(autouse=True)
+    def _reset_stale_directive_cursor(self):
+        """`discovery._stale_directive_cursor` is process-lifetime module
+        state (see its own comment) — left dirty by one test it silently
+        changes which window a LATER test's rotation sees, an ordering
+        dependency the sibling `_bot_identity_checked` global already avoids
+        via its own autouse fixture (tests/test_run_issue_directive_poller.py)
+        (claude P3 on #421)."""
+        from orchestrator.temporal.activities import discovery as discovery_mod
+
+        discovery_mod._stale_directive_cursor = 0
+        yield
+        discovery_mod._stale_directive_cursor = 0
+
     def _tree(self, paths, truncated=False):
         return {
             "truncated": truncated,
@@ -1763,6 +1777,352 @@ class TestReconcileReadsGitHub:
         with pytest.raises(ProposalListingError):
             await env.run(discover_and_project, "")
 
+    async def test_updated_at_is_extracted_from_the_status_blob(self, env, monkeypatch):
+        """mctlhq/mctl-agents#417: a field extraction from the blob already
+        being read, not a second fetch."""
+        from orchestrator.temporal.activities.gitops_state import list_proposal_refs
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-updated-at")]
+            ),
+            blobs={
+                "sha-updated-at": (
+                    "status: implemented\n"
+                    "updated_at: '2026-09-19T10:00:00Z'\n"
+                )
+            },
+            pulls={},
+        )
+
+        refs = await env.run(list_proposal_refs)
+        assert [r.updated_at for r in refs] == ["2026-09-19T10:00:00Z"]
+
+    async def test_a_status_file_missing_updated_at_yields_none(self, env, monkeypatch):
+        from orchestrator.temporal.activities.gitops_state import list_proposal_refs
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree([("mctl-web/proposals/issue-66-turnstile/.status.yaml", "sha-old")]),
+            blobs={"sha-old": "status: implemented\n"},
+            pulls={},
+        )
+
+        refs = await env.run(list_proposal_refs)
+        assert refs[0].updated_at is None
+
+    async def test_a_newer_unacked_directive_is_reported_stale(self, env, monkeypatch):
+        """The condition mctlhq/mctl-agents#417's reconcile report exists
+        for: run_issue_directive_poller's own scan missed it (broken, down,
+        or capped-out), and reconcile is the belt-and-braces that notices."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-proposed")]
+            ),
+            blobs={
+                "sha-proposed": (
+                    "status: proposed\n"
+                    "updated_at: '2026-09-19T10:00:00Z'\n"
+                )
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T12:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [d.comment_id for d in result.stale_directives] == ["c1"]
+        assert result.stale_directives[0].service == "mctl-web"
+        assert result.stale_directives[0].slug == "issue-9-fix"
+        # "proposed" is excluded from RECONCILE_INPUT_STATUSES — the
+        # projection sweep never looks at it — but the directive-staleness
+        # check must, since it is exactly the status a reinvestigate
+        # directive acts on.
+        assert result.total_inspected == 0
+
+    async def test_an_acked_directive_is_not_reported_stale(self, env, monkeypatch):
+        from orchestrator.directives import RawComment, ack_trailer
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-proposed-acked")]
+            ),
+            blobs={
+                "sha-proposed-acked": (
+                    "status: proposed\n"
+                    "updated_at: '2026-09-19T10:00:00Z'\n"
+                )
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T12:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                ),
+                RawComment(
+                    id="ack1", author="mctl-agents[bot]", created_at="2026-09-19T12:05:00Z",
+                    body=f"done\n\n{ack_trailer('c1')}", author_association="NONE",
+                ),
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.stale_directives == []
+
+    async def test_two_sibling_refs_sharing_an_issue_report_the_stale_directive_once(
+        self, env, monkeypatch
+    ):
+        """Two proposal directories resolving to the same GitHub issue (a
+        re-intake that left its old slug's directory behind) must not
+        report the same unanswered directive comment twice — once per
+        sibling ref — nor fetch that issue's comments twice (claude P3 on
+        #421, on top of the earlier agy P3 that only deduped the `gh`
+        call)."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [
+                    ("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-live"),
+                    ("mctl-web/proposals/issue-9-fix-old/.status.yaml", "sha-old"),
+                ]
+            ),
+            blobs={
+                "sha-live": "status: proposed\nupdated_at: '2026-09-19T10:00:00Z'\n",
+                "sha-old": "status: proposed\nupdated_at: '2026-09-18T10:00:00Z'\n",
+            },
+            pulls={},
+        )
+        calls = []
+
+        def _recording_read(issue_url):
+            calls.append(issue_url)
+            return [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T12:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ]
+
+        monkeypatch.setattr(discovery_mod, "read_issue_comments", _recording_read)
+
+        result = await env.run(discover_and_project, "")
+
+        assert len(calls) == 1
+        assert [d.comment_id for d in result.stale_directives] == ["c1"]
+
+    async def test_sibling_dedup_uses_the_least_recently_updated_ref_not_the_most(
+        self, env, monkeypatch
+    ):
+        """This is a belt-and-braces report for what the poller's own scan
+        might have missed, so a false negative (silently suppressing a
+        directive that some sibling has NOT actually addressed) is the
+        expensive failure direction — the representative sibling for the
+        staleness comparison must be the least recently updated one, not the
+        most recently updated one (claude P3 on head `6c1aea8`). Picking the
+        most-recently-updated sibling would suppress this exact directive,
+        since it falls before that sibling's `updated_at` but after the
+        other's."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [
+                    ("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-early"),
+                    ("mctl-web/proposals/issue-9-fix-old/.status.yaml", "sha-late"),
+                ]
+            ),
+            blobs={
+                "sha-early": "status: proposed\nupdated_at: '2026-09-19T08:00:00Z'\n",
+                "sha-late": "status: proposed\nupdated_at: '2026-09-19T14:00:00Z'\n",
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T10:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [d.comment_id for d in result.stale_directives] == ["c1"]
+        # Suppression compares against the oldest sibling (`sha-early`), but
+        # attribution names the newest one (`sha-late`) — the one likeliest
+        # to still be the live proposal in the re-published-proposal shape
+        # this grouping exists for (claude P3 on head `f7a42ab`).
+        assert result.stale_directives[0].slug == "issue-9-fix-old"
+
+    async def test_stale_directive_scan_honours_the_feature_kill_switch(
+        self, env, monkeypatch
+    ):
+        """MCTL_DIRECTIVE_SCAN_ENABLED=false is documented as the fastest
+        kill for the whole #417 feature — the reconcile belt-and-braces
+        sweep must stop making `gh` calls too, not only
+        run_issue_directive_poller.scan()."""
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-proposed-off")]
+            ),
+            blobs={"sha-proposed-off": "status: proposed\n"},
+            pulls={},
+        )
+
+        def _boom(issue_url):
+            raise AssertionError("read_issue_comments must not run when the scan is disabled")
+
+        monkeypatch.setattr(discovery_mod, "read_issue_comments", _boom)
+        monkeypatch.setenv("MCTL_DIRECTIVE_SCAN_ENABLED", "false")
+
+        result = await env.run(discover_and_project, "")
+
+        # None, not [] — the kill switch means the sweep was never run, not
+        # that it ran and found nothing stale; `[]` already means the
+        # latter, and ReconcileDiscoveryResult.stale_directives already has
+        # None as its "not checked" sentinel (claude P3 on #421).
+        assert result.stale_directives is None
+
+    async def test_an_unquoted_yaml_timestamp_still_suppresses_an_earlier_directive(
+        self, env, monkeypatch
+    ):
+        """An unquoted `updated_at:` in `.status.yaml` parses to a native
+        `datetime.datetime`, not a string — `_parse_status_yaml` then
+        renders it as `str(datetime)`, which uses a space separator and a
+        `+00:00` offset ('2026-09-19 10:00:00+00:00') instead of GitHub's
+        `T`/`Z` form ('2026-09-19T08:00:00Z'). A raw string `<=` comparison
+        across that format boundary is wrong (`'T' > ' '` and `'Z' > '+'`
+        in ASCII), so a directive created BEFORE `updated_at` on the same
+        day would misclassify as stale. Regression test for the P2 this
+        would have caught."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-unquoted")]
+            ),
+            blobs={
+                # Unquoted timestamp: PyYAML parses this to datetime.datetime,
+                # not str.
+                "sha-unquoted": "status: proposed\nupdated_at: 2026-09-19 10:00:00\n"
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T08:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert result.stale_directives == []
+
+    async def test_stale_directive_scan_rotates_past_the_cap_across_ticks(
+        self, env, monkeypatch
+    ):
+        """`MAX_STALE_DIRECTIVE_CANDIDATES` bounds one tick's scan, but the
+        window must rotate — a fixed alphabetical-prefix slice would starve
+        every candidate past the cap forever, since `list_proposal_refs`
+        returns the same stable order every tick and this scan is otherwise
+        stateless (agy P2 on #421)."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import (
+            MAX_STALE_DIRECTIVE_CANDIDATES,
+            discover_and_project,
+        )
+
+        total = MAX_STALE_DIRECTIVE_CANDIDATES + 1
+        entries = [
+            (f"mctl-web/proposals/issue-{i}-x/.status.yaml", f"sha-{i}")
+            for i in range(total)
+        ]
+        blobs = {f"sha-{i}": "status: proposed\nupdated_at: '2026-01-01T00:00:00Z'\n" for i in range(total)}
+
+        def comments_for(issue_url: str):
+            # Every candidate has exactly one unacked directive, so which
+            # ones got scanned this tick is observable from the result.
+            return [
+                RawComment(
+                    id=f"c-{issue_url}", author="octocat",
+                    created_at="2026-09-19T08:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ]
+
+        monkeypatch.setattr(discovery_mod, "read_issue_comments", comments_for)
+
+        self._clear_cache()
+        self._handler(monkeypatch, tree=self._tree(entries), blobs=blobs, pulls={})
+        first = await env.run(discover_and_project, "")
+
+        self._clear_cache()
+        self._handler(monkeypatch, tree=self._tree(entries), blobs=blobs, pulls={})
+        second = await env.run(discover_and_project, "")
+
+        first_slugs = {d.slug for d in first.stale_directives}
+        second_slugs = {d.slug for d in second.stale_directives}
+        assert len(first_slugs) == MAX_STALE_DIRECTIVE_CANDIDATES
+        # The window advanced: the second tick did not scan the identical
+        # prefix the first tick did, so the tail-end candidate the first
+        # tick skipped is reachable within a bounded number of ticks.
+        assert first_slugs != second_slugs
+        assert first_slugs | second_slugs == {f"issue-{i}-x" for i in range(total)}
+
 
 def _implement_status(phase: str, nodes: dict | None) -> dict:
     status = {"phase": phase, "startedAt": "2026-09-19T00:12:31Z"}
@@ -2087,3 +2447,90 @@ class TestSubmitAndWaitObservesTheImplementer:
         result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-investigate", params={}))
         assert result.implementer_ran is None
         assert result.succeeded
+
+
+class TestParseTimestampAndRotateWindow:
+    """Direct unit tests for `discovery._parse_timestamp` and
+    `discovery._rotate_window` (agy P3 on #421) — both are pure and were
+    previously exercised only indirectly through `_stale_directives`."""
+
+    def test_parses_a_z_suffixed_rfc3339_string(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("2026-09-19T08:00:00Z") == datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)
+
+    def test_parses_an_offset_suffixed_string(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("2026-09-19T08:00:00+00:00") == datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)
+
+    def test_a_naive_string_is_assumed_utc(self):
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("2026-09-19 08:00:00") == datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)
+
+    def test_none_and_empty_are_unparseable(self):
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp(None) is None
+        assert _parse_timestamp("") is None
+
+    def test_a_malformed_string_is_unparseable_not_a_crash(self):
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp("not-a-timestamp") is None
+
+    def test_a_raw_datetime_degrades_to_unparseable_not_a_typeerror(self):
+        # Defense in depth (agy P2 on #421): `gitops_state._parse_status_yaml`
+        # normalizes `updated_at` to `str(...)` so this shouldn't happen in
+        # practice, but `_parse_timestamp` must not crash the whole reconcile
+        # tick if a caller ever hands it a raw PyYAML `datetime` again.
+        from datetime import UTC, datetime
+
+        from orchestrator.temporal.activities.discovery import _parse_timestamp
+
+        assert _parse_timestamp(datetime(2026, 9, 19, 8, 0, 0, tzinfo=UTC)) is None  # type: ignore[arg-type]
+
+    def test_rotate_window_wraps_around(self):
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import _rotate_window
+
+        items = list(range(5))
+        discovery_mod._stale_directive_cursor = 3
+        try:
+            window = _rotate_window(items, cap=3)
+        finally:
+            discovery_mod._stale_directive_cursor = 0
+        assert window == [3, 4, 0]
+
+    def test_rotate_window_advances_the_cursor(self):
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import _rotate_window
+
+        items = list(range(10))
+        discovery_mod._stale_directive_cursor = 0
+        try:
+            _rotate_window(items, cap=4)
+            assert discovery_mod._stale_directive_cursor == 4
+        finally:
+            discovery_mod._stale_directive_cursor = 0
+
+    def test_rotate_window_covers_every_item_across_enough_ticks(self):
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import _rotate_window
+
+        items = list(range(7))
+        discovery_mod._stale_directive_cursor = 0
+        seen: set[int] = set()
+        try:
+            for _ in range(4):  # ceil(7/2) = 4 ticks at cap=2 covers everything
+                seen.update(_rotate_window(items, cap=2))
+        finally:
+            discovery_mod._stale_directive_cursor = 0
+        assert seen == set(items)

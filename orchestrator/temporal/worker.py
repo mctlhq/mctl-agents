@@ -46,7 +46,7 @@ from orchestrator.temporal.activities.deploy_state import (
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.incidents import list_service_incidents
-from orchestrator.temporal.activities.issue_poll import poll_issues_activity
+from orchestrator.temporal.activities.issue_poll import directive_scan_activity, poll_issues_activity
 from orchestrator.temporal.activities.issue_state import get_issue_state
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
 from orchestrator.temporal.activities.lifecycle_reconcile import (
@@ -534,6 +534,11 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         visibility.list_active_dev_loop_ids,
         visibility.count_swept_prestart_failures,
         poll_issues_activity,
+        # Second pass of the same tick (#417): reads GitHub issue comments
+        # and, at most, POSTs a `gh issue comment` reply plus one mctl-api
+        # submit — the same shape as poll_issues_activity, so it belongs on
+        # the same queue for the same reason.
+        directive_scan_activity,
         # Bounded GitHub reads, same shape as detect_orphans two lines up —
         # the implement-sweep's stranding scan (mctl-agents#412).
         find_stranded_accepted,

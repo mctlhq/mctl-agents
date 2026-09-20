@@ -120,6 +120,32 @@ and the PR carries `Closes <repo>#<N>`
 Triggered on demand — by the `mctl_trigger_issue` MCP tool or an operator
 submitting the `mctl-agents-investigate` workflow.
 
+#### Directive comments
+
+A comment on an issue that owns a proposal can also trigger a
+re-investigation, without an operator finding and running the
+`mctl_trigger_issue` dispatch by hand (mctlhq/mctl-agents#417):
+
+```
+@MCTL reinvestigate
+```
+
+posted as the first thing on its own line (mid-line and quoted mentions do
+not count) by an author whose association with the repository is `OWNER`,
+`MEMBER` or `COLLABORATOR`. `reinvestigate` is the only supported verb today
+— every other imperative-looking word gets an explicit "not a recognised
+instruction" reply rather than silence. `orchestrator/
+run_issue_directive_poller.py` runs as a second pass of the same 15-minute
+`IssuePollWorkflow` tick that drives the `agents:intake` label, and always
+replies: naming the Argo workflow it started, or explaining exactly why it
+did not (no proposal yet, an ambiguous or non-overwritable proposal, an
+unauthorized author, or an unrecognised verb). A reply carries a hidden
+`<!-- mctl-directive-ack: ... -->` marker so the same comment is never acted
+on twice; asking again is a new comment. The comment path never touches
+the `agents:intake` label and never starts or signals a `DevLoopWorkflow` —
+a parked approval gate stays parked, and the human who later approves it
+approves the *rewritten* proposal.
+
 ### Tier 2 — implementer
 
 `orchestrator/run_implementer.py` turns an `accepted` proposal into a

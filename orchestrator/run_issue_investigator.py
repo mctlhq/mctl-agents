@@ -1045,6 +1045,8 @@ def write_status_yaml(
     issue: IssueData,
     *,
     snapshot: ContextSnapshot | None = None,
+    requested_by: str | None = None,
+    requested_comment_url: str | None = None,
 ) -> Path:
     """Write the initial .status.yaml for an issue-driven proposal.
 
@@ -1059,6 +1061,13 @@ def write_status_yaml(
     never the sources or payloads. Additive because `_status_disagreements`
     (below) checks only its five named fields and ignores unknown top-level
     keys, so this cannot forge an approval or misroute a `Closes` line.
+
+    `requested_by`, when given (mctlhq/mctl-agents#417's directive-comment
+    trigger), adds an ADDITIVE `request` block recording the GitHub login
+    and comment URL that asked for this (re-)investigation — the requester
+    equivalent of `source` for the issue itself. Omitted entirely when
+    `requested_by` is falsy, so a label-driven investigation's payload is
+    byte-for-byte what it was before this parameter existed.
     """
     payload: dict[str, Any] = {
         "status": "proposed",
@@ -1080,6 +1089,12 @@ def write_status_yaml(
             "content_hash": snapshot.content_hash,
             "strategy": snapshot.strategy.name,
             "strategy_version": snapshot.strategy.version,
+        }
+    if requested_by:
+        payload["request"] = {
+            "by": requested_by,
+            "comment": requested_comment_url or "",
+            "received_at": _now_iso(),
         }
     proposal_dir.mkdir(parents=True, exist_ok=True)
     status_path = proposal_dir / ".status.yaml"
@@ -1672,8 +1687,18 @@ def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
     dry_run: bool = False,
+    *,
+    requested_by: str | None = None,
+    requested_comment_url: str | None = None,
 ) -> InvestigateResult:
-    """Investigate one GitHub issue and write a `proposed` proposal."""
+    """Investigate one GitHub issue and write a `proposed` proposal.
+
+    `requested_by` / `requested_comment_url` (mctlhq/mctl-agents#417) record
+    who asked for THIS run via a `@MCTL reinvestigate` directive comment —
+    threaded into `write_status_yaml`'s `request` block. Both default to
+    None, in which case the written payload is unchanged from before this
+    parameter existed (the label-driven path never passes them).
+    """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
 
@@ -1869,11 +1894,18 @@ def investigate(
         #    The two-argument call (no `snapshot=`) when context assembly
         #    did not run keeps this byte-identical to the pre-#265 call —
         #    including for a caller/test double that only accepts
-        #    (proposal_dir, issue).
+        #    (proposal_dir, issue). Same rule for `requested_by`: omitted
+        #    from the call entirely unless a directive comment actually
+        #    supplied one, so every existing test double that stands in for
+        #    write_status_yaml with the pre-#417 signature keeps working.
+        status_kwargs: dict[str, Any] = {}
+        if requested_by:
+            status_kwargs["requested_by"] = requested_by
+            status_kwargs["requested_comment_url"] = requested_comment_url
         if context is not None:
-            write_status_yaml(staging, issue, snapshot=context.snapshot)
+            write_status_yaml(staging, issue, snapshot=context.snapshot, **status_kwargs)
         else:
-            write_status_yaml(staging, issue)
+            write_status_yaml(staging, issue, **status_kwargs)
 
         # 6. Publish by swapping DIRECTORIES, not file by file. Four
         #    individual os.replace calls are each atomic but the sequence
@@ -2324,6 +2356,20 @@ def main() -> None:
         action="store_true",
         help="Resolve issue + slug only; don't clone, run the SDK, or comment",
     )
+    ap.add_argument(
+        "--requested-by",
+        default=None,
+        help=(
+            "GitHub login that requested this run via a `@MCTL reinvestigate` "
+            "directive comment (mctl-agents#417); recorded in .status.yaml's "
+            "`request` block. Omit for a label-driven investigation."
+        ),
+    )
+    ap.add_argument(
+        "--requested-comment-url",
+        default=None,
+        help="The requesting comment's URL, recorded alongside --requested-by.",
+    )
     args = ap.parse_args()
 
     # Not in dry-run: it resolves the issue and the slug and stops before
@@ -2341,6 +2387,8 @@ def main() -> None:
             issue_url=args.issue_url,
             state_dir=Path(args.state_dir),
             dry_run=args.dry_run,
+            requested_by=args.requested_by,
+            requested_comment_url=args.requested_comment_url,
         )
     except ProposalAmbiguityError as exc:
         # The process boundary is where a clean exit belongs — the library
