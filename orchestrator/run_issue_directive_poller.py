@@ -326,9 +326,24 @@ def _reply_no_proposal(author: str, comment_id: str) -> str:
 
 def _reply_ambiguous(author: str, comment_id: str, matches: list[ProposalStateRef]) -> str:
     names = ", ".join(sorted(f"{m.service}/{m.slug}" for m in matches))
+    stale = sorted(f"{m.service}/{m.slug}" for m in matches if m.status in TERMINAL_STATUSES)
+    # `resolve_slug` (orchestrator/run_issue_investigator.py) refuses this
+    # exact case too, status-agnostically — so a human deleting the stale
+    # directory is genuinely the only way forward, not one option among
+    # several. Naming it here means the operator does not also have to go
+    # read `resolve_slug`'s own error text to learn that (claude P2 on
+    # head `6c1aea8`).
+    stale_note = ""
+    if stale:
+        stale_statuses = ", ".join(sorted({m.status for m in matches if m.status in TERMINAL_STATUSES}))
+        verb = "is" if len(stale) == 1 else "are"
+        stale_note = (
+            f" {', '.join(stale)} {verb} already terminal ({stale_statuses}) and can "
+            "likely be removed from gitops to resolve this."
+        )
     return _with_ack(
         f"@{author} this issue has more than one proposal directory ({names}) — "
-        "refusing to guess which one to rewrite.",
+        f"refusing to guess which one to rewrite.{stale_note}",
         comment_id,
     )
 
@@ -468,19 +483,22 @@ async def _handle_directive(
         outcome, body = "unrecognised", _reply_unrecognised(directive.author, directive.comment_id)
     else:
         number = _issue_number(ref.slug)
-        # `scan()` already excludes TERMINAL_STATUSES refs from `candidates`
-        # before this is called, but `all_refs` here is unfiltered — without
-        # the same filter, a merged/rejected/review-stuck sibling directory
-        # left behind by a re-intake (e.g. a retitled issue re-proposed under
-        # a new slug) permanently counts toward `len(matches) > 1`, so every
-        # directive on that issue gets stuck replying "ambiguous" forever,
-        # even though exactly one proposal is actually live (claude P2 on
-        # #421).
-        matches = [
-            r
-            for r in all_refs
-            if r.service == ref.service and _issue_number(r.slug) == number and r.status not in TERMINAL_STATUSES
-        ]
+        # Deliberately UNFILTERED by status, unlike `scan()`'s own
+        # TERMINAL_STATUSES-excluded `candidates` — matching that filter
+        # here was tried and reverted (claude P2 on head `6c1aea8`): the
+        # actual dispatch target, `run_issue_investigator.resolve_slug` via
+        # `existing_slugs`, is purely directory-name based and
+        # status-agnostic, so it raises `ProposalAmbiguityError` on two
+        # `issue-N-*` directories regardless of either one's status. Filtering
+        # `matches` here without teaching the investigator the same rule made
+        # the poller dispatch a case the investigator refuses — the reply
+        # said "re-investigation started" (with the ack trailer, so it is
+        # never retried) and the Argo workflow then died with nothing posted
+        # back to the issue. Keeping this unfiltered means `_reply_ambiguous`
+        # is the fix instead: it must name which of the matches are stale so
+        # a human knows what to delete, not silently pick a winner the
+        # investigator disagrees with.
+        matches = [r for r in all_refs if r.service == ref.service and _issue_number(r.slug) == number]
         if not matches:
             outcome, body = "no-proposal", _reply_no_proposal(directive.author, directive.comment_id)
         elif len(matches) > 1:

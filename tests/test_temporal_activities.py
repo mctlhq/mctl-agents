@@ -1942,6 +1942,52 @@ class TestReconcileReadsGitHub:
         assert len(calls) == 1
         assert [d.comment_id for d in result.stale_directives] == ["c1"]
 
+    async def test_sibling_dedup_uses_the_least_recently_updated_ref_not_the_most(
+        self, env, monkeypatch
+    ):
+        """This is a belt-and-braces report for what the poller's own scan
+        might have missed, so a false negative (silently suppressing a
+        directive that some sibling has NOT actually addressed) is the
+        expensive failure direction — the representative sibling for the
+        staleness comparison must be the least recently updated one, not the
+        most recently updated one (claude P3 on head `6c1aea8`). Picking the
+        most-recently-updated sibling would suppress this exact directive,
+        since it falls before that sibling's `updated_at` but after the
+        other's."""
+        from orchestrator.directives import RawComment
+        from orchestrator.temporal.activities import discovery as discovery_mod
+        from orchestrator.temporal.activities.discovery import discover_and_project
+
+        self._clear_cache()
+        self._handler(
+            monkeypatch,
+            tree=self._tree(
+                [
+                    ("mctl-web/proposals/issue-9-fix/.status.yaml", "sha-early"),
+                    ("mctl-web/proposals/issue-9-fix-old/.status.yaml", "sha-late"),
+                ]
+            ),
+            blobs={
+                "sha-early": "status: proposed\nupdated_at: '2026-09-19T08:00:00Z'\n",
+                "sha-late": "status: proposed\nupdated_at: '2026-09-19T14:00:00Z'\n",
+            },
+            pulls={},
+        )
+        monkeypatch.setattr(
+            discovery_mod,
+            "read_issue_comments",
+            lambda issue_url: [
+                RawComment(
+                    id="c1", author="octocat", created_at="2026-09-19T10:00:00Z",
+                    body="@MCTL reinvestigate", author_association="OWNER",
+                )
+            ],
+        )
+
+        result = await env.run(discover_and_project, "")
+
+        assert [d.comment_id for d in result.stale_directives] == ["c1"]
+
     async def test_stale_directive_scan_honours_the_feature_kill_switch(
         self, env, monkeypatch
     ):

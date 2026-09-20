@@ -235,18 +235,26 @@ def test_ambiguous_proposal_dirs_are_named_in_the_reply(monkeypatch):
     assert "mctl-directive-ack: c1" in replies[0]
 
 
-def test_a_terminal_sibling_is_not_ambiguous(monkeypatch):
+def test_a_terminal_sibling_is_still_ambiguous_but_named_as_removable(monkeypatch):
     """A merged/rejected/review-stuck proposal directory left behind by a
-    re-intake must not count toward the ambiguity check — `scan()` already
-    excludes TERMINAL_STATUSES refs from its own candidate set, and
-    `_handle_directive` must agree, or an issue with exactly one live
-    proposal gets permanently stuck replying "ambiguous" because of a dead
-    sibling directory (claude P2 on #421)."""
+    re-intake must STILL count toward the ambiguity check here, even though
+    `scan()` excludes TERMINAL_STATUSES refs from its own candidate set —
+    the actual dispatch target, `run_issue_investigator.resolve_slug` via
+    `existing_slugs`, is purely directory-name based and status-agnostic, so
+    it raises `ProposalAmbiguityError` on two `issue-N-*` directories
+    regardless of status. An earlier round of this fix filtered `matches`
+    here to disagree with that check, which made the poller ack a dispatch
+    that the investigator then refused, permanently, with nothing posted
+    back to the issue (claude P2 on head `6c1aea8`). The fix instead makes
+    `_reply_ambiguous` name the stale directory so a human knows to delete
+    it."""
     live = _ref(slug="issue-9-fix")
     dead = _ref(slug="issue-9-fix-old", status="merged")
     outcome, replies = _handle(_directive(), live, [live, dead], monkeypatch)
-    assert outcome != "ambiguous"
-    assert replies == [] or "more than one proposal" not in replies[0].lower()
+    assert outcome == "ambiguous"
+    assert "issue-9-fix-old" in replies[0]
+    assert "merged" in replies[0]
+    assert "removed from gitops" in replies[0] or "removed" in replies[0].lower()
 
 
 def test_non_overwritable_status_is_named_in_the_reply(monkeypatch):

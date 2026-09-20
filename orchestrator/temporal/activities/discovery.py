@@ -297,18 +297,24 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
             continue
 
         acked = acked_comment_ids(comments)
-        # Compare against whichever sibling ref was updated most recently:
-        # the one least likely to falsely call a directive stale when the
-        # ref that actually incorporated it is a different sibling than the
-        # one iteration happened to reach first.
-        representative = max(
+        # Compare against whichever sibling ref was updated LEAST recently,
+        # not most: this sweep is a belt-and-braces report for what the
+        # poller's own scan might have missed (mctl-agents#417's reconcile
+        # report), so a false negative (silently suppressing a directive
+        # that is genuinely still unaddressed) is the expensive failure
+        # direction, not a false positive (reporting one that some sibling
+        # already handled). Picking the most-recently-updated sibling would
+        # suppress a directive as soon as ANY sibling had been touched since
+        # it was posted, even if the sibling that actually needs to act on
+        # it has not been (claude P3 on head `6c1aea8`).
+        representative = min(
             issue_refs,
             key=lambda r: _parse_timestamp(r.updated_at) or datetime.min.replace(tzinfo=UTC),
         )
+        ref_updated_at = _parse_timestamp(representative.updated_at)
         for directive in parse_comments(comments):
             if not directive.comment_id or directive.comment_id in acked:
                 continue
-            ref_updated_at = _parse_timestamp(representative.updated_at)
             directive_created_at = _parse_timestamp(directive.created_at)
             if ref_updated_at and directive_created_at and directive_created_at <= ref_updated_at:
                 continue
