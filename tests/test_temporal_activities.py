@@ -1987,6 +1987,11 @@ class TestReconcileReadsGitHub:
         result = await env.run(discover_and_project, "")
 
         assert [d.comment_id for d in result.stale_directives] == ["c1"]
+        # Suppression compares against the oldest sibling (`sha-early`), but
+        # attribution names the newest one (`sha-late`) — the one likeliest
+        # to still be the live proposal in the re-published-proposal shape
+        # this grouping exists for (claude P3 on head `f7a42ab`).
+        assert result.stale_directives[0].slug == "issue-9-fix-old"
 
     async def test_stale_directive_scan_honours_the_feature_kill_switch(
         self, env, monkeypatch

@@ -254,7 +254,14 @@ def test_a_terminal_sibling_is_still_ambiguous_but_named_as_removable(monkeypatc
     assert outcome == "ambiguous"
     assert "issue-9-fix-old" in replies[0]
     assert "merged" in replies[0]
-    assert "removed from gitops" in replies[0] or "removed" in replies[0].lower()
+    assert "removed from gitops" in replies[0]
+    # Not just naming the stale directory — this reply is acked (never
+    # retried), so it must also tell the operator that removing the
+    # directory alone will not resurrect this exact comment (claude P2 on
+    # head `f7a42ab`: a previous wording promised a fix the requester could
+    # not actually trigger by fixing the state).
+    assert "will not be retried" in replies[0]
+    assert "@MCTL reinvestigate" in replies[0]
 
 
 def test_non_overwritable_status_is_named_in_the_reply(monkeypatch):

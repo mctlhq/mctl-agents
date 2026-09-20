@@ -28,6 +28,16 @@ proposal directory, an ambiguous one, a non-overwritable status — is a
 reply, never a silence. Only the recognised, authorized, unambiguous,
 overwritable case submits anything.
 
+One deliberate exception: an issue whose ONLY proposal directory is
+terminal (`TERMINAL_STATUSES` — merged/rejected/review-stuck) never reaches
+`_handle_directive` at all — `scan()`'s own `candidates` filter excludes it
+from `all_refs` before the per-issue grouping even runs, and the
+`_stale_directives` sweep in `orchestrator.temporal.activities.discovery`
+applies the identical filter, so the belt-and-braces report is blind to it
+too. This is a scope decision, not an oversight: a directive on a fully
+closed-out issue has nothing left to reopen through this path (claude P3 on
+head `f7a42ab`).
+
 This module never starts or signals a DevLoopWorkflow, and never touches
 the `agents:intake` label: the comment path and the label path are
 independent by construction (see tests/test_run_issue_directive_poller.py's
@@ -337,9 +347,17 @@ def _reply_ambiguous(author: str, comment_id: str, matches: list[ProposalStateRe
     if stale:
         stale_statuses = ", ".join(sorted({m.status for m in matches if m.status in TERMINAL_STATUSES}))
         verb = "is" if len(stale) == 1 else "are"
+        # This whole reply goes through `_with_ack` below, so it is
+        # permanently acked — `scan()` never reads this comment again on a
+        # later tick. Telling the operator to remove the stale directory
+        # without also telling them the fix will not retry itself would
+        # promise an outcome they cannot actually trigger by fixing the
+        # state alone (claude P2 on head `f7a42ab`).
         stale_note = (
             f" {', '.join(stale)} {verb} already terminal ({stale_statuses}) and can "
-            "likely be removed from gitops to resolve this."
+            "likely be removed from gitops to resolve this. This comment is already "
+            "answered and will not be retried — comment `@MCTL reinvestigate` again "
+            "afterwards."
         )
     return _with_ack(
         f"@{author} this issue has more than one proposal directory ({names}) — "

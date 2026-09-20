@@ -307,11 +307,20 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
         # suppress a directive as soon as ANY sibling had been touched since
         # it was posted, even if the sibling that actually needs to act on
         # it has not been (claude P3 on head `6c1aea8`).
-        representative = min(
-            issue_refs,
-            key=lambda r: _parse_timestamp(r.updated_at) or datetime.min.replace(tzinfo=UTC),
-        )
-        ref_updated_at = _parse_timestamp(representative.updated_at)
+        def _updated_at_key(r: ProposalStateRef) -> datetime:
+            return _parse_timestamp(r.updated_at) or datetime.min.replace(tzinfo=UTC)
+
+        oldest_ref = min(issue_refs, key=_updated_at_key)
+        ref_updated_at = _parse_timestamp(oldest_ref.updated_at)
+        # Attribution is a SEPARATE question from suppression (claude P3 on
+        # head `f7a42ab`): the least-recently-updated sibling is the right
+        # one to compare the directive's timestamp against (see above), but
+        # in the re-published-proposal shape this grouping exists for, it is
+        # also the dead directory — reporting a `StaleDirective` naming it
+        # points an operator at the wrong slug to act on. Attribute to the
+        # most-recently-updated sibling instead: the one likeliest to still
+        # be live.
+        newest_ref = max(issue_refs, key=_updated_at_key)
         for directive in parse_comments(comments):
             if not directive.comment_id or directive.comment_id in acked:
                 continue
@@ -320,8 +329,8 @@ async def _stale_directives(refs: list[ProposalStateRef]) -> list[StaleDirective
                 continue
             stale.append(
                 StaleDirective(
-                    service=representative.service,
-                    slug=representative.slug,
+                    service=newest_ref.service,
+                    slug=newest_ref.slug,
                     issue_url=issue_url,
                     comment_id=directive.comment_id,
                     author=directive.author,
