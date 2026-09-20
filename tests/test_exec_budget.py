@@ -398,15 +398,25 @@ def test_executed_payload_recursion_does_not_reintroduce_false_positives(command
     assert exec_budget.detachment_match(command) is None
 
 
-def test_payload_recursion_is_depth_bounded():
-    """A pathological nest must cost bounded work, not unbounded."""
-    nested = "cmd &"
-    for _ in range(exec_budget.MAX_PAYLOAD_DEPTH + 3):
-        nested = f"bash -c {nested!r}"
-    # Either it is caught within the cap or it is not; what must not happen is
-    # recursion without a limit.
-    exec_budget.detachment_match(nested)
-    assert exec_budget.MAX_PAYLOAD_DEPTH >= 1
+def test_payload_recursion_stops_at_the_depth_cap():
+    """The cap is a documented limit, so pin it in both directions.
+
+    The old version asserted only `MAX_PAYLOAD_DEPTH >= 1` -- two constants
+    compared -- so deleting the guard left it green (claude P3 on
+    `8465c6e`). The guard is driven through `_depth` directly because it
+    cannot be reached by nesting a real command: `shlex` stops lexing the
+    escaped quotes of a third `bash -c` layer before the cap is hit, and
+    substitution nesting leaves the `&` visible to the top-level scan, so
+    neither construction ever recurses that far.
+    """
+    # Quoted, so the level's OWN scan cannot see the `&` -- only a recursion
+    # into the payload finds it, which is what the cap governs.
+    nested = "bash -c 'cmd &'"
+    assert (
+        exec_budget.detachment_match(nested, exec_budget.MAX_PAYLOAD_DEPTH - 1)
+        is not None
+    )
+    assert exec_budget.detachment_match(nested, exec_budget.MAX_PAYLOAD_DEPTH) is None
 
 
 # ---------------------------------------------------------------------------
@@ -478,3 +488,41 @@ def test_arithmetic_expansion_is_not_a_detachment(command):
 def test_a_command_substitution_nested_in_arithmetic_is_still_caught():
     """Blanking arithmetic must not hide a substitution that DOES run."""
     assert exec_budget.detachment_match("echo $(( $(worker &) + 1 ))") is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # bash runs BOTH commands here: `$((` falls back to command
+        # substitution when the inner paren does not close against a `)`.
+        "echo $((a) && (b &))",
+        "echo $((worker &) )",
+        # A subshell closes the background the same way a line end does.
+        "( go test ./... & )",
+    ],
+)
+def test_a_substitution_spelled_like_arithmetic_is_still_a_detachment(command):
+    """Blanking every `$((` unconditionally hid a payload that executes.
+
+    Verified against bash 5: `echo $((echo x) && (echo y))` prints `x y`,
+    so the span is a command substitution, not arithmetic (claude P3 on
+    `8465c6e`).
+    """
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `-ec` here is the SCRIPT's argv, not a shell flag.
+        'bash deploy.sh -ec "restart A & B"',
+        'sh run.sh -c "A & B"',
+    ],
+)
+def test_a_flag_after_the_shells_operand_is_not_a_shell_flag(command):
+    assert exec_budget.detachment_match(command) is None
+
+
+def test_an_attached_c_value_is_still_a_payload():
+    """`bash -c'cmd &'` lexes as one token, `-ccmd &`."""
+    assert exec_budget.detachment_match("bash -c'go test ./... &'") is not None

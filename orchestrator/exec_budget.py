@@ -154,7 +154,10 @@ def command_budget(
 # never the raw string: `git commit -m "A & B"` and `echo 'nohup'` carry these
 # characters as DATA, and denying them was a false positive that blocked
 # ordinary work (claude P2 on `630ac27`).
-_TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>])&(?!&)(?=\s|$)")
+# `)` closes a subshell, so `( worker & )` backgrounds exactly as a trailing
+# `&` does -- and after arithmetic stopped being blanked wholesale, that is
+# the spelling `$((worker &) )` reaches the scanner with.
+_TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>])&(?!&)(?=[\s)]|$)")
 _NOHUP_RE = re.compile(r"\bnohup\b", re.IGNORECASE)
 _SETSID_RE = re.compile(r"\bsetsid\b", re.IGNORECASE)
 _DISOWN_RE = re.compile(r"\bdisown\b", re.IGNORECASE)
@@ -302,7 +305,14 @@ def _arithmetic_spans(visible: str) -> list[tuple[int, int]]:
         opened = _ARITHMETIC_OPEN_RE.search(visible, position)
         if opened is None:
             return spans
-        depth = 2
+        # Count from the INNER paren and require the char that closes it to
+        # be immediately followed by `)`. That is what tells arithmetic apart
+        # from a command substitution whose first word is a subshell: bash
+        # runs both commands in `echo $((echo x) && (echo y))`, so the span
+        # `$((a) && (b &))` is NOT arithmetic and its `&` is a real
+        # background operator (claude P3 on `8465c6e`, confirmed against
+        # bash 5). `$((cmd &) )` fails the same test and stays a payload.
+        depth = 1
         index = opened.end()
         while index < len(visible) and depth:
             if visible[index] == "(":
@@ -310,10 +320,11 @@ def _arithmetic_spans(visible: str) -> list[tuple[int, int]]:
             elif visible[index] == ")":
                 depth -= 1
             index += 1
-        if depth:
-            return spans
-        spans.append((opened.start(), index))
-        position = index
+        if depth or index >= len(visible) or visible[index] != ")":
+            position = opened.end()
+            continue
+        spans.append((opened.start(), index + 1))
+        position = index + 1
 
 
 def _blank_arithmetic(visible: str) -> str:
@@ -384,6 +395,31 @@ def _segments(command: str) -> list[str]:
     return [command[lo:hi].strip() for lo, hi in bounds]
 
 
+def _attached_c_payload(word: str, *, has_next_word: bool) -> str | None:
+    """The payload of a `-c` whose value is ATTACHED, else None.
+
+    `bash -c'cmd &'` survives `shlex.split` as one token, `-ccmd &`. The
+    cluster is scanned letter by letter; the first `c` owns whatever is
+    left after it.
+
+    A remainder that is itself pure alphabetic is ambiguous with a flag
+    cluster (`-cl` is `-c -l`, not `-c l`), so it is read as a cluster
+    whenever a following word exists to be the payload -- and as an
+    attached value when there is none, since then it is the only candidate.
+    """
+    for offset, letter in enumerate(word[1:], start=1):
+        if not letter.isalpha():
+            return None
+        if letter == "c":
+            remainder = word[offset + 1:]
+            if not remainder:
+                return None
+            if remainder.isalpha() and has_next_word:
+                return None
+            return remainder
+    return None
+
+
 def _shell_c_payloads(command: str) -> list[str]:
     """The argument of a `-c` flag passed to a SHELL, if any.
 
@@ -412,8 +448,24 @@ def _shell_c_payloads(command: str) -> list[str]:
             continue
         if words[index].split("/")[-1] not in SHELL_COMMAND_WORDS:
             continue
-        for position in range(index + 1, len(words) - 1):
-            if _SHELL_C_FLAG_RE.match(words[position]):
+        for position in range(index + 1, len(words)):
+            word = words[position]
+            if not word.startswith("-") or word == "-":
+                # The shell's first OPERAND. Everything after it is the
+                # script's own argv, where `-ec` is just a string:
+                # `bash deploy.sh -ec "restart A & B"` runs no payload
+                # (claude P3 on `8465c6e`).
+                break
+            if word in ("--", "-s"):
+                break
+            attached = _attached_c_payload(
+                word, has_next_word=position + 1 < len(words)
+            )
+            if attached is not None:
+                # `bash -c'cmd &'` lexes as the single token `-ccmd &`.
+                found.append(attached)
+                break
+            if _SHELL_C_FLAG_RE.match(word) and position + 1 < len(words):
                 found.append(words[position + 1])
                 break
     return found

@@ -215,10 +215,17 @@ Three rules keep that rewrite from being worse than the defect it closes:
   CLUSTER containing `c`, not as the lone token `-c`: `bash -lc`, `sh -ec`
   and `bash -cl` all take the next word as the command, and once the
   segment's command word is already known to be a shell that looser test
-  cannot reopen the `git -c` false positive. Arithmetic expansion is NOT a
-  command substitution — `$((a & b))` is a bitwise AND on numbers, so the
-  whole `$((...))` span reads as data; a `$(...)` nested inside it still
-  executes and is still scanned.
+  cannot reopen the `git -c` false positive. The scan stops at the shell's
+  first OPERAND — after `bash deploy.sh` the word `-ec` is the script's own
+  argv — and reads an ATTACHED value (`bash -c'cmd &'`, one token after
+  lexing) as the payload. Arithmetic expansion is NOT a command
+  substitution: `$((a & b))` is a bitwise AND on numbers, so the span reads
+  as data — but ONLY when the inner paren closes against a `)`. Bash falls
+  back to command substitution otherwise, and runs both commands in
+  `echo $((echo x) && (echo y))`, so `$((cmd &) )` stays a payload. A
+  `$(...)` nested inside real arithmetic still executes and is still
+  scanned. A `&` before `)` closes a subshell exactly as one before
+  whitespace ends a line, so `( worker & )` is a detachment too.
 - **Shell state survives, but only where it cannot cost time.** A command
   built only from `SHELL_STATE_BUILTINS` (`cd`, `export`, `set`, …) is
   admitted UNWRAPPED, because the Bash tool carries that state — notably the
@@ -297,6 +304,17 @@ therefore gets its own `BatchOutcome` bucket, excluded from `failed` on the
 same grounds as `stale_source`. A hand-back whose compare-and-swap DECLINED
 wrote nothing and is still counted as a failure: there is no commit to
 protect, and another attempt owns the proposal.
+
+The cap's own terminal write is in that bucket too, and for a stronger
+reason. A dropped hand-back is recovered by the next green tick; a dropped
+terminal write is not recoverable at all — the proposal stays `accepted`
+with the old tally, so every later tick re-clones, re-runs a full paid pass
+and re-enters the same branch. A red tick there would turn an unbounded
+green retry loop into an unbounded red one at identical model cost. The
+terminal write also CLEARS `budget_handbacks`, because the documented way
+out of `needs-triage` is an operator moving the proposal back to `accepted`
+— a deliberate decision to try again, which must start from a full budget
+rather than go terminal on its first exhausted run.
 
 The ledger also OUTRANKS the refusal marker when the two disagree by
 omission. An agent that stops because it ran out of budget but writes a

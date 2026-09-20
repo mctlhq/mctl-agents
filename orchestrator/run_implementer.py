@@ -673,6 +673,14 @@ class ImplementResult:
     # advance and the paid retry loop it bounds stays unbounded (claude P2
     # on `4449024`).
     budget_handback: bool = False
+    # True only when the cap's terminal `needs-triage` write actually landed
+    # on THIS tick. Bucketed with the hand-back rather than with `failed` for
+    # the same reason: that write is what ENDS the loop, and a red tick can
+    # cost it the gitops commit. Unlike the hand-back there is no catch-up --
+    # every later tick re-enters the same branch and loses the same write --
+    # so a red tick here turns an unbounded green retry loop into an
+    # unbounded red one at identical model cost (claude P2 on `8465c6e`).
+    budget_terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -688,10 +696,11 @@ class BatchOutcome:
     # proposal on the same tick is not reported red for a refusal that
     # worked exactly as designed -- see the exit-code comment in `main()`.
     stale_source: int = 0
-    # Budget hand-backs (mctl-agents#430). Counted separately from `failed`
-    # for the same reason as `stale_source`: the arm's whole purpose is a
-    # durable `.status.yaml` write, which a non-zero exit can cost us.
-    budget_handback: int = 0
+    # Verification-budget outcomes (mctl-agents#430): a hand-back, or the
+    # cap's terminal write. Counted separately from `failed` for the same
+    # reason as `stale_source` -- each arm's whole purpose is a durable
+    # `.status.yaml` write, which a non-zero exit can cost us.
+    verification_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -2991,6 +3000,7 @@ def _mark_needs_triage(
     pr_url: str | None = None,
     attempt: dict[str, Any] | None = None,
     claim_context: _ClaimContext | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> bool:
     """Record a terminal failure on the proposal. True when it was written.
 
@@ -3005,6 +3015,8 @@ def _mark_needs_triage(
         },
         "notes": f"{stage}: {message[:500]}",
     }
+    if extra_fields:
+        fields.update(extra_fields)
     if pr_url:
         fields["pr"] = pr_url
     if attempt:
@@ -3507,11 +3519,21 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                         message=exhausted_msg,
                         attempt=attempt,
                         claim_context=claim_ctx,
+                        # The operator gate out of `needs-triage` is a
+                        # deliberate human decision to try again, so it must
+                        # start from a clean budget. `_mark_needs_triage`
+                        # preserves unrelated fields, so without this the next
+                        # run to exhaust its budget would go terminal at once
+                        # with zero hand-backs, printing "consecutive
+                        # attempts" on what is really the first (claude P3 on
+                        # `8465c6e`).
+                        extra_fields={"budget_handbacks": None},
                     )
                     return ImplementResult(
                         ref=ref,
                         pr_url=None,
                         error=_triage_error(exhausted_msg, recorded),
+                        budget_terminal=recorded,
                         budget_ledger=budget_ledger,
                     )
                 message = (
@@ -3811,7 +3833,7 @@ def _implement_refs(
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     """Classify every result; partial success must never mask a failure.
 
-    Order matters: stale_source -> budget_handback -> error -> blocked ->
+    Order matters: stale_source -> verification budget -> error -> blocked ->
     skipped_reason -> pr_url. A stale-source refusal also carries `error` (for readers of
     that older channel, and for the per-result "fail" summary line), so it
     must be classified before the `error` branch or a healthy admission
@@ -3822,12 +3844,12 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     `skipped_reason` branch or it would inflate the skip count.
     """
     succeeded = failed = skipped = blocked = stale_source = 0
-    budget_handback = 0
+    verification_budget = 0
     for result in results:
         if result.stale_source:
             stale_source += 1
-        elif result.budget_handback:
-            budget_handback += 1
+        elif result.budget_handback or result.budget_terminal:
+            verification_budget += 1
         elif result.error:
             failed += 1
         elif result.blocked:
@@ -3844,7 +3866,7 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
         skipped=skipped,
         blocked=blocked,
         stale_source=stale_source,
-        budget_handback=budget_handback,
+        verification_budget=verification_budget,
     )
 
 
@@ -4092,7 +4114,7 @@ def main() -> None:
         for result, (stale_code, issue_ref) in stale_sources:
             print(f"  {result.ref.service}/{result.ref.slug}: {stale_code} {issue_ref}")
 
-    handbacks = [r for r in results if r.budget_handback]
+    handbacks = [r for r in results if r.budget_handback or r.budget_terminal]
     if handbacks:
         print("\n=== Verification budget ===")
         for result in handbacks:
@@ -4106,7 +4128,7 @@ def main() -> None:
         f"{outcome.skipped} skipped, "
         f"{outcome.blocked} blocked, "
         f"{outcome.stale_source} stale source, "
-        f"{outcome.budget_handback} budget hand-back"
+        f"{outcome.verification_budget} verification budget"
     )
     if outcome.failed:
         sys.exit(1)
@@ -4125,13 +4147,17 @@ def main() -> None:
     # plus the committed `.status.yaml` already carry the signal for
     # operators, the same tradeoff already made for a mixed batch above.
     # `outcome.stale_source` is deliberately excluded from `outcome.failed`
-    # above for the same reason. `outcome.budget_handback` is excluded on
+    # above for the same reason. `outcome.verification_budget` is excluded on
     # exactly the same grounds (mctl-agents#430): that arm hands the proposal
     # back to `accepted` with an incremented `budget_handbacks`, and that
     # tally is the ONLY durable bound on the paid retry loop. If a non-zero
     # exit here marked `implement` Failed and skipped the commit step, every
     # tick would read `0` and the cap would never be reached -- reintroducing
-    # precisely the unbounded loop the cap was added to close.
+    # precisely the unbounded loop the cap was added to close. The cap's own
+    # terminal write is bucketed there too: it is the write that ENDS the
+    # loop, and it has no catch-up path -- a dropped hand-back is recovered by
+    # the next green tick, a dropped terminal write is re-attempted and
+    # re-dropped forever, at full model cost every time.
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also

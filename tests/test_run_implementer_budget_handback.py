@@ -272,7 +272,7 @@ def test_the_hand_back_does_not_turn_the_tick_red(monkeypatch, tmp_path: Path) -
 
     assert result.budget_handback is True
     outcome = run_implementer._batch_outcome([result])
-    assert outcome.budget_handback == 1
+    assert outcome.verification_budget == 1
     assert outcome.failed == 0, "a hand-back must not force the batch red"
 
 
@@ -292,3 +292,58 @@ def test_a_declined_hand_back_is_still_a_failure(monkeypatch, tmp_path: Path) ->
 
     assert result.budget_handback is False
     assert run_implementer._batch_outcome([result]).failed == 1
+
+
+def _at_the_cap(monkeypatch, tmp_path: Path):
+    ref = _make_ref(tmp_path)
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    status["budget_handbacks"] = run_implementer.IMPLEMENT_MAX_BUDGET_HANDBACKS - 1
+    ref.status_path.write_text(yaml.safe_dump(status), encoding="utf-8")
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+    return ref
+
+
+def test_the_terminal_write_at_the_cap_does_not_turn_the_tick_red(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The write that ENDS the loop is the one that must not be lost.
+
+    Making only the hand-back green left this arm exiting 1, and a non-zero
+    exit can skip the downstream gitops commit. Unlike the hand-back there
+    is no catch-up: the proposal stays `accepted` with the old tally, the
+    next tick re-clones, re-runs a full paid pass, re-enters this branch and
+    loses the same write -- an unbounded RED loop at identical model cost
+    (claude P2 on `8465c6e`).
+    """
+    ref = _at_the_cap(monkeypatch, tmp_path)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    assert _read(ref)["status"] == "needs-triage"
+    assert result.budget_terminal is True
+    outcome = run_implementer._batch_outcome([result])
+    assert outcome.verification_budget == 1
+    assert outcome.failed == 0
+
+
+def test_the_terminal_write_clears_the_tally_for_the_operator_gate(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """`needs-triage` is left only by a human moving it back to `accepted`.
+
+    `_mark_needs_triage` preserves unrelated fields, so a surviving tally
+    would send that deliberate retry terminal on its first exhausted run
+    (claude P3 on `8465c6e`).
+    """
+    ref = _at_the_cap(monkeypatch, tmp_path)
+
+    run_implementer.implement_one(ref, dry_run=False)
+
+    after = _read(ref)
+    assert after["failure"]["code"] == "verification-budget-exhausted"
+    assert not after.get("budget_handbacks"), "the operator gate must reset the budget"
