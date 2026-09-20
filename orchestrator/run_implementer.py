@@ -116,6 +116,7 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
@@ -254,6 +255,17 @@ EXIT_CLAIM_REFUSED = 49
 # MAX_HARNESS_FAILURES an orphaned sub-agent is (see
 # run_shepherd._followup_code_sets).
 EXIT_CI_EVIDENCE_INSUFFICIENT = 50
+# The run ended with the per-command execution budget exhausted: every
+# agent-issued Bash command is bounded to what remains of the run's envelope
+# (mctl-agents#430, `orchestrator/exec_budget.py`'s deadline guard), and this
+# run ran out of budget for another command before it could commit or refuse
+# on the merits. Distinct from EXIT_ORPHANED_SUBAGENT (46): 46 means our own
+# handoff lost a live child; 51 means the run stayed inside its envelope the
+# whole time and the STRUCTURED ledger (never model prose) says so -- the
+# same "no live agent-launched child process survives" guarantee, reached
+# deliberately instead of by a hard cancellation. Joins the shepherd's
+# harness set: blameless, bounded by the same MAX_HARNESS_FAILURES.
+EXIT_VERIFICATION_BUDGET_EXHAUSTED = 51
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -274,6 +286,11 @@ CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
 # Prefix mapped to EXIT_CI_EVIDENCE_INSUFFICIENT. Same style, used when the
 # refusal marker carries `"insufficient_evidence": true` (mctl-agents#423).
 CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX = "ci-evidence-insufficient:"
+# Prefix mapped to EXIT_VERIFICATION_BUDGET_EXHAUSTED (mctl-agents#430). Used
+# both when the ORCHESTRATOR-derived ledger reports `exhausted` with no
+# commit and no other refusal, and when the agent's own marker carries
+# `"verification_budget_exhausted": true`.
+VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX = "verification-budget-exhausted:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -301,10 +318,18 @@ class RefusalMarker:
     reached a merits decision at all). Both share the same marker shape and
     the same validation; only the mapped exit code, and therefore the
     shepherd's charging behaviour, differs.
+
+    `verification_budget_exhausted` (mctl-agents#430) is the third form: the
+    agent decided, on its own, that the remaining per-command execution
+    budget could not fit another verification step and recorded that
+    deliberately rather than being cut off by the deadline guard's own
+    denial. Maps to the same EXIT_VERIFICATION_BUDGET_EXHAUSTED the
+    ORCHESTRATOR-derived ledger produces when it observes the same fact.
     """
 
     reason: str
     insufficient_evidence: bool = False
+    verification_budget_exhausted: bool = False
 
 
 def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
@@ -438,6 +463,7 @@ def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
     return RefusalMarker(
         reason=" ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS],
         insufficient_evidence=data.get("insufficient_evidence") is True,
+        verification_budget_exhausted=data.get("verification_budget_exhausted") is True,
     )
 
 
@@ -459,6 +485,34 @@ def _write_refusal_out(path: Path, reason: str) -> None:
         # an escape would replace a correctly-classified refusal with an
         # uncaught traceback and exit 1 — the counter-less transient arm. The
         # reason is advisory; the exit code is what matters.
+        print(
+            f"warn: could not write refusal reason to {path} "
+            f"({type(e).__name__}: {e}); the exit code still carries the decision",
+            file=sys.stderr,
+        )
+
+
+def _write_verification_budget_exhausted_out(
+    path: Path, reason: str, ledger: CommandBudgetLedger | None,
+) -> None:
+    """Hand the ORCHESTRATOR-derived ledger summary to the shepherd as JSON
+    (mctl-agents#430) — the structured evidence `EXIT_VERIFICATION_BUDGET_
+    EXHAUSTED` exists to provide, not model prose. `reason` overrides the
+    ledger's own `describe()` text: for the marker-derived path it is the
+    agent's own (capped) explanation, which is more useful to an operator
+    than the orchestrator's clamp/deny counters alone; those counters still
+    ride along from `ledger.as_dict()` when a ledger is available.
+
+    Best-effort, same as `_write_refusal_out`: the exit code alone already
+    carries the decision that matters.
+    """
+    payload: dict[str, Any] = ledger.as_dict() if ledger is not None else {}
+    payload["reason"] = reason
+    payload["refused"] = True
+    payload["verification_budget_exhausted"] = True
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — advisory write; see _write_refusal_out
         print(
             f"warn: could not write refusal reason to {path} "
             f"({type(e).__name__}: {e}); the exit code still carries the decision",
@@ -516,6 +570,15 @@ def _review_feedback_exit_code(error: str) -> int:
         counter, bounded by MAX_HARNESS_FAILURES) rather than charging it to
         `refusals`.
 
+      - 51: the run ended with the per-command execution budget exhausted
+        (mctl-agents#430) — every agent-issued Bash command is bounded to
+        what remains of the run's envelope, and either the orchestrator's
+        own ledger observed that budget run out with no commit produced, or
+        the agent recorded the same fact itself via the refusal marker's
+        `verification_budget_exhausted` flag. Blameless the same way 46 and
+        50 are: the run stayed inside its envelope and said so structurally,
+        rather than being cut off by the outer bound.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -539,6 +602,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_CLAIM_REFUSED
     if error.startswith(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):
         return EXIT_CI_EVIDENCE_INSUFFICIENT
+    if error.startswith(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):
+        return EXIT_VERIFICATION_BUDGET_EXHAUSTED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -594,6 +659,28 @@ class ImplementResult:
     # Distinct from `blocked` -- this is a `needs-triage` write (the
     # proposal leaves the accepted queue), not a durable `accepted` park.
     stale_source: tuple[str, str] | None = None
+    # Set only on the EXIT_VERIFICATION_BUDGET_EXHAUSTED path (mctl-agents#430):
+    # the ledger `_run_implementer_agent`'s deadline guard populated, carried
+    # here so `main()` can write its structured counts (not just `error`'s
+    # reason text) to `--refusal-out`. `None` on every other path.
+    budget_ledger: CommandBudgetLedger | None = None
+    # True only on `implement_one`'s budget hand-back arm (mctl-agents#430):
+    # the proposal was handed back to `accepted` with an incremented
+    # `budget_handbacks` tally. Classified ahead of `error` by
+    # `_batch_outcome` so the tick exits 0 and the downstream gitops commit
+    # that makes the tally durable is never skipped -- the same reason
+    # `stale_source` is excluded from `failed`. Without it the cap can never
+    # advance and the paid retry loop it bounds stays unbounded (claude P2
+    # on `4449024`).
+    budget_handback: bool = False
+    # True only when the cap's terminal `needs-triage` write actually landed
+    # on THIS tick. Bucketed with the hand-back rather than with `failed` for
+    # the same reason: that write is what ENDS the loop, and a red tick can
+    # cost it the gitops commit. Unlike the hand-back there is no catch-up --
+    # every later tick re-enters the same branch and loses the same write --
+    # so a red tick here turns an unbounded green retry loop into an
+    # unbounded red one at identical model cost (claude P2 on `8465c6e`).
+    budget_terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -609,6 +696,11 @@ class BatchOutcome:
     # proposal on the same tick is not reported red for a refusal that
     # worked exactly as designed -- see the exit-code comment in `main()`.
     stale_source: int = 0
+    # Verification-budget outcomes (mctl-agents#430): a hand-back, or the
+    # cap's terminal write. Counted separately from `failed` for the same
+    # reason as `stale_source` -- each arm's whole purpose is a durable
+    # `.status.yaml` write, which a non-zero exit can cost us.
+    verification_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -1168,15 +1260,41 @@ def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> b
     return False
 
 
-def _hand_back_if_still_ours(ref: ProposalRef, attempt_id: str) -> bool:
+def _hand_back_if_still_ours(
+    ref: ProposalRef, attempt_id: str, *, budget_handbacks: int | None = None
+) -> bool:
     """Restore `accepted` only while `.status.yaml` still names our attempt.
 
-    Returns True when the hand-back was written.
+    Returns True when the hand-back was written. ``budget_handbacks``
+    (mctl-agents#430) records how many times THIS proposal has been handed
+    back for an exhausted verification budget, so the retry it enables stays
+    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`.
     """
     if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
         return False
-    update_status_yaml(ref, "accepted", attempt=None, failure=None)
+    fields: dict[str, Any] = {"attempt": None, "failure": None}
+    if budget_handbacks is not None:
+        fields["budget_handbacks"] = budget_handbacks
+    update_status_yaml(ref, "accepted", **fields)
     return True
+
+
+# The consecutive budget-exhausted attempt at which an implement run stops
+# being handed back and becomes terminal. Read it exactly as
+# `run_shepherd.MAX_HARNESS_FAILURES`, which it mirrors down to the
+# comparison (`new >= MAX`): the Nth occurrence is the one that stops the
+# loop, so N-1 hand-backs actually happen. Deliberately the same shape rather
+# than the more obvious "N hand-backs allowed" -- two sibling caps that read
+# alike but count differently is a worse trap than one slightly terse rule
+# (agy P2 on `61595a0` read it the other way, which is the evidence that the
+# wording, not the comparison, was what needed fixing).
+#
+# A cap is needed at all because the implement driver has no
+# `review_attempts`/`harness_failures` budget of its own -- the sibling
+# `except ImplementerOrphanedSubagent` arm stays terminal for exactly that
+# reason -- so an unconditional hand-back would trade a wrong terminal state
+# for an unbounded PAID retry loop (claude P2 on `624a433`).
+IMPLEMENT_MAX_BUDGET_HANDBACKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -1638,6 +1756,16 @@ Ground rules:
   turn. A slow build or test is fine — wait for it inline. Do NOT end your
   turn saying you will "keep working" or "report back once it's done":
   ending the turn ends the run, and anything not committed by then is lost.
+- Every command you run is bounded automatically to what remains of this
+  run's execution budget — you do not choose the bound and cannot widen it.
+  Backgrounding (a trailing `&`), `nohup`, `setsid`, `disown`, and starting a
+  background process to poll it in a loop are BLOCKED outright, not merely
+  discouraged: the tool call is denied. If the remaining budget cannot fit
+  another command, you will be told so; at that point, commit what is
+  already proven correct and say so in your final message, or — if nothing
+  is safe to commit — write the refusal marker with
+  `{{"refused": true, "verification_budget_exhausted": true, "reason":
+  "<what you could not verify>"}}`.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -1676,6 +1804,13 @@ Ground rules:
   turn. A slow build or test is fine — wait for it inline. Do NOT end your
   turn saying you will "keep working" or "report back once it's done":
   ending the turn ends the run, and anything not committed by then is lost.
+- Every command you run is bounded automatically to what remains of this
+  run's execution budget — you do not choose the bound and cannot widen it.
+  Backgrounding (a trailing `&`), `nohup`, `setsid`, `disown`, and starting a
+  background process to poll it in a loop are BLOCKED outright, not merely
+  discouraged: the tool call is denied. If the remaining budget cannot fit
+  another command, commit what is already proven correct and say so in your
+  final message.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -1901,6 +2036,7 @@ async def _run_implementer_agent(
     *,
     envelope_s: float | None = None,
     work_class: str = "review",
+    budget_ledger: CommandBudgetLedger | None = None,
 ) -> None:
     """Run the implementer's Claude Code turn under one outer wall-clock bound.
 
@@ -1913,11 +2049,38 @@ async def _run_implementer_agent(
     three positional args) resolves to `IMPLEMENTER_TIMEOUT_SECONDS` read at
     CALL time, not at function-definition time, so monkeypatching that module
     attribute still works exactly as it did before this parameter existed.
+
+    ``budget_ledger`` (mctl-agents#430): when supplied, every agent-issued
+    Bash command is bounded to what remains of THIS run's envelope via
+    `options._deadline_guard_hook` -- see `build_implementer_agent_options`.
+    The absolute deadline is computed HERE, immediately before
+    `anyio.fail_after(envelope_s)` below, on the SAME monotonic clock
+    (`anyio.current_time()`) that call uses, so the guard's remaining-budget
+    arithmetic and the outer bound agree on what "now" and "the deadline"
+    mean. ``budget_ledger=None`` (every caller and test that predates this
+    parameter) omits the guard entirely and reproduces today's behaviour
+    byte-for-byte -- see `build_implementer_agent_options`'s docstring.
     """
     if envelope_s is None:
         envelope_s = IMPLEMENTER_TIMEOUT_SECONDS
+    deadline_monotonic = anyio.current_time() + envelope_s
+    # One-shot probe, not per-command: `shutil.which` is cheap but there is no
+    # reason to pay it once per Bash call, and the fallback (skip wrapping,
+    # keep the tool-input clamp and the detachment denials) is a property of
+    # the whole run, not of any one command.
+    timeout_available = shutil.which("timeout") is not None
+    if not timeout_available:
+        print(
+            "warn: `timeout` binary not found on PATH; falling back to "
+            "tool-input clamping and detachment denials only -- commands are "
+            "no longer bounded at the OS level (mctl-agents#430)",
+            file=sys.stderr,
+        )
     options = build_implementer_agent_options(
-        repo_dir, SERVICE_AGENT_MODEL, proposal_dir, work_class=work_class
+        repo_dir, SERVICE_AGENT_MODEL, proposal_dir, work_class=work_class,
+        deadline_monotonic=deadline_monotonic,
+        budget_ledger=budget_ledger,
+        timeout_available=timeout_available,
     )
     mcp_configured = bool(options.mcp_servers)
     # A budget bounds spend but not a stalled network/model stream. Keep one
@@ -2205,13 +2368,20 @@ def review_feedback_one(
         # envelope is derived from the work class the bundle actually carries
         # (mctl-agents#423) -- a CI-remediation or mixed bundle gets a wider,
         # capped envelope than the review-only default, and its own guard
-        # hook (see build_implementer_agent_options).
+        # hook (see build_implementer_agent_options). `budget_ledger`
+        # (mctl-agents#430) is populated by the deadline guard as the run
+        # progresses -- created here, before the SDK call, so it is
+        # available below regardless of how the run ends.
         work_class = _bundle_work_class(bundle)
         n_checks = len(bundle.get("ci_failures") or [])
         envelope_s = implementer_envelope(work_class, n_checks=n_checks)
+        budget_ledger = CommandBudgetLedger()
         prompt = _build_prompt(ref, review_feedback=bundle, branch=branch, adopted=adopted)
         anyio.run(
-            functools.partial(_run_implementer_agent, envelope_s=envelope_s, work_class=work_class),
+            functools.partial(
+                _run_implementer_agent,
+                envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
+            ),
             target, prompt, ref.proposal_dir.resolve(),
         )
 
@@ -2222,6 +2392,18 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
+                if refusal.verification_budget_exhausted:
+                    # mctl-agents#430: the agent itself decided the remaining
+                    # command budget could not fit another verification step
+                    # -- the same outcome the ledger reports below, recorded
+                    # deliberately rather than observed by the guard's denial.
+                    release_reason = "no follow-up: verification budget exhausted"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {refusal.reason}",
+                        budget_ledger=budget_ledger,
+                    )
                 if refusal.insufficient_evidence:
                     # mctl-agents#423: the bounded CI-log evidence could not
                     # support a code decision -- distinct from an ordinary
@@ -2232,11 +2414,47 @@ def review_feedback_one(
                         pr_url=None,
                         error=f"{CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} {refusal.reason}",
                     )
+                if budget_ledger.exhausted:
+                    # The agent wrote a marker but left
+                    # `verification_budget_exhausted` unset, while the
+                    # ORCHESTRATOR's own ledger recorded the budget running
+                    # out. Falling through to the generic refusal would map
+                    # this to EXIT_DELIBERATE_NO_OP (47), which the shepherd
+                    # charges to `review_attempts` as a decision on the
+                    # merits -- charging the proposal for a fact about the
+                    # runner because a model omitted an optional boolean
+                    # (agy P2 on `624a433`). Structured orchestrator evidence
+                    # outranks model prose, which is the whole reason the
+                    # ledger exists; the agent's own reason still rides along.
+                    release_reason = "no follow-up: verification budget exhausted"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=(
+                            f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} "
+                            f"{refusal.reason} [{budget_ledger.describe()}]"
+                        ),
+                        budget_ledger=budget_ledger,
+                    )
                 release_reason = "no follow-up: refused"
                 return ImplementResult(
                     ref=ref,
                     pr_url=None,
                     error=f"{REFUSAL_ERROR_PREFIX} {refusal.reason}",
+                )
+            if budget_ledger.exhausted:
+                # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
+                # prose -- observed the command budget run out with nothing
+                # committed and no marker written. Distinct from a plain
+                # EXIT_NO_FOLLOWUP_COMMITS: re-running with a bigger reserve
+                # or a faster verification step may still make progress,
+                # whereas a plain no-commit is deterministic.
+                release_reason = "no follow-up: verification budget exhausted"
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {budget_ledger.describe()}",
+                    budget_ledger=budget_ledger,
                 )
             release_reason = "no follow-up commits"
             return ImplementResult(
@@ -2254,9 +2472,13 @@ def review_feedback_one(
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
+        # Print the ledger summary even on success (mctl-agents#430): commits
+        # present is EXIT_OK regardless of any clamping/truncation along the
+        # way, but that truncation must still be visible in the Argo log.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
         release_reason = "follow-up pushed"
+        print(f"info: command budget ledger: {budget_ledger.describe()}")
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
@@ -2778,6 +3000,7 @@ def _mark_needs_triage(
     pr_url: str | None = None,
     attempt: dict[str, Any] | None = None,
     claim_context: _ClaimContext | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> bool:
     """Record a terminal failure on the proposal. True when it was written.
 
@@ -2792,6 +3015,8 @@ def _mark_needs_triage(
         },
         "notes": f"{stage}: {message[:500]}",
     }
+    if extra_fields:
+        fields.update(extra_fields)
     if pr_url:
         fields["pr"] = pr_url
     if attempt:
@@ -3245,11 +3470,104 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         _stage_implementer_agent(target, ref.service)
 
         # 5. Run the SDK with PROPOSAL_DIR pointing at the gitops worktree.
+        # `budget_ledger` (mctl-agents#430): the same per-command deadline
+        # guard `review_feedback_one` wires in -- the boundary this proposal
+        # draws is generic over the driver, not review-remediation-only.
         prompt = _build_prompt(ref)
-        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
+        budget_ledger = CommandBudgetLedger()
+        anyio.run(
+            functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
+            target, prompt, ref.proposal_dir.resolve(),
+        )
+        print(f"info: command budget ledger: {budget_ledger.describe()}")
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
+            if budget_ledger.exhausted:
+                prior_handbacks = int(
+                    _load_status(ref.status_path).get("budget_handbacks", 0) or 0
+                )
+                # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
+                # prose -- observed the per-command budget run out with
+                # nothing committed. That is a fact about THIS RUN's envelope,
+                # not about the proposal, so it must not be charged to the
+                # proposal: `needs-triage` is terminal by contract (a retry
+                # needs an operator-reviewed gitops change moving it back to
+                # `accepted`), and parking a perfectly good proposal there
+                # for a busy runner is exactly the misattribution this PR
+                # removes on the review path and left in place here (claude
+                # P2 on `630ac27`). Hand back instead: release the claim and
+                # restore `accepted` under the same compare-and-swap the
+                # claim-vanished arm uses, so the next attempt re-runs
+                # against the current world.
+                if prior_handbacks + 1 >= IMPLEMENT_MAX_BUDGET_HANDBACKS:
+                    # The hand-back budget is spent. Blamelessness does not
+                    # mean "retry forever at cost": record it terminally, but
+                    # under its OWN code so the proposal's history still says
+                    # "the runner ran out of budget", not "this proposal
+                    # produces no commits".
+                    exhausted_msg = (
+                        "verification budget exhausted on "
+                        f"{prior_handbacks + 1} consecutive attempts "
+                        f"(limit {IMPLEMENT_MAX_BUDGET_HANDBACKS}): "
+                        f"{budget_ledger.describe()}"
+                    )
+                    recorded = _mark_needs_triage(
+                        ref,
+                        code="verification-budget-exhausted",
+                        stage="agent",
+                        message=exhausted_msg,
+                        attempt=attempt,
+                        claim_context=claim_ctx,
+                        # The operator gate out of `needs-triage` is a
+                        # deliberate human decision to try again, so it must
+                        # start from a clean budget. `_mark_needs_triage`
+                        # preserves unrelated fields, so without this the next
+                        # run to exhaust its budget would go terminal at once
+                        # with zero hand-backs, printing "consecutive
+                        # attempts" on what is really the first (claude P3 on
+                        # `8465c6e`).
+                        extra_fields={"budget_handbacks": None},
+                    )
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=_triage_error(exhausted_msg, recorded),
+                        budget_terminal=recorded,
+                        budget_ledger=budget_ledger,
+                    )
+                message = (
+                    "implementer produced no commits: "
+                    f"{budget_ledger.describe()} "
+                    f"(attempt {prior_handbacks + 1} of "
+                    f"{IMPLEMENT_MAX_BUDGET_HANDBACKS})"
+                )
+                # Status first, claim second -- the order every sibling arm
+                # uses (`_mark_needs_triage`, the `implemented` write). The
+                # reverse frees mutual exclusion while `.status.yaml` still
+                # names our live attempt, so a second executor can acquire
+                # the claim inside that window and either lose its own write
+                # to our hand-back or make our compare-and-swap decline
+                # (agy P2 on `61595a0`).
+                handed_back = _hand_back_if_still_ours(
+                    ref, attempt_id, budget_handbacks=prior_handbacks + 1
+                )
+                _release_claim(claim_ctx, reason="agent: verification budget exhausted")
+                if not handed_back:
+                    # The CAS declined -- somebody else's attempt is in the
+                    # file, so nothing was handed back and the next tick will
+                    # not retry it. Two different outcomes must not read
+                    # identically in the batch summary.
+                    message = (
+                        f"{message} (left as-is for the attempt that now holds it)"
+                    )
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {message}",
+                    budget_handback=handed_back,
+                    budget_ledger=budget_ledger,
+                )
             recorded = _mark_needs_triage(
                 ref,
                 code="no-commits",
@@ -3306,6 +3624,10 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=completed_attempt,
             failure=None,
             notes=None,
+            # A run that got through clears the hand-back tally: the cap
+            # bounds CONSECUTIVE budget-exhausted attempts, not the lifetime
+            # of the proposal (mctl-agents#430).
+            budget_handbacks=None,
         )
         _release_claim(claim_ctx, reason="implemented")
         result = ImplementResult(ref=ref, pr_url=pr_url)
@@ -3511,8 +3833,8 @@ def _implement_refs(
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     """Classify every result; partial success must never mask a failure.
 
-    Order matters: stale_source -> error -> blocked -> skipped_reason ->
-    pr_url. A stale-source refusal also carries `error` (for readers of
+    Order matters: stale_source -> verification budget -> error -> blocked ->
+    skipped_reason -> pr_url. A stale-source refusal also carries `error` (for readers of
     that older channel, and for the per-result "fail" summary line), so it
     must be classified before the `error` branch or a healthy admission
     refusal would count toward `failed` and force the whole batch red even
@@ -3522,9 +3844,12 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     `skipped_reason` branch or it would inflate the skip count.
     """
     succeeded = failed = skipped = blocked = stale_source = 0
+    verification_budget = 0
     for result in results:
         if result.stale_source:
             stale_source += 1
+        elif result.budget_handback or result.budget_terminal:
+            verification_budget += 1
         elif result.error:
             failed += 1
         elif result.blocked:
@@ -3541,6 +3866,7 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
         skipped=skipped,
         blocked=blocked,
         stale_source=stale_source,
+        verification_budget=verification_budget,
     )
 
 
@@ -3723,6 +4049,16 @@ def main() -> None:
                         Path(args.refusal_out),
                         result.error[len(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):].strip(),
                     )
+                elif code == EXIT_VERIFICATION_BUDGET_EXHAUSTED:
+                    # mctl-agents#430: the structured ledger summary (clamp/
+                    # deny counts, not just the reason text) so the shepherd
+                    # -- and an operator reading the log -- can tell a busy
+                    # runner apart from a reserve tuned too tight.
+                    _write_verification_budget_exhausted_out(
+                        Path(args.refusal_out),
+                        result.error[len(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):].strip(),
+                        result.budget_ledger,
+                    )
             sys.exit(code)
         if result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
@@ -3755,7 +4091,13 @@ def main() -> None:
 
     print("\n=== Summary ===")
     for result in results:
-        if result.error:
+        if result.budget_handback or result.budget_terminal:
+            # Not a `fail` line: these arms are excluded from `outcome.failed`
+            # below, and printing them as failures made a proposal retired
+            # cleanly under the cap read one way per result and the opposite
+            # way in `Totals:` (claude P3 on `68f3a05`).
+            print(f"  budget {result.ref.service}/{result.ref.slug}: {result.error}")
+        elif result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
         elif result.blocked:
             print(f"  blocked {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
@@ -3778,6 +4120,12 @@ def main() -> None:
         for result, (stale_code, issue_ref) in stale_sources:
             print(f"  {result.ref.service}/{result.ref.slug}: {stale_code} {issue_ref}")
 
+    budget_results = [r for r in results if r.budget_handback or r.budget_terminal]
+    if budget_results:
+        print("\n=== Verification budget ===")
+        for result in budget_results:
+            print(f"  {result.ref.service}/{result.ref.slug}: {result.error}")
+
     outcome = _batch_outcome(results)
     print(
         "Totals: "
@@ -3785,7 +4133,8 @@ def main() -> None:
         f"{outcome.failed} failed, "
         f"{outcome.skipped} skipped, "
         f"{outcome.blocked} blocked, "
-        f"{outcome.stale_source} stale source"
+        f"{outcome.stale_source} stale source, "
+        f"{outcome.verification_budget} verification budget"
     )
     if outcome.failed:
         sys.exit(1)
@@ -3804,7 +4153,17 @@ def main() -> None:
     # plus the committed `.status.yaml` already carry the signal for
     # operators, the same tradeoff already made for a mixed batch above.
     # `outcome.stale_source` is deliberately excluded from `outcome.failed`
-    # above for the same reason.
+    # above for the same reason. `outcome.verification_budget` is excluded on
+    # exactly the same grounds (mctl-agents#430): that arm hands the proposal
+    # back to `accepted` with an incremented `budget_handbacks`, and that
+    # tally is the ONLY durable bound on the paid retry loop. If a non-zero
+    # exit here marked `implement` Failed and skipped the commit step, every
+    # tick would read `0` and the cap would never be reached -- reintroducing
+    # precisely the unbounded loop the cap was added to close. The cap's own
+    # terminal write is bucketed there too: it is the write that ENDS the
+    # loop, and it has no catch-up path -- a dropped hand-back is recovered by
+    # the next green tick, a dropped terminal write is re-attempted and
+    # re-dropped forever, at full model cost every time.
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also

@@ -3908,6 +3908,70 @@ def test_apply_followup_reads_the_reason_on_ci_evidence_insufficient() -> None:
     assert exc.value.reason == "excerpt does not show the assertion"
 
 
+def test_verification_budget_exhausted_code_is_also_in_the_harness_set() -> None:
+    """mctl-agents#430: exit 51, like 46 and 50, is blameless — the run
+    stayed inside its own envelope and a structured ledger said so."""
+    deterministic, harness = run_shepherd._followup_code_sets()
+    assert run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED in harness
+    assert run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED not in deterministic
+    assert run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED == 51
+
+
+def test_apply_followup_raises_harness_on_verification_budget_exhausted() -> None:
+    """returncode=51 -> transient (retry) but labelled `harness`, exactly
+    like 46/50 — review_attempts unchanged, harness_failures incremented."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.transient is True
+    assert exc.value.kind == "harness"
+
+
+def test_apply_followup_reads_the_reason_on_verification_budget_exhausted() -> None:
+    """mctl-agents#430: `run_implementer` writes `--refusal-out` for exit
+    51 too (see its `elif code == EXIT_VERIFICATION_BUDGET_EXHAUSTED` arm),
+    gated into the same read as exit 50."""
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        Path(_refusal_out_path(cmd)).write_text(
+            json.dumps({
+                "refused": True,
+                "verification_budget_exhausted": True,
+                "reason": "go test did not finish in the remaining budget",
+            }),
+            encoding="utf-8",
+        )
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.kind == "harness"
+    assert exc.value.reason == "go test did not finish in the remaining budget"
+
+
 def test_apply_followup_orphaned_subagent_never_reads_a_reason() -> None:
     """The gate is on the exit code, not on whether the file happens to hold
     content — exit 46 never gets a `--refusal-out` write from

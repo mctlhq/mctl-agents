@@ -672,6 +672,16 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
       support a code decision — a platform-supplied-evidence gap, not a
       proposal defect, so it is blameless the same way an orphaned sub-agent
       is, bounded by the same ``MAX_HARNESS_FAILURES``.
+      ``EXIT_VERIFICATION_BUDGET_EXHAUSTED`` (mctl-agents#430) joins it too:
+      every agent-issued Bash command is bounded to what remains of the run's
+      envelope, and this code means the run stayed INSIDE that envelope the
+      whole time and a STRUCTURED ledger (never model prose) recorded the
+      command budget running out before a commit or a merits decision was
+      reached. The agent ran and was cut short by a platform-imposed bound —
+      blameless the same way 46 and 50 are, and bounded by the same
+      ``MAX_HARNESS_FAILURES`` — so ``EXIT_ORPHANED_SUBAGENT`` can go back to
+      being the safety net it was designed as, rather than the normal result
+      of a slow test suite.
     """
     from orchestrator import run_implementer  # deferred — see apply_followup
 
@@ -683,6 +693,7 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
     harness = frozenset({
         run_implementer.EXIT_ORPHANED_SUBAGENT,
         run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
+        run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED,
     })
     return deterministic, harness
 
@@ -2413,7 +2424,16 @@ def apply_followup(
         # is not an option.
         refusal_reason = (
             _read_refusal_reason(refusal_path)
-            if proc.returncode in _refusal_codes() | {run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT}
+            if proc.returncode in _refusal_codes() | {
+                run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
+                # mctl-agents#430: `run_implementer.main` writes the same
+                # `--refusal-out` file for this code too (see its `elif code
+                # == EXIT_VERIFICATION_BUDGET_EXHAUSTED` arm) — gate it in
+                # here for the same reason EXIT_CI_EVIDENCE_INSUFFICIENT is:
+                # the file is unlinked in the `finally` below regardless, so
+                # a later read is not an option.
+                run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED,
+            }
             else None
         )
     finally:
@@ -2468,10 +2488,11 @@ def apply_followup(
             kind = "fenced"
         elif proc.returncode in harness_codes:
             kind = "harness"
-            # Only `EXIT_CI_EVIDENCE_INSUFFICIENT` has a reason on this path
-            # (see the `refusal_reason` gate above); `EXIT_ORPHANED_SUBAGENT`
-            # never gets one, so `refusal_reason` is `None` for it and this
-            # stays a no-op there.
+            # `EXIT_CI_EVIDENCE_INSUFFICIENT` and (mctl-agents#430)
+            # `EXIT_VERIFICATION_BUDGET_EXHAUSTED` = 51 both have a reason on
+            # this path (see the `refusal_reason` gate above);
+            # `EXIT_ORPHANED_SUBAGENT` never gets one, so `refusal_reason` is
+            # `None` for it and this stays a no-op there.
             reason = refusal_reason
         elif proc.returncode in deterministic_codes:
             kind = "deterministic"
@@ -2967,9 +2988,11 @@ def process_one(
                 # re-clone the repo and re-run a paid SDK call every tick with
                 # no terminal state.
                 new_failures = ref.harness_failures + 1
-                # `e.reason` is only set for `EXIT_CI_EVIDENCE_INSUFFICIENT`
-                # (mctl-agents#423 review P2) — `EXIT_ORPHANED_SUBAGENT` never
-                # carries one, so this is a no-op suffix on that path.
+                # `e.reason` is set for `EXIT_CI_EVIDENCE_INSUFFICIENT`
+                # (mctl-agents#423 review P2) and for
+                # `EXIT_VERIFICATION_BUDGET_EXHAUSTED` (mctl-agents#430, which
+                # carries the ledger summary) — `EXIT_ORPHANED_SUBAGENT` never
+                # carries one, so this is a no-op suffix on that path only.
                 reason_suffix = f" Reason: {e.reason}" if e.reason else ""
                 print(
                     f"warn: {ref.service}/{ref.slug}: harness failure — not "
