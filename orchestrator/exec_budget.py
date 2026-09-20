@@ -140,6 +140,11 @@ def command_budget(
 # mctl-agents#430 -- `go test -race ./... > /tmp/test-race.log 2>&1 &` -- is a
 # plain trailing token; `2>&1` earlier in the same string is excluded by the
 # `(?<![&<>])` lookbehind, since its `&` is preceded by `>`.
+#
+# Every pattern below runs against the QUOTE-MASKED command (`mask_quoted`),
+# never the raw string: `git commit -m "A & B"` and `echo 'nohup'` carry these
+# characters as DATA, and denying them was a false positive that blocked
+# ordinary work (claude P2 on `630ac27`).
 _TRAILING_BACKGROUND_RE = re.compile(r"(?<![&<>])&(?!&)(?=\s|$)")
 _NOHUP_RE = re.compile(r"\bnohup\b", re.IGNORECASE)
 _SETSID_RE = re.compile(r"\bsetsid\b", re.IGNORECASE)
@@ -173,18 +178,144 @@ def normalize_shell_command(command: str) -> str:
     return re.sub(r"\\[ \t]*\r?\n[ \t]*", " ", command)
 
 
+def mask_quoted(command: str) -> str:
+    """Replace every quoted character with ``x``, preserving length.
+
+    Quote characters, backslashes and everything outside quotes are kept
+    verbatim, so offsets into the mask are offsets into the input and a
+    pattern that matches the mask can be reported against the original text.
+    A backslash-escaped character outside quotes is masked too (`\\&` is a
+    literal ampersand, not the async-list operator). An unterminated quote
+    masks to end of string -- the shell would not run such a command anyway,
+    and masking the tail is the conservative direction: it can only turn a
+    would-be denial into an allow, never invent one.
+
+    Exists because every detachment pattern here, and every command-word scan
+    below, must read the command's SHELL STRUCTURE rather than its data.
+    """
+    out: list[str] = []
+    quote: str | None = None
+    escaped = False
+    for ch in command:
+        if escaped:
+            out.append("x")
+            escaped = False
+            continue
+        if quote is None:
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch in ("'", '"'):
+                quote = ch
+                out.append(ch)
+            else:
+                out.append(ch)
+            continue
+        # Inside quotes. Single quotes have no escapes at all.
+        if ch == quote:
+            quote = None
+            out.append(ch)
+        elif quote == '"' and ch == "\\":
+            out.append("x")
+            escaped = True
+        else:
+            out.append("x")
+    return "".join(out)
+
+
+# Shell builtins whose whole point is to mutate the SHELL's own state. The
+# Bash tool carries that state (notably the working directory) across calls
+# within one session, and `wrap_bounded`'s `bash -c` subshell silently
+# discards it -- so `cd /repo` in one call would no longer apply to the next
+# (claude P2 on `630ac27`). A command built only from these is left unwrapped:
+# it cannot run long, so the OS-level bound buys nothing, while wrapping it
+# costs a behaviour change the agent has no way to see.
+SHELL_STATE_BUILTINS = frozenset({
+    ".", "alias", "cd", "export", "popd", "pushd", "set", "shopt",
+    "source", "umask", "unalias", "unset",
+})
+
+_SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|;|\||\n")
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
+
+
+def detachment_match(command: str) -> tuple[str, str] | None:
+    """``(label, fragment)`` for the first detachment form found, else None.
+
+    ``fragment`` is the offending text with a little surrounding context,
+    so a denial can quote what actually tripped it instead of leaving the
+    agent to guess which part of a long command was the problem.
+    """
+    normalized = normalize_shell_command(command)
+    masked = mask_quoted(normalized)
+    for label, pattern in DETACH_PATTERNS:
+        found = pattern.search(masked)
+        if found is None:
+            continue
+        start = max(0, found.start() - 20)
+        end = min(len(normalized), found.end() + 20)
+        fragment = normalized[start:end].strip()
+        if start > 0:
+            fragment = "…" + fragment
+        if end < len(normalized):
+            fragment = fragment + "…"
+        return label, fragment
+    return None
+
+
+def is_shell_state_only(command: str) -> bool:
+    """True when EVERY command word is a `SHELL_STATE_BUILTINS` member.
+
+    `cd /repo`, `cd a && cd b`, `export FOO=1` -- yes. `cd /repo && go test
+    ./...` -- no: it also runs something that can take arbitrarily long, and
+    bounding that matters more than preserving the `cd` (which, in that
+    shape, the agent wrote as a prefix to THIS command anyway). Callers use
+    this to decide whether `wrap_bounded` may rewrite the command at all.
+
+    A command this cannot parse (unbalanced quotes) returns False -- the
+    conservative direction, since False only means "bound it as usual".
+    """
+    normalized = normalize_shell_command(command)
+    masked = mask_quoted(normalized)
+    bounds: list[tuple[int, int]] = []
+    start = 0
+    for separator in _SEGMENT_SPLIT_RE.finditer(masked):
+        bounds.append((start, separator.start()))
+        start = separator.end()
+    bounds.append((start, len(masked)))
+
+    saw_a_word = False
+    for lo, hi in bounds:
+        segment = normalized[lo:hi].strip()
+        if not segment:
+            continue
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            return False
+        index = 0
+        while index < len(words) and _ASSIGNMENT_RE.match(words[index]):
+            index += 1
+        if index >= len(words):
+            # A bare `FOO=1` assignment: shell state too, by the same logic.
+            saw_a_word = True
+            continue
+        if words[index] not in SHELL_STATE_BUILTINS:
+            return False
+        saw_a_word = True
+    return saw_a_word
+
+
 def is_detached(command: str) -> str | None:
     """Return the matched detachment form, or ``None``.
 
     ``command`` is normalized first (see `normalize_shell_command`) so a
     line-continued `&`/`nohup`/`setsid`/`disown` cannot hide past a pattern
-    anchored on adjacent tokens.
+    anchored on adjacent tokens, then quote-masked (see `mask_quoted`) so the
+    same characters appearing as DATA are not mistaken for shell structure.
     """
-    normalized = normalize_shell_command(command)
-    for label, pattern in DETACH_PATTERNS:
-        if pattern.search(normalized):
-            return label
-    return None
+    found = detachment_match(command)
+    return None if found is None else found[0]
 
 
 def wrap_bounded(command: str, budget_s: float, *, kill_after_s: float) -> str:
@@ -201,6 +332,14 @@ def wrap_bounded(command: str, budget_s: float, *, kill_after_s: float) -> str:
     scripts and `cd` semantics exactly -- the alternative (parsing and
     rewriting the command) is the "command rewriting breaks a legitimate
     invocation" risk the design explicitly rejects.
+
+    ``budget_s`` is the EFFECTIVE bound, not the envelope-derived one: the
+    caller must already have narrowed it against any caller-supplied tool
+    timeout. Passing the wider envelope bound while the CLI's own tool
+    timeout is narrower reinstates the very defect this module exists to
+    close -- the CLI backgrounds the command at ITS timeout (ADR-011
+    "Containment") while `timeout` sits on the process group until the wider
+    bound, so the process escapes for the difference (agy P2 on `630ac27`).
 
     Both bounds are rounded up to whole seconds (`timeout`'s own resolution)
     and floored at 1s so a sub-second budget still renders a valid,

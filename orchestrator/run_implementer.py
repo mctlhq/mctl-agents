@@ -3410,6 +3410,39 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
+            if budget_ledger.exhausted:
+                # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
+                # prose -- observed the per-command budget run out with
+                # nothing committed. That is a fact about THIS RUN's envelope,
+                # not about the proposal, so it must not be charged to the
+                # proposal: `needs-triage` is terminal by contract (a retry
+                # needs an operator-reviewed gitops change moving it back to
+                # `accepted`), and parking a perfectly good proposal there
+                # for a busy runner is exactly the misattribution this PR
+                # removes on the review path and left in place here (claude
+                # P2 on `630ac27`). Hand back instead: release the claim and
+                # restore `accepted` under the same compare-and-swap the
+                # claim-vanished arm uses, so the next attempt re-runs
+                # against the current world.
+                _release_claim(claim_ctx, reason="agent: verification budget exhausted")
+                message = (
+                    "implementer produced no commits: "
+                    f"{budget_ledger.describe()}"
+                )
+                if not _hand_back_if_still_ours(ref, attempt_id):
+                    # The CAS declined -- somebody else's attempt is in the
+                    # file, so nothing was handed back and the next tick will
+                    # not retry it. Two different outcomes must not read
+                    # identically in the batch summary.
+                    message = (
+                        f"{message} (left as-is for the attempt that now holds it)"
+                    )
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {message}",
+                    budget_ledger=budget_ledger,
+                )
             recorded = _mark_needs_triage(
                 ref,
                 code="no-commits",

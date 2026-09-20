@@ -1,0 +1,137 @@
+"""A budget-exhausted implement run must not be charged to the proposal.
+
+mctl-agents#430 moved the "the runner ran out of budget" outcome into its own
+blameless lane on the REVIEW path (exit 51, `.status.yaml` untouched) but left
+the IMPLEMENT path writing `needs-triage` with `failure.code: no-commits` --
+terminal by contract, since a retry needs an operator-reviewed gitops change
+moving the proposal back to `accepted`. That is the same misattribution the
+proposal exists to remove, on the other driver (claude P2 on `630ac27`).
+
+These tests pin the hand-back: `accepted` restored, no `failure` block, and an
+error carrying the verification-budget prefix so the summary says what
+happened.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+from orchestrator import run_implementer
+from orchestrator.source_issue import SourceIssueVerdict
+
+OPEN = SourceIssueVerdict(known=True, failure=None, issue_ref="mctlhq/mctl-telegram#510")
+
+
+def _make_ref(tmp_path: Path) -> run_implementer.ProposalRef:
+    d = tmp_path / "mctl-telegram" / "proposals" / "issue-510-x"
+    d.mkdir(parents=True)
+    (d / ".status.yaml").write_text(
+        yaml.safe_dump({
+            "status": "accepted",
+            "source": {
+                "type": "github_issue",
+                "repo": "mctlhq/mctl-telegram",
+                "issue": 510,
+                "url": "https://github.com/mctlhq/mctl-telegram/issues/510",
+            },
+        }),
+        encoding="utf-8",
+    )
+    return run_implementer.ProposalRef(
+        service="mctl-telegram",
+        slug="issue-510-x",
+        proposal_dir=d,
+        status="accepted",
+        approval_ok=True,
+    )
+
+
+def _reach_the_sdk(monkeypatch, tmp_path: Path, *, on_run) -> None:
+    """Stub everything between the admission gate and step 6."""
+    monkeypatch.setattr(
+        run_implementer,
+        "_preflight_existing_result",
+        lambda _ref: run_implementer.ExistingResult(action="none"),
+    )
+    monkeypatch.setattr(run_implementer, "read_source_issue", lambda *_a, **_kw: OPEN)
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_acquire_claim", lambda *_a, **_kw: None)
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a, **_kw: clone)
+    monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_build_prompt", lambda *_a, **_kw: "prompt")
+    monkeypatch.setattr(run_implementer.anyio, "run", on_run)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: False)
+
+
+def _read(ref) -> dict:
+    return yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+
+
+def test_an_exhausted_budget_hands_the_proposal_back_instead_of_triaging(
+    monkeypatch, tmp_path: Path
+) -> None:
+    ref = _make_ref(tmp_path)
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    status = _read(ref)
+    assert status["status"] == "accepted", "a busy runner must not park the proposal"
+    assert "failure" not in status or status["failure"] is None
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
+    assert result.budget_ledger is not None
+    assert result.budget_ledger.exhausted is True
+    # The ledger summary rides along so an operator can tell a busy runner
+    # apart from a reserve tuned too tight.
+    assert "denied_exhausted=1" in result.error
+
+
+def test_a_plain_no_commit_run_is_still_charged_to_the_proposal(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The hand-back is scoped to an EXHAUSTED ledger. An ordinary no-commit
+    run stays terminal -- it is deterministic, and re-running it burns spend
+    for the same result."""
+    ref = _make_ref(tmp_path)
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=lambda *_a, **_kw: None)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    status = _read(ref)
+    assert status["status"] == "needs-triage"
+    assert status["failure"]["code"] == "no-commits"
+    assert result.error is not None
+    assert not result.error.startswith(
+        run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX
+    )
+
+
+def test_the_hand_back_says_so_when_the_compare_and_swap_declines(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """Somebody else's attempt is in the file: nothing was handed back, and
+    the summary must not read identically to the case where it was."""
+    ref = _make_ref(tmp_path)
+
+    def on_run(func, *_a, **_kw):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=on_run)
+    monkeypatch.setattr(run_implementer, "_hand_back_if_still_ours", lambda *_a, **_kw: False)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
+    assert "attempt that now holds it" in result.error

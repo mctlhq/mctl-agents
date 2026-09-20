@@ -15,7 +15,8 @@ from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
 from orchestrator.exec_budget import (
     CommandBudgetLedger,
     command_budget,
-    is_detached,
+    detachment_match,
+    is_shell_state_only,
     wrap_bounded,
 )
 from orchestrator.exec_budget import normalize_shell_command as _normalize_shell_command
@@ -571,7 +572,8 @@ def _deadline_guard_hook(
 
     Per `Bash` tool call:
 
-    1. `run_in_background: true`, or a detached form (`is_detached`) — deny,
+    1. `run_in_background: true`, or a detached form (`detachment_match`,
+       read against the QUOTE-MASKED command so quoted text is data) — deny,
        ledger `denied_background += 1`, reason naming the detachment form.
     2. `command_budget(...) is None` (the remaining envelope, minus the
        teardown reserve, cannot clear the floor) — deny, ledger
@@ -580,8 +582,10 @@ def _deadline_guard_hook(
     3. otherwise — allow, with `updatedInput` carrying the derived bound: the
        tool-input `timeout` (milliseconds) is only ever NARROWED (`min`
        against any caller-supplied value — clamping is one-directional), and
-       — unless `IMPLEMENTER_BOUND_COMMANDS` is off or `timeout_available` is
-       False — the `command` itself is rewritten under `wrap_bounded()` so
+       — unless `IMPLEMENTER_BOUND_COMMANDS` is off, `timeout_available` is
+       False, or the command is shell-state-only (`is_shell_state_only`) —
+       the `command` itself is rewritten under `wrap_bounded()`, at the SAME
+       effective bound as the clamp (never the wider envelope one), so
        the bound is enforced at the OS level, not only by the CLI's own tool
        timeout (which backgrounds rather than fails an over-running command,
        ADR-011 "Containment"). Ledger `clamped += 1`.
@@ -622,15 +626,23 @@ def _deadline_guard_hook(
                 "ending your turn."
             )
         normalized = _normalize_shell_command(command)
-        detach_form = is_detached(normalized)
-        if detach_form is not None:
+        # Quote-aware: `git commit -m "A & B"` carries `&` as data, not as
+        # the async-list operator, and denying it blocked ordinary work
+        # (claude P2 on `630ac27`). `detachment_match` also hands back the
+        # offending fragment so the denial can quote what tripped it.
+        detached = detachment_match(normalized)
+        if detached is not None:
+            detach_form, fragment = detached
             ledger.record_denied_background(command, detach_form)
             return _deny(
-                f"Detached execution ({detach_form}) is disabled on this run "
-                "(mctl-agents#430). Backgrounding, nohup/setsid/disown and "
+                f"Detached execution is disabled on this run "
+                f"(mctl-agents#430). What tripped this: {detach_form} in "
+                f"`{fragment}`. Backgrounding, nohup/setsid/disown and "
                 "polling loops escape the remaining execution budget and are "
                 "blocked outright. Re-run the command synchronously and wait "
-                "for its result before ending your turn."
+                "for its result before ending your turn. If that text was "
+                "meant as DATA rather than as a shell operator, quote it "
+                "(the guard reads quoted text as data)."
             )
 
         budget_s = command_budget(
@@ -652,18 +664,41 @@ def _deadline_guard_hook(
                 '"reason": "<what you could not verify>"}`.'
             )
 
-        ledger.record_clamped(command, budget_s)
-        updated_input = dict(tool_input)
-        if IMPLEMENTER_BOUND_COMMANDS and timeout_available:
-            updated_input["command"] = wrap_bounded(
-                command, budget_s, kill_after_s=IMPLEMENTER_COMMAND_KILL_GRACE_SECONDS
-            )
-        derived_ms = int(budget_s * 1000)
+        # The EFFECTIVE bound: the envelope-derived budget narrowed against
+        # any caller-supplied tool timeout, computed ONCE and used for both
+        # the tool-input clamp and the OS-level wrapper. Deriving them
+        # separately (the wrapper from `budget_s`, the clamp from the
+        # caller's value) leaves the CLI backgrounding the command at the
+        # narrower bound while `timeout` holds the process group until the
+        # wider one -- the orphaned-background-process defect this guard
+        # exists to close, reopened inside the guard itself (agy P2 on
+        # `630ac27`). Clamping stays one-directional: `min` never widens.
+        effective_s = budget_s
         existing_timeout_ms = tool_input.get("timeout")
-        if isinstance(existing_timeout_ms, int | float):
-            updated_input["timeout"] = min(int(existing_timeout_ms), derived_ms)
-        else:
-            updated_input["timeout"] = derived_ms
+        if (
+            isinstance(existing_timeout_ms, int | float)
+            and not isinstance(existing_timeout_ms, bool)
+            and existing_timeout_ms > 0
+        ):
+            effective_s = min(budget_s, float(existing_timeout_ms) / 1000.0)
+
+        ledger.record_clamped(command, effective_s)
+        updated_input = dict(tool_input)
+        # A command built only from shell-state builtins (`cd`, `export`, …)
+        # is admitted UNWRAPPED: the Bash tool carries that state across
+        # calls, and `bash -c` would discard it, so `cd /repo` would stop
+        # applying to the next call (claude P2 on `630ac27`). Such a command
+        # cannot run long, so the OS-level bound buys nothing anyway; the
+        # tool-input clamp below still applies.
+        if (
+            IMPLEMENTER_BOUND_COMMANDS
+            and timeout_available
+            and not is_shell_state_only(normalized)
+        ):
+            updated_input["command"] = wrap_bounded(
+                command, effective_s, kill_after_s=IMPLEMENTER_COMMAND_KILL_GRACE_SECONDS
+            )
+        updated_input["timeout"] = int(effective_s * 1000)
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

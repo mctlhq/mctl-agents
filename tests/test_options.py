@@ -1054,6 +1054,126 @@ def test_deadline_guard_composes_with_the_ci_log_guard_and_the_audit_hook(tmp_pa
     assert len(callbacks) == 3  # audit + ci-log + deadline
 
 
+def _guard_for(tmp_path, ledger, *, work_class="review", remaining=1000.0):
+    built = options.build_implementer_agent_options(
+        tmp_path, "test-model", work_class=work_class,
+        deadline_monotonic=anyio_current_time_stub() + remaining,
+        budget_ledger=ledger,
+    )
+    return _guard_callback(built)
+
+
+def test_deadline_guard_bounds_the_wrapper_at_the_caller_timeout_not_the_envelope(
+    tmp_path, monkeypatch
+):
+    """agy P2 on `630ac27`: deriving the OS bound from the ENVELOPE while the
+    CLI's own tool timeout is much narrower reopens the orphaned-background
+    defect -- the CLI backgrounds at 5s, `timeout` waits 300s, and the
+    process escapes for the 295s in between."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    ledger = options.CommandBudgetLedger()
+    cb = _guard_for(tmp_path, ledger)
+    result = _run_guard(cb, {"command": "sleep 20", "timeout": 5000})
+    out = result["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"
+    assert out["updatedInput"]["timeout"] == 5000
+    # The OS-level bound must be the SAME 5s, not the 300s ceiling.
+    assert "timeout --kill-after=5s 5s bash -c" in out["updatedInput"]["command"]
+    assert "300s" not in out["updatedInput"]["command"]
+    assert ledger.last_bound_s == 5.0
+
+
+def test_deadline_guard_still_uses_the_envelope_bound_without_a_caller_timeout(
+    tmp_path, monkeypatch
+):
+    """The narrowing is `min`, so an absent (or non-positive) caller timeout
+    leaves the envelope-derived bound in force."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    for tool_input in ({"command": "pytest -q"}, {"command": "pytest -q", "timeout": 0}):
+        ledger = options.CommandBudgetLedger()
+        cb = _guard_for(tmp_path, ledger)
+        out = _run_guard(cb, dict(tool_input))["hookSpecificOutput"]
+        assert out["updatedInput"]["timeout"] == 300 * 1000, tool_input
+        assert "timeout --kill-after=5s 300s bash -c" in out["updatedInput"]["command"]
+
+
+def test_deadline_guard_allows_a_quoted_ampersand(tmp_path, monkeypatch):
+    """claude P2 on `630ac27`: `&` inside quotes is data, not the async-list
+    operator, and denying it blocked ordinary commits."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    ledger = options.CommandBudgetLedger()
+    cb = _guard_for(tmp_path, ledger)
+    result = _run_guard(cb, {"command": 'git commit -m "A & B"'})
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert ledger.denied_background == 0
+
+
+def test_deadline_guard_denial_reason_quotes_what_tripped_it(tmp_path):
+    """A denial the agent cannot act on is a denial it will retry blindly."""
+    ledger = options.CommandBudgetLedger()
+    cb = _guard_for(tmp_path, ledger)
+    result = _run_guard(
+        cb, {"command": "go test -race ./... > /tmp/test-race.log 2>&1 &"}
+    )
+    out = result["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny"
+    assert "test-race.log" in out["permissionDecisionReason"]
+
+
+def test_deadline_guard_leaves_a_cd_unwrapped_so_it_persists(tmp_path, monkeypatch):
+    """claude P2 on `630ac27`: the Bash tool carries the working directory
+    across calls; `bash -c` would discard it, so `cd /repo` in one call would
+    stop applying to the next."""
+    monkeypatch.setattr(options, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", 120.0)
+    monkeypatch.setattr(options, "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", 20.0)
+    ledger = options.CommandBudgetLedger()
+    cb = _guard_for(tmp_path, ledger)
+    out = _run_guard(cb, {"command": "cd /repo"})["hookSpecificOutput"]
+    assert out["permissionDecision"] == "allow"
+    assert out["updatedInput"]["command"] == "cd /repo"
+    # The tool-input clamp still applies -- only the rewrite is skipped.
+    assert out["updatedInput"]["timeout"] == 300 * 1000
+    # A compound that also runs real work is still bounded.
+    out2 = _run_guard(cb, {"command": "cd /repo && go test ./..."})["hookSpecificOutput"]
+    assert out2["updatedInput"]["command"].startswith("timeout --kill-after=")
+
+
+def test_ci_log_deny_survives_the_deadline_guards_allow(tmp_path):
+    """claude P2 on `630ac27`: the composition test pinned REGISTRATION only.
+    On a ci-remediation run the deadline guard returns `allow` for a `gh run
+    view --log-failed` (it is not detached and fits the budget), so nothing
+    but #423's own deny stands between the agent and an unbounded CI-log
+    fetch. Pin that at least one composed hook still DENIES it."""
+    ledger = options.CommandBudgetLedger()
+    built = options.build_implementer_agent_options(
+        tmp_path, "test-model", work_class="ci-remediation",
+        deadline_monotonic=anyio_current_time_stub() + 1000.0,
+        budget_ledger=ledger,
+    )
+    matchers = (built.hooks or {}).get("PreToolUse") or []
+    callbacks = [h for m in matchers for h in m.hooks]
+    command = "gh run view 123 --log-failed"
+    decisions = []
+    for cb in callbacks:
+        result = _run_guard(cb, {"command": command})
+        specific = (result or {}).get("hookSpecificOutput") or {}
+        if specific.get("permissionDecision"):
+            decisions.append(specific["permissionDecision"])
+    assert "deny" in decisions, decisions
+    # And the deadline guard is indeed the one that would have allowed it --
+    # i.e. this is a real composition guarantee, not a vacuous one.
+    assert _run_guard(_guard_callback(built), {"command": command})[
+        "hookSpecificOutput"
+    ]["permissionDecision"] == "allow"
+
+
 # ---------------------------------------------------------------------------
 # SDK contract pin (mctl-agents#430 T8): `updatedInput` on an `allow`
 # `PreToolUseHookSpecificOutput` must stay honoured by the pinned SDK.

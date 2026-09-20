@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from orchestrator import exec_budget
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -201,3 +203,86 @@ def test_ledger_describe_is_a_short_summary_line() -> None:
     assert "exhausted=true" not in ledger.describe()
     ledger.record_denied_exhausted("cmd")
     assert "exhausted=true" in ledger.describe()
+
+
+# ---------------------------------------------------------------------------
+# Quote awareness (claude P2 on `630ac27`): these characters are DATA inside
+# quotes, and denying an ordinary command for carrying them was a false
+# positive that blocked real work.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "A & B"',
+        "git commit -m 'fix & polish'",
+        'echo "nohup is a word"',
+        "grep -r 'disown' .",
+        'python -c "print(1) # setsid"',
+        r"git commit -m A\ \&\ B",
+    ],
+)
+def test_is_detached_treats_quoted_operators_as_data(command):
+    assert exec_budget.is_detached(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "go test -race ./... > /tmp/test-race.log 2>&1 &",
+        'git commit -m "A & B" && sleep 100 &',
+        "nohup go test ./...",
+        "setsid make check",
+        "go test ./... & disown",
+    ],
+)
+def test_is_detached_still_catches_real_detachment(command):
+    assert exec_budget.is_detached(command) is not None
+
+
+def test_detachment_match_reports_the_offending_fragment():
+    found = exec_budget.detachment_match(
+        "go test -race ./... > /tmp/test-race.log 2>&1 &"
+    )
+    assert found is not None
+    label, fragment = found
+    assert "&" in label
+    # The fragment must quote the actual text, not just name the form.
+    assert "test-race.log" in fragment
+
+
+def test_mask_quoted_preserves_length_and_structure():
+    command = 'git commit -m "A & B" && echo ok'
+    masked = exec_budget.mask_quoted(command)
+    assert len(masked) == len(command)
+    # The `&&` outside quotes survives; the `&` inside quotes does not.
+    assert "&&" in masked
+    assert masked.count("&") == 2
+
+
+def test_mask_quoted_masks_an_unterminated_quote_to_end_of_string():
+    masked = exec_budget.mask_quoted('echo "oops & more')
+    assert masked.count("&") == 0
+
+
+# ---------------------------------------------------------------------------
+# Shell-state-only commands (claude P2 on `630ac27`): `bash -c` would discard
+# the working directory the Bash tool carries across calls.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    ["cd /repo", "cd /repo && cd src", "export FOO=1", "FOO=1", "source .venv/bin/activate"],
+)
+def test_is_shell_state_only_accepts_pure_state_commands(command):
+    assert exec_budget.is_shell_state_only(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cd /repo && go test ./...", "pytest -q", "cd /repo; make check", ""],
+)
+def test_is_shell_state_only_rejects_anything_that_also_runs_work(command):
+    assert exec_budget.is_shell_state_only(command) is False
+
+
+def test_is_shell_state_only_is_conservative_on_unparseable_input():
+    assert exec_budget.is_shell_state_only('cd "/repo') is False

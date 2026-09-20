@@ -160,15 +160,37 @@ same lesson, installed for EVERY work class when the caller supplies both a
 `deadline_monotonic` and a `CommandBudgetLedger`
 (`orchestrator/exec_budget.py`). Per `Bash` tool call, before the command
 starts: deny a detached launch (a trailing async-list `&`, `nohup`, `setsid`,
-`disown`, or `run_in_background: true`) with a reason naming the form; deny
-outright once `command_budget()` — `min(IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
-remaining_envelope - IMPLEMENTER_TEARDOWN_RESERVE_SECONDS)` — cannot clear
-`IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS`; otherwise allow, with the derived
+`disown`, or `run_in_background: true`) with a reason naming the form AND
+quoting the fragment that tripped it; deny outright once `command_budget()` —
+`min(IMPLEMENTER_COMMAND_TIMEOUT_SECONDS, remaining_envelope -
+IMPLEMENTER_TEARDOWN_RESERVE_SECONDS)` — cannot clear
+`IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS`; otherwise allow, with the EFFECTIVE
 bound applied BOTH to the tool-input `timeout` (narrowed only — clamping is
-one-directional) AND, unless the `IMPLEMENTER_BOUND_COMMANDS=0` break-glass
-or a missing `timeout` binary falls back to tool-input clamping alone, by
-rewriting the command under `timeout --kill-after=<k>s <budget>s bash -c
-<quoted command>` (`exec_budget.wrap_bounded()`). GNU `timeout` signals the
+one-directional) AND, unless the `IMPLEMENTER_BOUND_COMMANDS=0` break-glass,
+a missing `timeout` binary, or a shell-state-only command falls back to
+tool-input clamping alone, by rewriting the command under `timeout
+--kill-after=<k>s <budget>s bash -c <quoted command>`
+(`exec_budget.wrap_bounded()`).
+
+Three rules keep that rewrite from being worse than the defect it closes:
+
+- **One effective bound, not two.** The wrapper and the tool-input clamp use
+  the SAME number — the envelope-derived budget narrowed against any
+  caller-supplied tool timeout. Deriving them separately lets the CLI
+  background the command at the narrower bound while `timeout` holds the
+  process group until the wider one, reopening the orphan window for the
+  difference.
+- **Shell structure, not text.** Detachment patterns and command-word scans
+  read the QUOTE-MASKED command (`exec_budget.mask_quoted()`), so `git commit
+  -m "A & B"` and `echo 'nohup'` carry those characters as data and are
+  admitted. A backslash-escaped operator outside quotes is masked too.
+- **Shell state survives.** A command built only from `SHELL_STATE_BUILTINS`
+  (`cd`, `export`, `source`, …) is admitted UNWRAPPED, because the Bash tool
+  carries that state — notably the working directory — across calls and
+  `bash -c` would discard it. Such a command cannot run long, so the OS-level
+  bound buys nothing. A compound that also runs real work (`cd /repo && go
+  test ./...`) IS wrapped: bounding the test matters more, and there the `cd`
+  was written as a prefix to that command anyway. GNU `timeout` signals the
 command's whole PROCESS GROUP, so this is OS-level enforcement, not only the
 CLI's own Bash-tool timeout that backgrounds rather than fails an
 over-running command. Every decision (clamped, denied-background,
@@ -204,7 +226,15 @@ command outright or because the agent itself recorded the same fact via the
 refusal marker's `verification_budget_exhausted` flag. Both join
 `EXIT_ORPHANED_SUBAGENT` (46) in `run_shepherd._followup_code_sets()`'s
 harness set: blameless (never charges `review_attempts`), still bounded by
-`MAX_HARNESS_FAILURES`. A run that DOES produce a commit still pushes and
+`MAX_HARNESS_FAILURES`. Blamelessness is a property of BOTH drivers, not just
+the review path: an implement run that ends with no commit and an exhausted
+ledger hands the proposal back to `accepted` (`_hand_back_if_still_ours`,
+under the same compare-and-swap the claim-vanished arm uses) instead of
+writing `needs-triage`. `needs-triage` is terminal by contract — a retry
+needs an operator-reviewed gitops change moving the proposal back to
+`accepted` — so charging a busy runner there parks a sound proposal at a
+human gate for a fact about the runner. A plain no-commit run stays terminal:
+that one IS deterministic, and re-running it buys the same result. A run that DOES produce a commit still pushes and
 exits `EXIT_OK` even if some verification was cut short along the way — the
 commit is the outcome; the ledger's clamp/deny counts are printed to the Argo
 log either way, so the truncation stays visible without gating success on it.
