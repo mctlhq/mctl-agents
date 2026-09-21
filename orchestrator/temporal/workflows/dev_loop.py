@@ -1475,9 +1475,16 @@ class DevLoopWorkflow:
         # Re-checked before the first sleep of this run (`_watch_pr`'s own
         # first statement observes `_abandoned`): a signal that landed in
         # the previous run, or in the instant between the hop decision and
-        # this run starting, still ends the watch.
-        self._abandoned = resume.abandoned
-        self._abandon_reason = resume.abandon_reason
+        # this run starting, still ends the watch. `resume.abandoned` is
+        # always `False` by construction (`_merge_watch_hop_suggested`
+        # never fires once `_abandoned` is set, so a resume record can
+        # never carry `abandoned=True`) -- OR it in rather than assigning,
+        # so an `abandon` signal delivered in the continue_as_new gap
+        # (applied before `initialize_workflow` per temporalio's job
+        # ordering) is never clobbered by this rehydration.
+        self._abandoned = self._abandoned or resume.abandoned
+        if self._abandoned and not self._abandon_reason:
+            self._abandon_reason = resume.abandon_reason or "abandoned by operator"
 
         outcome = await self._watch_pr(resume.service, resume.slug, resume=resume)
         if outcome.resume is not None:

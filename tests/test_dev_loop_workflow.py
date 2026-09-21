@@ -4852,6 +4852,71 @@ class TestMergeWatchContinueAsNew:
         assert result.approve is not None and result.approve.phase == "Succeeded"
         assert result.ended == ""
 
+    async def test_deadline_is_carried_not_recomputed_across_hops(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T3 follow-up (codex P2): the ADR addendum calls "the deadline is
+        an INPUT, not a recomputation" the first load-bearing property of
+        this change, but nothing pinned it -- every other test here would
+        pass unchanged if `_watch_pr` recomputed
+        `workflow.now() + MERGE_WATCH_DEADLINE` on every resume instead of
+        carrying `resume.deadline`, which is exactly the regression that
+        turns a bounded 14-day watch into an unbounded one.
+
+        Forces both the history floor (a hop after every single poll) and
+        the deadline itself down to a few poll intervals, then feeds a PR
+        that never resolves to a terminal state and counts how many times
+        `get_pr_state` is actually called. A 40-minute deadline at the
+        15-minute fast-cadence poll interval allows at most 3 polls (t=0,
+        15, 30) before the watch ends at t=45 -- a per-hop recomputation
+        instead keeps the deadline 40 minutes ahead of "now" on every one
+        of the up to MERGE_WATCH_MAX_HOPS=16 hops this low floor forces,
+        which blows a generous bound wide open long before the watch would
+        ever end on its own."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_DEADLINE", timedelta(minutes=40))
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        base_activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        poll_count = {"n": 0}
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_counting_open(service: str, slug: str) -> PRState:
+            poll_count["n"] += 1
+            return open_pr
+
+        activities = [a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"]
+        activities.append(fake_get_pr_state_counting_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/962"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "OPEN"
+        assert result.ended == ""
+        assert poll_count["n"] <= 5
+
     async def test_abandon_beats_a_pending_hop(self, env, monkeypatch: pytest.MonkeyPatch) -> None:
         """T5: an `abandon` signal must win a race with the hop predicate.
         The history floor is forced low enough that a hop would otherwise
