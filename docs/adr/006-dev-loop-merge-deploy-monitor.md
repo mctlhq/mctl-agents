@@ -104,6 +104,55 @@ to merge it. See
 `agents-state/mctl-agents/proposals/issue-292-fix-lifecycle-steward-owned-repos-have-n/`
 for the full design.
 
+**Addendum (mctl-agents#404 v2, 2026-09).** A complete 14-day merge watch at
+`MERGE_POLL_INTERVAL` is ~15,500 history events — over Temporal's default
+`limit.historyCount.warn` (10,240) — because nothing in the loop ever called
+`continue_as_new`. `_watch_pr` now hops onto a fresh run, behind its own
+`workflow.patched("merge-watch-continue-as-new")` marker, once the server
+suggests it (`workflow.info().is_continue_as_new_suggested()`) or, failing
+that, once `workflow.info().get_current_history_length()` crosses a local
+`MERGE_WATCH_HISTORY_FLOOR` (4096, Temporal's own
+`limit.historyCount.suggestContinueAsNew` default) — a floor exists
+because the cluster's `temporal-dynamic-config` is empty, and the bound must
+not depend on that ever being set.
+
+A few things about the hop are load-bearing:
+
+- **The deadline is an INPUT, not a recomputation.** The first run of a
+  watch computes `deadline = workflow.now() + MERGE_WATCH_DEADLINE` once;
+  every hop carries that absolute timestamp forward in a `MergeWatchResume`
+  record (`IssueRef.resume`, a defaulted field, not a second parameter on
+  `run` — argument arity stays `[IssueRef]` on every start, external or
+  continued). Recomputing it per run would restart the 14-day clock on every
+  hop and defeat the bound this change exists to add.
+- **A hop never releases the lifecycle-ownership claim.** `_watch_pr`
+  returns a decision (`_WatchOutcome`) instead of calling
+  `workflow.continue_as_new` inline, specifically so its `finally` block can
+  tell "the watch is hopping" apart from "the watch genuinely ended" and
+  skip the relinquishing `release`/`terminal` write on a hop. Raising
+  `continue_as_new` from inside the `try` would unwind through that
+  `finally` and release the row on every hop — the owner id
+  (`workflow.info().workflow_id`) and the epoch both stay valid across
+  continue_as_new, so there is nothing to release.
+- **`abandon` is kept safe across the boundary.** The hop predicate refuses
+  to fire while `self._abandoned` is set, so an abandon already observed
+  always wins a race with a pending hop. `_abandoned`/`_abandon_reason` are
+  carried in the resume record regardless, and the continued run re-checks
+  them before its first sleep — the residual exposure is a single `abandon`
+  delivered in the instant between the hop decision and the continuation,
+  which costs at most one poll interval before a re-sent signal is observed.
+- **The attrition property narrows, it does not change.** Migration by
+  attrition (`_run_cwft`'s doc comment, `tests/test_patch_memoization.py`)
+  already meant an in-flight execution's unpatched branches stay unpatched
+  for its whole life. This adds one more branch to that set: a watch
+  already running when this shipped never hops, and finishes in one history
+  exactly as before.
+
+See `agents-state/mctl-agents/proposals/issue-404-devloopworkflow-never-calls-continue-as-v2/`
+for the full design, including the four `@workflow.query` handlers'
+rehydration contract and why `resume` is a dataclass field rather than a
+second `run` parameter.
+
 ### 6.2 Release observation (#215)
 
 After merge: watch the release land, using only existing read surfaces —

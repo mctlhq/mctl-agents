@@ -66,6 +66,7 @@ dev_loop:
   - lifecycle-ownership
   - lifecycle-refusal-backoff
   - merge-detection
+  - merge-watch-continue-as-new
   - registry-required
   - shepherd-in-loop
   - slug-scoped-implement
