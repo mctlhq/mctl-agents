@@ -31,6 +31,7 @@ import base64
 import binascii
 import os
 from pathlib import Path
+from typing import cast
 
 import httpx
 import yaml
@@ -159,17 +160,15 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
             # then log "Task exception was never retrieved" once per orphan.
             # The first exception is re-raised unchanged, so the failure a
             # caller sees is identical.
-            statuses = await asyncio.gather(
-                *(_read_proposal_status(client, headers, service, slug) for slug in matches),
-                return_exceptions=True,
+            statuses = _raise_first(
+                await asyncio.gather(
+                    *(_read_proposal_status(client, headers, service, slug) for slug in matches),
+                    return_exceptions=True,
+                )
             )
-            for status in statuses:
-                if isinstance(status, BaseException):
-                    raise status
             candidates = [
                 ProposalCandidate(slug=slug, status=status)
                 for slug, status in zip(matches, statuses, strict=True)
-                if not isinstance(status, BaseException)
             ]
             try:
                 return select_proposal_slug(candidates)
@@ -182,6 +181,25 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
                 ) from exc
     except httpx.RequestError as exc:
         raise ProposalListingError(f"listing {url} failed: {exc}") from exc
+
+
+def _raise_first(results: list[str | BaseException | None]) -> list[str | None]:
+    """Re-raise the first failed status read; otherwise narrow the list.
+
+    ``asyncio.gather(..., return_exceptions=True)`` is used so one failing
+    read cannot unwind while its siblings are still in flight — but the
+    outcome must stay fail-closed: ONE unreadable status is enough to
+    abandon the whole resolution, because a partial candidate set could
+    resolve to a different slug than the complete one would. Raising here
+    rather than filtering says that in one place.
+    """
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    # Every element is `str | None` by now; the cast is what the loop above
+    # just proved, and keeping it here stops the caller from looking like
+    # it tolerates partial failures.
+    return cast("list[str | None]", results)
 
 
 async def _read_proposal_status(

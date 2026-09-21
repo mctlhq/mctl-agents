@@ -77,6 +77,11 @@ from orchestrator.directives import (
     failed_attempt_counts,
     parse_comments,
 )
+from orchestrator.proposal_identity import (
+    AmbiguousProposalError,
+    ProposalCandidate,
+    select_proposal_slug,
+)
 from orchestrator.run_issue_investigator import _OVERWRITABLE_STATUSES, _run
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
@@ -342,11 +347,18 @@ def _reply_ambiguous(author: str, comment_id: str, matches: list[ProposalStateRe
     names = ", ".join(sorted(f"{m.service}/{m.slug}" for m in matches))
     stale = sorted(f"{m.service}/{m.slug}" for m in matches if m.status in TERMINAL_STATUSES)
     # `resolve_slug` (orchestrator/run_issue_investigator.py) refuses this
-    # exact case too, status-agnostically — so a human deleting the stale
-    # directory is genuinely the only way forward, not one option among
-    # several. Naming it here means the operator does not also have to go
-    # read `resolve_slug`'s own error text to learn that (claude P2 on
-    # head `6c1aea8`).
+    # exact case too — both sides now ask
+    # `proposal_identity.select_proposal_slug`, so reaching this reply means
+    # the choice was genuinely not forced: either every candidate is
+    # `rejected`, or more than one is live. A human resolving the directories
+    # is the only way forward, not one option among several. Naming it here
+    # means the operator does not also have to go read `resolve_slug`'s own
+    # error text to learn that (claude P2 on head `6c1aea8`).
+    #
+    # Note a `rejected` directory beside a live one no longer reaches here at
+    # all: the resolver retires it and the directive dispatches normally, so
+    # the operator is never told to delete something that does not need
+    # deleting (claude P2 on head `90024c3`).
     stale_note = ""
     if stale:
         stale_statuses = ", ".join(sorted({m.status for m in matches if m.status in TERMINAL_STATUSES}))
@@ -512,24 +524,38 @@ async def _handle_directive(
     else:
         number = _issue_number(ref.slug)
         # Deliberately UNFILTERED by status, unlike `scan()`'s own
-        # TERMINAL_STATUSES-excluded `candidates` — matching that filter
-        # here was tried and reverted (claude P2 on head `6c1aea8`): the
-        # actual dispatch target, `run_issue_investigator.resolve_slug` via
-        # `existing_slugs`, is purely directory-name based and
-        # status-agnostic, so it raises `ProposalAmbiguityError` on two
-        # `issue-N-*` directories regardless of either one's status. Filtering
-        # `matches` here without teaching the investigator the same rule made
-        # the poller dispatch a case the investigator refuses — the reply
-        # said "re-investigation started" (with the ack trailer, so it is
-        # never retried) and the Argo workflow then died with nothing posted
-        # back to the issue. Keeping this unfiltered means `_reply_ambiguous`
-        # is the fix instead: it must name which of the matches are stale so
-        # a human knows what to delete, not silently pick a winner the
-        # investigator disagrees with.
+        # TERMINAL_STATUSES-excluded `candidates`: this list is the input to
+        # the shared resolver, which needs to see every directory claiming
+        # the issue — including the terminal ones it is about to retire —
+        # to decide whether the choice is forced.
+        #
+        # Matching `scan()`'s filter here instead was tried and reverted
+        # (claude P2 on head `6c1aea8`), because it made the poller dispatch
+        # a case `run_issue_investigator.resolve_slug` then refused: the
+        # reply said "re-investigation started" (with the ack trailer, so it
+        # is never retried) and the Argo workflow died with nothing posted
+        # back to the issue. That divergence is now closed from the other
+        # end — both this decision and `resolve_slug` route through
+        # `proposal_identity.select_proposal_slug`, so the poller dispatches
+        # exactly the cases the investigator accepts, and refuses exactly
+        # the ones it refuses.
         matches = [r for r in all_refs if r.service == ref.service and _issue_number(r.slug) == number]
+        resolved: str | None = None
+        if matches:
+            try:
+                resolved = select_proposal_slug(
+                    [ProposalCandidate(slug=m.slug, status=m.status) for m in matches]
+                )
+            except AmbiguousProposalError:
+                resolved = None
         if not matches:
             outcome, body = "no-proposal", _reply_no_proposal(directive.author, directive.comment_id)
-        elif len(matches) > 1:
+        elif resolved != ref.slug:
+            # Either the resolver refused, or it named a directory other than
+            # the one being walked. The second cannot happen today (`scan()`
+            # only walks non-terminal refs, and a lone survivor of a
+            # retire-the-rejected pass is that ref), but treating it as
+            # ambiguous keeps this fail-closed if either filter ever moves.
             outcome, body = "ambiguous", _reply_ambiguous(directive.author, directive.comment_id, matches)
         elif ref.status not in _OVERWRITABLE_STATUSES:
             outcome, body = (
