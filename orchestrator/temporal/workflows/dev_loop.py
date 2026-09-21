@@ -179,6 +179,21 @@ APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 MERGE_POLL_INTERVAL = timedelta(minutes=15)
 LEGACY_MERGE_POLL_INTERVAL = timedelta(minutes=30)
 MERGE_WATCH_DEADLINE = timedelta(days=14)
+# #404: a full MERGE_WATCH_DEADLINE watch at MERGE_POLL_INTERVAL accumulates
+# ~15.5k history events, crossing Temporal's default `limit.historyCount.warn`
+# (10,240). The watch hops onto a fresh run via continue_as_new once its
+# history crosses this floor OR the server suggests it
+# (workflow.info().is_continue_as_new_suggested()) -- whichever comes first.
+# The floor is Temporal's own documented `limit.historyCount.suggestContinueAsNew`
+# default, so an empty `temporal-dynamic-config` cannot silently disable the
+# bound, and a test can lower this module constant to force a hop
+# deterministically without depending on server dynamic config.
+MERGE_WATCH_HISTORY_FLOOR = 4096
+# Four times the ~4 hops a complete 14-day watch needs at the floor above.
+# Past this many hops in one watch, the loop logs an error and keeps polling
+# in the CURRENT run until the deadline instead of hopping again: the bound
+# is observational and must never fail the workflow over itself.
+MERGE_WATCH_MAX_HOPS = 16
 # The implementer writes the pr: link into .status.yaml in the same commit
 # that flips it to implemented, so the link should be visible on the first
 # poll. A few polls of grace absorb gitops main lag; after that, a missing
@@ -407,6 +422,20 @@ INCIDENT_POLL_INTERVAL = timedelta(minutes=5)
 @dataclass(frozen=True)
 class IssueRef:
     issue_url: str
+    # Carries the merge-watch continue-as-new state across a hop (#404).
+    # Deliberately a FIELD here rather than a second parameter on
+    # `DevLoopWorkflow.run`: temporalio 1.31.0's `_convert_payloads`
+    # (`_workflow_instance.py`) drops ALL type hints for a workflow-start
+    # call whose payload count does not exactly match `run()`'s declared
+    # parameter count, so a genuine second run() parameter would decode
+    # `issue` itself back as a raw dict on every ONE-argument start — which
+    # is every start `start.py` makes today and every history recorded
+    # before this change. Keeping `run()` at one parameter and adding an
+    # optional field here instead means every payload, old or new, decodes
+    # correctly: a JSON payload missing this key (every existing one) fills
+    # it from this default, exactly like every other backward-compatible
+    # field in this module (see `ImplementExecutionState`).
+    resume: MergeWatchResume | None = None
 
 
 @dataclass(frozen=True)
@@ -764,6 +793,53 @@ def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
         )
 
 
+def _hop_suggested() -> bool:
+    """Has the server, or the local floor backing it up, suggested a hop?
+
+    `workflow.info().is_continue_as_new_suggested` is a METHOD in
+    temporalio 1.31.0 (`temporalio/workflow/_context.py:186`) — reading it
+    WITHOUT calling it is always truthy (a bound method), which is the bug
+    in the issue's own sketch. The local floor does not replace the server
+    signal, it backs it up: MERGE_WATCH_HISTORY_FLOOR is Temporal's own
+    documented `limit.historyCount.suggestContinueAsNew` default, so an
+    empty `temporal-dynamic-config` cannot silently switch the bound off.
+    """
+    info = workflow.info()
+    return info.is_continue_as_new_suggested() or info.get_current_history_length() >= MERGE_WATCH_HISTORY_FLOOR
+
+
+def _should_hop(
+    *,
+    patched: bool,
+    polls_this_run: int,
+    tick_task: asyncio.Task[None] | None,
+    hops: int,
+) -> bool:
+    """Should the merge watch end this run with continue_as_new right now?
+
+    Every gate is load-bearing on its own (design.md, "The hop predicate"):
+
+    - `patched`: an execution whose history predates the
+      `merge-watch-continue-as-new` marker must never take this branch
+      (migration by attrition, like every other marker in this module).
+    - `polls_this_run >= 1`: at least one completed poll in the CURRENT run,
+      so a misconfigured floor cannot produce a continue-as-new storm.
+    - `tick_task is None or tick_task.done()`: never hop with an in-loop
+      shepherd tick in flight — deferring costs one poll, cancelling one
+      could discard a tick that already spawned an implementer run.
+    - `hops < MERGE_WATCH_MAX_HOPS`: past the cap the watch stays in the
+      current run and logs an error instead of hopping again — the bound
+      must never fail the workflow over itself.
+    """
+    return (
+        patched
+        and polls_this_run >= 1
+        and (tick_task is None or tick_task.done())
+        and hops < MERGE_WATCH_MAX_HOPS
+        and _hop_suggested()
+    )
+
+
 @dataclass(frozen=True)
 class ImplementExecutionState:
     """What THIS workflow knows about its implement step, for #389.
@@ -783,6 +859,96 @@ class ImplementExecutionState:
     prestart_requeues: int = 0
     # success | pre_start | execution | finalization, once the step ended.
     outcome: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeWatchResume:
+    """Everything a continue-as-new hop of the merge watch carries (#404).
+
+    Every field is defaulted — this crosses the continue-as-new boundary as
+    a plain workflow argument, so it has to survive the payload converter
+    like any other input. Four groups, each carried rather than recomputed,
+    because recomputing any of them on the far side of the hop would either
+    reset a bound (the deadline) or silently adopt a decision the run being
+    replaced never made:
+
+    - **Watch cursor**: where the poll loop was.
+    - **Decisions already taken**: which patch-marker branches the FIRST run
+      took, carried as data so a new image deployed mid-watch cannot change
+      the shape of a watch already running (design.md's residual risk).
+    - **Lifecycle claim**: every field the `lifecycle_claim` and
+      `shepherd_in_loop` queries answer from, and everything
+      `_track_ownership` needs to keep behaving as if it had never stopped.
+      This is the sharpest failure mode named in design.md: a hop that
+      forgot any of these could make `run_shepherd._dev_loop_owns_answer`
+      believe this loop stood down, and put a cron shepherd beside it.
+    - **Prior stage results**: so the final `DevLoopResult` reports what the
+      FIRST run actually did, not a hop-shaped lie about it.
+    """
+
+    # --- Watch cursor ---
+    service: str = ""
+    slug: str = ""
+    # ISO-8601 Z. The ABSOLUTE deadline the first run computed. Never
+    # recomputed from workflow.now() on a hop, or an intentionally bounded
+    # 14-day watch would reset its clock on every continue-as-new.
+    deadline: str = ""
+    last_pr: PRState | None = None
+    polls_without_pr: int = 0
+    poll_index: int = 0
+    shepherd_ticks: int = 0
+
+    # --- Decisions already taken, in place of the fast-shepherd-cadence,
+    # shepherd-in-loop, concurrent-shepherd-tick and lifecycle-ownership
+    # patch markers, which a continued run must NOT re-evaluate. ---
+    fast_cadence: bool = True
+    shepherd_in_loop: bool = False
+    concurrent_ticks: bool = False
+    track_ownership: bool = False
+
+    # --- Lifecycle claim (mirrors DevLoopWorkflow.__init__'s own fields) ---
+    owned_entity_id: str = ""
+    owner_epoch: int = 0
+    owned_head_sha: str = ""
+    poll_index_for_heartbeat: int = 0
+    claim_refused: bool = False
+    claim_refused_until_poll: int = 0
+    refused_by_type: str = ""
+    refused_by_id: str = ""
+    refusals_observed: int = 0
+    unknown_acquires: int = 0
+    unknown_progress: int = 0
+    unknown_heartbeats: int = 0
+    proposal_ref: str = ""
+    policy_ref: str = ""
+    last_lifecycle_op: str = ""
+    last_lifecycle_op_landed: bool = False
+    claim_abandoned: bool = False
+
+    # --- Prior stage results and bookkeeping ---
+    investigate: WorkflowResult | None = None
+    implement: WorkflowResult | None = None
+    approve: WorkflowResult | None = None
+    implement_state: ImplementExecutionState = field(default_factory=ImplementExecutionState)
+    # How many hops this watch has already made, INCLUDING the one this
+    # record is for. Compared against MERGE_WATCH_MAX_HOPS so the bound
+    # is per-WATCH, not per-run.
+    hops: int = 0
+
+
+@dataclass(frozen=True)
+class _WatchOutcome:
+    """What `_watch_pr` decided at the end of one run.
+
+    `resume` non-None means the watch is hopping: `_watch_pr` never calls
+    `continue_as_new` itself, because raising it from inside the loop's own
+    try/finally would unwind through the relinquishing lifecycle write (see
+    design.md's "This is the load-bearing structural decision"). `run` is
+    the one that actually ends the run, once its own finally has run.
+    """
+
+    last: PRState | None
+    resume: MergeWatchResume | None = None
 
 
 @workflow.defn
@@ -883,213 +1049,279 @@ class DevLoopWorkflow:
 
     @workflow.run
     async def run(self, issue: IssueRef) -> DevLoopResult:
+        # `resume` travels as a FIELD of `issue`, not a second parameter of
+        # this method — see `IssueRef.resume`'s comment for why a genuine
+        # second parameter would break argument decoding for every
+        # one-argument start (which is every start ever recorded, plus
+        # every fresh one `start.py` makes).
+        resume = issue.resume
         target_repo = _target_repo(issue)
-
-        # Pin the investigator version ONCE, at the start of this step. A
-        # later promote/rollback in the registry must not retroactively
-        # change what an in-flight (or replayed) workflow already ran.
-        investigator_release = _require_release(
-            "issue-investigator", await _resolve("issue-investigator")
-        )
-        investigate_params = {"issue_url": issue.issue_url}
-        if investigator_release and investigator_release.image_ref:
-            investigate_params["agent_image"] = investigator_release.image_ref
-            investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
-
-        investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
-        await _record("issue-investigator", investigator_release, investigate_result, target_repo)
-
-        if not investigate_result.succeeded:
-            return DevLoopResult(investigate=investigate_result, implement=None)
-
-        # Durable wait: this workflow can sit here for days without costing
-        # anything beyond Temporal's own history storage — exactly the
-        # "durable per-issue state" the plan's problem statement calls out
-        # as missing from the current polling-cron pipeline.
-        await workflow.wait_condition(lambda: self._approved)
-
-        # mctl-agents#410: the durable wait above has no upper bound, so the
-        # issue that started this loop can close while it sits parked --
-        # reopened elsewhere, superseded, or resolved directly. Check BEFORE
-        # find_proposal_slug and BEFORE the mctl-agents-approve CWFT below,
-        # so a closed issue is never spent flipping a proposal to `accepted`
-        # (and then implementing it) for a reason that is already gone.
-        #
-        # workflow.patched: get_issue_state is a brand-new command in every
-        # position it could go, so an unpatched (pre-existing) history must
-        # take the legacy branch untouched -- inserting it unconditionally
-        # would be a command mismatch that wedges every in-flight approved
-        # loop on replay, the same hazard slug-scoped-implement's own guard
-        # exists to avoid two paragraphs down.
-        if workflow.patched("stale-issue-admission"):
-            issue_parts = parse_issue_url(issue.issue_url)
-            issue_repo = f"{issue_parts.owner}/{issue_parts.repo}"
-            issue_number_int = int(issue_parts.number)
-            issue_state: IssueState | None = None
-            try:
-                issue_state = await workflow.execute_activity(
-                    get_issue_state,
-                    args=[issue_repo, issue_number_int],
-                    start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-                    retry_policy=FAST_ACTIVITY_RETRY_POLICY,
-                )
-            except ActivityError:
-                # Fail-open on the workflow side: the implementer's own
-                # admission gate (mctl-agents#410's other half) is the
-                # authoritative check. Wedging every loop parked at approval
-                # on a GitHub blip here is worse than letting one proceed to
-                # a refusal it would hit downstream anyway.
-                workflow.logger.warning(
-                    "get_issue_state failed after retries for %s#%s -- "
-                    "proceeding without the pre-approve stale-issue check",
-                    issue_repo,
-                    issue_number_int,
-                )
-            if issue_state is not None and issue_state.state == "closed":
-                return DevLoopResult(
-                    investigate=investigate_result,
-                    implement=None,
-                    approve=None,
-                )
-
-        # Scoped to this issue's own proposal, not just its repo. Service
-        # scoping alone left a same-repo race: two approved loops for the
-        # same repo both discovered the full accepted list from their own
-        # (stale) gitops clones, claimed overlapping proposals, and their
-        # commit-and-push steps rebase-conflicted on each other's
-        # .status.yaml (2026-08-28, mctl-portal 79/80 — mctl-agents#203).
-        # With the slug pinned, concurrent same-repo loops touch disjoint
-        # proposal dirs and the commit step's rebase-retry stays clean.
-        #
-        # Failing loudly beats falling back to an unscoped run: unscoped,
-        # this loop could implement a DIFFERENT accepted proposal in the
-        # repo — the exact wrong-proposal hazard scoping exists to prevent.
-        # The proposal must exist by now (investigate committed it before
-        # this workflow ever reached wait_condition), so a missing slug
-        # after retries means agents-state is in a state a human needs to
-        # look at anyway.
-        # workflow.patched: histories recorded before this change scheduled
-        # submit_and_wait directly after the implementer resolve — replaying
-        # them through an unconditional find_proposal_slug would be a command
-        # mismatch (nondeterminism) that permanently wedges every in-flight
-        # approved loop at deploy time. Old histories take the legacy
-        # unscoped branch; new executions record the patch marker and get
-        # slug scoping. Drop to workflow.deprecate_patch once no pre-patch
-        # execution can still be running.
         slug: str | None = None
+        investigate_result: WorkflowResult | None = None
+        implement_result: WorkflowResult | None = None
         approve_result: WorkflowResult | None = None
-        implementer_release: ResolvedRelease | None = None
-        # Evaluate the atomic-approve patch ONCE, up front, because it also
-        # decides the position of the implementer resolve. Histories from the
-        # slug-scoped-but-pre-approve era (1.29.2..1.29.4) recorded
-        # resolve → slug-lookup → implement; unconditionally moving the
-        # resolve after the flip would be a command mismatch that wedges
-        # every such in-flight loop on replay (codex P1 round 2, PR #212).
-        # patched() returns a stable answer per execution, so both branches
-        # below see the same value.
-        atomic_approve = workflow.patched("atomic-approve")
-        if not atomic_approve:
-            # Legacy position: pre-atomic-approve histories resolved the
-            # implementer before the slug lookup — keep their command order.
-            implementer_release = _require_release("implementer", await _resolve("implementer"))
-        if workflow.patched("slug-scoped-implement"):
-            issue_number = parse_issue_url(issue.issue_url).number
-            slug = await workflow.execute_activity(
-                find_proposal_slug,
-                args=[target_repo, issue_number],
-                start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
-                retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+        watch_outcome: _WatchOutcome | None = None
+
+        if resume is not None:
+            # A continued run (#404's continue-as-new hop). Every
+            # query-visible and lifecycle-claim field is rehydrated BEFORE
+            # the first await, so `implement_execution`, `shepherd_in_loop`
+            # and `lifecycle_claim` all answer as the run this one replaces
+            # would have, from the very first workflow task of the new run
+            # (design.md's sharpest named risk: a hop that forgot any of
+            # this could make run_shepherd._dev_loop_owns_answer believe
+            # this loop stood down). Investigate, the approve wait, the
+            # stale-issue admission check, find_proposal_slug, the approve
+            # CWFT and the implement submit are all skipped — this run's
+            # only job is to keep watching.
+            self._implement_state = resume.implement_state
+            self._shepherd_in_loop = resume.shepherd_in_loop
+            self._owned_entity_id = resume.owned_entity_id
+            self._owner_epoch = resume.owner_epoch
+            self._owned_head_sha = resume.owned_head_sha
+            self._poll_index_for_heartbeat = resume.poll_index_for_heartbeat
+            self._claim_refused = resume.claim_refused
+            self._claim_refused_until_poll = resume.claim_refused_until_poll
+            self._refused_by_type = resume.refused_by_type
+            self._refused_by_id = resume.refused_by_id
+            self._refusals_observed = resume.refusals_observed
+            self._unknown_acquires = resume.unknown_acquires
+            self._unknown_progress = resume.unknown_progress
+            self._unknown_heartbeats = resume.unknown_heartbeats
+            self._proposal_ref = resume.proposal_ref
+            self._policy_ref = resume.policy_ref
+            self._last_lifecycle_op = resume.last_lifecycle_op
+            self._last_lifecycle_op_landed = resume.last_lifecycle_op_landed
+            self._claim_abandoned = resume.claim_abandoned
+
+            slug = resume.slug
+            investigate_result = resume.investigate
+            implement_result = resume.implement
+            approve_result = resume.approve
+            watch_outcome = await self._watch_pr(target_repo, resume.slug, resume)
+        else:
+            # Pin the investigator version ONCE, at the start of this step. A
+            # later promote/rollback in the registry must not retroactively
+            # change what an in-flight (or replayed) workflow already ran.
+            investigator_release = _require_release(
+                "issue-investigator", await _resolve("issue-investigator")
             )
-            if not slug:
-                raise ApplicationError(
-                    f"no proposal dir issue-{issue_number}-* found under "
-                    f"agents-state/{target_repo}/proposals on gitops main; "
-                    "refusing an unscoped implement run",
-                    non_retryable=True,
-                )
-            # Atomic approve (phase-5 cutover, mctl-agents#150): flip THIS
-            # proposal proposed → accepted as an Argo-executed gitops commit,
-            # instead of relying on the operator's manual edit. Nested inside
-            # the slug-scoped branch because the flip needs the slug, and any
-            # execution new enough to record this patch marker records the
-            # outer one too; old in-flight histories replay the legacy
-            # signal-only path (manual flip stays their affordance). The CWFT
-            # is idempotent on already-accepted, so a Temporal retry or a
-            # racing manual approve is a successful no-op — but any other
-            # failure (missing proposal dir, unexpected status, push failure)
-            # stops the loop HERE: proceeding to implement without a durable
-            # accepted status would just be a silent no-op run.
-            if atomic_approve:
-                approve_result = await _run_cwft(
-                    "mctl-agents-approve",
-                    {
-                        "service": target_repo,
-                        "slug": slug,
-                        "approver": self._approver or "unknown",
-                    },
-                    step_timeout=APPROVE_STEP_TIMEOUT,
-                )
-                # No record_execution here: the executions ledger is for
-                # SDK-backed agent runs (see docs/agent-inventory.yaml), and
-                # this deterministic flip is already triply audited — the
-                # .status.yaml approval block, the gitops commit message,
-                # and this workflow's own history all carry the approver.
-                if not approve_result.succeeded:
+            investigate_params = {"issue_url": issue.issue_url}
+            if investigator_release and investigator_release.image_ref:
+                investigate_params["agent_image"] = investigator_release.image_ref
+                investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
+
+            investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
+            await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+
+            if not investigate_result.succeeded:
+                return DevLoopResult(investigate=investigate_result, implement=None)
+
+            # Durable wait: this workflow can sit here for days without costing
+            # anything beyond Temporal's own history storage — exactly the
+            # "durable per-issue state" the plan's problem statement calls out
+            # as missing from the current polling-cron pipeline.
+            await workflow.wait_condition(lambda: self._approved)
+
+            # mctl-agents#410: the durable wait above has no upper bound, so the
+            # issue that started this loop can close while it sits parked --
+            # reopened elsewhere, superseded, or resolved directly. Check BEFORE
+            # find_proposal_slug and BEFORE the mctl-agents-approve CWFT below,
+            # so a closed issue is never spent flipping a proposal to `accepted`
+            # (and then implementing it) for a reason that is already gone.
+            #
+            # workflow.patched: get_issue_state is a brand-new command in every
+            # position it could go, so an unpatched (pre-existing) history must
+            # take the legacy branch untouched -- inserting it unconditionally
+            # would be a command mismatch that wedges every in-flight approved
+            # loop on replay, the same hazard slug-scoped-implement's own guard
+            # exists to avoid two paragraphs down.
+            if workflow.patched("stale-issue-admission"):
+                issue_parts = parse_issue_url(issue.issue_url)
+                issue_repo = f"{issue_parts.owner}/{issue_parts.repo}"
+                issue_number_int = int(issue_parts.number)
+                issue_state: IssueState | None = None
+                try:
+                    issue_state = await workflow.execute_activity(
+                        get_issue_state,
+                        args=[issue_repo, issue_number_int],
+                        start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                        retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+                    )
+                except ActivityError:
+                    # Fail-open on the workflow side: the implementer's own
+                    # admission gate (mctl-agents#410's other half) is the
+                    # authoritative check. Wedging every loop parked at approval
+                    # on a GitHub blip here is worse than letting one proceed to
+                    # a refusal it would hit downstream anyway.
+                    workflow.logger.warning(
+                        "get_issue_state failed after retries for %s#%s -- "
+                        "proceeding without the pre-approve stale-issue check",
+                        issue_repo,
+                        issue_number_int,
+                    )
+                if issue_state is not None and issue_state.state == "closed":
                     return DevLoopResult(
                         investigate=investigate_result,
                         implement=None,
-                        approve=approve_result,
+                        approve=None,
                     )
-        if atomic_approve:
-            # Resolve the implementer only AFTER the approval flip is
-            # durable: _resolve can fail permanently (registry outage
-            # outlasting its five retries), and if that happened before the
-            # flip, the operator's approval would evaporate with the failed
-            # workflow (codex P1 on PR #212). The reverse case — the gate
-            # below failing AFTER the flip — leaves an accepted proposal
-            # that never implements. Recovery is to publish the missing
-            # release and re-add the intake label: ALLOW_DUPLICATE_FAILED_ONLY
-            # lets the issue start again, and the approve CWFT is a no-op on
-            # an already-accepted proposal. It is a restart, not a resume —
-            # the new run re-investigates and waits for a fresh approve
-            # signal, and if the issue TITLE changed in between, the
-            # investigator derives a different slug and find_proposal_slug
-            # then refuses the ambiguous issue-<N>-* match (codex P2). Both
-            # are acceptable for a misconfiguration that should not happen
-            # once every release refreshes the registry, and neither is
-            # silent. Pre-atomic-approve histories already resolved above,
-            # in their recorded position.
-            implementer_release = _require_release("implementer", await _resolve("implementer"))
-        #
-        # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
-        # declaring this `service` parameter and threading it to
-        # `run_implementer.py --service <value>` — verified directly
-        # (not assumed) as of this comment: see
-        # cwft-mctl-agents-implement.yaml's `arguments.parameters` (name:
-        # service) and its `implement-proposals` step, which does
-        # `[ -n "$WORKFLOW_SERVICE" ] && set -- "$@" --service "$WORKFLOW_SERVICE"`
-        # before invoking run_implementer.py. mctl-agents' CI can't check
-        # this out to assert it directly (mctl-gitops is a sibling repo), so
-        # if that CWFT is ever changed to drop/rename the parameter, this
-        # scoping silently reverts to today's unscoped behavior with no
-        # error on this side.
-        implement_params: dict[str, str] = {"service": target_repo}
-        if slug:
-            implement_params["slug"] = slug
-        if implementer_release and implementer_release.image_ref:
-            implement_params["agent_image"] = implementer_release.image_ref
-            implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
-        implement_result = await self._implement(implementer_release, implement_params, target_repo)
+            # Scoped to this issue's own proposal, not just its repo. Service
+            # scoping alone left a same-repo race: two approved loops for the
+            # same repo both discovered the full accepted list from their own
+            # (stale) gitops clones, claimed overlapping proposals, and their
+            # commit-and-push steps rebase-conflicted on each other's
+            # .status.yaml (2026-08-28, mctl-portal 79/80 — mctl-agents#203).
+            # With the slug pinned, concurrent same-repo loops touch disjoint
+            # proposal dirs and the commit step's rebase-retry stays clean.
+            #
+            # Failing loudly beats falling back to an unscoped run: unscoped,
+            # this loop could implement a DIFFERENT accepted proposal in the
+            # repo — the exact wrong-proposal hazard scoping exists to prevent.
+            # The proposal must exist by now (investigate committed it before
+            # this workflow ever reached wait_condition), so a missing slug
+            # after retries means agents-state is in a state a human needs to
+            # look at anyway.
+            # workflow.patched: histories recorded before this change scheduled
+            # submit_and_wait directly after the implementer resolve — replaying
+            # them through an unconditional find_proposal_slug would be a command
+            # mismatch (nondeterminism) that permanently wedges every in-flight
+            # approved loop at deploy time. Old histories take the legacy
+            # unscoped branch; new executions record the patch marker and get
+            # slug scoping. Drop to workflow.deprecate_patch once no pre-patch
+            # execution can still be running.
+            implementer_release: ResolvedRelease | None = None
+            # Evaluate the atomic-approve patch ONCE, up front, because it also
+            # decides the position of the implementer resolve. Histories from the
+            # slug-scoped-but-pre-approve era (1.29.2..1.29.4) recorded
+            # resolve → slug-lookup → implement; unconditionally moving the
+            # resolve after the flip would be a command mismatch that wedges
+            # every such in-flight loop on replay (codex P1 round 2, PR #212).
+            # patched() returns a stable answer per execution, so both branches
+            # below see the same value.
+            atomic_approve = workflow.patched("atomic-approve")
+            if not atomic_approve:
+                # Legacy position: pre-atomic-approve histories resolved the
+                # implementer before the slug lookup — keep their command order.
+                implementer_release = _require_release("implementer", await _resolve("implementer"))
+            if workflow.patched("slug-scoped-implement"):
+                issue_number = parse_issue_url(issue.issue_url).number
+                slug = await workflow.execute_activity(
+                    find_proposal_slug,
+                    args=[target_repo, issue_number],
+                    start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+                    retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+                )
+                if not slug:
+                    raise ApplicationError(
+                        f"no proposal dir issue-{issue_number}-* found under "
+                        f"agents-state/{target_repo}/proposals on gitops main; "
+                        "refusing an unscoped implement run",
+                        non_retryable=True,
+                    )
+                # Atomic approve (phase-5 cutover, mctl-agents#150): flip THIS
+                # proposal proposed → accepted as an Argo-executed gitops commit,
+                # instead of relying on the operator's manual edit. Nested inside
+                # the slug-scoped branch because the flip needs the slug, and any
+                # execution new enough to record this patch marker records the
+                # outer one too; old in-flight histories replay the legacy
+                # signal-only path (manual flip stays their affordance). The CWFT
+                # is idempotent on already-accepted, so a Temporal retry or a
+                # racing manual approve is a successful no-op — but any other
+                # failure (missing proposal dir, unexpected status, push failure)
+                # stops the loop HERE: proceeding to implement without a durable
+                # accepted status would just be a silent no-op run.
+                if atomic_approve:
+                    approve_result = await _run_cwft(
+                        "mctl-agents-approve",
+                        {
+                            "service": target_repo,
+                            "slug": slug,
+                            "approver": self._approver or "unknown",
+                        },
+                        step_timeout=APPROVE_STEP_TIMEOUT,
+                    )
+                    # No record_execution here: the executions ledger is for
+                    # SDK-backed agent runs (see docs/agent-inventory.yaml), and
+                    # this deterministic flip is already triply audited — the
+                    # .status.yaml approval block, the gitops commit message,
+                    # and this workflow's own history all carry the approver.
+                    if not approve_result.succeeded:
+                        return DevLoopResult(
+                            investigate=investigate_result,
+                            implement=None,
+                            approve=approve_result,
+                        )
+            if atomic_approve:
+                # Resolve the implementer only AFTER the approval flip is
+                # durable: _resolve can fail permanently (registry outage
+                # outlasting its five retries), and if that happened before the
+                # flip, the operator's approval would evaporate with the failed
+                # workflow (codex P1 on PR #212). The reverse case — the gate
+                # below failing AFTER the flip — leaves an accepted proposal
+                # that never implements. Recovery is to publish the missing
+                # release and re-add the intake label: ALLOW_DUPLICATE_FAILED_ONLY
+                # lets the issue start again, and the approve CWFT is a no-op on
+                # an already-accepted proposal. It is a restart, not a resume —
+                # the new run re-investigates and waits for a fresh approve
+                # signal, and if the issue TITLE changed in between, the
+                # investigator derives a different slug and find_proposal_slug
+                # then refuses the ambiguous issue-<N>-* match (codex P2). Both
+                # are acceptable for a misconfiguration that should not happen
+                # once every release refreshes the registry, and neither is
+                # silent. Pre-atomic-approve histories already resolved above,
+                # in their recorded position.
+                implementer_release = _require_release("implementer", await _resolve("implementer"))
+            #
+            # Depends on mctl-gitops's cwft-mctl-agents-implement.yaml already
+            # declaring this `service` parameter and threading it to
+            # `run_implementer.py --service <value>` — verified directly
+            # (not assumed) as of this comment: see
+            # cwft-mctl-agents-implement.yaml's `arguments.parameters` (name:
+            # service) and its `implement-proposals` step, which does
+            # `[ -n "$WORKFLOW_SERVICE" ] && set -- "$@" --service "$WORKFLOW_SERVICE"`
+            # before invoking run_implementer.py. mctl-agents' CI can't check
+            # this out to assert it directly (mctl-gitops is a sibling repo), so
+            # if that CWFT is ever changed to drop/rename the parameter, this
+            # scoping silently reverts to today's unscoped behavior with no
+            # error on this side.
+            implement_params: dict[str, str] = {"service": target_repo}
+            if slug:
+                implement_params["slug"] = slug
+            if implementer_release and implementer_release.image_ref:
+                implement_params["agent_image"] = implementer_release.image_ref
+                implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
-        # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
-        # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
-        # the slug (the PR is resolved from this proposal's .status.yaml);
-        # any execution new enough to record this marker also recorded
-        # slug-scoped-implement, so slug is set whenever the branch is taken.
-        pr_state: PRState | None = None
-        if workflow.patched("merge-detection") and implement_result.succeeded and slug:
-            pr_state = await self._watch_pr(target_repo, slug)
+            implement_result = await self._implement(implementer_release, implement_params, target_repo)
+
+            # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
+            # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
+            # the slug (the PR is resolved from this proposal's .status.yaml);
+            # any execution new enough to record this marker also recorded
+            # slug-scoped-implement, so slug is set whenever the branch is taken.
+            if workflow.patched("merge-detection") and implement_result.succeeded and slug:
+                watch_outcome = await self._watch_pr(target_repo, slug)
+
+        # #404: the watch decided to end THIS run with continue_as_new rather
+        # than a terminal PR state. `_watch_pr`'s own finally has already run
+        # by the time its outcome is returned here (skipping the relinquishing
+        # lifecycle write, since the claim is simply carried forward) — so
+        # nothing below this line has touched the claim or the result stages
+        # yet, and ending the run right here is safe. `continue_as_new` raises;
+        # it is never awaited.
+        if watch_outcome is not None and watch_outcome.resume is not None:
+            hop = dataclasses.replace(
+                watch_outcome.resume,
+                investigate=investigate_result,
+                implement=implement_result,
+                approve=approve_result,
+                implement_state=self._implement_state,
+            )
+            # A single argument, always -- see IssueRef.resume's comment.
+            workflow.continue_as_new(dataclasses.replace(issue, resume=hop))
+
+        pr_state: PRState | None = watch_outcome.last if watch_outcome is not None else None
 
         # Stages 6.2/6.3 (ADR-006, #215): only a merged PR produces a
         # release to observe. A closed-unmerged or still-open PR ends the
@@ -1120,6 +1352,12 @@ class DevLoopWorkflow:
         ):
             incidents = await self._watch_incidents(deploy.app, watch_since)
 
+        # investigate_result is None only along paths that already returned
+        # above (investigate failed, the stale-issue gate, a failed approve
+        # flip) — reaching here means either the fresh-start branch recorded
+        # a real result or the resume branch carried one from the run before
+        # it.
+        assert investigate_result is not None  # noqa: S101
         return DevLoopResult(
             investigate=investigate_result,
             implement=implement_result,
@@ -2430,90 +2668,224 @@ class DevLoopWorkflow:
             and self._poll_index_for_heartbeat % self._cadence.heartbeat_every_polls != 0
         )
 
-    async def _watch_pr(self, service: str, slug: str) -> PRState | None:
-        """Poll get_pr_state until the PR reaches a terminal state.
+    async def _watch_pr(
+        self, service: str, slug: str, resume: MergeWatchResume | None = None
+    ) -> _WatchOutcome:
+        """Poll get_pr_state until the PR reaches a terminal state, hopping
+        the watch onto a fresh run via continue_as_new before its own
+        history grows unbounded (#404).
 
         Observational, fail-open: a persistently failing read (GitHub outage
         outlasting the activity retries) returns the last known state
         instead of failing a loop whose implement already succeeded. Returns
-        None when no PR link ever appeared within the grace polls.
+        a `_WatchOutcome` with `last=None` when no PR link ever appeared
+        within the grace polls, and with `resume` set (never alongside a
+        terminal `last`) when the watch decided to hop rather than end.
+
+        ``resume`` non-None means this is a continued run: the watch cursor,
+        the cadence/shepherd/ownership decisions and the lifecycle claim all
+        come from it rather than from workflow.now() or a freshly-evaluated
+        patch marker — see design.md's "Arithmetic" and "Cadence and
+        constants" for why recomputing any of it here would either reset the
+        14-day bound or silently adopt a different decision than the run
+        this one replaces.
         """
-        deadline = workflow.now() + MERGE_WATCH_DEADLINE
-        polls_without_pr = 0
-        last: PRState | None = None
-        # In-loop shepherd (#213): evaluated once — the marker also fixes
-        # whether tick commands appear in this execution's history at all.
-        # Poll interval, tick cadence and every poll COUNT below, as one
-        # value (#213 follow-up). Its own marker because it changes both the
-        # timer durations and the number of activities a poll schedules: an
-        # execution recorded under the old 30-min/4-h cadence must keep
-        # replaying it, and `_Cadence` is what lets it.
-        cadence = CADENCE if workflow.patched("fast-shepherd-cadence") else LEGACY_CADENCE
-        self._cadence = cadence
-        shepherd_in_loop = workflow.patched("shepherd-in-loop")
-        # Published to the sweeper via the shepherd_in_loop query the moment
-        # the watch starts, not at the first tick a poll later: between those
-        # two points this execution IS the owner, and the cron must already
-        # be standing down.
-        if shepherd_in_loop and not await _shepherd_is_pinned():
-            # Decline the claim rather than fail (round 2 on #241). The
-            # first fix raised here, which failed the whole workflow after
-            # investigate, approve and implement had all succeeded —
-            # contradicting this function's own fail-open contract and
-            # throwing away merge detection and deploy observation over a
-            # tick that is an optimisation, not correctness. But it cannot
-            # simply be left to _shepherd_tick either: that runs as a
-            # background task whose exceptions it swallows, so the loop
-            # would keep answering shepherd_in_loop=True while the sweeper
-            # stood down and nothing shepherded the PR for 14 days (codex
-            # P1, claude P2). Declining gives the same protection with no
-            # loss: nothing runs unpinned, and the cron sweeper picks the
-            # proposal up exactly as it did before #213.
-            workflow.logger.warning(
-                "no released shepherd image — %s/%s keeps watching but leaves "
-                "shepherding to the cron sweeper",
-                service,
-                slug,
-            )
-            shepherd_in_loop = False
-        self._shepherd_in_loop = shepherd_in_loop
-        # #231: run the tick concurrently so polling continues while it
-        # runs. Awaiting it inline stalled merge detection for the tick's
-        # whole duration — up to the 2 h SDK_STEP_TIMEOUT when the shepherd
-        # spawns a follow-up implementation, against a 30-min poll
-        # interval. Its own marker, because it changes the ORDER of
-        # commands in history: executions that already recorded a
-        # sequential tick must keep replaying one.
-        concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
-        # Lifecycle ownership (mctlhq/.github#57). Gated on the same claim as
-        # the in-loop shepherd: if this execution declined to shepherd, the
-        # cron sweeper owns the PR and this loop must not record itself as the
-        # owner. Its own marker, because it adds commands to history.
-        track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
-        # NOTE (ADR-010 phase 2, #352): there is deliberately no
-        # "lifecycle-claims" patch marker here. This PR reverted the watch-end
-        # write to a bare `release` because nothing in this repository calls
-        # `handoff/complete` yet, so the branch the marker would gate does not
-        # exist. A `workflow.patched` call writes a marker into EVERY new
-        # execution's history and can only be retired through
-        # `deprecate_patch` plus a second deploy — a cost with no branch to
-        # pay for. The marker belongs in the change that actually ships the
-        # handoff (#353), where it will guard a real fork in behaviour.
-        if track_ownership:
-            # ADR-010 §12 asks for the resolved policy to be recorded on the
-            # row, so "why does this actor own it" is answerable without
-            # reconstructing a CWFT env var in another repository. Both are
-            # derived here, once, because this is where service and slug are
-            # in scope — and both are plain strings, so no policy lookup runs
-            # inside workflow code.
-            self._proposal_ref = f"{service}/{slug}"
-            self._policy_ref = f"devloop:{service}"
+        # Evaluated once per run, like every other marker below: an
+        # execution whose history predates this marker (a fresh start OR a
+        # resume — impossible in practice, since a resume only exists on an
+        # execution that already recorded this marker) never takes the hop
+        # branch, so it keeps polling in one run exactly as today (migration
+        # by attrition).
+        hop_patched = workflow.patched("merge-watch-continue-as-new")
+
+        if resume is not None:
+            deadline = _as_utc(resume.deadline)
+            polls_without_pr = resume.polls_without_pr
+            last: PRState | None = resume.last_pr
+            cadence = CADENCE if resume.fast_cadence else LEGACY_CADENCE
+            self._cadence = cadence
+            shepherd_in_loop = resume.shepherd_in_loop
+            self._shepherd_in_loop = shepherd_in_loop
+            concurrent_ticks = resume.concurrent_ticks
+            track_ownership = resume.track_ownership
+            if track_ownership:
+                self._proposal_ref = resume.proposal_ref
+                self._policy_ref = resume.policy_ref
+            poll_index = resume.poll_index
+            shepherd_ticks = resume.shepherd_ticks
+            hops = resume.hops
+            # Lifecycle claim: rehydrated here too (not just in `run`) so a
+            # direct unit test that drives `_watch_pr` on a bare instance —
+            # as TestTickSettling does for the tick helpers — sees the same
+            # state `run` would have given it.
+            self._owned_entity_id = resume.owned_entity_id
+            self._owner_epoch = resume.owner_epoch
+            self._owned_head_sha = resume.owned_head_sha
+            self._poll_index_for_heartbeat = resume.poll_index_for_heartbeat
+            self._claim_refused = resume.claim_refused
+            self._claim_refused_until_poll = resume.claim_refused_until_poll
+            self._refused_by_type = resume.refused_by_type
+            self._refused_by_id = resume.refused_by_id
+            self._refusals_observed = resume.refusals_observed
+            self._unknown_acquires = resume.unknown_acquires
+            self._unknown_progress = resume.unknown_progress
+            self._unknown_heartbeats = resume.unknown_heartbeats
+            self._last_lifecycle_op = resume.last_lifecycle_op
+            self._last_lifecycle_op_landed = resume.last_lifecycle_op_landed
+            self._claim_abandoned = resume.claim_abandoned
+        else:
+            deadline = workflow.now() + MERGE_WATCH_DEADLINE
+            polls_without_pr = 0
+            last = None
+            # In-loop shepherd (#213): evaluated once — the marker also fixes
+            # whether tick commands appear in this execution's history at all.
+            # Poll interval, tick cadence and every poll COUNT below, as one
+            # value (#213 follow-up). Its own marker because it changes both the
+            # timer durations and the number of activities a poll schedules: an
+            # execution recorded under the old 30-min/4-h cadence must keep
+            # replaying it, and `_Cadence` is what lets it.
+            cadence = CADENCE if workflow.patched("fast-shepherd-cadence") else LEGACY_CADENCE
+            self._cadence = cadence
+            shepherd_in_loop = workflow.patched("shepherd-in-loop")
+            # Published to the sweeper via the shepherd_in_loop query the moment
+            # the watch starts, not at the first tick a poll later: between those
+            # two points this execution IS the owner, and the cron must already
+            # be standing down.
+            if shepherd_in_loop and not await _shepherd_is_pinned():
+                # Decline the claim rather than fail (round 2 on #241). The
+                # first fix raised here, which failed the whole workflow after
+                # investigate, approve and implement had all succeeded —
+                # contradicting this function's own fail-open contract and
+                # throwing away merge detection and deploy observation over a
+                # tick that is an optimisation, not correctness. But it cannot
+                # simply be left to _shepherd_tick either: that runs as a
+                # background task whose exceptions it swallows, so the loop
+                # would keep answering shepherd_in_loop=True while the sweeper
+                # stood down and nothing shepherded the PR for 14 days (codex
+                # P1, claude P2). Declining gives the same protection with no
+                # loss: nothing runs unpinned, and the cron sweeper picks the
+                # proposal up exactly as it did before #213.
+                workflow.logger.warning(
+                    "no released shepherd image — %s/%s keeps watching but leaves "
+                    "shepherding to the cron sweeper",
+                    service,
+                    slug,
+                )
+                shepherd_in_loop = False
+            self._shepherd_in_loop = shepherd_in_loop
+            # #231: run the tick concurrently so polling continues while it
+            # runs. Awaiting it inline stalled merge detection for the tick's
+            # whole duration — up to the 2 h SDK_STEP_TIMEOUT when the shepherd
+            # spawns a follow-up implementation, against a 30-min poll
+            # interval. Its own marker, because it changes the ORDER of
+            # commands in history: executions that already recorded a
+            # sequential tick must keep replaying one.
+            concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
+            # Lifecycle ownership (mctlhq/.github#57). Gated on the same claim as
+            # the in-loop shepherd: if this execution declined to shepherd, the
+            # cron sweeper owns the PR and this loop must not record itself as the
+            # owner. Its own marker, because it adds commands to history.
+            track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
+            # NOTE (ADR-010 phase 2, #352): there is deliberately no
+            # "lifecycle-claims" patch marker here. This PR reverted the watch-end
+            # write to a bare `release` because nothing in this repository calls
+            # `handoff/complete` yet, so the branch the marker would gate does not
+            # exist. A `workflow.patched` call writes a marker into EVERY new
+            # execution's history and can only be retired through
+            # `deprecate_patch` plus a second deploy — a cost with no branch to
+            # pay for. The marker belongs in the change that actually ships the
+            # handoff (#353), where it will guard a real fork in behaviour.
+            if track_ownership:
+                # ADR-010 §12 asks for the resolved policy to be recorded on the
+                # row, so "why does this actor own it" is answerable without
+                # reconstructing a CWFT env var in another repository. Both are
+                # derived here, once, because this is where service and slug are
+                # in scope — and both are plain strings, so no policy lookup runs
+                # inside workflow code.
+                self._proposal_ref = f"{service}/{slug}"
+                self._policy_ref = f"devloop:{service}"
+            poll_index = 0
+            shepherd_ticks = 0
+            hops = 0
 
         tick_task: asyncio.Task[None] | None = None
-        poll_index = 0
-        shepherd_ticks = 0
+        polls_this_run = 0
+        hop_resume: MergeWatchResume | None = None
+        hop_cap_logged = False
         try:
             while workflow.now() < deadline:
+                if hop_patched and _should_hop(
+                    patched=hop_patched,
+                    polls_this_run=polls_this_run,
+                    tick_task=tick_task,
+                    hops=hops,
+                ):
+                    hops += 1
+                    history_length = workflow.info().get_current_history_length()
+                    remaining = deadline - workflow.now()
+                    workflow.logger.info(
+                        "merge watch for %s/%s hopping to a new run via "
+                        "continue_as_new (hop %d, history length %d, %d "
+                        "poll(s) completed this run, %s left to the deadline)",
+                        service,
+                        slug,
+                        hops,
+                        history_length,
+                        polls_this_run,
+                        remaining,
+                    )
+                    hop_resume = MergeWatchResume(
+                        service=service,
+                        slug=slug,
+                        deadline=deadline.isoformat().replace("+00:00", "Z"),
+                        last_pr=last,
+                        polls_without_pr=polls_without_pr,
+                        poll_index=poll_index,
+                        shepherd_ticks=shepherd_ticks,
+                        fast_cadence=cadence is CADENCE,
+                        shepherd_in_loop=shepherd_in_loop,
+                        concurrent_ticks=concurrent_ticks,
+                        track_ownership=track_ownership,
+                        owned_entity_id=self._owned_entity_id,
+                        owner_epoch=self._owner_epoch,
+                        owned_head_sha=self._owned_head_sha,
+                        poll_index_for_heartbeat=self._poll_index_for_heartbeat,
+                        claim_refused=self._claim_refused,
+                        claim_refused_until_poll=self._claim_refused_until_poll,
+                        refused_by_type=self._refused_by_type,
+                        refused_by_id=self._refused_by_id,
+                        refusals_observed=self._refusals_observed,
+                        unknown_acquires=self._unknown_acquires,
+                        unknown_progress=self._unknown_progress,
+                        unknown_heartbeats=self._unknown_heartbeats,
+                        proposal_ref=self._proposal_ref,
+                        policy_ref=self._policy_ref,
+                        last_lifecycle_op=self._last_lifecycle_op,
+                        last_lifecycle_op_landed=self._last_lifecycle_op_landed,
+                        claim_abandoned=self._claim_abandoned,
+                        hops=hops,
+                    )
+                    break
+                if (
+                    hop_patched
+                    and not hop_cap_logged
+                    and hops >= MERGE_WATCH_MAX_HOPS
+                    and _hop_suggested()
+                ):
+                    # The bound is observational: past the cap the watch
+                    # keeps polling in THIS run until the deadline rather
+                    # than hopping again, and says so once rather than on
+                    # every remaining poll.
+                    workflow.logger.error(
+                        "merge watch for %s/%s has hopped %d time(s), at "
+                        "MERGE_WATCH_MAX_HOPS — staying in this run until "
+                        "the deadline instead of hopping again",
+                        service,
+                        slug,
+                        hops,
+                    )
+                    hop_cap_logged = True
+
                 try:
                     state: PRState = await workflow.execute_activity(
                         get_pr_state,
@@ -2543,7 +2915,7 @@ class DevLoopWorkflow:
                             slug,
                             cause,
                         )
-                        return last
+                        return _WatchOutcome(last=last)
                     workflow.logger.warning(
                         "get_pr_state failed after retries for %s/%s — retrying "
                         "next poll interval",
@@ -2552,6 +2924,11 @@ class DevLoopWorkflow:
                     )
                     await workflow.sleep(cadence.poll_interval)
                     continue
+                # A completed poll, whether or not it resolved a PR — the hop
+                # gate above requires at least one of these in THIS run
+                # before it will ever fire (design.md: "so a misconfigured
+                # threshold cannot produce a continue-as-new storm").
+                polls_this_run += 1
                 if state.found:
                     last = state
                     polls_without_pr = 0
@@ -2575,7 +2952,7 @@ class DevLoopWorkflow:
                             self._finish_claim(
                                 "terminal", done, state.repo or "", state.number or 0
                             )
-                        return state
+                        return _WatchOutcome(last=state)
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
                     # consuming its boundary and dropping it for a whole
@@ -2651,11 +3028,16 @@ class DevLoopWorkflow:
                             polls_without_pr,
                             "none" if last is None else (last.pr_url or "unresolved"),
                         )
-                        return last
+                        return _WatchOutcome(last=last)
                 await workflow.sleep(cadence.poll_interval)
         finally:
             await self._settle_tick(tick_task, service, slug)
-            if track_ownership and self._owned_entity_id:
+            # WHILE hopping, THE SYSTEM SHALL NOT issue a lifecycle release
+            # or terminal write and SHALL keep the claim it already holds
+            # (#404): the owner id (workflow_id) and the epoch both remain
+            # valid in the continued run, and the resume record above
+            # already carries them forward unchanged.
+            if hop_resume is None and track_ownership and self._owned_entity_id:
                 # The watch ended without the PR reaching a terminal state —
                 # the deadline expired, or the PR stopped resolving. RELEASE,
                 # not terminal: the work remains and somebody must be able to
@@ -2715,7 +3097,8 @@ class DevLoopWorkflow:
                 self._finish_claim(op, done, repo, number)
             # After the LAST relinquishing write of this watch, whichever path
             # made it. One metric line per abandoned entity, not per failed
-            # attempt — see _report_claim_abandonment.
-            if track_ownership:
+            # attempt — see _report_claim_abandonment. Skipped on a hop for
+            # the same reason as the write above: nothing was relinquished.
+            if hop_resume is None and track_ownership:
                 self._report_claim_abandonment()
-        return last
+        return _WatchOutcome(last=last, resume=hop_resume)

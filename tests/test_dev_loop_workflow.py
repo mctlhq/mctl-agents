@@ -9,7 +9,9 @@ server binary (cached under ~/.cache after the first run).
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import re
 import uuid
 from datetime import timedelta
 
@@ -19,6 +21,7 @@ from temporalio import activity
 from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import UnsandboxedWorkflowRunner
 
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
@@ -4217,3 +4220,313 @@ class TestImplementationAdmission:
         # The execution record was still written before the loop failed.
         assert [r.phase for r in records if r.agent == "implementer"] == ["Failed"]
         assert state.outcome in ("execution", "finalization")
+
+
+# ---------------------------------------------------------------------------
+# #404: DevLoopWorkflow bounds the merge-watch's history by calling
+# continue_as_new once the server (or the local MERGE_WATCH_HISTORY_FLOOR
+# backing it up) suggests it. T1 (the payload-converter round trip) lives in
+# its own module, tests/test_merge_watch_resume_roundtrip.py, mirroring
+# tests/test_stranded_skipped_roundtrip.py. T6 (the hop safety rails) drives
+# dev_loop._should_hop/_hop_suggested directly, the TestTickSettling pattern
+# from this module, since they are pure enough not to need the harness.
+# ---------------------------------------------------------------------------
+class TestMergeWatchContinueAsNew:
+    async def _drive(
+        self,
+        env,
+        *,
+        pr_states,
+        issue: int,
+        monkeypatch: pytest.MonkeyPatch,
+        floor: int = 1,
+        **kwargs,
+    ):
+        """Force a hop on (almost) every eligible poll by lowering the local
+        history floor, then run a dev loop to completion and query it.
+
+        `floor=1` is always crossed once at least one activity has been
+        scheduled, so a run only ever gets ONE poll before the hop predicate
+        fires again — deterministic, and independent of the real history
+        count, which is exactly why design.md calls the floor "the only
+        handle a test has".
+
+        `workflow_runner=UnsandboxedWorkflowRunner()`: by default temporalio
+        replays workflow code against an isolated, re-imported copy of its
+        module for determinism, so a `monkeypatch.setattr(dev_loop, ...)`
+        performed from the test process never reaches the copy the workflow
+        actually executes against -- the floor would silently stay at its
+        real default and no hop would ever be forced. Unsandboxing this
+        worker only (never done in `orchestrator/temporal/worker.py`) makes
+        the host process's module the one the workflow runs against, so the
+        monkeypatch above is visible where it needs to be.
+        """
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", floor)
+        activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True, pr_states=pr_states, **kwargs
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(60):
+                result = await handle.result()
+            claim = await handle.query(DevLoopWorkflow.lifecycle_claim)
+            implement_state = await handle.query(DevLoopWorkflow.implement_execution)
+            shepherd_in_loop = await handle.query(DevLoopWorkflow.shepherd_in_loop)
+        return result, ownership_ops, claim, implement_state, shepherd_in_loop
+
+    async def test_forced_hop_still_reaches_merged_with_a_populated_result(self, env, monkeypatch):
+        """T2: a forced hop still ends the watch at MERGED, and the final
+        DevLoopResult carries the investigate/implement/approve results
+        produced before the hop (they can only have come from there — the
+        continued run skips all three steps)."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="a" * 40,
+        )
+        result, _ops, _claim, _impl, _shep = await self._drive(
+            env, pr_states=[open_pr, MERGED_PR], issue=4041, monkeypatch=monkeypatch
+        )
+
+        assert result.investigate.succeeded
+        assert result.implement is not None and result.implement.succeeded
+        assert result.approve is not None and result.approve.succeeded
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert result.pr.merged is True
+
+    _HOP_LOG_RE = re.compile(
+        r"hop (\d+), history length \d+, \d+ poll\(s\) completed this run, "
+        r"(.+) left to the deadline"
+    )
+
+    @staticmethod
+    def _parse_timedelta_str(text: str) -> timedelta:
+        """Parse `str(timedelta(...))`, e.g. "4 days, 17:14:34.682000" or
+        "0:14:59.153000" -- the format the per-hop log line reports the
+        remaining time in."""
+        days = 0
+        if "day" in text:
+            day_part, _, text = text.partition(", ")
+            days = int(day_part.split()[0])
+        hours, minutes, seconds = text.split(":")
+        return timedelta(days=days, hours=int(hours), minutes=int(minutes), seconds=float(seconds))
+
+    async def test_hopped_deadline_is_carried_not_reset(self, env, monkeypatch, caplog):
+        """T3: the carried deadline is an absolute instant, never recomputed
+        on a hop. A watch that hops (floor=1 crosses on nearly every poll,
+        up to MERGE_WATCH_MAX_HOPS times before it falls back to polling in
+        one run until the deadline) still ends with the PR still OPEN, and
+        the "time left to the deadline" this hop's own log line reports
+        never goes back UP -- which a recomputed (reset) deadline would
+        do on every single hop.
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        with caplog.at_level(logging.INFO, logger="temporalio.workflow"):
+            result, _ops, _claim, _impl, _shep = await self._drive(
+                env, pr_states=[open_pr], issue=4042, monkeypatch=monkeypatch
+            )
+
+        assert result.pr is not None and result.pr.state == "OPEN"
+        remaining = [
+            self._parse_timedelta_str(m.group(2))
+            for m in (self._HOP_LOG_RE.search(r.getMessage()) for r in caplog.records)
+            if m is not None
+        ]
+        assert remaining, "expected at least one forced hop to have logged"
+        assert remaining[0] <= dev_loop.MERGE_WATCH_DEADLINE
+        for earlier, later in itertools.pairwise(remaining):
+            assert later < earlier, (
+                f"a hop's remaining time went UP instead of down -- the "
+                f"deadline was recomputed rather than carried: {remaining}"
+            )
+
+    async def test_hop_preserves_query_answers(self, env, monkeypatch):
+        """T4: shepherd_in_loop, implement_execution and lifecycle_claim all
+        answer as the pre-hop run would have, once the watch has hopped.
+
+        The terminal write is made to fail so the claim is NOT cleared by
+        the ordinary end-of-watch cleanup -- the only way to observe, from a
+        query issued AFTER `handle.result()`, that the entity_id/epoch
+        acquired before the hop are still the ones held after it
+        (`_finish_claim` only clears them once the relinquishing write
+        actually lands; see test_a_failed_terminal_keeps_the_claim_and_says_so
+        for the same technique used pre-#404).
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="a" * 40,
+        )
+        result, ops, claim, implement_state, shepherd_in_loop = await self._drive(
+            env,
+            pr_states=[open_pr, MERGED_PR],
+            issue=4043,
+            monkeypatch=monkeypatch,
+            ownership_terminal_fails=True,
+        )
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert shepherd_in_loop is True
+        assert implement_state.stage == "implementer"
+        assert implement_state.outcome == "success"
+        assert ops and ops[0].op == "acquire", "the loop never acquired the claim before hopping"
+        assert claim.entity_id == f"{MERGED_PR.repo}#{MERGED_PR.number}"
+        assert claim.epoch == 1
+
+    async def test_no_ownership_churn_before_the_pr_resolves(self, env, monkeypatch):
+        """T5: a hop issues no release/terminal write, and an ownership call
+        made AFTER a hop asserts the SAME epoch this loop acquired before
+        it -- never a reset fencing generation.
+
+        Eight identical OPEN polls (same head, so no progress write) put a
+        heartbeat re-acquire (`LIFECYCLE_HEARTBEAT_EVERY_POLLS == 8` at the
+        fast cadence) inside a run that only exists because of a hop, so its
+        request is the one that proves the carried epoch rather than a fresh
+        (reset) one.
+        """
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="a" * 40,
+        )
+        result, ops, _claim, _impl, _shep = await self._drive(
+            env,
+            pr_states=[open_pr] * 8 + [MERGED_PR],
+            issue=4044,
+            monkeypatch=monkeypatch,
+        )
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        relinquishing = [o.op for o in ops if o.op in ("release", "terminal")]
+        assert relinquishing == ["terminal"], (
+            f"a hop must not release or terminal the claim before the PR "
+            f"actually resolves: {[o.op for o in ops]}"
+        )
+        acquires = [o for o in ops if o.op == "acquire"]
+        assert len(acquires) >= 2, "expected the first claim plus a post-hop heartbeat re-acquire"
+        assert acquires[0].epoch == 0, "the very first acquire has no epoch to assert yet"
+        assert all(o.epoch == 1 for o in acquires[1:]), (
+            f"a post-hop acquire asserted a different epoch than the one "
+            f"acquired before the hop: {[(o.op, o.epoch) for o in ops]}"
+        )
+
+
+class _FakeContinueAsNewInfo:
+    """Stands in for `workflow.info()` for the hop-predicate unit tests.
+
+    `TestTickSettling` established the pattern of driving pure-enough watch
+    helpers directly, without the Temporal harness, because the branch under
+    test (a tick genuinely in flight) cannot be reached under the
+    time-skipping test server. The hop predicate has the same shape: it must
+    be exercised with `is_continue_as_new_suggested()` true independent of
+    the real, server-computed history length.
+    """
+
+    def __init__(self, *, suggested: bool, history_length: int = 0) -> None:
+        self._suggested = suggested
+        self._history_length = history_length
+
+    def is_continue_as_new_suggested(self) -> bool:
+        return self._suggested
+
+    def get_current_history_length(self) -> int:
+        return self._history_length
+
+
+class TestHopSafetyRails:
+    """T6, driven directly against `dev_loop._should_hop`/`_hop_suggested`."""
+
+    def _patch_info(self, monkeypatch: pytest.MonkeyPatch, **kwargs) -> None:
+        monkeypatch.setattr(dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(**kwargs))
+
+    def test_no_hop_before_one_completed_poll_in_this_run(self, monkeypatch):
+        self._patch_info(monkeypatch, suggested=True, history_length=10**9)
+        assert not dev_loop._should_hop(patched=True, polls_this_run=0, tick_task=None, hops=0)
+        assert dev_loop._should_hop(patched=True, polls_this_run=1, tick_task=None, hops=0)
+
+    def test_no_hop_when_unpatched(self, monkeypatch):
+        """Migration by attrition: a history predating the marker must never
+        take the hop branch, no matter how strong the suggestion."""
+        self._patch_info(monkeypatch, suggested=True, history_length=10**9)
+        assert not dev_loop._should_hop(patched=False, polls_this_run=5, tick_task=None, hops=0)
+
+    async def test_no_hop_with_an_unfinished_tick(self, monkeypatch):
+        self._patch_info(monkeypatch, suggested=True, history_length=10**9)
+
+        async def never_finishes() -> None:
+            await asyncio.sleep(3600)
+
+        tick_task = asyncio.create_task(never_finishes())
+        await asyncio.sleep(0)
+        try:
+            assert not dev_loop._should_hop(patched=True, polls_this_run=5, tick_task=tick_task, hops=0)
+        finally:
+            tick_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tick_task
+
+    async def test_hop_once_the_tick_has_finished(self, monkeypatch):
+        self._patch_info(monkeypatch, suggested=True, history_length=10**9)
+
+        async def finishes_immediately() -> None:
+            return None
+
+        tick_task = asyncio.create_task(finishes_immediately())
+        await tick_task
+        assert dev_loop._should_hop(patched=True, polls_this_run=5, tick_task=tick_task, hops=0)
+
+    def test_no_hop_past_the_cap(self, monkeypatch):
+        self._patch_info(monkeypatch, suggested=True, history_length=10**9)
+        assert not dev_loop._should_hop(
+            patched=True,
+            polls_this_run=5,
+            tick_task=None,
+            hops=dev_loop.MERGE_WATCH_MAX_HOPS,
+        )
+        assert dev_loop._should_hop(
+            patched=True,
+            polls_this_run=5,
+            tick_task=None,
+            hops=dev_loop.MERGE_WATCH_MAX_HOPS - 1,
+        )
+
+    def test_hop_when_only_the_server_suggestion_is_true(self, monkeypatch):
+        """The local floor is a backstop, not the only signal: a history
+        length far below MERGE_WATCH_HISTORY_FLOOR must still hop once the
+        server itself suggests it."""
+        self._patch_info(monkeypatch, suggested=True, history_length=0)
+        assert dev_loop.MERGE_WATCH_HISTORY_FLOOR > 0
+        assert dev_loop._should_hop(patched=True, polls_this_run=1, tick_task=None, hops=0)
+
+    def test_no_hop_when_neither_signal_fires(self, monkeypatch):
+        self._patch_info(monkeypatch, suggested=False, history_length=0)
+        assert not dev_loop._should_hop(patched=True, polls_this_run=1, tick_task=None, hops=0)
