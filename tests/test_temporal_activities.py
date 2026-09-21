@@ -9,6 +9,7 @@ mctl-api's actual request/response shapes are asserted against directly
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 
 import httpx
@@ -666,6 +667,111 @@ class TestFindProposalSlug:
         with pytest.raises(ApplicationError, match="listing cap") as excinfo:
             await env.run(find_proposal_slug, "mctl-portal", "80")
         assert excinfo.value.non_retryable
+
+    # -- a `rejected` leftover must not block its replacement (#438) --------
+
+    _LISTING = (
+        "/repos/mctlhq/mctl-gitops/contents/"
+        "platform-gitops/agents-state/mctl-agents/proposals"
+    )
+    V1 = "issue-404-devloopworkflow-never-calls-continue-as"
+    V2 = "issue-404-devloopworkflow-never-calls-continue-as-v2"
+
+    def _status_body(self, status: str) -> dict[str, str]:
+        raw = f"status: {status}\nupdated_by: test\n".encode()
+        return {"encoding": "base64", "content": base64.b64encode(raw).decode()}
+
+    def _handler_for(self, statuses: dict[str, str | None], seen: list[str] | None = None):
+        """Serve the proposals listing plus each proposal's .status.yaml.
+
+        A None status serves 404 — the file is absent, which the resolver
+        must read as "live", never as "ignorable".
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if seen is not None:
+                seen.append(path)
+            if path == self._LISTING:
+                return httpx.Response(200, json=self._entries(*statuses))
+            for slug, status in statuses.items():
+                if path == f"{self._LISTING}/{slug}/.status.yaml":
+                    if status is None:
+                        return httpx.Response(404)
+                    return httpx.Response(200, json=self._status_body(status))
+            return httpx.Response(404)
+
+        return handler
+
+    async def test_a_rejected_duplicate_does_not_block_its_replacement(self, env, monkeypatch):
+        """The production case behind mctl-agents#438."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        _mock_async_client(
+            monkeypatch, self._handler_for({self.V1: "rejected", self.V2: "accepted"})
+        )
+
+        assert await env.run(find_proposal_slug, "mctl-agents", "404") == self.V2
+
+    async def test_two_rejected_duplicates_are_refused(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        _mock_async_client(
+            monkeypatch, self._handler_for({self.V1: "rejected", self.V2: "rejected"})
+        )
+
+        with pytest.raises(ApplicationError, match="rejected") as excinfo:
+            await env.run(find_proposal_slug, "mctl-agents", "404")
+        assert excinfo.value.non_retryable
+
+    async def test_two_accepted_duplicates_are_refused(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        _mock_async_client(
+            monkeypatch, self._handler_for({self.V1: "accepted", self.V2: "accepted"})
+        )
+
+        with pytest.raises(ApplicationError) as excinfo:
+            await env.run(find_proposal_slug, "mctl-agents", "404")
+        assert excinfo.value.non_retryable
+
+    async def test_merged_beside_accepted_is_refused(self, env, monkeypatch):
+        """Reopened/continued-issue semantics are out of scope for this fix."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        _mock_async_client(
+            monkeypatch, self._handler_for({self.V1: "merged", self.V2: "accepted"})
+        )
+
+        with pytest.raises(ApplicationError) as excinfo:
+            await env.run(find_proposal_slug, "mctl-agents", "404")
+        assert excinfo.value.non_retryable
+
+    async def test_an_absent_status_file_keeps_the_proposal_live(self, env, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        _mock_async_client(monkeypatch, self._handler_for({self.V1: None, self.V2: "accepted"}))
+
+        with pytest.raises(ApplicationError):
+            await env.run(find_proposal_slug, "mctl-agents", "404")
+
+    async def test_a_status_read_failure_raises_for_retry(self, env, monkeypatch):
+        """A GitHub outage must not read as "unreadable status" and change
+        which slug wins — it must retry instead."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self._LISTING:
+                return httpx.Response(200, json=self._entries(self.V1, self.V2))
+            return httpx.Response(500, text="boom")
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError, match="reading"):
+            await env.run(find_proposal_slug, "mctl-agents", "404")
+
+    async def test_a_single_match_reads_no_status_file(self, env, monkeypatch):
+        """The steady-state cost of a lookup is unchanged: one request."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        seen: list[str] = []
+        _mock_async_client(monkeypatch, self._handler_for({self.V1: "rejected"}, seen))
+
+        assert await env.run(find_proposal_slug, "mctl-agents", "404") == self.V1
+        assert seen == [self._LISTING]
 
 
 class TestGetPRState:
