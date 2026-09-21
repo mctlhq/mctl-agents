@@ -85,6 +85,17 @@ def test_merged_beside_accepted_stays_ambiguous():
     assert V2 in message
 
 
+def test_merged_beside_rejected_resolves_to_the_merged_one():
+    """The least obvious corner, stated deliberately rather than inherited.
+
+    Dropping the rejected candidate leaves one survivor, so the `merged`
+    slug is returned — consistent with the single-directory rule, which
+    already returns a lone `merged`. `merged` being un-ignorable means it
+    is never DROPPED; it does not mean it can never WIN.
+    """
+    assert select_proposal_slug([_c(V1, "rejected"), _c(V2, "merged")]) == V2
+
+
 def test_merged_is_not_in_the_ignorable_set():
     """Guards the rule itself, not just one call of it."""
     assert IGNORABLE_STATUSES == frozenset({"rejected"})
@@ -111,6 +122,19 @@ def test_three_way_with_one_survivor_resolves():
         [_c("issue-9-a", "rejected"), _c("issue-9-b", "rejected"), _c("issue-9-c", "proposed")]
     )
     assert chosen == "issue-9-c"
+
+
+def test_each_refusal_carries_its_own_remedy():
+    """The two refusals need opposite remedies, so neither may be generic."""
+    with pytest.raises(AmbiguousProposalError) as all_rejected:
+        select_proposal_slug([_c(V1, "rejected"), _c(V2, "rejected")])
+    assert "create a replacement proposal instead" in str(all_rejected.value)
+    assert "remove the stale one" not in str(all_rejected.value)
+
+    with pytest.raises(AmbiguousProposalError) as both_live:
+        select_proposal_slug([_c(V1, "accepted"), _c(V2, "accepted")])
+    assert "remove the stale one from gitops first" in str(both_live.value)
+    assert "create a replacement proposal" not in str(both_live.value)
 
 
 def test_a_v2_suffix_is_not_a_tie_break():

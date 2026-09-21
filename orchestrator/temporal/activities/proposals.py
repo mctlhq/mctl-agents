@@ -153,12 +153,23 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
             # behind after a closed-unmerged PR — stops blocking its
             # replacement. Statuses are fetched concurrently because this
             # sits on DevLoopWorkflow's critical path.
+            # `return_exceptions=True` so a failing read does not unwind out
+            # of the `async with` while its siblings are still in flight: the
+            # client would close under them and the worker's event loop would
+            # then log "Task exception was never retrieved" once per orphan.
+            # The first exception is re-raised unchanged, so the failure a
+            # caller sees is identical.
             statuses = await asyncio.gather(
-                *(_read_proposal_status(client, headers, service, slug) for slug in matches)
+                *(_read_proposal_status(client, headers, service, slug) for slug in matches),
+                return_exceptions=True,
             )
+            for status in statuses:
+                if isinstance(status, BaseException):
+                    raise status
             candidates = [
                 ProposalCandidate(slug=slug, status=status)
                 for slug, status in zip(matches, statuses, strict=True)
+                if not isinstance(status, BaseException)
             ]
             try:
                 return select_proposal_slug(candidates)
@@ -186,12 +197,19 @@ async def _read_proposal_status(
     is never retired on missing evidence. A transport error or an
     unexpected HTTP status raises instead, so a GitHub outage cannot look
     like an unreadable status and silently change which slug wins.
+
+    Transport failures are caught here rather than by the caller's own
+    ``httpx.RequestError`` handler: that one names the listing URL, which
+    answered fine, and would point an operator at the wrong request.
     """
     url = (
         f"https://api.github.com/repos/{GITOPS_REPO}/contents/"
         f"{AGENTS_STATE_PREFIX}/{service}/proposals/{slug}/.status.yaml"
     )
-    response = await client.get(url, params={"ref": "main"}, headers=headers)
+    try:
+        response = await client.get(url, params={"ref": "main"}, headers=headers)
+    except httpx.RequestError as exc:
+        raise ProposalListingError(f"reading {url} failed: {exc}") from exc
     if response.status_code == 404:
         return None
     if response.status_code != 200:

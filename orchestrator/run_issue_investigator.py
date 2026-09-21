@@ -948,9 +948,9 @@ def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
     try:
         chosen = select_proposal_slug(candidates)
     except AmbiguousProposalError as exc:
-        raise ProposalAmbiguityError(
-            f"issue #{issue_number}: {exc}; remove the stale one from gitops first"
-        ) from exc
+        # The remedy sentence belongs to `select_proposal_slug` and differs
+        # per case, so this wrapper only adds which issue it was about.
+        raise ProposalAmbiguityError(f"issue #{issue_number}: {exc}") from exc
     return chosen if chosen else build_slug(issue_number, title)
 
 

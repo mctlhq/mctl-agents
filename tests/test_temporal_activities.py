@@ -764,6 +764,22 @@ class TestFindProposalSlug:
         with pytest.raises(ProposalListingError, match="reading"):
             await env.run(find_proposal_slug, "mctl-agents", "404")
 
+    async def test_a_transport_failure_names_the_status_url_not_the_listing(
+        self, env, monkeypatch
+    ):
+        """The listing answered fine — the error must not blame it."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == self._LISTING:
+                return httpx.Response(200, json=self._entries(self.V1, self.V2))
+            raise httpx.ConnectError("connection reset", request=request)
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ProposalListingError) as excinfo:
+            await env.run(find_proposal_slug, "mctl-agents", "404")
+        assert ".status.yaml failed" in str(excinfo.value)
+
     async def test_a_single_match_reads_no_status_file(self, env, monkeypatch):
         """The steady-state cost of a lookup is unchanged: one request."""
         monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")

@@ -26,6 +26,9 @@ back into guessing:
 - ``merged`` is NOT ignored. A ``merged`` proposal beside an ``accepted``
   one is a real question about what a reopened or continued issue means,
   and it stays an ambiguity until that is decided on its own terms.
+  Un-ignorable means never DROPPED, not never chosen: ``merged`` beside
+  ``rejected`` leaves one survivor and resolves to the merged slug, just
+  as a lone ``merged`` directory already did.
 - No newest-wins tie-break on ``updated_at``. Timestamps are written by
   several actors and a stale clock would silently pick the wrong work.
 - No lexical tie-break on the slug itself. A ``-v2`` suffix sorting last is
@@ -52,6 +55,11 @@ class AmbiguousProposalError(Exception):
     non-retryable ``ApplicationError`` inside an activity, a
     ``ProposalAmbiguityError`` in the investigator — so the shared decision
     stays in one place while the error each surface reports stays its own.
+
+    The message carries the remedy too, and it differs per case: an
+    all-rejected set needs a replacement proposal, while several live ones
+    need the stale directory removed. Callers must not append a remedy of
+    their own, or the two sentences contradict each other.
     """
 
 
@@ -102,5 +110,6 @@ def select_proposal_slug(candidates: Sequence[ProposalCandidate]) -> str | None:
         )
     raise AmbiguousProposalError(
         f"multiple live proposal directories for this issue: {_describe(live)} "
-        f"(of {_describe(candidates)}) — refusing to guess which one is real"
+        f"(of {_describe(candidates)}) — refusing to guess which one is real; "
+        "remove the stale one from gitops first"
     )
