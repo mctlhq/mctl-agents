@@ -355,10 +355,15 @@ def _reply_ambiguous(author: str, comment_id: str, matches: list[ProposalStateRe
     # means the operator does not also have to go read `resolve_slug`'s own
     # error text to learn that (claude P2 on head `6c1aea8`).
     #
-    # Note a `rejected` directory beside a live one no longer reaches here at
-    # all: the resolver retires it and the directive dispatches normally, so
-    # the operator is never told to delete something that does not need
-    # deleting (claude P2 on head `90024c3`).
+    # A `rejected` directory beside EXACTLY ONE live sibling no longer
+    # reaches here: the resolver retires it and the directive dispatches
+    # normally. With two or more live siblings it does still reach here
+    # (`rejected` v1 + live v2 + live v3 — the resolver drops v1, two
+    # survive, refusal), and `stale_note` below then names v1 as removable
+    # when v2/v3 are the actual ambiguity. That imprecision predates the
+    # resolver — it has the same shape for a `merged` sibling beside two
+    # live ones — and is left as is rather than papered over here (claude
+    # P3 on head `77107d0`).
     stale_note = ""
     if stale:
         stale_statuses = ", ".join(sorted({m.status for m in matches if m.status in TERMINAL_STATUSES}))
@@ -536,9 +541,21 @@ async def _handle_directive(
         # is never retried) and the Argo workflow died with nothing posted
         # back to the issue. That divergence is now closed from the other
         # end — both this decision and `resolve_slug` route through
-        # `proposal_identity.select_proposal_slug`, so the poller dispatches
-        # exactly the cases the investigator accepts, and refuses exactly
-        # the ones it refuses.
+        # `proposal_identity.select_proposal_slug`, so the two agree on
+        # every candidate set they both see.
+        #
+        # They do NOT always see the same set, and that gap is older than
+        # the shared resolver: `resolve_slug` enumerates DIRECTORIES
+        # (`existing_slugs` -> `iterdir`) and counts an absent or
+        # unparseable `.status.yaml` as live, while `all_refs` comes from
+        # `list_proposal_refs`, which enumerates `.status.yaml` BLOBS and
+        # drops any it cannot parse (`gitops_state`, "has an unreadable
+        # .status.yaml ...; skipping"). So a corrupt status file on one of
+        # two directories is invisible here and live there — this side
+        # dispatches, the investigator refuses, and the ack is permanent.
+        # Pre-existing and unchanged by the resolver (the same single match
+        # reached `len(matches) > 1` before), recorded here rather than
+        # claimed away (claude P3 on head `77107d0`).
         matches = [r for r in all_refs if r.service == ref.service and _issue_number(r.slug) == number]
         resolved: str | None = None
         if matches:
