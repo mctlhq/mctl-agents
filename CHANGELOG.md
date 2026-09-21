@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.53.1](https://github.com/mctlhq/mctl-agents/compare/1.53.0...1.53.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* **proposals:** address review findings on the identity resolver ([90024c3](https://github.com/mctlhq/mctl-agents/commit/90024c30b516987c81396de97d77028c400ec2bf)), closes [#439](https://github.com/mctlhq/mctl-agents/issues/439)
+* **proposals:** converge the directive poller onto the shared resolver ([77107d0](https://github.com/mctlhq/mctl-agents/commit/77107d004bc8abd461be04f24a7ae0d71c4352cc)), closes [#439](https://github.com/mctlhq/mctl-agents/issues/439)
+* **proposals:** stop a rejected proposal blocking its own replacement ([7622eab](https://github.com/mctlhq/mctl-agents/commit/7622eab09c42c7c32894c23de943cfa2f5a2aef9))
+* **proposals:** stop a rejected proposal blocking its own replacement ([eb60db8](https://github.com/mctlhq/mctl-agents/commit/eb60db89f42f0d229b877b4f62e78042cd065e6d)), closes [#439](https://github.com/mctlhq/mctl-agents/issues/439)
+
 ## [1.53.0](https://github.com/mctlhq/mctl-agents/compare/1.52.0...1.53.0) (2026-09-20)
 
 
