@@ -244,18 +244,22 @@ def test_ambiguous_proposal_dirs_are_named_in_the_reply(monkeypatch):
 
 
 def test_a_terminal_sibling_is_still_ambiguous_but_named_as_removable(monkeypatch):
-    """A merged/rejected/review-stuck proposal directory left behind by a
-    re-intake must STILL count toward the ambiguity check here, even though
-    `scan()` excludes TERMINAL_STATUSES refs from its own candidate set —
-    the actual dispatch target, `run_issue_investigator.resolve_slug` via
-    `existing_slugs`, is purely directory-name based and status-agnostic, so
-    it raises `ProposalAmbiguityError` on two `issue-N-*` directories
-    regardless of status. An earlier round of this fix filtered `matches`
-    here to disagree with that check, which made the poller ack a dispatch
-    that the investigator then refused, permanently, with nothing posted
-    back to the issue (claude P2 on head `6c1aea8`). The fix instead makes
-    `_reply_ambiguous` name the stale directory so a human knows to delete
-    it."""
+    """A `merged` proposal directory left behind by a re-intake must STILL
+    count toward the ambiguity check here, even though `scan()` excludes
+    TERMINAL_STATUSES refs from its own candidate set.
+
+    Both this decision and the actual dispatch target,
+    `run_issue_investigator.resolve_slug`, now route through
+    `proposal_identity.select_proposal_slug`, and `merged` is deliberately
+    NOT ignorable there — a merged proposal beside a live one is a real
+    question about what a reopened issue means. So both sides still refuse
+    this pair, together.
+
+    An earlier round of this fix filtered `matches` here to disagree with
+    the investigator, which made the poller ack a dispatch that the
+    investigator then refused, permanently, with nothing posted back to the
+    issue (claude P2 on head `6c1aea8`). `_reply_ambiguous` names the stale
+    directory instead, so a human knows what to look at."""
     live = _ref(slug="issue-9-fix")
     dead = _ref(slug="issue-9-fix-old", status="merged")
     outcome, replies = _handle(_directive(), live, [live, dead], monkeypatch)
@@ -270,6 +274,27 @@ def test_a_terminal_sibling_is_still_ambiguous_but_named_as_removable(monkeypatc
     # not actually trigger by fixing the state).
     assert "will not be retried" in replies[0]
     assert "@MCTL reinvestigate" in replies[0]
+
+
+def test_a_rejected_sibling_no_longer_blocks_the_directive(monkeypatch):
+    """The mctl-agents#438/#439 shape: a `rejected` leftover beside a live
+    proposal must dispatch, not refuse.
+
+    `resolve_slug` now retires the rejected directory and returns the live
+    slug, so a poller that still refused here would tell the operator to
+    delete a directory that no longer needs deleting — and, because
+    `_reply_ambiguous` goes through `_with_ack`, would do it permanently.
+    This pins that the two sides agree; `merged` (above) pins that they
+    still agree when the answer is "refuse".
+    """
+    submitted: list = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _recording_submit(submitted))
+    live = _ref(slug="issue-404-continue-as-new-v2")
+    dead = _ref(slug="issue-404-continue-as-new", status="rejected")
+    outcome, replies = _handle(_directive(), live, [live, dead], monkeypatch)
+    assert outcome == "dispatched"
+    assert len(submitted) == 1, "the live proposal is the one dispatched"
+    assert all("refusing to guess" not in r for r in replies)
 
 
 def test_non_overwritable_status_is_named_in_the_reply(monkeypatch):

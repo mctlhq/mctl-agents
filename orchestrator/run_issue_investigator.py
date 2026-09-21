@@ -83,6 +83,11 @@ from orchestrator import context_assembly
 from orchestrator.context_snapshot import ContextSnapshot
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
+from orchestrator.proposal_identity import (
+    AmbiguousProposalError,
+    ProposalCandidate,
+    select_proposal_slug,
+)
 
 # subagent_wait defers its own claude_agent_sdk imports (see its module note),
 # so unlike options/mcp_guard below it is safe at module scope here.
@@ -888,6 +893,25 @@ def existing_slugs(proposals_dir: Path, issue_number: int) -> list[str]:
     return sorted(p.name for p in proposals_dir.iterdir() if p.is_dir() and p.name.startswith(prefix))
 
 
+def read_proposal_status(proposal_dir: Path) -> str | None:
+    """The ``status:`` in a proposal directory's ``.status.yaml``, or None.
+
+    None on anything unreadable — absent file, unparseable YAML, a
+    non-mapping document, a non-string status. `select_proposal_slug`
+    treats None as live, so a broken status file can never retire a
+    proposal; it only ever loses the chance to retire itself.
+    """
+    try:
+        text = (proposal_dir / ".status.yaml").read_text()
+        data = yaml.safe_load(text)
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    return status if isinstance(status, str) else None
+
+
 def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
     """The slug this issue's proposal lives at, reusing one if it exists.
 
@@ -901,17 +925,33 @@ def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
     produced a second directory beside the first, and `find_proposal_slug`
     then refused the ambiguous `issue-<N>-*` lookup — the loop could not
     proceed and gitops kept a stray proposal (codex P2 on #241, #246).
-    Two directories is already-broken state, so say which ones rather than
-    silently picking one.
+    Two LIVE directories is still already-broken state, so say which ones
+    rather than silently picking one.
+
+    A `rejected` directory is the exception, and the only one: after a
+    closed-unmerged PR the proposal is rewritten to `rejected` and can
+    never be acted on again (mctl-agents#438), so leaving it able to block
+    its own replacement means the issue can never be given a working
+    proposal. `proposal_identity.select_proposal_slug` holds that rule, so
+    this path and the `find_proposal_slug` activity cannot drift apart.
     """
     matches = existing_slugs(proposals_dir, issue_number)
     if len(matches) > 1:
-        raise ProposalAmbiguityError(
-            f"issue #{issue_number} already has {len(matches)} proposal dirs "
-            f"({', '.join(matches)}) — refusing to guess which one is real; "
-            "remove the stale one from gitops first"
-        )
-    return matches[0] if matches else build_slug(issue_number, title)
+        candidates = [
+            ProposalCandidate(slug=slug, status=read_proposal_status(proposals_dir / slug))
+            for slug in matches
+        ]
+    else:
+        # One directory is not a choice — skip the status reads entirely.
+        candidates = [ProposalCandidate(slug=slug) for slug in matches]
+
+    try:
+        chosen = select_proposal_slug(candidates)
+    except AmbiguousProposalError as exc:
+        # The remedy sentence belongs to `select_proposal_slug` and differs
+        # per case, so this wrapper only adds which issue it was about.
+        raise ProposalAmbiguityError(f"issue #{issue_number}: {exc}") from exc
+    return chosen if chosen else build_slug(issue_number, title)
 
 
 def gh_issue_view(url: str) -> IssueData:
