@@ -2940,12 +2940,32 @@ class DevLoopWorkflow:
         instead of failing a loop whose implement already succeeded. Returns
         a `last` of None when no PR link ever appeared within the grace
         polls -- UNLESS this is a resumed run carrying an abandon, in which
-        case the carried `resume.last_pr` is returned instead: the abandon
-        guard right below must not erase the PR state an earlier run
-        already observed (task 5a).
+        case the carried `resume.last_pr` is returned instead: task 5a's
+        guard must not erase the PR state an earlier run already observed.
+
+        An already-true `self._abandoned` on a RESUMED call is deliberately
+        NOT an early return here (round 2 on mctl-agents#404 v2, claude +
+        agy P2): an early return before `try` would skip this method's own
+        `finally`, which is what releases the lifecycle-ownership claim a
+        hop kept held. Instead, when `resume` carries the claim
+        (`track_ownership`/`owned_entity_id`, rehydrated by
+        `_resume_merge_watch` before this call), execution falls through to
+        the `while` loop below, whose own `not self._abandoned` condition is
+        already false on entry -- the loop body never runs, but `finally`
+        still does, issuing the same relinquishing write a normal
+        (non-hopped) watch end would. `last` stays `resume.last_pr`,
+        matching what the old guard used to return directly.
+
+        The narrow case that IS still an early return: `resume is None` and
+        `self._abandoned` is already true. Unreachable in production --
+        `run()` checks `self._abandoned` immediately before ever calling
+        `_watch_pr(target_repo, slug)` with no resume (see `run`, just above
+        the `merge-detection` patch check) -- so no ownership claim can be
+        outstanding here to release; this call shape only exists as a direct
+        unit-test entry point with no workflow context.
         """
-        if self._abandoned:
-            return _WatchOutcome(last=resume.last_pr if resume is not None else None)
+        if resume is None and self._abandoned:
+            return _WatchOutcome(last=None)
         if resume is not None:
             # The ABSOLUTE deadline the first run of this watch computed.
             # Never recomputed here -- doing so would restart the 14-day

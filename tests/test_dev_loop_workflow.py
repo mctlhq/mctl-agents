@@ -4748,17 +4748,34 @@ class TestMergeWatchHopPredicate:
 
 
 class TestMergeWatchAbandonGuard:
-    """T5a: a carried abandon must not erase the PR state a PREVIOUS run
-    already observed. `_watch_pr`'s abandon guard is the very first
-    statement in the method -- no workflow context needed to reach it, so
-    this drives it directly on a bare instance, exactly like T8 above."""
+    """T5a, plus the round-2 P2 fix (claude + agy against commit 0e4bcf1):
+    a carried abandon must not erase the PR state a PREVIOUS run already
+    observed, AND must not skip `_watch_pr`'s `finally` -- the block that
+    releases the lifecycle-ownership claim a hop kept held. The
+    resume-carrying case now falls through into the `while`/`try`/`finally`
+    machinery (its own `not self._abandoned` loop condition is what ends it
+    immediately), so it needs a real Temporal worker to supply
+    `workflow.now()`/`workflow.patched()`/the ownership activity -- see
+    `test_carried_abandon_releases_the_ownership_claim` below. Only the
+    resume=None case is still reachable with no workflow context at all
+    (that call shape is dead in production; see `_watch_pr`'s docstring),
+    so `test_unpatched_non_resume_abandon_guard_still_returns_none` keeps
+    driving it directly on a bare instance."""
 
     pytestmark = pytest.mark.anyio
 
-    async def test_carried_abandon_returns_the_resumes_last_pr_not_none(self) -> None:
-        wf = DevLoopWorkflow()
-        wf._abandoned = True
-        wf._abandon_reason = "operator cleanup"
+    async def test_carried_abandon_releases_the_ownership_claim(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resumed run (`issue.resume is not None`) whose carried
+        `abandoned` is already True on entry must still run `_watch_pr`'s
+        `finally`: `self._owned_entity_id`/`track_ownership` are rehydrated
+        by `_resume_merge_watch` before `_watch_pr` is ever called, exactly
+        as they would be for a resume that is NOT already abandoned, so the
+        relinquishing write must land here too. Asserted the same way
+        `test_no_ownership_churn_across_a_hop` asserts the absence of one:
+        by inspecting the captured `ownership_ops`."""
+        activities, _calls, _investigate_ran, ownership_ops = _fake_activities(released=True)
         carried_pr = PRState(
             found=True,
             pr_url=MERGED_PR.pr_url,
@@ -4768,11 +4785,51 @@ class TestMergeWatchAbandonGuard:
             head_sha="deadbeef",
         )
         resume = MergeWatchResume(
-            service="mctl-telegram", slug="issue-1-x", deadline="2026-01-01T00:00:00Z", last_pr=carried_pr
+            service="mctl-telegram",
+            slug="issue-1-x",
+            deadline="2026-01-01T00:00:00Z",
+            last_pr=carried_pr,
+            track_ownership=True,
+            owned_entity_id=f"{MERGED_PR.repo}#{MERGED_PR.number}",
+            owner_epoch=1,
+            abandoned=True,
+            abandon_reason="operator cleanup",
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
         )
-        outcome = await wf._watch_pr("mctl-telegram", "issue-1-x", resume=resume)
-        assert outcome.last == carried_pr
-        assert outcome.resume is None
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/963", resume=resume
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        # The guard took the resume path (task 5a): the carried PR state
+        # survives, it is not erased to None.
+        assert result.pr == carried_pr
+        assert result.ended == "abandoned: operator cleanup"
+        # The fix under test: the ownership claim was released, not
+        # orphaned. A hop skips this write on purpose (`hopping=True`); an
+        # abandon -- carried or not -- must not.
+        release_ops = [
+            op for op in ownership_ops if op.op in ("release", "terminal")
+        ]
+        assert len(release_ops) == 1, f"expected exactly one relinquishing write, got {ownership_ops}"
+        assert release_ops[0].op == "release"
+        assert release_ops[0].entity_id == f"{MERGED_PR.repo}#{MERGED_PR.number}"
+        assert release_ops[0].epoch == 1
 
     async def test_unpatched_non_resume_abandon_guard_still_returns_none(self) -> None:
         """The pre-existing (non-resume) path is unchanged: nothing was
