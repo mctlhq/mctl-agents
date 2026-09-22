@@ -4526,6 +4526,7 @@ class TestWorkContextResume:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 gated_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
