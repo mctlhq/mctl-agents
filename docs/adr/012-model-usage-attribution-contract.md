@@ -46,7 +46,7 @@ priority). `ModelSelection` already logs `task/profile/model/source`.
 | shepherd | no model call of its own | — | subprocess into run_implementer (review-feedback mode) | inherits implementer's frame |
 | incident-responder | `run_incident_responder.py:180` | model_policy | per-incident; Temporal activity retries upstream | incident id, repo, Temporal workflow/run id |
 | mentor | `run_mentor.py:149` | task `mentor_digest` → profile `cheap` | scheduled | schedule id |
-| service-agent | `run_service_agent.py:156` | task `service_agent` → profile `balanced` | per-service runs | service/tenant |
+| service-agent | `run_service_agent.py:127` | task `service_agent` → profile `balanced` | per-service runs | service/tenant |
 | subagent drain | `subagent_wait.py:311` | same SDK session | child usage arrives in the parent's stream; orphan/grace semantics deliberately avoid double-charging | parent's frame |
 
 Reviewer bots (claude-review.yml) run in GitHub Actions outside this repo's
