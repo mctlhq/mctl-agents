@@ -23,16 +23,14 @@ budgets_usd:
   shepherd: '5.00'
 cronworkflows:
   cronworkflow-labs-claude-remote-restart.yaml: 0 3 * * 0
-  cronworkflow-mctl-agents-implement.yaml: '*/5 * * * *'
   cronworkflow-mctl-agents-incidents.yaml: 15 * * * *
-  cronworkflow-mctl-agents-issue-poll.yaml: '*/15 * * * *'
-  cronworkflow-mctl-agents-shepherd.yaml: 0 7-21/2 * * *
   cwft-mctl-agents-daily.yaml: 0 0 * * 6
 cwft_env_overrides:
   IMPLEMENTER_BUDGET_USD: '20.00'
+  IMPLEMENTER_DRAIN_TIMEOUT_SECONDS: '300'
   IMPLEMENTER_TIMEOUT_SECONDS: '5400'
   INCIDENT_RESPONDER_BUDGET_USD: '20.00'
-  ISSUE_INVESTIGATOR_BUDGET_USD: '3.00'
+  ISSUE_INVESTIGATOR_BUDGET_USD: '8.00'
   MENTOR_BUDGET_USD: '10.00'
   SERVICE_AGENT_BUDGET_USD: '5.00'
   SHEPHERD_BUDGET_USD: '5.00'
@@ -41,7 +39,6 @@ cwfts:
 - mctl-agents-daily
 - mctl-agents-implement
 - mctl-agents-investigate
-- mctl-agents-issue-poll
 - mctl-agents-reconcile
 - mctl-agents-run
 - mctl-agents-shepherd
@@ -85,7 +82,7 @@ manifest_api_versions:
   mentor: agents.mctl.ai/v1alpha1
   service-agent: agents.mctl.ai/v1alpha1
   shepherd: agents.mctl.ai/v1alpha1
-mcp_tool_count: 73
+mcp_tool_count: 75
 mcp_tools:
 - mctl_acknowledge_incident
 - mctl_add_custom_domain
@@ -103,6 +100,7 @@ mcp_tools:
 - mctl_deprecate_platform_skill
 - mctl_disable_tenant_skill
 - mctl_enable_tenant_skill
+- mctl_get_dev_loop
 - mctl_get_incident
 - mctl_get_openclaw_sizing_recommendation
 - mctl_get_operation
@@ -155,6 +153,7 @@ mcp_tools:
 - mctl_trigger_incident_responder
 - mctl_trigger_issue
 - mctl_trigger_mentor_only
+- mctl_trigger_portal_server_auth_apply
 - mctl_trigger_reconcile
 - mctl_trigger_shepherd
 - mctl_trigger_single_service
@@ -205,13 +204,13 @@ registry_environments:
 - production
 - shadow
 releases_seen:
-  mctlhq/mctl-academy: 0.1.50
-  mctlhq/mctl-agent: 2.0.1
-  mctlhq/mctl-agents: 1.39.0
-  mctlhq/mctl-api: 4.37.0
-  mctlhq/mctl-docs: 0.1.38
-  mctlhq/mctl-portal: 4.15.0
-  mctlhq/mctl-telegram: 0.59.0
+  mctlhq/mctl-academy: 0.1.51
+  mctlhq/mctl-agent: 2.1.0
+  mctlhq/mctl-agents: 1.45.0
+  mctlhq/mctl-api: 4.46.0
+  mctlhq/mctl-docs: 0.1.40
+  mctlhq/mctl-portal: 4.16.0
+  mctlhq/mctl-telegram: 0.67.0
 schedules:
   ImplementSweepWorkflow: 15 min
   IncidentLoopWorkflow: 1 h
