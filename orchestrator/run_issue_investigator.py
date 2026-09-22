@@ -497,7 +497,9 @@ def _verify_landed(
     return stat.S_ISDIR(landed.st_mode) and (landed.st_dev, landed.st_ino) == expected
 
 
-def _landed_triplet_defects(staging_fd: int | None, issue: IssueData) -> list[str]:
+def _landed_triplet_defects(
+    staging_fd: int | None, issue: IssueData, *, expected_agent: str = "issue-investigator"
+) -> list[str]:
     """Which of the triplet are not regular files, asked through ``staging_fd``.
 
     fstatat against the descriptor of the directory that was just renamed
@@ -543,7 +545,7 @@ def _landed_triplet_defects(staging_fd: int | None, issue: IssueData) -> list[st
             # out. A publish refused in error costs a re-run; a publish
             # allowed in error is a forged approval in agents-state.
             try:
-                defects.extend(_status_disagreements(published, issue))
+                defects.extend(_status_disagreements(published, issue, expected_agent=expected_agent))
             except Exception as exc:  # noqa: BLE001 — deliberate, see above
                 defects.append(
                     f"{STATUS_FILENAME} could not be checked: "
@@ -597,7 +599,9 @@ def _read_published_status(staging_fd: int) -> dict:
         os.close(fd)
 
 
-def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
+def _status_disagreements(
+    published: dict, issue: IssueData, *, expected_agent: str = "issue-investigator"
+) -> list[str]:
     """Ways the published status file differs from what we wrote.
 
     Not just `status`. The `source` block names the issue the implementer
@@ -644,9 +648,11 @@ def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
         ("source.url", source.get("url"), issue.ref.url),
         ("control.requires_human_approval", control.get("requires_human_approval"), True),
         # Read-only annotation, never approval/authorization semantics
-        # (mctlhq/mctl-agents#196, ADR 011) — only the fixed literal `agent`
-        # is checked; context_id/trace_id vary run to run by design.
-        ("execution.agent", execution.get("agent"), "issue-investigator"),
+        # (mctlhq/mctl-agents#196, ADR 011) — the expected value is the same
+        # source the writer used (context.executor.agent, driver literal as
+        # fallback), so writer and checker cannot disagree about which agent
+        # this run was; context_id/trace_id vary run to run by design.
+        ("execution.agent", execution.get("agent"), expected_agent),
     ]
     return [
         f"{STATUS_FILENAME} says {field}={actual!r}, not {wanted!r}"
@@ -2201,7 +2207,11 @@ def investigate(
                 # spoken after the rename rather than before it, through
                 # the fd we already hold — which names the published
                 # directory itself, no path to re-resolve.
-                bad = _landed_triplet_defects(staging_fd, issue)
+                bad = _landed_triplet_defects(
+                    staging_fd,
+                    issue,
+                    expected_agent=execution_context.executor.agent or "issue-investigator",
+                )
                 if bad:
                     _remove_rejected(proposal_dir)
                     raise _StagingReplaced(

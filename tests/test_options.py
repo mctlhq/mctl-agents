@@ -1316,6 +1316,19 @@ def test_mctl_mcp_config_headers_are_exactly_authorization_when_env_unset(monkey
     assert set(headers) == {"Authorization"}
 
 
+def test_mctl_mcp_config_fails_closed_at_build_time_even_without_a_token(monkeypatch):
+    """The require-mode raise must fire at options CONSTRUCTION, before the
+    MCTL_TOKEN early-return — not only from inside the PreToolUse audit
+    hook, whose exception propagation is an SDK implementation detail."""
+    from orchestrator.execution_identity import ExecutionContextRequiredError
+
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    with pytest.raises(ExecutionContextRequiredError):
+        options.mctl_mcp_config()
+
+
 def test_execution_context_headers_fail_closed_when_required_and_env_unset(monkeypatch):
     """agy finding 1 on 86fb8e8: the early `return {}` for an unset file env
     ran BEFORE load_from_environment() could raise, so require mode silently

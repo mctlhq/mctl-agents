@@ -96,6 +96,13 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     (mcp_servers={} below) — it never calls mcp__mctl__* tools, so there is
     nothing to always-load.
     """
+    # Build-time fail-closed: raise the require-mode error HERE, at options
+    # construction, not only from inside the PreToolUse audit hook — whether
+    # an exception raised in a hook propagates is an SDK implementation
+    # detail this control must not depend on. Deliberately BEFORE the token
+    # early-return, so require mode fails closed even with no MCTL_TOKEN
+    # (the hook-time raise below stays as backstop).
+    identity_headers = _execution_context_headers()
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
         print("warn: MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
@@ -103,7 +110,7 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     server_config: dict[str, Any] = {
         "type": "http",
         "url": MCTL_MCP_URL,
-        "headers": {"Authorization": f"Bearer {token}", **_execution_context_headers()},
+        "headers": {"Authorization": f"Bearer {token}", **identity_headers},
     }
     if always_load:
         server_config["alwaysLoad"] = True

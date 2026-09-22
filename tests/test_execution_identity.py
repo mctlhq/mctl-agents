@@ -244,6 +244,22 @@ def test_validate_rejects_unknown_executor_type():
         _context(executor=_executor(type="freelancer"))
 
 
+def test_validate_rejects_unknown_asserted_by():
+    with pytest.raises(ei.ExecutionIdentityError, match=r"assertions\.asserted_by"):
+        _context(assertions=_assertions(asserted_by="totally-trustworthy"))
+
+
+@pytest.mark.parametrize("value", sorted(ei.ASSERTED_BY))
+def test_every_documented_asserted_by_is_accepted(value):
+    """The closed vocabulary is exactly what the two producers mint:
+    "control-plane" (the mint activity / a sealed CWFT context) and "local"
+    (mint_local). Verified against mctl-gitops: no other value is produced
+    anywhere (design.md for issue-196 states asserted_by is always
+    "control-plane" for a minted context)."""
+    context = _context(assertions=_assertions(asserted_by=value))
+    context.validate()
+
+
 def test_adr_010_executor_vocabulary_is_a_subset_of_this_schemas():
     """design.md: 'executor.type reuses ADR 010's Executor values verbatim
     so the two contracts never diverge' — every ADR 010 value must still be

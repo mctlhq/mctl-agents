@@ -3752,3 +3752,41 @@ def test_write_status_yaml_with_a_snapshot_is_additive_and_agrees(tmp_path):
     finally:
         os.close(fd)
     assert reread["context"]["snapshot_id"] == snapshot.snapshot_id
+
+
+def test_status_disagreements_agent_check_is_symmetric_with_the_writer(tmp_path):
+    """Round-3 P2 on #393: the writer records context.executor.agent while
+    the checker compared a literal — a context whose executor.agent differs
+    would be written by one layer and destroyed by the other. Both sides now
+    read the same source."""
+    import orchestrator.execution_identity as ei
+
+    proposal_dir = tmp_path / "p"
+    context = ei.mint_local(
+        executor_type="issue-investigator", workflow_type="investigate", agent="custom-agent"
+    )
+    status_path = write_status_yaml(proposal_dir, _issue(), context)
+    published = yaml.safe_load(status_path.read_text())
+    assert published["execution"]["agent"] == "custom-agent"
+
+    # Same source on both sides: clean.
+    assert (
+        run_issue_investigator._status_disagreements(
+            published, _issue(), expected_agent=context.executor.agent or "issue-investigator"
+        )
+        == []
+    )
+    # Direction 1: checker left on the literal while the writer used the
+    # context — the exact one-sided break this test pins.
+    assert any(
+        "execution.agent" in d
+        for d in run_issue_investigator._status_disagreements(published, _issue())
+    )
+    # Direction 2: an agent rewrote the block after publish — still flagged.
+    published["execution"]["agent"] = "tampered"
+    assert any(
+        "execution.agent" in d
+        for d in run_issue_investigator._status_disagreements(
+            published, _issue(), expected_agent=context.executor.agent or "issue-investigator"
+        )
+    )
