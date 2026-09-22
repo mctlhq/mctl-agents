@@ -13,7 +13,6 @@ tests exercise the real function output instead, for every builder.
 from __future__ import annotations
 
 import dataclasses
-
 from pathlib import Path
 
 import pytest

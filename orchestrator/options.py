@@ -22,7 +22,6 @@ from orchestrator.exec_budget import (
 from orchestrator.exec_budget import normalize_shell_command as _normalize_shell_command
 from orchestrator.resolver import ExecutionPlan
 
-
 # Paths already warned about by _execution_context_headers(): the audit hook
 # re-reads the env on every PreToolUse, so an unreadable context file would
 # otherwise print the same warning once per tool call.
@@ -70,8 +69,11 @@ def _execution_context_headers() -> dict[str, str]:
         # deliberately passes through: require mode fails closed, never
         # degrades to headerless calls.
         path = os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip()
-        if path not in _warned_context_paths:
-            _warned_context_paths.add(path)
+        # Keyed on path AND failure text, so a same-path file that starts
+        # failing differently (unreadable -> tampered) still warns once.
+        warn_key = f"{path}: {exc}"
+        if warn_key not in _warned_context_paths:
+            _warned_context_paths.add(warn_key)
             print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); omitting identity headers.")
         return {}
     return {"X-Mctl-Execution-Context": context.context_id, "X-Mctl-Trace-Id": context.trace_id}

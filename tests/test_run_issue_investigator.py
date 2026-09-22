@@ -3790,3 +3790,18 @@ def test_status_disagreements_agent_check_is_symmetric_with_the_writer(tmp_path)
             published, _issue(), expected_agent=context.executor.agent or "issue-investigator"
         )
     )
+
+
+def test_write_status_yaml_default_degrades_on_a_broken_context_file(tmp_path, monkeypatch):
+    """Round-5 P3 on #393: the no-context fallback's degrade branch. A direct
+    caller with a present-but-broken context file gets a locally-minted
+    unverified identity, not a crash — same as every driver call site."""
+    broken = tmp_path / "context.json"
+    broken.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(broken))
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+
+    status_path = write_status_yaml(tmp_path / "p", _issue())
+    published = yaml.safe_load(status_path.read_text())
+    assert published["execution"]["agent"] == "issue-investigator"
+    assert published["execution"]["context_id"].startswith("ex-")
