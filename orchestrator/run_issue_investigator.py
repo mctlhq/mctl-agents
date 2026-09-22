@@ -599,6 +599,13 @@ def _read_published_status(staging_fd: int) -> dict:
         os.close(fd)
 
 
+def _status_agent(context: ExecutionContext) -> str:
+    """The one spelling of the status block's agent value — used by the
+    writer (write_status_yaml) and the post-publish checker alike, so the
+    two can never diverge."""
+    return context.executor.agent or "issue-investigator"
+
+
 def _status_disagreements(
     published: dict, issue: IssueData, *, expected_agent: str = "issue-investigator"
 ) -> list[str]:
@@ -1138,9 +1145,19 @@ def write_status_yaml(
     `requested_by` is falsy, so a label-driven investigation's payload is
     byte-for-byte what it was before this parameter existed.
     """
-    context = context or load_from_environment(
-        executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
-    )
+    if context is None:
+        try:
+            context = load_from_environment(
+                executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+            )
+        except ExecutionIdentityError:
+            # Same degrade as every other call site: a present-but-broken
+            # context file must not crash a direct caller. An
+            # ExecutionContextRequiredError (require mode) still passes
+            # through uncaught — fail closed, ADR 011.
+            context = mint_local(
+                executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+            )
     payload: dict[str, Any] = {
         "status": "proposed",
         "updated_at": _now_iso(),
@@ -1148,7 +1165,7 @@ def write_status_yaml(
         "execution": {
             "context_id": context.context_id,
             "trace_id": context.trace_id,
-            "agent": context.executor.agent or "issue-investigator",
+            "agent": _status_agent(context),
             "version": context.executor.version,
         },
         "source": {
@@ -2208,9 +2225,7 @@ def investigate(
                 # the fd we already hold — which names the published
                 # directory itself, no path to re-resolve.
                 bad = _landed_triplet_defects(
-                    staging_fd,
-                    issue,
-                    expected_agent=execution_context.executor.agent or "issue-investigator",
+                    staging_fd, issue, expected_agent=_status_agent(execution_context)
                 )
                 if bad:
                     _remove_rejected(proposal_dir)

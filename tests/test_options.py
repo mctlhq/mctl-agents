@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import dataclasses
 
+from pathlib import Path
+
 import pytest
 
 from orchestrator import options, resolver
+
+_IDENTITY_FIXTURE = str(Path(__file__).parent / "fixtures" / "identity" / "investigator-context.json")
+
 
 # Every drain sub-deadline (mctl-agents#366/#368). They share the
 # `_positive_seconds` clamp, so the clamp and env-name tests below are one
@@ -1290,7 +1295,7 @@ def test_execution_context_headers_degrade_on_broken_file(monkeypatch, tmp_path,
 def test_execution_context_headers_from_a_sealed_file(monkeypatch):
     """Positive path: a valid context file produces exactly the two identity
     headers — the zero-agent-cooperation guarantee this PR exists for."""
-    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", "tests/fixtures/identity/investigator-context.json")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
     monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
     assert options._execution_context_headers() == {
         "X-Mctl-Execution-Context": "ex-c5618d6437519c29",
@@ -1300,7 +1305,7 @@ def test_execution_context_headers_from_a_sealed_file(monkeypatch):
 
 def test_mctl_mcp_config_merges_identity_headers_next_to_authorization(monkeypatch):
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
-    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", "tests/fixtures/identity/investigator-context.json")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
     monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
     headers = options.mctl_mcp_config()["mctl"]["headers"]
     assert headers["Authorization"] == "Bearer test-token"
@@ -1355,3 +1360,28 @@ def test_execution_context_headers_fail_closed_in_require_mode(monkeypatch, tmp_
     monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
     with pytest.raises(ExecutionContextRequiredError):
         options._execution_context_headers()
+
+
+def test_audit_hook_appends_execution_context_when_present(monkeypatch, capsys):
+    import asyncio
+
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    asyncio.run(
+        options._audit_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}}, None, None)
+    )
+    out = capsys.readouterr().out
+    assert "AUDIT tool=Bash cmd='ls' execution_context=ex-c5618d6437519c29" in out
+
+
+def test_audit_hook_omits_execution_context_when_absent(monkeypatch, capsys):
+    import asyncio
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    asyncio.run(
+        options._audit_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}}, None, None)
+    )
+    out = capsys.readouterr().out
+    assert "AUDIT tool=Bash cmd='ls'" in out
+    assert "execution_context" not in out

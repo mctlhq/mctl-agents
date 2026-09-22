@@ -23,6 +23,12 @@ from orchestrator.exec_budget import normalize_shell_command as _normalize_shell
 from orchestrator.resolver import ExecutionPlan
 
 
+# Paths already warned about by _execution_context_headers(): the audit hook
+# re-reads the env on every PreToolUse, so an unreadable context file would
+# otherwise print the same warning once per tool call.
+_warned_context_paths: set[str] = set()
+
+
 def _execution_context_headers() -> dict[str, str]:
     """`X-Mctl-Execution-Context` / `X-Mctl-Trace-Id` (mctlhq/mctl-agents#196,
     ADR 011: docs/adr/011-execution-identity-contract.md) — present only when
@@ -63,7 +69,10 @@ def _execution_context_headers() -> dict[str, str]:
         # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
         # deliberately passes through: require mode fails closed, never
         # degrades to headerless calls.
-        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); omitting identity headers.")
+        path = os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip()
+        if path not in _warned_context_paths:
+            _warned_context_paths.add(path)
+            print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); omitting identity headers.")
         return {}
     return {"X-Mctl-Execution-Context": context.context_id, "X-Mctl-Trace-Id": context.trace_id}
 
@@ -73,7 +82,10 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
 
     Returns an empty dict when MCTL_TOKEN is unset — the agent then runs
     without mcp__mctl__* tools (Read/Write/WebSearch/WebFetch/Bash only).
-    Convenient for smoke tests and local dev without mctl access.
+    Convenient for smoke tests and local dev without mctl access. The
+    execution-identity headers are evaluated FIRST, before that early
+    return, so MCTL_REQUIRE_EXECUTION_CONTEXT fails closed at options
+    construction (ExecutionContextRequiredError) even in a tokenless run.
 
     always_load: sets the CLI's `alwaysLoad` flag, which blocks first-turn
     dispatch until this server connects (bounded by the CLI's own MCP
