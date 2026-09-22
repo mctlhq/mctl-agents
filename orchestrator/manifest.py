@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from orchestrator.service_skills import ServiceSkillPolicy
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MANIFESTS_DIR = REPO_ROOT / "agents" / "_manifests"
@@ -104,6 +106,12 @@ class AgentManifest:
     # orchestrator/validate_manifest.py working unchanged.
     api_version: str = SUPPORTED_API_VERSION
     execution_profile_ref: Mapping[str, str] | None = None
+    # mctlhq/mctl-agents#305: the platform-side envelope for repository-
+    # scoped ServiceSkillSets (.mctl/skills/ in the TARGET repo). Absent
+    # `spec.serviceSkills` -> ServiceSkillPolicy(enabled=False) -- no git
+    # read of a target repository's `.mctl/` root ever happens for an
+    # agent that never declared this block.
+    service_skills: ServiceSkillPolicy = field(default_factory=lambda: ServiceSkillPolicy(enabled=False))
 
     def _resolve_callable(self, ref: str, field: str) -> Callable[..., Any]:
         module, symbol = _resolve_ref(ref)
@@ -220,6 +228,7 @@ def _parse_fields_v1alpha1(document: dict[str, Any], path: Path) -> AgentManifes
         sandbox_backend=sandbox.get("backend", ""),
         cluster_workflow_template=sandbox.get("clusterWorkflowTemplate", ""),
         path=path,
+        service_skills=ServiceSkillPolicy.from_spec(spec.get("serviceSkills")),
     )
 
 
@@ -301,6 +310,11 @@ def _parse_fields_v1alpha2(document: dict[str, Any], path: Path) -> AgentManifes
         path=path,
         api_version="agents.mctl.ai/v1alpha2",
         execution_profile_ref={"name": profile_name, "compatibility": compatibility},
+        # The profile already parsed spec.serviceSkills (resolver.load_profile)
+        # -- reused here rather than re-parsed, the same "resolve the
+        # reference once" rule every other v1alpha2 field on this manifest
+        # already follows.
+        service_skills=profile.service_skills,
     )
 
 

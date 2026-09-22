@@ -214,6 +214,68 @@ def test_execute_resolves_a_valid_fixture_set(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#305 T11 — ExecutionPlan service-skill provenance
+# ---------------------------------------------------------------------------
+def test_execute_records_service_skill_provenance(tmp_path, monkeypatch):
+    """`ExecutionPlan.service_skills`/`.service_skill_manifest_hash`/
+    `.service_skills_resolved_from_sha` are populated from a real
+    `ServiceSkillBundle` and surfaced in `to_log_dict()` — identifiers and
+    `sha256:`-prefixed hashes only, never the skill text."""
+    import subprocess
+
+    _build_fixture_set(
+        tmp_path, monkeypatch,
+        profile_overrides={"serviceSkills": {"enabled": True}},
+    )
+    # `_AGENT` ("test-agent") isn't one of this repo's real
+    # agents/_manifests/* names — the known-agent-name check inside
+    # resolve_bundle would reject a binding to it. Patch load_all() to make
+    # the synthetic fixture agent "known", the same way `known_agents` would
+    # in a direct orchestrator.service_skills.resolve_bundle() call.
+    monkeypatch.setattr("orchestrator.manifest.load_all", lambda *a, **k: {_AGENT: object()})
+
+    repo = tmp_path / "target-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    skill_dir = repo / ".mctl" / "skills" / "repo-testing"
+    skill_dir.mkdir(parents=True)
+    (repo / ".mctl" / "skills" / "manifest.yaml").write_text(
+        "apiVersion: agents.mctl.ai/v1alpha1\n"
+        "kind: ServiceSkillSet\n"
+        "metadata:\n  service: test-service\n"
+        "spec:\n"
+        f"  bindings:\n    {_AGENT}: [repo-testing]\n"
+        "  skills:\n    repo-testing: {path: .mctl/skills/repo-testing/SKILL.md}\n"
+    )
+    (skill_dir / "SKILL.md").write_text("---\nname: repo-testing\ndescription: d\n---\n\nBody.\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add skill"], cwd=repo, check=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    plan = resolver.execute(
+        _AGENT, resolver.Task(target_repository_sha=sha, target_repo_dir=repo)
+    )
+    assert plan.service_skills_resolved_from_sha == sha
+    assert plan.service_skill_manifest_hash is not None
+    assert plan.service_skill_manifest_hash.startswith("sha256:")
+    assert len(plan.service_skills) == 1
+    identifier = plan.service_skills[0]
+    assert identifier["skill_id"] == "repo-testing"
+    assert identifier["path"] == ".mctl/skills/repo-testing/SKILL.md"
+    assert identifier["content_hash"].startswith("sha256:")
+    assert "text" not in identifier
+
+    log_dict = plan.to_log_dict()
+    assert log_dict["service_skills"] == list(plan.service_skills)
+    assert log_dict["service_skill_manifest_hash"] == plan.service_skill_manifest_hash
+    assert log_dict["service_skills_resolved_from_sha"] == sha
+
+
+# ---------------------------------------------------------------------------
 # T5 — determinism: same fixture + same task/target SHA -> identical plan
 # ---------------------------------------------------------------------------
 def test_execute_is_deterministic_for_the_same_input(tmp_path, monkeypatch):
@@ -226,15 +288,20 @@ def test_execute_is_deterministic_for_the_same_input(tmp_path, monkeypatch):
 
 def test_execute_differs_only_by_target_sha(tmp_path, monkeypatch):
     """A later promotion never mutates an already created plan — here,
-    changing only the per-run input (target SHA) changes only that field."""
+    changing only the per-run input (target SHA) changes only that field
+    (and, mctlhq/mctl-agents#305, `service_skills_resolved_from_sha`: with
+    no `target_repo_dir` the bundle is empty and pinned to the same
+    `target_repository_sha` by construction, so it tracks it 1:1)."""
     _build_fixture_set(tmp_path, monkeypatch)
     plan_one = resolver.execute(_AGENT, resolver.Task(target_repository_sha="c" * 40))
     plan_two = resolver.execute(_AGENT, resolver.Task(target_repository_sha="d" * 40))
     assert plan_one.target_repository_sha != plan_two.target_repository_sha
+    assert plan_two.service_skills_resolved_from_sha == plan_two.target_repository_sha
+    sha_derived_fields = {"target_repository_sha", "service_skills_resolved_from_sha"}
     fields_that_must_still_match = {
-        k: v for k, v in plan_one.to_log_dict().items() if k != "target_repository_sha"
+        k: v for k, v in plan_one.to_log_dict().items() if k not in sha_derived_fields
     }
-    assert {k: v for k, v in plan_two.to_log_dict().items() if k != "target_repository_sha"} == (
+    assert {k: v for k, v in plan_two.to_log_dict().items() if k not in sha_derived_fields} == (
         fields_that_must_still_match
     )
 

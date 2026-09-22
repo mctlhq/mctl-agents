@@ -765,6 +765,77 @@ def check_binding_pins_match_definitions(manifests: dict[str, AgentManifest]) ->
     return errors
 
 
+GITOPS_POLICY_PATH = GITOPS_ROOT / "agent-platform" / "policy.yaml"
+
+
+def check_service_skills_limits(manifests: dict[str, AgentManifest]) -> list[str]:
+    """A declared `spec.serviceSkills` ceiling (`maxSkills`/`maxSkillBytes`/
+    `maxTotalBytes`) must never exceed the mctl-gitops
+    `agent-platform/policy.yaml` ceiling (mctlhq/mctl-agents#305, tasks.md
+    task 7), in the style of `check_catalog_profiles_match_builders` above:
+    the comparison needs BOTH files, and only this repository can read both.
+
+    `policy.yaml`'s `spec.limits.maxServiceSkills` /
+    `spec.limits.maxServiceSkillBytes` / `spec.limits.maxServiceTotalBytes`
+    keys -- note the `spec.limits.` nesting; the existing budget ceilings in
+    that file sit directly under `spec`, but these three live one level down
+    -- are themselves additive and optional (mctlhq/mctl-agents#305 tasks.md
+    task 16, a separate mctl-gitops PR; the third key bounds the AGGREGATE
+    `maxTotalBytes` and must be created alongside the other two) -- until
+    that PR lands, or
+    for an agent with no declared block at all, there is nothing to compare
+    against and this reports no error. An agent whose block declares a
+    ceiling ABOVE a configured platform ceiling is the one thing this
+    checks for.
+    """
+    if not GITOPS_POLICY_PATH.is_file():
+        return _gitops_missing(GITOPS_POLICY_PATH, "the agent-platform service-skill ceilings")
+
+    try:
+        policy_document = yaml.safe_load(GITOPS_POLICY_PATH.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        return [f"{GITOPS_POLICY_PATH}: invalid YAML: {exc}"]
+    if not isinstance(policy_document, dict):
+        return [f"{GITOPS_POLICY_PATH}: root must be a mapping"]
+    spec = policy_document.get("spec")
+    limits = spec.get("limits") if isinstance(spec, dict) else None
+    if not isinstance(limits, dict):
+        return []
+    max_skills_ceiling = limits.get("maxServiceSkills")
+    max_bytes_ceiling = limits.get("maxServiceSkillBytes")
+    max_total_ceiling = limits.get("maxServiceTotalBytes")
+
+    errors: list[str] = []
+    for manifest in sorted(manifests.values(), key=lambda m: m.name):
+        policy = manifest.service_skills
+        if not policy.enabled:
+            continue
+        if isinstance(max_skills_ceiling, int) and policy.max_skills > max_skills_ceiling:
+            errors.append(
+                f"{manifest.path}: spec.serviceSkills.maxSkills ({policy.max_skills}) exceeds "
+                f"the platform ceiling limits.maxServiceSkills ({max_skills_ceiling}) in "
+                f"{GITOPS_POLICY_PATH}"
+            )
+        if isinstance(max_bytes_ceiling, int) and policy.max_skill_bytes > max_bytes_ceiling:
+            errors.append(
+                f"{manifest.path}: spec.serviceSkills.maxSkillBytes ({policy.max_skill_bytes}) "
+                f"exceeds the platform ceiling limits.maxServiceSkillBytes ({max_bytes_ceiling}) "
+                f"in {GITOPS_POLICY_PATH}"
+            )
+        # The aggregate limit compares against its own aggregate ceiling,
+        # never against the per-skill one: maxTotalBytes (96 KiB default)
+        # legitimately exceeds maxServiceSkillBytes (32 KiB default) on
+        # every manifest, so comparing across the two would fail every
+        # enabled agent the moment the per-skill ceiling is configured.
+        if isinstance(max_total_ceiling, int) and policy.max_total_bytes > max_total_ceiling:
+            errors.append(
+                f"{manifest.path}: spec.serviceSkills.maxTotalBytes ({policy.max_total_bytes}) "
+                f"exceeds the platform ceiling limits.maxServiceTotalBytes ({max_total_ceiling}) "
+                f"in {GITOPS_POLICY_PATH}"
+            )
+    return errors
+
+
 def validate(manifest: AgentManifest) -> list[str]:
     """Return human-readable errors for one manifest; empty means valid."""
     errors: list[str] = []
@@ -866,6 +937,13 @@ def main(argv: list[str] | None = None) -> int:
             exit_code = 1
             print("FAIL mctl-gitops release bindings <-> agents/_manifests/:")
             for error in pin_errors:
+                print(f"  - {error}")
+
+        service_skills_errors = check_service_skills_limits(manifests)
+        if service_skills_errors:
+            exit_code = 1
+            print("FAIL spec.serviceSkills <-> mctl-gitops agent-platform policy.yaml ceilings:")
+            for error in service_skills_errors:
                 print(f"  - {error}")
 
     return exit_code

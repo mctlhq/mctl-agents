@@ -25,6 +25,7 @@ from _pytest.outcomes import Failed, Skipped
 from config.model_policy import resolve_model
 from orchestrator import validate_manifest as validate_manifest_module
 from orchestrator.manifest import AgentManifest, ManifestError, load, load_all
+from orchestrator.service_skills import ServiceSkillPolicy
 from orchestrator.validate_manifest import (
     GITOPS_CATALOG_PROFILES_DIR,
     _check_legacy_env_override,
@@ -32,6 +33,7 @@ from orchestrator.validate_manifest import (
     check_binding_pins_match_definitions,
     check_catalog_profiles_match_builders,
     check_manifests_match_inventory,
+    check_service_skills_limits,
     validate,
 )
 
@@ -868,3 +870,133 @@ def test_bindings_for_another_repository_are_skipped_but_never_silently(
     errors = check_binding_pins_match_definitions(MANIFESTS)
 
     assert errors and "none targets mctlhq/mctl-agents" in errors[0], errors
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#305 T14 — serviceSkills normalization / ceiling check
+# ---------------------------------------------------------------------------
+def test_service_skills_defaults_to_disabled_for_every_real_manifest() -> None:
+    """No agent.yaml declares spec.serviceSkills yet (mctlhq/mctl-agents#305
+    ships the machinery only, not the flip -- R17's own acceptance
+    criterion is exercised by every one of today's real manifests)."""
+    for manifest in MANIFESTS.values():
+        assert manifest.service_skills == ServiceSkillPolicy(enabled=False)
+
+
+def test_service_skills_parses_identically_from_v1alpha1_and_v1alpha2(tmp_path) -> None:
+    """The same spec.serviceSkills block parses to the same ServiceSkillPolicy
+    whether it comes from a v1alpha1 agent.yaml's own spec or (via
+    resolver.load_profile) a v1alpha2 ExecutionProfile's spec."""
+    block = {"enabled": True, "root": ".mctl/skills", "maxSkills": 5, "maxSkillBytes": 111, "maxTotalBytes": 222}
+
+    agent_dir = tmp_path / "manifests" / "sample-agent"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "agent.yaml").write_text(yaml.safe_dump({
+        "apiVersion": "agents.mctl.ai/v1alpha1",
+        "kind": "Agent",
+        "metadata": {"name": "sample-agent", "owner": "test"},
+        "spec": {
+            "runtime": {
+                "type": "claude-agent-sdk",
+                "entrypoint": "orchestrator.run_implementer:implement_one",
+                "optionsBuilder": "orchestrator.options:build_implementer_agent_options",
+            },
+            "prompt": {"sources": [{"inline": "tests.test_manifest:_dummy_prompt"}]},
+            "modelPolicy": {"task": "service_agent"},
+            "toolPolicy": {"allow": ["Read"]},
+            "execution": {"budgetUsd": 1.0, "sandbox": {"backend": "argo", "clusterWorkflowTemplate": "x"}},
+            "serviceSkills": block,
+        },
+    }))
+    v1alpha1_manifest = load(agent_dir / "agent.yaml")
+
+    # And the same block parsed straight off an ExecutionProfile's spec, the
+    # v1alpha2 half of the same claim, via ServiceSkillPolicy.from_spec
+    # directly (resolver.load_profile's own code path).
+    from_v1alpha2_profile_spec = ServiceSkillPolicy.from_spec(block)
+
+    assert v1alpha1_manifest.service_skills == from_v1alpha2_profile_spec
+    assert v1alpha1_manifest.service_skills == ServiceSkillPolicy(
+        enabled=True, root=".mctl/skills", max_skills=5, max_skill_bytes=111, max_total_bytes=222
+    )
+
+
+def _dummy_prompt() -> str:
+    return "dummy"
+
+
+def test_check_service_skills_limits_flags_a_ceiling_violation(tmp_path, monkeypatch) -> None:
+    policy_path = tmp_path / "agent-platform" / "policy.yaml"
+    policy_path.parent.mkdir(parents=True)
+    policy_path.write_text(yaml.safe_dump({
+        "spec": {"limits": {"maxServiceSkills": 4, "maxServiceSkillBytes": 1000}}
+    }))
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_POLICY_PATH", policy_path)
+
+    over_ceiling = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True, max_skills=10, max_skill_bytes=500, max_total_bytes=500),
+    )
+    errors = check_service_skills_limits({"x": over_ceiling})
+    assert any("maxSkills" in e for e in errors), errors
+
+
+def test_check_service_skills_limits_passes_within_ceiling(tmp_path, monkeypatch) -> None:
+    policy_path = tmp_path / "agent-platform" / "policy.yaml"
+    policy_path.parent.mkdir(parents=True)
+    policy_path.write_text(yaml.safe_dump({
+        "spec": {"limits": {"maxServiceSkills": 10, "maxServiceSkillBytes": 100000}}
+    }))
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_POLICY_PATH", policy_path)
+
+    within_ceiling = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True, max_skills=4, max_skill_bytes=500, max_total_bytes=500),
+    )
+    assert check_service_skills_limits({"x": within_ceiling}) == []
+
+
+def test_check_service_skills_limits_total_compares_against_total_ceiling_only(tmp_path, monkeypatch) -> None:
+    """Regression (agy P2 on #407): maxTotalBytes must never be compared
+    against the per-skill ceiling -- the default-shaped policy (total 96 KiB >
+    per-skill 32 KiB) is legal whenever it is within maxServiceTotalBytes,
+    and only a configured maxServiceTotalBytes can flag it."""
+    policy_path = tmp_path / "agent-platform" / "policy.yaml"
+    policy_path.parent.mkdir(parents=True)
+    policy_path.write_text(yaml.safe_dump({
+        "spec": {"limits": {
+            "maxServiceSkillBytes": 32 * 1024,
+            "maxServiceTotalBytes": 96 * 1024,
+        }}
+    }))
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_POLICY_PATH", policy_path)
+
+    default_shaped = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True),  # 32 KiB / 96 KiB defaults
+    )
+    assert check_service_skills_limits({"x": default_shaped}) == []
+
+    over_total = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True, max_total_bytes=97 * 1024),
+    )
+    errors = check_service_skills_limits({"x": over_total})
+    assert any("maxServiceTotalBytes" in e for e in errors), errors
+
+
+def test_check_service_skills_limits_no_op_when_ceilings_not_yet_configured(tmp_path, monkeypatch) -> None:
+    """policy.yaml exists but has no limits.maxServiceSkills*  keys yet
+    (mctlhq/mctl-agents#305 tasks.md task 16 is a separate, not-yet-landed
+    mctl-gitops PR) -- nothing to compare against, so this reports no error
+    regardless of what an agent declares."""
+    policy_path = tmp_path / "agent-platform" / "policy.yaml"
+    policy_path.parent.mkdir(parents=True)
+    policy_path.write_text(yaml.safe_dump({"spec": {"limits": {"maxBudgetUsd": 25.0}}}))
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_POLICY_PATH", policy_path)
+
+    huge = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True, max_skills=999, max_skill_bytes=999, max_total_bytes=999),
+    )
+    assert check_service_skills_limits({"x": huge}) == []
