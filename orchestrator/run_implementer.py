@@ -117,6 +117,7 @@ from config.settings import (
 )
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
+from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
@@ -3350,6 +3351,29 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         print(f"[dry-run] would preflight then implement {ref.service}/{ref.slug}")
         return ImplementResult(ref=ref, pr_url=None, skipped_reason="dry-run")
 
+    # Loaded once per proposal attempt (mctlhq/mctl-agents#196, ADR 011) and
+    # reused wherever this run's identity is recorded, so the log line, the
+    # MCP headers (orchestrator.options, loaded from the same
+    # MCTL_EXECUTION_CONTEXT_FILE) and the `.status.yaml` execution: block
+    # agree by construction whenever a control-plane-minted context exists.
+    try:
+        execution_context = load_from_environment(
+            executor_type="implementer", workflow_type="implement", agent="implementer"
+        )
+    except ExecutionIdentityError as exc:
+        # Mirrors orchestrator.options._execution_context_headers(): a
+        # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
+        # truncated, or tamper-evidence failure) must not crash the attempt —
+        # degrade to a locally-minted, explicitly unverified context instead.
+        # load_from_environment() wraps every read/parse failure into
+        # ExecutionIdentityError, so this narrow catch is complete — and an
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # passes through and kills the attempt: require mode fails closed
+        # and never mints a local identity (ADR 011).
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
+        execution_context = mint_local(executor_type="implementer", workflow_type="implement", agent="implementer")
+    print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
+
     try:
         existing = _preflight_existing_result(ref)
     except GitHubPreflightError as exc:
@@ -3716,6 +3740,16 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             attempt=completed_attempt,
             failure=None,
             notes=None,
+            # Read-only annotation, never approval/authorization (ADR 011):
+            # overrides the investigator's own execution: block with THIS
+            # attempt's identity, since a fresh implementer run produced
+            # this transition.
+            execution={
+                "context_id": execution_context.context_id,
+                "trace_id": execution_context.trace_id,
+                "agent": execution_context.executor.agent or "implementer",
+                "version": execution_context.executor.version,
+            },
             # A run that got through clears the hand-back tally: the cap
             # bounds CONSECUTIVE budget-exhausted attempts, not the lifetime
             # of the proposal (mctl-agents#430).
