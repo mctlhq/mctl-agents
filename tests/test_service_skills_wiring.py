@@ -64,7 +64,7 @@ def test_implementer_resolution_disabled_policy_skips_pin_sha(monkeypatch):
         "orchestrator.run_implementer", reason="needs Python >= 3.11"
     )
 
-    def _boom(*a, **k):  # noqa: ANN002, ANN003
+    def _boom(*a, **k):
         raise AssertionError("pin_sha must not run for a disabled policy")
 
     monkeypatch.setattr(run_implementer, "service_skill_pin_sha", _boom)
