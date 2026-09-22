@@ -975,15 +975,37 @@ def _resolve_service_skill_bundle_for_plan(
             root=profile.service_skills.root,
             manifest_hash=None,
         )
-    from orchestrator.service_skills import ServiceSkillError
+    from orchestrator.service_skills import (
+        _GIT_TIMEOUT_SECONDS,
+        AGENT_AUTHORED_AGENTS,
+        ServiceSkillError,
+        _merge_base_with_default_branch,
+    )
 
+    pinned_sha = task.target_repository_sha.strip()
     try:
+        if profile.service_skills.enabled and agent in AGENT_AUTHORED_AGENTS:
+            # R6 lives HERE too, not only in run_implementer's ad hoc path:
+            # an agent that commits to the branch it runs on must read
+            # service skills from the merge-base with the default branch,
+            # never from a SHA that may carry its own previous run's
+            # commits. The caller's pin is verified rather than silently
+            # replaced, so a migration that passes branch HEAD fails loudly.
+            expected = _merge_base_with_default_branch(
+                task.target_repo_dir, timeout=_GIT_TIMEOUT_SECONDS
+            )
+            if pinned_sha != expected:
+                raise ResolverError(
+                    f"service skills for agent-authored agent {agent!r} must be pinned to the "
+                    f"merge-base with the default branch ({expected}), got "
+                    f"{pinned_sha!r} -- see service_skills.pin_sha (R6)"
+                )
         return _resolve_service_skill_bundle(
             agent=agent,
             repo_dir=task.target_repo_dir,
             policy=profile.service_skills,
             tool_allow=profile.tools,
-            pinned_sha=task.target_repository_sha.strip(),
+            pinned_sha=pinned_sha,
         )
     except ServiceSkillError as exc:
         # Same conversion `_parse_service_skills_policy` performs: every

@@ -67,13 +67,13 @@ MAX_MANIFEST_BYTES = 64 * 1024
 # on disk; the tree LISTING is the only place a mode can hide.
 _BLOB_MODES = frozenset({"100644", "100755"})
 
-# Agents whose branch is agent-authored (`feat/agents-*`): resolving from
+# Agents that commit to the branch they run on -- `feat/agents-*` or an
+# adopted PR's own head branch (mctlhq/mctl-agents#334): resolving from
 # HEAD would let a skill edit committed by a previous run of the SAME agent
 # become policy for the NEXT run without human review (R6). Resolving from
 # the merge-base with the default branch means a skill change only takes
 # effect once a human merges it.
 AGENT_AUTHORED_AGENTS = ("implementer", "shepherd")
-_AGENT_BRANCH_PREFIX = "feat/agents-"
 
 # Front-matter keys that would let repository-owned text widen the agent's
 # envelope. Authority stays with ExecutionProfile/AgentManifest -- never
@@ -96,11 +96,11 @@ _STRIPPED_TAG = "[tag stripped]"
 # cannot terminate or forge the delimiter block it is rendered inside (R18).
 _FORGED_TAG_RE = re.compile(r"(?i)<[\s/]*service_skills(?![-\w])[^>\n]*>?")
 
-# `skill_id` is rendered verbatim into the prompt block's `### {skill_id}`
-# heading (R18) -- it is never passed through `_neutralize_service_skill_tags`,
-# so unlike skill TEXT it cannot rely on tag-stripping for containment. It
-# must instead be structurally incapable of spelling a delimiter tag: no `<`,
-# `>`, whitespace or newlines, ever. Manifest keys already look like this in
+# `skill_id` is rendered into the prompt block's `### {skill_id}` heading
+# (R18). Since a6eeaa7 it also passes through `_neutralize_service_skill_tags`
+# at render as defense in depth, but the primary containment is structural:
+# an id must be incapable of spelling a delimiter tag at all -- no `<`, `>`,
+# whitespace or newlines, ever. Manifest keys already look like this in
 # every real declaration (`repo-testing`, `generated-files`), so this is not
 # a behavior change for well-formed manifests.
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?\Z")
@@ -413,13 +413,17 @@ def _merge_base_with_default_branch(repo_dir: Path, *, timeout: float) -> str:
 def pin_sha(repo_dir: Path, *, agent: str, branch: str | None, timeout: float = _GIT_TIMEOUT_SECONDS) -> str:
     """The SHA service skills are read from for one run (R6/R7).
 
-    `git rev-parse HEAD` for a read-only agent. For an agent-authored
-    branch (`implementer`/`shepherd` on `feat/agents-*`) the merge-base
-    with the default branch instead, so a skill edit a previous run of the
-    SAME agent committed cannot become policy for the next run without a
-    human merging it first.
+    `git rev-parse HEAD` for a read-only agent. For an agent-authored run
+    (`implementer`/`shepherd` on ANY named branch) the merge-base with the
+    default branch instead, so a skill edit a previous run of the SAME
+    agent committed cannot become policy for the next run without a human
+    merging it first. The branch name deliberately does not matter: the
+    adopted-PR path (mctlhq/mctl-agents#334) runs the implementer on the
+    PR's own head branch, which need not start with `feat/agents-`, and a
+    previous remediation run may have committed `.mctl/skills/**` edits
+    there just the same (R6/ADR 007).
     """
-    if agent in AGENT_AUTHORED_AGENTS and branch and branch.startswith(_AGENT_BRANCH_PREFIX):
+    if agent in AGENT_AUTHORED_AGENTS and branch:
         return _merge_base_with_default_branch(repo_dir, timeout=timeout)
     return _head_sha(repo_dir, timeout=timeout)
 
@@ -745,6 +749,13 @@ def _cli_validate(argv: Sequence[str] | None = None) -> int:
 
     manifests = _manifest.load_all()
     known_agents = sorted(manifests.keys())
+    unknown = sorted(set(args.agent or ()) - set(known_agents))
+    if unknown:
+        # A misspelled --agent would otherwise validate an unbound name
+        # against a default policy and print a vacuous OK -- same false-OK
+        # class as the kill-switch guard above.
+        print(f"FAIL: unknown agent(s) {unknown!r}; known: {known_agents}")
+        return 1
     agents = args.agent or known_agents
     try:
         sha = _head_sha(args.repo, timeout=_GIT_TIMEOUT_SECONDS)

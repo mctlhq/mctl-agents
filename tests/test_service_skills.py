@@ -271,6 +271,29 @@ def test_merge_base_rule_excludes_branch_authored_skill(tmp_path):
     assert bundle.manifest_hash is None
 
 
+def test_merge_base_rule_applies_to_adopted_pr_branch(tmp_path):
+    """R6 on the adopted-PR path (mctl-agents#334): the implementer runs on
+    the PR's own head branch, whose name need not start with `feat/agents-`.
+    A skills edit a previous remediation run committed on that branch must
+    still NOT change the bundle the next run resolves."""
+    clone = _setup_origin(tmp_path)
+    base_sha = _head(clone)
+
+    _git(clone, "checkout", "-q", "-b", "fix/some-human-branch")
+    _write_manifest(clone, bindings={"implementer": ["a"]}, skills={"a": _skill_text("a", "branch-authored")})
+    _commit_all(clone, "previous remediation run committed a skill on the adopted branch")
+
+    pinned = pin_sha(clone, agent="implementer", branch="fix/some-human-branch")
+    assert pinned == base_sha
+
+    bundle = resolve_bundle(
+        agent="implementer", repo_dir=clone, policy=_enabled_policy(), tool_allow=(),
+        pinned_sha=pinned, known_agents=_KNOWN_AGENTS,
+    )
+    assert bundle.skills == ()
+    assert bundle.manifest_hash is None
+
+
 def test_merge_base_rule_is_a_noop_for_read_only_agents(tmp_path):
     clone = _setup_origin(tmp_path)
     _write_manifest(clone, bindings={"issue-investigator": ["a"]}, skills={"a": _skill_text("a")})

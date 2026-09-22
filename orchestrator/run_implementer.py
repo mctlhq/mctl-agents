@@ -1573,11 +1573,12 @@ def _resolve_implementer_service_skills(target: Path, branch: str) -> ServiceSki
     comes straight from `AgentManifest` (`tool_allow`, and
     `service_skills` for enablement/ceilings).
 
-    `branch` is `feat/agents-<slug>` on every caller, so
-    `service_skills.pin_sha` always resolves the merge-base with the
-    default branch (R6) rather than HEAD — on a brand-new branch that is
-    the same commit HEAD already is, and on a review-feedback branch it is
-    NOT whatever a previous implementer run committed on top of it.
+    `branch` is `feat/agents-<slug>` for a proposal run, or the adopted
+    PR's own head branch (mctlhq/mctl-agents#334); either way
+    `service_skills.pin_sha` resolves the merge-base with the default
+    branch (R6) rather than HEAD — on a brand-new branch that is the same
+    commit HEAD already is, and on a review-feedback or adopted branch it
+    is NOT whatever a previous implementer run committed on top of it.
 
     Raises `ServiceSkillError` — the caller aborts before
     `_run_implementer_agent`, so before any commit, push, or PR (R22).
