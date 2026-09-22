@@ -13,10 +13,14 @@ tests exercise the real function output instead, for every builder.
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 
 from orchestrator import options, resolver
+
+_IDENTITY_FIXTURE = str(Path(__file__).parent / "fixtures" / "identity" / "investigator-context.json")
+
 
 # Every drain sub-deadline (mctl-agents#366/#368). They share the
 # `_positive_seconds` clamp, so the clamp and env-name tests below are one
@@ -1289,3 +1293,111 @@ def test_pretooluse_hook_output_still_declares_updated_input():
     from claude_agent_sdk.types import PreToolUseHookSpecificOutput
 
     assert "updatedInput" in PreToolUseHookSpecificOutput.__annotations__
+
+
+# ---------------------------------------------------------------------------
+# Execution identity headers (mctl-agents#196, ADR 011): the degrade path
+# is a single narrow catch, and require mode passes through it fail-closed.
+# ---------------------------------------------------------------------------
+def test_execution_context_headers_degrade_on_broken_file(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "context.json"
+    path.write_bytes(b"\xff\xfe\x00garbage")  # UnicodeDecodeError territory
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(path))
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    assert options._execution_context_headers() == {}
+    assert "omitting identity headers" in capsys.readouterr().out
+
+
+def test_execution_context_headers_from_a_sealed_file(monkeypatch):
+    """Positive path: a valid context file produces exactly the two identity
+    headers — the zero-agent-cooperation guarantee this PR exists for."""
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    assert options._execution_context_headers() == {
+        "X-Mctl-Execution-Context": "ex-c5618d6437519c29",
+        "X-Mctl-Trace-Id": "a" * 32,
+    }
+
+
+def test_mctl_mcp_config_merges_identity_headers_next_to_authorization(monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    headers = options.mctl_mcp_config()["mctl"]["headers"]
+    assert headers["Authorization"] == "Bearer test-token"
+    assert headers["X-Mctl-Execution-Context"] == "ex-c5618d6437519c29"
+    assert headers["X-Mctl-Trace-Id"] == "a" * 32
+
+
+def test_mctl_mcp_config_headers_are_exactly_authorization_when_env_unset(monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    headers = options.mctl_mcp_config()["mctl"]["headers"]
+    assert set(headers) == {"Authorization"}
+
+
+def test_mctl_mcp_config_fails_closed_at_build_time_even_without_a_token(monkeypatch):
+    """The require-mode raise must fire at options CONSTRUCTION, before the
+    MCTL_TOKEN early-return — not only from inside the PreToolUse audit
+    hook, whose exception propagation is an SDK implementation detail."""
+    from orchestrator.execution_identity import ExecutionContextRequiredError
+
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    with pytest.raises(ExecutionContextRequiredError):
+        options.mctl_mcp_config()
+
+
+def test_execution_context_headers_fail_closed_when_required_and_env_unset(monkeypatch):
+    """agy finding 1 on 86fb8e8: the early `return {}` for an unset file env
+    ran BEFORE load_from_environment() could raise, so require mode silently
+    proceeded headerless in exactly the missing-env case."""
+    from orchestrator.execution_identity import ExecutionContextRequiredError
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    with pytest.raises(ExecutionContextRequiredError):
+        options._execution_context_headers()
+
+
+def test_execution_context_headers_fail_closed_in_require_mode(monkeypatch, tmp_path):
+    """Driver-level fail-closed proof: with MCTL_REQUIRE_EXECUTION_CONTEXT
+    set and a broken context file, the consumer must NOT degrade — the
+    require-mode error passes through the narrow ExecutionIdentityError
+    catch and aborts the caller. All four degrade sites (options plus the
+    three run_* drivers) share this exact catch shape."""
+    from orchestrator.execution_identity import ExecutionContextRequiredError
+
+    path = tmp_path / "context.json"
+    path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(path))
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    with pytest.raises(ExecutionContextRequiredError):
+        options._execution_context_headers()
+
+
+def test_audit_hook_appends_execution_context_when_present(monkeypatch, capsys):
+    import asyncio
+
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", _IDENTITY_FIXTURE)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    asyncio.run(
+        options._audit_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}}, None, None)
+    )
+    out = capsys.readouterr().out
+    assert "AUDIT tool=Bash cmd='ls' execution_context=ex-c5618d6437519c29" in out
+
+
+def test_audit_hook_omits_execution_context_when_absent(monkeypatch, capsys):
+    import asyncio
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    asyncio.run(
+        options._audit_pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "ls"}}, None, None)
+    )
+    out = capsys.readouterr().out
+    assert "AUDIT tool=Bash cmd='ls'" in out
+    assert "execution_context" not in out

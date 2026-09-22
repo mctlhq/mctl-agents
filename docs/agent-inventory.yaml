@@ -69,6 +69,11 @@ version: 1
 # front of the model, beyond the single target SHA pinned above) now lives in
 # ADR 009 (docs/adr/009-context-snapshot-contract.md) and
 # orchestrator/context_snapshot.py.
+#
+# Who ran it (as opposed to what it saw) is a separate contract: ADR 011
+# (docs/adr/011-execution-identity-contract.md) and
+# orchestrator/execution_identity.py define the versioned ExecutionContext
+# every agent execution loads via load_from_environment().
 
 agents:
   - name: issue-investigator

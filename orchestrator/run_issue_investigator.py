@@ -80,7 +80,18 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
 from orchestrator import context_assembly
-from orchestrator.context_snapshot import ContextSnapshot
+from orchestrator.context_snapshot import (
+    MAX_PRIOR_EXECUTION_IDS,
+    MAX_WORK_CONTEXT_ID_LENGTH,
+    ContextSnapshot,
+    WorkContextRef,
+)
+from orchestrator.execution_identity import (
+    ExecutionContext,
+    ExecutionIdentityError,
+    load_from_environment,
+    mint_local,
+)
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 from orchestrator.proposal_identity import (
@@ -91,6 +102,7 @@ from orchestrator.proposal_identity import (
 
 # subagent_wait defers its own claude_agent_sdk imports (see its module note),
 # so unlike options/mcp_guard below it is safe at module scope here.
+# execution_identity is stdlib-only for the same reason (mctlhq/mctl-agents#196).
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
     OrphanedSubagentError,
@@ -490,7 +502,9 @@ def _verify_landed(
     return stat.S_ISDIR(landed.st_mode) and (landed.st_dev, landed.st_ino) == expected
 
 
-def _landed_triplet_defects(staging_fd: int | None, issue: IssueData) -> list[str]:
+def _landed_triplet_defects(
+    staging_fd: int | None, issue: IssueData, *, expected_agent: str = "issue-investigator"
+) -> list[str]:
     """Which of the triplet are not regular files, asked through ``staging_fd``.
 
     fstatat against the descriptor of the directory that was just renamed
@@ -536,7 +550,7 @@ def _landed_triplet_defects(staging_fd: int | None, issue: IssueData) -> list[st
             # out. A publish refused in error costs a re-run; a publish
             # allowed in error is a forged approval in agents-state.
             try:
-                defects.extend(_status_disagreements(published, issue))
+                defects.extend(_status_disagreements(published, issue, expected_agent=expected_agent))
             except Exception as exc:  # noqa: BLE001 — deliberate, see above
                 defects.append(
                     f"{STATUS_FILENAME} could not be checked: "
@@ -590,7 +604,16 @@ def _read_published_status(staging_fd: int) -> dict:
         os.close(fd)
 
 
-def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
+def _status_agent(context: ExecutionContext) -> str:
+    """The one spelling of the status block's agent value — used by the
+    writer (write_status_yaml) and the post-publish checker alike, so the
+    two can never diverge."""
+    return context.executor.agent or "issue-investigator"
+
+
+def _status_disagreements(
+    published: dict, issue: IssueData, *, expected_agent: str = "issue-investigator"
+) -> list[str]:
     """Ways the published status file differs from what we wrote.
 
     Not just `status`. The `source` block names the issue the implementer
@@ -623,16 +646,25 @@ def _status_disagreements(published: dict, issue: IssueData) -> list[str]:
     # on #247).
     source = published.get("source")
     control = published.get("control")
+    execution = published.get("execution")
     if not isinstance(source, dict):
         source = {}
     if not isinstance(control, dict):
         control = {}
+    if not isinstance(execution, dict):
+        execution = {}
     expected = [
         ("status", published.get("status"), "proposed"),
         ("source.repo", source.get("repo"), issue.ref.full_repo),
         ("source.issue", source.get("issue"), issue.ref.number),
         ("source.url", source.get("url"), issue.ref.url),
         ("control.requires_human_approval", control.get("requires_human_approval"), True),
+        # Read-only annotation, never approval/authorization semantics
+        # (mctlhq/mctl-agents#196, ADR 011) — the expected value is the same
+        # source the writer used (context.executor.agent, driver literal as
+        # fallback), so writer and checker cannot disagree about which agent
+        # this run was; context_id/trace_id vary run to run by design.
+        ("execution.agent", execution.get("agent"), expected_agent),
     ]
     return [
         f"{STATUS_FILENAME} says {field}={actual!r}, not {wanted!r}"
@@ -1083,6 +1115,7 @@ def _status_mode(proposal_dir: Path) -> int:
 def write_status_yaml(
     proposal_dir: Path,
     issue: IssueData,
+    context: ExecutionContext | None = None,
     *,
     snapshot: ContextSnapshot | None = None,
     requested_by: str | None = None,
@@ -1093,7 +1126,15 @@ def write_status_yaml(
     Status starts at `proposed`. The `source` block links the proposal back
     to the originating GitHub issue — the Tier 2 implementer reads it to add
     `Closes <repo>#<N>` to the PR, and `update_status_yaml` preserves it
-    through every later transition.
+    through every later transition (proposal_state.update_status_file merges
+    by default, so the `execution` block below survives untouched unless a
+    later writer explicitly overrides it).
+
+    `context` is read-only annotation (mctlhq/mctl-agents#196, ADR 011): it
+    names which agent/execution produced this proposal, never an
+    authorization. Callers that already loaded one (investigate()) pass it
+    through so every consumer of this run sees the same identity; callers
+    that did not (direct test calls) get a locally-minted, unverified one.
 
     `snapshot`, when given (mctlhq/mctl-agents#265's `shadow`/`on` context
     modes), adds an ADDITIVE `context` block carrying just the correlation
@@ -1109,10 +1150,29 @@ def write_status_yaml(
     `requested_by` is falsy, so a label-driven investigation's payload is
     byte-for-byte what it was before this parameter existed.
     """
+    if context is None:
+        try:
+            context = load_from_environment(
+                executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+            )
+        except ExecutionIdentityError:
+            # Same degrade as every other call site: a present-but-broken
+            # context file must not crash a direct caller. An
+            # ExecutionContextRequiredError (require mode) still passes
+            # through uncaught — fail closed, ADR 011.
+            context = mint_local(
+                executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+            )
     payload: dict[str, Any] = {
         "status": "proposed",
         "updated_at": _now_iso(),
         "updated_by": "mctl-agents[bot]",
+        "execution": {
+            "context_id": context.context_id,
+            "trace_id": context.trace_id,
+            "agent": _status_agent(context),
+            "version": context.executor.version,
+        },
         "source": {
             "type": "github_issue",
             "repo": issue.ref.full_repo,
@@ -1627,6 +1687,7 @@ def _assemble_context(
     proposal_dir: Path,
     service: str,
     slug: str,
+    work_context: WorkContextRef | None = None,
 ) -> context_assembly.AssemblyResult | None:
     """Assembles and seals this investigation's `ContextSnapshot`
     (mctlhq/mctl-agents#265). Returns `None` in `off` mode without doing any
@@ -1676,6 +1737,7 @@ def _assemble_context(
             legacy_model=INVESTIGATOR_MODEL,
             legacy_allowed_tools=_LEGACY_ALLOWED_TOOLS,
             legacy_budget_usd=legacy_budget_usd,
+            work_context=work_context,
         )
     except Exception as exc:
         if mode == "on":
@@ -1723,15 +1785,126 @@ def _assemble_context(
 # so the published path still cannot leave agents-state. Making even the
 # contents trustworthy means not running the agent as this uid, which is
 # #149's territory.
+def _canonical_issue_key(url: str) -> str:
+    """`(owner, repo, number)` as a comparable key, case-folded — so the
+    work-item/issue cross-check compares issue IDENTITIES, not spellings
+    (`http://` vs `https://`, a trailing slash, case). An unparseable URL
+    falls back to its stripped self: never silently equal to a parseable
+    one."""
+    m = _ISSUE_URL_RE.match(url.strip())
+    if not m:
+        return url.strip()
+    return f"{m.group(1).lower()}/{m.group(2).lower()}#{m.group(3)}"
+
+
+def _prior_execution_ids(
+    canonical: Any, *, execution_id: str, resume_from_execution_id: str | None
+) -> tuple[str, ...]:
+    """The prior-execution list BOTH a derived --execution-id and the sealed
+    `execution_sequence` are computed from — one function so the sequence the
+    id encodes can never skew from the sequence the snapshot seals (they
+    disagreed when --resume-from-execution-id named an execution the store
+    had not recorded)."""
+    # The store may already have recorded THIS execution (the dev_loop seeds
+    # execution #1 before the investigator runs) — a prior list containing
+    # ourselves would claim one sequence too many.
+    prior_ids = tuple(pid for pid in canonical.prior_execution_ids if pid != execution_id)
+    if resume_from_execution_id and resume_from_execution_id not in prior_ids:
+        prior_ids = (*prior_ids, resume_from_execution_id)
+    return prior_ids
+
+
+def _work_context_ref(
+    *,
+    canonical: Any,
+    item: Any,
+    execution_id: str,
+    resume_from_execution_id: str | None,
+    surface: str | None,
+    actor_kind: str | None,
+    actor_id: str | None,
+) -> WorkContextRef:
+    """Fold the resolved WorkItem and the caller's provenance flags into the
+    `work_context` block a sealed ContextSnapshot carries (mctlhq/
+    mctl-agents#267). `canonical` is a `CanonicalState`, `item` a
+    `WorkItem` — typed as Any only to keep this module's lazy-import
+    discipline for the work_context package (see investigate())."""
+    prior_ids = _prior_execution_ids(
+        canonical, execution_id=execution_id, resume_from_execution_id=resume_from_execution_id
+    )
+    # The sequence counts every prior execution; the sealed prior list is
+    # then clamped to the newest MAX_PRIOR_EXECUTION_IDS entries, so a
+    # work item with more recorded executions than the ADR 009 ceiling
+    # still seals instead of failing validate() in seal().
+    execution_sequence = len(prior_ids) + 1
+    if len(prior_ids) > MAX_PRIOR_EXECUTION_IDS:
+        prior_ids = prior_ids[-MAX_PRIOR_EXECUTION_IDS:]
+    # `surface_transition` matches ExecutionRef's definition — did THIS
+    # execution change the surface or actor relative to the one before it —
+    # so the baseline is the newest PRIOR execution with a known kind
+    # (never this execution itself, which the store may already have
+    # recorded — the same self-exclusion `_prior_execution_ids` makes; and
+    # never a kindless seed, which carries no provenance to compare
+    # against), falling back to the work item's origin. Only comparisons
+    # where both sides are known can claim a change: unlike the dev_loop
+    # signal, an undeclared side here is an optional CLI flag, not a
+    # rejected resume.
+    priors_newest_first = sorted(
+        (e for e in item.executions if e.execution_id and e.execution_id != execution_id),
+        key=lambda e: e.sequence,
+        reverse=True,
+    )
+    baseline_surface = next(
+        (e.surface.kind for e in priors_newest_first if e.surface.kind), item.origin.kind
+    )
+    baseline_actor = next((e.actor for e in priors_newest_first if e.actor.kind), None)
+    surface_changed = bool(surface and baseline_surface and surface != baseline_surface)
+    actor_changed = bool(
+        actor_kind
+        and baseline_actor is not None
+        and baseline_actor.kind
+        and (actor_kind != baseline_actor.kind or (actor_id or "") != baseline_actor.actor_id)
+    )
+    return WorkContextRef(
+        work_item_id=canonical.work_item_id,
+        # Store-supplied and unbounded on the way in — clamped like
+        # prior_execution_ids above, so an over-long revision string cannot
+        # fail validate() at seal time. Informational only (ADR 011), so a
+        # truncated tail loses nothing an authorization or correlation
+        # decision reads.
+        work_item_revision=item.revision[:MAX_WORK_CONTEXT_ID_LENGTH],
+        execution_id=execution_id,
+        execution_sequence=execution_sequence,
+        prior_execution_ids=prior_ids,
+        origin_surface=item.origin.kind,
+        current_surface=surface or "",
+        actor_kind=actor_kind or "",
+        actor_id=actor_id or "",
+        surface_transition=surface_changed or actor_changed,
+    )
+
+
 def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
     dry_run: bool = False,
     *,
+    work_item_id: str | None = None,
+    execution_id: str | None = None,
+    resume_from_execution_id: str | None = None,
+    surface: str | None = None,
+    actor_kind: str | None = None,
+    actor_id: str | None = None,
     requested_by: str | None = None,
     requested_comment_url: str | None = None,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
+
+    The six work-context keyword-only parameters are mctlhq/mctl-agents#267's
+    seam. Every existing call site — `investigate(url, tmp_path)` in the
+    tests, and `orchestrator/run_issue_poller.py` — is untouched: none of
+    them is required, all default to None, and at the default
+    `WORK_CONTEXT_ROLLOUT_MODE=off` none of them changes behaviour at all.
 
     `requested_by` / `requested_comment_url` (mctlhq/mctl-agents#417) record
     who asked for THIS run via a `@MCTL reinvestigate` directive comment —
@@ -1741,6 +1914,33 @@ def investigate(
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
+
+    # Loaded once per run (mctlhq/mctl-agents#196, ADR 011) and reused for
+    # every consumer of this execution's identity — the MCP headers built by
+    # orchestrator.options load their own copy from the same
+    # MCTL_EXECUTION_CONTEXT_FILE, so in the control-plane-asserted case
+    # (once mctl-gitops writes that file) they agree by construction; only
+    # the local-fallback path can differ between independent loads, and that
+    # path is explicitly `unverified` evidence, never the audited value.
+    try:
+        execution_context = load_from_environment(
+            executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+        )
+    except ExecutionIdentityError as exc:
+        # Mirrors orchestrator.options._execution_context_headers(): a
+        # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
+        # truncated, or tamper-evidence failure) must not crash the run —
+        # degrade to a locally-minted, explicitly unverified context instead.
+        # load_from_environment() wraps every read/parse failure into
+        # ExecutionIdentityError, so this narrow catch is complete — and an
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # passes through and kills the run: require mode fails closed and
+        # never mints a local identity (ADR 011).
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
+        execution_context = mint_local(
+            executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
+        )
+    print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
 
     issue = gh_issue_view(issue_url)
     service = issue.ref.repo
@@ -1767,6 +1967,115 @@ def investigate(
         )
         print(f"warn: {reason}")
         return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+
+    # Work-context seam (mctlhq/mctl-agents#267): resolve the WorkItem and
+    # reconstruct canonical state, but only when a caller actually supplied
+    # one and the rollout is at least `observe`. At the default `off` mode
+    # this whole block is skipped — the store is never contacted and behaviour
+    # is byte-for-byte what it is today. Imported lazily, inside this
+    # function body, never at module scope (see the import-discipline note
+    # at the top of this file and tests/test_worker_isolation.py).
+    work_context_ref: WorkContextRef | None = None
+    if work_item_id:
+        from orchestrator.work_context import rollout as _work_context_rollout
+        from orchestrator.work_context.contract import (
+            TERMINAL_WORK_ITEM_STATES,
+            WORK_ITEM_FOUND,
+            CanonicalState,
+            reconstruct_canonical_state,
+        )
+
+        if _work_context_rollout.computes_new_answer():
+            from orchestrator.work_context.client import WorkItemClient
+
+            answer = WorkItemClient().get(work_item_id)
+            if answer.verdict == WORK_ITEM_FOUND and answer.item is not None:
+                resolved: CanonicalState = reconstruct_canonical_state(answer.item, proposal_dir, ())
+                canonical: CanonicalState | None = resolved
+                print(
+                    "info: work_context "
+                    f"work_item_id={resolved.work_item_id} state={resolved.state} "
+                    f"prior_execution_ids={list(resolved.prior_execution_ids)}"
+                )
+                # This is where the remaining work-context flags become
+                # real (mctlhq/mctl-agents#267): the resolved WorkItem plus
+                # the caller's execution/surface/actor provenance seal into
+                # the ContextSnapshot's `work_context` block, so a second
+                # execution's snapshot stays correlated to the same
+                # WorkItem and to the execution it resumed from. Metadata
+                # only — no transcript, per the contract's own rule.
+                #
+                # The one identity cross-check the workflow's `resume` signal
+                # makes (`work-item-mismatch`) and the CLI otherwise lacks:
+                # a --work-item-id about a DIFFERENT issue must not veto this
+                # run or seal its identity into this issue's snapshot. Warn
+                # at `observe`, refuse where the store's answer has teeth.
+                if resolved.issue_url and _canonical_issue_key(
+                    resolved.issue_url
+                ) != _canonical_issue_key(issue.ref.url):
+                    reason = (
+                        f"work item {work_item_id} is about {resolved.issue_url}, "
+                        f"not {issue.ref.url} — work-item mismatch"
+                    )
+                    if _work_context_rollout.new_answer_may_veto():
+                        print(f"warn: {reason}")
+                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                    print(f"warn: {reason} (observe mode — proceeding without work context)")
+                    work_context_ref = None
+                    canonical = None
+                if canonical is not None:
+                    # An omitted --execution-id derives deterministically from
+                    # the work item and the store's recorded executions,
+                    # exactly as the flag's help text promises — with a fixed
+                    # "cli" attempt salt so a re-run of the identical
+                    # invocation derives the SAME id (a retry, not a fork; see
+                    # execution_id_for's own docstring). Derived from the same
+                    # prior list `_work_context_ref` seals the sequence from,
+                    # so the sequence the id encodes cannot skew from the
+                    # sealed one.
+                    if not execution_id:
+                        from orchestrator.work_context.contract import execution_id_for
+
+                        execution_id = execution_id_for(
+                            canonical.work_item_id,
+                            len(
+                                _prior_execution_ids(
+                                    canonical,
+                                    execution_id="",
+                                    resume_from_execution_id=resume_from_execution_id,
+                                )
+                            )
+                            + 1,
+                            "cli",
+                        )
+                    work_context_ref = _work_context_ref(
+                        canonical=canonical,
+                        item=answer.item,
+                        execution_id=execution_id,
+                        resume_from_execution_id=resume_from_execution_id,
+                        surface=surface,
+                        actor_kind=actor_kind,
+                        actor_id=actor_id,
+                    )
+                    # `enforce`/`only`: the reconstructed state may VETO this
+                    # run (a work item already in a terminal state) but never
+                    # LICENSE one the issue path would have refused on its own
+                    # — requirements.md's "Rollout staging" acceptance
+                    # criteria.
+                    if (
+                        _work_context_rollout.new_answer_may_veto()
+                        and canonical.state in TERMINAL_WORK_ITEM_STATES
+                    ):
+                        reason = (
+                            f"work item {work_item_id} is already in terminal state "
+                            f"{canonical.state!r} — refusing to re-investigate"
+                        )
+                        print(f"warn: {reason}")
+                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+            elif _work_context_rollout.blocks_on_unknown():
+                reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
+                print(f"warn: {reason}")
+                return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
 
     if issue.state == "CLOSED":
         print(f"warn: issue {issue.ref.full_repo}#{issue.ref.number} is CLOSED — investigating anyway.")
@@ -1822,6 +2131,7 @@ def investigate(
             proposal_dir=proposal_dir,
             service=service,
             slug=slug,
+            work_context=work_context_ref,
         )
 
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.
@@ -1931,21 +2241,22 @@ def investigate(
         # 5. Write .status.yaml into STAGING as well, so a failure there
         #    publishes nothing at all rather than leaving the new
         #    documents paired with the previous run's status.
-        #    The two-argument call (no `snapshot=`) when context assembly
-        #    did not run keeps this byte-identical to the pre-#265 call —
-        #    including for a caller/test double that only accepts
-        #    (proposal_dir, issue). Same rule for `requested_by`: omitted
-        #    from the call entirely unless a directive comment actually
-        #    supplied one, so every existing test double that stands in for
-        #    write_status_yaml with the pre-#417 signature keeps working.
+        #    `snapshot=` is omitted when context assembly did not run, and
+        #    `requested_by` is omitted unless a directive comment actually
+        #    supplied one, so a label-driven run without assembly stays
+        #    byte-identical to the pre-#265/#417 payload. The execution
+        #    identity is always passed: it is loaded unconditionally above
+        #    (mctlhq/mctl-agents#196, ADR 011).
         status_kwargs: dict[str, Any] = {}
         if requested_by:
             status_kwargs["requested_by"] = requested_by
             status_kwargs["requested_comment_url"] = requested_comment_url
         if context is not None:
-            write_status_yaml(staging, issue, snapshot=context.snapshot, **status_kwargs)
+            write_status_yaml(
+                staging, issue, execution_context, snapshot=context.snapshot, **status_kwargs
+            )
         else:
-            write_status_yaml(staging, issue, **status_kwargs)
+            write_status_yaml(staging, issue, execution_context, **status_kwargs)
 
         # 6. Publish by swapping DIRECTORIES, not file by file. Four
         #    individual os.replace calls are each atomic but the sequence
@@ -2141,7 +2452,9 @@ def investigate(
                 # spoken after the rename rather than before it, through
                 # the fd we already hold — which names the published
                 # directory itself, no path to re-resolve.
-                bad = _landed_triplet_defects(staging_fd, issue)
+                bad = _landed_triplet_defects(
+                    staging_fd, issue, expected_agent=_status_agent(execution_context)
+                )
                 if bad:
                     _remove_rejected(proposal_dir)
                     raise _StagingReplaced(
@@ -2377,14 +2690,58 @@ def investigate(
                 pass
 
 
+def _work_context_from_args(args: argparse.Namespace) -> None:
+    """Validate the work-context CLI flags before they reach `investigate()`.
+
+    Exits non-zero (via `SystemExit`, caught by argparse's own convention of
+    letting it propagate out of `main()`) on every documented rejection path;
+    a valid combination returns `None` and has no other side effect.
+    Imported lazily, matching `investigate()`'s own import discipline.
+    """
+    from orchestrator.work_context import rollout as _work_context_rollout
+    from orchestrator.work_context.contract import ACTOR_KINDS, SURFACE_KINDS
+
+    if args.resume_from_execution_id and not args.work_item_id:
+        raise SystemExit("--resume-from-execution-id requires --work-item-id")
+    if args.surface is not None and args.surface not in SURFACE_KINDS:
+        raise SystemExit(f"--surface must be one of {sorted(SURFACE_KINDS)}, got {args.surface!r}")
+    if args.actor_kind is not None and args.actor_kind not in ACTOR_KINDS:
+        raise SystemExit(f"--actor-kind must be one of {sorted(ACTOR_KINDS)}, got {args.actor_kind!r}")
+    # The id-shaped flags seal into fields ContextSnapshot.validate()
+    # bounds at MAX_WORK_CONTEXT_ID_LENGTH — refuse them here, where the
+    # CLI can say why, instead of letting seal() crash the investigation.
+    for flag, value in (
+        ("--work-item-id", args.work_item_id),
+        ("--execution-id", args.execution_id),
+        ("--resume-from-execution-id", args.resume_from_execution_id),
+        ("--actor-id", args.actor_id),
+    ):
+        if value is not None and len(value) > MAX_WORK_CONTEXT_ID_LENGTH:
+            raise SystemExit(
+                f"{flag} exceeds {MAX_WORK_CONTEXT_ID_LENGTH} characters "
+                f"(the context snapshot's id ceiling)"
+            )
+    if not args.issue_url and not (
+        args.work_item_id and _work_context_rollout.at_least(_work_context_rollout.ONLY)
+    ):
+        raise SystemExit(
+            "--issue-url is required unless --work-item-id is given and "
+            f"{_work_context_rollout.ENV_VAR}={_work_context_rollout.ONLY!r}"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Issue-investigator — turn a GitHub issue into a proposal"
     )
     ap.add_argument(
         "--issue-url",
-        required=True,
-        help="GitHub issue URL, e.g. https://github.com/mctlhq/mctl-telegram/issues/123",
+        default=None,
+        help=(
+            "GitHub issue URL, e.g. https://github.com/mctlhq/mctl-telegram/issues/123. "
+            "Optional only when --work-item-id is given and "
+            "WORK_CONTEXT_ROLLOUT_MODE=only, in which case it is resolved from the work item."
+        ),
     )
     ap.add_argument(
         "--state-dir",
@@ -2396,6 +2753,26 @@ def main() -> None:
         action="store_true",
         help="Resolve issue + slug only; don't clone, run the SDK, or comment",
     )
+    ap.add_argument(
+        "--work-item-id", default=None,
+        help="Canonical WorkItem id to resume against (mctlhq/mctl-agents#267)",
+    )
+    ap.add_argument(
+        "--execution-id", default=None,
+        help=(
+            "This execution's own id; when omitted it is derived "
+            "deterministically from the work item and its recorded "
+            "executions (execution_id_for, attempt salt 'cli'), so an "
+            "identical re-run derives the same id"
+        ),
+    )
+    ap.add_argument(
+        "--resume-from-execution-id", default=None,
+        help="The prior execution this run resumes; requires --work-item-id",
+    )
+    ap.add_argument("--surface", default=None, help="Surface this execution runs on (closed vocabulary)")
+    ap.add_argument("--actor-kind", default=None, help="Kind of actor driving this execution (closed vocabulary)")
+    ap.add_argument("--actor-id", default=None, help="Identity of the actor driving this execution")
     ap.add_argument(
         "--requested-by",
         default=None,
@@ -2411,6 +2788,19 @@ def main() -> None:
         help="The requesting comment's URL, recorded alongside --requested-by.",
     )
     args = ap.parse_args()
+    _work_context_from_args(args)
+
+    issue_url = args.issue_url
+    if not issue_url:
+        # Only reachable once _work_context_from_args has already confirmed
+        # --work-item-id is set and the mode is `only`.
+        from orchestrator.work_context.client import WorkItemClient
+        from orchestrator.work_context.contract import WORK_ITEM_FOUND
+
+        answer = WorkItemClient().get(args.work_item_id)
+        if answer.verdict != WORK_ITEM_FOUND or answer.item is None or not answer.item.issue_url:
+            raise SystemExit(f"could not resolve --issue-url from work item {args.work_item_id!r}: {answer.reason}")
+        issue_url = answer.item.issue_url
 
     # Not in dry-run: it resolves the issue and the slug and stops before
     # the agent, so requiring Claude credentials to do that would break the
@@ -2424,9 +2814,15 @@ def main() -> None:
 
     try:
         result = investigate(
-            issue_url=args.issue_url,
+            issue_url=issue_url,
             state_dir=Path(args.state_dir),
             dry_run=args.dry_run,
+            work_item_id=args.work_item_id,
+            execution_id=args.execution_id,
+            resume_from_execution_id=args.resume_from_execution_id,
+            surface=args.surface,
+            actor_kind=args.actor_kind,
+            actor_id=args.actor_id,
             requested_by=args.requested_by,
             requested_comment_url=args.requested_comment_url,
         )

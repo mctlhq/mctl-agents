@@ -9,6 +9,7 @@ server binary (cached under ~/.cache after the first run).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 from datetime import timedelta
@@ -50,7 +51,9 @@ from orchestrator.temporal.workflows.dev_loop import (
     DevLoopWorkflow,
     IssueRef,
     MergeWatchResume,
+    ResumeRejection,
 )
+from orchestrator.work_context.contract import ActorRef, ExecutionRef, SurfaceRef
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
 # The watch loop skips poll 1 (it runs at t=0, before the first sleep), so the
@@ -4275,6 +4278,460 @@ class TestDevLoopWorkflow:
         assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
 
 
+class TestWorkContextResume:
+    """mctlhq/mctl-agents#267, ADR 011 — T9/T10/T11 in the proposal's
+    tasks.md."""
+
+    async def test_resume_from_a_second_surface_correlates_to_one_work_item(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            before = await handle.query(DevLoopWorkflow.work_context)
+            assert before.work_item_id == "wi-1"
+            assert len(before.executions) == 1
+            seed_execution_id = before.executions[0].execution_id
+
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1",
+                    "execution_id": "e2",
+                    "surface": "telegram",
+                    "actor_kind": "human",
+                    "actor_id": "carol",
+                },
+            )
+
+            after = await handle.query(DevLoopWorkflow.work_context)
+            assert after.work_item_id == "wi-1"
+            assert len(after.executions) == 2
+            assert after.executions[0].execution_id == seed_execution_id
+            assert after.executions[1].execution_id == "e2"
+            assert after.execution_id == "e2"
+            assert after.execution_sequence == 2
+
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_duplicate_resume_is_idempotent(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            payload = {
+                "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                "actor_kind": "human", "actor_id": "carol",
+            }
+            await handle.signal(DevLoopWorkflow.resume, payload)
+            once = await handle.query(DevLoopWorkflow.work_context)
+            assert len(once.executions) == 2
+
+            # The exact same payload again — the deterministic execution_id
+            # means a duplicated signal delivery lands here by construction.
+            await handle.signal(DevLoopWorkflow.resume, payload)
+            twice = await handle.query(DevLoopWorkflow.work_context)
+            assert len(twice.executions) == 2
+            assert twice.resume_rejections == ()
+
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+    async def test_a_differing_execution_id_is_rejected_while_one_resume_is_pending(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            # Accepted: a surface/actor-changing resume, which leaves a
+            # resume pending fresh approval.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "carol",
+                },
+            )
+            # A second, DIFFERENT execution racing in while the first is
+            # still pending fresh approval must be rejected, never forking
+            # the work item into two divergent executions.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e3", "surface": "web",
+                    "actor_kind": "human", "actor_id": "dave",
+                },
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 2  # e3 never joined
+            assert any(
+                r.execution_id == "e3" and r.reason == "resume-already-pending" for r in state.resume_rejections
+            )
+
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+    async def test_a_mismatched_work_item_id_is_rejected(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(
+                DevLoopWorkflow.resume, {"work_item_id": "wi-999", "execution_id": "e2"},
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 1  # never joined
+            assert any(
+                r.execution_id == "e2" and r.reason == "work-item-mismatch" for r in state.resume_rejections
+            )
+
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+    async def test_a_surface_transition_clears_approval_until_a_fresh_approve(self, env):
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+
+            # A resume from a different surface/actor must re-arm the wait —
+            # approval granted by alice on the original surface must not be
+            # silently inherited by bob on telegram.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            # A query forces a round trip through the workflow's event loop,
+            # so by the time it returns, the resume signal above has
+            # definitely been applied — proving the assertion below is not
+            # a race rather than proving the transition happened.
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert state.executions[-1].surface_transition is True
+            assert "mctl-agents-implement" not in calls  # approval cleared, not inherited
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
+            result = await handle.result()
+
+        assert calls.count("mctl-agents-implement") == 1
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_a_same_surface_resume_does_not_clear_approval(self, env):
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            # First resume establishes github/alice as the current surface
+            # and actor, and leaves a resume pending fresh approval.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "github",
+                    "actor_kind": "human", "actor_id": "alice",
+                },
+            )
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+
+            # A second resume from the SAME surface and actor must not
+            # re-litigate a decision nobody changed.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e3", "surface": "github",
+                    "actor_kind": "human", "actor_id": "alice",
+                },
+            )
+
+            # No second approve is sent; completion proves approval was
+            # never cleared by the same-surface resume.
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_prod_shaped_start_resume_transition_fires_and_flip_waits(self, env):
+        """The two production-shaped guarantees, on a loop started WITHOUT a
+        work_item_id (exactly what orchestrator/temporal/start.py submits):
+
+        1. the first surface/actor-declaring resume counts as a transition
+           even though no execution was seeded — the gate must not be inert
+           on real starts;
+        2. a resume landing in the slug-lookup gap (after alice's approval
+           was consumed by the first gate) re-arms approval BEFORE the
+           approve CWFT, so the durable flip is attributed to the actor who
+           re-approved, never to "unknown".
+        """
+        seen_params: dict[str, dict[str, str]] = {}
+        investigate_ran = anyio.Event()
+        slug_lookup_entered = anyio.Event()
+        slug_release = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
+
+        @activity.defn(name="submit_and_wait")
+        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            seen_params[input.operation] = input.params
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        @activity.defn(name="find_proposal_slug")
+        async def gated_find_proposal_slug(service: str, issue_number: str) -> str | None:
+            slug_lookup_entered.set()
+            await slug_release.wait()
+            return f"issue-{issue_number}-fake-title"
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[
+                fake_resolve_agent_release,
+                capturing_submit_and_wait,
+                fake_record_execution,
+                gated_find_proposal_slug,
+                _fake_get_issue_state_open,
+            ],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/88"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            # The first gate consumes alice's approval and the loop enters
+            # the slug lookup, where it now blocks.
+            with anyio.fail_after(10):
+                await slug_lookup_entered.wait()
+
+            # bob picks the work item up from telegram mid-gap.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            # No seeded execution existed, and the transition still fired.
+            assert state.executions[-1].surface_transition is True
+
+            slug_release.set()
+            # The loop reaches the pre-flip gate with approval cleared: no
+            # approve CWFT, no implement. The query round-trips the event
+            # loop so these are ordered assertions, not races.
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert "mctl-agents-approve" not in seen_params
+            assert "mctl-agents-implement" not in seen_params
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert seen_params["mctl-agents-approve"]["approver"] == "bob"
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_abandon_releases_the_reapproval_park(self, env):
+        """claude P2 round 2: the re-approval gates must not re-open #420's
+        escape-hatch-free park — an `abandon` while parked on re-approval
+        ends the loop gracefully (no Temporal terminate, no leaked
+        lifecycle row)."""
+        seen_params: dict[str, dict[str, str]] = {}
+        investigate_ran = anyio.Event()
+        slug_lookup_entered = anyio.Event()
+        slug_release = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
+
+        @activity.defn(name="submit_and_wait")
+        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            seen_params[input.operation] = input.params
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        @activity.defn(name="find_proposal_slug")
+        async def gated_find_proposal_slug(service: str, issue_number: str) -> str | None:
+            slug_lookup_entered.set()
+            await slug_release.wait()
+            return f"issue-{issue_number}-fake-title"
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[
+                fake_resolve_agent_release,
+                capturing_submit_and_wait,
+                fake_record_execution,
+                gated_find_proposal_slug,
+                _fake_get_issue_state_open,
+            ],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/88"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            with anyio.fail_after(10):
+                await slug_lookup_entered.wait()
+            # A surface transition parks the loop on re-approval…
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            slug_release.set()
+            # …and bob never re-approves; an operator abandons instead.
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "wrong actor"})
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.ended.startswith("abandoned:")
+        assert "mctl-agents-approve" not in seen_params
+        assert "mctl-agents-implement" not in seen_params
+
+    async def test_resume_without_surface_or_actor_is_rejected_not_inherited(self, env):
+        """A resume that omits surface/actor_kind fails CLOSED: it is
+        rejected and recorded, records no execution, and cannot inherit the
+        standing approval. The same bad payload re-delivered does not grow
+        the rejection list (dedupe on (execution_id, reason))."""
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            bad = {"work_item_id": "wi-1", "execution_id": "e2"}
+            await handle.signal(DevLoopWorkflow.resume, bad)
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 1  # nothing recorded
+            assert [r.reason for r in state.resume_rejections] == ["surface-or-actor-missing"]
+
+            # Re-delivery of the identical rejected payload: still one entry.
+            await handle.signal(DevLoopWorkflow.resume, bad)
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert [r.reason for r in state.resume_rejections] == ["surface-or-actor-missing"]
+
+            # Out-of-vocabulary kinds are rejected too — the signal path
+            # enforces the same closed vocabularies as the CLI.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e3",
+                    "surface": "carrier-pigeon", "actor_kind": "alien",
+                },
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 1
+            assert [r.reason for r in state.resume_rejections] == [
+                "surface-or-actor-missing",
+                "surface-or-actor-unrecognised",
+            ]
+
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+
 SERVICE = "mctl-telegram"
 SLUG = "issue-88-fake-title"
 
@@ -5188,6 +5645,136 @@ class TestMergeWatchContinueAsNew:
         assert result.approve is not None and result.approve.phase == "Succeeded"
         assert result.ended == ""
 
+    async def test_work_context_survives_a_merge_watch_hop(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mctlhq/mctl-agents#267: the work-context binding must cross the
+        continue_as_new boundary. Both hop sites fold it into
+        MergeWatchResume (`_carry_work_context`) and `_resume_merge_watch`
+        rehydrates it, so after forced hops the `work_context` query on the
+        FINAL run of the chain still answers the binding the first run
+        seeded — instead of resetting to empty, which would also make the
+        `work-item-mismatch` guard vacuous and forget
+        `_seen_execution_ids`."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/964",
+                    work_item_id="wi-hop-1",
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+            state = await handle.query(DevLoopWorkflow.work_context)
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        # The seeded execution #1 survived the hops the low floor forced.
+        assert state.work_item_id == "wi-hop-1"
+        assert [e.sequence for e in state.executions] == [1]
+        assert state.executions[0].execution_id
+
+    async def test_carried_work_context_is_rehydrated_on_a_resumed_run(self, env) -> None:
+        """The rehydration half in isolation: a resume record carrying a
+        full work-context binding (two executions, a rejection, a telegram
+        baseline) must answer verbatim from the continued run's
+        `work_context` query — the fields `_resume_merge_watch` assigns,
+        not `__init__`'s empty defaults."""
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(released=True)
+        carried_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        resume = MergeWatchResume(
+            service="mctl-telegram",
+            slug="issue-1-x",
+            deadline="2026-01-01T00:00:00Z",
+            last_pr=carried_pr,
+            abandoned=True,
+            abandon_reason="operator cleanup",
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+            work_item_id="wi-9",
+            executions=(
+                ExecutionRef(
+                    execution_id="e1",
+                    sequence=1,
+                    surface=SurfaceRef(kind="github"),
+                    actor=ActorRef(kind="agent"),
+                ),
+                ExecutionRef(
+                    execution_id="e2",
+                    sequence=2,
+                    surface=SurfaceRef(kind="telegram"),
+                    actor=ActorRef(kind="human", actor_id="bob"),
+                    surface_transition=True,
+                ),
+            ),
+            seen_execution_ids=("e1", "e2"),
+            current_surface=SurfaceRef(kind="telegram"),
+            current_actor=ActorRef(kind="human", actor_id="bob"),
+            resume_rejections=(
+                ResumeRejection(execution_id="e9", work_item_id="wi-other", reason="work-item-mismatch"),
+            ),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/965",
+                    work_item_id="wi-9",
+                    resume=resume,
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await handle.result()
+
+            state = await handle.query(DevLoopWorkflow.work_context)
+
+        assert state.work_item_id == "wi-9"
+        assert [e.execution_id for e in state.executions] == ["e1", "e2"]
+        assert state.executions[1].surface_transition is True
+        assert state.last_surface == SurfaceRef(kind="telegram")
+        assert state.last_actor == ActorRef(kind="human", actor_id="bob")
+        assert [r.reason for r in state.resume_rejections] == ["work-item-mismatch"]
+
     async def test_deadline_is_carried_not_recomputed_across_hops(
         self, env, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -5372,3 +5959,106 @@ class TestMergeWatchContinueAsNew:
         assert claim.last_op == "terminal"
         assert claim.last_op_landed is True
         assert claim.epoch == 0, "_finish_claim zeroes the epoch once the claim is released"
+
+
+class TestWorkContextGapMerge:
+    """#408 round 4: `_rehydrate_work_context` on a bare instance — the gap
+    window between a hop decision and the continued run's rehydration,
+    where `resume` signals run against __init__'s empty state."""
+
+    def _carried(self) -> MergeWatchResume:
+        return MergeWatchResume(
+            work_item_id="wi-1",
+            executions=(
+                ExecutionRef(execution_id="e1", sequence=1, surface=SurfaceRef(kind="github")),
+            ),
+            seen_execution_ids=("e1",),
+            current_surface=SurfaceRef(kind="github"),
+            current_actor=ActorRef(kind="human", actor_id="alice"),
+        )
+
+    def test_foreign_gap_resume_is_rejected_not_grafted(self) -> None:
+        """claude P2 on b82be1d: a gap resume naming a DIFFERENT work item
+        was accepted against the empty binding (the mismatch guard was
+        vacuous); rehydration must reject it with the guard's own reason
+        instead of grafting the foreign execution onto the carried item."""
+        wf = DevLoopWorkflow()
+        wf.resume(
+            {
+                "work_item_id": "wi-999", "execution_id": "e7", "surface": "telegram",
+                "actor_kind": "human", "actor_id": "mallory",
+            }
+        )
+        assert wf._work_item_id == "wi-999"  # the gap acceptance under test
+        wf._rehydrate_work_context(self._carried())
+        assert wf._work_item_id == "wi-1"
+        assert [e.execution_id for e in wf._executions] == ["e1"]
+        assert "e7" not in wf._seen_execution_ids
+        assert [(r.execution_id, r.work_item_id, r.reason) for r in wf._resume_rejections] == [
+            ("e7", "wi-999", "work-item-mismatch")
+        ]
+        # The rejected resume's pending window is not left open.
+        assert wf._resume_pending is False
+        # The foreign surface/actor never became the baseline.
+        assert wf._current_surface == SurfaceRef(kind="github")
+
+    def test_same_item_gap_resume_is_reapplied_against_the_carried_baseline(self) -> None:
+        wf = DevLoopWorkflow()
+        wf.resume(
+            {
+                "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                "actor_kind": "human", "actor_id": "bob",
+            }
+        )
+        wf._rehydrate_work_context(self._carried())
+        assert [(e.execution_id, e.sequence) for e in wf._executions] == [("e1", 1), ("e2", 2)]
+        assert wf._executions[1].surface_transition is True
+        assert wf._current_surface == SurfaceRef(kind="telegram")
+        # An accepted transitioning gap resume re-opens the pending window.
+        assert wf._resume_pending is True
+
+    def test_carry_work_context_round_trips_through_rehydration(self) -> None:
+        wf = DevLoopWorkflow()
+        wf._work_item_id = "wi-1"
+        wf._executions = [ExecutionRef(execution_id="e1", sequence=1)]
+        wf._seen_execution_ids = {"e1"}
+        wf._current_surface = SurfaceRef(kind="cli")
+        wf._current_actor = ActorRef(kind="human", actor_id="alice")
+        wf._resume_rejections = [
+            ResumeRejection(execution_id="e9", work_item_id="wi-1", reason="resume-already-pending")
+        ]
+        wf._resume_pending = True
+        carried = wf._carry_work_context(MergeWatchResume())
+        fresh = DevLoopWorkflow()
+        fresh._rehydrate_work_context(carried)
+        assert fresh._work_item_id == "wi-1"
+        assert fresh._executions == list(wf._executions)
+        assert fresh._seen_execution_ids == {"e1"}
+        assert fresh._current_surface == SurfaceRef(kind="cli")
+        assert fresh._current_actor == ActorRef(kind="human", actor_id="alice")
+        assert fresh._resume_rejections == list(wf._resume_rejections)
+        assert fresh._resume_pending is True
+
+    def test_gap_resume_is_rejected_while_a_carried_resume_is_pending(self) -> None:
+        """#408 round 5 (claude P2): the carried record can say one accepted
+        resume is still awaiting fresh approval (`resume_pending=True`, and
+        only `approve` closes that window) — a gap resume must be rejected
+        `resume-already-pending` against that restored value, exactly as the
+        identical signal a second earlier or later would have been."""
+        wf = DevLoopWorkflow()
+        wf.resume(
+            {
+                "work_item_id": "wi-1", "execution_id": "e3", "surface": "web",
+                "actor_kind": "human", "actor_id": "mallory",
+            }
+        )
+        carried = dataclasses.replace(self._carried(), resume_pending=True)
+        wf._rehydrate_work_context(carried)
+        assert [e.execution_id for e in wf._executions] == ["e1"]
+        assert "e3" not in wf._seen_execution_ids
+        assert [(r.execution_id, r.reason) for r in wf._resume_rejections] == [
+            ("e3", "resume-already-pending")
+        ]
+        # The window itself survives the hop.
+        assert wf._resume_pending is True
+        assert wf._current_surface == SurfaceRef(kind="github")

@@ -108,6 +108,21 @@ def _load_fixture_snapshot() -> cs.ContextSnapshot:
     return cs.ContextSnapshot.from_dict(data)
 
 
+def _work_context(**overrides) -> cs.WorkContextRef:
+    fields = dict(
+        work_item_id="wi-1",
+        work_item_revision="1",
+        execution_id="e1",
+        execution_sequence=1,
+        origin_surface="github",
+        current_surface="github",
+        actor_kind="human",
+        actor_id="octocat",
+    )
+    fields.update(overrides)
+    return cs.WorkContextRef(**fields)
+
+
 # ---------------------------------------------------------------------------
 # T1 — round-trip: from_dict(to_dict(snapshot)) == snapshot
 # ---------------------------------------------------------------------------
@@ -706,3 +721,208 @@ def test_fixture_matches_worked_investigator_example():
     assert len(snapshot.evidence_refs) == 1
     assert snapshot.budget.max_sources > 0
     assert snapshot.budget.max_bytes > 0
+
+
+# ---------------------------------------------------------------------------
+# WorkContextRef (mctlhq/mctl-agents#267, ADR 011) — T6/T7 in the proposal's
+# tasks.md.
+# ---------------------------------------------------------------------------
+def test_seal_with_work_context_round_trips():
+    work_context = _work_context()
+    snapshot = _minimal_snapshot(work_context=work_context)
+    assert snapshot.work_context == work_context
+    assert cs.ContextSnapshot.from_dict(snapshot.to_dict()) == snapshot
+
+
+def test_two_executions_differing_only_in_execution_id_seal_to_different_snapshot_ids():
+    common = dict(execution=_execution(), strategy=_strategy(), budget=_budget(), retention=_retention())
+    snap_a = cs.seal(created_at="2026-01-01T00:00:00Z", work_context=_work_context(execution_id="e1"), **common)
+    snap_b = cs.seal(created_at="2026-01-01T00:00:00Z", work_context=_work_context(execution_id="e2"), **common)
+    assert snap_a.content_hash != snap_b.content_hash
+    assert snap_a.snapshot_id != snap_b.snapshot_id
+
+
+def test_work_context_none_hashes_differently_from_a_populated_one():
+    common = dict(execution=_execution(), strategy=_strategy(), budget=_budget(), retention=_retention())
+    without = cs.seal(created_at="2026-01-01T00:00:00Z", **common)
+    with_context = cs.seal(created_at="2026-01-01T00:00:00Z", work_context=_work_context(), **common)
+    assert without.content_hash != with_context.content_hash
+
+
+def test_from_dict_rejects_unknown_key_inside_work_context():
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    doc = snapshot.to_dict()
+    doc["work_context"]["extra_field"] = "nope"
+    with pytest.raises(cs.ContextSnapshotError, match="unknown key"):
+        cs.ContextSnapshot.from_dict(doc)
+
+
+def test_from_dict_accepts_a_document_with_no_work_context_key():
+    doc = _minimal_snapshot().to_dict()
+    assert doc["work_context"] is None
+    reloaded = cs.ContextSnapshot.from_dict(doc)
+    assert reloaded.work_context is None
+
+
+def test_validate_rejects_unknown_origin_surface():
+    # Built via dataclasses.replace, not seal(), so the invalid value is
+    # injected AFTER construction — seal() itself would already refuse to
+    # produce this snapshot, matching the pattern of the freshness/trust/
+    # source-kind vocabulary tests above.
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    bad = dc_replace(snapshot, work_context=dc_replace(snapshot.work_context, origin_surface="carrier-pigeon"))
+    with pytest.raises(cs.ContextSnapshotError, match="origin_surface"):
+        bad.validate()
+
+
+def test_validate_rejects_unknown_current_surface():
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    bad = dc_replace(snapshot, work_context=dc_replace(snapshot.work_context, current_surface="carrier-pigeon"))
+    with pytest.raises(cs.ContextSnapshotError, match="current_surface"):
+        bad.validate()
+
+
+def test_validate_rejects_unknown_actor_kind():
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    bad = dc_replace(snapshot, work_context=dc_replace(snapshot.work_context, actor_kind="alien"))
+    with pytest.raises(cs.ContextSnapshotError, match="actor_kind"):
+        bad.validate()
+
+
+def test_child_step_snapshot_with_matching_work_context_validates_against_parent():
+    work_context = _work_context()
+    parent = _minimal_snapshot(work_context=work_context)
+    child = _minimal_snapshot(
+        work_context=work_context,
+        step=cs.StepRef(parent_snapshot_id=parent.snapshot_id, step="implement", sequence=1),
+    )
+    child.validate(parent=parent)  # must not raise
+
+
+def test_child_step_snapshot_work_context_mismatch_is_rejected():
+    parent = _minimal_snapshot(work_context=_work_context())
+    child = _minimal_snapshot(
+        work_context=_work_context(execution_id="e2"),
+        step=cs.StepRef(parent_snapshot_id=parent.snapshot_id, step="implement", sequence=1),
+    )
+    with pytest.raises(cs.ContextSnapshotError, match="work_context block must equal its parent"):
+        child.validate(parent=parent)
+
+
+def test_no_field_in_work_context_is_ever_read_by_authorization():
+    """Provenance metadata only (ADR 009 sec. 5): the field NAMES must not
+    contain an authorization token, mirroring
+    test_serialized_schema_has_no_authorization_field_name above."""
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    keys = set(_walk_keys(snapshot.to_dict()["work_context"]))
+    for key in keys:
+        lowered = key.lower()
+        for token in _FORBIDDEN_TOKENS:
+            assert token not in lowered, f"field name {key!r} contains forbidden token {token!r}"
+
+
+def test_to_log_dict_with_work_context_emits_ids_but_never_actor_id():
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    log_dict = snapshot.to_log_dict()
+    assert log_dict["work_item_id"] == "wi-1"
+    assert log_dict["execution_id"] == "e1"
+    assert log_dict["execution_sequence"] == 1
+    assert "actor_id" not in log_dict
+    assert "octocat" not in json.dumps(log_dict)
+
+
+def test_to_log_dict_without_work_context_omits_the_correlation_keys():
+    snapshot = _minimal_snapshot()
+    log_dict = snapshot.to_log_dict()
+    assert "work_item_id" not in log_dict
+    assert "execution_id" not in log_dict
+    assert "execution_sequence" not in log_dict
+
+
+# ---------------------------------------------------------------------------
+# T7 — the golden fixture's DOCUMENT carries the work_context key (to_dict
+# always emits it), while the HASH excludes it when null — which is exactly
+# why this fixture's content_hash is unchanged from before the field
+# existed (see _content_payload's docstring, and T3 above which recomputes
+# it).
+# ---------------------------------------------------------------------------
+def test_golden_fixture_carries_a_null_work_context_key():
+    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    assert raw["work_context"] is None
+
+
+def test_null_work_context_leaves_the_hash_unchanged_and_present_changes_it():
+    """An absent work_context must hash identically to the pre-#267 shape
+    (no silent re-identification of persisted documents), while a PRESENT
+    one participates — and two executions of the same work item differing
+    only in execution_id seal to different snapshot_ids (ADR 011)."""
+    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    base = cs.ContextSnapshot.from_dict(raw)
+    assert base.work_context is None
+
+    def _reseal(wc):
+        return cs.seal(
+            execution=base.execution,
+            strategy=base.strategy,
+            budget=base.budget,
+            retention=base.retention,
+            created_at=base.created_at,
+            step=base.step,
+            work_context=wc,
+            sources=base.sources,
+            evidence_refs=base.evidence_refs,
+        )
+
+    assert _reseal(None).content_hash == raw["content_hash"]
+
+    wc_e1 = cs.WorkContextRef(
+        work_item_id="wi-1", work_item_revision="r1", execution_id="e1", execution_sequence=1
+    )
+    wc_e2 = cs.WorkContextRef(
+        work_item_id="wi-1", work_item_revision="r1", execution_id="e2", execution_sequence=2
+    )
+    with_e1 = _reseal(wc_e1)
+    with_e2 = _reseal(wc_e2)
+    assert with_e1.content_hash != raw["content_hash"]
+    assert with_e1.snapshot_id != with_e2.snapshot_id
+
+
+def test_work_context_id_fields_are_length_bounded():
+    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    base = cs.ContextSnapshot.from_dict(raw)
+    oversized = cs.WorkContextRef(
+        work_item_id="wi-1",
+        work_item_revision="",
+        execution_id="e1",
+        execution_sequence=1,
+        actor_id="x" * (cs.MAX_WORK_CONTEXT_ID_LENGTH + 1),
+    )
+    with pytest.raises(cs.ContextSnapshotError, match="actor_id"):
+        cs.seal(
+            execution=base.execution,
+            strategy=base.strategy,
+            budget=base.budget,
+            retention=base.retention,
+            created_at=base.created_at,
+            work_context=oversized,
+            sources=base.sources,
+            evidence_refs=base.evidence_refs,
+        )
+    too_many_priors = cs.WorkContextRef(
+        work_item_id="wi-1",
+        work_item_revision="",
+        execution_id="e1",
+        execution_sequence=1,
+        prior_execution_ids=tuple(f"e{i}" for i in range(cs.MAX_PRIOR_EXECUTION_IDS + 1)),
+    )
+    with pytest.raises(cs.ContextSnapshotError, match="prior_execution_ids"):
+        cs.seal(
+            execution=base.execution,
+            strategy=base.strategy,
+            budget=base.budget,
+            retention=base.retention,
+            created_at=base.created_at,
+            work_context=too_many_priors,
+            sources=base.sources,
+            evidence_refs=base.evidence_refs,
+        )

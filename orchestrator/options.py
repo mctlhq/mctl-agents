@@ -22,13 +22,72 @@ from orchestrator.exec_budget import (
 from orchestrator.exec_budget import normalize_shell_command as _normalize_shell_command
 from orchestrator.resolver import ExecutionPlan
 
+# Paths already warned about by _execution_context_headers(): the audit hook
+# re-reads the env on every PreToolUse, so an unreadable context file would
+# otherwise print the same warning once per tool call.
+_warned_context_paths: set[str] = set()
+
+
+def _execution_context_headers() -> dict[str, str]:
+    """`X-Mctl-Execution-Context` / `X-Mctl-Trace-Id` (mctlhq/mctl-agents#196,
+    ADR 011: docs/adr/011-execution-identity-contract.md) — present only when
+    the CWFT actually wrote a sealed context to
+    `MCTL_EXECUTION_CONTEXT_FILE`, absent (never present-but-empty) otherwise,
+    mirroring this module's own convention for MCTL_TOKEN/mctl_mcp_config.
+    Every `mcp__mctl__*` call then carries the identity with zero agent
+    cooperation; a local run or a test with no context file adds nothing.
+
+    Deferred import: orchestrator.execution_identity is stdlib-only and meant
+    to be importable by the long-lived Temporal worker too — nothing here
+    requires importing it at options.py's own module scope.
+    """
+    from orchestrator.execution_identity import (
+        MCTL_EXECUTION_CONTEXT_FILE_ENV,
+        MCTL_REQUIRE_EXECUTION_CONTEXT_ENV,
+        ExecutionIdentityError,
+        load_from_environment,
+    )
+
+    if not os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip():
+        if os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip():
+            # Require mode must fail closed on the MISSING-env case too, not
+            # only on a present-but-broken file — an early `return {}` here
+            # would silently send headerless calls. Delegate for the
+            # canonical ExecutionContextRequiredError raise.
+            load_from_environment(executor_type="system")
+        return {}
+    try:
+        # executor_type is only consulted on the local-mint fallback branch,
+        # which this call never takes (the file is present) — the value
+        # passed here is inert.
+        context = load_from_environment(executor_type="system")
+    except ExecutionIdentityError as exc:
+        # load_from_environment() wraps every read/parse failure of a present
+        # file (OSError, JSONDecodeError, UnicodeDecodeError, ...) into
+        # ExecutionIdentityError, so this one narrow catch is complete. An
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # deliberately passes through: require mode fails closed, never
+        # degrades to headerless calls.
+        path = os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip()
+        # Keyed on path AND failure text, so a same-path file that starts
+        # failing differently (unreadable -> tampered) still warns once.
+        warn_key = f"{path}: {exc}"
+        if warn_key not in _warned_context_paths:
+            _warned_context_paths.add(warn_key)
+            print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); omitting identity headers.")
+        return {}
+    return {"X-Mctl-Execution-Context": context.context_id, "X-Mctl-Trace-Id": context.trace_id}
+
 
 def mctl_mcp_config(*, always_load: bool = False) -> dict:
     """MCP config for https://api.mctl.ai/mcp.
 
     Returns an empty dict when MCTL_TOKEN is unset — the agent then runs
     without mcp__mctl__* tools (Read/Write/WebSearch/WebFetch/Bash only).
-    Convenient for smoke tests and local dev without mctl access.
+    Convenient for smoke tests and local dev without mctl access. The
+    execution-identity headers are evaluated FIRST, before that early
+    return, so MCTL_REQUIRE_EXECUTION_CONTEXT fails closed at options
+    construction (ExecutionContextRequiredError) even in a tokenless run.
 
     always_load: sets the CLI's `alwaysLoad` flag, which blocks first-turn
     dispatch until this server connects (bounded by the CLI's own MCP
@@ -51,6 +110,13 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     (mcp_servers={} below) — it never calls mcp__mctl__* tools, so there is
     nothing to always-load.
     """
+    # Build-time fail-closed: raise the require-mode error HERE, at options
+    # construction, not only from inside the PreToolUse audit hook — whether
+    # an exception raised in a hook propagates is an SDK implementation
+    # detail this control must not depend on. Deliberately BEFORE the token
+    # early-return, so require mode fails closed even with no MCTL_TOKEN
+    # (the hook-time raise below stays as backstop).
+    identity_headers = _execution_context_headers()
     token = os.environ.get("MCTL_TOKEN", "").strip()
     if not token:
         print("warn: MCTL_TOKEN is not set — agent will run without mctl MCP tools.")
@@ -58,7 +124,7 @@ def mctl_mcp_config(*, always_load: bool = False) -> dict:
     server_config: dict[str, Any] = {
         "type": "http",
         "url": MCTL_MCP_URL,
-        "headers": {"Authorization": f"Bearer {token}"},
+        "headers": {"Authorization": f"Bearer {token}", **identity_headers},
     }
     if always_load:
         server_config["alwaysLoad"] = True
@@ -472,7 +538,18 @@ async def _audit_pre_tool_use(
     _context: Any,
 ) -> dict[str, Any]:
     """Log Bash invocations. Orchestrator git/gh wrappers already print `$ cmd`;
-    this covers the SDK Bash tool the model runs under acceptEdits (SOC F8)."""
+    this covers the SDK Bash tool the model runs under acceptEdits (SOC F8).
+
+    Reads the execution context id fresh on every call (mctlhq/mctl-agents
+    #196, ADR 011) rather than a value captured in a closure at hook-build
+    time: `_command_audit_hooks()` is called once per `build_*_options()`
+    invocation, and two builders resolving the identical config for the same
+    run must be able to compare `==` (tests/test_options.py's declarative-
+    vs-legacy equivalence tests) — a closure over a freshly-defined inner
+    function breaks that even when its captured value is identical, since two
+    distinct function objects are never `==`. `_execution_context_headers()`
+    reading `os.environ` again per call is cheap next to a Bash tool call.
+    """
     tool_name = ""
     tool_input: dict[str, Any] = {}
     if isinstance(input_data, dict):
@@ -480,10 +557,12 @@ async def _audit_pre_tool_use(
         raw = input_data.get("tool_input") or {}
         if isinstance(raw, dict):
             tool_input = raw
+    execution_context_id = _execution_context_headers().get("X-Mctl-Execution-Context", "")
+    context_suffix = f" execution_context={execution_context_id}" if execution_context_id else ""
     if tool_name == "Bash":
-        print(f"AUDIT tool=Bash cmd={tool_input.get('command', '')!r}")
+        print(f"AUDIT tool=Bash cmd={tool_input.get('command', '')!r}{context_suffix}")
     else:
-        print(f"AUDIT tool={tool_name}")
+        print(f"AUDIT tool={tool_name}{context_suffix}")
     return {}
 
 
