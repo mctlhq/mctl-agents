@@ -24,7 +24,6 @@ from claude_agent_sdk import TaskUpdatedMessage
 
 from orchestrator import run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
-from orchestrator.work_context import rollout as _work_context_rollout
 from orchestrator.run_implementer import (
     ProposalRef,
     _issue_closing_line,
@@ -44,6 +43,7 @@ from orchestrator.run_issue_investigator import (
     try_parse_issue_url,
     write_status_yaml,
 )
+from orchestrator.work_context import rollout as _work_context_rollout
 from tests.conftest import (
     fake_mcp_client_factory,
     result_message,
@@ -3959,3 +3959,82 @@ def test_enforce_mode_blocks_on_an_unknown_answer(tmp_path, monkeypatch):
     )
     assert result.skipped_reason != "dry-run"
     assert "could not be resolved" in result.skipped_reason
+
+
+def test_seal_side_wiring_carries_work_context_end_to_end(tmp_path, monkeypatch):
+    """#408 round 2 (claude P3): drive investigate() with dry_run=False and
+    assert the work-context block actually reaches the assembly entry point
+    — including the deterministic --execution-id derivation the help text
+    promises. The assemble→seal half of the join is pinned in
+    test_context_assembly.py::test_assemble_threads_work_context_into_the_sealed_snapshot."""
+    from orchestrator.work_context.contract import (
+        WORK_ITEM_FOUND,
+        ExecutionRef,
+        WorkItem,
+        WorkItemAnswer,
+        execution_id_for,
+    )
+
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", "shadow")
+
+    item = WorkItem(
+        work_item_id="wi-1",
+        revision="r7",
+        state="in-progress",
+        service="mctl-telegram",
+        slug="issue-103-e2e",
+        executions=(ExecutionRef(execution_id="e1", sequence=1),),
+    )
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+
+    captured: dict[str, object] = {}
+    real_entry = run_issue_investigator.context_assembly.assemble_investigator_context
+
+    def capturing_entry(**kwargs):
+        captured["work_context"] = kwargs.get("work_context")
+        # Delegate to the real entry point so the sealed snapshot below is
+        # real — the capture only observes the join, it does not replace it.
+        result = real_entry(**kwargs)
+        captured["snapshot"] = result.snapshot
+        return result
+
+    monkeypatch.setattr(
+        run_issue_investigator.context_assembly, "assemble_investigator_context", capturing_entry
+    )
+    assert real_entry is not None  # guard against a rename silently hollowing this test
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "a" * 40)
+
+    _investigate_harness(
+        tmp_path, monkeypatch, number=103, title="Seal wiring end to end",
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"x {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/103",
+        state_dir=tmp_path,
+        work_item_id="wi-1",
+        surface="telegram",
+        actor_kind="human",
+        actor_id="carol",
+    )
+    assert result.error is None
+
+    wc = captured["work_context"]
+    assert wc is not None
+    snapshot = captured["snapshot"]
+    assert snapshot.work_context == wc  # sealed, not merely accepted
+    assert wc.work_item_id == "wi-1"
+    assert wc.work_item_revision == "r7"
+    assert wc.prior_execution_ids == ("e1",)
+    assert wc.execution_sequence == 2
+    assert wc.current_surface == "telegram"
+    assert wc.actor_kind == "human"
+    assert wc.actor_id == "carol"
+    # The derived id is exactly what the help text promises.
+    assert wc.execution_id == execution_id_for("wi-1", 2, "cli")

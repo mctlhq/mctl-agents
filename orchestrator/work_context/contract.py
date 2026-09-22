@@ -244,12 +244,38 @@ def work_item_verdict_for(item: WorkItem) -> str:
     side."""
     if item.state not in WORK_ITEM_STATES:
         return WORK_ITEM_UNKNOWN
+    # Only a NON-EMPTY kind can be out of vocabulary: `ExecutionRef.
+    # from_payload` deliberately parses an absent surface/actor block into
+    # `SurfaceRef()`/`ActorRef()` ("an execution predating this field, or
+    # one from a surface that never reported one"), and dev_loop's own
+    # execution #1 seed carries neither — the same non-empty-only rule
+    # `ContextSnapshot.validate` applies to these fields.
     for execution in item.executions:
-        if execution.surface.kind not in SURFACE_KINDS:
+        if execution.surface.kind and execution.surface.kind not in SURFACE_KINDS:
             return WORK_ITEM_UNKNOWN
-        if execution.actor.kind not in ACTOR_KINDS:
+        if execution.actor.kind and execution.actor.kind not in ACTOR_KINDS:
             return WORK_ITEM_UNKNOWN
     return WORK_ITEM_FOUND
+
+
+def work_item_unknown_reason(item: WorkItem) -> str:
+    """Name the actual cause `work_item_verdict_for` refused on — the state,
+    or the first out-of-vocabulary execution field — so a blocked operator
+    is pointed at the offending value, not at a valid state."""
+    if item.state not in WORK_ITEM_STATES:
+        return f"unrecognised work item state {item.state!r}"
+    for execution in item.executions:
+        if execution.surface.kind and execution.surface.kind not in SURFACE_KINDS:
+            return (
+                f"execution {execution.execution_id!r} carries unrecognised "
+                f"surface kind {execution.surface.kind!r}"
+            )
+        if execution.actor.kind and execution.actor.kind not in ACTOR_KINDS:
+            return (
+                f"execution {execution.execution_id!r} carries unrecognised "
+                f"actor kind {execution.actor.kind!r}"
+            )
+    return "unrecognised work item shape"
 
 
 @dataclass(frozen=True)
@@ -303,7 +329,7 @@ def answer_from(status: int, payload: dict[str, Any], *, path: str = "", body_em
                 accepted=not body_empty,
             )
         verdict = work_item_verdict_for(item)
-        reason = "" if verdict != WORK_ITEM_UNKNOWN else f"unrecognised work item state {item.state!r}"
+        reason = "" if verdict != WORK_ITEM_UNKNOWN else work_item_unknown_reason(item)
         return WorkItemAnswer(verdict=verdict, item=item, reason=reason, accepted=True)
     if status == 404:
         # The only branch that dereferences `payload` directly — guard the
@@ -382,7 +408,7 @@ _ARTIFACT_NAMES = ("requirements.md", "design.md", "tasks.md", ".status.yaml")
 # parser (stdlib only) and does not need one — reconstruction only ever
 # reads the single `status:` scalar, never anything nested, so a plain
 # regex is the whole parser this needs and adds no dependency.
-_STATUS_LINE_RE = re.compile(r'^status:\s*"?([A-Za-z0-9_-]+)"?\s*$', re.MULTILINE)
+_STATUS_LINE_RE = re.compile(r"""^status:\s*["']?([A-Za-z0-9_-]+)["']?\s*$""", re.MULTILINE)
 
 
 def _read_prior_status(proposal_dir: Path | None) -> str:
@@ -426,11 +452,20 @@ def reconstruct_canonical_state(
             reconstructed_from.append("proposal_dir")
         prior_status = _read_prior_status(proposal_dir)
 
-    prior_execution_ids = tuple(
-        str(digest["execution_id"])
-        for digest in prior_digests
-        if isinstance(digest, Mapping) and digest.get("execution_id")
-    )
+    # The store's own execution ledger is the primary source of sibling
+    # correlation: deriving priors only from `prior_digests` reported every
+    # production run as execution #1 of a work item that may have run many
+    # times (the caller passes `()` today). Digests remain an ADDITIONAL
+    # source — a snapshot digest can name an execution the store has not
+    # recorded (or not yet).
+    seen: dict[str, None] = {}
+    for execution in sorted(item.executions, key=lambda e: e.sequence):
+        if execution.execution_id:
+            seen.setdefault(execution.execution_id, None)
+    for digest in prior_digests:
+        if isinstance(digest, Mapping) and digest.get("execution_id"):
+            seen.setdefault(str(digest["execution_id"]), None)
+    prior_execution_ids = tuple(seen)
     if prior_digests:
         reconstructed_from.append("prior_digests")
 

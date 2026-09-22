@@ -4572,6 +4572,80 @@ class TestWorkContextResume:
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 
+    async def test_abandon_releases_the_reapproval_park(self, env):
+        """claude P2 round 2: the re-approval gates must not re-open #420's
+        escape-hatch-free park — an `abandon` while parked on re-approval
+        ends the loop gracefully (no Temporal terminate, no leaked
+        lifecycle row)."""
+        seen_params: dict[str, dict[str, str]] = {}
+        investigate_ran = anyio.Event()
+        slug_lookup_entered = anyio.Event()
+        slug_release = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
+
+        @activity.defn(name="submit_and_wait")
+        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            seen_params[input.operation] = input.params
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        @activity.defn(name="find_proposal_slug")
+        async def gated_find_proposal_slug(service: str, issue_number: str) -> str | None:
+            slug_lookup_entered.set()
+            await slug_release.wait()
+            return f"issue-{issue_number}-fake-title"
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[
+                fake_resolve_agent_release,
+                capturing_submit_and_wait,
+                fake_record_execution,
+                gated_find_proposal_slug,
+                _fake_get_issue_state_open,
+            ],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/88"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            with anyio.fail_after(10):
+                await slug_lookup_entered.wait()
+            # A surface transition parks the loop on re-approval…
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            slug_release.set()
+            # …and bob never re-approves; an operator abandons instead.
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "wrong actor"})
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.ended.startswith("abandoned:")
+        assert "mctl-agents-approve" not in seen_params
+        assert "mctl-agents-implement" not in seen_params
+
     async def test_resume_without_surface_or_actor_is_rejected_not_inherited(self, env):
         """A resume that omits surface/actor_kind fails CLOSED: it is
         rejected and recorded, records no execution, and cannot inherit the
@@ -4600,6 +4674,22 @@ class TestWorkContextResume:
             await handle.signal(DevLoopWorkflow.resume, bad)
             state = await handle.query(DevLoopWorkflow.work_context)
             assert [r.reason for r in state.resume_rejections] == ["surface-or-actor-missing"]
+
+            # Out-of-vocabulary kinds are rejected too — the signal path
+            # enforces the same closed vocabularies as the CLI.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e3",
+                    "surface": "carrier-pigeon", "actor_kind": "alien",
+                },
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 1
+            assert [r.reason for r in state.resume_rejections] == [
+                "surface-or-actor-missing",
+                "surface-or-actor-unrecognised",
+            ]
 
             await handle.signal(DevLoopWorkflow.approve)
             with anyio.fail_after(10):

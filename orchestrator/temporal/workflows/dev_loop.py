@@ -94,6 +94,8 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
     from orchestrator.temporal.issue_ref import parse_issue_url
     from orchestrator.work_context.contract import (
+        ACTOR_KINDS,
+        SURFACE_KINDS,
         ActorRef,
         ExecutionRef,
         SurfaceRef,
@@ -1208,6 +1210,43 @@ class DevLoopWorkflow:
             ResumeRejection(execution_id=execution_id, work_item_id=work_item_id, reason=reason)
         )
 
+    async def _await_reapproval(
+        self, investigate_result: WorkflowResult, *, approve: WorkflowResult | None = None
+    ) -> DevLoopResult | None:
+        """Park until a resume-cleared approval is re-granted — releasable
+        and bounded, per #420's rule for every approval park in this
+        workflow. Observes `_abandoned` and expires at APPROVAL_WAIT_DEADLINE
+        so a resumed-but-never-re-approved loop never needs a Temporal
+        `terminate` (which would skip _watch_pr's `finally` and leak the
+        lifecycle-ownership row). Returns the terminal DevLoopResult to
+        return, or None to proceed. No issue-state polling here: unlike the
+        original pre-slug park, a closed source issue is caught by the
+        stale-issue gate that already ran, and the flip/implement below are
+        guarded by their own checks."""
+        try:
+            await workflow.wait_condition(
+                lambda: self._approved or self._abandoned,
+                timeout=APPROVAL_WAIT_DEADLINE,
+            )
+        except TimeoutError:
+            # A signal landing while the timeout fired must not be
+            # discarded — same late-signal rule as the original park.
+            if not (self._approved or self._abandoned):
+                return DevLoopResult(
+                    investigate=investigate_result,
+                    implement=None,
+                    approve=approve,
+                    ended="re-approval wait expired",
+                )
+        if self._abandoned:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                approve=approve,
+                ended=f"abandoned: {self._abandon_reason}",
+            )
+        return None
+
     @workflow.signal
     def resume(self, *args: object) -> None:
         """Pick up this work item's task from a possibly different surface
@@ -1296,6 +1335,14 @@ class DevLoopWorkflow:
         # rejected and recorded, never merely dropped.
         if not surface.kind or not actor.kind:
             self._reject_resume(execution_id, work_item_id, "surface-or-actor-missing")
+            return
+
+        # Same closed vocabularies the CLI enforces (_work_context_from_args):
+        # an out-of-vocabulary kind would land in `work_context` query
+        # responses and, mirrored back into a WorkItem, make
+        # `work_item_verdict_for` read the whole item as UNKNOWN.
+        if surface.kind not in SURFACE_KINDS or actor.kind not in ACTOR_KINDS:
+            self._reject_resume(execution_id, work_item_id, "surface-or-actor-unrecognised")
             return
 
         self._work_item_id = self._work_item_id or work_item_id
@@ -1558,13 +1605,18 @@ class DevLoopWorkflow:
                 # or actor can land in that gap, clearing `_approved` AND
                 # `_approver` — without this gate the flip below would
                 # commit a gitops approval attributed to "unknown" on the
-                # new actor's behalf. `wait_condition` schedules no command,
-                # so behind the patch marker this is a true no-op for every
-                # history that never saw a resume. The twin gate before the
+                # new actor's behalf. Unlike the original park, this wait
+                # also observes `_abandoned` and is bounded by
+                # APPROVAL_WAIT_DEADLINE — a resumed-but-never-re-approved
+                # loop must stay releasable by `abandon` and must expire the
+                # way the first park does (#420), not park forever with
+                # `terminate` as the only exit. The twin gate before the
                 # implement CWFT covers the later gaps (implementer resolve,
                 # the flip itself).
                 if workflow.patched("work-context-resume"):
-                    await workflow.wait_condition(lambda: self._approved)
+                    ended = await self._await_reapproval(investigate_result)
+                    if ended is not None:
+                        return ended
                 approve_result = await _run_cwft(
                     "mctl-agents-approve",
                     {
@@ -1633,13 +1685,12 @@ class DevLoopWorkflow:
         # remaining gaps (the flip itself and the implementer resolve are
         # both real activity awaits), so a resume landing after the flip
         # still forces re-approval before any implementer is released.
-        # Gated behind the patch marker because it is new workflow-visible
-        # behaviour, even though it is a true no-op for every history that
-        # never calls `resume` — `_approved` is already True, so
-        # `wait_condition` resolves immediately and schedules nothing,
-        # leaving old histories' command stream untouched.
+        # Same abandon/deadline semantics as its twin — see the comment
+        # there and #420.
         if workflow.patched("work-context-resume"):
-            await workflow.wait_condition(lambda: self._approved)
+            ended = await self._await_reapproval(investigate_result, approve=approve_result)
+            if ended is not None:
+                return ended
 
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
 

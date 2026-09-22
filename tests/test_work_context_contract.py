@@ -333,3 +333,74 @@ def test_module_import_is_stdlib_only():
         if any(name == prefix or name.startswith(prefix + ".") for prefix in third_party_prefixes)
     )
     assert not leaked, f"orchestrator.work_context pulled in third-party modules: {leaked}"
+
+
+# ---------------------------------------------------------------------------
+# Round-2 review fixes on #408: priors from the store's own ledger, kindless
+# executions stay FOUND, accurate UNKNOWN reasons, single-quoted status.
+# ---------------------------------------------------------------------------
+def test_reconstruct_priors_come_from_item_executions_and_merge_digests():
+    """agy P1 / claude P2 on #408: deriving priors only from prior_digests
+    reported every production run as execution #1. The store's ledger is
+    primary; digests remain an additional source; order is by sequence,
+    duplicates collapse."""
+    item = wc.WorkItem(
+        work_item_id="wi-1",
+        state="in-progress",
+        executions=(
+            wc.ExecutionRef(execution_id="e2", sequence=2),
+            wc.ExecutionRef(execution_id="e1", sequence=1),
+        ),
+    )
+    state = wc.reconstruct_canonical_state(item, None, ({"execution_id": "e2"}, {"execution_id": "e3"}))
+    assert state.prior_execution_ids == ("e1", "e2", "e3")
+
+    bare = wc.reconstruct_canonical_state(item, None, ())
+    assert bare.prior_execution_ids == ("e1", "e2")
+    assert "prior_digests" not in bare.reconstructed_from
+
+
+def test_kindless_executions_still_classify_found():
+    """claude P2 / agy P2 on #408: an absent surface/actor block is an
+    execution predating the fields (or dev_loop's own seed) — it must not
+    turn the whole item UNKNOWN."""
+    item = wc.WorkItem(
+        work_item_id="wi-1",
+        state="in-progress",
+        executions=(wc.ExecutionRef(execution_id="e1", sequence=1),),
+    )
+    assert wc.work_item_verdict_for(item) == wc.WORK_ITEM_FOUND
+
+    pigeon = wc.WorkItem(
+        work_item_id="wi-1",
+        state="in-progress",
+        executions=(
+            wc.ExecutionRef(execution_id="e1", sequence=1, surface=wc.SurfaceRef(kind="carrier-pigeon")),
+        ),
+    )
+    assert wc.work_item_verdict_for(pigeon) == wc.WORK_ITEM_UNKNOWN
+
+
+def test_unknown_reason_names_the_actual_cause():
+    valid_state_bad_surface = wc.WorkItem(
+        work_item_id="wi-1",
+        state="open",
+        executions=(
+            wc.ExecutionRef(execution_id="e1", sequence=1, surface=wc.SurfaceRef(kind="carrier-pigeon")),
+        ),
+    )
+    reason = wc.work_item_unknown_reason(valid_state_bad_surface)
+    assert "carrier-pigeon" in reason and "'open'" not in reason
+
+    bad_state = wc.WorkItem(work_item_id="wi-1", state="limbo")
+    assert "limbo" in wc.work_item_unknown_reason(bad_state)
+
+
+def test_status_scalar_reads_single_and_double_quotes(tmp_path: Path):
+    for raw in ('status: accepted\n', 'status: "accepted"\n', "status: 'accepted'\n"):
+        proposal_dir = tmp_path / raw.replace(":", "").replace(" ", "").replace('"', "d").replace("'", "s")
+        proposal_dir.mkdir()
+        (proposal_dir / ".status.yaml").write_text(raw, encoding="utf-8")
+        item = wc.WorkItem(work_item_id="wi-1", state="open")
+        state = wc.reconstruct_canonical_state(item, proposal_dir, ())
+        assert state.prior_status == "accepted", raw

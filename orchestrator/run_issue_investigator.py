@@ -1740,9 +1740,12 @@ def _work_context_ref(
     mctl-agents#267). `canonical` is a `CanonicalState`, `item` a
     `WorkItem` — typed as Any only to keep this module's lazy-import
     discipline for the work_context package (see investigate())."""
-    prior_ids = tuple(canonical.prior_execution_ids)
+    # The store may already have recorded THIS execution (the dev_loop seeds
+    # execution #1 before the investigator runs) — a prior list containing
+    # ourselves would claim one sequence too many.
+    prior_ids = tuple(pid for pid in canonical.prior_execution_ids if pid != execution_id)
     if resume_from_execution_id and resume_from_execution_id not in prior_ids:
-        prior_ids = prior_ids + (resume_from_execution_id,)
+        prior_ids = (*prior_ids, resume_from_execution_id)
     return WorkContextRef(
         work_item_id=canonical.work_item_id,
         work_item_revision=item.revision,
@@ -1848,16 +1851,29 @@ def investigate(
                 # execution's snapshot stays correlated to the same
                 # WorkItem and to the execution it resumed from. Metadata
                 # only — no transcript, per the contract's own rule.
-                if execution_id:
-                    work_context_ref = _work_context_ref(
-                        canonical=canonical,
-                        item=answer.item,
-                        execution_id=execution_id,
-                        resume_from_execution_id=resume_from_execution_id,
-                        surface=surface,
-                        actor_kind=actor_kind,
-                        actor_id=actor_id,
+                #
+                # An omitted --execution-id derives deterministically from
+                # the work item and the store's recorded executions, exactly
+                # as the flag's help text promises — the same
+                # execution_id_for the dev_loop seed uses, with a fixed
+                # "cli" attempt salt so a re-run of the identical invocation
+                # derives the SAME id (a retry, not a fork; see
+                # execution_id_for's own docstring).
+                if not execution_id:
+                    from orchestrator.work_context.contract import execution_id_for
+
+                    execution_id = execution_id_for(
+                        canonical.work_item_id, len(canonical.prior_execution_ids) + 1, "cli"
                     )
+                work_context_ref = _work_context_ref(
+                    canonical=canonical,
+                    item=answer.item,
+                    execution_id=execution_id,
+                    resume_from_execution_id=resume_from_execution_id,
+                    surface=surface,
+                    actor_kind=actor_kind,
+                    actor_id=actor_id,
+                )
                 # `enforce`/`only`: the reconstructed state may VETO this run
                 # (a work item already in a terminal state) but never
                 # LICENSE one the issue path would have refused on its own —
@@ -2539,7 +2555,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--execution-id", default=None,
-        help="This execution's own id; derived deterministically when omitted",
+        help=(
+            "This execution's own id; when omitted it is derived "
+            "deterministically from the work item and its recorded "
+            "executions (execution_id_for, attempt salt 'cli'), so an "
+            "identical re-run derives the same id"
+        ),
     )
     ap.add_argument(
         "--resume-from-execution-id", default=None,
