@@ -123,6 +123,11 @@ def _neutralize_service_skill_tags(text: str) -> str:
     return _FORGED_TAG_RE.sub(_STRIPPED_TAG, text or "")
 
 
+# Public name for cross-module use (run_implementer neutralizes untrusted
+# review/CI text with it); the underscored name stays for in-module callers.
+neutralize_service_skill_tags = _neutralize_service_skill_tags
+
+
 @dataclass(frozen=True)
 class ServiceSkillPolicy:
     """The platform-side envelope: whether a named agent may read service

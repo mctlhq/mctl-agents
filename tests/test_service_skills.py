@@ -316,6 +316,19 @@ def test_merge_base_shallow_clone_fails_closed(tmp_path):
         pin_sha(clone, agent="implementer", branch="feat/agents-my-slug")
 
 
+def test_merge_base_with_a_rev_absent_from_the_clone_names_the_real_cause(tmp_path):
+    # A Task-supplied rev that was never fetched into this clone (replayed
+    # plan, re-cloned checkout) is probed with `git cat-file -e` first: the
+    # error must say the rev is missing, not send the operator down the
+    # `--deepen` path that can never fix it.
+    clone = _setup_origin(tmp_path)
+    missing = "d" * 40
+    with pytest.raises(ServiceSkillError, match=f"{missing} is not a commit"):
+        service_skills._merge_base_with_default_branch(
+            clone, rev=missing, timeout=service_skills._GIT_TIMEOUT_SECONDS
+        )
+
+
 def test_agent_authored_agents_constant_names_the_two_committing_agents(tmp_path):
     """The behavioural pin_sha coverage lives in the three tests above; this
     only pins the constant's membership."""
