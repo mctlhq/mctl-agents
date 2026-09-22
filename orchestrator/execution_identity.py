@@ -31,6 +31,7 @@ identity, never permission. See ADR 011 sec. 5 for the full boundary table.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -85,6 +86,16 @@ class ExecutionIdentityError(ValueError):
     a default shape."""
 
 
+class ExecutionContextRequiredError(RuntimeError):
+    """`MCTL_REQUIRE_EXECUTION_CONTEXT` demands a control-plane-minted
+    context and none could be produced — the file is missing, unreadable or
+    fails tamper evidence. Deliberately NOT an `ExecutionIdentityError`
+    subclass: the drivers' degrade-to-local handlers catch that one and mint
+    an `asserted_by="local"` context, which is exactly what require mode
+    must never allow (ADR 011). This error passes through those handlers
+    and kills the run."""
+
+
 def _hash_bytes(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -110,7 +121,7 @@ def _require_mapping(value: Any, *, where: str) -> Mapping[str, Any]:
 
 def _require_str(value: Any, *, where: str, allow_empty: bool = True) -> str:
     if not isinstance(value, str) or (not allow_empty and not value):
-        raise ExecutionIdentityError(f"{where} must be a{'n' if allow_empty else ' non-empty'} string")
+        raise ExecutionIdentityError(f"{where} must be a {'string' if allow_empty else 'non-empty string'}")
     return value
 
 
@@ -746,42 +757,71 @@ def load_from_environment(
     """Read the sealed context the CWFT wrote to
     `MCTL_EXECUTION_CONTEXT_FILE`, or degrade to a locally-minted, explicitly
     `unverified` context (requirements.md "Trust model"). When
-    `MCTL_REQUIRE_EXECUTION_CONTEXT` is set and no file is present, fails
-    closed instead of degrading — for a cluster run that must never proceed
-    without a control-plane-minted identity. Never raises on the local-mint
+    `MCTL_REQUIRE_EXECUTION_CONTEXT` is set, fails closed instead of
+    degrading — for a cluster run that must never proceed without a
+    control-plane-minted identity. Never raises on the local-mint
     path: a driver calling this with a bare `executor_type` always gets back
-    an ExecutionContext, so local development and tests keep working."""
+    an ExecutionContext, so local development and tests keep working.
+
+    Error contract: every failure to produce a verified context from a
+    PRESENT file — unreadable path, bad encoding, truncated JSON, schema
+    violation, tamper-evidence mismatch — surfaces as
+    `ExecutionIdentityError`, so a degrading caller needs exactly one narrow
+    catch and nothing (e.g. `UnicodeDecodeError`, an OSError) escapes it.
+    When `MCTL_REQUIRE_EXECUTION_CONTEXT` is set, the same failures and the
+    missing-file case raise `ExecutionContextRequiredError` instead, which
+    degrading callers must NOT catch: require mode fails closed even when
+    the file is present but broken."""
     path = os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip()
+    required = bool(os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip())
     if path:
-        text = Path(path).read_text(encoding="utf-8")
-        data = json.loads(text)
-        context = ExecutionContext.from_dict(data)
-        # from_dict() only checks shape and vocabulary (see its docstring);
-        # this is the one production call site that reads an untrusted
-        # document, so verify the tamper evidence ADR 011 promises here.
-        expected_content_hash = recompute_content_hash(context)
-        if expected_content_hash != context.content_hash:
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+            data = json.loads(text)
+            context = ExecutionContext.from_dict(data)
+            # from_dict() only checks shape and vocabulary (see its docstring);
+            # this is the one production call site that reads an untrusted
+            # document, so verify the tamper evidence ADR 011 promises here.
+            expected_content_hash = recompute_content_hash(context)
+            # compare_digest is hygiene, not a proven timing oracle: both
+            # sides derive from the same caller-supplied document.
+            if not hmac.compare_digest(expected_content_hash, context.content_hash):
+                raise ExecutionIdentityError(
+                    f"content_hash mismatch for context_id={context.context_id!r} loaded from "
+                    f"{MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: document content does not match "
+                    "its declared content_hash"
+                )
+            # content_hash is computed over every field except content_hash,
+            # context_id and issued_at itself (_content_payload), so a matching
+            # content_hash alone does not prove context_id was not swapped for
+            # some other (even legitimately sealed) context's id. seal() derives
+            # context_id deterministically as "ex-" + content_hash[7:23]; recheck
+            # that binding explicitly so a tampered context_id is caught too.
+            expected_context_id = "ex-" + expected_content_hash[7:23]
+            if not hmac.compare_digest(context.context_id, expected_context_id):
+                raise ExecutionIdentityError(
+                    f"context_id mismatch loaded from {MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: "
+                    f"declared context_id={context.context_id!r} does not match {expected_context_id!r} "
+                    "derived from its own content_hash"
+                )
+            return context
+        except (OSError, ValueError) as exc:
+            # ValueError covers ExecutionIdentityError itself plus its
+            # parse-stage siblings: json.JSONDecodeError and
+            # UnicodeDecodeError are ValueError subclasses that are NOT
+            # ExecutionIdentityError subclasses.
+            if required:
+                raise ExecutionContextRequiredError(
+                    f"{MCTL_REQUIRE_EXECUTION_CONTEXT_ENV} demands a control-plane-minted context, "
+                    f"but {MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r} did not yield one: {exc}"
+                ) from exc
+            if isinstance(exc, ExecutionIdentityError):
+                raise
             raise ExecutionIdentityError(
-                f"content_hash mismatch for context_id={context.context_id!r} loaded from "
-                f"{MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: document content does not match "
-                "its declared content_hash"
-            )
-        # content_hash is computed over every field except content_hash,
-        # context_id and issued_at itself (_content_payload), so a matching
-        # content_hash alone does not prove context_id was not swapped for
-        # some other (even legitimately sealed) context's id. seal() derives
-        # context_id deterministically as "ex-" + content_hash[7:23]; recheck
-        # that binding explicitly so a tampered context_id is caught too.
-        expected_context_id = "ex-" + expected_content_hash[7:23]
-        if context.context_id != expected_context_id:
-            raise ExecutionIdentityError(
-                f"context_id mismatch loaded from {MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: "
-                f"declared context_id={context.context_id!r} does not match {expected_context_id!r} "
-                "derived from its own content_hash"
-            )
-        return context
-    if os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip():
-        raise ExecutionIdentityError(
+                f"{MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r} is unreadable or unparseable: {exc}"
+            ) from exc
+    if required:
+        raise ExecutionContextRequiredError(
             f"{MCTL_EXECUTION_CONTEXT_FILE_ENV} is not set and {MCTL_REQUIRE_EXECUTION_CONTEXT_ENV} "
             "demands a control-plane-minted context"
         )

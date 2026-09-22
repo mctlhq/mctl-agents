@@ -1,5 +1,4 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
-import json
 import math
 import os
 import re
@@ -50,11 +49,13 @@ def _execution_context_headers() -> dict[str, str]:
         # which this call never takes (the file is present) — the value
         # passed here is inert.
         context = load_from_environment(executor_type="system")
-    except (ExecutionIdentityError, OSError, json.JSONDecodeError) as exc:
-        # OSError: missing/unreadable file (FileNotFoundError, PermissionError, ...).
-        # json.JSONDecodeError: truncated or half-written file. Neither is an
-        # ExecutionIdentityError (json.JSONDecodeError is a ValueError sibling,
-        # not a subclass), so both must be caught explicitly alongside it.
+    except ExecutionIdentityError as exc:
+        # load_from_environment() wraps every read/parse failure of a present
+        # file (OSError, JSONDecodeError, UnicodeDecodeError, ...) into
+        # ExecutionIdentityError, so this one narrow catch is complete. An
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # deliberately passes through: require mode fails closed, never
+        # degrades to headerless calls.
         print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); omitting identity headers.")
         return {}
     return {"X-Mctl-Execution-Context": context.context_id, "X-Mctl-Trace-Id": context.trace_id}

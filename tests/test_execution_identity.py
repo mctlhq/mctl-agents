@@ -398,7 +398,62 @@ def test_load_from_environment_degrades_to_local_when_file_is_absent(monkeypatch
 def test_load_from_environment_fails_closed_when_required_and_missing(monkeypatch):
     monkeypatch.delenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, raising=False)
     monkeypatch.setenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "1")
-    with pytest.raises(ei.ExecutionIdentityError, match="MCTL_REQUIRE_EXECUTION_CONTEXT"):
+    with pytest.raises(ei.ExecutionContextRequiredError, match="MCTL_REQUIRE_EXECUTION_CONTEXT"):
+        ei.load_from_environment(executor_type="shepherd")
+
+
+def test_required_error_is_not_caught_by_the_drivers_degrade_tuple(monkeypatch, tmp_path):
+    """The P1 regression this exists to prevent: every driver degrades with
+    `except ExecutionIdentityError` and mints a local identity. The require-
+    mode raise must NOT be an instance of that (nor of the old tuple's
+    OSError/json.JSONDecodeError), or require mode silently stops failing
+    closed."""
+    assert not issubclass(ei.ExecutionContextRequiredError, ei.ExecutionIdentityError)
+    assert not issubclass(ei.ExecutionContextRequiredError, (ValueError, OSError))
+
+
+def test_load_from_environment_fails_closed_when_required_and_file_is_broken(monkeypatch, tmp_path):
+    """Require mode fails closed on a PRESENT but broken file too — a
+    truncated, tampered or unreadable document must not degrade to a
+    locally-minted identity when MCTL_REQUIRE_EXECUTION_CONTEXT is set."""
+    path = tmp_path / "context.json"
+    path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, str(path))
+    monkeypatch.setenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "1")
+    with pytest.raises(ei.ExecutionContextRequiredError):
+        ei.load_from_environment(executor_type="shepherd")
+
+
+def test_load_from_environment_fails_closed_when_required_and_file_is_tampered(monkeypatch, tmp_path):
+    context = _load_fixture_context()
+    tampered = context.to_dict()
+    tampered["workflow_type"] = "investigate" if tampered["workflow_type"] != "investigate" else "implement"
+    path = tmp_path / "context.json"
+    path.write_text(json.dumps(tampered), encoding="utf-8")
+    monkeypatch.setenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, str(path))
+    monkeypatch.setenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "1")
+    with pytest.raises(ei.ExecutionContextRequiredError, match="did not yield one"):
+        ei.load_from_environment(executor_type="shepherd")
+
+
+def test_load_from_environment_wraps_undecodable_bytes_as_identity_error(monkeypatch, tmp_path):
+    """P2 regression: UnicodeDecodeError is a ValueError that was in none of
+    the drivers' old catch tuples, so a file of binary garbage crashed the
+    run instead of degrading. load_from_environment() now wraps it, so the
+    single `except ExecutionIdentityError` catch covers it."""
+    path = tmp_path / "context.json"
+    path.write_bytes(b"\xff\xfe\x00garbage")
+    monkeypatch.setenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, str(path))
+    monkeypatch.delenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, raising=False)
+    with pytest.raises(ei.ExecutionIdentityError, match="unreadable or unparseable"):
+        ei.load_from_environment(executor_type="shepherd")
+
+
+def test_load_from_environment_wraps_oserror_as_identity_error(monkeypatch, tmp_path):
+    path = tmp_path / "does-not-exist.json"
+    monkeypatch.setenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, str(path))
+    monkeypatch.delenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, raising=False)
+    with pytest.raises(ei.ExecutionIdentityError, match="unreadable or unparseable"):
         ei.load_from_environment(executor_type="shepherd")
 
 

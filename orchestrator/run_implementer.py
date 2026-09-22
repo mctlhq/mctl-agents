@@ -3290,11 +3290,16 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         execution_context = load_from_environment(
             executor_type="implementer", workflow_type="implement", agent="implementer"
         )
-    except (ExecutionIdentityError, OSError, json.JSONDecodeError) as exc:
+    except ExecutionIdentityError as exc:
         # Mirrors orchestrator.options._execution_context_headers(): a
         # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
         # truncated, or tamper-evidence failure) must not crash the attempt —
         # degrade to a locally-minted, explicitly unverified context instead.
+        # load_from_environment() wraps every read/parse failure into
+        # ExecutionIdentityError, so this narrow catch is complete — and an
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # passes through and kills the attempt: require mode fails closed
+        # and never mints a local identity (ADR 011).
         print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
         execution_context = mint_local(executor_type="implementer", workflow_type="implement", agent="implementer")
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")

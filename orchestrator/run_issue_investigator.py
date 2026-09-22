@@ -1785,11 +1785,16 @@ def investigate(
         execution_context = load_from_environment(
             executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"
         )
-    except (ExecutionIdentityError, OSError, json.JSONDecodeError) as exc:
+    except ExecutionIdentityError as exc:
         # Mirrors orchestrator.options._execution_context_headers(): a
         # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
         # truncated, or tamper-evidence failure) must not crash the run —
         # degrade to a locally-minted, explicitly unverified context instead.
+        # load_from_environment() wraps every read/parse failure into
+        # ExecutionIdentityError, so this narrow catch is complete — and an
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # passes through and kills the run: require mode fails closed and
+        # never mints a local identity (ADR 011).
         print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
         execution_context = mint_local(
             executor_type="issue-investigator", workflow_type="investigate", agent="issue-investigator"

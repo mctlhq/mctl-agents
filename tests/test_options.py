@@ -1272,3 +1272,32 @@ def test_pretooluse_hook_output_still_declares_updated_input():
     from claude_agent_sdk.types import PreToolUseHookSpecificOutput
 
     assert "updatedInput" in PreToolUseHookSpecificOutput.__annotations__
+
+
+# ---------------------------------------------------------------------------
+# Execution identity headers (mctl-agents#196, ADR 011): the degrade path
+# is a single narrow catch, and require mode passes through it fail-closed.
+# ---------------------------------------------------------------------------
+def test_execution_context_headers_degrade_on_broken_file(monkeypatch, tmp_path, capsys):
+    path = tmp_path / "context.json"
+    path.write_bytes(b"\xff\xfe\x00garbage")  # UnicodeDecodeError territory
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(path))
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    assert options._execution_context_headers() == {}
+    assert "omitting identity headers" in capsys.readouterr().out
+
+
+def test_execution_context_headers_fail_closed_in_require_mode(monkeypatch, tmp_path):
+    """Driver-level fail-closed proof: with MCTL_REQUIRE_EXECUTION_CONTEXT
+    set and a broken context file, the consumer must NOT degrade — the
+    require-mode error passes through the narrow ExecutionIdentityError
+    catch and aborts the caller. All four degrade sites (options plus the
+    three run_* drivers) share this exact catch shape."""
+    from orchestrator.execution_identity import ExecutionContextRequiredError
+
+    path = tmp_path / "context.json"
+    path.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(path))
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    with pytest.raises(ExecutionContextRequiredError):
+        options._execution_context_headers()
