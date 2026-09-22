@@ -778,7 +778,7 @@ def test_plan_grants_human_input_tracks_the_capability_in_plan_tools():
     plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
 
     granted = dataclasses.replace(
-        plan, tools=tuple(plan.tools) + (options.HUMAN_INPUT_CAPABILITY,)
+        plan, tools=(*plan.tools, options.HUMAN_INPUT_CAPABILITY)
     )
     assert options.plan_grants_human_input(granted) is True
 

@@ -1110,6 +1110,11 @@ class MergeWatchResume:
     approve: WorkflowResult | None = None
     implement_state: ImplementExecutionState = field(default_factory=ImplementExecutionState)
     approver: str | None = None
+    # The clarification round's recorded outcome (mctl-agents#333), a prior
+    # stage result like the three above: human input happens before the
+    # watch ever starts, so a hop that dropped it would erase the round
+    # from the final DevLoopResult.
+    human_input: HumanInputOutcome | None = None
 
     # --- Bookkeeping: how many times THIS watch has already hopped, so
     # MERGE_WATCH_MAX_HOPS bounds the whole watch, not just one run. ---
@@ -1621,9 +1626,10 @@ class DevLoopWorkflow:
                     round=request.round, resume_count=self._human_input_resume_count,
                 )
             try:
-                await workflow.wait_condition(
-                    lambda consumed=consumed: len(self._input_responses) > consumed, timeout=remaining
-                )
+                def _answer_arrived(threshold: int = consumed) -> bool:
+                    return len(self._input_responses) > threshold
+
+                await workflow.wait_condition(_answer_arrived, timeout=remaining)
             except TimeoutError:
                 self._human_input_state = _state(INPUT_TIMED_OUT)
                 workflow.logger.info(
@@ -1769,11 +1775,11 @@ class DevLoopWorkflow:
                 retry_policy=SLUG_LOOKUP_RETRY_POLICY,
             )
             while input_slug:
-                outcome = await self._await_human_input(target_repo, input_slug)
-                if outcome is None:
+                hi_outcome = await self._await_human_input(target_repo, input_slug)
+                if hi_outcome is None:
                     break
-                human_input_outcome = outcome
-                if outcome.outcome == "timed_out":
+                human_input_outcome = hi_outcome
+                if hi_outcome.outcome == "timed_out":
                     return DevLoopResult(
                         investigate=investigate_result, implement=None, human_input=human_input_outcome
                     )
@@ -1785,12 +1791,12 @@ class DevLoopWorkflow:
                 # _await_human_input) bounds this loop.
                 continuation_params = dict(investigate_params)
                 continuation_params["human_input_response"] = json.dumps({
-                    "request_id": outcome.request_id,
-                    "request_hash": outcome.request_hash,
-                    "value": outcome.value,
-                    "respondent": outcome.respondent,
-                    "surface": outcome.surface,
-                    "received_at": outcome.received_at,
+                    "request_id": hi_outcome.request_id,
+                    "request_hash": hi_outcome.request_hash,
+                    "value": hi_outcome.value,
+                    "respondent": hi_outcome.respondent,
+                    "surface": hi_outcome.surface,
+                    "received_at": hi_outcome.received_at,
                 })
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
@@ -2081,6 +2087,7 @@ class DevLoopWorkflow:
                         approve=approve_result,
                         implement_state=self._implement_state,
                         approver=self._approver,
+                        human_input=human_input_outcome,
                     )
                 )
                 workflow.continue_as_new(
@@ -2092,6 +2099,7 @@ class DevLoopWorkflow:
             investigate_result=investigate_result,
             implement_result=implement_result,
             approve_result=approve_result,
+            human_input_outcome=human_input_outcome,
             outcome=outcome,
         )
 
@@ -2258,6 +2266,7 @@ class DevLoopWorkflow:
                     approve=resume.approve,
                     implement_state=self._implement_state,
                     approver=self._approver,
+                    human_input=resume.human_input,
                 )
             )
             workflow.continue_as_new(
@@ -2275,6 +2284,7 @@ class DevLoopWorkflow:
             investigate_result=investigate_result,
             implement_result=resume.implement,
             approve_result=resume.approve,
+            human_input_outcome=resume.human_input,
             outcome=outcome,
         )
 
@@ -2285,6 +2295,7 @@ class DevLoopWorkflow:
         investigate_result: WorkflowResult,
         implement_result: WorkflowResult | None,
         approve_result: WorkflowResult | None,
+        human_input_outcome: HumanInputOutcome | None,
         outcome: _WatchOutcome,
     ) -> DevLoopResult:
         """Shared tail of `run`/`_resume_merge_watch`: deploy observation,

@@ -592,7 +592,10 @@ def validate_response(
         raise HumanInputError("response.request_hash does not match the request's hash")
 
     expires_dt = _parse_iso(request.expires_at, where="expires_at")
-    now_dt = now if getattr(now, "tzinfo", None) is not None else _parse_iso(str(now), where="now")
+    if isinstance(now, datetime) and now.tzinfo is not None:
+        now_dt = now
+    else:
+        now_dt = _parse_iso(str(now), where="now")
     if now_dt >= expires_dt:
         raise HumanInputError(f"request {request.request_id} expired at {request.expires_at}")
 

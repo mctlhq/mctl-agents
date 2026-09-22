@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json as _json
 import logging
 import uuid
+from datetime import UTC as _UTC
+from datetime import datetime as _datetime
 from datetime import timedelta
 
 import anyio
@@ -22,6 +25,8 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner
 
+import orchestrator.human_input as hi
+from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
@@ -144,6 +149,8 @@ async def _fake_find_human_input_request_none(service: str, slug: str) -> str | 
     `_fake_activities`) test in this file wants, so the durable-clarification
     branch (mctlhq/mctl-agents#333) is a same-behaviour no-op for them."""
     return None
+
+
 @activity.defn(name="get_issue_state")
 async def _fake_get_issue_state_open(repo: str, issue_number: int) -> IssueState:
     """The stale-issue gate's default fake for tests that build their own
@@ -4894,6 +4901,8 @@ class TestTickSettling:
         assert SERVICE in caplog.text and SLUG in caplog.text
 
 
+
+
 # ---------------------------------------------------------------------------
 # Durable clarification: the WAITING_FOR_INPUT branch itself (#333, ADR 011).
 # Everything above only ever proved the branch is a no-op when no request
@@ -4901,13 +4910,6 @@ class TestTickSettling:
 # an invalid answer, the stale-expired read, the workflow-owned round bound
 # and the malformed-document guard.
 # ---------------------------------------------------------------------------
-import json as _json
-from datetime import UTC as _UTC, datetime as _datetime
-
-import orchestrator.human_input as hi
-from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
-
-
 def _hi_execution() -> _ExecutionCorrelation:
     return _ExecutionCorrelation(
         agent="issue-investigator",
@@ -4994,7 +4996,7 @@ class TestDevLoopHumanInput:
             await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
             # The continuation investigate must finish before approval below.
             with anyio.fail_after(15):
-                while calls.count("mctl-agents-investigate") < 2:
+                while calls.count("mctl-agents-investigate") < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
                     await asyncio.sleep(0.05)
             await handle.signal(DevLoopWorkflow.approve)
             result = await handle.result()
@@ -5009,7 +5011,7 @@ class TestDevLoopHumanInput:
 
     async def test_unanswered_request_times_out_and_ends_the_loop(self, env):
         request = _sealed_request(ttl_seconds=120)
-        activities, calls, investigate_ran, _ = _fake_activities(
+        activities, calls, _investigate_ran, _ = _fake_activities(
             released=True,
             human_input_requests=[_request_json(request)]
         )
@@ -5031,7 +5033,7 @@ class TestDevLoopHumanInput:
 
     async def test_invalid_answer_is_rejected_and_a_valid_one_still_resumes(self, env):
         request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
-        activities, calls, investigate_ran, _ = _fake_activities(
+        activities, calls, _investigate_ran, _ = _fake_activities(
             released=True,
             human_input_requests=[_request_json(request), None]
         )
@@ -5055,7 +5057,7 @@ class TestDevLoopHumanInput:
             assert state.state == "WAITING_FOR_INPUT"
             await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
             with anyio.fail_after(15):
-                while calls.count("mctl-agents-investigate") < 2:
+                while calls.count("mctl-agents-investigate") < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
                     await asyncio.sleep(0.05)
             await handle.signal(DevLoopWorkflow.approve)
             result = await handle.result()
@@ -5084,6 +5086,74 @@ class TestDevLoopHumanInput:
                 id=f"dev-loop-test-{uuid.uuid4()}",
                 task_queue=TASK_QUEUE,
             )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.human_input is None
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert calls.count("mctl-agents-investigate") == 1
+
+    async def test_workflow_owned_resume_count_bounds_agent_written_rounds(self, env):
+        """Every request claims round=1 (the producer bug the reviewer's P2
+        names). The workflow's own resume counter must still stop the loop
+        after MAX_CLARIFICATION_ROUNDS accepted answers."""
+        requests = [
+            _sealed_request(f"Question number {i}?", ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
+            for i in range(hi.MAX_CLARIFICATION_ROUNDS + 1)
+        ]
+        activities, _calls, _investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(r) for r in requests]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            for request in requests[: hi.MAX_CLARIFICATION_ROUNDS]:
+                await _wait_for_pending_request(handle, request.request_id)
+                await handle.signal(
+                    DevLoopWorkflow.human_input_response, _response_payload(request)
+                )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "clarification_rounds_exhausted"
+
+    async def test_malformed_request_document_fails_loud_not_wedged(self, env):
+        request = _sealed_request()
+        document = request.to_dict()
+        document["question"] = "A tampered question?"  # carried hashes no longer match
+        activities, _calls, _investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_json.dumps(document)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "human_input_malformed"
+
+
+# ---------------------------------------------------------------------------
 # Admission (#395, #396): the implement submit goes to its own queue, waits
 # there when capacity is taken, requeues when nothing ran, and fails the
 # loop honestly when something did.
@@ -5136,6 +5206,7 @@ def _admission_activities(implement_results, *, seen_queues=None, running=None):
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        _fake_find_human_input_request_none,
     ]
     return activities, implement_calls, records, investigate_ran
 
@@ -5197,66 +5268,6 @@ class TestImplementationAdmission:
             await handle.signal(DevLoopWorkflow.approve)
             result = await handle.result()
 
-        assert result.human_input is None
-        assert result.implement is not None and result.implement.phase == "Succeeded"
-        assert calls.count("mctl-agents-investigate") == 1
-
-    async def test_workflow_owned_resume_count_bounds_agent_written_rounds(self, env):
-        """Every request claims round=1 (the producer bug the reviewer's P2
-        names). The workflow's own resume counter must still stop the loop
-        after MAX_CLARIFICATION_ROUNDS accepted answers."""
-        requests = [
-            _sealed_request(f"Question number {i}?", ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
-            for i in range(hi.MAX_CLARIFICATION_ROUNDS + 1)
-        ]
-        activities, calls, investigate_ran, _ = _fake_activities(
-            released=True,
-            human_input_requests=[_request_json(r) for r in requests]
-        )
-        async with Worker(
-            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
-        ):
-            handle = await env.client.start_workflow(
-                DevLoopWorkflow.run,
-                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
-                id=f"dev-loop-test-{uuid.uuid4()}",
-                task_queue=TASK_QUEUE,
-            )
-            for request in requests[: hi.MAX_CLARIFICATION_ROUNDS]:
-                await _wait_for_pending_request(handle, request.request_id)
-                await handle.signal(
-                    DevLoopWorkflow.human_input_response, _response_payload(request)
-                )
-            with pytest.raises(WorkflowFailureError) as excinfo:
-                await handle.result()
-
-        cause = excinfo.value.cause
-        assert isinstance(cause, ApplicationError)
-        assert cause.type == "clarification_rounds_exhausted"
-
-    async def test_malformed_request_document_fails_loud_not_wedged(self, env):
-        request = _sealed_request()
-        document = request.to_dict()
-        document["question"] = "A tampered question?"  # carried hashes no longer match
-        activities, calls, investigate_ran, _ = _fake_activities(
-            released=True,
-            human_input_requests=[_json.dumps(document)]
-        )
-        async with Worker(
-            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
-        ):
-            handle = await env.client.start_workflow(
-                DevLoopWorkflow.run,
-                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
-                id=f"dev-loop-test-{uuid.uuid4()}",
-                task_queue=TASK_QUEUE,
-            )
-            with pytest.raises(WorkflowFailureError) as excinfo:
-                await handle.result()
-
-        cause = excinfo.value.cause
-        assert isinstance(cause, ApplicationError)
-        assert cause.type == "human_input_malformed"
         assert result.implement is not None and result.implement.succeeded
         assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE]
         assert seen["mctl-agents-investigate"] == [EXECUTION_TASK_QUEUE]
