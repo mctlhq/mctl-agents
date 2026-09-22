@@ -106,6 +106,22 @@ is found (#276) and narrows the code:
 All three keep `status: needs-triage`. Retiring a proposal stays an operator
 decision: the loop makes the reason legible, it does not write the terminal.
 
+#### Stale source issue (Tier 2 admission)
+
+`source-resolved` and `source-not-planned` are not reconcile-exclusive.
+The Tier 2 implementer's admission gate (`run_implementer.implement_one`,
+mctl-agents#410) reads the same `source:` block and emits the identical two
+codes -- with `failure.stage: admission` instead of `failure.stage:
+reconcile` -- when an `accepted` proposal has no existing branch or PR at
+all (the `_preflight_existing_result` `none` arm) and its source issue is
+already closed. The check runs before any model call, so a closed-issue
+proposal never reaches the SDK. The classification logic lives once, in
+`orchestrator.source_issue.read_source_issue`; both `run_shepherd` and
+`run_implementer` call it with a different `stage`. A merged PR always
+wins over this gate: it only fires on the `none` preflight arm, so a
+proposal the implementer already carried to `merged` is never relabelled
+stale by the issue its own PR closed.
+
 ### Projection rules (read-only, GitHub-first)
 
 For each actionable proposal, reconcile fetches the canonical

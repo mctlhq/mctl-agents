@@ -85,6 +85,16 @@ agents:
       # changing its version — pinned per run by the target git SHA instead.
       - targetRepo: CLAUDE.md
       - targetRepo: source tree (Glob/Grep/Read to ground the design)
+      # mctlhq/mctl-agents#265, ADR 009 follow-up row (a):
+      # orchestrator/context_assembly.py assembles and seals a ContextSnapshot
+      # of these inputs (github-issue, github-issue-comment, target-repo,
+      # proposal-dir, inline-template) — gated by ISSUE_INVESTIGATOR_CONTEXT_MODE
+      # (default off; no collector runs and no snapshot is sealed unless it is
+      # "shadow" or "on"). Recorded here, not in promptSources above, for the
+      # same reason CLAUDE.md is: real prompt/context surface that resolves
+      # per run against the target repo/issue, not fixed at publish time.
+      - targetRepo: issue comments (github-issue-comment, via the same `gh issue view --json` call)
+      - targetRepo: prior proposal triplet, when re-investigating (proposal-dir)
     modelPolicyTask: service_agent
     budgetEnv: ISSUE_INVESTIGATOR_BUDGET_USD   # default 3.00
     sandbox:
@@ -95,6 +105,7 @@ agents:
     triggeredBy:
       - mctl_trigger_issue (MCP, admin-only)
       - orchestrator/run_issue_poller.py (agents:intake label)
+      - orchestrator/run_issue_directive_poller.py (@MCTL reinvestigate comment)
     notes: >-
       cwd is a throwaway shallow clone of the target repo, so the SDK picks up
       no mctl-agents-owned prompt files at all: the inline template is this
@@ -139,7 +150,16 @@ agents:
     writes: commits + branch + PR on mctlhq/<service>
     riskLevel: high         # the only agent that authors code
     triggeredBy:
-      - cronworkflow-mctl-agents-implement (currently suspend: true)
+      - >-
+        cronworkflow-mctl-agents-implement (suspended, and superseded rather
+        than merely paused: implement-sweep-mctl-agents-schedule below,
+        agents#412, now covers the same sweep-and-run cadence through the
+        admission queue instead of bypassing it)
+      - >-
+        implement-sweep-mctl-agents-schedule (Temporal, every 15 min offset
+        12, ships unpaused; ImplementSweepWorkflow submits
+        mctl-agents-implement scoped to service+slug for any accepted
+        proposal no live DevLoopWorkflow owns — agents#412)
       - mctl_trigger_implementer (MCP, admin-only)
       - forked by run_shepherd.py with --review-feedback
     notes: >-

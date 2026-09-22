@@ -95,6 +95,23 @@ def _canonical_json(payload: Any) -> bytes:
         raise ContextSnapshotError(f"payload is not JSON-serializable: {exc}") from exc
 
 
+def hash_bytes(raw: bytes) -> str:
+    """The one `sha256:`-prefixed content-hash rule any producer may use
+    (mctlhq/mctl-agents#265, ADR 009's "a second, disagreeing hash
+    convention creeps in" risk). A thin public alias of `_hash_bytes` —
+    same function, no behaviour change — so a caller outside this module
+    (e.g. `orchestrator/context_assembly.py`) never has a reason to invent
+    its own hashing."""
+    return _hash_bytes(raw)
+
+
+def canonical_json(payload: Any) -> bytes:
+    """The one canonical-JSON serialization rule any producer may hash
+    (see `hash_bytes`). A thin public alias of `_canonical_json` — same
+    function, no behaviour change."""
+    return _canonical_json(payload)
+
+
 def _reject_unknown_keys(data: Mapping[str, Any], allowed: frozenset[str], *, where: str) -> None:
     unknown = set(data) - allowed
     if unknown:

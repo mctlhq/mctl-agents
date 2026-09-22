@@ -30,8 +30,10 @@ from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_TASK_QUEUE,
     METRICS_PORT,
     TASK_QUEUE,
+    implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.worker import (
     owns_schedules,
@@ -45,6 +47,12 @@ from orchestrator.temporal.worker import (
 def visibility():
     stub = MagicMock()
     stub.list_active_dev_loop_ids = _named_activity("list_active_dev_loop_ids")
+    # Named too, not left as a bare MagicMock attribute: `activity_names`
+    # reads `__temporal_activity_definition.name`, and on a plain MagicMock
+    # that is another MagicMock — so an activity this fixture does not name
+    # can never be asserted on, and a dropped registration for it is
+    # invisible to this whole suite (review P3 on #412).
+    stub.count_swept_prestart_failures = _named_activity("count_swept_prestart_failures")
     return stub
 
 
@@ -67,18 +75,162 @@ def test_all_keeps_the_original_control_queue_shape(visibility):
     assert control.max_concurrent_activities is None
 
 
-def test_all_also_polls_the_execution_queue(visibility):
+def test_the_implement_sweep_registers_on_the_control_queue_only(visibility):
+    """The sweep (#412) is a control-queue workflow like the other three —
+    it services no long Argo poll itself and must not land on either split
+    queue, which register no workflows at all."""
+    from orchestrator.temporal.workflows.implement_sweep import (
+        ImplementSweepWorkflow,
+        SweptImplementWorkflow,
+    )
+
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
+    assert ImplementSweepWorkflow in control.workflows
+    assert SweptImplementWorkflow in control.workflows
+    assert "find_stranded_accepted" in control.activity_names
+    # Both visibility activities are scheduled by STRING name from
+    # ImplementSweepWorkflow, so a dropped registration is not a type error
+    # anywhere — the tick just fails its budget query every 15 minutes.
+    assert "count_swept_prestart_failures" in control.activity_names
+    assert "list_active_dev_loop_ids" in control.activity_names
+
+    for role in ("execution", "implementation"):
+        for plan in worker_plans(role, visibility):
+            assert ImplementSweepWorkflow not in plan.workflows
+            assert SweptImplementWorkflow not in plan.workflows
+
+
+def test_implement_sweep_tunables_are_read_from_the_environment(monkeypatch):
+    """Same `_int_env` rule IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES follows
+    (mctl-agents#412): env override, default, refusal on a bad value."""
+    from orchestrator.temporal.constants import (
+        implement_sweep_grace_minutes,
+        implement_sweep_max_submits,
+    )
+
+    monkeypatch.delenv("IMPLEMENT_SWEEP_GRACE_MINUTES", raising=False)
+    monkeypatch.delenv("IMPLEMENT_SWEEP_MAX_SUBMITS", raising=False)
+    assert implement_sweep_grace_minutes() == 20
+    assert implement_sweep_max_submits() == 5
+
+    monkeypatch.setenv("IMPLEMENT_SWEEP_GRACE_MINUTES", "30")
+    monkeypatch.setenv("IMPLEMENT_SWEEP_MAX_SUBMITS", "1")
+    assert implement_sweep_grace_minutes() == 30
+    assert implement_sweep_max_submits() == 1
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
+@pytest.mark.parametrize(
+    "env_var,fn_name",
+    [
+        ("IMPLEMENT_SWEEP_GRACE_MINUTES", "implement_sweep_grace_minutes"),
+        ("IMPLEMENT_SWEEP_MAX_SUBMITS", "implement_sweep_max_submits"),
+    ],
+)
+def test_a_malformed_implement_sweep_tunable_is_refused_at_startup(monkeypatch, bad, env_var, fn_name):
+    """A non-positive or unparseable value must not become a silent default
+    — it is a startup refusal, read where setup_schedules builds the
+    schedule's input, never inside workflow code."""
+    import orchestrator.temporal.constants as constants_module
+
+    monkeypatch.setenv(env_var, bad)
+    with pytest.raises(SystemExit):
+        getattr(constants_module, fn_name)()
+
+
+def test_all_also_polls_every_routed_queue(visibility):
     """`all` is the documented rollback target, so it has to work as one.
 
-    After the routing flip, patched histories schedule submit_and_wait onto the
-    execution queue. Collapsing the split deployments back to a process
-    that listens only on the control queue would leave those activities
-    with no poller until they time out — a rollback that strands work is
-    not a rollback (codex P1 on #249).
+    After a routing flip, patched histories schedule submit_and_wait onto
+    the execution or implementation queue. Collapsing the split deployments
+    back to a process that listens only on the control queue would leave
+    those activities with no poller until they time out — a rollback that
+    strands work is not a rollback (codex P1 on #249).
     """
     queues = {p.task_queue for p in worker_plans("all", visibility)}
 
-    assert queues == {TASK_QUEUE, EXECUTION_TASK_QUEUE}
+    assert queues == {TASK_QUEUE, EXECUTION_TASK_QUEUE, IMPLEMENTATION_TASK_QUEUE}
+
+
+def test_all_keeps_the_admission_limit_on_the_implementation_queue(visibility):
+    """The one limit `all` must NOT drop.
+
+    Control and execution run unbounded under `all` because their limits
+    are about starvation, and a single dev process has none. The
+    implementation limit is different in kind: it is the admission
+    capacity (#395). An `all` process admitting everything would be a
+    rollback that silently removes the property the queue exists for.
+    """
+    plans = worker_plans("all", visibility)
+    implementation = next(p for p in plans if p.task_queue == IMPLEMENTATION_TASK_QUEUE)
+
+    assert implementation.max_concurrent_activities == implementation_max_concurrent_activities()
+    assert implementation.activity_names == {"submit_and_wait"}
+
+
+def test_the_implementation_worker_polls_only_the_admission_queue(visibility):
+    """Same activity as execution, different queue, its own capacity.
+
+    It runs no workflows and serves nothing else: a short activity landing
+    here would take an implementation slot from an implementer, and a
+    second long operation would make N mean two things at once.
+    """
+    plans = worker_plans("implementation", visibility)
+
+    assert [p.task_queue for p in plans] == [IMPLEMENTATION_TASK_QUEUE]
+    assert plans[0].activity_names == {"submit_and_wait"}
+    assert plans[0].workflows == []
+    assert plans[0].max_concurrent_activities == implementation_max_concurrent_activities()
+    assert plans[0].max_concurrent_workflow_tasks is None
+
+
+def test_the_execution_worker_is_untouched_by_the_admission_queue(visibility):
+    """#395 adds a queue; it does not re-shape the one ADR-008 built.
+
+    Lowering exec from 40, or making it poll the admission queue too,
+    would re-couple investigate/reconcile/incidents to implementer
+    capacity — exactly the coupling the split removed.
+    """
+    plans = worker_plans("execution", visibility)
+
+    assert [p.task_queue for p in plans] == [EXECUTION_TASK_QUEUE]
+    assert plans[0].max_concurrent_activities == EXECUTION_MAX_CONCURRENT_ACTIVITIES
+    assert EXECUTION_MAX_CONCURRENT_ACTIVITIES == 40
+
+
+def test_implementation_capacity_is_read_from_the_environment(monkeypatch, visibility):
+    """N is the number an operator moves, so it comes from values.yaml via
+    env — not from a constant that needs a code release to change."""
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "5")
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 5
+
+    monkeypatch.delenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES")
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 3
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
+def test_a_capacity_that_admits_nothing_is_refused_at_startup(monkeypatch, visibility, bad):
+    """Zero or garbage must not become a worker that polls and admits
+    nothing forever — that is a queue nobody reads with extra steps."""
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", bad)
+    with pytest.raises(SystemExit):
+        worker_plans("implementation", visibility)
+
+
+@pytest.mark.parametrize("role", ["control", "execution"])
+def test_a_bad_capacity_cannot_take_down_a_role_that_never_admits(monkeypatch, visibility, role):
+    """A typo in a shared env must fail only the admission worker.
+
+    N is read when the implementation plan is built, not on import: a
+    module-level constant would SystemExit every role at import time, so a
+    bad value in a configmap reused across the three deployments would
+    crash-loop control and execution workers that never touch the queue
+    (claude P3 on #397).
+    """
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "nope")
+    plans = worker_plans(role, visibility)
+
+    assert IMPLEMENTATION_TASK_QUEUE not in {p.task_queue for p in plans}
 
 
 def test_the_execution_worker_polls_only_the_new_queue(visibility):
@@ -198,6 +350,7 @@ def test_only_workflow_running_roles_own_the_schedules():
     assert owns_schedules("all") is True
     assert owns_schedules("control") is True
     assert owns_schedules("execution") is False
+    assert owns_schedules("implementation") is False
 
 
 def test_no_control_ceiling_is_lowered_before_the_routing_flip():
@@ -381,3 +534,22 @@ def test_the_sdk_still_offers_the_run_shutdown_pair_this_module_drives():
         member = getattr(Worker, name, None)
         assert member is not None, f"Worker no longer has {name}()"
         assert inspect.iscoroutinefunction(member), f"Worker.{name}() is no longer awaitable"
+
+
+def test_the_visibility_activity_names_the_workflow_schedules_by_string_exist():
+    """The other half of the registration assertion above.
+
+    `worker_plans` is tested against a MagicMock stub, so it can only pin that
+    whatever the stub exposes gets registered. This pins the real class
+    actually exposes those two activity names — the strings
+    `ImplementSweepWorkflow` schedules by. A rename on either side is silent
+    otherwise: the workflow compiles, the worker starts, and every tick fails
+    its budget query.
+    """
+    from orchestrator.temporal.activities.visibility import VisibilityActivities
+
+    names = {
+        getattr(getattr(VisibilityActivities, attr), "__temporal_activity_definition").name
+        for attr in ("list_active_dev_loop_ids", "count_swept_prestart_failures")
+    }
+    assert names == {"list_active_dev_loop_ids", "count_swept_prestart_failures"}

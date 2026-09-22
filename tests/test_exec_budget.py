@@ -1,0 +1,601 @@
+"""Unit tests for orchestrator.exec_budget (mctl-agents#430).
+
+Pure-logic module -- no `claude_agent_sdk` import at any scope, so these
+tests exercise it directly rather than through a hook. See
+tests/test_worker_isolation.py for the module-import-graph guard that keeps
+it that way.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from orchestrator import exec_budget
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_module_does_not_import_the_agent_sdk() -> None:
+    """Importable by the Temporal worker, and unit-testable without the SDK.
+
+    A fresh subprocess, not an in-process `sys.modules` check: pytest has
+    already imported half the codebase (including the SDK, via other test
+    modules) by the time this runs in the same session, so `sys.modules`
+    here would prove nothing — see tests/test_worker_isolation.py, whose
+    module docstring explains the same thing about its own check.
+    """
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import orchestrator.exec_budget, sys; "
+            "assert 'claude_agent_sdk' not in sys.modules",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+# ---------------------------------------------------------------------------
+# command_budget — T1
+# ---------------------------------------------------------------------------
+def test_command_budget_early_in_the_envelope_clamps_to_the_ceiling() -> None:
+    # 1000s remaining, reserve 120 -> 880 available, but the ceiling (300)
+    # is narrower.
+    assert exec_budget.command_budget(
+        1000.0, 0.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) == 300.0
+
+
+def test_command_budget_mid_envelope_clamps_to_remaining_minus_reserve() -> None:
+    # 1000s deadline, 700s elapsed -> 300s remaining, minus 120s reserve = 180s,
+    # narrower than the 300s ceiling.
+    assert exec_budget.command_budget(
+        1000.0, 700.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) == 180.0
+
+
+def test_command_budget_below_the_floor_denies() -> None:
+    # 1000s deadline, 995s elapsed -> 5s remaining, minus 120s reserve is
+    # negative, well under the 20s floor.
+    assert exec_budget.command_budget(
+        1000.0, 995.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) is None
+
+
+def test_command_budget_exactly_at_the_floor_is_admitted() -> None:
+    # remaining - reserve == floor exactly -> admitted, not denied.
+    assert exec_budget.command_budget(
+        1000.0, 860.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    ) == 20.0
+
+
+def test_command_budget_never_widens_above_the_ceiling() -> None:
+    """Clamping is one-directional (EARS: 'never widen a command's bound')."""
+    huge_remaining = exec_budget.command_budget(
+        1_000_000.0, 0.0, ceiling_s=300.0, reserve_s=120.0, floor_s=20.0,
+    )
+    assert huge_remaining == 300.0
+
+
+# ---------------------------------------------------------------------------
+# is_detached — T2
+# ---------------------------------------------------------------------------
+def test_is_detached_matches_the_production_shape_from_mctl_telegram_652() -> None:
+    assert exec_budget.is_detached(
+        "go test -race ./... > /tmp/test-race.log 2>&1 &"
+    ) is not None
+
+
+def test_is_detached_matches_nohup_setsid_disown() -> None:
+    assert exec_budget.is_detached("nohup ./run.sh") is not None
+    assert exec_budget.is_detached("setsid ./run.sh") is not None
+    assert exec_budget.is_detached("./run.sh & disown") is not None
+
+
+def test_is_detached_matches_a_backslash_continued_trailing_ampersand() -> None:
+    assert exec_budget.is_detached("go test ./... \\\n  &") is not None
+
+
+def test_is_detached_does_not_match_logical_and() -> None:
+    assert exec_budget.is_detached("a && b") is None
+
+
+def test_is_detached_does_not_match_redirect_merges() -> None:
+    assert exec_budget.is_detached("cmd 2>&1") is None
+    assert exec_budget.is_detached("cmd 1>&2") is None
+    assert exec_budget.is_detached("go test -race ./... > /tmp/test-race.log 2>&1") is None
+
+
+def test_is_detached_does_not_match_a_quoted_ampersand() -> None:
+    assert exec_budget.is_detached("grep '&' file") is None
+
+
+def test_is_detached_returns_none_for_an_ordinary_command() -> None:
+    assert exec_budget.is_detached("pytest -q") is None
+    assert exec_budget.is_detached("git status") is None
+
+
+# ---------------------------------------------------------------------------
+# wrap_bounded — T3
+# ---------------------------------------------------------------------------
+def test_wrap_bounded_always_carries_kill_after() -> None:
+    # 29s, not 30s: an exact-integer budget is shaved by one second so GNU
+    # `timeout` fires deterministically BEFORE the CLI's own tool timeout,
+    # which is set from the same budget and backgrounds rather than fails
+    # (agy P2 on `624a433`).
+    wrapped = exec_budget.wrap_bounded("pytest -q", 30.0, kill_after_s=5.0)
+    assert wrapped.startswith("timeout --kill-after=5s 29s bash -c ")
+
+
+def test_wrap_bounded_round_trips_a_heredoc() -> None:
+    command = "cat <<'EOF'\nhello\nEOF"
+    wrapped = exec_budget.wrap_bounded(command, 10.0, kill_after_s=5.0)
+    # The whole original command must be a single shlex-quoted argument to
+    # `bash -c`, preserving the heredoc verbatim.
+    import shlex
+    tokens = shlex.split(wrapped)
+    assert tokens[-1] == command
+
+
+def test_wrap_bounded_round_trips_a_pipeline_and_and_chain() -> None:
+    command = "echo hi | grep h && echo done"
+    wrapped = exec_budget.wrap_bounded(command, 10.0, kill_after_s=5.0)
+    import shlex
+    tokens = shlex.split(wrapped)
+    assert tokens[-1] == command
+
+
+def test_wrap_bounded_round_trips_a_multiline_script() -> None:
+    command = "set -e\ncd /tmp\nls -la"
+    wrapped = exec_budget.wrap_bounded(command, 10.0, kill_after_s=5.0)
+    import shlex
+    tokens = shlex.split(wrapped)
+    assert tokens[-1] == command
+
+
+def test_wrap_bounded_renders_sub_second_budgets_fractionally() -> None:
+    """Flooring to 1s here would put the OS bound ABOVE a 0.2s tool timeout
+    and invert the ordering the guard rests on (claude P3 on `aa60779`). GNU
+    `timeout` takes a floating point duration, so the bound stays under the
+    budget instead."""
+    wrapped = exec_budget.wrap_bounded("echo hi", 0.2, kill_after_s=0.1)
+    assert wrapped.startswith("timeout --kill-after=1s 0.16s bash -c ")
+
+
+# ---------------------------------------------------------------------------
+# CommandBudgetLedger
+# ---------------------------------------------------------------------------
+def test_ledger_records_clamped_commands() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_clamped("pytest -q", 42.0)
+    assert ledger.clamped == 1
+    assert ledger.last_bound_s == 42.0
+    assert ledger.last_command == "pytest -q"
+    assert ledger.exhausted is False
+
+
+def test_ledger_records_denied_background() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_denied_background("cmd &", "trailing background (`&`)")
+    assert ledger.denied_background == 1
+    assert ledger.exhausted is False
+
+
+def test_ledger_records_denied_exhausted_and_sets_exhausted() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_denied_exhausted("go test ./...")
+    assert ledger.denied_exhausted == 1
+    assert ledger.exhausted is True
+
+
+def test_ledger_as_dict_is_machine_readable_and_bounded() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    ledger.record_denied_exhausted("x" * 10_000)
+    payload = ledger.as_dict()
+    assert payload["exhausted"] is True
+    assert payload["verification_budget_exhausted"] is True
+    assert payload["denied_exhausted"] == 1
+    assert len(payload["last_command"]) <= exec_budget.MAX_LEDGER_COMMAND_CHARS + 1
+    assert isinstance(payload["reason"], str)
+
+
+def test_ledger_describe_is_a_short_summary_line() -> None:
+    ledger = exec_budget.CommandBudgetLedger()
+    assert "clamped=0" in ledger.describe()
+    assert "exhausted=true" not in ledger.describe()
+    ledger.record_denied_exhausted("cmd")
+    assert "exhausted=true" in ledger.describe()
+
+
+# ---------------------------------------------------------------------------
+# Quote awareness (claude P2 on `630ac27`): these characters are DATA inside
+# quotes, and denying an ordinary command for carrying them was a false
+# positive that blocked real work.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "A & B"',
+        "git commit -m 'fix & polish'",
+        'echo "nohup is a word"',
+        "grep -r 'disown' .",
+        'python -c "print(1) # setsid"',
+        r"git commit -m A\ \&\ B",
+    ],
+)
+def test_is_detached_treats_quoted_operators_as_data(command):
+    assert exec_budget.is_detached(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "go test -race ./... > /tmp/test-race.log 2>&1 &",
+        'git commit -m "A & B" && sleep 100 &',
+        "nohup go test ./...",
+        "setsid make check",
+        "go test ./... & disown",
+    ],
+)
+def test_is_detached_still_catches_real_detachment(command):
+    assert exec_budget.is_detached(command) is not None
+
+
+def test_detachment_match_reports_the_offending_fragment():
+    found = exec_budget.detachment_match(
+        "go test -race ./... > /tmp/test-race.log 2>&1 &"
+    )
+    assert found is not None
+    label, fragment = found
+    assert "&" in label
+    # The fragment must quote the actual text, not just name the form.
+    assert "test-race.log" in fragment
+
+
+def test_mask_quoted_preserves_length_and_structure():
+    command = 'git commit -m "A & B" && echo ok'
+    masked = exec_budget.mask_quoted(command)
+    assert len(masked) == len(command)
+    # The `&&` outside quotes survives; the `&` inside quotes does not.
+    assert "&&" in masked
+    assert masked.count("&") == 2
+
+
+def test_mask_quoted_masks_an_unterminated_quote_to_end_of_string():
+    masked = exec_budget.mask_quoted('echo "oops & more')
+    assert masked.count("&") == 0
+
+
+# ---------------------------------------------------------------------------
+# Shell-state-only commands (claude P2 on `630ac27`): `bash -c` would discard
+# the working directory the Bash tool carries across calls.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    ["cd /repo", "cd /repo && cd src", "export FOO=1", "FOO=1", "umask 022"],
+)
+def test_is_shell_state_only_accepts_pure_state_commands(command):
+    assert exec_budget.is_shell_state_only(command) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["cd /repo && go test ./...", "pytest -q", "cd /repo; make check", ""],
+)
+def test_is_shell_state_only_rejects_anything_that_also_runs_work(command):
+    assert exec_budget.is_shell_state_only(command) is False
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `source`/`.` execute an arbitrary script: state-mutating AND
+        # potentially long, so the exemption would reopen the hole.
+        "source .venv/bin/activate",
+        ". ./env.sh",
+        # A builtin by command word, an unbounded subprocess in fact.
+        "export FOO=$(slow)",
+        "export FOO=`slow`",
+        "cd $(find / -name x)",
+    ],
+)
+def test_is_shell_state_only_refuses_state_commands_that_can_run_long(command):
+    """claude P3 on `624a433`: the exemption exists because these commands
+    cannot run long. One that can must not get it."""
+    assert exec_budget.is_shell_state_only(command) is False
+
+
+def test_is_shell_state_only_is_conservative_on_unparseable_input():
+    assert exec_budget.is_shell_state_only('cd "/repo') is False
+
+
+# ---------------------------------------------------------------------------
+# Ordering between the OS bound and the CLI's own tool timeout (agy P2 on
+# `624a433`): GNU `timeout` must fire STRICTLY FIRST, or the CLI backgrounds
+# a still-live command and the orphan window reopens.
+# ---------------------------------------------------------------------------
+def _rendered_bound(budget_s: float, kill_after_s: float = 5.0) -> float:
+    rendered = exec_budget.wrap_bounded(budget_s=budget_s, command="x", kill_after_s=kill_after_s)
+    found = re.search(r"--kill-after=\d+s ([\d.]+)s bash -c ", rendered)
+    assert found is not None, rendered
+    return float(found.group(1))
+
+
+@pytest.mark.parametrize(
+    "budget_s,want_bound",
+    [
+        (300.0, 299.0),  # exact integer: shaved by one so it cannot tie
+        (20.6, 20.0),    # fractional: floored, never rounded UP past the budget
+        (20.4, 20.0),
+        (5.0, 4.0),
+        (2.0, 1.0),
+        (1.2, 1.0),
+        (1.0, 0.8),      # below the integer grid: rendered fractionally
+        (0.2, 0.16),
+    ],
+)
+def test_wrap_bounded_never_exceeds_the_budget(budget_s, want_bound):
+    bound = _rendered_bound(budget_s)
+    assert bound == pytest.approx(want_bound)
+    # The invariant the ordering rests on, stated directly.
+    assert bound < budget_s
+
+
+def test_the_rendered_bound_stays_under_the_budget_across_the_range():
+    """One property, checked over the whole range rather than row by row.
+
+    Compared in MILLISECONDS, the unit the CLI's own tool timeout is set in.
+    In seconds a sub-millisecond fraction hides a tie -- 20.0004s renders
+    `20s` against a 20000 ms CLI timeout -- and a tie is not an ordering
+    (claude P3 on `68f3a05`).
+    """
+    for budget_s in (
+        0.05, 0.2, 0.9, 1.0, 1.5, 2.0, 19.9, 20.0, 20.0004, 119.7, 300.0, 600.0
+    ):
+        assert _rendered_bound(budget_s) * 1000 < int(budget_s * 1000), budget_s
+
+
+def test_wrap_bounded_rounds_the_kill_grace_up_not_down():
+    """Shortening the SIGKILL backstop weakens the one guarantee it gives."""
+    rendered = exec_budget.wrap_bounded(budget_s=300.0, command="x", kill_after_s=4.2)
+    assert "--kill-after=5s" in rendered
+
+
+# ---------------------------------------------------------------------------
+# Quoted text that the shell EXECUTES (claude P2 on `624a433`): masking is the
+# right reading for operators, but a `bash -c` payload or a command
+# substitution is a shell program, and GNU `timeout` exits with its DIRECT
+# child -- so a backgrounded grandchild in there is the #652 shape again.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        'bash -c "cmd &"',
+        "bash -c 'go test ./... &'",
+        "sh -c 'nohup ./run.sh'",
+        "/bin/bash -c 'setsid ./run.sh'",
+        'echo "$(cmd &)"',
+        "X=`slow &` echo hi",
+        'bash -c "bash -c \'x &\'"',
+    ],
+)
+def test_detachment_match_follows_executed_payloads(command):
+    found = exec_budget.detachment_match(command)
+    assert found is not None, command
+    assert "inside an executed payload" in found[1]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git commit -m "A & B"',
+        "bash -c 'echo \"A & B\"'",
+        'echo "$(date)"',
+        "grep -r 'disown' .",
+        'python -c "print(1) # setsid"',
+    ],
+)
+def test_executed_payload_recursion_does_not_reintroduce_false_positives(command):
+    assert exec_budget.detachment_match(command) is None
+
+
+def test_payload_recursion_stops_at_the_depth_cap():
+    """The cap is a documented limit, so pin it in both directions.
+
+    The old version asserted only `MAX_PAYLOAD_DEPTH >= 1` -- two constants
+    compared -- so deleting the guard left it green (claude P3 on
+    `8465c6e`). The guard is driven through `_depth` directly because it
+    cannot be reached by nesting a real command: `shlex` stops lexing the
+    escaped quotes of a third `bash -c` layer before the cap is hit, and
+    substitution nesting leaves the `&` visible to the top-level scan, so
+    neither construction ever recurses that far.
+    """
+    # Quoted, so the level's OWN scan cannot see the `&` -- only a recursion
+    # into the payload finds it, which is what the cap governs.
+    nested = "bash -c 'cmd &'"
+    assert (
+        exec_budget.detachment_match(nested, exec_budget.MAX_PAYLOAD_DEPTH - 1)
+        is not None
+    )
+    assert exec_budget.detachment_match(nested, exec_budget.MAX_PAYLOAD_DEPTH) is None
+
+
+# ---------------------------------------------------------------------------
+# `-c` belongs to a SEGMENT, not to a command line (agy P2 on `166133b`).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "command",
+    [
+        # A shell NAME appearing as a path elsewhere must not make `git -c`
+        # a shell payload -- and `shlex.split` unquotes, so the bogus payload
+        # `user.name=A & B` used to trip the detachment deny.
+        'cd /repo/bash && git -c user.name="A & B" commit -m x',
+        "echo sh && git -c core.pager=less log",
+        'git -c user.name="A & B" commit -m x',
+    ],
+)
+def test_a_non_shell_dash_c_is_not_a_shell_payload(command):
+    assert exec_budget.detachment_match(command) is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'cd /repo && bash -c "go test ./... &"',
+        'env FOO=1 bash -c "x &"',
+        '/usr/bin/sh -c "nohup y"',
+    ],
+)
+def test_a_real_shell_payload_is_still_followed_per_segment(command):
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'bash -lc "go test ./... &"',
+        'bash -ec "x &"',
+        'sh -xc "y &"',
+        'bash -cl "z &"',
+        'cd /repo && bash -lc "make build &"',
+    ],
+)
+def test_a_bundled_short_flag_is_still_a_shell_payload(command):
+    """`-lc`/`-ec`/`-xc`/`-cl` take the next word exactly as `-c` does.
+
+    Matching the lone token `-c` let `bash -lc "cmd &"` past the payload
+    scan: the inner shell backgrounds and exits, `timeout` reaps its direct
+    child and exits with it, and the grandchild survives reparented -- the
+    mctl-telegram#652 shape reached through a different spelling of the
+    same flag (claude P2 on `4449024`).
+    """
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $((a & b))",
+        "x=$((mask & 0xff)); echo $x",
+        "test $((a | b)) -eq 3",
+        "echo $(( (a & b) | c ))",
+    ],
+)
+def test_arithmetic_expansion_is_not_a_detachment(command):
+    """`$((a & b))` is a bitwise AND on numbers, not a background `&`."""
+    assert exec_budget.detachment_match(command) is None
+
+
+def test_a_command_substitution_nested_in_arithmetic_is_still_caught():
+    """Blanking arithmetic must not hide a substitution that DOES run."""
+    assert exec_budget.detachment_match("echo $(( $(worker &) + 1 ))") is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # bash runs BOTH commands here: `$((` falls back to command
+        # substitution when the inner paren does not close against a `)`.
+        "echo $((a) && (b &))",
+        "echo $((worker &) )",
+        # A subshell closes the background the same way a line end does.
+        "( go test ./... & )",
+    ],
+)
+def test_a_substitution_spelled_like_arithmetic_is_still_a_detachment(command):
+    """Blanking every `$((` unconditionally hid a payload that executes.
+
+    Verified against bash 5: `echo $((echo x) && (echo y))` prints `x y`,
+    so the span is a command substitution, not arithmetic (claude P3 on
+    `8465c6e`).
+    """
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `-ec` here is the SCRIPT's argv, not a shell flag.
+        'bash deploy.sh -ec "restart A & B"',
+        'sh run.sh -c "A & B"',
+    ],
+)
+def test_a_flag_after_the_shells_operand_is_not_a_shell_flag(command):
+    assert exec_budget.detachment_match(command) is None
+
+
+def test_an_attached_c_value_is_still_a_payload():
+    """`bash -c'cmd &'` lexes as one token, `-ccmd &`."""
+    assert exec_budget.detachment_match("bash -c'go test ./... &'") is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # `pipefail`/`globstar`/`f` are ARGUMENTS of the option before them,
+        # not the shell's operand, so the scan must not stop on them.
+        'bash -o pipefail -c "go test ./... &"',
+        'bash -euo pipefail -c "go test ./... &"',
+        'bash -O globstar -c "go test ./... &"',
+        'bash --rcfile /tmp/rc -c "go test ./... &"',
+        # A multi-call binary names its applet first.
+        'busybox sh -c "go test ./... &"',
+    ],
+)
+def test_an_option_argument_does_not_end_the_flag_scan(command):
+    """Verified against bash 5: `bash -o pipefail -c 'echo A'` prints `A`,
+    so `-c` really is reached and the payload really does execute (claude P2
+    on `68f3a05`)."""
+    assert exec_budget.detachment_match(command) is not None
+
+
+def test_an_option_argument_does_not_manufacture_a_payload():
+    """The same walk must not turn a synchronous command into a denial."""
+    assert exec_budget.detachment_match('bash -o pipefail -c "go test ./..."') is None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'env -i bash -c "go test ./... &"',
+        'env -u HOME bash -c "go test ./... &"',
+        'nice bash -c "go test ./... &"',
+        'nice -n 10 bash -c "go test ./... &"',
+        'sudo bash -c "go test ./... &"',
+        'sudo -u ci bash -c "go test ./... &"',
+        'stdbuf -o0 bash -c "go test ./... &"',
+        'stdbuf -o 0 bash -c "go test ./... &"',
+        # Wrappers compose, and an assignment can sit between them.
+        'env -i FOO=1 nice bash -lc "go test ./... &"',
+    ],
+)
+def test_an_exec_wrapper_does_not_hide_the_payload(command):
+    """A wrapper execs the shell, so the shell still owns the payload.
+
+    `env` was skipped as a bare word, so `env -i bash -c "…"` stopped on
+    `-i` and the payload was never scanned — the same envelope escape #430
+    exists to close, reached through a wrapper rather than a flag spelling
+    (claude/agy P3 on `24fe327`).
+    """
+    assert exec_budget.detachment_match(command) is not None
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'env -i bash -c "go test ./..."',
+        'sudo git -c user.name="A & B" commit -m x',
+        "nice go test ./...",
+        # The operand rule still applies on the far side of a wrapper.
+        'env -i bash deploy.sh -ec "restart A & B"',
+    ],
+)
+def test_seeing_through_a_wrapper_does_not_manufacture_a_payload(command):
+    assert exec_budget.detachment_match(command) is None

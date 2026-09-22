@@ -57,9 +57,10 @@ consequence, not the criterion — a short activity in the critical path and
 a short activity in reconcile belong together.
 
 **D2 — One image, one deployment per role, selected by `--role`.**
-`python -m orchestrator.temporal.worker --role control|execution|all`.
-`all` stays the default so the current single deployment keeps working
-unchanged, and so a rollback is a values edit rather than a code revert.
+`python -m orchestrator.temporal.worker --role control|execution|implementation|all`
+(`implementation` added by D7). `all` stays the default so the current
+single deployment keeps working unchanged, and so a rollback is a values
+edit rather than a code revert.
 
 **D3 — Explicit slot limits per role, in configuration.**
 The point is that capacity is something configuration states and metrics
@@ -186,6 +187,119 @@ roles are I/O-bound waiters, so CPU-based autoscaling would measure the
 wrong thing entirely; the right signal is slot availability, which needs
 a custom metrics adapter that does not exist yet. Fixed replicas with a
 visible backlog is honest; an HPA on the wrong metric is not.
+
+**D7 — A third queue for admission, not for holding time (amended
+2026-09-19, mctlhq/mctl-agents#395).** D1's criterion was "can this occupy a
+slot for hours", and by that criterion the implementer submit belongs on
+`mctl-dev-loop-exec` with every other long Argo poll — which is where step 4
+put it. The 2026-09-19 incident showed the criterion is necessary but not
+sufficient for one operation. Nine approvals in twenty minutes produced nine
+`submit_and_wait` activities, all admitted at once by a 40-slot pool, all
+submitted to Argo at once, and then serialised INSIDE Argo on the capacity-1
+mutex `mctl-agents-proposal-claims`. Six of them died of their own workflow
+deadline before reaching the head of that queue, and nothing in Temporal
+knew: the DevLoops completed as `Completed`.
+
+The queue was in the wrong layer. Temporal is the orchestration authority;
+"may this run now" is its decision to make, before Argo sees anything.
+
+So the split gains a queue whose criterion is **admission**:
+
+```text
+mctl-dev-loop             control / short activities
+mctl-dev-loop-exec        every long Argo wait EXCEPT the implementer — stays at 40
+mctl-dev-loop-implement   ONLY mctl-agents-implement, max_concurrent_activities = N
+```
+
+A `--role implementation` worker serves it; the activity is still
+`submit_and_wait`. With no free slot the activity stays Scheduled in
+Temporal — no Argo workflow, no Argo deadline — and the schedule-to-start
+latency on this queue is, by construction, the queue age.
+
+Three things D7 deliberately does not do, each for a reason recorded in
+#395:
+
+- **It does not lower exec from 40.** Investigate, reconcile and incidents
+  are independent of implementer capacity; capping their pool to N would
+  re-couple exactly the workloads D1 separated.
+- **It does not add `schedule_to_start_timeout`** to the implement submit.
+  `submit_and_wait` is scheduled with `start_to_close_timeout` only, so
+  the queue wait neither consumes the execution budget nor is bounded by
+  it. A schedule-to-start timeout would turn a capacity wait into a
+  failure, which is the shape of the bug being fixed one layer earlier.
+- **It does not remove the Argo mutex.** The admin-only direct
+  `mctl_trigger_implementer` bypasses Temporal admission entirely; the
+  mutex still guards that path until ADR-010's server-side claim is at
+  `enforce` (mctlhq/mctl-api#337).
+
+**N is a process limit, not a distributed semaphore.** Capacity is
+`replicas × N`, so the implementation deployment runs one replica as an
+architectural invariant of this phase, and mctl-gitops fails CI if that
+number changes (mctlhq/mctl-gitops#1285). Worker slots are backpressure,
+not a lease: a worker that dies after submitting leaves Argo running while
+Temporal retries the activity on heartbeat timeout, and in that window the
+slot is gone. The contract is therefore "under normal worker operation no
+more than N implementation submissions are actively supervised, and queued
+DevLoops submit no Argo work at all" — not "never more than N implementers
+exist". The hard count across crashes belongs to ADR-010's claims.
+
+N is read from `IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES` in the
+environment (default 3) rather than fixed in `constants.py`, because it is
+the one number D5 expects an operator to move, and the values file that
+sets it is where the queue-age alert that says it is wrong lives.
+
+The rollout repeats steps 1–4 in the same fail-closed order: role and
+queue first (mctl-agents#397, 1.47.0), the deployment polling an empty
+queue second (mctl-gitops#1287), the routing flip behind
+`workflow.patched("implement-queue")` third, attrition fourth. Only the
+implement submit is routed; `incidents.py` and `reconcile.py` keep
+`exec-queue`.
+
+**What the flip carries with it, and why it is the same change.** Moving
+the queue alone would have left the other half of the incident in place:
+an implementer that never ran and one that ran and failed both ended the
+loop as `Completed` with `implement.phase == "Failed"`, indistinguishable
+from success in every list of running loops. So the same release, behind
+a second marker `implement-outcome`, reads Argo's node graph for the
+implement operation (`implement_outcome.py`) and classifies the result:
+
+```text
+pre_start     no run-implementer pod ever ran     → resubmit, ≤ MAX_PRESTART_REQUEUES,
+                                                     no attempt counted, no human
+execution     the pod ran and did not succeed     → workflow FAILS, ImplementationFailed
+finalization  the pod succeeded, commit/assert    → workflow FAILS, ImplementationFinalizationFailed
+              did not
+success       the pod ran and committed           → the loop continues to merge detection
+```
+
+One honest limit of the rollout, measured rather than assumed: nothing in
+CI proves that a loop already running when `implement-outcome` deploys
+still completes on a failed implement. A history recorded before the
+marker ENDS at that failure — completing there is the old behaviour — so
+the only divergence today's code could produce sits in the final workflow
+task, and the replayer does not compare it (the capability table in
+`tests/test_workflow_replay.py` now records this, verified both ways). The
+SDK half of the promise, that an execution which replayed a missing marker
+keeps taking the unpatched branch for life, is covered by
+`tests/test_patch_memoization.py` against a real server. The branch is
+short-lived: once every loop started before the flip has passed
+`MERGE_WATCH_DEADLINE`, the guard and this paragraph go together.
+
+"Ran" is read from the marks a pod leaves on its node (`hostNodeName`, an
+exit code, a Succeeded phase) — never from the node's `startedAt`, which
+Argo stamps at node creation while the node may still be Pending on a
+mutex. Unknown (no node graph) is `execution`, because resubmitting an
+implementer that may have run is the duplicate-attempt failure the
+heartbeat-resume design exists to prevent.
+
+The attempt therefore begins when a pod is observed running, not at
+approval, not when a worker slot admits the activity, not when Argo
+accepts the workflow. `submit_and_wait` publishes that progression —
+`admitted → submitted → running`, with timestamps — as its second
+heartbeat detail. That heartbeat, read through Temporal's describe API,
+plus the workflow's `implement_execution` query (queued_at, requeues,
+outcome) is the runtime-state surface mctl-agents#389 projects from. Git
+remains durable lifecycle state; nothing is pushed there mid-attempt.
 
 ## Rollout order (fail-closed)
 
@@ -322,5 +436,8 @@ that record the patch, which is why it is alone.
 ## Non-goals
 
 HPA and per-agent quotas/cost budgets (D6 and #152's "per-agent quotas"
-bullet — both need D5's metrics first); splitting reconcile onto a third
-queue; any change to what runs in Argo.
+bullet — both need D5's metrics first); splitting reconcile onto its own
+queue (the third queue D7 adds is for admission of one operation, not a
+further holding-time split); per-service capacity `M` (needs a distributed
+counter, see ADR-010 / mctlhq/mctl-api#337); any change to what runs in
+Argo.
