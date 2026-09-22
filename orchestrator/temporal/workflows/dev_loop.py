@@ -34,6 +34,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -492,7 +493,10 @@ class HumanInputOutcome:
     outcome: str = ""  # "answered" | "timed_out"
     request_id: str = ""
     request_hash: str = ""
-    value: object = None
+    # `Any`, not bare `object`: temporalio's value_to_type special-cases Any
+    # (returned as-is) but has no handler for object, so a recorded outcome
+    # would fail to decode on handle.result() / replay with object here.
+    value: Any = None
     respondent: str = ""
     surface: str = ""
     received_at: str = ""
@@ -949,6 +953,20 @@ class DevLoopWorkflow:
                 non_retryable=True,
             )
 
+        # The real bound. `request.round` above is agent-written — a producer
+        # that always writes round=1 with a fresh question each time would
+        # never trip it. `_human_input_resume_count` is incremented by THIS
+        # workflow, once per accepted answer, so it bounds the continuation
+        # loop no matter what the producer writes.
+        if self._human_input_resume_count >= human_input.MAX_CLARIFICATION_ROUNDS:
+            raise ApplicationError(
+                f"clarification rounds exhausted for {service}/{slug}: "
+                f"resume_count={self._human_input_resume_count} >= "
+                f"MAX_CLARIFICATION_ROUNDS={human_input.MAX_CLARIFICATION_ROUNDS}",
+                type="clarification_rounds_exhausted",
+                non_retryable=True,
+            )
+
         def _state(state: str) -> HumanInputState:
             return HumanInputState(
                 state=state,
@@ -976,6 +994,23 @@ class DevLoopWorkflow:
                 type="human_input_malformed",
                 non_retryable=True,
             ) from exc
+
+        if (expires_at - workflow.now()).total_seconds() <= 0:
+            # Already expired when READ, not watched expiring: a leftover
+            # request.json from an earlier execution that timed out. Treat it
+            # as no pending request rather than as a fresh timeout — a
+            # timed_out return here would end every later execution of the
+            # same issue instantly, forever (the file is never rewritten by a
+            # run that dies on reading it). If the re-run investigator still
+            # needs an answer it seals a fresh request with a fresh
+            # expires_at, overwriting this one; if it did not re-ask,
+            # proceeding is exactly right. No gitops write, replay-safe.
+            self._human_input_state = _state(RUNNING)
+            workflow.logger.info(
+                "human_input.stale_expired",
+                extra={"human_input": human_input.request_log_dict(request)},
+            )
+            return None
         consumed = 0
         while True:
             remaining = (expires_at - workflow.now()).total_seconds()

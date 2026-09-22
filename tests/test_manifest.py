@@ -940,3 +940,15 @@ def test_bindings_for_another_repository_are_skipped_but_never_silently(
     errors = check_binding_pins_match_definitions(MANIFESTS)
 
     assert errors and "none targets mctlhq/mctl-agents" in errors[0], errors
+
+
+def test_capability_tools_stays_in_lockstep_with_options_constant():
+    """_CAPABILITY_TOOLS re-declares the capability literal (the lazy/reload
+    handling of orchestrator.options in this module makes a module-level
+    import of the constant undesirable); this pins the two together so a
+    rename in either place goes red instead of silently un-excusing the
+    capability from the tool-set equality checks."""
+    from orchestrator import options as _options
+    from orchestrator import validate_manifest as _vm
+
+    assert _vm._CAPABILITY_TOOLS == frozenset({_options.HUMAN_INPUT_CAPABILITY})

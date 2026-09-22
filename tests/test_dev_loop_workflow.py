@@ -3917,3 +3917,260 @@ class TestTickSettling:
 
         assert "unexpected RuntimeError" in caplog.text
         assert SERVICE in caplog.text and SLUG in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Durable clarification: the WAITING_FOR_INPUT branch itself (#333, ADR 011).
+# Everything above only ever proved the branch is a no-op when no request
+# exists; these run it for real — happy continuation, timeout, rejection of
+# an invalid answer, the stale-expired read, the workflow-owned round bound
+# and the malformed-document guard.
+# ---------------------------------------------------------------------------
+import json as _json
+from datetime import UTC as _UTC, datetime as _datetime
+
+import orchestrator.human_input as hi
+from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
+
+
+def _hi_execution() -> _ExecutionCorrelation:
+    return _ExecutionCorrelation(
+        agent="issue-investigator",
+        environment="shadow",
+        temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-1",
+        target_repository_sha="a" * 40,
+        definition_version="1.0.0",
+        definition_content_hash="sha256:" + "1" * 64,
+        profile_version="1.2.0",
+        profile_content_hash="sha256:" + "2" * 64,
+        release_revision=1,
+    )
+
+
+def _sealed_request(
+    question: str = "Use library A or library B?",
+    *,
+    created: _datetime | None = None,
+    ttl_seconds: int = 3600,
+    round: int = 1,
+) -> hi.HumanInputRequest:
+    created_dt = created or _datetime.now(_UTC)
+    return hi.seal_request(
+        work_item_id="mctl-telegram-1",
+        execution=_hi_execution(),
+        question=question,
+        reason="the issue is ambiguous",
+        response=hi.ResponseSpec(type="free_text"),
+        requested_from=hi.RequestedFrom(audience="work_item_owner", actor_refs=("github:alice",)),
+        created_at=created_dt.isoformat(),
+        expires_at=(created_dt + timedelta(seconds=ttl_seconds)).isoformat(),
+        round=round,
+    )
+
+
+def _request_json(request: hi.HumanInputRequest) -> str:
+    return _json.dumps(request.to_dict())
+
+
+def _response_payload(request: hi.HumanInputRequest, value: str = "library A") -> dict:
+    return {
+        "api_version": hi.API_VERSION,
+        "kind": hi.RESPONSE_KIND,
+        "request_id": request.request_id,
+        "request_hash": request.request_hash,
+        "respondent": {"actor_type": "github", "actor_id": "alice"},
+        "surface": "telegram",
+        "value": value,
+        "received_at": _datetime.now(_UTC).isoformat(),
+    }
+
+
+async def _wait_for_pending_request(handle, request_id: str) -> None:
+    """Poll the human_input_state query until THIS request is the one being
+    waited on — answers signalled before their request is pending would be
+    consumed and rejected against the wrong request."""
+    with anyio.fail_after(15):
+        while True:
+            state = await handle.query(DevLoopWorkflow.human_input_state)
+            if state.state == "WAITING_FOR_INPUT" and state.request_id == request_id:
+                return
+            await asyncio.sleep(0.05)
+
+
+class TestDevLoopHumanInput:
+    async def test_answered_request_resubmits_investigate_and_records_outcome(self, env):
+        request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(request), None]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await _wait_for_pending_request(handle, request.request_id)
+            await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            # The continuation investigate must finish before approval below.
+            with anyio.fail_after(15):
+                while calls.count("mctl-agents-investigate") < 2:
+                    await asyncio.sleep(0.05)
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert calls.count("mctl-agents-investigate") == 2
+        assert result.human_input is not None
+        assert result.human_input.outcome == "answered"
+        assert result.human_input.request_id == request.request_id
+        assert result.human_input.value == "library A"
+        assert result.human_input.resume_count == 1
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+
+    async def test_unanswered_request_times_out_and_ends_the_loop(self, env):
+        request = _sealed_request(ttl_seconds=120)
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(request)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            result = await handle.result()
+
+        assert result.human_input is not None
+        assert result.human_input.outcome == "timed_out"
+        assert result.implement is None
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_invalid_answer_is_rejected_and_a_valid_one_still_resumes(self, env):
+        request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(request), None]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await _wait_for_pending_request(handle, request.request_id)
+            bad = _response_payload(request)
+            bad["request_hash"] = "sha256:" + "0" * 64
+            await handle.signal(DevLoopWorkflow.human_input_response, bad)
+            # The rejected answer must NOT resume the loop; the state stays
+            # WAITING_FOR_INPUT for the same request.
+            await asyncio.sleep(0.2)
+            state = await handle.query(DevLoopWorkflow.human_input_state)
+            assert state.state == "WAITING_FOR_INPUT"
+            await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            with anyio.fail_after(15):
+                while calls.count("mctl-agents-investigate") < 2:
+                    await asyncio.sleep(0.05)
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.human_input is not None
+        assert result.human_input.outcome == "answered"
+
+    async def test_stale_expired_request_is_skipped_not_timed_out(self, env):
+        """A leftover request.json already past expires_at when READ must not
+        end this execution as timed_out — that would poison every later
+        execution of the same issue (the reviewer's P2). It is skipped, and
+        the loop proceeds exactly as if no request existed."""
+        stale = _sealed_request(
+            created=_datetime.now(_UTC) - timedelta(hours=2), ttl_seconds=3600
+        )
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(stale)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.human_input is None
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert calls.count("mctl-agents-investigate") == 1
+
+    async def test_workflow_owned_resume_count_bounds_agent_written_rounds(self, env):
+        """Every request claims round=1 (the producer bug the reviewer's P2
+        names). The workflow's own resume counter must still stop the loop
+        after MAX_CLARIFICATION_ROUNDS accepted answers."""
+        requests = [
+            _sealed_request(f"Question number {i}?", ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
+            for i in range(hi.MAX_CLARIFICATION_ROUNDS + 1)
+        ]
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(r) for r in requests]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            for request in requests[: hi.MAX_CLARIFICATION_ROUNDS]:
+                await _wait_for_pending_request(handle, request.request_id)
+                await handle.signal(
+                    DevLoopWorkflow.human_input_response, _response_payload(request)
+                )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "clarification_rounds_exhausted"
+
+    async def test_malformed_request_document_fails_loud_not_wedged(self, env):
+        request = _sealed_request()
+        document = request.to_dict()
+        document["question"] = "A tampered question?"  # carried hashes no longer match
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_json.dumps(document)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "human_input_malformed"

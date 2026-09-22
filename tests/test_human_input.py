@@ -213,6 +213,51 @@ def test_request_round_trips_through_to_dict_from_dict():
 
 
 # ---------------------------------------------------------------------------
+# T3b — the content address is enforced on the read path
+# ---------------------------------------------------------------------------
+def test_tampered_question_is_rejected_on_read():
+    document = _seal().to_dict()
+    document["question"] = "A subtly different question?"
+    with pytest.raises(hi.HumanInputError, match="hash"):
+        hi.HumanInputRequest.from_dict(document)
+
+
+def test_carried_request_hash_not_matching_content_is_rejected():
+    document = _seal().to_dict()
+    document["request_hash"] = "sha256:" + "0" * 64
+    with pytest.raises(hi.HumanInputError, match="request_hash"):
+        hi.HumanInputRequest.from_dict(document)
+
+
+def test_carried_question_hash_not_matching_content_is_rejected():
+    document = _seal().to_dict()
+    document["question_hash"] = "sha256:" + "0" * 64
+    with pytest.raises(hi.HumanInputError, match="question_hash"):
+        hi.HumanInputRequest.from_dict(document)
+
+
+def test_request_id_not_derived_from_hash_is_rejected():
+    document = _seal().to_dict()
+    document["request_id"] = "hir-0123456789abcdef"
+    with pytest.raises(hi.HumanInputError, match="request_id"):
+        hi.HumanInputRequest.from_dict(document)
+
+
+def test_unparseable_expires_at_is_rejected_on_read():
+    document = _seal().to_dict()
+    document["expires_at"] = "tomorrow"
+    with pytest.raises(hi.HumanInputError, match="expires_at"):
+        hi.HumanInputRequest.from_dict(document)
+
+
+def test_expires_before_created_is_rejected_on_read():
+    document = _seal().to_dict()
+    document["created_at"], document["expires_at"] = document["expires_at"], document["created_at"]
+    with pytest.raises(hi.HumanInputError, match="expires_at"):
+        hi.HumanInputRequest.from_dict(document)
+
+
+# ---------------------------------------------------------------------------
 # T4 — response rejection matrix (each rejects, and the positive case accepts)
 # ---------------------------------------------------------------------------
 def _valid_response(request: hi.HumanInputRequest, **overrides) -> hi.HumanInputResponse:

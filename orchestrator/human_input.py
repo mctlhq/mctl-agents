@@ -213,7 +213,9 @@ _REQUEST_KEYS = frozenset({
 class HumanInputRequest:
     """One immutable, content-addressed clarification question. Only ever
     produced by `seal_request()`; `from_dict` reconstructs an already-sealed
-    document and re-validates its shape, but never recomputes the hash."""
+    document, and `validate()` recomputes both hashes from the document's
+    own content — a carried identity that does not match its content is
+    rejected, so the content address is enforced on the read path too."""
 
     api_version: str
     kind: str
@@ -311,6 +313,55 @@ class HumanInputRequest:
                 raise HumanInputError(
                     f"context_refs entry {ref!r} does not start with one of {CONTEXT_REF_PREFIXES!r}"
                 )
+
+        # Timestamps must PARSE, not merely be strings: an `expires_at` like
+        # "tomorrow" would otherwise sail through here and only explode later
+        # inside workflow code (the wedge claude's P1 on #400 describes).
+        created_dt = _parse_iso(self.created_at, where="created_at")
+        expires_dt = _parse_iso(self.expires_at, where="expires_at")
+        if expires_dt <= created_dt:
+            raise HumanInputError("expires_at must be strictly after created_at")
+        if (expires_dt - created_dt).total_seconds() > MAX_REQUEST_TTL_SECONDS:
+            raise HumanInputError(
+                f"expires_at is more than MAX_REQUEST_TTL_SECONDS ({MAX_REQUEST_TTL_SECONDS}s) after created_at"
+            )
+
+        # Enforce the content address on read: recompute both hashes from
+        # the document's own content and refuse a mismatch. Without this,
+        # `request_hash`/`question_hash` are just strings a producer (or a
+        # hand edit in gitops main) may set to anything, and the dedupe set
+        # and response binding built on them address nothing.
+        expected_question_hash = question_hash_for(self.question, self.response)
+        if self.question_hash != expected_question_hash:
+            raise HumanInputError(
+                f"question_hash {self.question_hash!r} does not match the recomputed "
+                f"hash of this document's question/response spec"
+            )
+        expected_request_hash = _hash_bytes(
+            _canonical_json(
+                _content_payload(
+                    work_item_id=self.work_item_id,
+                    execution=self.execution,
+                    expires_at=self.expires_at,
+                    question=self.question,
+                    reason=self.reason,
+                    response=self.response,
+                    requested_from=self.requested_from,
+                    context_refs=self.context_refs,
+                    round=self.round,
+                    request_version=self.request_version,
+                )
+            )
+        )
+        if self.request_hash != expected_request_hash:
+            raise HumanInputError(
+                f"request_hash {self.request_hash!r} does not match the recomputed "
+                f"hash of this document's content"
+            )
+        if self.request_id != "hir-" + expected_request_hash[7:23]:
+            raise HumanInputError(
+                f"request_id {self.request_id!r} was not derived from this document's request_hash"
+            )
 
 
 _RESPONSE_KEYS = frozenset({
@@ -529,8 +580,9 @@ def validate_response(
     Checks, in order: `request_id` match, `request_hash` match (exact),
     `now < expires_at`, `respondent` inside `requested_from.actor_refs`, and
     `value` satisfies `request.response` (declared options for a
-    choice-typed request, non-empty for free_text, list cardinality for
-    multi_choice).
+    choice-typed request, non-empty for free_text, and a non-empty list of
+    declared options for multi_choice — no min/max selection count and no
+    duplicate rejection; `ResponseSpec` declares neither).
     """
     if response.request_id != request.request_id:
         raise HumanInputError(
