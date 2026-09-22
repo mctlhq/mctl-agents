@@ -1287,6 +1287,47 @@ def test_execution_context_headers_degrade_on_broken_file(monkeypatch, tmp_path,
     assert "omitting identity headers" in capsys.readouterr().out
 
 
+def test_execution_context_headers_from_a_sealed_file(monkeypatch):
+    """Positive path: a valid context file produces exactly the two identity
+    headers — the zero-agent-cooperation guarantee this PR exists for."""
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", "tests/fixtures/identity/investigator-context.json")
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    assert options._execution_context_headers() == {
+        "X-Mctl-Execution-Context": "ex-c5618d6437519c29",
+        "X-Mctl-Trace-Id": "a" * 32,
+    }
+
+
+def test_mctl_mcp_config_merges_identity_headers_next_to_authorization(monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", "tests/fixtures/identity/investigator-context.json")
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    headers = options.mctl_mcp_config()["mctl"]["headers"]
+    assert headers["Authorization"] == "Bearer test-token"
+    assert headers["X-Mctl-Execution-Context"] == "ex-c5618d6437519c29"
+    assert headers["X-Mctl-Trace-Id"] == "a" * 32
+
+
+def test_mctl_mcp_config_headers_are_exactly_authorization_when_env_unset(monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    headers = options.mctl_mcp_config()["mctl"]["headers"]
+    assert set(headers) == {"Authorization"}
+
+
+def test_execution_context_headers_fail_closed_when_required_and_env_unset(monkeypatch):
+    """agy finding 1 on 86fb8e8: the early `return {}` for an unset file env
+    ran BEFORE load_from_environment() could raise, so require mode silently
+    proceeded headerless in exactly the missing-env case."""
+    from orchestrator.execution_identity import ExecutionContextRequiredError
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    with pytest.raises(ExecutionContextRequiredError):
+        options._execution_context_headers()
+
+
 def test_execution_context_headers_fail_closed_in_require_mode(monkeypatch, tmp_path):
     """Driver-level fail-closed proof: with MCTL_REQUIRE_EXECUTION_CONTEXT
     set and a broken context file, the consumer must NOT degrade — the

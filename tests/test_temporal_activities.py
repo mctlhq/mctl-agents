@@ -507,6 +507,38 @@ class TestMintExecutionContext:
         assert result.context_id
         assert result.trace_id == "a" * 32
 
+    async def test_degrades_when_the_request_vocabulary_is_invalid(self, env, monkeypatch):
+        """Outer degrade branch (identity.py `except ExecutionIdentityError`):
+        a caller-supplied vocabulary field fails seal()'s validate(), and the
+        activity degrades to mint_local() instead of raising — the module
+        docstring's "never raises" promise."""
+        from dataclasses import replace
+
+        monkeypatch.delenv("MCTL_TOKEN", raising=False)
+        req = replace(self._REQUEST, actor_type="not-a-vocabulary-value")
+
+        result = await env.run(mint_execution_context, req)
+
+        assert result.stored is False
+        assert result.context_id
+        assert result.trace_id == "a" * 32
+
+    async def test_degrades_when_the_trace_id_is_malformed(self, env, monkeypatch):
+        """Inner retry branch: mint_local() forwards trace_id unchanged, so
+        the first degrade attempt re-raises and the nested retry with
+        mint_local()'s own known-valid defaults must be what succeeds."""
+        from dataclasses import replace
+
+        monkeypatch.delenv("MCTL_TOKEN", raising=False)
+        req = replace(self._REQUEST, trace_id="nope")
+
+        result = await env.run(mint_execution_context, req)
+
+        assert result.stored is False
+        assert result.context_id
+        # The retry minted its own trace_id; the malformed one must be gone.
+        assert result.trace_id != "nope"
+
 
 class TestDiscoverAndProject:
     async def test_discover_and_project_empty_dir(self, env, tmp_path):

@@ -173,11 +173,18 @@ rather than trusting the document wholesale.
 `load_from_environment()` reads the sealed context the CWFT wrote to
 `MCTL_EXECUTION_CONTEXT_FILE` (a **file**, never an inline env value, so the
 document never lands in an Argo parameter dump or a `printenv` in agent
-logs). When that variable is absent, `MCTL_REQUIRE_EXECUTION_CONTEXT` decides
-the outcome: unset degrades to an explicitly `actor.verification=
+logs). `MCTL_REQUIRE_EXECUTION_CONTEXT` decides what a failure means: with
+it unset, an absent file degrades to an explicitly `actor.verification=
 "unverified"`, `assertions.asserted_by="local"` context (`mint_local()`) so
-local development and tests keep working; set raises
-`ExecutionIdentityError` instead of proceeding silently unverified.
+local development and tests keep working, and a present-but-broken file
+(unreadable, truncated, tampered) raises `ExecutionIdentityError`, which
+the drivers catch narrowly and degrade the same way; with it set, both the
+absent-file and broken-file cases raise `ExecutionContextRequiredError`
+instead — deliberately NOT an `ExecutionIdentityError` subclass, so it
+passes through the drivers' degrade handlers and kills the run rather than
+proceeding silently unverified. A driver must never widen its catch to
+cover it: `except ExecutionIdentityError` degrades, and
+`ExecutionContextRequiredError` fails closed, by construction.
 
 **Logging never risks a payload.** `to_log_dict()` returns the full
 `to_dict()` — unlike `ContextSnapshot.to_log_dict()`, which drops `sources`,

@@ -449,6 +449,26 @@ def test_load_from_environment_wraps_undecodable_bytes_as_identity_error(monkeyp
         ei.load_from_environment(executor_type="shepherd")
 
 
+def test_load_from_environment_wraps_non_ascii_content_hash_as_identity_error(monkeypatch, tmp_path):
+    """compare_digest raises TypeError on non-ASCII str — which is neither
+    an OSError nor a ValueError, so it would escape every degrade handler
+    raw. The comparison feeds ascii-encoded bytes instead, so a shape-valid
+    document with a non-ASCII content_hash degrades like any other
+    malformed-document case (and fails closed in require mode)."""
+    context = _load_fixture_context()
+    doc = context.to_dict()
+    doc["content_hash"] = "sha256:é"
+    path = tmp_path / "context.json"
+    path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, str(path))
+    monkeypatch.delenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, raising=False)
+    with pytest.raises(ei.ExecutionIdentityError):
+        ei.load_from_environment(executor_type="shepherd")
+    monkeypatch.setenv(ei.MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "1")
+    with pytest.raises(ei.ExecutionContextRequiredError):
+        ei.load_from_environment(executor_type="shepherd")
+
+
 def test_load_from_environment_wraps_oserror_as_identity_error(monkeypatch, tmp_path):
     path = tmp_path / "does-not-exist.json"
     monkeypatch.setenv(ei.MCTL_EXECUTION_CONTEXT_FILE_ENV, str(path))

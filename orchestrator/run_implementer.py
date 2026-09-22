@@ -3655,7 +3655,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             execution={
                 "context_id": execution_context.context_id,
                 "trace_id": execution_context.trace_id,
-                "agent": "implementer",
+                "agent": execution_context.executor.agent or "implementer",
                 "version": execution_context.executor.version,
             },
             # A run that got through clears the hand-back tally: the cap

@@ -38,11 +38,18 @@ def _execution_context_headers() -> dict[str, str]:
     """
     from orchestrator.execution_identity import (
         MCTL_EXECUTION_CONTEXT_FILE_ENV,
+        MCTL_REQUIRE_EXECUTION_CONTEXT_ENV,
         ExecutionIdentityError,
         load_from_environment,
     )
 
     if not os.environ.get(MCTL_EXECUTION_CONTEXT_FILE_ENV, "").strip():
+        if os.environ.get(MCTL_REQUIRE_EXECUTION_CONTEXT_ENV, "").strip():
+            # Require mode must fail closed on the MISSING-env case too, not
+            # only on a present-but-broken file — an early `return {}` here
+            # would silently send headerless calls. Delegate for the
+            # canonical ExecutionContextRequiredError raise.
+            load_from_environment(executor_type="system")
         return {}
     try:
         # executor_type is only consulted on the local-mint fallback branch,

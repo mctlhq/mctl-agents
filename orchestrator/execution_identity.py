@@ -61,6 +61,7 @@ WORKFLOW_TYPES = frozenset({
 # dev_loop.py:80 / resolver.py:110 — the same two-value vocabulary those
 # modules already use as plain strings, given a closed home here.
 ENVIRONMENTS = frozenset({"production", "shadow"})
+ASSERTED_BY = frozenset({"control-plane", "local"})
 # Reuses ADR 010's Executor vocabulary verbatim (orchestrator/lifecycle/
 # contract.py's Executor.type docstring: "shepherd | pr-steward |
 # devloop-workflow | reconciler | implementer") so the two contracts never
@@ -503,6 +504,10 @@ class ExecutionContext:
             raise ExecutionIdentityError(
                 f"executor.type {self.executor.type!r} is not one of {sorted(EXECUTOR_TYPES)!r}"
             )
+        if self.assertions.asserted_by not in ASSERTED_BY:
+            raise ExecutionIdentityError(
+                f"assertions.asserted_by {self.assertions.asserted_by!r} is not one of {sorted(ASSERTED_BY)!r}"
+            )
 
         if parent is not None:
             if self.parent_context_id != parent.context_id:
@@ -784,8 +789,15 @@ def load_from_environment(
             # document, so verify the tamper evidence ADR 011 promises here.
             expected_content_hash = recompute_content_hash(context)
             # compare_digest is hygiene, not a proven timing oracle: both
-            # sides derive from the same caller-supplied document.
-            if not hmac.compare_digest(expected_content_hash, context.content_hash):
+            # sides derive from the same caller-supplied document. Encoded
+            # to bytes because compare_digest raises TypeError on non-ASCII
+            # str — and TypeError escapes every catch below. A non-ASCII
+            # content_hash/context_id in the document instead raises
+            # UnicodeEncodeError (a ValueError), wrapped like any other
+            # malformed-document case.
+            if not hmac.compare_digest(
+                expected_content_hash.encode("ascii"), context.content_hash.encode("ascii")
+            ):
                 raise ExecutionIdentityError(
                     f"content_hash mismatch for context_id={context.context_id!r} loaded from "
                     f"{MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: document content does not match "
@@ -798,7 +810,7 @@ def load_from_environment(
             # context_id deterministically as "ex-" + content_hash[7:23]; recheck
             # that binding explicitly so a tampered context_id is caught too.
             expected_context_id = "ex-" + expected_content_hash[7:23]
-            if not hmac.compare_digest(context.context_id, expected_context_id):
+            if not hmac.compare_digest(context.context_id.encode("ascii"), expected_context_id.encode("ascii")):
                 raise ExecutionIdentityError(
                     f"context_id mismatch loaded from {MCTL_EXECUTION_CONTEXT_FILE_ENV}={path!r}: "
                     f"declared context_id={context.context_id!r} does not match {expected_context_id!r} "

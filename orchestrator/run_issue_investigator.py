@@ -1142,7 +1142,7 @@ def write_status_yaml(
         "execution": {
             "context_id": context.context_id,
             "trace_id": context.trace_id,
-            "agent": "issue-investigator",
+            "agent": context.executor.agent or "issue-investigator",
             "version": context.executor.version,
         },
         "source": {
