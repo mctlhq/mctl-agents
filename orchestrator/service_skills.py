@@ -374,22 +374,27 @@ def _head_sha(repo_dir: Path, *, timeout: float) -> str:
     return sha
 
 
-def _git_merge_base(repo_dir: Path, *, timeout: float) -> str:
-    proc = _run_git(["merge-base", "HEAD", "origin/HEAD"], cwd=repo_dir, timeout=timeout)
+def _git_merge_base(repo_dir: Path, *, timeout: float, rev: str = "HEAD") -> str:
+    proc = _run_git(["merge-base", rev, "origin/HEAD"], cwd=repo_dir, timeout=timeout)
     sha = proc.stdout.decode().strip()
     if not sha:
-        raise ServiceSkillError(f"git merge-base HEAD origin/HEAD produced no output in {repo_dir}")
+        raise ServiceSkillError(f"git merge-base {rev} origin/HEAD produced no output in {repo_dir}")
     return sha
 
 
-def _merge_base_with_default_branch(repo_dir: Path, *, timeout: float) -> str:
-    """`git merge-base HEAD origin/HEAD` (R6), with one deepening fetch
+def _merge_base_with_default_branch(repo_dir: Path, *, timeout: float, rev: str = "HEAD") -> str:
+    """`git merge-base <rev> origin/HEAD` (R6), with one deepening fetch
     retry (R7) before failing closed. `origin/HEAD` is the same default-
     branch symref `run_implementer._has_new_commits` already relies on --
     `gh repo clone`/`git clone` set it up, so no separate "what is the
-    default branch" query is needed."""
+    default branch" query is needed.
+
+    `rev` defaults to the worktree HEAD (`pin_sha`'s contract); the
+    declarative resolver passes the Task's own pinned SHA instead, so its
+    derived pin is a pure function of the Task rather than of checkout
+    state at call time."""
     try:
-        return _git_merge_base(repo_dir, timeout=timeout)
+        return _git_merge_base(repo_dir, timeout=timeout, rev=rev)
     except ServiceSkillError:
         pass
     try:
@@ -401,7 +406,7 @@ def _merge_base_with_default_branch(repo_dir: Path, *, timeout: float) -> str:
             "(`git fetch --deepen=<N> origin`) and re-run"
         ) from exc
     try:
-        return _git_merge_base(repo_dir, timeout=timeout)
+        return _git_merge_base(repo_dir, timeout=timeout, rev=rev)
     except ServiceSkillError as exc:
         raise ServiceSkillError(
             f"cannot compute a merge-base with origin/HEAD in {repo_dir} even after "
@@ -423,16 +428,16 @@ def pin_sha(repo_dir: Path, *, agent: str, branch: str | None, timeout: float = 
     previous remediation run may have committed `.mctl/skills/**` edits
     there just the same (R6/ADR 007).
 
-    `branch` is therefore only a statement of WHO is running: pass the
-    branch the run is on (any truthy name) for an agent that commits to
-    its own branch, and `None` only when the caller is not on a work
-    branch at all (a read-only agent pinning HEAD). An agent-authored
-    caller must never pass `None`. The declarative path
-    (`resolver._resolve_service_skill_bundle_for_plan`) does not go
-    through this function -- it derives the merge-base directly for an
-    agent in `AGENT_AUTHORED_AGENTS`, unconditionally.
+    `branch` is documentation, not a condition: the WHO (`agent`) alone
+    decides the rule, unconditionally, exactly as
+    `resolver._resolve_service_skill_bundle_for_plan` does on the
+    declarative path -- the two R6 implementations agree on every input.
+    The parameter stays in the signature so call sites keep naming the
+    branch they run on, but a caller that fails to plumb it through can
+    no longer silently reinstate HEAD-pinning for the two agents R6
+    exists for.
     """
-    if agent in AGENT_AUTHORED_AGENTS and branch:
+    if agent in AGENT_AUTHORED_AGENTS:
         return _merge_base_with_default_branch(repo_dir, timeout=timeout)
     return _head_sha(repo_dir, timeout=timeout)
 

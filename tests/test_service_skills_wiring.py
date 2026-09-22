@@ -181,10 +181,71 @@ def test_declarative_path_head_pin_for_read_only_agent(tmp_path):
     assert bundle.skills == ()
 
 
+def test_declarative_path_positive_control_reads_merged_skill(tmp_path):
+    """The positive control the exclusion tests need: a skill merged to the
+    default branch (reachable from origin/HEAD) IS resolved for an
+    agent-authored agent, from the merge-base, even while the run sits on a
+    branch with its own extra commit."""
+    clone = _setup_origin(tmp_path)
+    _write_skills_manifest(clone)
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "skills merged to main")
+    _git(clone, "push", "-q", "origin", "main")
+    base_sha = _head(clone)
+
+    _git(clone, "checkout", "-q", "-b", "fix/work-branch")
+    (clone / "unrelated.txt").write_text("work\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "unrelated work on the branch")
+    branch_head = _head(clone)
+
+    profile = SimpleNamespace(service_skills=ServiceSkillPolicy(enabled=True), tools=())
+    task = resolver.Task(target_repository_sha=branch_head, target_repo_dir=clone)
+    bundle = resolver._resolve_service_skill_bundle_for_plan(
+        agent="implementer", profile=profile, task=task
+    )
+    assert bundle.resolved_from_sha == base_sha
+    assert [s.skill_id for s in bundle.skills] == ["a"]
+
+
+def test_declarative_pin_is_a_function_of_the_task_not_the_checkout(tmp_path):
+    """The merge-base is computed from `rev=Task.target_repository_sha`,
+    not from the worktree HEAD: with the checkout moved elsewhere, the
+    derived pin still follows the Task's SHA."""
+    clone = _setup_origin(tmp_path)
+    _write_skills_manifest(clone)
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "skills merged to main")
+    _git(clone, "push", "-q", "origin", "main")
+    base_sha = _head(clone)
+
+    _git(clone, "checkout", "-q", "-b", "fix/task-branch")
+    (clone / "w.txt").write_text("w\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "task branch commit")
+    task_sha = _head(clone)
+
+    # Move the WORKTREE somewhere else entirely; the Task still names the
+    # branch commit.
+    _git(clone, "checkout", "-q", "-b", "other-branch", "main")
+    (clone / "o.txt").write_text("o\n")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "checkout drifted")
+
+    profile = SimpleNamespace(service_skills=ServiceSkillPolicy(enabled=True), tools=())
+    task = resolver.Task(target_repository_sha=task_sha, target_repo_dir=clone)
+    bundle = resolver._resolve_service_skill_bundle_for_plan(
+        agent="implementer", profile=profile, task=task
+    )
+    assert bundle.resolved_from_sha == base_sha
+    assert [s.skill_id for s in bundle.skills] == ["a"]
+
+
 def test_declarative_path_kill_switch_runs_no_git(tmp_path, monkeypatch):
-    """R25: with MCTL_SERVICE_SKILLS=off the declarative path must not run
-    a single git subprocess, even for an agent-authored agent -- proven by
-    making the merge-base helper explode if called."""
+    """R25: with MCTL_SERVICE_SKILLS=off the merge-base helper is never
+    reached for an agent-authored agent (it explodes if called);
+    `resolve_bundle`'s own kill-switch check is what stops the remaining
+    git reads and returns the empty bundle."""
     monkeypatch.setenv("MCTL_SERVICE_SKILLS", "off")
 
     def _boom(*a, **k):

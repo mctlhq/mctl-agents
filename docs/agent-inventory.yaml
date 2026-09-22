@@ -157,8 +157,9 @@ agents:
       - proposalDir: requirements.md / design.md / tasks.md (via PROPOSAL_DIR)
       # mctlhq/mctl-agents#305: the pinned, validated alternative to the
       # ambient CLAUDE.md/.claude/ load two lines up. `.mctl/skills/**`, read
-      # at the merge-base with the default branch (never this agent's own
-      # feat/agents-* HEAD — a skill edit this agent commits cannot become
+      # at the merge-base with the default branch (never the HEAD of the
+      # branch this agent runs on — feat/agents-* or an adopted PR's own
+      # head branch alike — so a skill edit this agent commits cannot become
       # policy for its own next run without a human merging it first). Empty
       # unless agents/_manifests/implementer/agent.yaml's
       # spec.serviceSkills.enabled is true. NOT true as of this proposal:

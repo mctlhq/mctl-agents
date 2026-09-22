@@ -998,8 +998,12 @@ def _resolve_service_skill_bundle_for_plan(
         # kill switch first: `MCTL_SERVICE_SKILLS=off` must not run a
         # single git subprocess (R17/R25).
         if _skills_enabled(profile.service_skills) and agent in AGENT_AUTHORED_AGENTS:
+            # `rev=pinned_sha`, never the worktree HEAD: the derived pin is
+            # a pure function of the Task, so replaying a recorded plan (or
+            # resolving twice in one run across checkouts/commits) reads
+            # skills from the same merge-base every time.
             pinned_sha = _merge_base_with_default_branch(
-                task.target_repo_dir, timeout=_GIT_TIMEOUT_SECONDS
+                task.target_repo_dir, rev=pinned_sha, timeout=_GIT_TIMEOUT_SECONDS
             )
         return _resolve_service_skill_bundle(
             agent=agent,
