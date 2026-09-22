@@ -200,6 +200,40 @@ def _target_repository_sha(repo_dir: Path) -> str:
         raise RuntimeError(f"cannot pin target_repository_sha: empty HEAD in {repo_dir}")
     return sha
 
+
+def _service_skills_prompt_block(repo_dir: Path) -> str:
+    """mctlhq/mctl-agents#305 (R23): resolve the issue-investigator's
+    `ServiceSkillBundle` and render it for the prompt — but ONLY in
+    `declarative` resolver mode. `legacy` (the default, and the only mode
+    running in production today — see orchestrator/resolver.py's module
+    docstring) returns `""` without reading the target repository's
+    `.mctl/` root at all.
+
+    Deferred `resolver` import, for the same worker-isolation reason
+    `_run_agent` imports it inside itself rather than at module scope (see
+    that function's comment): resolver.py does not import the SDK, but a
+    module-scope import here would be the one extra line a reader has to
+    check by hand every time test_worker_isolation goes red.
+    """
+    if _resolver_mode() != "declarative":
+        return ""
+    from orchestrator import resolver
+
+    bundle = resolver.resolve_service_skill_bundle(
+        "issue-investigator",
+        resolver.Task(
+            target_repository_sha=_target_repository_sha(repo_dir),
+            target_repo_dir=repo_dir,
+        ),
+    )
+    if bundle.skills:
+        print(
+            f"[service_skills] issue-investigator bundle: {len(bundle.skills)} skill(s) from "
+            f"{bundle.resolved_from_sha[:8]}"
+        )
+    return bundle.to_prompt_block()
+
+
 # A proposal whose .status.yaml is missing or still `proposed` can be
 # (re-)investigated. Anything past that means the implementer/shepherd has
 # taken ownership — re-running the investigator would clobber in-flight work.
@@ -1294,14 +1328,17 @@ _STRIPPED_TAG = "[tag stripped]"
 
 
 def _neutralize_prompt_tags(text: str) -> str:
-    """Strip forged <issue_title>/<issue_body>/<context_source> (and
-    closing) tags from untrusted text so it cannot break out of — or fake
-    — the delimiter blocks it is wrapped in (agy P1 round 2, PR #212: a
-    body containing `</issue_body>` would end the untrusted block early
-    and promote the attacker's remaining text to instruction level).
-    `context_source` carries the same untrusted-DATA payloads through
-    `_render_assembled_context_section` in `on` mode (#265) and reopens
-    the identical hole if left out here. Targeted removal, not blanket
+    """Strip forged <issue_title>/<issue_body>/<context_source>/
+    <service_skills> (and closing) tags from untrusted text so it cannot
+    break out of — or fake — the delimiter blocks it is wrapped in (agy P1
+    round 2, PR #212: a body containing `</issue_body>` would end the
+    untrusted block early and promote the attacker's remaining text to
+    instruction level). `context_source` carries the same untrusted-DATA
+    payloads through `_render_assembled_context_section` in `on` mode
+    (#265) and reopens the identical hole if left out here;
+    `service_skills` (#305) is worse — a forged one is a trust UPGRADE,
+    relabeling attacker text as repository-convention authority. Targeted
+    removal, not blanket
     angle-bracket escaping: issue bodies and prior-proposal text
     legitimately carry code with generics/HTML that must reach the agent
     intact."""
@@ -1321,7 +1358,7 @@ def _neutralize_prompt_tags(text: str) -> str:
     # again. A marker between them keeps the halves apart (agy P1, round 2
     # on #248 — same fix in the sibling guard named above).
     return re.sub(
-        r"(?i)<[\s/]*(?:issue_(?:title|body)|context_source)(?![-\w])[^>\n]*>?",
+        r"(?i)<[\s/]*(?:issue_(?:title|body)|context_source|service_skills)(?![-\w])[^>\n]*>?",
         _STRIPPED_TAG,
         text or "",
     )
@@ -1373,6 +1410,7 @@ def _build_prompt(
     slug: str,
     *,
     context: context_assembly.AssemblyResult | None = None,
+    service_skills_block: str = "",
 ) -> str:
     """Prompt for the investigator SDK agent.
 
@@ -1384,7 +1422,20 @@ def _build_prompt(
     byte-identical to this function's `main`-branch behaviour. In `on` mode
     it appends the `## Assembled context` section above; every other line
     below is unmodified (mctlhq/mctl-agents#265).
+
+    `service_skills_block` is `""` unless
+    `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` resolved a non-empty
+    `ServiceSkillBundle` (mctlhq/mctl-agents#305) — an empty string changes
+    this function's output by zero bytes, so the default/legacy prompt stays
+    byte-identical. Its placement is a literal `{skills_section}` slot in
+    the template between "## Your working context" and "## What to
+    produce" — code-owned template structure, deliberately NOT a
+    text-anchor splice over the rendered prompt: the issue body is
+    substituted ABOVE the slot and is attacker-writable, so any anchor an
+    issue author can spell (a plain Markdown heading) must never decide
+    where an authority block lands.
     """
+    skills_section = f"\n{service_skills_block}\n" if service_skills_block else ""
     prompt = f"""\
 **Output language: English only. Write every file in English.**
 **No human is present. Do not ask for input. Work with what you have.**
@@ -1424,7 +1475,7 @@ outside the tags.
   design. Ground every design decision in code you actually read.
 - Read the repo's `CLAUDE.md` (cwd root, if present) for conventions.
 - `$PROPOSAL_DIR` (env var) is where you write the proposal files.
-
+{skills_section}
 ## What to produce
 
 Write exactly three files into `$PROPOSAL_DIR`:
@@ -1567,7 +1618,10 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     if mode == "declarative":
         plan = resolver.execute(
             "issue-investigator",
-            resolver.Task(target_repository_sha=_target_repository_sha(repo_dir)),
+            resolver.Task(
+                target_repository_sha=_target_repository_sha(repo_dir),
+                target_repo_dir=repo_dir,
+            ),
         )
         plan.log()
         options = build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
@@ -2134,8 +2188,19 @@ def investigate(
             work_context=work_context_ref,
         )
 
+        # 2c. Resolve this investigation's ServiceSkillBundle
+        #     (mctlhq/mctl-agents#305) — empty unless resolver_mode is
+        #     `declarative`; see _service_skills_prompt_block's docstring.
+        #     A malformed target-repo manifest raises ResolverError out of
+        #     here uncaught — deliberate fail-closed (R22): the run aborts
+        #     before the SDK client exists rather than proceeding without
+        #     the block.
+        service_skills_block = _service_skills_prompt_block(clone / "repo")
+
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.
-        prompt = _build_prompt(issue, service, slug, context=context)
+        prompt = _build_prompt(
+            issue, service, slug, context=context, service_skills_block=service_skills_block
+        )
         anyio.run(_run_agent, clone / "repo", prompt, staging.resolve())
 
         # 4a. Before looking INSIDE staging, check staging itself is still

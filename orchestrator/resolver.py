@@ -83,6 +83,8 @@ import yaml
 from config.model_policy import DEFAULT_POLICY_PATH, resolve_model
 from orchestrator.manifest import ManifestError as _ManifestError
 from orchestrator.manifest import PromptSource
+from orchestrator.service_skills import ServiceSkillBundle, ServiceSkillPolicy
+from orchestrator.service_skills import resolve_bundle as _resolve_service_skill_bundle
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFINITIONS_DIR = REPO_ROOT / "agents" / "_manifests"
@@ -143,6 +145,13 @@ class Task:
     """
 
     target_repository_sha: str
+    # mctlhq/mctl-agents#305: the target-repo clone service skills are read
+    # from, at exactly `target_repository_sha`. `None` (the default) means
+    # "no clone available" -- execute() then resolves an empty
+    # ServiceSkillBundle rather than raising, so every caller that does not
+    # yet pass this (or that runs against a repo with no clone on disk)
+    # keeps behaving exactly as it did before this field existed.
+    target_repo_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +198,11 @@ class ExecutionProfile:
     evidence: tuple[str, ...]
     path: Path
     content_hash: str = field(compare=False)
+    # mctlhq/mctl-agents#305: optional spec.serviceSkills block. Absent ->
+    # ServiceSkillPolicy(enabled=False) -- see ServiceSkillPolicy.from_spec.
+    service_skills: ServiceSkillPolicy = field(
+        default_factory=lambda: ServiceSkillPolicy(enabled=False), compare=False
+    )
 
 
 @dataclass(frozen=True)
@@ -256,6 +270,14 @@ class ExecutionPlan:
     target_repository_sha: str
     approval: Mapping[str, Any]
     evidence: tuple[str, ...]
+    # mctlhq/mctl-agents#305 (R19/R20): identifiers only -- id, path,
+    # sha256:-prefixed content hash, byte count -- never the skill TEXT, so
+    # the plan stays small and safe to log via to_log_dict(). `None` manifest
+    # hash means the target repo had no .mctl/skills/manifest.yaml at the
+    # pinned SHA (R5: a valid, non-error state).
+    service_skills: tuple[Mapping[str, Any], ...] = ()
+    service_skill_manifest_hash: str | None = None
+    service_skills_resolved_from_sha: str = ""
 
     def to_log_dict(self) -> dict[str, Any]:
         """JSON-serializable snapshot for structured logging (mctlhq/mctl-agents#227
@@ -285,6 +307,9 @@ class ExecutionPlan:
             "target_repository_sha": self.target_repository_sha,
             "approval": dict(self.approval),
             "evidence": list(self.evidence),
+            "service_skills": [dict(s) for s in self.service_skills],
+            "service_skill_manifest_hash": self.service_skill_manifest_hash,
+            "service_skills_resolved_from_sha": self.service_skills_resolved_from_sha,
         }
 
     def log(self) -> None:
@@ -417,6 +442,20 @@ def _parse_prompt_source(raw: Any, path: Path) -> PromptSource:
         return PromptSource.from_dict(raw)
     except _ManifestError as exc:
         raise ResolverError(f"{path}: {exc}") from exc
+
+
+def _parse_service_skills_policy(raw: Any, *, path: Path) -> ServiceSkillPolicy:
+    """mctlhq/mctl-agents#305: parse a profile's optional
+    `spec.serviceSkills` block, converting `ServiceSkillError` (this
+    module's `ResolverError` sibling for the same fail-closed contract)
+    into `ResolverError` so every malformed profile field raises the same
+    exception type."""
+    from orchestrator.service_skills import ServiceSkillError
+
+    try:
+        return ServiceSkillPolicy.from_spec(raw)
+    except ServiceSkillError as exc:
+        raise ResolverError(f"{path}: spec.serviceSkills: {exc}") from exc
 
 
 def load_definition(agent: str) -> AgentDefinition:
@@ -591,6 +630,7 @@ def load_profile(name: str) -> ExecutionProfile:
         evidence=tuple(evidence),
         path=path,
         content_hash=content_hash,
+        service_skills=_parse_service_skills_policy(spec.get("serviceSkills"), path=path),
     )
 
 
@@ -880,6 +920,17 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
         log=False,
     )
 
+    # mctlhq/mctl-agents#305 (R23): resolved AFTER the profile so tool_allow
+    # (profile.tools) is known, and BEFORE the plan is constructed so a bad
+    # bundle raises before this function returns -- i.e. before the SDK
+    # client is built and before Argo submission for every caller reached
+    # through resolver.execute() (R22).
+    skill_bundle = _resolve_service_skill_bundle_for_plan(
+        agent=definition.name,
+        profile=profile,
+        task=task,
+    )
+
     return ExecutionPlan(
         agent=definition.name,
         definition_version=binding.definition_version,
@@ -904,4 +955,80 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
         target_repository_sha=task.target_repository_sha.strip(),
         approval=dict(profile.approval),
         evidence=profile.evidence,
+        service_skills=skill_bundle.identifiers(),
+        service_skill_manifest_hash=skill_bundle.manifest_hash,
+        service_skills_resolved_from_sha=skill_bundle.resolved_from_sha,
     )
+
+
+def _resolve_service_skill_bundle_for_plan(
+    *, agent: str, profile: ExecutionProfile, task: Task
+) -> ServiceSkillBundle:
+    """The bundle behind `ExecutionPlan.service_skills`'s identifiers.
+    `task.target_repo_dir=None` (no clone available to this caller) and a
+    disabled/absent `spec.serviceSkills` block both resolve an empty
+    bundle -- see `service_skills.resolve_bundle`."""
+    if task.target_repo_dir is None:
+        return ServiceSkillBundle(
+            agent=agent,
+            resolved_from_sha=task.target_repository_sha.strip(),
+            root=profile.service_skills.root,
+            manifest_hash=None,
+        )
+    from orchestrator.service_skills import (
+        _GIT_TIMEOUT_SECONDS,
+        AGENT_AUTHORED_AGENTS,
+        ServiceSkillError,
+        _merge_base_with_default_branch,
+    )
+    from orchestrator.service_skills import is_enabled as _skills_enabled
+
+    pinned_sha = task.target_repository_sha.strip()
+    try:
+        # R6 lives HERE too, not only in run_implementer's ad hoc path: an
+        # agent that commits to the branch it runs on must read service
+        # skills from the merge-base with the default branch, never from a
+        # SHA that may carry its own previous run's commits. The skill pin
+        # is DERIVED here (like run_implementer's pin_sha), never verified
+        # against `task.target_repository_sha` -- that field keeps meaning
+        # what its docstring says (the commit the agent actually runs
+        # against, honest plan provenance), while the bundle's own
+        # `resolved_from_sha` records the merge-base the skills were read
+        # from. `is_enabled` (not the raw `.enabled` field) keeps the
+        # kill switch first: `MCTL_SERVICE_SKILLS=off` must not run a
+        # single git subprocess (R17/R25).
+        if _skills_enabled(profile.service_skills) and agent in AGENT_AUTHORED_AGENTS:
+            # `rev=pinned_sha`, never the worktree HEAD: the derived pin is
+            # a pure function of the Task, so replaying a recorded plan (or
+            # resolving twice in one run across checkouts/commits) reads
+            # skills from the same merge-base every time.
+            pinned_sha = _merge_base_with_default_branch(
+                task.target_repo_dir, rev=pinned_sha, timeout=_GIT_TIMEOUT_SECONDS
+            )
+        return _resolve_service_skill_bundle(
+            agent=agent,
+            repo_dir=task.target_repo_dir,
+            policy=profile.service_skills,
+            tool_allow=profile.tools,
+            pinned_sha=pinned_sha,
+        )
+    except ServiceSkillError as exc:
+        # Same conversion `_parse_service_skills_policy` performs: every
+        # malformed input surfaced through `execute()` raises ResolverError.
+        raise ResolverError(f"service skill bundle for {agent!r}: {exc}") from exc
+
+
+def resolve_service_skill_bundle(agent: str, task: Task) -> ServiceSkillBundle:
+    """Resolve just the `ServiceSkillBundle` for `agent`/`task`, with the
+    actual skill TEXT `ExecutionPlan.service_skills` deliberately omits
+    (identifiers/hashes only, so the plan stays small and loggable) --
+    for callers that need to render a prompt block (`bundle.to_prompt_block()`)
+    BEFORE the full `ExecutionPlan` is otherwise needed. Resolution is
+    read-only and idempotent (R21), so calling this and `execute()`
+    separately for the same inputs is safe and produces byte-identical
+    bundle identifiers."""
+    _require_catalog_present()
+    definition = load_definition(agent)
+    binding = load_release_binding(agent)
+    profile = load_profile(binding.profile_name)
+    return _resolve_service_skill_bundle_for_plan(agent=definition.name, profile=profile, task=task)

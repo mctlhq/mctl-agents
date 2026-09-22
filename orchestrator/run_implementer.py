@@ -134,6 +134,8 @@ from orchestrator.lifecycle.contract import (
     EntityRef,
     Executor,
 )
+from orchestrator.manifest import MANIFESTS_DIR
+from orchestrator.manifest import load as load_agent_manifest
 from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
@@ -152,6 +154,10 @@ from orchestrator.proposal_state import (
     now_iso,
     update_status_file,
 )
+from orchestrator.service_skills import ServiceSkillBundle, ServiceSkillError, neutralize_service_skill_tags
+from orchestrator.service_skills import is_enabled as is_service_skills_enabled
+from orchestrator.service_skills import pin_sha as service_skill_pin_sha
+from orchestrator.service_skills import resolve_bundle as resolve_service_skill_bundle
 from orchestrator.source_issue import SourceIssueVerdict, read_source_issue
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
@@ -1561,6 +1567,50 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
                 f.write(f"{entry}\n")
 
 
+def _resolve_implementer_service_skills(target: Path, branch: str) -> ServiceSkillBundle:
+    """mctlhq/mctl-agents#305 (R24): resolve the implementer's
+    `ServiceSkillBundle` even though the implementer is still
+    `agents.mctl.ai/v1alpha1` and has no `ExecutionPlan` — its envelope
+    comes straight from `AgentManifest` (`tool_allow`, and
+    `service_skills` for enablement/ceilings).
+
+    `branch` is `feat/agents-<slug>` for a proposal run, or the adopted
+    PR's own head branch (mctlhq/mctl-agents#334); either way
+    `service_skills.pin_sha` resolves the merge-base with the default
+    branch (R6) rather than HEAD — on a brand-new branch that is the same
+    commit HEAD already is, and on a review-feedback or adopted branch it
+    is NOT whatever a previous implementer run committed on top of it.
+
+    Raises `ServiceSkillError` — the caller aborts before
+    `_run_implementer_agent`, so before any commit, push, or PR (R22).
+
+    Checks `service_skills.is_enabled` BEFORE calling `pin_sha` — a
+    disabled policy (the default: no `spec.serviceSkills` block, or
+    `MCTL_SERVICE_SKILLS=off`) must not run `git merge-base` at all (R17),
+    not just skip the eventual `git ls-tree`.
+    """
+    implementer_manifest = load_agent_manifest(MANIFESTS_DIR / "implementer" / "agent.yaml")
+    policy = implementer_manifest.service_skills
+    pinned_sha = (
+        service_skill_pin_sha(target, agent="implementer", branch=branch)
+        if is_service_skills_enabled(policy)
+        else ""
+    )
+    bundle = resolve_service_skill_bundle(
+        agent="implementer",
+        repo_dir=target,
+        policy=policy,
+        tool_allow=implementer_manifest.tool_allow,
+        pinned_sha=pinned_sha,
+    )
+    if bundle.skills:
+        print(
+            f"[service_skills] implementer bundle: {len(bundle.skills)} skill(s) from "
+            f"{bundle.resolved_from_sha[:8]}"
+        )
+    return bundle
+
+
 def _adopted_pr_number(ref: ProposalRef) -> int | None:
     """The PR number for an adopted ref, recovered from `slug = "pr-<n>"`
     (mctlhq/mctl-agents#334). Kept a pure function of `ref.slug` rather than
@@ -1580,6 +1630,7 @@ def _build_prompt(
     review_feedback: dict | None = None,
     branch: str | None = None,
     adopted: bool = False,
+    service_skills_block: str = "",
 ) -> str:
     """Prompt that delegates to the `implementer` sub-agent.
 
@@ -1597,11 +1648,20 @@ def _build_prompt(
     ``adopted`` drops the proposal-spec sentence and commit trailer in
     favour of a plain PR reference, since an adoption record carries no
     requirements/design/tasks triplet to read.
+    ``service_skills_block`` is ``""`` unless a non-empty
+    ``ServiceSkillBundle`` was resolved for this run (mctlhq/mctl-agents#305)
+    -- an empty string changes this function's output by zero bytes.
     """
     branch = branch or f"feat/agents-{ref.slug}"
+    skills_section = f"\n{service_skills_block}\n" if service_skills_block else ""
 
     if review_feedback is not None:
-        feedback_md = _render_review_feedback(review_feedback)
+        # Review-comment bodies and CI log excerpts are attacker-writable
+        # (anyone who can comment on the PR / influence a build log). With a
+        # <service_skills> authority block spliced into this same prompt,
+        # that text must not be able to forge the block's delimiter tags --
+        # same neutralizer the skill bodies themselves go through (R18).
+        feedback_md = neutralize_service_skill_tags(_render_review_feedback(review_feedback))
         ci_only = _bundle_is_ci_only(review_feedback)
         # What the run is actually about. Every one of these was hardcoded to
         # the code-review framing; a CI-only bundle then read as a
@@ -1741,7 +1801,7 @@ Workflow:
    marker is ignored.
 
 {feedback_md}
-
+{skills_section}
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
 - Stay strictly within scope — fixing the {work_items} only.
@@ -1788,7 +1848,7 @@ Workflow:
    you finish. Just commit.
 5. If the proposal can't be safely implemented (missing context, scope too
    large, blocking dependency), STOP without committing and explain why.
-
+{skills_section}
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
 - Stay strictly within the proposal's scope — no drive-by refactors.
@@ -2365,6 +2425,15 @@ def review_feedback_one(
                 ),
             )
 
+        # 4c. Resolve this run's ServiceSkillBundle (mctlhq/mctl-agents#305,
+        # R24) BEFORE the SDK call — a ServiceSkillError aborts here, before
+        # any commit, push, or PR (R22).
+        try:
+            skill_bundle = _resolve_implementer_service_skills(target, branch)
+        except ServiceSkillError as exc:
+            release_reason = "service skill resolution failed"
+            return ImplementResult(ref=ref, pr_url=None, error=f"service skill resolution failed: {exc}")
+
         # 5. Run the SDK with the bundle baked into the prompt. The execution
         # envelope is derived from the work class the bundle actually carries
         # (mctl-agents#423) -- a CI-remediation or mixed bundle gets a wider,
@@ -2377,7 +2446,13 @@ def review_feedback_one(
         n_checks = len(bundle.get("ci_failures") or [])
         envelope_s = implementer_envelope(work_class, n_checks=n_checks)
         budget_ledger = CommandBudgetLedger()
-        prompt = _build_prompt(ref, review_feedback=bundle, branch=branch, adopted=adopted)
+        prompt = _build_prompt(
+            ref,
+            review_feedback=bundle,
+            branch=branch,
+            adopted=adopted,
+            service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}"),
+        )
         anyio.run(
             functools.partial(
                 _run_implementer_agent,
@@ -3493,11 +3568,33 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         # 4. Drop the implementer sub-agent into the clone's .claude/.
         _stage_implementer_agent(target, ref.service)
 
+        # 4b. Resolve this run's ServiceSkillBundle (mctlhq/mctl-agents#305,
+        # R24) BEFORE the SDK call — a ServiceSkillError aborts here, before
+        # any commit, push, or PR (R22).
+        try:
+            skill_bundle = _resolve_implementer_service_skills(target, branch)
+        except ServiceSkillError as exc:
+            recorded = _mark_needs_triage(
+                ref,
+                code="service-skill-error",
+                stage="service-skills",
+                message=f"service skill resolution failed: {exc}",
+                attempt=attempt,
+                claim_context=claim_ctx,
+            )
+            return ImplementResult(
+                ref=ref,
+                pr_url=None,
+                error=_triage_error(f"service skill resolution failed: {exc}", recorded),
+            )
+
         # 5. Run the SDK with PROPOSAL_DIR pointing at the gitops worktree.
         # `budget_ledger` (mctl-agents#430): the same per-command deadline
         # guard `review_feedback_one` wires in -- the boundary this proposal
         # draws is generic over the driver, not review-remediation-only.
-        prompt = _build_prompt(ref)
+        prompt = _build_prompt(
+            ref, service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}")
+        )
         budget_ledger = CommandBudgetLedger()
         anyio.run(
             functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
