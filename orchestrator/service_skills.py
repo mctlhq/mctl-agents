@@ -393,6 +393,18 @@ def _merge_base_with_default_branch(repo_dir: Path, *, timeout: float, rev: str 
     declarative resolver passes the Task's own pinned SHA instead, so its
     derived pin is a pure function of the Task rather than of checkout
     state at call time."""
+    if rev != "HEAD":
+        # A Task-supplied rev may simply not exist in this clone (a replayed
+        # plan against a re-cloned checkout, a branch never fetched here).
+        # `--deepen` can never fix that, so name the real cause instead of
+        # sending the operator down the deepening path.
+        try:
+            _run_git(["cat-file", "-e", f"{rev}^{{commit}}"], cwd=repo_dir, timeout=timeout)
+        except ServiceSkillError as exc:
+            raise ServiceSkillError(
+                f"{rev} is not a commit in {repo_dir} -- fetch the ref that contains it "
+                "before resolving service skills against it"
+            ) from exc
     try:
         return _git_merge_base(repo_dir, timeout=timeout, rev=rev)
     except ServiceSkillError:
@@ -437,6 +449,7 @@ def pin_sha(repo_dir: Path, *, agent: str, branch: str | None, timeout: float = 
     no longer silently reinstate HEAD-pinning for the two agents R6
     exists for.
     """
+    del branch  # documentation only: the agent alone decides the rule (R6)
     if agent in AGENT_AUTHORED_AGENTS:
         return _merge_base_with_default_branch(repo_dir, timeout=timeout)
     return _head_sha(repo_dir, timeout=timeout)
@@ -588,10 +601,11 @@ def resolve_bundle(
         raise ServiceSkillError(f"{manifest_path}: spec.bindings.{agent} must be a list of skill ids")
     invalid_ids = sorted({i for i in ids if not _SKILL_ID_RE.match(i)})
     if invalid_ids:
-        # R18: skill_id is rendered unneutralized into the prompt block's
-        # heading, so an id must not be able to spell a delimiter tag --
-        # reject anything outside the safe identifier charset before it is
-        # ever bound to a skill, rather than trying to sanitize it later.
+        # R18: the id's charset is the PRIMARY containment for the prompt
+        # block's heading (render also passes it through the neutralizer,
+        # as defense in depth) -- reject anything outside the safe
+        # identifier charset before it is ever bound to a skill, rather
+        # than relying on sanitizing later.
         raise ServiceSkillError(
             f"{manifest_path}: spec.bindings.{agent} has invalid skill id(s) {invalid_ids!r} -- "
             "skill ids must match ^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?$"

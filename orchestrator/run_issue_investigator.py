@@ -1350,7 +1350,7 @@ def _neutralize_prompt_tags(text: str) -> str:
     # again. A marker between them keeps the halves apart (agy P1, round 2
     # on #248 — same fix in the sibling guard named above).
     return re.sub(
-        r"(?i)<[\s/]*(?:issue_(?:title|body)|context_source)(?![-\w])[^>\n]*>?",
+        r"(?i)<[\s/]*(?:issue_(?:title|body)|context_source|service_skills)(?![-\w])[^>\n]*>?",
         _STRIPPED_TAG,
         text or "",
     )

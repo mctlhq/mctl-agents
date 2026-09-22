@@ -316,7 +316,9 @@ def test_merge_base_shallow_clone_fails_closed(tmp_path):
         pin_sha(clone, agent="implementer", branch="feat/agents-my-slug")
 
 
-def test_agent_authored_agents_constant_matches_pin_sha_behaviour(tmp_path):
+def test_agent_authored_agents_constant_names_the_two_committing_agents(tmp_path):
+    """The behavioural pin_sha coverage lives in the three tests above; this
+    only pins the constant's membership."""
     assert set(AGENT_AUTHORED_AGENTS) == {"implementer", "shepherd"}
 
 

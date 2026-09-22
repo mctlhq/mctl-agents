@@ -154,7 +154,7 @@ from orchestrator.proposal_state import (
     now_iso,
     update_status_file,
 )
-from orchestrator.service_skills import ServiceSkillBundle, ServiceSkillError
+from orchestrator.service_skills import ServiceSkillBundle, ServiceSkillError, _neutralize_service_skill_tags
 from orchestrator.service_skills import is_enabled as is_service_skills_enabled
 from orchestrator.service_skills import pin_sha as service_skill_pin_sha
 from orchestrator.service_skills import resolve_bundle as resolve_service_skill_bundle
@@ -1656,7 +1656,12 @@ def _build_prompt(
     skills_section = f"\n{service_skills_block}\n" if service_skills_block else ""
 
     if review_feedback is not None:
-        feedback_md = _render_review_feedback(review_feedback)
+        # Review-comment bodies and CI log excerpts are attacker-writable
+        # (anyone who can comment on the PR / influence a build log). With a
+        # <service_skills> authority block spliced into this same prompt,
+        # that text must not be able to forge the block's delimiter tags --
+        # same neutralizer the skill bodies themselves go through (R18).
+        feedback_md = _neutralize_service_skill_tags(_render_review_feedback(review_feedback))
         ci_only = _bundle_is_ci_only(review_feedback)
         # What the run is actually about. Every one of these was hardcoded to
         # the code-review framing; a CI-only bundle then read as a
