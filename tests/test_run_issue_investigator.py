@@ -2039,14 +2039,14 @@ def test_a_background_swap_after_the_agent_returns_cannot_redirect_writes(
 
     real_write = run_issue_investigator.write_status_yaml
 
-    def _swap_the_path_the_agent_saw(proposal_dir, issue_data):
+    def _swap_the_path_the_agent_saw(proposal_dir, issue_data, *args, **kwargs):
         # Stands in for a leftover background process: it can only act on
         # the path it observed, which is no longer where the work is.
         old = seen["staging"]
         if old.exists() or old.is_symlink():
             shutil.rmtree(old, ignore_errors=True)
             old.symlink_to(victim)
-        return real_write(proposal_dir, issue_data)
+        return real_write(proposal_dir, issue_data, *args, **kwargs)
 
     monkeypatch.setattr(
         run_issue_investigator, "write_status_yaml", _swap_the_path_the_agent_saw
@@ -2091,10 +2091,10 @@ def test_the_staging_wrapper_is_not_writable_while_the_work_happens(
 
     real_write = run_issue_investigator.write_status_yaml
 
-    def _note_wrapper_mode(proposal_dir, issue_data):
+    def _note_wrapper_mode(proposal_dir, issue_data, *args, **kwargs):
         # proposal_dir here IS staging; its parent is the wrapper.
         observed["mode"] = stat.S_IMODE(proposal_dir.parent.stat().st_mode)
-        return real_write(proposal_dir, issue_data)
+        return real_write(proposal_dir, issue_data, *args, **kwargs)
 
     issue = _investigate_harness(
         tmp_path, monkeypatch, number=52,
@@ -4226,3 +4226,56 @@ def test_prior_ids_clamp_to_the_ceiling_but_the_sequence_counts_all():
     assert len(ref.prior_execution_ids) == MAX_PRIOR_EXECUTION_IDS
     assert ref.prior_execution_ids[0] == "e2"  # oldest dropped
     assert ref.prior_execution_ids[-1] == f"e{MAX_PRIOR_EXECUTION_IDS + 1}"
+
+
+def test_status_disagreements_agent_check_is_symmetric_with_the_writer(tmp_path):
+    """Round-3 P2 on #393: the writer records context.executor.agent while
+    the checker compared a literal — a context whose executor.agent differs
+    would be written by one layer and destroyed by the other. Both sides now
+    read the same source."""
+    import orchestrator.execution_identity as ei
+
+    proposal_dir = tmp_path / "p"
+    context = ei.mint_local(
+        executor_type="issue-investigator", workflow_type="investigate", agent="custom-agent"
+    )
+    status_path = write_status_yaml(proposal_dir, _issue(), context)
+    published = yaml.safe_load(status_path.read_text())
+    assert published["execution"]["agent"] == "custom-agent"
+
+    # Same source on both sides: clean.
+    assert (
+        run_issue_investigator._status_disagreements(
+            published, _issue(), expected_agent=context.executor.agent or "issue-investigator"
+        )
+        == []
+    )
+    # Direction 1: checker left on the literal while the writer used the
+    # context — the exact one-sided break this test pins.
+    assert any(
+        "execution.agent" in d
+        for d in run_issue_investigator._status_disagreements(published, _issue())
+    )
+    # Direction 2: an agent rewrote the block after publish — still flagged.
+    published["execution"]["agent"] = "tampered"
+    assert any(
+        "execution.agent" in d
+        for d in run_issue_investigator._status_disagreements(
+            published, _issue(), expected_agent=context.executor.agent or "issue-investigator"
+        )
+    )
+
+
+def test_write_status_yaml_default_degrades_on_a_broken_context_file(tmp_path, monkeypatch):
+    """Round-5 P3 on #393: the no-context fallback's degrade branch. A direct
+    caller with a present-but-broken context file gets a locally-minted
+    unverified identity, not a crash — same as every driver call site."""
+    broken = tmp_path / "context.json"
+    broken.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(broken))
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+
+    status_path = write_status_yaml(tmp_path / "p", _issue())
+    published = yaml.safe_load(status_path.read_text())
+    assert published["execution"]["agent"] == "issue-investigator"
+    assert published["execution"]["context_id"].startswith("ex-")

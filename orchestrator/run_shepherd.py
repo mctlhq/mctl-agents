@@ -100,6 +100,7 @@ import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
+from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout, shadow
 from orchestrator.lifecycle.claim import ClaimClient
@@ -3769,6 +3770,28 @@ def main() -> None:
     budget = args.budget if args.budget is not None else SHEPHERD_BUDGET_USD
     if budget <= 0:
         print(f"warn: SHEPHERD_BUDGET_USD={budget} is non-positive; nothing will run")
+
+    # Loaded and logged once per shepherd tick (mctlhq/mctl-agents#196,
+    # ADR 011) — see run_issue_investigator.investigate()'s identical
+    # comment for why independently-loaded copies still agree once a
+    # control-plane-minted context exists.
+    try:
+        execution_context = load_from_environment(
+            executor_type="shepherd", workflow_type="review-fix", agent="shepherd"
+        )
+    except ExecutionIdentityError as exc:
+        # Mirrors orchestrator.options._execution_context_headers(): a
+        # present-but-broken MCTL_EXECUTION_CONTEXT_FILE (unreadable,
+        # truncated, or tamper-evidence failure) must not crash the tick —
+        # degrade to a locally-minted, explicitly unverified context instead.
+        # load_from_environment() wraps every read/parse failure into
+        # ExecutionIdentityError, so this narrow catch is complete — and an
+        # ExecutionContextRequiredError (MCTL_REQUIRE_EXECUTION_CONTEXT set)
+        # passes through and kills the tick: require mode fails closed and
+        # never mints a local identity (ADR 011).
+        print(f"warn: MCTL_EXECUTION_CONTEXT_FILE is set but unreadable ({exc}); minting a local execution context.")
+        execution_context = mint_local(executor_type="shepherd", workflow_type="review-fix", agent="shepherd")
+    print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
 
     # PR adoption (mctlhq/mctl-agents#334) — deferred: pr_adoption imports
     # this module, so a module-level import here would cycle. With neither
