@@ -61,6 +61,51 @@ def test_blocked_result_is_counted_separately_from_skipped() -> None:
     )
 
 
+def test_stale_source_result_is_not_counted_as_failed() -> None:
+    # A stale-source admission refusal also carries `error` (the older
+    # channel), so `_batch_outcome` must classify it via `stale_source`
+    # before it ever reaches the `error` branch -- otherwise a healthy
+    # refusal alongside a real success would still report the batch as
+    # having a failure (codex P2 follow-up on mctl-agents#410).
+    stale = run_implementer.ImplementResult(
+        ref=_ref("stale"),
+        pr_url=None,
+        error="source-resolved",
+        counts_toward_limit=False,
+        stale_source=("source-resolved", "mctlhq/mctl-telegram#510"),
+    )
+    success = run_implementer.ImplementResult(
+        ref=_ref("success"),
+        pr_url="https://github.com/mctlhq/mctl-agents/pull/1",
+    )
+
+    outcome = run_implementer._batch_outcome([stale, success])
+
+    assert outcome == run_implementer.BatchOutcome(
+        succeeded=1, failed=0, skipped=0, blocked=0, stale_source=1
+    )
+
+
+def test_stale_source_only_batch_is_still_a_failure() -> None:
+    # requirements.md's EARS: "WHEN a batch run's only outcome is an
+    # admission refusal THE SYSTEM SHALL count it as a failed result
+    # (exit 1)". `_batch_outcome` keeps that fact visible via
+    # `stale_source` even though it is no longer folded into `failed`.
+    stale = run_implementer.ImplementResult(
+        ref=_ref("stale"),
+        pr_url=None,
+        error="source-resolved",
+        counts_toward_limit=False,
+        stale_source=("source-resolved", "mctlhq/mctl-telegram#510"),
+    )
+
+    outcome = run_implementer._batch_outcome([stale])
+
+    assert outcome == run_implementer.BatchOutcome(
+        succeeded=0, failed=0, skipped=0, blocked=0, stale_source=1
+    )
+
+
 def test_explicit_skip_takes_precedence_over_pr_url() -> None:
     result = run_implementer.ImplementResult(
         ref=_ref("closed-pr"),

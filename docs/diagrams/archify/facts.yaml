@@ -46,12 +46,15 @@ cwfts:
 - mctl-agents-run
 - mctl-agents-shepherd
 dev_loop:
+  approval_poll_interval: 6 h
+  approval_wait_deadline: 14 d
   approve_step_timeout: 15 min
   deploy_verify_deadline: 45 min
   incident_watch_window: 30 min
   merge_poll_interval: 15 min
   merge_watch_deadline: 14 d
   patched_markers:
+  - approval-watch
   - atomic-approve
   - concurrent-shepherd-tick
   - deploy-observation
@@ -63,9 +66,11 @@ dev_loop:
   - lifecycle-ownership
   - lifecycle-refusal-backoff
   - merge-detection
+  - merge-watch-continue-as-new
   - registry-required
   - shepherd-in-loop
   - slug-scoped-implement
+  - stale-issue-admission
   release_lookup_deadline: 20 min
   sdk_step_retry_attempts: '3'
   sdk_step_timeout: 2 h
@@ -208,6 +213,7 @@ releases_seen:
   mctlhq/mctl-portal: 4.15.0
   mctlhq/mctl-telegram: 0.59.0
 schedules:
+  ImplementSweepWorkflow: 15 min
   IncidentLoopWorkflow: 1 h
   IssuePollWorkflow: 15 min
   ReconcileWorkflow: 15 min
@@ -233,6 +239,8 @@ shepherd:
   - review-fixing
 workflows:
 - DevLoopWorkflow
+- ImplementSweepWorkflow
 - IncidentLoopWorkflow
 - IssuePollWorkflow
 - ReconcileWorkflow
+- SweptImplementWorkflow

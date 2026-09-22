@@ -83,6 +83,11 @@ from orchestrator import context_assembly
 from orchestrator.context_snapshot import ContextSnapshot, WorkContextRef
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
+from orchestrator.proposal_identity import (
+    AmbiguousProposalError,
+    ProposalCandidate,
+    select_proposal_slug,
+)
 
 # subagent_wait defers its own claude_agent_sdk imports (see its module note),
 # so unlike options/mcp_guard below it is safe at module scope here.
@@ -888,6 +893,25 @@ def existing_slugs(proposals_dir: Path, issue_number: int) -> list[str]:
     return sorted(p.name for p in proposals_dir.iterdir() if p.is_dir() and p.name.startswith(prefix))
 
 
+def read_proposal_status(proposal_dir: Path) -> str | None:
+    """The ``status:`` in a proposal directory's ``.status.yaml``, or None.
+
+    None on anything unreadable — absent file, unparseable YAML, a
+    non-mapping document, a non-string status. `select_proposal_slug`
+    treats None as live, so a broken status file can never retire a
+    proposal; it only ever loses the chance to retire itself.
+    """
+    try:
+        text = (proposal_dir / ".status.yaml").read_text()
+        data = yaml.safe_load(text)
+    except (OSError, ValueError, yaml.YAMLError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    return status if isinstance(status, str) else None
+
+
 def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
     """The slug this issue's proposal lives at, reusing one if it exists.
 
@@ -901,17 +925,33 @@ def resolve_slug(proposals_dir: Path, issue_number: int, title: str) -> str:
     produced a second directory beside the first, and `find_proposal_slug`
     then refused the ambiguous `issue-<N>-*` lookup — the loop could not
     proceed and gitops kept a stray proposal (codex P2 on #241, #246).
-    Two directories is already-broken state, so say which ones rather than
-    silently picking one.
+    Two LIVE directories is still already-broken state, so say which ones
+    rather than silently picking one.
+
+    A `rejected` directory is the exception, and the only one: after a
+    closed-unmerged PR the proposal is rewritten to `rejected` and can
+    never be acted on again (mctl-agents#438), so leaving it able to block
+    its own replacement means the issue can never be given a working
+    proposal. `proposal_identity.select_proposal_slug` holds that rule, so
+    this path and the `find_proposal_slug` activity cannot drift apart.
     """
     matches = existing_slugs(proposals_dir, issue_number)
     if len(matches) > 1:
-        raise ProposalAmbiguityError(
-            f"issue #{issue_number} already has {len(matches)} proposal dirs "
-            f"({', '.join(matches)}) — refusing to guess which one is real; "
-            "remove the stale one from gitops first"
-        )
-    return matches[0] if matches else build_slug(issue_number, title)
+        candidates = [
+            ProposalCandidate(slug=slug, status=read_proposal_status(proposals_dir / slug))
+            for slug in matches
+        ]
+    else:
+        # One directory is not a choice — skip the status reads entirely.
+        candidates = [ProposalCandidate(slug=slug) for slug in matches]
+
+    try:
+        chosen = select_proposal_slug(candidates)
+    except AmbiguousProposalError as exc:
+        # The remedy sentence belongs to `select_proposal_slug` and differs
+        # per case, so this wrapper only adds which issue it was about.
+        raise ProposalAmbiguityError(f"issue #{issue_number}: {exc}") from exc
+    return chosen if chosen else build_slug(issue_number, title)
 
 
 def gh_issue_view(url: str) -> IssueData:
@@ -1045,6 +1085,8 @@ def write_status_yaml(
     issue: IssueData,
     *,
     snapshot: ContextSnapshot | None = None,
+    requested_by: str | None = None,
+    requested_comment_url: str | None = None,
 ) -> Path:
     """Write the initial .status.yaml for an issue-driven proposal.
 
@@ -1059,6 +1101,13 @@ def write_status_yaml(
     never the sources or payloads. Additive because `_status_disagreements`
     (below) checks only its five named fields and ignores unknown top-level
     keys, so this cannot forge an approval or misroute a `Closes` line.
+
+    `requested_by`, when given (mctlhq/mctl-agents#417's directive-comment
+    trigger), adds an ADDITIVE `request` block recording the GitHub login
+    and comment URL that asked for this (re-)investigation — the requester
+    equivalent of `source` for the issue itself. Omitted entirely when
+    `requested_by` is falsy, so a label-driven investigation's payload is
+    byte-for-byte what it was before this parameter existed.
     """
     payload: dict[str, Any] = {
         "status": "proposed",
@@ -1080,6 +1129,12 @@ def write_status_yaml(
             "content_hash": snapshot.content_hash,
             "strategy": snapshot.strategy.name,
             "strategy_version": snapshot.strategy.version,
+        }
+    if requested_by:
+        payload["request"] = {
+            "by": requested_by,
+            "comment": requested_comment_url or "",
+            "received_at": _now_iso(),
         }
     proposal_dir.mkdir(parents=True, exist_ok=True)
     status_path = proposal_dir / ".status.yaml"
@@ -1713,14 +1768,22 @@ def investigate(
     surface: str | None = None,
     actor_kind: str | None = None,
     actor_id: str | None = None,
+    requested_by: str | None = None,
+    requested_comment_url: str | None = None,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
 
-    The six keyword-only parameters are mctlhq/mctl-agents#267's work-context
+    The six work-context keyword-only parameters are mctlhq/mctl-agents#267's
     seam. Every existing call site — `investigate(url, tmp_path)` in the
     tests, and `orchestrator/run_issue_poller.py` — is untouched: none of
     them is required, all default to None, and at the default
     `WORK_CONTEXT_ROLLOUT_MODE=off` none of them changes behaviour at all.
+
+    `requested_by` / `requested_comment_url` (mctlhq/mctl-agents#417) record
+    who asked for THIS run via a `@MCTL reinvestigate` directive comment —
+    threaded into `write_status_yaml`'s `request` block. Both default to
+    None, in which case the written payload is unchanged from before this
+    parameter existed (the label-driven path never passes them).
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
@@ -1978,11 +2041,18 @@ def investigate(
         #    The two-argument call (no `snapshot=`) when context assembly
         #    did not run keeps this byte-identical to the pre-#265 call —
         #    including for a caller/test double that only accepts
-        #    (proposal_dir, issue).
+        #    (proposal_dir, issue). Same rule for `requested_by`: omitted
+        #    from the call entirely unless a directive comment actually
+        #    supplied one, so every existing test double that stands in for
+        #    write_status_yaml with the pre-#417 signature keeps working.
+        status_kwargs: dict[str, Any] = {}
+        if requested_by:
+            status_kwargs["requested_by"] = requested_by
+            status_kwargs["requested_comment_url"] = requested_comment_url
         if context is not None:
-            write_status_yaml(staging, issue, snapshot=context.snapshot)
+            write_status_yaml(staging, issue, snapshot=context.snapshot, **status_kwargs)
         else:
-            write_status_yaml(staging, issue)
+            write_status_yaml(staging, issue, **status_kwargs)
 
         # 6. Publish by swapping DIRECTORIES, not file by file. Four
         #    individual os.replace calls are each atomic but the sequence
@@ -2478,6 +2548,20 @@ def main() -> None:
     ap.add_argument("--surface", default=None, help="Surface this execution runs on (closed vocabulary)")
     ap.add_argument("--actor-kind", default=None, help="Kind of actor driving this execution (closed vocabulary)")
     ap.add_argument("--actor-id", default=None, help="Identity of the actor driving this execution")
+    ap.add_argument(
+        "--requested-by",
+        default=None,
+        help=(
+            "GitHub login that requested this run via a `@MCTL reinvestigate` "
+            "directive comment (mctl-agents#417); recorded in .status.yaml's "
+            "`request` block. Omit for a label-driven investigation."
+        ),
+    )
+    ap.add_argument(
+        "--requested-comment-url",
+        default=None,
+        help="The requesting comment's URL, recorded alongside --requested-by.",
+    )
     args = ap.parse_args()
     _work_context_from_args(args)
 
@@ -2514,6 +2598,8 @@ def main() -> None:
             surface=args.surface,
             actor_kind=args.actor_kind,
             actor_id=args.actor_id,
+            requested_by=args.requested_by,
+            requested_comment_url=args.requested_comment_url,
         )
     except ProposalAmbiguityError as exc:
         # The process boundary is where a clean exit belongs — the library

@@ -1,5 +1,125 @@
 # Changelog
 
+## [1.53.1](https://github.com/mctlhq/mctl-agents/compare/1.53.0...1.53.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* **proposals:** address review findings on the identity resolver ([90024c3](https://github.com/mctlhq/mctl-agents/commit/90024c30b516987c81396de97d77028c400ec2bf)), closes [#439](https://github.com/mctlhq/mctl-agents/issues/439)
+* **proposals:** converge the directive poller onto the shared resolver ([77107d0](https://github.com/mctlhq/mctl-agents/commit/77107d004bc8abd461be04f24a7ae0d71c4352cc)), closes [#439](https://github.com/mctlhq/mctl-agents/issues/439)
+* **proposals:** stop a rejected proposal blocking its own replacement ([7622eab](https://github.com/mctlhq/mctl-agents/commit/7622eab09c42c7c32894c23de943cfa2f5a2aef9))
+* **proposals:** stop a rejected proposal blocking its own replacement ([eb60db8](https://github.com/mctlhq/mctl-agents/commit/eb60db89f42f0d229b877b4f62e78042cd065e6d)), closes [#439](https://github.com/mctlhq/mctl-agents/issues/439)
+
+## [1.53.0](https://github.com/mctlhq/mctl-agents/compare/1.52.0...1.53.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-420-devloopworkflow-never-completes-on-tempo ([730c525](https://github.com/mctlhq/mctl-agents/commit/730c5257a89a2d70bc1d1baddd9226c269db40a8))
+
+
+### Bug Fixes
+
+* **dev-loop:** bound the approval park and add a graceful abandon signal ([e6ce411](https://github.com/mctlhq/mctl-agents/commit/e6ce411b5cdbd987b8520699100c727fa5ef76a3))
+* **devloop:** address edge cases in abandon handling and closed issue priority ([91d51c1](https://github.com/mctlhq/mctl-agents/commit/91d51c159cd58d3a3f3d32cd0b6f7aea1250292b))
+* **devloop:** address review findings on approval watch and abandon signal ([8bdffd5](https://github.com/mctlhq/mctl-agents/commit/8bdffd5c9837b487f375b077d6f8c58c23dc2df3))
+* **lint:** address ruff findings in cli.py and test_dev_loop_workflow.py ([161908c](https://github.com/mctlhq/mctl-agents/commit/161908c26e6ef50baee533ce11fcd33bbda1ba63))
+
+## [1.52.0](https://github.com/mctlhq/mctl-agents/compare/1.51.0...1.52.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-430-fix-implementer-bound-long-running-local ([99d61f9](https://github.com/mctlhq/mctl-agents/commit/99d61f9423bac5409287d6f406e1ba0c6121dba3))
+
+
+### Bug Fixes
+
+* **agents:** bound implementer commands to the remaining envelope ([630ac27](https://github.com/mctlhq/mctl-agents/commit/630ac27b59c17fee341e554998a2371ea50c4ab4))
+* **agents:** close the five P2 findings on the execution-budget guard ([624a433](https://github.com/mctlhq/mctl-agents/commit/624a4337fc30b827f1ec31f3bf561380364f1207))
+* **agents:** keep the timer ordering below a one-second budget ([a4674cc](https://github.com/mctlhq/mctl-agents/commit/a4674ccdef4e300442845fe99e035e0357265892))
+* **agents:** make the OS timer fire first and let the ledger outrank the marker ([aa60779](https://github.com/mctlhq/mctl-agents/commit/aa60779d8d9129cf5f333b733c69a77f09bee416))
+* **agents:** scan executed payloads and bound the implement-path hand-back ([166133b](https://github.com/mctlhq/mctl-agents/commit/166133b74508be8f85745870fb56e9db900d48b7))
+* **agents:** scope `-c` to its segment and write status before releasing the claim ([4449024](https://github.com/mctlhq/mctl-agents/commit/444902429ffea13165b370b65f68b9e4284f0141))
+* **agents:** withhold the shell-state exemption from anything that can run long ([61595a0](https://github.com/mctlhq/mctl-agents/commit/61595a05ad2933d4719f30378ee4cb10ad26070e))
+* **implementer:** see through exec wrappers when scanning for a shell payload ([fc84dc5](https://github.com/mctlhq/mctl-agents/commit/fc84dc5efa97c97e63ac853f9f6cd99755496471))
+* **implementer:** step over option arguments in the flag scan, order the bounds in milliseconds ([24fe327](https://github.com/mctlhq/mctl-agents/commit/24fe3274228a6022b4764bca8956d260b5ef9cd9))
+
+## [1.51.0](https://github.com/mctlhq/mctl-agents/compare/1.50.0...1.51.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-417-fix-devloop-a-directive-comment-on-an-is ([c5f32c0](https://github.com/mctlhq/mctl-agents/commit/c5f32c04c9521f5ddcbf8b3d090d5d753aa490a3))
+* **agents:** issue-423-fix-devloop-ci-remediation-workload-can ([3ba6190](https://github.com/mctlhq/mctl-agents/commit/3ba6190cf0dfcf162aceeaf1e313d5e72cfdda0f))
+
+
+### Bug Fixes
+
+* **agents-421:** filter terminal-status siblings out of the ambiguity check, dedup stale-directive reports per issue ([6c1aea8](https://github.com/mctlhq/mctl-agents/commit/6c1aea8099ad46743144f871bdb532497921603c))
+* **agents-421:** revert the terminal-sibling matches filter, name the stale directory instead ([f7a42ab](https://github.com/mctlhq/mctl-agents/commit/f7a42ab6801ff1df564f74f36f5f70e962fbd231))
+* **agents-421:** sharpen ambiguous-dispatch classification, dedup stale-directive comment reads ([bdb9e1b](https://github.com/mctlhq/mctl-agents/commit/bdb9e1b64d8a641ac609b56b9eccd2de6f04073c))
+* **agents-421:** the ack-doesn't-retry notice applies to every ambiguous reply, not only the stale-sibling one ([79020fe](https://github.com/mctlhq/mctl-agents/commit/79020feff13208e7511e906a14e27881af2bb596))
+* **agents-421:** the stale-directory remediation must say it won't be retried ([91ebe3e](https://github.com/mctlhq/mctl-agents/commit/91ebe3e6e7b3524e51b4e0ddf748680d20df84c2))
+* **agents:** actually normalize updated_at/expires_at to str, and harden _parse_timestamp ([265b0a4](https://github.com/mctlhq/mctl-agents/commit/265b0a470a8f8b0e4892d6a597fa5886f6103b1b))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([e6b3aca](https://github.com/mctlhq/mctl-agents/commit/e6b3aca4572316e3dbc2a70962b8c1c1f7981e7f))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([a2dbef4](https://github.com/mctlhq/mctl-agents/commit/a2dbef46c49e24d20476624a53088c3a0435ec55))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([a7286e6](https://github.com/mctlhq/mctl-agents/commit/a7286e61dce8ca931267a8ff57ad194b9a7e5c26))
+* **agents:** address P1/P2 codex findings on issue-423-fix-devloop-ci-remediation-workload-can ([1591740](https://github.com/mctlhq/mctl-agents/commit/1591740de7119c3f7f2be123c4a179a54e9ce6fa))
+* **agents:** bound CI-log retrieval and derive the implementer envelope from work class ([1fa1842](https://github.com/mctlhq/mctl-agents/commit/1fa1842bc846b67373c23546cf3f74ec2f71e405))
+* **agents:** make dispatch ambiguity explicit and close the round-2 P3s on [#417](https://github.com/mctlhq/mctl-agents/issues/417) ([726fdd5](https://github.com/mctlhq/mctl-agents/commit/726fdd52660a14bee409b66260fa716d968ab6b8))
+* close CI-log-guard bypass via global gh flags / line continuation ([e9a57aa](https://github.com/mctlhq/mctl-agents/commit/e9a57aa31b789b6a27dd53eeab53e3a0f73167d5))
+* **options:** close CI-log-guard bypass via global gh flags / line continuation ([796141c](https://github.com/mctlhq/mctl-agents/commit/796141c97cc51753554c9475d6474fc21f4741d4))
+* **options:** close two more gh-flag-parsing bypasses in the CI-log guard ([fa24cca](https://github.com/mctlhq/mctl-agents/commit/fa24ccafdffbf61964a9ab1ce5acb47bdd8c94da))
+
+## [1.50.0](https://github.com/mctlhq/mctl-agents/compare/1.49.0...1.50.0) (2026-09-20)
+
+
+### Features
+
+* **agents:** issue-412-an-approval-outside-a-live-devloopworkfl ([9314f7d](https://github.com/mctlhq/mctl-agents/commit/9314f7dd12c7ef0af31d2138f07d9333d49618c3))
+
+
+### Bug Fixes
+
+* **agents:** await the started child and stop documenting the rejected design ([5a1a859](https://github.com/mctlhq/mctl-agents/commit/5a1a8591c68593428dd6a10bd2ebad33216962e1))
+* **agents:** bound the pre-start budget read to each id's recent runs ([a820c10](https://github.com/mctlhq/mctl-agents/commit/a820c10b80608e0282163f9d935b0ad0daac9d78))
+* **agents:** bound the traversal too, not only the per-run fetches ([66fd212](https://github.com/mctlhq/mctl-agents/commit/66fd21263827f243d6ef72657d59c23c9c6796e5))
+* **agents:** close the last two unawaited children and drop a field nothing writes ([8297c3d](https://github.com/mctlhq/mctl-agents/commit/8297c3dd3d152a4672e065c674293b9f707bee8d))
+* **agents:** delete the unreachable old budget query and split unknown from exhausted ([d1aae8f](https://github.com/mctlhq/mctl-agents/commit/d1aae8fe5d6f0954d6013751dba1ed40203f886e))
+* **agents:** make the ceiling test actually reach the ceiling, and stop overclaiming why an id is unaccounted ([61652e8](https://github.com/mctlhq/mctl-agents/commit/61652e8ecff92ea6f819ac8f4432a1dbba9e1259))
+* **agents:** scale the traversal ceiling to the chunk and settle the third omission case ([17a2cea](https://github.com/mctlhq/mctl-agents/commit/17a2cead5a0fb40cdf4bec715fc50545ea71dbf1))
+
+## [1.49.0](https://github.com/mctlhq/mctl-agents/compare/1.48.0...1.49.0) (2026-09-19)
+
+
+### Features
+
+* **agents:** issue-265-feat-context-assemble-investigator-conte ([3490fd9](https://github.com/mctlhq/mctl-agents/commit/3490fd9a66a82c328ddbc3e2e5b54f77ba5f0eb7))
+* **agents:** issue-334-feat-lifecycle-adopt-proposal-less-same ([c6b7df7](https://github.com/mctlhq/mctl-agents/commit/c6b7df7b333791a18bfa758d9fa3135842b87224))
+* **agents:** issue-410-implementer-admission-must-reject-accept ([231c824](https://github.com/mctlhq/mctl-agents/commit/231c824504a32d0f54592bb56fa354cb088d540b))
+* **agents:** issue-411-fix-shepherd-feed-failing-required-pr-ch ([44af8fb](https://github.com/mctlhq/mctl-agents/commit/44af8fb28bc023c28995da1d32a2a482fe8ef660))
+* **agents:** reject accepted proposals with a closed source issue ([5bff7d3](https://github.com/mctlhq/mctl-agents/commit/5bff7d3ed94c7a6b7072fdfffc4d183630a84311))
+* **shepherd:** adopt proposal-less same-repo PRs with blocking reviews ([cedf6ca](https://github.com/mctlhq/mctl-agents/commit/cedf6ca768b1100239661271c4cb5e03d011ba7d))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([e909f37](https://github.com/mctlhq/mctl-agents/commit/e909f37a6f4c8e19bdca3f5ebb7ba609c7320aa0))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([319c442](https://github.com/mctlhq/mctl-agents/commit/319c442051e1a5aaebfea1ccceba7dae0986eba2))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([aaa2542](https://github.com/mctlhq/mctl-agents/commit/aaa2542cedc2fc2ff1570d37b572dea7469ed260))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([c9f6abc](https://github.com/mctlhq/mctl-agents/commit/c9f6abc01d2a0c24f3bf60e6d74e1a12dcaf0c62))
+* **agents:** address P1/P2 codex findings on issue-334-feat-lifecycle-adopt-proposal-less-same ([b822f63](https://github.com/mctlhq/mctl-agents/commit/b822f63e157936948d9c557ffb7679919e4151b6))
+* **agents:** address P1/P2 codex findings on issue-410-implementer-admission-must-reject-accept ([1af2023](https://github.com/mctlhq/mctl-agents/commit/1af2023b8c6bfa3c0982d0f695d2da418358a165))
+* **agents:** address P1/P2 codex findings on issue-410-implementer-admission-must-reject-accept ([1a58747](https://github.com/mctlhq/mctl-agents/commit/1a5874740221db44ec3cafc847fd8f5ac61c8025))
+* **agents:** address P1/P2 codex findings on issue-410-implementer-admission-must-reject-accept ([036ffca](https://github.com/mctlhq/mctl-agents/commit/036ffcab083e6b9c3e55e458f185691779b195bb))
+* **agents:** address P1/P2 codex findings on issue-411-fix-shepherd-feed-failing-required-pr-ch ([4d59b7c](https://github.com/mctlhq/mctl-agents/commit/4d59b7cf7012a0cf724ddb62b967ba10e50f485e))
+* **agents:** address P1/P2 codex findings on issue-411-fix-shepherd-feed-failing-required-pr-ch ([bf510f7](https://github.com/mctlhq/mctl-agents/commit/bf510f797f314659111ce73281cf83136af68c47))
+* **agents:** address P1/P2 codex findings on issue-411-fix-shepherd-feed-failing-required-pr-ch ([d0d4072](https://github.com/mctlhq/mctl-agents/commit/d0d4072798dc7280c2546fc044ecf482a9fd55fd))
+* **agents:** feed failing required PR checks into shepherd remediation ([72123d1](https://github.com/mctlhq/mctl-agents/commit/72123d1a81b178ec77b76129ee6c7e0c6b3e79de))
+* **implementer:** frame the follow-up prompt around what the bundle holds ([a8bcc3b](https://github.com/mctlhq/mctl-agents/commit/a8bcc3b87f75b1f67dba2bb6775c75e3ecd59fb0)), closes [#411](https://github.com/mctlhq/mctl-agents/issues/411)
+* **shepherd:** close the carried CI-probe review findings on [#411](https://github.com/mctlhq/mctl-agents/issues/411) ([16f4118](https://github.com/mctlhq/mctl-agents/commit/16f411815906228856a85d47d8be87e3d31375c5))
+
 ## [1.48.0](https://github.com/mctlhq/mctl-agents/compare/1.47.0...1.48.0) (2026-09-19)
 
 

@@ -54,9 +54,10 @@ def test_valid_marker_yields_the_reason(repo) -> None:
         "refused": True,
         "reason": "Finding 2 is out of scope by explicit operator decision.",
     })
-    assert run_implementer._read_refusal_marker(repo) == (
+    assert run_implementer._read_refusal_marker(repo).reason == (
         "Finding 2 is out of scope by explicit operator decision."
     )
+    assert run_implementer._read_refusal_marker(repo).insufficient_evidence is False
 
 
 def test_no_marker_is_not_a_refusal(repo) -> None:
@@ -98,11 +99,34 @@ def test_a_committed_marker_is_ignored(repo) -> None:
 
 def test_reason_is_normalised_and_bounded(repo) -> None:
     _write_marker(repo, {"refused": True, "reason": "a\n\n  b\t c " + "x" * 5000})
-    reason = run_implementer._read_refusal_marker(repo)
-    assert reason is not None
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker is not None
+    reason = marker.reason
     assert reason.startswith("a b c ")
     assert "\n" not in reason
     assert len(reason) == run_implementer.MAX_REFUSAL_REASON_CHARS
+
+
+def test_insufficient_evidence_flag_is_carried_on_the_marker(repo) -> None:
+    """mctl-agents#423: `insufficient_evidence: true` distinguishes "the
+    bounded CI-log evidence cannot support a code decision" from an ordinary
+    refusal — both share the same marker shape and validation."""
+    _write_marker(repo, {
+        "refused": True,
+        "insufficient_evidence": True,
+        "reason": "the excerpt does not show which assertion failed",
+    })
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker.insufficient_evidence is True
+    assert marker.reason == "the excerpt does not show which assertion failed"
+
+
+def test_insufficient_evidence_defaults_to_false(repo) -> None:
+    """An ordinary refusal marker (no `insufficient_evidence` key at all,
+    every pre-#423 marker) must not be misread as evidence-insufficient."""
+    _write_marker(repo, {"refused": True, "reason": "already fixed on this head"})
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker.insufficient_evidence is False
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +136,20 @@ def test_refusal_error_maps_to_47() -> None:
     assert run_implementer._review_feedback_exit_code(
         f"{run_implementer.REFUSAL_ERROR_PREFIX} operator said no"
     ) == run_implementer.EXIT_DELIBERATE_NO_OP
+
+
+def test_ci_evidence_insufficient_error_maps_to_50() -> None:
+    """mctl-agents#423: the dedicated bounded sentinel, distinct from 47."""
+    assert run_implementer._review_feedback_exit_code(
+        f"{run_implementer.CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} cannot tell from this excerpt"
+    ) == run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT
+    assert run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT == 50
+    assert run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT not in {
+        run_implementer.EXIT_DELIBERATE_NO_OP,
+        run_implementer.EXIT_ORPHANED_SUBAGENT,
+        run_implementer.EXIT_FENCED,
+        run_implementer.EXIT_CLAIM_REFUSED,
+    }
 
 
 def test_existing_sentinels_are_unchanged() -> None:
@@ -325,7 +363,7 @@ def test_excluded_marker_survives_git_add_dash_a(repo) -> None:
     assert "src.txt" in staged
     assert run_implementer.REFUSAL_MARKER_FILENAME not in staged
     # ... and the marker is therefore still honoured on the next run.
-    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert run_implementer._read_refusal_marker(repo).reason == "r"
 
 
 def test_staging_is_idempotent(repo) -> None:
@@ -404,7 +442,7 @@ def test_exit_one_is_still_honoured_as_untracked(repo, monkeypatch) -> None:
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(run_implementer, "_run", fake_run)
-    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert run_implementer._read_refusal_marker(repo).reason == "r"
 
 
 def test_subagent_definitions_exclude_the_blocked_case() -> None:
@@ -469,7 +507,7 @@ def test_the_read_itself_is_bounded(repo, monkeypatch) -> None:
         return _CountingHandle(real_open(self, *a, **kw))
 
     monkeypatch.setattr(Path, "open", counting_open)
-    assert run_implementer._read_refusal_marker(repo) == "r"
+    assert run_implementer._read_refusal_marker(repo).reason == "r"
     assert requested == [cap + 1], (
         "the marker must be read with an explicit bound, never to EOF"
     )
@@ -518,7 +556,7 @@ def test_a_marker_at_the_cap_is_still_honoured(repo) -> None:
     path.write_text(padded, encoding="utf-8")
     assert path.stat().st_size == run_implementer.MAX_REFUSAL_MARKER_BYTES
 
-    assert run_implementer._read_refusal_marker(repo) == "operator decision"
+    assert run_implementer._read_refusal_marker(repo).reason == "operator decision"
 
 
 def _deeply_nested_marker(repo: Path, depth: int = 20_000) -> Path:
@@ -618,6 +656,57 @@ def test_a_failing_refusal_write_still_exits_47(tmp_path, monkeypatch) -> None:
     assert exc.value.code == run_implementer.EXIT_DELIBERATE_NO_OP
 
 
+def test_main_writes_refusal_out_and_exits_50_on_insufficient_ci_evidence(
+    tmp_path, monkeypatch,
+) -> None:
+    """mctl-agents#423 fix-forward: end-to-end `insufficient_evidence` path.
+
+    `RefusalMarker(insufficient_evidence=True)` -> `ImplementResult.error`
+    prefixed with `CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX` -> `main()` maps it
+    to exit 50 AND writes the stripped reason to `--refusal-out`. The pieces
+    were each unit-tested individually; this pins them wired together, since
+    that wiring is exactly what regressed once before (see the P2 note on
+    the `EXIT_CI_EVIDENCE_INSUFFICIENT` branch above).
+    """
+    ref = _ref(tmp_path)
+    bundle = tmp_path / "feedback.json"
+    bundle.write_text("{}", encoding="utf-8")
+    refusal_out = tmp_path / "refusal.json"
+
+    monkeypatch.setattr("sys.argv", [
+        "run_implementer.py",
+        "--service", "mctl-web",
+        "--slug", "test-slug",
+        "--state-dir", str(tmp_path),
+        "--review-feedback", str(bundle),
+        "--refusal-out", str(refusal_out),
+    ])
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(run_implementer, "_load_review_feedback", lambda _p: {})
+    monkeypatch.setattr(
+        run_implementer, "find_accepted_proposals", lambda *_a, **_kw: [ref],
+    )
+    monkeypatch.setattr(
+        run_implementer, "review_feedback_one",
+        lambda *_a, **_kw: run_implementer.ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=(
+                f"{run_implementer.CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} "
+                "bounded excerpt does not show the failing assertion"
+            ),
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        run_implementer.main()
+
+    assert exc.value.code == run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT
+    assert exc.value.code == 50
+    written = json.loads(refusal_out.read_text(encoding="utf-8"))
+    assert written["reason"] == "bounded excerpt does not show the failing assertion"
+
+
 def test_a_missing_git_binary_is_not_a_refusal(repo, monkeypatch) -> None:
     """`FileNotFoundError` from a missing binary is not a return code.
 
@@ -657,3 +746,188 @@ def test_a_slow_ls_files_is_not_a_refusal_either(repo, monkeypatch) -> None:
 
     monkeypatch.setattr(run_implementer, "_run", slow)
     assert run_implementer._read_refusal_marker(repo) is None
+
+
+# ---------------------------------------------------------------------------
+# Verification-budget-exhausted (mctl-agents#430) — exit 51
+# ---------------------------------------------------------------------------
+def test_verification_budget_exhausted_flag_is_carried_on_the_marker(repo) -> None:
+    _write_marker(repo, {
+        "refused": True,
+        "verification_budget_exhausted": True,
+        "reason": "go test was still running when the budget ran out",
+    })
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker.verification_budget_exhausted is True
+    assert marker.reason == "go test was still running when the budget ran out"
+
+
+def test_verification_budget_exhausted_defaults_to_false(repo) -> None:
+    _write_marker(repo, {"refused": True, "reason": "already fixed on this head"})
+    marker = run_implementer._read_refusal_marker(repo)
+    assert marker.verification_budget_exhausted is False
+
+
+def test_verification_budget_exhausted_error_maps_to_51() -> None:
+    assert run_implementer._review_feedback_exit_code(
+        f"{run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} clamped=1; denied_exhausted=1"
+    ) == run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED
+    assert run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED == 51
+    assert run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED not in {
+        run_implementer.EXIT_DELIBERATE_NO_OP,
+        run_implementer.EXIT_ORPHANED_SUBAGENT,
+        run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
+        run_implementer.EXIT_FENCED,
+        run_implementer.EXIT_CLAIM_REFUSED,
+    }
+
+
+def test_no_commits_with_budget_exhausted_marker_maps_to_51(repo, monkeypatch) -> None:
+    _stub_review_feedback(monkeypatch, repo)
+    _write_marker(repo, {
+        "refused": True,
+        "verification_budget_exhausted": True,
+        "reason": "test suite did not finish in the remaining budget",
+    })
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
+    assert "test suite did not finish" in result.error
+    assert run_implementer._review_feedback_exit_code(result.error) == 51
+
+
+def test_no_commits_with_an_exhausted_ledger_and_no_marker_maps_to_51(repo, monkeypatch) -> None:
+    """The ORCHESTRATOR-derived ledger, not model prose: the deadline guard
+    observed the budget run out and the agent never got (or never wrote) a
+    marker at all."""
+    _stub_review_feedback(monkeypatch, repo)
+
+    def fake_anyio_run(func, *args, **kwargs):
+        # Simulate the deadline guard recording an exhausted command budget
+        # on the ledger `review_feedback_one` created before this call.
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    monkeypatch.setattr(run_implementer.anyio, "run", fake_anyio_run)
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
+    assert run_implementer._review_feedback_exit_code(result.error) == 51
+    assert result.budget_ledger is not None
+    assert result.budget_ledger.exhausted is True
+
+
+def test_an_exhausted_ledger_beats_a_marker_that_omitted_the_flag(repo, monkeypatch) -> None:
+    """Structured orchestrator evidence outranks model prose.
+
+    The agent stopped and wrote a refusal marker but left
+    `verification_budget_exhausted` unset, while the deadline guard's ledger
+    recorded the budget running out. Falling through to the generic refusal
+    would map this to EXIT_DELIBERATE_NO_OP (47), which the shepherd charges
+    to `review_attempts` as a decision on the merits -- charging the proposal
+    for a fact about the runner because a model omitted an optional boolean
+    (agy P2 on `624a433`)."""
+    _stub_review_feedback(monkeypatch, repo)
+    _write_marker(repo, {"refused": True, "reason": "ran out of command budget"})
+
+    def fake_anyio_run(func, *args, **kwargs):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    monkeypatch.setattr(run_implementer.anyio, "run", fake_anyio_run)
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX)
+    assert run_implementer._review_feedback_exit_code(result.error) == 51
+    # The agent's own reason is preserved, not discarded for the ledger's.
+    assert "ran out of command budget" in result.error
+    assert "denied_exhausted=1" in result.error
+    assert result.budget_ledger is not None
+
+
+def test_a_plain_refusal_without_an_exhausted_ledger_is_still_a_merits_no_op(
+    repo, monkeypatch
+) -> None:
+    """The override is scoped to an EXHAUSTED ledger. An ordinary refusal on
+    the merits stays exit 47 and stays charged."""
+    _stub_review_feedback(monkeypatch, repo)
+    _write_marker(repo, {"refused": True, "reason": "the requested change is wrong"})
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert result.error.startswith(run_implementer.REFUSAL_ERROR_PREFIX)
+    assert run_implementer._review_feedback_exit_code(result.error) == run_implementer.EXIT_DELIBERATE_NO_OP
+
+
+def test_a_commit_beats_an_exhausted_ledger(repo, monkeypatch) -> None:
+    """A commit is the outcome, even if some verification was cut short
+    along the way (EARS: 'a run ends with new commits ... push and exit OK
+    even if some verification was cut short')."""
+    _stub_review_feedback(monkeypatch, repo)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_push_followup", lambda *_a, **_kw: None)
+    monkeypatch.setattr(run_implementer, "_load_status", lambda *_a: {"pr": "https://pr"})
+
+    def fake_anyio_run(func, *args, **kwargs):
+        func.keywords["budget_ledger"].record_denied_exhausted("go test ./...")
+        return None
+
+    monkeypatch.setattr(run_implementer.anyio, "run", fake_anyio_run)
+
+    result = run_implementer.review_feedback_one(_ref(repo), {"summaries": []})
+
+    assert result.error is None
+    assert result.pr_url == "https://pr"
+
+
+def test_main_writes_the_ledger_summary_json_and_exits_51(tmp_path, monkeypatch) -> None:
+    ref = _ref(tmp_path)
+    bundle = tmp_path / "feedback.json"
+    bundle.write_text("{}", encoding="utf-8")
+    out = tmp_path / "refusal.json"
+
+    ledger = run_implementer.CommandBudgetLedger()
+    ledger.record_denied_exhausted("go test -race ./...")
+
+    monkeypatch.setattr("sys.argv", [
+        "run_implementer.py",
+        "--service", "mctl-web",
+        "--slug", "test-slug",
+        "--state-dir", str(tmp_path),
+        "--review-feedback", str(bundle),
+        "--refusal-out", str(out),
+    ])
+    monkeypatch.setattr(run_implementer, "ensure_auth_for_sdk", lambda: None)
+    monkeypatch.setattr(run_implementer, "_load_review_feedback", lambda _p: {})
+    monkeypatch.setattr(
+        run_implementer, "find_accepted_proposals", lambda *_a, **_kw: [ref],
+    )
+    monkeypatch.setattr(
+        run_implementer, "review_feedback_one",
+        lambda *_a, **_kw: run_implementer.ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=(
+                f"{run_implementer.VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} "
+                "the test suite could not finish"
+            ),
+            budget_ledger=ledger,
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        run_implementer.main()
+
+    assert exc.value.code == run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED
+    payload = json.loads(out.read_text(encoding="utf-8"))
+    assert payload["refused"] is True
+    assert payload["verification_budget_exhausted"] is True
+    assert payload["denied_exhausted"] == 1
+    assert payload["reason"] == "the test suite could not finish"

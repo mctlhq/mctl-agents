@@ -189,6 +189,94 @@ def test_prepatch_histories_predate_the_exec_queue_flip(scenario: Scenario) -> N
     )
 
 
+def test_dev_loop_prepatch_history_predates_the_stale_issue_gate() -> None:
+    """mctl-agents#410: `dev_loop_full.prepatch.json` is also the fixture
+    proving `workflow.patched("stale-issue-admission")` guards correctly.
+
+    Recorded long before this change, its history carries no marker for the
+    new patch id -- so `test_recorded_history_replays_against_current_definitions`
+    replaying it clean (above, parametrized over every scenario) is exactly
+    the "old history takes the legacy branch" guarantee task 8 asks for: the
+    new `get_issue_state` command never gets scheduled against this history,
+    or replay would have raised NondeterminismError.
+    """
+    scenario = scenario_by_name("dev_loop_full")
+    events = _events(scenario)
+    assert "stale-issue-admission" not in _patch_ids(events), (
+        f"{scenario.path.name} records the stale-issue-admission patch, so "
+        "it no longer exercises the unpatched branch this test is about. "
+        "Restore it from git rather than re-recording."
+    )
+    assert not any(
+        name == "get_issue_state" for name, _queue in _scheduled_activities(events)
+    ), (
+        f"{scenario.path.name} schedules get_issue_state -- a pre-patch "
+        "history must not, or it was recorded after this change landed."
+    )
+
+
+def test_prepatch_history_predates_the_approval_watch() -> None:
+    """mctl-agents#420: both recorded `dev_loop_full` histories predate the
+    `approval-watch` marker, so `test_recorded_history_replays_against_current_definitions`
+    / `test_patched_history_replays_against_current_definitions` replaying
+    them clean (parametrized over every scenario, above and below) is the
+    "old history takes the legacy branch" guarantee for this change too: the
+    bounded poll loop is never scheduled against either recording, or replay
+    would have raised NondeterminismError.
+
+    Both fixtures, not just the prepatch one: neither predates
+    `approval-watch`'s existence by definition (this repo has no history that
+    postdates it yet), so both are equally the "old history" this marker must
+    not wedge.
+    """
+    scenario = scenario_by_name("dev_loop_full")
+    for events, name in (
+        (_events(scenario), scenario.path.name),
+        (_events_at(scenario.patched_path), scenario.patched_path.name),
+    ):
+        assert "approval-watch" not in _patch_ids(events), (
+            f"{name} records the approval-watch patch, so it no longer "
+            "exercises the unpatched branch this test is about. Restore it "
+            "from git rather than re-recording."
+        )
+
+
+async def test_parked_history_replays_against_current_definitions() -> None:
+    """mctl-agents#420 (task 4): does `approval-watch` reach an execution
+    that is ALREADY parked at the unbounded wait when a worker picks it back
+    up? `dev_loop_parked.json` (see `_STANDALONE_FIXTURES` above for how it
+    was recorded) is a genuine history of exactly that shape: investigate
+    succeeded, approve was never signalled, and the recording stops at the
+    bare `await workflow.wait_condition(lambda: self._approved)` -- no
+    timeout, so no timer command, so the last recorded workflow task carries
+    no commands at all.
+
+    This assertion confirms that `dev_loop_parked.json` replays clean against
+    current definitions: because `workflow.patched(id)` is
+    `not is_replaying or id in patches_notified`, replaying this unpatched
+    history has `is_replaying=True` with no `"approval-watch"` marker, so
+    `patched("approval-watch")` returns False and takes the legacy branch.
+    No timer is scheduled during replay, guaranteeing that unpatched
+    histories remain byte-compatible without nondeterminism.
+
+    The practical consequence for operators: a live execution already
+    parked at the unbounded `wait_condition` has no pending timer or activity,
+    so deploying this change will not cause a worker to spontaneously re-enter
+    `run()` and pick up the bounded poll loop. `abandon` (task 1) is not
+    just a fallback — it is the explicit mechanism that moves such an execution
+    (delivering the signal schedules a workflow task, replay takes the legacy
+    branch, and the wait condition observes `_abandoned`).
+    """
+    from tests.replay_scenarios import HISTORY_DIR
+
+    history = WorkflowHistory.from_json(
+        "replay-dev_loop_parked",
+        (HISTORY_DIR / "dev_loop_parked.json").read_text(encoding="utf-8"),
+    )
+    workflows = scenario_by_name("dev_loop_full").workflows
+    await Replayer(workflows=workflows).replay_workflow(history)
+
+
 @pytest.mark.parametrize("scenario", SCENARIOS, ids=_IDS)
 async def test_patched_history_replays_against_current_definitions(
     scenario: Scenario,
@@ -361,6 +449,30 @@ def test_every_history_actually_reaches_submit_and_wait(scenario: Scenario) -> N
     )
 
 
+# Fixtures replayed directly by tests/test_implement_sweep_replay.py rather
+# than through the SCENARIOS/prepatch/patched machinery above: #412's
+# ImplementSweepWorkflow has no exec-queue migration to be "prepatch" or
+# "patched" ABOUT (see that file's module docstring for why forcing it into
+# a Scenario fails two of the generic assertions here for reasons that are
+# true of the workflow by design). Named here too so this orphan-fixture
+# guard does not fire against coverage that exists, just not through this
+# module's own abstraction.
+#
+# dev_loop_parked.json (mctl-agents#420, task 4): also standalone, and for a
+# similar reason -- there is no "prepatch"/"patched" pair here either, only
+# ONE recording. It predates `approval-watch` entirely (recorded from a
+# checkout of the code as it stood immediately before this change, via
+# `git stash` + `tools/record_workflow_history.py`'s own recording path
+# reused by hand -- see the module docstring below `test_replayer_...`
+# functions for what this fixture is and is not evidence of), and ends at
+# the bare `await workflow.wait_condition(lambda: self._approved)` with no
+# timeout and therefore no timer command: `investigate` succeeded, `approve`
+# was never signalled, and the recording stops there. Unlike the SCENARIOS
+# fixtures it is never re-recorded going forward -- once `approval-watch`
+# ships, no code checkout can produce this shape again.
+_STANDALONE_FIXTURES = {"implement_sweep.json", "swept_implement.json", "dev_loop_parked.json"}
+
+
 def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     """An orphan fixture is a fixture nothing replays.
 
@@ -370,6 +482,10 @@ def test_every_recorded_fixture_belongs_to_a_scenario() -> None:
     from tests.replay_scenarios import HISTORY_DIR
 
     on_disk = {p.name for p in Path(HISTORY_DIR).glob("*.json")}
-    expected = {s.path.name for s in SCENARIOS} | {s.patched_path.name for s in SCENARIOS}
+    expected = (
+        {s.path.name for s in SCENARIOS}
+        | {s.patched_path.name for s in SCENARIOS}
+        | _STANDALONE_FIXTURES
+    )
     assert on_disk == expected
 

@@ -824,10 +824,18 @@ def test_the_review_lease_always_outlives_the_run_it_covers(
 ) -> None:
     """Nothing renews a claim mid-run, so a lease shorter than the run's own
     timeouts guarantees a CLAIM_UNCLAIMED refusal at the push site. The floor
-    holds for the default timeouts; a raised IMPLEMENTER_TIMEOUT_SECONDS must
-    widen the lease rather than silently outgrow it."""
+    holds for the default timeouts; a raised IMPLEMENTER_TIMEOUT_CEILING_SECONDS
+    must widen the lease rather than silently outgrow it.
+
+    mctl-agents#423: the lease is derived from the CEILING, not from
+    IMPLEMENTER_TIMEOUT_SECONDS alone — a CI-remediation or mixed follow-up
+    can widen its own envelope up to the ceiling before its work class is
+    even known (the claim is acquired before the bundle's work class is
+    derived), so the lease has to cover the widest envelope any class could
+    select, unconditionally.
+    """
     assert run_implementer._review_claim_lease_default() >= run_implementer.REVIEW_CLAIM_LEASE_FLOOR
-    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 7200.0)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", 7200.0)
     monkeypatch.setattr(run_implementer, "IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", 300.0)
     widened = run_implementer._review_claim_lease_default()
     assert widened.total_seconds() >= 7200.0

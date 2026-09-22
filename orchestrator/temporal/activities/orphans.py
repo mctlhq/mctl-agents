@@ -79,24 +79,36 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
     )
 
 
-def _expected_workflow_id(slug: str, repo: str | None, service: str) -> str | None:
+def expected_dev_loop_id(slug: str, repo: str | None, service: str) -> str | None:
     """The DevLoop workflow ID this proposal would have, if it has one.
 
     Real IDs are dev-loop-{owner}-{repo}-{issue-number} (start.py's
     workflow_id_for), NOT ...-{slug}: the old slug-based reconstruction
     matched nothing, so every actionable proposal was reported as an orphan
     (#151). Slugs without an issue-<N>- prefix (incident-*, pre-Temporal)
-    never had a DevLoop, so no active-ID check applies to them.
+    never had a DevLoop, so no active-ID check applies to them — which is
+    also why the implement-sweep (mctl-agents#412) can pick up the incident
+    responder's auto-accepted proposals: they are never "owned" by this
+    check.
 
     The owner comes from the PR rather than a hardcoded "mctlhq":
     parse_issue_url only admits mctlhq issues today, but deriving it keeps
     the comparison correct if that ever widens (agy P2 on PR #212).
+
+    Public (promoted from `_expected_workflow_id` for #412) because
+    `stranded.py` needs the exact same reconstruction the orphan sweep uses;
+    `_expected_workflow_id` stays as an alias for `lifecycle_reconcile.py`'s
+    existing import.
     """
     m = re.match(r"issue-(\d+)-", slug)
     if not m:
         return None
     owner = repo.split("/")[0] if repo and "/" in repo else "mctlhq"
     return f"dev-loop-{owner}-{service}-{m.group(1)}"
+
+
+# Back-compat alias — see expected_dev_loop_id's docstring.
+_expected_workflow_id = expected_dev_loop_id
 
 
 async def _detect_from_github(active_ids: set[str]) -> OrphanDetectionResult:

@@ -25,7 +25,7 @@ sequenceDiagram
     alt investigate не Succeeded
         T-->>OP: DevLoopResult(implement=None)
     else Succeeded
-        Note over T,R: await workflow.wait_condition(approved) —<br/>durable-ожидание, может длиться днями
+        Note over T,R: await workflow.wait_condition(approved or abandoned) —<br/>durable-ожидание, но bounded (#420):<br/>опрос issue каждые 6ч, истекает через 14д
         OP->>T: signal approve({approver}?)
         T->>T: find_proposal_slug(repo, N) → slug issue-N-*<br/>(нет слага → non-retryable fail)
         T->>S: submit_and_wait("mctl-agents-approve", {service, slug, approver})
