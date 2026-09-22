@@ -41,6 +41,7 @@ from orchestrator.context_snapshot import (
     RetentionPolicy,
     Selection,
     Trust,
+    WorkContextRef,
     canonical_json,
     hash_bytes,
     seal,
@@ -658,6 +659,7 @@ def assemble(
     *,
     mode: str,
     execution: ExecutionCorrelation,
+    work_context: WorkContextRef | None = None,
 ) -> AssemblyResult:
     """Runs every collector, the deterministic pipeline, and `seal()`.
     Sealing the same inputs twice at two different `created_at` values
@@ -712,6 +714,7 @@ def assemble(
         budget=budget,
         retention=retention,
         created_at=_iso(assembly_input.now),
+        work_context=work_context,
         sources=sources,
         evidence_refs=(),
     )
@@ -762,6 +765,7 @@ def assemble_investigator_context(
     argo_workflow_name: str | None = None,
     config: AssemblyConfig | None = None,
     now: datetime | None = None,
+    work_context: WorkContextRef | None = None,
 ) -> AssemblyResult | None:
     """The feature-gated entry point `run_issue_investigator.investigate()`
     calls. Returns `None` when `mode == "off"` — no collector runs, no
@@ -794,4 +798,4 @@ def assemble_investigator_context(
         now=resolved_now,
         config=resolved_config,
     )
-    return assemble(assembly_input, mode=mode, execution=execution)
+    return assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)

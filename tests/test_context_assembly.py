@@ -576,3 +576,26 @@ def test_module_does_not_import_a_policy_or_permission_symbol():
         if stripped.startswith("import ") or stripped.startswith("from "):
             assert "policy" not in stripped.lower()
             assert "permission" not in stripped.lower()
+
+
+# ---------------------------------------------------------------------------
+# #408 round 2 — work_context threads through assemble() into the sealed
+# snapshot (the producer-side join the round-1 finding was about).
+# ---------------------------------------------------------------------------
+def test_assemble_threads_work_context_into_the_sealed_snapshot(tmp_path):
+    wc = cs.WorkContextRef(
+        work_item_id="wi-1",
+        work_item_revision="r1",
+        execution_id="e2",
+        execution_sequence=2,
+        prior_execution_ids=("e1",),
+        current_surface="telegram",
+        actor_kind="human",
+        actor_id="carol",
+    )
+    assembly_input = _assembly_input(tmp_path)
+    with_wc = ca.assemble(assembly_input, mode="shadow", execution=_execution(), work_context=wc)
+    without = ca.assemble(assembly_input, mode="shadow", execution=_execution())
+    assert with_wc.snapshot.work_context == wc
+    assert without.snapshot.work_context is None
+    assert with_wc.snapshot.snapshot_id != without.snapshot.snapshot_id
