@@ -956,6 +956,35 @@ def test_check_service_skills_limits_passes_within_ceiling(tmp_path, monkeypatch
     assert check_service_skills_limits({"x": within_ceiling}) == []
 
 
+def test_check_service_skills_limits_total_compares_against_total_ceiling_only(tmp_path, monkeypatch) -> None:
+    """Regression (agy P2 on #407): maxTotalBytes must never be compared
+    against the per-skill ceiling -- the default-shaped policy (total 96 KiB >
+    per-skill 32 KiB) is legal whenever it is within maxServiceTotalBytes,
+    and only a configured maxServiceTotalBytes can flag it."""
+    policy_path = tmp_path / "agent-platform" / "policy.yaml"
+    policy_path.parent.mkdir(parents=True)
+    policy_path.write_text(yaml.safe_dump({
+        "spec": {"limits": {
+            "maxServiceSkillBytes": 32 * 1024,
+            "maxServiceTotalBytes": 96 * 1024,
+        }}
+    }))
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_POLICY_PATH", policy_path)
+
+    default_shaped = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True),  # 32 KiB / 96 KiB defaults
+    )
+    assert check_service_skills_limits({"x": default_shaped}) == []
+
+    over_total = dataclasses.replace(
+        next(iter(MANIFESTS.values())),
+        service_skills=ServiceSkillPolicy(enabled=True, max_total_bytes=97 * 1024),
+    )
+    errors = check_service_skills_limits({"x": over_total})
+    assert any("maxServiceTotalBytes" in e for e in errors), errors
+
+
 def test_check_service_skills_limits_no_op_when_ceilings_not_yet_configured(tmp_path, monkeypatch) -> None:
     """policy.yaml exists but has no limits.maxServiceSkills*  keys yet
     (mctlhq/mctl-agents#305 tasks.md task 16 is a separate, not-yet-landed

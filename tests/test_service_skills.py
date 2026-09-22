@@ -662,6 +662,58 @@ def test_non_skill_md_file_in_skill_directory_rejected(tmp_path):
         )
 
 
+def test_nested_rogue_file_in_skill_subdirectory_rejected(tmp_path):
+    """R12 containment is full-prefix, not immediate-parent: a rogue file
+    nested one directory deeper inside a declared skill's directory still
+    rejects the bundle."""
+    repo = _init_repo(tmp_path)
+    _write_manifest(repo, bindings={"implementer": ["a"]}, skills={"a": _skill_text("a")})
+    nested = repo / ".mctl" / "skills" / "a" / "sub"
+    nested.mkdir(parents=True)
+    (nested / "payload.sh").write_text("#!/bin/sh\necho hi\n")
+    sha = _commit_all(repo, "nested rogue file")
+    with pytest.raises(ServiceSkillError, match=r"SKILL\.md"):
+        resolve_bundle(
+            agent="implementer", repo_dir=repo, policy=_enabled_policy(), tool_allow=(),
+            pinned_sha=sha, known_agents=_KNOWN_AGENTS,
+        )
+
+
+def test_file_outside_declared_skill_directories_is_allowed(tmp_path):
+    """The other direction of R12: a file under the skills root but NOT
+    inside any DECLARED skill's directory does not reject the bundle --
+    only declared directories must be clean."""
+    repo = _init_repo(tmp_path)
+    _write_manifest(repo, bindings={"implementer": ["a"]}, skills={"a": _skill_text("a")})
+    undeclared = repo / ".mctl" / "skills" / "drafts"
+    undeclared.mkdir(parents=True)
+    (undeclared / "notes.md").write_text("scratch\n")
+    sha = _commit_all(repo, "undeclared sibling dir")
+    bundle = resolve_bundle(
+        agent="implementer", repo_dir=repo, policy=_enabled_policy(), tool_allow=(),
+        pinned_sha=sha, known_agents=_KNOWN_AGENTS,
+    )
+    assert [s.skill_id for s in bundle.skills] == ["a"]
+
+
+def test_oversized_manifest_rejected_before_parse(tmp_path):
+    """manifest.yaml itself is size-bounded before its bytes are read or
+    YAML-parsed, independent of the per-skill/total policy ceilings."""
+    repo = _init_repo(tmp_path)
+    _write_manifest(repo, bindings={"implementer": ["a"]}, skills={"a": _skill_text("a")})
+    manifest = repo / ".mctl" / "skills" / "manifest.yaml"
+    padding = "# " + "x" * 80 + "\n"
+    with manifest.open("a") as f:
+        for _ in range(service_skills.MAX_MANIFEST_BYTES // len(padding) + 2):
+            f.write(padding)
+    sha = _commit_all(repo, "oversized manifest")
+    with pytest.raises(ServiceSkillError, match=r"manifest\s+ceiling|exceeding the manifest"):
+        resolve_bundle(
+            agent="implementer", repo_dir=repo, policy=_enabled_policy(), tool_allow=(),
+            pinned_sha=sha, known_agents=_KNOWN_AGENTS,
+        )
+
+
 # ---------------------------------------------------------------------------
 # T10 — disabled/absent path
 # ---------------------------------------------------------------------------

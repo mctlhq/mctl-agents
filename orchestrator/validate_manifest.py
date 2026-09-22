@@ -798,6 +798,7 @@ def check_service_skills_limits(manifests: dict[str, AgentManifest]) -> list[str
         return []
     max_skills_ceiling = limits.get("maxServiceSkills")
     max_bytes_ceiling = limits.get("maxServiceSkillBytes")
+    max_total_ceiling = limits.get("maxServiceTotalBytes")
 
     errors: list[str] = []
     for manifest in sorted(manifests.values(), key=lambda m: m.name):
@@ -810,19 +811,23 @@ def check_service_skills_limits(manifests: dict[str, AgentManifest]) -> list[str
                 f"the platform ceiling limits.maxServiceSkills ({max_skills_ceiling}) in "
                 f"{GITOPS_POLICY_PATH}"
             )
-        if isinstance(max_bytes_ceiling, int):
-            if policy.max_skill_bytes > max_bytes_ceiling:
-                errors.append(
-                    f"{manifest.path}: spec.serviceSkills.maxSkillBytes ({policy.max_skill_bytes}) "
-                    f"exceeds the platform ceiling limits.maxServiceSkillBytes ({max_bytes_ceiling}) "
-                    f"in {GITOPS_POLICY_PATH}"
-                )
-            if policy.max_total_bytes > max_bytes_ceiling:
-                errors.append(
-                    f"{manifest.path}: spec.serviceSkills.maxTotalBytes ({policy.max_total_bytes}) "
-                    f"exceeds the platform ceiling limits.maxServiceSkillBytes ({max_bytes_ceiling}) "
-                    f"in {GITOPS_POLICY_PATH}"
-                )
+        if isinstance(max_bytes_ceiling, int) and policy.max_skill_bytes > max_bytes_ceiling:
+            errors.append(
+                f"{manifest.path}: spec.serviceSkills.maxSkillBytes ({policy.max_skill_bytes}) "
+                f"exceeds the platform ceiling limits.maxServiceSkillBytes ({max_bytes_ceiling}) "
+                f"in {GITOPS_POLICY_PATH}"
+            )
+        # The aggregate limit compares against its own aggregate ceiling,
+        # never against the per-skill one: maxTotalBytes (96 KiB default)
+        # legitimately exceeds maxServiceSkillBytes (32 KiB default) on
+        # every manifest, so comparing across the two would fail every
+        # enabled agent the moment the per-skill ceiling is configured.
+        if isinstance(max_total_ceiling, int) and policy.max_total_bytes > max_total_ceiling:
+            errors.append(
+                f"{manifest.path}: spec.serviceSkills.maxTotalBytes ({policy.max_total_bytes}) "
+                f"exceeds the platform ceiling limits.maxServiceTotalBytes ({max_total_ceiling}) "
+                f"in {GITOPS_POLICY_PATH}"
+            )
     return errors
 
 

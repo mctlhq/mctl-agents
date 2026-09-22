@@ -43,7 +43,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +55,11 @@ from orchestrator.proc import describe_output
 DEFAULT_ROOT = ".mctl/skills"
 SUPPORTED_API_VERSION = "agents.mctl.ai/v1alpha1"
 SUPPORTED_KIND = "ServiceSkillSet"
+
+# Ceiling on manifest.yaml itself, independent of the per-skill/total policy
+# ceilings: the manifest is read and YAML-parsed before any policy limit can
+# apply, so it needs its own bound.
+MAX_MANIFEST_BYTES = 64 * 1024
 
 # Git blob modes `git ls-tree` reports for a plain file. A symlink (120000)
 # or gitlink/submodule (160000) is rejected outright (R11) -- there is no
@@ -98,7 +103,7 @@ _FORGED_TAG_RE = re.compile(r"(?i)<[\s/]*service_skills(?![-\w])[^>\n]*>?")
 # `>`, whitespace or newlines, ever. Manifest keys already look like this in
 # every real declaration (`repo-testing`, `generated-files`), so this is not
 # a behavior change for well-formed manifests.
-_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?$")
+_SKILL_ID_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?\Z")
 
 _FRONT_MATTER_RE = re.compile(r"\A---[ \t]*\r?\n(.*?\r?\n)---[ \t]*\r?\n?", re.DOTALL)
 
@@ -503,6 +508,16 @@ def resolve_bundle(
             f"{manifest_path} at {pinned_sha} is not a regular file (git mode {entries[manifest_path]!r})"
         )
 
+    # Bound the manifest read on SIZE before materializing content, the same
+    # guard the skill bodies get below -- an oversized manifest.yaml (or a
+    # YAML alias bomb padded into one) must be rejected before its bytes
+    # enter this process, not after `yaml.safe_load` has expanded it.
+    manifest_size = _blob_size(repo_dir, pinned_sha, manifest_path, timeout=timeout)
+    if manifest_size > MAX_MANIFEST_BYTES:
+        raise ServiceSkillError(
+            f"{manifest_path} at {pinned_sha} is {manifest_size} bytes, exceeding the manifest "
+            f"ceiling of {MAX_MANIFEST_BYTES} bytes"
+        )
     manifest_bytes = _blob_bytes(repo_dir, pinned_sha, manifest_path, timeout=timeout)
     manifest_hash = _hash_bytes(manifest_bytes)
     try:
@@ -607,7 +622,14 @@ def resolve_bundle(
     for entry_path, entry_mode in entries.items():
         if entry_path == manifest_path or entry_path in declared_paths:
             continue
-        if posixpath.dirname(entry_path) in declared_dirs:
+        # Full-prefix containment, not just the immediate parent: a rogue
+        # file nested any number of subdirectories below a declared skill's
+        # directory is still inside it and rejects the bundle.
+        inside = any(
+            entry_path.startswith(f"{d}/") if d else "/" not in entry_path
+            for d in declared_dirs
+        )
+        if inside:
             raise ServiceSkillError(
                 f"{manifest_path}: {entry_path!r} (git mode {entry_mode!r}) sits inside a declared "
                 "skill directory but is not itself a declared SKILL.md (R12)"
@@ -702,7 +724,9 @@ def _cli_validate(argv: Sequence[str] | None = None) -> int:
         # currently-deployed policy for this agent happens to be.
         policy = agent_manifest.service_skills if agent_manifest else ServiceSkillPolicy(enabled=True)
         if not policy.enabled:
-            policy = ServiceSkillPolicy(enabled=True, root=policy.root)
+            # Preserve the manifest's own declared ceilings; only flip the
+            # enablement bit for validation purposes.
+            policy = replace(policy, enabled=True)
         tool_allow = agent_manifest.tool_allow if agent_manifest else ()
         try:
             bundle = resolve_bundle(
