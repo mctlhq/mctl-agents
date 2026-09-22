@@ -4279,3 +4279,79 @@ def test_write_status_yaml_default_degrades_on_a_broken_context_file(tmp_path, m
     published = yaml.safe_load(status_path.read_text())
     assert published["execution"]["agent"] == "issue-investigator"
     assert published["execution"]["context_id"].startswith("ex-")
+
+
+def test_canonical_issue_key_compares_identities_not_spellings():
+    """#408 round 4 (claude P3): the work-item/issue cross-check must not
+    refuse two spellings of the same issue — _ISSUE_URL_RE itself accepts
+    http:// and a trailing slash."""
+    key = run_issue_investigator._canonical_issue_key
+    canonical = key("https://github.com/mctlhq/mctl-telegram/issues/103")
+    assert key("https://github.com/mctlhq/mctl-telegram/issues/103/") == canonical
+    assert key("http://github.com/mctlhq/mctl-telegram/issues/103") == canonical
+    assert key("https://github.com/MCTLHQ/MCTL-Telegram/issues/103") == canonical
+    assert key("https://github.com/mctlhq/mctl-telegram/issues/104") != canonical
+    # Unparseable never silently equals a parseable one.
+    assert key("not-a-url") == "not-a-url"
+    assert key("not-a-url") != canonical
+
+
+def test_surface_transition_baseline_excludes_self_and_kindless_executions():
+    """#408 round 4 (claude/agy P3): the baseline must be the newest PRIOR
+    execution with a known kind — never this execution itself (the store
+    may already have recorded it), and never a kindless seed (dev_loop's
+    execution #1 carries no provenance to compare against)."""
+    from orchestrator.work_context.contract import (
+        ActorRef,
+        CanonicalState,
+        ExecutionRef,
+        SurfaceRef,
+        WorkItem,
+    )
+
+    canonical = CanonicalState(work_item_id="wi-1", state="in-progress")
+
+    def ref(item, execution_id="e-cur", *, surface=None, actor_kind=None, actor_id=None):
+        return run_issue_investigator._work_context_ref(
+            canonical=canonical, item=item, execution_id=execution_id,
+            resume_from_execution_id=None, surface=surface,
+            actor_kind=actor_kind, actor_id=actor_id,
+        )
+
+    # Self as last recorded execution: e2 IS this execution — the baseline
+    # is e1's github, so github→telegram alice→bob is a transition.
+    self_recorded = WorkItem(
+        work_item_id="wi-1", revision="r1", origin=SurfaceRef(kind="github"),
+        executions=(
+            ExecutionRef(execution_id="e1", sequence=1, surface=SurfaceRef(kind="github"),
+                         actor=ActorRef(kind="human", actor_id="alice")),
+            ExecutionRef(execution_id="e2", sequence=2, surface=SurfaceRef(kind="telegram"),
+                         actor=ActorRef(kind="human", actor_id="bob")),
+        ),
+    )
+    out = ref(self_recorded, execution_id="e2", surface="telegram", actor_kind="human", actor_id="bob")
+    assert out.surface_transition is True
+
+    # Kindless seed as last execution: falls through to e1's github — a
+    # telegram resume still counts as a transition instead of comparing
+    # against "".
+    kindless_last = WorkItem(
+        work_item_id="wi-1", revision="r1", origin=SurfaceRef(kind="github"),
+        executions=(
+            ExecutionRef(execution_id="e1", sequence=1, surface=SurfaceRef(kind="github")),
+            ExecutionRef(execution_id="e2", sequence=2),  # dev_loop seed shape
+        ),
+    )
+    out = ref(kindless_last, surface="telegram", actor_kind="human", actor_id="bob")
+    assert out.surface_transition is True
+    # And the same declared surface as the last KNOWN one is not one.
+    out = ref(kindless_last, surface="github")
+    assert out.surface_transition is False
+
+    # Only kindless executions recorded: origin is the fallback.
+    only_seed = WorkItem(
+        work_item_id="wi-1", revision="r1", origin=SurfaceRef(kind="github"),
+        executions=(ExecutionRef(execution_id="e1", sequence=1),),
+    )
+    out = ref(only_seed, surface="telegram")
+    assert out.surface_transition is True

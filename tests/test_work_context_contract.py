@@ -30,9 +30,13 @@ def test_surface_ref_round_trips_and_ignores_unknown_keys():
     assert ref == wc.SurfaceRef(kind="github", surface_id="mctlhq/x#1")
 
 
-def test_surface_ref_missing_kind_is_none():
-    assert wc.SurfaceRef.from_payload({"surface_id": "x"}) is None
+def test_surface_ref_kindless_block_is_absent_not_malformed():
+    # #408 round 4 (agy P2): a kindless block is an absent surface — a
+    # record serialized from a default SurfaceRef() — never a parse abort.
+    assert wc.SurfaceRef.from_payload({"surface_id": "x"}) == wc.SurfaceRef(surface_id="x")
+    assert wc.SurfaceRef.from_payload({"kind": ""}) == wc.SurfaceRef()
     assert wc.SurfaceRef.from_payload("not-a-dict") is None
+    assert wc.SurfaceRef.from_payload({"kind": 5}) is None
 
 
 def test_actor_ref_round_trips_and_ignores_unknown_keys():
@@ -40,8 +44,9 @@ def test_actor_ref_round_trips_and_ignores_unknown_keys():
     assert ref == wc.ActorRef(kind="human", actor_id="octocat")
 
 
-def test_actor_ref_missing_kind_is_none():
-    assert wc.ActorRef.from_payload({"actor_id": "octocat"}) is None
+def test_actor_ref_kindless_block_is_absent_not_malformed():
+    assert wc.ActorRef.from_payload({"actor_id": "octocat"}) == wc.ActorRef(actor_id="octocat")
+    assert wc.ActorRef.from_payload({"kind": 5}) is None
 
 
 def test_work_item_ref_round_trips_and_ignores_unknown_keys():
@@ -101,8 +106,10 @@ def test_execution_ref_tolerates_absent_surface_and_actor():
 
 
 def test_execution_ref_malformed_surface_is_none():
-    payload = _execution_payload(surface={"surface_id": "no-kind"})
-    assert wc.ExecutionRef.from_payload(payload) is None
+    # Kindless is tolerated (see above); MALFORMED — a non-dict block or a
+    # non-string kind — still refuses the record.
+    assert wc.ExecutionRef.from_payload(_execution_payload(surface={"kind": 5})) is None
+    assert wc.ExecutionRef.from_payload(_execution_payload(surface="github")) is None
 
 
 def _work_item_payload(**overrides):
@@ -404,3 +411,46 @@ def test_status_scalar_reads_single_and_double_quotes(tmp_path: Path):
         item = wc.WorkItem(work_item_id="wi-1", state="open")
         state = wc.reconstruct_canonical_state(item, proposal_dir, ())
         assert state.prior_status == "accepted", raw
+
+
+def test_kindless_surface_and_actor_blocks_parse_as_absent_not_malformed():
+    """#408 round 4 (agy P2): a record serialized from a default
+    SurfaceRef()/ActorRef() — dev_loop's own seed — arrives as
+    `{"kind": ""}` (or `{}`). That is a legitimately absent block, not a
+    malformed payload: one such execution must not abort the whole WorkItem
+    parse into WORK_ITEM_UNKNOWN."""
+    payload = {
+        "work_item_id": "wi-1",
+        "state": "open",
+        "executions": [
+            {"execution_id": "e1", "sequence": 1, "surface": {"kind": ""}, "actor": {}},
+        ],
+    }
+    item = wc.WorkItem.from_payload(payload)
+    assert item is not None
+    assert item.executions[0].surface == wc.SurfaceRef()
+    assert item.executions[0].actor == wc.ActorRef()
+    assert wc.work_item_verdict_for(item) == wc.WORK_ITEM_FOUND
+
+    # PRESENT but genuinely malformed still refuses the record.
+    for bad in ({"kind": 5}, "github", ["github"]):
+        assert wc.WorkItem.from_payload({**payload, "executions": [
+            {"execution_id": "e1", "sequence": 1, "surface": bad},
+        ]}) is None
+
+
+def test_out_of_vocabulary_origin_is_unknown_with_a_named_reason():
+    """#408 round 4 (agy P3): `origin.kind` seals as `origin_surface`, which
+    ContextSnapshot.validate() rejects out of vocabulary — so the verdict
+    must classify it UNKNOWN here instead of letting the seal crash at
+    context mode `on`. Empty origin stays FOUND (a work item predating the
+    field)."""
+    bad_origin = wc.WorkItem(
+        work_item_id="wi-1", state="open", origin=wc.SurfaceRef(kind="slack")
+    )
+    assert wc.work_item_verdict_for(bad_origin) == wc.WORK_ITEM_UNKNOWN
+    assert "slack" in wc.work_item_unknown_reason(bad_origin)
+    assert "origin" in wc.work_item_unknown_reason(bad_origin)
+
+    no_origin = wc.WorkItem(work_item_id="wi-1", state="open")
+    assert wc.work_item_verdict_for(no_origin) == wc.WORK_ITEM_FOUND

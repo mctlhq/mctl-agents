@@ -36,7 +36,6 @@ DEFAULT_TIMEOUT_S = 10
 # this clone (open question in requirements.md).
 ROUTES = {
     "get_work_item": "/api/v1/work-items/{id}",
-    "list_executions": "/api/v1/work-items/{id}/executions",
     "record_execution": "/api/v1/work-items/{id}/executions",
 }
 
@@ -134,12 +133,12 @@ class WorkItemClient:
             return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=str(exc))
         return answer_from(res.status, res.payload, path=res.status_path, body_empty=res.body_empty)
 
-    def list_executions(self, work_item_id: str) -> WorkItemAnswer:
-        try:
-            res = self._request("GET", ROUTES["list_executions"].format(id=_q(work_item_id)))
-        except WorkItemUnavailable as exc:
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=str(exc))
-        return answer_from(res.status, res.payload, path=res.status_path, body_empty=res.body_empty)
+    # No list_executions read: `GET .../executions` returns an execution
+    # LISTING, not a WorkItem envelope, so `answer_from` (which parses a
+    # WorkItem) is the wrong reader for it — and nothing in this repo
+    # consumes the route. The executions this repo needs arrive embedded in
+    # `get`'s WorkItem. Add a typed listing parser with the first real
+    # consumer instead of guessing mctl-api#227's response shape here.
 
     # -- writes -------------------------------------------------------------
 

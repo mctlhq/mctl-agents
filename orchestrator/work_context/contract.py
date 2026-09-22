@@ -77,7 +77,18 @@ class SurfaceRef:
         if not isinstance(data, dict):
             return None
         kind = data.get("kind")
-        if not isinstance(kind, str) or not kind:
+        if kind is None or kind == "":
+            # A kindless block is a legitimately ABSENT surface — an
+            # execution predating the field, or a record serialized from a
+            # default SurfaceRef() (dev_loop's own seed) — not a malformed
+            # payload. Returning None here would make one such execution
+            # abort the whole WorkItem parse into WORK_ITEM_UNKNOWN, the
+            # exact intolerance work_item_verdict_for's non-empty-only rule
+            # exists to avoid.
+            return SurfaceRef(
+                surface_id=_str(data.get("surface_id")), thread_ref=_str(data.get("thread_ref"))
+            )
+        if not isinstance(kind, str):
             return None
         return SurfaceRef(kind=kind, surface_id=_str(data.get("surface_id")), thread_ref=_str(data.get("thread_ref")))
 
@@ -95,7 +106,11 @@ class ActorRef:
         if not isinstance(data, dict):
             return None
         kind = data.get("kind")
-        if not isinstance(kind, str) or not kind:
+        if kind is None or kind == "":
+            # Same tolerance as SurfaceRef.from_payload: a kindless block is
+            # an absent actor, not a malformed payload.
+            return ActorRef(actor_id=_str(data.get("actor_id")))
+        if not isinstance(kind, str):
             return None
         return ActorRef(kind=kind, actor_id=_str(data.get("actor_id")))
 
@@ -244,6 +259,13 @@ def work_item_verdict_for(item: WorkItem) -> str:
     side."""
     if item.state not in WORK_ITEM_STATES:
         return WORK_ITEM_UNKNOWN
+    # `origin.kind` is held to the same vocabulary as execution surfaces:
+    # `_work_context_ref` seals it as `origin_surface`, which
+    # `ContextSnapshot.validate()` rejects when out of vocabulary — so an
+    # unrecognised origin must be classified here, not crash the seal at
+    # context mode `on`.
+    if item.origin.kind and item.origin.kind not in SURFACE_KINDS:
+        return WORK_ITEM_UNKNOWN
     # Only a NON-EMPTY kind can be out of vocabulary: `ExecutionRef.
     # from_payload` deliberately parses an absent surface/actor block into
     # `SurfaceRef()`/`ActorRef()` ("an execution predating this field, or
@@ -264,6 +286,8 @@ def work_item_unknown_reason(item: WorkItem) -> str:
     is pointed at the offending value, not at a valid state."""
     if item.state not in WORK_ITEM_STATES:
         return f"unrecognised work item state {item.state!r}"
+    if item.origin.kind and item.origin.kind not in SURFACE_KINDS:
+        return f"work item carries unrecognised origin surface kind {item.origin.kind!r}"
     for execution in item.executions:
         if execution.surface.kind and execution.surface.kind not in SURFACE_KINDS:
             return (

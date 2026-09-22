@@ -5679,3 +5679,82 @@ class TestMergeWatchContinueAsNew:
         assert claim.last_op == "terminal"
         assert claim.last_op_landed is True
         assert claim.epoch == 0, "_finish_claim zeroes the epoch once the claim is released"
+
+
+class TestWorkContextGapMerge:
+    """#408 round 4: `_rehydrate_work_context` on a bare instance — the gap
+    window between a hop decision and the continued run's rehydration,
+    where `resume` signals run against __init__'s empty state."""
+
+    def _carried(self) -> MergeWatchResume:
+        return MergeWatchResume(
+            work_item_id="wi-1",
+            executions=(
+                ExecutionRef(execution_id="e1", sequence=1, surface=SurfaceRef(kind="github")),
+            ),
+            seen_execution_ids=("e1",),
+            current_surface=SurfaceRef(kind="github"),
+            current_actor=ActorRef(kind="human", actor_id="alice"),
+        )
+
+    def test_foreign_gap_resume_is_rejected_not_grafted(self) -> None:
+        """claude P2 on b82be1d: a gap resume naming a DIFFERENT work item
+        was accepted against the empty binding (the mismatch guard was
+        vacuous); rehydration must reject it with the guard's own reason
+        instead of grafting the foreign execution onto the carried item."""
+        wf = DevLoopWorkflow()
+        wf.resume(
+            {
+                "work_item_id": "wi-999", "execution_id": "e7", "surface": "telegram",
+                "actor_kind": "human", "actor_id": "mallory",
+            }
+        )
+        assert wf._work_item_id == "wi-999"  # the gap acceptance under test
+        wf._rehydrate_work_context(self._carried())
+        assert wf._work_item_id == "wi-1"
+        assert [e.execution_id for e in wf._executions] == ["e1"]
+        assert "e7" not in wf._seen_execution_ids
+        assert [(r.execution_id, r.work_item_id, r.reason) for r in wf._resume_rejections] == [
+            ("e7", "wi-999", "work-item-mismatch")
+        ]
+        # The rejected resume's pending window is not left open.
+        assert wf._resume_pending is False
+        # The foreign surface/actor never became the baseline.
+        assert wf._current_surface == SurfaceRef(kind="github")
+
+    def test_same_item_gap_resume_is_reapplied_against_the_carried_baseline(self) -> None:
+        wf = DevLoopWorkflow()
+        wf.resume(
+            {
+                "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                "actor_kind": "human", "actor_id": "bob",
+            }
+        )
+        wf._rehydrate_work_context(self._carried())
+        assert [(e.execution_id, e.sequence) for e in wf._executions] == [("e1", 1), ("e2", 2)]
+        assert wf._executions[1].surface_transition is True
+        assert wf._current_surface == SurfaceRef(kind="telegram")
+        # An accepted transitioning gap resume re-opens the pending window.
+        assert wf._resume_pending is True
+
+    def test_carry_work_context_round_trips_through_rehydration(self) -> None:
+        wf = DevLoopWorkflow()
+        wf._work_item_id = "wi-1"
+        wf._executions = [ExecutionRef(execution_id="e1", sequence=1)]
+        wf._seen_execution_ids = {"e1"}
+        wf._current_surface = SurfaceRef(kind="cli")
+        wf._current_actor = ActorRef(kind="human", actor_id="alice")
+        wf._resume_rejections = [
+            ResumeRejection(execution_id="e9", work_item_id="wi-1", reason="resume-already-pending")
+        ]
+        wf._resume_pending = True
+        carried = wf._carry_work_context(MergeWatchResume())
+        fresh = DevLoopWorkflow()
+        fresh._rehydrate_work_context(carried)
+        assert fresh._work_item_id == "wi-1"
+        assert fresh._executions == list(wf._executions)
+        assert fresh._seen_execution_ids == {"e1"}
+        assert fresh._current_surface == SurfaceRef(kind="cli")
+        assert fresh._current_actor == ActorRef(kind="human", actor_id="alice")
+        assert fresh._resume_rejections == list(wf._resume_rejections)
+        assert fresh._resume_pending is True

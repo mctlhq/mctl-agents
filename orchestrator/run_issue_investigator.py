@@ -1780,6 +1780,18 @@ def _assemble_context(
 # so the published path still cannot leave agents-state. Making even the
 # contents trustworthy means not running the agent as this uid, which is
 # #149's territory.
+def _canonical_issue_key(url: str) -> str:
+    """`(owner, repo, number)` as a comparable key, case-folded — so the
+    work-item/issue cross-check compares issue IDENTITIES, not spellings
+    (`http://` vs `https://`, a trailing slash, case). An unparseable URL
+    falls back to its stripped self: never silently equal to a parseable
+    one."""
+    m = _ISSUE_URL_RE.match(url.strip())
+    if not m:
+        return url.strip()
+    return f"{m.group(1).lower()}/{m.group(2).lower()}#{m.group(3)}"
+
+
 def _prior_execution_ids(
     canonical: Any, *, execution_id: str, resume_from_execution_id: str | None
 ) -> tuple[str, ...]:
@@ -1824,17 +1836,23 @@ def _work_context_ref(
         prior_ids = prior_ids[-MAX_PRIOR_EXECUTION_IDS:]
     # `surface_transition` matches ExecutionRef's definition — did THIS
     # execution change the surface or actor relative to the one before it —
-    # so the baseline is the last recorded execution, falling back to the
-    # work item's origin when none is recorded. Only comparisons where both
-    # sides are known can claim a change: unlike the dev_loop signal, an
-    # undeclared side here is an optional CLI flag, not a rejected resume.
-    last = max(
-        (e for e in item.executions if e.execution_id),
+    # so the baseline is the newest PRIOR execution with a known kind
+    # (never this execution itself, which the store may already have
+    # recorded — the same self-exclusion `_prior_execution_ids` makes; and
+    # never a kindless seed, which carries no provenance to compare
+    # against), falling back to the work item's origin. Only comparisons
+    # where both sides are known can claim a change: unlike the dev_loop
+    # signal, an undeclared side here is an optional CLI flag, not a
+    # rejected resume.
+    priors_newest_first = sorted(
+        (e for e in item.executions if e.execution_id and e.execution_id != execution_id),
         key=lambda e: e.sequence,
-        default=None,
+        reverse=True,
     )
-    baseline_surface = last.surface.kind if last else item.origin.kind
-    baseline_actor = last.actor if last else None
+    baseline_surface = next(
+        (e.surface.kind for e in priors_newest_first if e.surface.kind), item.origin.kind
+    )
+    baseline_actor = next((e.actor for e in priors_newest_first if e.actor.kind), None)
     surface_changed = bool(surface and baseline_surface and surface != baseline_surface)
     actor_changed = bool(
         actor_kind
@@ -1953,6 +1971,7 @@ def investigate(
         from orchestrator.work_context.contract import (
             TERMINAL_WORK_ITEM_STATES,
             WORK_ITEM_FOUND,
+            CanonicalState,
             reconstruct_canonical_state,
         )
 
@@ -1961,11 +1980,12 @@ def investigate(
 
             answer = WorkItemClient().get(work_item_id)
             if answer.verdict == WORK_ITEM_FOUND and answer.item is not None:
-                canonical = reconstruct_canonical_state(answer.item, proposal_dir, ())
+                resolved: CanonicalState = reconstruct_canonical_state(answer.item, proposal_dir, ())
+                canonical: CanonicalState | None = resolved
                 print(
                     "info: work_context "
-                    f"work_item_id={canonical.work_item_id} state={canonical.state} "
-                    f"prior_execution_ids={list(canonical.prior_execution_ids)}"
+                    f"work_item_id={resolved.work_item_id} state={resolved.state} "
+                    f"prior_execution_ids={list(resolved.prior_execution_ids)}"
                 )
                 # This is where the remaining work-context flags become
                 # real (mctlhq/mctl-agents#267): the resolved WorkItem plus
@@ -1980,9 +2000,11 @@ def investigate(
                 # a --work-item-id about a DIFFERENT issue must not veto this
                 # run or seal its identity into this issue's snapshot. Warn
                 # at `observe`, refuse where the store's answer has teeth.
-                if canonical.issue_url and canonical.issue_url != issue.ref.url:
+                if resolved.issue_url and _canonical_issue_key(
+                    resolved.issue_url
+                ) != _canonical_issue_key(issue.ref.url):
                     reason = (
-                        f"work item {work_item_id} is about {canonical.issue_url}, "
+                        f"work item {work_item_id} is about {resolved.issue_url}, "
                         f"not {issue.ref.url} — work-item mismatch"
                     )
                     if _work_context_rollout.new_answer_may_veto():

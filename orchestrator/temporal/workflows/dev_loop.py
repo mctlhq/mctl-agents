@@ -1031,6 +1031,11 @@ class MergeWatchResume:
     current_surface: SurfaceRef = field(default_factory=SurfaceRef)
     current_actor: ActorRef = field(default_factory=ActorRef)
     resume_rejections: tuple[ResumeRejection, ...] = ()
+    # The "one resume already pending" window (`resume`'s
+    # `resume-already-pending` rejection). Only `approve` ever closes it,
+    # so a hop that dropped it would accept an overlapping resume the
+    # previous run had promised to reject.
+    resume_pending: bool = False
 
     # --- Prior stage results. A continued run never re-runs investigate,
     # approve or implement, so the final DevLoopResult can only report
@@ -1769,7 +1774,67 @@ class DevLoopWorkflow:
             current_surface=self._current_surface,
             current_actor=self._current_actor,
             resume_rejections=tuple(self._resume_rejections),
+            resume_pending=self._resume_pending,
         )
+
+    def _rehydrate_work_context(self, resume: MergeWatchResume) -> None:
+        """The counterpart of `_carry_work_context`: restore the carried
+        binding, then re-apply whatever `resume` signals delivered in the
+        continue_as_new gap recorded against __init__'s empty state —
+        re-deriving sequence and transition against the carried baseline,
+        and re-checking the one guard the empty state made vacuous."""
+        gap_work_item_id = self._work_item_id
+        gap_executions = self._executions
+        gap_rejections = self._resume_rejections
+        self._work_item_id = resume.work_item_id or self._work_item_id
+        self._executions = list(resume.executions)
+        self._seen_execution_ids = set(resume.seen_execution_ids)
+        self._current_surface = resume.current_surface
+        self._current_actor = resume.current_actor
+        self._resume_rejections = list(resume.resume_rejections)
+        # Not OR-ed with the gap value: the only pre-rehydration setter is a
+        # gap resume, and the loop below re-derives the pending window for
+        # the gap executions it actually ACCEPTS — a rejected (foreign) gap
+        # resume must not leave its window open.
+        self._resume_pending = resume.resume_pending
+        # A gap `resume` ran against an EMPTY binding, so the
+        # work-item-mismatch guard was vacuous for it: a resume naming a
+        # foreign work item was accepted there. Re-applying it here would
+        # graft the foreign execution onto the carried work item — reject
+        # it now, with the same reason the guard gives when the binding is
+        # in place.
+        gap_is_foreign = bool(
+            gap_work_item_id and self._work_item_id and gap_work_item_id != self._work_item_id
+        )
+        for execution in gap_executions:
+            if gap_is_foreign:
+                self._reject_resume(execution.execution_id, gap_work_item_id, "work-item-mismatch")
+                continue
+            if execution.execution_id in self._seen_execution_ids:
+                continue
+            self._seen_execution_ids.add(execution.execution_id)
+            transition = (
+                execution.surface != self._current_surface or execution.actor != self._current_actor
+            )
+            self._executions.append(
+                dataclasses.replace(
+                    execution,
+                    sequence=len(self._executions) + 1,
+                    surface_transition=transition,
+                )
+            )
+            if execution.surface.kind:
+                self._current_surface = execution.surface
+            if execution.actor.kind:
+                self._current_actor = execution.actor
+            if transition:
+                self._resume_pending = True
+        for rejection in gap_rejections:
+            if not any(
+                r.execution_id == rejection.execution_id and r.reason == rejection.reason
+                for r in self._resume_rejections
+            ):
+                self._resume_rejections.append(rejection)
 
     async def _resume_merge_watch(self, issue: IssueRef) -> DevLoopResult:
         """Continue a merge watch that hopped via continue_as_new
@@ -1829,42 +1894,8 @@ class DevLoopWorkflow:
 
         # Work-context binding (#267): same clobber hazard as `abandoned`
         # above — a `resume` signal delivered in the continue_as_new gap ran
-        # against __init__'s empty state before this method did. Rehydrate
-        # the carried binding first, then re-apply whatever the gap signals
-        # recorded on top of it, re-deriving sequence and transition against
-        # the carried baseline instead of the empty one.
-        gap_executions = self._executions
-        gap_rejections = self._resume_rejections
-        self._work_item_id = resume.work_item_id or self._work_item_id
-        self._executions = list(resume.executions)
-        self._seen_execution_ids = set(resume.seen_execution_ids)
-        self._current_surface = resume.current_surface
-        self._current_actor = resume.current_actor
-        self._resume_rejections = list(resume.resume_rejections)
-        for execution in gap_executions:
-            if execution.execution_id in self._seen_execution_ids:
-                continue
-            self._seen_execution_ids.add(execution.execution_id)
-            transition = (
-                execution.surface != self._current_surface or execution.actor != self._current_actor
-            )
-            self._executions.append(
-                dataclasses.replace(
-                    execution,
-                    sequence=len(self._executions) + 1,
-                    surface_transition=transition,
-                )
-            )
-            if execution.surface.kind:
-                self._current_surface = execution.surface
-            if execution.actor.kind:
-                self._current_actor = execution.actor
-        for rejection in gap_rejections:
-            if not any(
-                r.execution_id == rejection.execution_id and r.reason == rejection.reason
-                for r in self._resume_rejections
-            ):
-                self._resume_rejections.append(rejection)
+        # against __init__'s empty state before this method did.
+        self._rehydrate_work_context(resume)
 
         outcome = await self._watch_pr(resume.service, resume.slug, resume=resume)
         if outcome.resume is not None:

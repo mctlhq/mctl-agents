@@ -129,11 +129,6 @@ def test_a_3xx_is_surfaced_never_followed(monkeypatch: pytest.MonkeyPatch) -> No
     assert answer.verdict == WORK_ITEM_UNKNOWN
 
 
-def test_list_executions_200_is_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    answer = _client(monkeypatch, _ok(WORK_ITEM_PAYLOAD)).list_executions("wi-1")
-    assert answer.verdict == WORK_ITEM_FOUND
-
-
 def test_record_execution_posts_and_reads_the_response(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
