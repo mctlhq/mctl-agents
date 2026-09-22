@@ -170,6 +170,11 @@ class RequestedFrom:
     def validate(self) -> None:
         if self.audience not in AUDIENCES:
             raise HumanInputError(f"requested_from.audience {self.audience!r} is not one of {sorted(AUDIENCES)!r}")
+        if not self.actor_refs:
+            # `validate_response` requires the respondent to be listed here,
+            # so an empty allow-list seals a request nobody can ever answer —
+            # it would burn its full TTL and time out.
+            raise HumanInputError("requested_from.actor_refs must name at least one actor")
 
 
 @dataclass(frozen=True)

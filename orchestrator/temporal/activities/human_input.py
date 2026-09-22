@@ -25,6 +25,7 @@ from pathlib import Path
 
 import httpx
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
 GITOPS_REPO = "mctlhq/mctl-gitops"
 AGENTS_STATE_PREFIX = "platform-gitops/agents-state"
@@ -96,6 +97,17 @@ async def find_human_input_request(service: str, slug: str) -> str | None:
         raise HumanInputListingError(f"unexpected non-file response from {url}")
     encoding = document.get("encoding")
     content = document.get("content")
+    if encoding == "none":
+        # The contents API stops inlining `content` above 1 MB and returns
+        # encoding "none". A request.json that large is malformed by
+        # contract, not a transient condition — raising the retryable
+        # listing error here would retry the identical read forever.
+        raise ApplicationError(
+            f"{url} exceeds the contents-API inline limit; a request.json "
+            "this large is malformed",
+            type="human_input_malformed",
+            non_retryable=True,
+        )
     if encoding != "base64" or not isinstance(content, str):
         raise HumanInputListingError(f"{url} returned an unexpected content encoding {encoding!r}")
     try:

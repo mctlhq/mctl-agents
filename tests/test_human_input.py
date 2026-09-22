@@ -304,6 +304,15 @@ def test_respondent_outside_audience_is_rejected():
         hi.validate_response(request, response, now=NOW)
 
 
+def test_empty_actor_refs_is_rejected_at_validation():
+    """An empty allow-list seals a request nobody can ever answer — it would
+    burn its full TTL and time out (claude P2 on #450)."""
+    with pytest.raises(hi.HumanInputError, match="actor_refs"):
+        _requested_from(actor_refs=()).validate()
+    with pytest.raises(hi.HumanInputError, match="actor_refs"):
+        _seal(requested_from=hi.RequestedFrom(audience="work_item_owner", actor_refs=()))
+
+
 # ---------------------------------------------------------------------------
 # T6 — question_hash dedupe
 # ---------------------------------------------------------------------------

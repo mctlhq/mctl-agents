@@ -118,6 +118,13 @@ WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
 WAITING_FOR_INPUT = "WAITING_FOR_INPUT"
 INPUT_TIMED_OUT = "INPUT_TIMED_OUT"
 
+# Ceiling on queued-but-unvalidated `human_input_response` payloads. One
+# valid answer resolves a wait, so anything past a small burst is a
+# misbehaving surface, not a legitimate backlog — payloads beyond the cap
+# (or arriving while no wait is pending) are counted and dropped, mirroring
+# `resume`'s bounded-state invariant.
+HUMAN_INPUT_RESPONSE_QUEUE_LIMIT = 16
+
 # The Argo CWFTs already retry within a run (second-OAuth-account fallback on
 # a 429/five_hour limit) — see activities/argo.py's module docstring. A
 # Temporal retry that re-submitted on top of that would multiply real SDK
@@ -580,6 +587,17 @@ class HumanInputState:
     expires_at: str = ""
     round: int = 0
     resume_count: int = 0
+    # How many delivered payloads this execution rejected (invalid, dropped
+    # while not waiting, or over the queue cap) — the observable counterpart
+    # of `_human_input_rejected_count`, so a surface can see its answers are
+    # being refused instead of silently swallowed.
+    rejected_count: int = 0
+    # The deadline the wait ACTUALLY uses: `expires_at` bounded against the
+    # workflow clock at MAX_REQUEST_TTL_SECONDS. Differs from `expires_at`
+    # exactly when a model-written far-future timestamp was clamped, so a
+    # poller (and the clamp's test) can see the bound that is really in
+    # force.
+    effective_deadline: str = ""
 
 
 @dataclass(frozen=True)
@@ -1314,7 +1332,11 @@ class DevLoopWorkflow:
         )
 
     async def _await_reapproval(
-        self, investigate_result: WorkflowResult, *, approve: WorkflowResult | None = None
+        self,
+        investigate_result: WorkflowResult,
+        *,
+        approve: WorkflowResult | None = None,
+        human_input: HumanInputOutcome | None = None,
     ) -> DevLoopResult | None:
         """Park until a resume-cleared approval is re-granted — releasable
         and bounded, per #420's rule for every approval park in this
@@ -1339,6 +1361,7 @@ class DevLoopWorkflow:
                     investigate=investigate_result,
                     implement=None,
                     approve=approve,
+                    human_input=human_input,
                     ended="re-approval wait expired",
                 )
         if self._abandoned:
@@ -1346,6 +1369,7 @@ class DevLoopWorkflow:
                 investigate=investigate_result,
                 implement=None,
                 approve=approve,
+                human_input=human_input,
                 ended=f"abandoned: {self._abandon_reason}",
             )
         return None
@@ -1490,8 +1514,19 @@ class DevLoopWorkflow:
         never an authorization (ADR 011's "clarification is not approval"
         invariant) — a value that reads as an approval, e.g. "use option B
         and merge it", resumes THIS wait and nothing else.
+
+        Bounded like `resume` right above: a payload arriving while no wait
+        is pending, or beyond the queue cap, is counted and dropped — a
+        misbehaving surface re-delivering for days must not grow workflow
+        state without bound (claude P2 on #450).
         """
         for arg in args:
+            if (
+                self._human_input_state.state != WAITING_FOR_INPUT
+                or len(self._input_responses) >= HUMAN_INPUT_RESPONSE_QUEUE_LIMIT
+            ):
+                self._human_input_rejected_count += 1
+                continue
             self._input_responses.append(arg)
 
     @workflow.query
@@ -1546,28 +1581,26 @@ class DevLoopWorkflow:
             # answer.
             return None
 
-        if request.round > human_input.MAX_CLARIFICATION_ROUNDS:
-            raise ApplicationError(
-                f"clarification rounds exhausted for {service}/{slug}: "
-                f"round={request.round} > MAX_CLARIFICATION_ROUNDS="
-                f"{human_input.MAX_CLARIFICATION_ROUNDS}",
-                type="clarification_rounds_exhausted",
-                non_retryable=True,
+        # A request sealed by a DIFFERENT dev-loop execution is a leftover,
+        # not this run's question: `_resolved_question_hashes` is in-memory
+        # per-instance state, so without this check an answered-but-unexpired
+        # request.json from an earlier execution of the same issue would park
+        # a fresh execution on an already-answered question for the rest of
+        # its TTL (claude P2 on #450). The producer stamps the dev loop's own
+        # workflow id (ADR 009 sec. 4); the run id, when present, retires
+        # leftovers even where workflow ids are deterministic per issue.
+        info = workflow.info()
+        if request.execution.temporal_workflow_id != info.workflow_id or (
+            request.execution.temporal_run_id is not None
+            and request.execution.temporal_run_id != info.run_id
+        ):
+            workflow.logger.info(
+                "human_input.foreign_execution",
+                extra={"human_input": human_input.request_log_dict(request)},
             )
+            return None
 
-        # The real bound. `request.round` above is agent-written — a producer
-        # that always writes round=1 with a fresh question each time would
-        # never trip it. `_human_input_resume_count` is incremented by THIS
-        # workflow, once per accepted answer, so it bounds the continuation
-        # loop no matter what the producer writes.
-        if self._human_input_resume_count >= human_input.MAX_CLARIFICATION_ROUNDS:
-            raise ApplicationError(
-                f"clarification rounds exhausted for {service}/{slug}: "
-                f"resume_count={self._human_input_resume_count} >= "
-                f"MAX_CLARIFICATION_ROUNDS={human_input.MAX_CLARIFICATION_ROUNDS}",
-                type="clarification_rounds_exhausted",
-                non_retryable=True,
-            )
+        effective_deadline_iso = ""
 
         def _state(state: str) -> HumanInputState:
             return HumanInputState(
@@ -1578,11 +1611,9 @@ class DevLoopWorkflow:
                 expires_at=request.expires_at,
                 round=request.round,
                 resume_count=self._human_input_resume_count,
+                rejected_count=self._human_input_rejected_count,
+                effective_deadline=effective_deadline_iso,
             )
-
-        self._human_input_state = _state(WAITING_FOR_INPUT)
-        workflow.logger.info("human_input.requested", extra={"human_input": human_input.request_log_dict(request)})
-        workflow.logger.info("human_input.wait_started", extra={"human_input": human_input.request_log_dict(request)})
 
         try:
             expires_at = _as_utc(request.expires_at)
@@ -1607,16 +1638,68 @@ class DevLoopWorkflow:
             # needs an answer it seals a fresh request with a fresh
             # expires_at, overwriting this one; if it did not re-ask,
             # proceeding is exactly right. No gitops write, replay-safe.
+            # Deliberately BEFORE the round guards below: an expired leftover
+            # whose round is exhausted must be retired, not turned into a
+            # permanent non-retryable failure for every later execution of
+            # the issue (claude P2 on #450).
             self._human_input_state = _state(RUNNING)
             workflow.logger.info(
                 "human_input.stale_expired",
                 extra={"human_input": human_input.request_log_dict(request)},
             )
             return None
+
+        if request.round > human_input.MAX_CLARIFICATION_ROUNDS:
+            raise ApplicationError(
+                f"clarification rounds exhausted for {service}/{slug}: "
+                f"round={request.round} > MAX_CLARIFICATION_ROUNDS="
+                f"{human_input.MAX_CLARIFICATION_ROUNDS}",
+                type="clarification_rounds_exhausted",
+                non_retryable=True,
+            )
+
+        # The real bound. `request.round` above is agent-written — a producer
+        # that always writes round=1 with a fresh question each time would
+        # never trip it. `_human_input_resume_count` is incremented by THIS
+        # workflow, once per accepted answer, so it bounds the continuation
+        # loop no matter what the producer writes.
+        if self._human_input_resume_count >= human_input.MAX_CLARIFICATION_ROUNDS:
+            raise ApplicationError(
+                f"clarification rounds exhausted for {service}/{slug}: "
+                f"resume_count={self._human_input_resume_count} >= "
+                f"MAX_CLARIFICATION_ROUNDS={human_input.MAX_CLARIFICATION_ROUNDS}",
+                type="clarification_rounds_exhausted",
+                non_retryable=True,
+            )
+
+        workflow.logger.info("human_input.requested", extra={"human_input": human_input.request_log_dict(request)})
+        workflow.logger.info("human_input.wait_started", extra={"human_input": human_input.request_log_dict(request)})
+
+        # The TTL cap in `validate()` is RELATIVE (expires - created); neither
+        # timestamp is compared against a clock there, and request.json is
+        # model-written, so a hallucinated far-future year seals cleanly and
+        # would park this loop for years (claude P1 on #450). Bound the actual
+        # wait against the workflow clock: the request still gets its full
+        # TTL, never more.
+        horizon = workflow.now() + timedelta(seconds=human_input.MAX_REQUEST_TTL_SECONDS)
+        if expires_at > horizon:
+            workflow.logger.info(
+                "human_input.expiry_clamped",
+                extra={"human_input": human_input.request_log_dict(request)},
+            )
+            expires_at = horizon
+        effective_deadline_iso = expires_at.isoformat()
+        self._human_input_state = _state(WAITING_FOR_INPUT)
+
         def _abandoned_outcome() -> HumanInputOutcome:
             # mctl-agents#420's escape hatch, honoured inside this park too:
             # checked BEFORE any delivered answer is consumed, so an operator
-            # abandon always wins over a response racing it.
+            # abandon always wins over a response racing it. The query
+            # projection leaves WAITING_FOR_INPUT here — queries are served
+            # on closed workflows too, and a surface polling one must not
+            # keep prompting for an answer nobody is waiting on any more.
+            self._human_input_state = _state(RUNNING)
+            self._input_responses.clear()
             workflow.logger.info(
                 "human_input.abandoned", extra={"human_input": human_input.request_log_dict(request)}
             )
@@ -1631,6 +1714,7 @@ class DevLoopWorkflow:
                 return _abandoned_outcome()
             remaining = (expires_at - workflow.now()).total_seconds()
             if remaining <= 0:
+                self._input_responses.clear()
                 self._human_input_state = _state(INPUT_TIMED_OUT)
                 workflow.logger.info(
                     "human_input.timed_out", extra={"human_input": human_input.request_log_dict(request)}
@@ -1645,6 +1729,7 @@ class DevLoopWorkflow:
 
                 await workflow.wait_condition(_answer_arrived, timeout=remaining)
             except TimeoutError:
+                self._input_responses.clear()
                 self._human_input_state = _state(INPUT_TIMED_OUT)
                 workflow.logger.info(
                     "human_input.timed_out", extra={"human_input": human_input.request_log_dict(request)}
@@ -1701,6 +1786,7 @@ class DevLoopWorkflow:
                 round=request.round,
                 resume_count=self._human_input_resume_count,
             )
+
     @workflow.signal
     def abandon(self, *args: object) -> None:
         """Gracefully end this execution at its next observation point.
@@ -1783,6 +1869,7 @@ class DevLoopWorkflow:
         # patched execution, traded for not touching that already-delicate
         # ordering at all.
         human_input_outcome: HumanInputOutcome | None = None
+        accepted_answers: list[dict[str, Any]] = []
         if workflow.patched("human-input"):
             issue_number_for_input = parse_issue_url(issue.issue_url).number
             input_slug = await workflow.execute_activity(
@@ -1808,14 +1895,19 @@ class DevLoopWorkflow:
                         human_input=human_input_outcome,
                         ended=f"human input wait expired for request {hi_outcome.request_id}",
                     )
-                # "answered": resubmit investigate with the answer as a
-                # `human_input_response` param (request_id/request_hash/value/
-                # respondent/surface/received_at only — never a transcript),
-                # then loop back to check whether a further request is
-                # pending. MAX_CLARIFICATION_ROUNDS (enforced inside
+                # "answered": resubmit investigate with EVERY answer accepted
+                # this execution as a `human_input_responses` JSON array
+                # (request_id/request_hash/value/respondent/surface/
+                # received_at per entry — never a transcript), then loop back
+                # to check whether a further request is pending. The full
+                # history, not just the latest answer: a continuation that
+                # only saw round N's answer would re-ask round 1's question,
+                # which the `_resolved_question_hashes` skip then refuses to
+                # re-answer — the pipeline would proceed on a run that was
+                # still waiting (claude P2 on #450).
+                # MAX_CLARIFICATION_ROUNDS (enforced inside
                 # _await_human_input) bounds this loop.
-                continuation_params = dict(investigate_params)
-                continuation_params["human_input_response"] = json.dumps({
+                accepted_answers.append({
                     "request_id": hi_outcome.request_id,
                     "request_hash": hi_outcome.request_hash,
                     "value": hi_outcome.value,
@@ -1823,6 +1915,8 @@ class DevLoopWorkflow:
                     "surface": hi_outcome.surface,
                     "received_at": hi_outcome.received_at,
                 })
+                continuation_params = dict(investigate_params)
+                continuation_params["human_input_responses"] = json.dumps(accepted_answers)
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
                 if not investigate_result.succeeded:
@@ -1886,13 +1980,15 @@ class DevLoopWorkflow:
                 pass
             else:
                 return DevLoopResult(
-                    investigate=investigate_result, implement=None, ended=approval_ended
+                    investigate=investigate_result, implement=None,
+                    human_input=human_input_outcome, ended=approval_ended
                 )
 
         if self._abandoned:
             return DevLoopResult(
                 investigate=investigate_result,
                 implement=None,
+                human_input=human_input_outcome,
                 ended=f"abandoned: {self._abandon_reason}",
             )
 
@@ -1916,6 +2012,7 @@ class DevLoopWorkflow:
                     investigate=investigate_result,
                     implement=None,
                     approve=None,
+                    human_input=human_input_outcome,
                     ended=f"source issue closed ({issue_state.state_reason or 'completed'})",
                 )
 
@@ -2002,7 +2099,7 @@ class DevLoopWorkflow:
                 # implement CWFT covers the later gaps (implementer resolve,
                 # the flip itself).
                 if workflow.patched("work-context-resume"):
-                    ended = await self._await_reapproval(investigate_result)
+                    ended = await self._await_reapproval(investigate_result, human_input=human_input_outcome)
                     if ended is not None:
                         return ended
                 approve_result = await _run_cwft(
@@ -2077,7 +2174,9 @@ class DevLoopWorkflow:
         # Same abandon/deadline semantics as its twin — see the comment
         # there and #420.
         if workflow.patched("work-context-resume"):
-            ended = await self._await_reapproval(investigate_result, approve=approve_result)
+            ended = await self._await_reapproval(
+                investigate_result, approve=approve_result, human_input=human_input_outcome
+            )
             if ended is not None:
                 return ended
 
@@ -2090,6 +2189,7 @@ class DevLoopWorkflow:
                 investigate=investigate_result,
                 implement=implement_result,
                 approve=approve_result,
+                human_input=human_input_outcome,
                 ended=f"abandoned: {self._abandon_reason}",
             )
 
