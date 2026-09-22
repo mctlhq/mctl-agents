@@ -82,7 +82,11 @@ from orchestrator.proposal_identity import (
     ProposalCandidate,
     select_proposal_slug,
 )
-from orchestrator.run_issue_investigator import _OVERWRITABLE_STATUSES, _run
+from orchestrator.run_issue_investigator import (
+    _OVERWRITABLE_STATUSES,
+    _parse_issue_url,
+    _run,
+)
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
@@ -177,16 +181,6 @@ def _issue_number(slug: str) -> str | None:
     return match.group(1) if match else None
 
 
-# `https://github.com/<owner>/<repo>/issues/<n>` — the only shape
-# `issue_url_for` produces, and the only one `read_issue_comments` can turn
-# into a REST path. Anything else is a programming error, not a GitHub
-# failure, so it raises rather than returning an empty comment list: an empty
-# list reads as "no directives here" and would silently disable the scan.
-_ISSUE_URL_RE = re.compile(
-    r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/issues/(?P<number>\d+)/?$"
-)
-
-
 def read_issue_comments(issue_url: str) -> list[RawComment]:
     """Every comment on one issue, reduced to the `RawComment` shape
     `orchestrator.directives` reads. Raises `subprocess.CalledProcessError`
@@ -228,9 +222,15 @@ def read_issue_comments(issue_url: str) -> list[RawComment]:
     pagination is a cost of the transport change, not a second bug fixed by
     it.)
     """
-    match = _ISSUE_URL_RE.match((issue_url or "").strip())
-    if not match:
-        raise ValueError(f"not an issue URL this poller can read: {issue_url!r}")
+    # `_parse_issue_url`, not a second regex in this module: it already
+    # exists next door, and it additionally rejects an owner outside the
+    # mctlhq org, which a local `[^/]+` pattern would not. It raises
+    # `IssueURLError` (a ValueError) on anything unparseable — deliberately a
+    # raise rather than an empty list, because an empty comment list reads as
+    # "no directives on this issue" and would silently disable the scan for
+    # it. Not reachable today: `issue_url` only ever comes from
+    # `issue_url_for()`.
+    ref = _parse_issue_url(issue_url or "")
     # `--jq '.[]'` rather than `--slurp`: with `--paginate` the raw body is
     # several JSON arrays concatenated, which `json.loads` cannot read, and
     # `--jq` streams one compact object per line on every `gh` version this
@@ -239,7 +239,7 @@ def read_issue_comments(issue_url: str) -> list[RawComment]:
     proc = _run([
         "gh", "api", "--paginate",
         "--jq", ".[]",
-        f"repos/{match['owner']}/{match['repo']}/issues/{match['number']}/comments",
+        f"repos/{ref.full_repo}/issues/{ref.number}/comments",
     ])
     comments: list[RawComment] = []
     for line in proc.stdout.splitlines():

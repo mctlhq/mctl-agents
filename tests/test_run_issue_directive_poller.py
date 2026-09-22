@@ -12,13 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from dataclasses import replace
 
 import httpx
 import pytest
 
 from orchestrator import run_issue_directive_poller
-from dataclasses import replace
-
 from orchestrator.directives import BOT_LOGINS, Directive, ack_trailer, acked_comment_ids
 from orchestrator.run_issue_directive_poller import (
     DirectiveScanResult,
@@ -699,7 +698,11 @@ def test_a_gh_failure_on_one_issue_does_not_stop_the_scan(monkeypatch):
     gh.add_comment(good_url)
 
     def flaky_run(cmd):
-        if cmd[:2] == ["gh", "api"] and cmd[-1].endswith(f"/issues/1/comments"):
+        # `cmd[-1].endswith("/comments")` first: `gh api graphql` (the bot
+        # identity check) also starts with ["gh", "api"] but carries no
+        # repos/ path to map back.
+        if (cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/comments")
+                and FakeGitHub._url_for_rest_path(cmd[-1]) == bad_url):
             raise subprocess.CalledProcessError(1, cmd, stderr="boom")
         return gh.run(cmd)
 
@@ -727,7 +730,11 @@ def test_a_malformed_gh_payload_does_not_stop_the_scan(monkeypatch):
     gh.add_comment(good_url)
 
     def flaky_run(cmd):
-        if cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/issues/1/comments"):
+        # `cmd[-1].endswith("/comments")` first: `gh api graphql` (the bot
+        # identity check) also starts with ["gh", "api"] but carries no
+        # repos/ path to map back.
+        if (cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/comments")
+                and FakeGitHub._url_for_rest_path(cmd[-1]) == bad_url):
             return subprocess.CompletedProcess(cmd, 0, stdout="not valid json", stderr="")
         return gh.run(cmd)
 
@@ -1124,11 +1131,17 @@ def test_the_read_path_spells_the_bot_the_way_bot_logins_does(monkeypatch):
 def test_read_issue_comments_rejects_a_url_it_cannot_turn_into_a_rest_path(monkeypatch):
     """A URL shape the poller cannot parse must raise, not return `[]`: an
     empty comment list reads as "no directives on this issue" and would
-    silently disable the scan for it."""
+    silently disable the scan for it.
+
+    Parsing is delegated to `run_issue_investigator._parse_issue_url` rather
+    than a second regex in the poller, so an owner outside the mctlhq org is
+    rejected too — hence the third case here. `IssueURLError` is a ValueError.
+    """
     monkeypatch.setattr(
         run_issue_directive_poller, "_run",
         lambda cmd: pytest.fail(f"must not reach gh for an unparseable URL: {cmd}"))
     for bad in ("", "https://github.com/mctlhq/mctl-agents/pull/336",
-                "https://example.com/mctlhq/mctl-agents/issues/395"):
+                "https://example.com/mctlhq/mctl-agents/issues/395",
+                "https://github.com/someone-else/mctl-agents/issues/395"):
         with pytest.raises(ValueError):
             run_issue_directive_poller.read_issue_comments(bad)
