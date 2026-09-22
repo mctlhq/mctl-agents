@@ -80,7 +80,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
 from orchestrator import context_assembly
-from orchestrator.context_snapshot import ContextSnapshot
+from orchestrator.context_snapshot import ContextSnapshot, WorkContextRef
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 
@@ -1572,6 +1572,7 @@ def _assemble_context(
     proposal_dir: Path,
     service: str,
     slug: str,
+    work_context: WorkContextRef | None = None,
 ) -> context_assembly.AssemblyResult | None:
     """Assembles and seals this investigation's `ContextSnapshot`
     (mctlhq/mctl-agents#265). Returns `None` in `off` mode without doing any
@@ -1621,6 +1622,7 @@ def _assemble_context(
             legacy_model=INVESTIGATOR_MODEL,
             legacy_allowed_tools=_LEGACY_ALLOWED_TOOLS,
             legacy_budget_usd=legacy_budget_usd,
+            work_context=work_context,
         )
     except Exception as exc:
         if mode == "on":
@@ -1668,6 +1670,38 @@ def _assemble_context(
 # so the published path still cannot leave agents-state. Making even the
 # contents trustworthy means not running the agent as this uid, which is
 # #149's territory.
+def _work_context_ref(
+    *,
+    canonical: Any,
+    item: Any,
+    execution_id: str,
+    resume_from_execution_id: str | None,
+    surface: str | None,
+    actor_kind: str | None,
+    actor_id: str | None,
+) -> WorkContextRef:
+    """Fold the resolved WorkItem and the caller's provenance flags into the
+    `work_context` block a sealed ContextSnapshot carries (mctlhq/
+    mctl-agents#267). `canonical` is a `CanonicalState`, `item` a
+    `WorkItem` — typed as Any only to keep this module's lazy-import
+    discipline for the work_context package (see investigate())."""
+    prior_ids = tuple(canonical.prior_execution_ids)
+    if resume_from_execution_id and resume_from_execution_id not in prior_ids:
+        prior_ids = prior_ids + (resume_from_execution_id,)
+    return WorkContextRef(
+        work_item_id=canonical.work_item_id,
+        work_item_revision=item.revision,
+        execution_id=execution_id,
+        execution_sequence=len(prior_ids) + 1,
+        prior_execution_ids=prior_ids,
+        origin_surface=item.origin.kind,
+        current_surface=surface or "",
+        actor_kind=actor_kind or "",
+        actor_id=actor_id or "",
+        surface_transition=bool(surface and item.origin.kind and surface != item.origin.kind),
+    )
+
+
 def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
@@ -1724,6 +1758,7 @@ def investigate(
     # is byte-for-byte what it is today. Imported lazily, inside this
     # function body, never at module scope (see the import-discipline note
     # at the top of this file and tests/test_worker_isolation.py).
+    work_context_ref: WorkContextRef | None = None
     if work_item_id:
         from orchestrator.work_context import rollout as _work_context_rollout
         from orchestrator.work_context.contract import (
@@ -1743,6 +1778,23 @@ def investigate(
                     f"work_item_id={canonical.work_item_id} state={canonical.state} "
                     f"prior_execution_ids={list(canonical.prior_execution_ids)}"
                 )
+                # This is where the remaining work-context flags become
+                # real (mctlhq/mctl-agents#267): the resolved WorkItem plus
+                # the caller's execution/surface/actor provenance seal into
+                # the ContextSnapshot's `work_context` block, so a second
+                # execution's snapshot stays correlated to the same
+                # WorkItem and to the execution it resumed from. Metadata
+                # only — no transcript, per the contract's own rule.
+                if execution_id:
+                    work_context_ref = _work_context_ref(
+                        canonical=canonical,
+                        item=answer.item,
+                        execution_id=execution_id,
+                        resume_from_execution_id=resume_from_execution_id,
+                        surface=surface,
+                        actor_kind=actor_kind,
+                        actor_id=actor_id,
+                    )
                 # `enforce`/`only`: the reconstructed state may VETO this run
                 # (a work item already in a terminal state) but never
                 # LICENSE one the issue path would have refused on its own —
@@ -1813,6 +1865,7 @@ def investigate(
             proposal_dir=proposal_dir,
             service=service,
             slug=slug,
+            work_context=work_context_ref,
         )
 
         # 3. Run the SDK agent — writes the requirements/design/tasks triplet.

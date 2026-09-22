@@ -7,6 +7,7 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import pathlib
@@ -23,6 +24,7 @@ from claude_agent_sdk import TaskUpdatedMessage
 
 from orchestrator import run_issue_investigator
 from orchestrator.proposal_state import unrunnable_reason
+from orchestrator.work_context import rollout as _work_context_rollout
 from orchestrator.run_implementer import (
     ProposalRef,
     _issue_closing_line,
@@ -3617,11 +3619,6 @@ def test_write_status_yaml_with_a_snapshot_is_additive_and_agrees(tmp_path):
 # investigate(url, tmp_path) positional call still succeeds; provenance is
 # recorded at mode observe and the store is never contacted at mode off.
 # ---------------------------------------------------------------------------
-import argparse  # noqa: E402 — grouped with the other test-only additions below
-
-from orchestrator.work_context import rollout as _work_context_rollout  # noqa: E402
-
-
 def _args(**overrides):
     base = dict(
         issue_url="https://github.com/mctlhq/mctl-telegram/issues/1",
@@ -3703,6 +3700,54 @@ def test_work_item_store_is_never_contacted_at_mode_off(tmp_path, monkeypatch):
         work_item_id="wi-1",
     )
     assert result.skipped_reason == "dry-run"
+
+
+def test_work_context_ref_folds_flags_and_canonical_state():
+    """The flags that used to be accepted-and-discarded (claude P2 on #408)
+    now land in the sealed snapshot's work_context block — this covers the
+    fold itself; the seal-side participation is covered in
+    test_context_snapshot.py."""
+    from orchestrator.work_context.contract import (
+        CanonicalState,
+        SurfaceRef,
+        WorkItem,
+    )
+
+    canonical = CanonicalState(work_item_id="wi-1", state="in-progress", prior_execution_ids=("e1",))
+    item = WorkItem(work_item_id="wi-1", revision="r7", origin=SurfaceRef(kind="github"))
+    ref = run_issue_investigator._work_context_ref(
+        canonical=canonical,
+        item=item,
+        execution_id="e2",
+        resume_from_execution_id="e1",
+        surface="telegram",
+        actor_kind="human",
+        actor_id="carol",
+    )
+    assert ref.work_item_id == "wi-1"
+    assert ref.work_item_revision == "r7"
+    assert ref.execution_id == "e2"
+    assert ref.prior_execution_ids == ("e1",)  # no duplicate append
+    assert ref.execution_sequence == 2
+    assert ref.origin_surface == "github"
+    assert ref.current_surface == "telegram"
+    assert ref.actor_kind == "human"
+    assert ref.actor_id == "carol"
+    assert ref.surface_transition is True
+
+    # A first execution with no resume and no declared surface: sequence 1,
+    # no transition claimed.
+    first = run_issue_investigator._work_context_ref(
+        canonical=CanonicalState(work_item_id="wi-1", state="new"),
+        item=item,
+        execution_id="e1",
+        resume_from_execution_id=None,
+        surface=None,
+        actor_kind=None,
+        actor_id=None,
+    )
+    assert first.execution_sequence == 1
+    assert first.surface_transition is False
 
 
 def test_provenance_is_recorded_at_mode_observe(tmp_path, monkeypatch, capsys):

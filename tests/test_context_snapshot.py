@@ -825,10 +825,89 @@ def test_to_log_dict_without_work_context_omits_the_correlation_keys():
 
 
 # ---------------------------------------------------------------------------
-# T7 — the re-cut golden fixture still verifies via recompute_content_hash,
-# and its work_context key is present (as null) so it participates in the
-# hash exactly like `step`.
+# T7 — the golden fixture's DOCUMENT carries the work_context key (to_dict
+# always emits it), while the HASH excludes it when null — which is exactly
+# why this fixture's content_hash is unchanged from before the field
+# existed (see _content_payload's docstring, and T3 above which recomputes
+# it).
 # ---------------------------------------------------------------------------
 def test_golden_fixture_carries_a_null_work_context_key():
     raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
     assert raw["work_context"] is None
+
+
+def test_null_work_context_leaves_the_hash_unchanged_and_present_changes_it():
+    """An absent work_context must hash identically to the pre-#267 shape
+    (no silent re-identification of persisted documents), while a PRESENT
+    one participates — and two executions of the same work item differing
+    only in execution_id seal to different snapshot_ids (ADR 011)."""
+    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    base = cs.ContextSnapshot.from_dict(raw)
+    assert base.work_context is None
+
+    def _reseal(wc):
+        return cs.seal(
+            execution=base.execution,
+            strategy=base.strategy,
+            budget=base.budget,
+            retention=base.retention,
+            created_at=base.created_at,
+            step=base.step,
+            work_context=wc,
+            sources=base.sources,
+            evidence_refs=base.evidence_refs,
+        )
+
+    assert _reseal(None).content_hash == raw["content_hash"]
+
+    wc_e1 = cs.WorkContextRef(
+        work_item_id="wi-1", work_item_revision="r1", execution_id="e1", execution_sequence=1
+    )
+    wc_e2 = cs.WorkContextRef(
+        work_item_id="wi-1", work_item_revision="r1", execution_id="e2", execution_sequence=2
+    )
+    with_e1 = _reseal(wc_e1)
+    with_e2 = _reseal(wc_e2)
+    assert with_e1.content_hash != raw["content_hash"]
+    assert with_e1.snapshot_id != with_e2.snapshot_id
+
+
+def test_work_context_id_fields_are_length_bounded():
+    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    base = cs.ContextSnapshot.from_dict(raw)
+    oversized = cs.WorkContextRef(
+        work_item_id="wi-1",
+        work_item_revision="",
+        execution_id="e1",
+        execution_sequence=1,
+        actor_id="x" * (cs.MAX_WORK_CONTEXT_ID_LENGTH + 1),
+    )
+    with pytest.raises(cs.ContextSnapshotError, match="actor_id"):
+        cs.seal(
+            execution=base.execution,
+            strategy=base.strategy,
+            budget=base.budget,
+            retention=base.retention,
+            created_at=base.created_at,
+            work_context=oversized,
+            sources=base.sources,
+            evidence_refs=base.evidence_refs,
+        )
+    too_many_priors = cs.WorkContextRef(
+        work_item_id="wi-1",
+        work_item_revision="",
+        execution_id="e1",
+        execution_sequence=1,
+        prior_execution_ids=tuple(f"e{i}" for i in range(cs.MAX_PRIOR_EXECUTION_IDS + 1)),
+    )
+    with pytest.raises(cs.ContextSnapshotError, match="prior_execution_ids"):
+        cs.seal(
+            execution=base.execution,
+            strategy=base.strategy,
+            budget=base.budget,
+            retention=base.retention,
+            created_at=base.created_at,
+            work_context=too_many_priors,
+            sources=base.sources,
+            evidence_refs=base.evidence_refs,
+        )

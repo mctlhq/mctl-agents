@@ -3962,6 +3962,136 @@ class TestWorkContextResume:
         assert result.implement is not None
         assert result.implement.phase == "Succeeded"
 
+    async def test_prod_shaped_start_resume_transition_fires_and_flip_waits(self, env):
+        """The two production-shaped guarantees, on a loop started WITHOUT a
+        work_item_id (exactly what orchestrator/temporal/start.py submits):
+
+        1. the first surface/actor-declaring resume counts as a transition
+           even though no execution was seeded — the gate must not be inert
+           on real starts;
+        2. a resume landing in the slug-lookup gap (after alice's approval
+           was consumed by the first gate) re-arms approval BEFORE the
+           approve CWFT, so the durable flip is attributed to the actor who
+           re-approved, never to "unknown".
+        """
+        seen_params: dict[str, dict[str, str]] = {}
+        investigate_ran = anyio.Event()
+        slug_lookup_entered = anyio.Event()
+        slug_release = anyio.Event()
+
+        @activity.defn(name="resolve_agent_release")
+        async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+            return ResolvedRelease(
+                agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+            )
+
+        @activity.defn(name="submit_and_wait")
+        async def capturing_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+            seen_params[input.operation] = input.params
+            if input.operation == "mctl-agents-investigate":
+                investigate_ran.set()
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+        @activity.defn(name="record_execution")
+        async def fake_record_execution(record: ExecutionRecord) -> None:
+            return None
+
+        @activity.defn(name="find_proposal_slug")
+        async def gated_find_proposal_slug(service: str, issue_number: str) -> str | None:
+            slug_lookup_entered.set()
+            await slug_release.wait()
+            return f"issue-{issue_number}-fake-title"
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=[
+                fake_resolve_agent_release,
+                capturing_submit_and_wait,
+                fake_record_execution,
+                gated_find_proposal_slug,
+            ],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/88"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            # The first gate consumes alice's approval and the loop enters
+            # the slug lookup, where it now blocks.
+            with anyio.fail_after(10):
+                await slug_lookup_entered.wait()
+
+            # bob picks the work item up from telegram mid-gap.
+            await handle.signal(
+                DevLoopWorkflow.resume,
+                {
+                    "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
+                    "actor_kind": "human", "actor_id": "bob",
+                },
+            )
+            state = await handle.query(DevLoopWorkflow.work_context)
+            # No seeded execution existed, and the transition still fired.
+            assert state.executions[-1].surface_transition is True
+
+            slug_release.set()
+            # The loop reaches the pre-flip gate with approval cleared: no
+            # approve CWFT, no implement. The query round-trips the event
+            # loop so these are ordered assertions, not races.
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert "mctl-agents-approve" not in seen_params
+            assert "mctl-agents-implement" not in seen_params
+
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "bob"})
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert seen_params["mctl-agents-approve"]["approver"] == "bob"
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
+    async def test_resume_without_surface_or_actor_is_rejected_not_inherited(self, env):
+        """A resume that omits surface/actor_kind fails CLOSED: it is
+        rejected and recorded, records no execution, and cannot inherit the
+        standing approval. The same bad payload re-delivered does not grow
+        the rejection list (dedupe on (execution_id, reason))."""
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/267", work_item_id="wi-1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            bad = {"work_item_id": "wi-1", "execution_id": "e2"}
+            await handle.signal(DevLoopWorkflow.resume, bad)
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert len(state.executions) == 1  # nothing recorded
+            assert [r.reason for r in state.resume_rejections] == ["surface-or-actor-missing"]
+
+            # Re-delivery of the identical rejected payload: still one entry.
+            await handle.signal(DevLoopWorkflow.resume, bad)
+            state = await handle.query(DevLoopWorkflow.work_context)
+            assert [r.reason for r in state.resume_rejections] == ["surface-or-actor-missing"]
+
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+
 
 SERVICE = "mctl-telegram"
 SLUG = "issue-88-fake-title"

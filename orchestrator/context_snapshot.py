@@ -75,6 +75,11 @@ WORK_CONTEXT_ACTOR_KINDS = frozenset({"human", "agent", "system"})
 # ceilings, the same spirit as resolver.py's MAX_BUDGET_USD/MAX_TIMEOUT_SECONDS.
 MAX_LOCATOR_LENGTH = 2048
 MAX_SELECTOR_JSON_LENGTH = 2048
+# WorkContextRef's id-shaped fields (work_item_id, execution_id, actor_id,
+# …) and the prior_execution_ids list get the same treatment: generous for
+# any real id, far too small for a payload.
+MAX_WORK_CONTEXT_ID_LENGTH = 256
+MAX_PRIOR_EXECUTION_IDS = 64
 
 
 class ContextSnapshotError(ValueError):
@@ -931,6 +936,32 @@ class ContextSnapshot:
                     f"work_context.actor_kind {wc.actor_kind!r} is not one of "
                     f"{sorted(WORK_CONTEXT_ACTOR_KINDS)!r}"
                 )
+            # Bounded-length rule (ADR 009 sec. 7), same spirit as
+            # MAX_LOCATOR_LENGTH on sources: these are id-shaped fields in a
+            # sealed, content-hashed, gitops-persisted document — actor_id in
+            # particular is externally-supplied free text — and none of them
+            # may become a place to smuggle a payload.
+            for field_name, value in (
+                ("work_item_id", wc.work_item_id),
+                ("work_item_revision", wc.work_item_revision),
+                ("execution_id", wc.execution_id),
+                ("actor_id", wc.actor_id),
+                ("resumed_from_snapshot_id", wc.resumed_from_snapshot_id or ""),
+            ):
+                if len(value) > MAX_WORK_CONTEXT_ID_LENGTH:
+                    raise ContextSnapshotError(
+                        f"work_context.{field_name} exceeds {MAX_WORK_CONTEXT_ID_LENGTH} characters"
+                    )
+            if len(wc.prior_execution_ids) > MAX_PRIOR_EXECUTION_IDS:
+                raise ContextSnapshotError(
+                    f"work_context.prior_execution_ids exceeds {MAX_PRIOR_EXECUTION_IDS} entries"
+                )
+            for prior in wc.prior_execution_ids:
+                if len(prior) > MAX_WORK_CONTEXT_ID_LENGTH:
+                    raise ContextSnapshotError(
+                        f"work_context.prior_execution_ids entry exceeds "
+                        f"{MAX_WORK_CONTEXT_ID_LENGTH} characters"
+                    )
 
         if parent is not None:
             if self.step is None:
@@ -1027,26 +1058,31 @@ def _content_payload(
     """Every field that participates in `content_hash` — everything except
     `content_hash`, `snapshot_id` and `created_at` (ADR 009 sec. 2).
 
-    `work_context` is unconditionally present in the payload (as `null` when
-    absent), exactly like `step` — so two executions of the same work item
-    that differ only in `execution_id` seal to different `snapshot_id`s
-    (mctlhq/mctl-agents#267, ADR 011). This moves every existing
-    `content_hash`, including documents with `work_context=None`; the module
-    has no production producer yet (`:19-21`), so the only casualty is the
-    golden fixture `tests/fixtures/context/investigator-snapshot.json`,
-    re-cut in the same change."""
-    return {
+    `work_context` participates in the hash ONLY when present: two
+    executions of the same work item that differ only in `execution_id`
+    still seal to different `snapshot_id`s (mctlhq/mctl-agents#267,
+    ADR 011), while a snapshot with no work context hashes exactly as it
+    did before the field existed. Unconditional inclusion (as `null`, like
+    `step`) would silently re-identify every already-persisted document —
+    and there IS a production producer since #394: `context_assembly`'s
+    `seal()` call driven by `_assemble_context` in `shadow`/`on` mode, whose
+    `snapshot_id`s land in `.status.yaml`. ADR 009's field-growth rule
+    ("optional fields without an apiVersion bump") is only coherent when an
+    absent optional field leaves existing hashes untouched."""
+    payload: dict[str, Any] = {
         "api_version": API_VERSION,
         "kind": KIND,
         "execution": execution.to_dict(),
         "step": step.to_dict() if step is not None else None,
-        "work_context": work_context.to_dict() if work_context is not None else None,
         "strategy": strategy.to_dict(),
         "budget": budget.to_dict(),
         "sources": [s.to_dict() for s in sources],
         "evidence_refs": [e.to_dict() for e in evidence_refs],
         "retention": retention.to_dict(),
     }
+    if work_context is not None:
+        payload["work_context"] = work_context.to_dict()
+    return payload
 
 
 def seal(

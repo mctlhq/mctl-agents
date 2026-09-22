@@ -306,6 +306,15 @@ def answer_from(status: int, payload: dict[str, Any], *, path: str = "", body_em
         reason = "" if verdict != WORK_ITEM_UNKNOWN else f"unrecognised work item state {item.state!r}"
         return WorkItemAnswer(verdict=verdict, item=item, reason=reason, accepted=True)
     if status == 404:
+        # The only branch that dereferences `payload` directly — guard the
+        # type first. `_HTTPResult` coerces to `{}` today, but `answer_from`
+        # is a public module-level function whose contract is "uncertainty
+        # is a value, never an exception", and that must hold for any future
+        # transport too.
+        if not isinstance(payload, dict):
+            return WorkItemAnswer(
+                verdict=WORK_ITEM_UNKNOWN, reason=f"404 with a non-mapping payload from {path or 'a read'}"
+            )
         if not isinstance(payload.get("error"), str) or not payload["error"]:
             # A 404 with no error envelope did not come from mctl-api — see
             # the identical guard in orchestrator/lifecycle/contract.py.

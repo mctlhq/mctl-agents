@@ -955,19 +955,36 @@ class DevLoopWorkflow:
         # and a subsequent resume is free to open a new window of its own.
         self._resume_pending = False
 
+    def _reject_resume(self, execution_id: str, work_item_id: str, reason: str) -> None:
+        """Record one rejection per (execution_id, reason). A retrying
+        surface callback re-delivering the same rejected payload — for the
+        days this workflow can legitimately stay open — must not grow
+        workflow state or every `work_context` query response without
+        bound."""
+        if any(r.execution_id == execution_id and r.reason == reason for r in self._resume_rejections):
+            return
+        self._resume_rejections.append(
+            ResumeRejection(execution_id=execution_id, work_item_id=work_item_id, reason=reason)
+        )
+
     @workflow.signal
     def resume(self, *args: object) -> None:
         """Pick up this work item's task from a possibly different surface
         or actor (mctlhq/mctl-agents#267, ADR 011).
 
         Parses defensively and never raises, exactly like `approve` above.
-        Expected payload: a single dict with `work_item_id`, `execution_id`
-        and optionally `surface`, `actor_kind`, `actor_id`. Anything else —
-        no args, a non-dict arg, a dict missing `work_item_id` or
+        Expected payload: a single dict with `work_item_id`, `execution_id`,
+        `surface` and `actor_kind` (plus optional `actor_id`). Anything
+        else — no args, a non-dict arg, a dict missing `work_item_id` or
         `execution_id` — is silently ignored: a signal handler that raised
         on a malformed payload would fail the workflow task, and a resume is
         exactly the kind of externally-triggered input that must never do
-        that (the same reasoning `approve`'s docstring gives).
+        that (the same reasoning `approve`'s docstring gives). A payload
+        that parses but omits `surface` or `actor_kind` is REJECTED with
+        `reason="surface-or-actor-missing"` rather than ignored: without
+        provenance the approval semantics below cannot be evaluated, and
+        accepting it would let the new execution silently inherit the
+        previous actor's approval.
 
         Idempotent, never forking: a duplicate `execution_id` (the common
         case, since `execution_id_for` is deterministic) is a no-op; a
@@ -986,7 +1003,10 @@ class DevLoopWorkflow:
         submitted — re-arm, and approval is re-evaluated by the current
         actor. A same-surface, same-actor resume (e.g. a retry from the
         same place) never touches approval at all: that would be
-        re-litigating a decision nobody changed.
+        re-litigating a decision nobody changed. "Same" requires a recorded
+        baseline: on a loop whose own launch carried no surface/actor (every
+        production start today), the first accepted resume always counts as
+        a transition — an unprovable "same" fails closed.
         """
         payload: dict[str, object] | None = None
         for arg in args:
@@ -995,6 +1015,9 @@ class DevLoopWorkflow:
                 break
         if payload is None:
             return
+        # (rejections are deduplicated on (execution_id, reason) by
+        # _reject_resume: a surface callback re-delivering the same bad
+        # payload for days must not grow workflow state without bound)
 
         work_item_id = payload.get("work_item_id")
         execution_id = payload.get("execution_id")
@@ -1004,20 +1027,14 @@ class DevLoopWorkflow:
             return
 
         if self._work_item_id and work_item_id != self._work_item_id:
-            self._resume_rejections.append(
-                ResumeRejection(execution_id=execution_id, work_item_id=work_item_id, reason="work-item-mismatch")
-            )
+            self._reject_resume(execution_id, work_item_id, "work-item-mismatch")
             return
 
         if execution_id in self._seen_execution_ids:
             return  # idempotent no-op — the same execution resuming again
 
         if self._resume_pending:
-            self._resume_rejections.append(
-                ResumeRejection(
-                    execution_id=execution_id, work_item_id=work_item_id, reason="resume-already-pending"
-                )
-            )
+            self._reject_resume(execution_id, work_item_id, "resume-already-pending")
             return
 
         surface_raw = payload.get("surface")
@@ -1030,12 +1047,27 @@ class DevLoopWorkflow:
             else ActorRef()
         )
 
+        # Fail closed on provenance, not open: a resume that does not say
+        # where it comes from and who is acting cannot have its approval
+        # semantics evaluated at all — accepting it would record an
+        # execution while silently keeping the PREVIOUS actor's approval,
+        # the exact cross-surface privilege inheritance #267 forbids. It is
+        # rejected and recorded, never merely dropped.
+        if not surface.kind or not actor.kind:
+            self._reject_resume(execution_id, work_item_id, "surface-or-actor-missing")
+            return
+
         self._work_item_id = self._work_item_id or work_item_id
         self._seen_execution_ids.add(execution_id)
-        surface_transition = bool(self._executions) and (
-            (bool(surface.kind) and surface != self._current_surface)
-            or (bool(actor.kind) and actor != self._current_actor)
-        )
+        # No `self._executions` gate here: production starts
+        # (orchestrator/temporal/start.py) construct IssueRef without a
+        # work_item_id, so the seeded-execution list is empty for every real
+        # loop and a gate on it made this transition inert exactly where it
+        # matters. With no recorded baseline, `_current_surface`/
+        # `_current_actor` are empty and any declared surface/actor differs
+        # from them — the un-provable "same surface, same actor" case
+        # deliberately counts as a transition (fail closed).
+        surface_transition = (surface != self._current_surface) or (actor != self._current_actor)
         self._executions.append(
             ExecutionRef(
                 execution_id=execution_id,
@@ -1169,6 +1201,19 @@ class DevLoopWorkflow:
             # stops the loop HERE: proceeding to implement without a durable
             # accepted status would just be a silent no-op run.
             if atomic_approve:
+                # Re-check approval immediately before the durable flip
+                # (mctlhq/mctl-agents#267, ADR 011). The slug lookup above
+                # is a real activity await; a `resume` that changes surface
+                # or actor can land in that gap, clearing `_approved` AND
+                # `_approver` — without this gate the flip below would
+                # commit a gitops approval attributed to "unknown" on the
+                # new actor's behalf. `wait_condition` schedules no command,
+                # so behind the patch marker this is a true no-op for every
+                # history that never saw a resume. The twin gate before the
+                # implement CWFT covers the later gaps (implementer resolve,
+                # the flip itself).
+                if workflow.patched("work-context-resume"):
+                    await workflow.wait_condition(lambda: self._approved)
                 approve_result = await _run_cwft(
                     "mctl-agents-approve",
                     {
@@ -1230,18 +1275,17 @@ class DevLoopWorkflow:
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
         # Re-check approval immediately before implementing (mctlhq/mctl-
-        # agents#267, ADR 011). The first `wait_condition` above only proves
-        # SOMEONE had approved by the time this loop started resolving the
-        # slug/approve-flip/implementer-release chain — each of those is a
-        # real await on an activity, and a `resume` signal that changes
-        # surface or actor can land in that gap and clear `_approved` again.
-        # Without this second check, that resume would be recorded but have
-        # no effect: the loop would already be past the only gate that reads
-        # `_approved`. Gated behind the patch marker because it is new
-        # workflow-visible behaviour, even though it is a true no-op for
-        # every history that never calls `resume` — `_approved` is already
-        # True, so `wait_condition` resolves immediately and schedules
-        # nothing, leaving old histories' command stream untouched.
+        # agents#267, ADR 011) — the twin of the gate before the approve
+        # flip above. That one closes the slug-lookup gap so a resume cannot
+        # produce an "unknown"-attributed flip; this one closes the
+        # remaining gaps (the flip itself and the implementer resolve are
+        # both real activity awaits), so a resume landing after the flip
+        # still forces re-approval before any implementer is released.
+        # Gated behind the patch marker because it is new workflow-visible
+        # behaviour, even though it is a true no-op for every history that
+        # never calls `resume` — `_approved` is already True, so
+        # `wait_condition` resolves immediately and schedules nothing,
+        # leaving old histories' command stream untouched.
         if workflow.patched("work-context-resume"):
             await workflow.wait_condition(lambda: self._approved)
 
