@@ -109,6 +109,37 @@ def implementation_max_concurrent_activities() -> int:
     return _int_env(IMPLEMENTATION_CAPACITY_ENV, DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES)
 
 
+# Implement-sweep tunables (mctl-agents#412). Read the same way as
+# IMPLEMENTATION_CAPACITY_ENV above and for the same reason: a function
+# called once at worker startup (worker.setup_schedules, gated by
+# owns_schedules), not a module constant every role would evaluate on
+# import.
+#
+# Grace period: how long a freshly-`updated_at` `accepted` proposal is left
+# alone before the sweep will consider it stranded. 20 minutes because it
+# exceeds dev_loop.APPROVE_STEP_TIMEOUT (15 min), so a DevLoopWorkflow that
+# flipped the approve but has not yet submitted its own implement step is
+# always still inside the window, even if the visibility query is stale.
+IMPLEMENT_SWEEP_GRACE_MINUTES_ENV = "IMPLEMENT_SWEEP_GRACE_MINUTES"
+DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES = 20
+
+# Per-tick submit cap: how many children one ImplementSweepWorkflow tick may
+# start. Matches the issue poller's and the incident responder's per-run
+# caps. The real concurrency bound is the admission queue
+# (IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES); this cap only limits how many
+# children one tick mints after a long outage.
+IMPLEMENT_SWEEP_MAX_SUBMITS_ENV = "IMPLEMENT_SWEEP_MAX_SUBMITS"
+DEFAULT_IMPLEMENT_SWEEP_MAX_SUBMITS = 5
+
+
+def implement_sweep_grace_minutes() -> int:
+    return _int_env(IMPLEMENT_SWEEP_GRACE_MINUTES_ENV, DEFAULT_IMPLEMENT_SWEEP_GRACE_MINUTES)
+
+
+def implement_sweep_max_submits() -> int:
+    return _int_env(IMPLEMENT_SWEEP_MAX_SUBMITS_ENV, DEFAULT_IMPLEMENT_SWEEP_MAX_SUBMITS)
+
+
 # Where the Temporal SDK's Prometheus exporter binds (ADR-008 D5, #252).
 #
 # The starvation this split addresses was invisible: a full slot pool looks

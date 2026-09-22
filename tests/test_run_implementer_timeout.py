@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import types
+from typing import ClassVar
 
 import anyio
 import pytest
@@ -429,6 +430,162 @@ def test_outer_timeout_with_a_live_child_is_an_orphan_even_before_the_drain(
         anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
 
 
+# ---------------------------------------------------------------------------
+# Shielded, bounded teardown on the orphan path (mctl-agents#423 / T5)
+#
+# `ledger.live` when the outer envelope fires means the CLI subprocess and
+# its delegated child are still running. Without a SHIELDED teardown,
+# `client.disconnect()` awaits inside the scope `fail_after` just cancelled
+# and the first checkpoint inside it raises immediately -- the disconnect
+# never actually runs, and whatever the SDK spawned outlives this process.
+# ---------------------------------------------------------------------------
+class _DisconnectTrackingClient(_FakeClient):
+    """Records whether/how `disconnect()` was awaited, and can simulate a
+    disconnect that itself hangs past the teardown grace clamp."""
+
+    disconnect_calls: ClassVar[list[str]] = []
+
+    def __init__(self, *, options, message_gen, hang_seconds: float = 0.0):
+        super().__init__(options=options, message_gen=message_gen)
+        self._hang_seconds = hang_seconds
+
+    async def disconnect(self):
+        self.__class__.disconnect_calls.append("called")
+        if self._hang_seconds:
+            await anyio.sleep(self._hang_seconds)
+        self.__class__.disconnect_calls.append("completed")
+
+
+def test_orphan_teardown_awaits_disconnect_on_the_cancelled_path(tmp_path, monkeypatch) -> None:
+    """T5: exit 46 is still raised, and disconnect() was actually awaited --
+    the shield is what makes that possible on a scope `fail_after` cancelled."""
+    _DisconnectTrackingClient.disconnect_calls = []
+
+    async def messages():
+        yield _started()
+        await anyio.sleep(10)  # never settles -> ledger.live at the outer bound
+
+    def _factory(*, options):
+        return _DisconnectTrackingClient(options=options, message_gen=messages)
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _factory)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", 5)
+
+    with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+    assert "called" in _DisconnectTrackingClient.disconnect_calls
+    assert "completed" in _DisconnectTrackingClient.disconnect_calls, (
+        "disconnect() was cancelled before finishing -- the shield did not hold"
+    )
+
+
+def test_orphan_teardown_itself_cannot_exceed_the_grace_clamp(tmp_path, monkeypatch) -> None:
+    """T5: a wedged disconnect() must not turn a harness failure into a hang
+    -- move_on_after bounds the shield itself."""
+    _DisconnectTrackingClient.disconnect_calls = []
+
+    async def messages():
+        yield _started()
+        await anyio.sleep(10)
+
+    def _factory(*, options):
+        return _DisconnectTrackingClient(options=options, message_gen=messages, hang_seconds=30)
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _factory)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", 0.2)
+
+    import time
+    start = time.monotonic()
+    with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 5, "the whole run took too long -- teardown was not bounded"
+    assert "called" in _DisconnectTrackingClient.disconnect_calls
+    assert "completed" not in _DisconnectTrackingClient.disconnect_calls, (
+        "a 30s sleep must not complete inside a 0.2s grace clamp"
+    )
+
+
+class _FakeChildProcess:
+    """Stands in for the SDK transport's `_process` -- just enough surface
+    for the belt-and-suspenders check: a `returncode` and a `terminate()`
+    that records whether it fired."""
+
+    def __init__(self):
+        self.returncode = None
+        self.terminated = False
+
+    def terminate(self):
+        self.terminated = True
+
+
+class _DisconnectHangingClientWithProcess(_DisconnectTrackingClient):
+    """A `_DisconnectTrackingClient` that also exposes `_transport._process`,
+    so the belt-and-suspenders path in the teardown has something to find."""
+
+    def __init__(self, *, options, message_gen, hang_seconds):
+        super().__init__(options=options, message_gen=message_gen, hang_seconds=hang_seconds)
+        self.process = _FakeChildProcess()
+        self._transport = types.SimpleNamespace(_process=self.process)
+
+
+def test_orphan_teardown_terminates_process_when_disconnect_is_cut_short_by_the_grace_clamp(
+    tmp_path, monkeypatch
+) -> None:
+    """mctl-agents#423 review P2 round 2: the belt-and-suspenders
+    `process.terminate()` must fire in exactly the case its own comment
+    names -- a `disconnect()` cut short by the grace clamp -- not only on
+    the untested happy path where `disconnect()` finishes cleanly."""
+    _DisconnectTrackingClient.disconnect_calls = []
+    created: dict = {}
+
+    async def messages():
+        yield _started()
+        await anyio.sleep(10)
+
+    def _factory(*, options):
+        client = _DisconnectHangingClientWithProcess(
+            options=options, message_gen=messages, hang_seconds=30
+        )
+        created["client"] = client
+        return client
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _factory)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", 0.2)
+
+    with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+    assert "completed" not in _DisconnectTrackingClient.disconnect_calls, (
+        "a 30s sleep must not complete inside a 0.2s grace clamp"
+    )
+    assert created["client"].process.terminated, (
+        "process.terminate() must still run when disconnect() itself was "
+        "cancelled by the grace clamp -- it was unreachable before this fix"
+    )
+
+
+def test_orphan_teardown_survives_a_client_with_no_disconnect_method(tmp_path, monkeypatch) -> None:
+    """The plain `_FakeClient` (every other test in this file) has no
+    `disconnect` at all -- the teardown must degrade to a warning, not an
+    unhandled AttributeError that replaces the real exit-46 classification."""
+    async def messages():
+        yield _started()
+        await anyio.sleep(10)
+
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", 5)
+
+    with pytest.raises(run_implementer.ImplementerOrphanedSubagent):
+        anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+
+
 def test_outer_timeout_after_the_drain_keeps_the_work_instead_of_charging(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -464,3 +621,70 @@ def test_outer_timeout_after_the_drain_keeps_the_work_instead_of_charging(
     anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
 
     assert "after the sub-agent was awaited" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Per-command execution budget wiring (mctl-agents#430)
+# ---------------------------------------------------------------------------
+def test_run_implementer_agent_wires_the_deadline_and_ledger_into_the_builder(
+    tmp_path, monkeypatch,
+) -> None:
+    """The absolute deadline handed to `build_implementer_agent_options` must
+    be on the SAME monotonic clock `anyio.fail_after` uses, and the ledger
+    passed through unchanged."""
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+
+    captured: dict = {}
+    real_builder = run_implementer.build_implementer_agent_options
+
+    def spy_builder(*args, **kwargs):
+        captured.update(kwargs)
+        return real_builder(*args, **kwargs)
+
+    monkeypatch.setattr(run_implementer, "build_implementer_agent_options", spy_builder)
+
+    ledger = run_implementer.CommandBudgetLedger()
+    before = None
+
+    async def _run():
+        nonlocal before
+        before = anyio.current_time()
+        await run_implementer._run_implementer_agent(
+            tmp_path, "prompt", tmp_path, budget_ledger=ledger,
+        )
+
+    anyio.run(_run)
+
+    assert captured["budget_ledger"] is ledger
+    assert captured["deadline_monotonic"] is not None
+    # Deadline should be ~5s after the call started, not e.g. `inf` or 0.
+    assert before < captured["deadline_monotonic"] <= before + 5 + 1
+
+
+def test_run_implementer_agent_omits_the_ledger_when_the_caller_does_not_pass_one(
+    tmp_path, monkeypatch,
+) -> None:
+    """Every pre-#430 caller (no `budget_ledger` kwarg) must resolve options
+    with the guard omitted -- byte-identical to today's behaviour."""
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, "prompt", tmp_path)
+    # Must not raise -- and, since no guard is installed, no Bash tool is
+    # ever invoked by this fake stream, so nothing to assert beyond "it ran".
+
+
+def test_run_implementer_agent_warns_once_when_the_timeout_binary_is_absent(
+    tmp_path, monkeypatch, capsys,
+) -> None:
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", _fake_client_factory(_fast_messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+    monkeypatch.setattr(run_implementer.shutil, "which", lambda _name: None)
+
+    anyio.run(
+        run_implementer._run_implementer_agent,
+        tmp_path, "prompt", tmp_path,
+    )
+
+    assert "timeout" in capsys.readouterr().err

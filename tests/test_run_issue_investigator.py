@@ -193,6 +193,80 @@ def test_a_file_is_not_a_proposal_directory(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A `rejected` directory must not block its own replacement (mctl-agents#438)
+# ---------------------------------------------------------------------------
+def _proposal(proposals: Path, slug: str, status: str | None) -> Path:
+    directory = proposals / slug
+    directory.mkdir(parents=True)
+    if status is not None:
+        (directory / ".status.yaml").write_text(f"status: {status}\nupdated_by: test\n")
+    return directory
+
+
+V1_404 = "issue-404-devloopworkflow-never-calls-continue-as"
+V2_404 = "issue-404-devloopworkflow-never-calls-continue-as-v2"
+
+
+def test_a_rejected_proposal_does_not_block_its_replacement(tmp_path):
+    """The production case: a closed-unmerged PR left v1 `rejected`."""
+    proposals = tmp_path / "proposals"
+    _proposal(proposals, V1_404, "rejected")
+    _proposal(proposals, V2_404, "accepted")
+
+    assert resolve_slug(proposals, 404, "whatever") == V2_404
+
+
+def test_two_rejected_proposals_are_still_refused(tmp_path):
+    proposals = tmp_path / "proposals"
+    _proposal(proposals, V1_404, "rejected")
+    _proposal(proposals, V2_404, "rejected")
+
+    with pytest.raises(ProposalAmbiguityError, match="rejected"):
+        resolve_slug(proposals, 404, "whatever")
+
+
+def test_two_accepted_proposals_are_still_refused(tmp_path):
+    proposals = tmp_path / "proposals"
+    _proposal(proposals, V1_404, "accepted")
+    _proposal(proposals, V2_404, "accepted")
+
+    with pytest.raises(ProposalAmbiguityError) as excinfo:
+        resolve_slug(proposals, 404, "whatever")
+
+    message = str(excinfo.value)
+    assert V1_404 in message
+    assert V2_404 in message
+
+
+def test_merged_beside_accepted_is_still_refused(tmp_path):
+    """Reopened/continued-issue semantics are not decided by this fix."""
+    proposals = tmp_path / "proposals"
+    _proposal(proposals, V1_404, "merged")
+    _proposal(proposals, V2_404, "accepted")
+
+    with pytest.raises(ProposalAmbiguityError):
+        resolve_slug(proposals, 404, "whatever")
+
+
+def test_a_lone_rejected_proposal_is_still_reused(tmp_path):
+    """One directory is not a choice — unchanged behaviour."""
+    proposals = tmp_path / "proposals"
+    _proposal(proposals, V1_404, "rejected")
+
+    assert resolve_slug(proposals, 404, "whatever") == V1_404
+
+
+def test_a_status_file_that_cannot_be_parsed_keeps_the_proposal_live(tmp_path):
+    proposals = tmp_path / "proposals"
+    broken = _proposal(proposals, V1_404, None)
+    (broken / ".status.yaml").write_text("status: [unclosed\n")
+    _proposal(proposals, V2_404, "accepted")
+
+    with pytest.raises(ProposalAmbiguityError):
+        resolve_slug(proposals, 404, "whatever")
+
+
+# ---------------------------------------------------------------------------
 # write_status_yaml
 # ---------------------------------------------------------------------------
 def _issue(number=123, title="Add monitoring", repo="mctl-telegram"):
@@ -219,6 +293,53 @@ def test_write_status_yaml_shape(tmp_path):
         "url": "https://github.com/mctlhq/mctl-telegram/issues/123",
     }
     assert data["control"]["requires_human_approval"] is True
+
+
+def test_write_status_yaml_with_requested_by_writes_a_request_block(tmp_path):
+    """mctlhq/mctl-agents#417: a re-investigation dispatched by a directive
+    comment records who asked for it."""
+    proposal_dir = tmp_path / "proposals" / "issue-123-add-monitoring"
+    status_path = write_status_yaml(
+        proposal_dir, _issue(),
+        requested_by="octocat",
+        requested_comment_url="https://github.com/mctlhq/mctl-telegram/issues/123#issuecomment-1",
+    )
+
+    data = yaml.safe_load(status_path.read_text())
+    assert data["request"]["by"] == "octocat"
+    assert data["request"]["comment"] == (
+        "https://github.com/mctlhq/mctl-telegram/issues/123#issuecomment-1"
+    )
+    assert "received_at" in data["request"]
+
+
+def test_write_status_yaml_without_requested_by_writes_an_unchanged_payload(tmp_path):
+    """The label-driven path never passes `requested_by` — the payload must
+    stay byte-for-byte what it was before this parameter existed."""
+    proposal_dir = tmp_path / "proposals" / "issue-123-add-monitoring"
+    status_path = write_status_yaml(proposal_dir, _issue())
+
+    data = yaml.safe_load(status_path.read_text())
+    assert "request" not in data
+
+
+def test_update_status_file_preserves_the_request_block(tmp_path):
+    """The requester survives every later transition, the same as `source`."""
+    from orchestrator.proposal_state import update_status_file
+
+    proposal_dir = tmp_path / "proposals" / "issue-123-add-monitoring"
+    status_path = proposal_dir / ".status.yaml"
+    write_status_yaml(
+        proposal_dir, _issue(),
+        requested_by="octocat",
+        requested_comment_url="https://github.com/mctlhq/mctl-telegram/issues/123#issuecomment-1",
+    )
+
+    update_status_file(status_path, "in-progress")
+
+    data = yaml.safe_load(status_path.read_text())
+    assert data["status"] == "in-progress"
+    assert data["request"]["by"] == "octocat"
 
 
 def test_write_status_yaml_never_publishes_an_unrunnable_proposal(tmp_path):
@@ -511,6 +632,28 @@ def test_a_previous_runs_files_do_not_count_as_this_runs_output(tmp_path, monkey
     # The good proposal from run one is preserved — the rollback deliberately
     # spares a directory it did not create.
     assert (first.proposal_dir / ".status.yaml").is_file()
+
+
+def test_investigate_threads_requested_by_into_the_status_file(tmp_path, monkeypatch):
+    """mctlhq/mctl-agents#417: a directive-comment-driven re-investigation
+    records who asked for it, end to end through investigate()."""
+    issue = _investigate_harness(
+        tmp_path, monkeypatch,
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"v1 {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    result = investigate(
+        issue.ref.url, state_dir=tmp_path,
+        requested_by="octocat",
+        requested_comment_url=f"{issue.ref.url}#issuecomment-1",
+    )
+    assert result.error is None
+
+    data = yaml.safe_load((result.proposal_dir / ".status.yaml").read_text())
+    assert data["request"]["by"] == "octocat"
+    assert data["request"]["comment"] == f"{issue.ref.url}#issuecomment-1"
 
 
 def test_an_identical_rewrite_is_accepted(tmp_path, monkeypatch):

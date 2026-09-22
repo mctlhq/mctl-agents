@@ -37,6 +37,7 @@ import yaml
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
 
+from orchestrator.proposal_state import execution_authorization, unrunnable_reason
 from orchestrator.temporal.activities.pr_state import _PR_API_URL_RE, _PR_URL_RE
 from orchestrator.temporal.activities.proposals import (
     AGENTS_STATE_PREFIX,
@@ -54,7 +55,10 @@ TREE_URL = (
 # Bound on the blob cache. Well above today's 212 proposals, and small
 # enough that a worker that never restarts cannot grow it without limit.
 _BLOB_CACHE_MAX = 4096
-_blob_cache: OrderedDict[str, tuple[str, str | None]] = OrderedDict()
+_ParsedStatus = tuple[
+    str, str | None, str | None, str | None, bool, bool, str | None, str | None
+]
+_blob_cache: OrderedDict[str, _ParsedStatus] = OrderedDict()
 
 # How many blob/PR reads to have in flight at once. The worker shares one
 # GitHub token with every dev loop; a burst of 200 parallel reads would
@@ -74,6 +78,48 @@ class ProposalStateRef:
     slug: str
     status: str
     pr_url: str | None
+    #: The `.status.yaml` `updated_at` field — a field extraction from the
+    #: blob already being read, not a second fetch. Defaulted so a ref
+    #: built before this field existed still constructs. Two independent
+    #: consumers read it: the implement-sweep's stranding predicate
+    #: (mctl-agents#412, orchestrator/temporal/activities/stranded.py) and
+    #: mctl-agents#417's directive-staleness report, which compares a
+    #: comment's timestamp against this value.
+    updated_at: str | None = None
+    # The three fields below feed only the implement-sweep's stranding
+    # predicate; reconcile/orphans never read them. Defaulted so a result
+    # recorded by a worker before this change still deserializes — the
+    # same rule PRSnapshot.head_sha follows.
+    #: The `attempt.expires_at` .status.yaml records while an implementer
+    #: run holds this proposal (run_implementer.IMPLEMENT_ATTEMPT_LEASE).
+    #: None when there is no in-flight attempt.
+    attempt_expires_at: str | None = None
+    #: `proposal_state.unrunnable_reason(data) is not None` — a proposal
+    #: that is `accepted` with `control.requires_human_approval` set and no
+    #: verified approver (mctl-agents#349). A submit here could only refuse.
+    unrunnable: bool = False
+    #: Whether a durable `blocked:` marker is present, written once by
+    #: run_implementer for the same permanently-unrunnable condition.
+    blocked: bool = False
+    #: `proposal_state.execution_authorization(data)` — what explicitly
+    #: authorizes executing this proposal, or None when nothing does. None is
+    #: the fail-closed default and the shape all 69 legacy `incident-*`
+    #: records carry: no `control` block, no `approval`, written by an agent's
+    #: own auto-accept. `unrunnable` covers the neighbouring case (a control
+    #: block that DEMANDS approval and has none); this covers the one that
+    #: demands nothing, which is not the same fact as being authorised
+    #: (mctl-agents#412, the 2026-09-19 product decision).
+    #:
+    #: Note what is deliberately NOT here: `updated_by`. Who wrote a record is
+    #: not authorization to execute it, so the sweep is not given the field it
+    #: would need to build a writer allowlist out of.
+    execution_authorization: str | None = None
+    #: Why nothing authorizes it, when `execution_authorization` is None.
+    #: Two shapes with opposite remedies share that None — a record that was
+    #: never approved at all, and one a human DID approve through a path that
+    #: recorded no identity — and an operator triaging the quarantine needs
+    #: to tell them apart. Exactly one of the two fields is ever set.
+    unauthorized_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,32 +166,72 @@ def _headers(token: str) -> dict[str, str]:
     }
 
 
-def _cache_get(sha: str) -> tuple[str, str | None] | None:
+def _cache_get(sha: str) -> _ParsedStatus | None:
     hit = _blob_cache.get(sha)
     if hit is not None:
         _blob_cache.move_to_end(sha)
     return hit
 
 
-def _cache_put(sha: str, value: tuple[str, str | None]) -> None:
+def _cache_put(sha: str, value: _ParsedStatus) -> None:
     _blob_cache[sha] = value
     _blob_cache.move_to_end(sha)
     while len(_blob_cache) > _BLOB_CACHE_MAX:
         _blob_cache.popitem(last=False)
 
 
-def _parse_status_yaml(text: str) -> tuple[str, str | None]:
-    """Return (status, pr_url) from a .status.yaml body.
+def _parse_status_yaml(text: str) -> _ParsedStatus:
+    """Return (status, pr_url, updated_at, attempt_expires_at, unrunnable,
+    blocked, execution_authorization, unauthorized_reason) from a .status.yaml
+    body.
 
     Mirrors run_shepherd._load_status: flat YAML written by the
     investigator, defaulting to "proposed" the way _discover_refs does.
+    `updated_at` is None when absent or unparseable — a status file older
+    than mctl-agents#417, whose directive-staleness report is the other
+    consumer of this field alongside the implement-sweep's stranding
+    predicate below.
+
+    The last five are read once here, alongside status/pr_url, rather than
+    via a second parse of the same blob: they exist for the implement-sweep's
+    stranding predicate (mctl-agents#412), which needs to tell an `accepted`
+    proposal a live implementer run still holds (`attempt`) or that can never
+    run as written (`unrunnable`/`blocked`) from one a DevLoopWorkflow simply
+    has not reached yet — and, separately, needs `execution_authorization` to
+    tell "nothing ever authorised executing this" from "a human did".
+
+    `updated_at`/`attempt_expires_at` are normalized to `str(...)` here
+    rather than left as whatever PyYAML produced: an unquoted timestamp in
+    `.status.yaml` parses to a native `datetime.datetime`, and `str()` on
+    that yields a space-separated, `+00:00`-suffixed form that is NOT
+    directly comparable, lexicographically, to GitHub's `T`/`Z`-suffixed
+    RFC 3339 strings — callers that compare these against another
+    timestamp (`discovery._stale_directives`) must parse both sides into
+    `datetime` objects first, never compare the raw strings.
     """
     data = yaml.safe_load(text)
     if not isinstance(data, dict):
         raise ValueError("status file is not a mapping")
     status = str(data.get("status", "proposed"))
     pr = data.get("pr")
-    return status, str(pr) if pr else None
+    raw_updated_at = data.get("updated_at")
+    updated_at = str(raw_updated_at) if raw_updated_at is not None else None
+    attempt = data.get("attempt")
+    raw_expires_at = attempt.get("expires_at") if isinstance(attempt, dict) else None
+    attempt_expires_at = str(raw_expires_at) if raw_expires_at is not None else None
+    unrunnable = unrunnable_reason(data) is not None
+    blocked = bool(data.get("blocked"))
+    authorization, unauthorized = execution_authorization(data)
+    return (
+        status,
+        str(pr) if pr else None,
+        str(updated_at) if updated_at else None,
+        str(attempt_expires_at) if attempt_expires_at else None,
+        unrunnable,
+        blocked,
+        authorization,
+        unauthorized,
+    )
 
 
 async def _resolve_token_async() -> str:
@@ -177,7 +263,7 @@ async def _get_json(client: httpx.AsyncClient, url: str, token: str) -> object:
         raise ProposalListingError(f"non-JSON payload from {url}") from exc
 
 
-async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> tuple[str, str | None]:
+async def _read_blob(client: httpx.AsyncClient, sha: str, token: str) -> _ParsedStatus:
     cached = _cache_get(sha)
     if cached is not None:
         return cached
@@ -258,7 +344,16 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
         async def one(service: str, slug: str, sha: str) -> ProposalStateRef | None:
             async with semaphore:
                 try:
-                    status, pr_url = await _read_blob(client, sha, token)
+                    (
+                        status,
+                        pr_url,
+                        updated_at,
+                        attempt_expires_at,
+                        unrunnable,
+                        blocked,
+                        authorization,
+                        unauthorized,
+                    ) = await _read_blob(client, sha, token)
                 except (ValueError, yaml.YAMLError) as exc:
                     # One unparseable status file must not blind the sweep to
                     # the other 200 — same tolerance _discover_refs has.
@@ -269,7 +364,18 @@ async def list_proposal_refs() -> list[ProposalStateRef]:
                         exc,
                     )
                     return None
-            return ProposalStateRef(service=service, slug=slug, status=status, pr_url=pr_url)
+            return ProposalStateRef(
+                service=service,
+                slug=slug,
+                status=status,
+                pr_url=pr_url,
+                updated_at=updated_at,
+                attempt_expires_at=attempt_expires_at,
+                unrunnable=unrunnable,
+                blocked=blocked,
+                execution_authorization=authorization,
+                unauthorized_reason=unauthorized,
+            )
 
         results = await _gather_or_raise([one(s, g, sha) for s, g, sha in paths])
 

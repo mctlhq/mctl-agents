@@ -128,6 +128,50 @@ def test_main_exits_45_for_a_blocked_only_batch(monkeypatch, tmp_path, capsys) -
     assert "1 blocked" in output
 
 
+# --- main()'s exit-code table for a batch that includes a stale-source ----
+# admission refusal (codex P2 follow-up on mctl-agents#410): a refusal must
+# not force a red run when the same tick also implemented a real proposal.
+
+def _stale_source_result(slug: str) -> run_implementer.ImplementResult:
+    return run_implementer.ImplementResult(
+        ref=_ref(slug),
+        pr_url=None,
+        error="source-resolved",
+        counts_toward_limit=False,
+        stale_source=("source-resolved", "mctlhq/mctl-telegram#510"),
+    )
+
+
+def test_main_exits_0_for_a_stale_source_only_batch(monkeypatch, tmp_path, capsys) -> None:
+    # codex P2 follow-up on mctl-agents#410 (PR #416): the `needs-triage`
+    # write IS the retirement, and the downstream commit-and-push step is
+    # gated on this step's Argo status, not its exit code, so a non-zero
+    # exit here can lose that write and make the proposal repeat forever.
+    # main() returns normally (no sys.exit) even for a refusal-only batch.
+    _run_main(monkeypatch, tmp_path, [_stale_source_result("stale-only")])
+
+    output = capsys.readouterr().out
+    assert "=== Stale source ===" in output
+    assert "1 stale source" in output
+
+
+def test_main_exits_0_when_a_stale_source_refusal_shares_a_batch_with_success(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    success = run_implementer.ImplementResult(
+        ref=_ref("real-work"),
+        pr_url="https://github.com/mctlhq/mctl-agents/pull/9",
+    )
+
+    # main() returns normally (no sys.exit) when the batch is not all-red.
+    _run_main(monkeypatch, tmp_path, [_stale_source_result("stale"), success])
+
+    output = capsys.readouterr().out
+    assert "=== Stale source ===" in output
+    assert "1 succeeded" in output
+    assert "0 failed" in output
+
+
 def test_main_exits_zero_when_a_blocked_result_coexists_with_a_pr(
     monkeypatch, tmp_path
 ) -> None:

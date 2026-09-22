@@ -113,6 +113,7 @@ agents:
     triggeredBy:
       - mctl_trigger_issue (MCP, admin-only)
       - orchestrator/run_issue_poller.py (agents:intake label)
+      - orchestrator/run_issue_directive_poller.py (@MCTL reinvestigate comment)
     notes: >-
       cwd is a throwaway shallow clone of the target repo, so the SDK picks up
       no mctl-agents-owned prompt files at all: the inline template is this
@@ -170,7 +171,16 @@ agents:
     writes: commits + branch + PR on mctlhq/<service>
     riskLevel: high         # the only agent that authors code
     triggeredBy:
-      - cronworkflow-mctl-agents-implement (currently suspend: true)
+      - >-
+        cronworkflow-mctl-agents-implement (suspended, and superseded rather
+        than merely paused: implement-sweep-mctl-agents-schedule below,
+        agents#412, now covers the same sweep-and-run cadence through the
+        admission queue instead of bypassing it)
+      - >-
+        implement-sweep-mctl-agents-schedule (Temporal, every 15 min offset
+        12, ships unpaused; ImplementSweepWorkflow submits
+        mctl-agents-implement scoped to service+slug for any accepted
+        proposal no live DevLoopWorkflow owns — agents#412)
       - mctl_trigger_implementer (MCP, admin-only)
       - forked by run_shepherd.py with --review-feedback
     notes: >-

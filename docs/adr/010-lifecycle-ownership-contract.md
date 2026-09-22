@@ -456,6 +456,22 @@ the steward or handing the shepherd merge rights.
 No `.status.yaml` is created and no proposal is synthesised. The *shape* exists
 from phase 1; the *discovery* of adoptable PRs is #334's own work.
 
+Shipped as `orchestrator/pr_adoption.py`: a second durable record,
+`agents-state/<service>/adopted-prs/pr-<number>/.prref.yaml`, discovered by
+`discover_adoptable()` and driven by the existing `process_one` /
+`run_implementer --review-feedback` path, FIX_ONLY, behind
+`SHEPHERD_ADOPT_PRS` (default off). It acquires ownership directly as
+`owner_type: shepherd` rather than `reconciler`-then-handoff: the reconciler
+cannot fork `run_implementer` or write to the gitops worktree (see "the
+reconciler does not keep what it recovers" below), so a `reconciler`-first
+adoption would have nothing to hand off to except the shepherd's own next
+tick — the same actor, one hop later. The phase-3 `reconciler` -> `shepherd`
+hand-off this paragraph originally described remains future work for the
+cases where the reconciler recovers a *different* kind of orphaned entity.
+
+`policy_ref` is recorded on every acquire (`policy.policy_ref_for`), so the
+later integration has something durable to read.
+
 ### 11. Access control
 
 The write API decides who may mutate a PR, so its identity boundary is part of

@@ -14,7 +14,11 @@ stateDiagram-v2
     Done --> [*]
 
     note right of AwaitApproval
-      wait_condition — ждём сигнала сколько угодно.
+      Bounded (mctl-agents#420): опрашиваем каждые
+      APPROVAL_POLL_INTERVAL (6h), перечитываем состояние
+      issue и завершаемся, если оно closed; истекает через
+      APPROVAL_WAIT_DEADLINE (14d), если ничего не пришло.
+      Сигнал abandon завершает ожидание досрочно.
       approve() теперь ФЛИПАЕТ .status.yaml:
       CWFT mctl-agents-approve коммитит
       proposed → accepted под mutex (идемпотентно,

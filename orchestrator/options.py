@@ -1,14 +1,25 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import anyio
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
 from config.settings import MCTL_MCP_URL
+from orchestrator.ci_checks import CI_LOG_MAX_CHECKS
+from orchestrator.exec_budget import (
+    CommandBudgetLedger,
+    command_budget,
+    detachment_match,
+    is_shell_state_only,
+    wrap_bounded,
+)
+from orchestrator.exec_budget import normalize_shell_command as _normalize_shell_command
 from orchestrator.resolver import ExecutionPlan
 
 
@@ -176,6 +187,217 @@ ISSUE_INVESTIGATOR_DRAIN_TIMEOUT_SECONDS = _positive_seconds(
 IMPLEMENTER_COMMAND_TIMEOUT_SECONDS = float(
     os.getenv("IMPLEMENTER_COMMAND_TIMEOUT_SECONDS", "300")
 )
+# ---------------------------------------------------------------------------
+# Work-class-derived execution envelope (mctl-agents#423).
+#
+# #411 made a failing required CI check a first-class review-remediation
+# blocker, but the implementer's whole execution still ran inside the ONE
+# IMPLEMENTER_TIMEOUT_SECONDS envelope sized for "read a handful of review
+# findings and edit a few lines". A CI-remediation bundle is genuinely more
+# work (analysing a bounded log excerpt per failing check, on top of the
+# fix), and — now that ci_checks.fetch_failure_logs() moves log retrieval
+# OUT of the envelope and into the shepherd tick (see orchestrator/ci_checks.py)
+# — that extra work is the only thing left for the envelope to fund.
+# ---------------------------------------------------------------------------
+# Per-check analysis budget added to the base envelope for a CI-remediation or
+# mixed run, capped at CI_LOG_MAX_CHECKS checks (see implementer_envelope()).
+IMPLEMENTER_CI_ANALYSIS_SECONDS = _positive_seconds(
+    "IMPLEMENTER_CI_ANALYSIS_SECONDS", default=120.0
+)
+# Hard ceiling on the derived envelope, whatever work class or check count
+# produced it. Never exceeded — this is the number an operator can point to
+# and say "no single implementer run can run longer than this".
+IMPLEMENTER_TIMEOUT_CEILING_SECONDS = _positive_seconds(
+    "IMPLEMENTER_TIMEOUT_CEILING_SECONDS", default=1800.0
+)
+# The slice of any envelope that must survive drain/teardown so a run that
+# analysed its evidence still has time left to actually mutate code and
+# commit. validate_budget_contract() (below) asserts every work class's
+# envelope leaves at least this much after 2x the drain sub-budget.
+IMPLEMENTER_MUTATION_RESERVE_SECONDS = _positive_seconds(
+    "IMPLEMENTER_MUTATION_RESERVE_SECONDS", default=180.0
+)
+# Bound on the shielded teardown _run_implementer_agent performs when the
+# outer envelope expires with a delegated task still live: disconnect the SDK
+# client and terminate its CLI child before the process exits, rather than
+# abandoning them (mctl-agents#423).
+IMPLEMENTER_TEARDOWN_GRACE_SECONDS = _positive_seconds(
+    "IMPLEMENTER_TEARDOWN_GRACE_SECONDS", default=15.0
+)
+# ---------------------------------------------------------------------------
+# Per-command execution budget (mctl-agents#430).
+#
+# #423 bounded CI-log retrieval; live acceptance on mctlhq/mctl-telegram#652
+# showed a second hole -- legitimate local verification (`go test -race ...
+# &`, then polling the background shell) that is bounded only by the CLI's
+# own tool timeout, which backgrounds rather than fails an over-running
+# command (ADR-011 "Containment"). These knobs let every implementer-owned
+# Bash call derive its own bound from what remains of the run's envelope
+# instead. See orchestrator/exec_budget.py for the pure logic.
+# ---------------------------------------------------------------------------
+# The slice of the remaining envelope held back from every derived command
+# bound so `_run_implementer_agent` still has time, after the last command
+# returns, to cancel it, drain any delegated children, write the structured
+# marker and return before the outer bound fires. Deliberately NOT
+# IMPLEMENTER_DRAIN_TIMEOUT_SECONDS (300s), which would leave a 900s
+# `review` envelope with too little command budget to be useful -- see the
+# proposal's "open questions" for the 120s default's derivation
+# (IMPLEMENTER_TEARDOWN_GRACE_SECONDS + a closing turn + the commit).
+IMPLEMENTER_TEARDOWN_RESERVE_SECONDS = _positive_seconds(
+    "IMPLEMENTER_TEARDOWN_RESERVE_SECONDS", default=120.0
+)
+# Below this, a derived command bound is not worth admitting -- it would
+# expire before the command can do anything useful. `command_budget()`
+# returns `None` (deny) rather than a bound under this floor.
+IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS = _positive_seconds(
+    "IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS", default=20.0
+)
+# The Claude Code Bash tool's own ceiling for its `timeout` input, in
+# milliseconds. A larger value is not honoured, so injecting one would leave
+# the tool-input clamp inoperative and put the whole bound on the OS wrapper
+# alone (claude P3 on `624a433`).
+BASH_TOOL_MAX_TIMEOUT_MS = 600_000
+
+# `timeout --kill-after=<this>s` on every wrapped command: SIGTERM first, then
+# SIGKILL after this much longer if the process group ignored it. Keeps the
+# "no live child remains" guarantee even against a command that traps SIGTERM.
+IMPLEMENTER_COMMAND_KILL_GRACE_SECONDS = _positive_seconds(
+    "IMPLEMENTER_COMMAND_KILL_GRACE_SECONDS", default=5.0
+)
+# Break-glass: "0" (or any falsy-looking value) disables REWRITING commands
+# under `timeout` while leaving the tool-input clamp and the detachment
+# denials in place. Rollback lever named in the proposal's design, not a
+# knob a normal run should ever need to touch.
+IMPLEMENTER_BOUND_COMMANDS = os.getenv(
+    "IMPLEMENTER_BOUND_COMMANDS", "1"
+).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def implementer_envelope(work_class: str, n_checks: int = 0) -> float:
+    """The outer `anyio.fail_after` bound for one implementer run.
+
+    `work_class` is `"review"` (the pre-#423 default — the base envelope,
+    unconditionally), `"ci-remediation"` (CI failures only) or `"mixed"`
+    (CI failures plus review findings) — see
+    `run_implementer._bundle_work_class`. For the latter two, the envelope
+    widens by `IMPLEMENTER_CI_ANALYSIS_SECONDS` per failing check actually
+    carried in the bundle, capped at `CI_LOG_MAX_CHECKS` (retrieval itself
+    never fetches more than that many logs, so analysing more than that
+    many is not a cost this formula needs to fund) and at
+    `IMPLEMENTER_TIMEOUT_CEILING_SECONDS` overall.
+
+    Deliberately NOT a blanket timeout increase (see design.md's rejected
+    alternative 1): a `"review"` bundle keeps the exact pre-#423 envelope,
+    the widening is proportional to a bounded count of bounded evidence, and
+    it is capped and logged rather than silently unbounded.
+
+    `IMPLEMENTER_TIMEOUT_CEILING_SECONDS` bounds every work class, `"review"`
+    included -- `_review_claim_lease_default()` derives its lease from the
+    ceiling alone on the assumption that no class's envelope can exceed it
+    (mctl-agents#423 review P2: a `"review"` run used to return
+    `IMPLEMENTER_TIMEOUT_SECONDS` uncapped, so an env override raising that
+    past the ceiling would silently outlive the lease sized from it).
+    """
+    if work_class not in ("ci-remediation", "mixed"):
+        return min(IMPLEMENTER_TIMEOUT_CEILING_SECONDS, IMPLEMENTER_TIMEOUT_SECONDS)
+    n = max(0, min(n_checks, CI_LOG_MAX_CHECKS))
+    return min(
+        IMPLEMENTER_TIMEOUT_CEILING_SECONDS,
+        IMPLEMENTER_TIMEOUT_SECONDS + n * IMPLEMENTER_CI_ANALYSIS_SECONDS,
+    )
+
+
+def validate_budget_contract() -> None:
+    """Assert every work class's envelope leaves room for drain + mutation,
+    and for at least one command at the floor budget (mctl-agents#430).
+
+    `2 * IMPLEMENTER_DRAIN_TIMEOUT_SECONDS` because `drain_until_settled` can
+    restart its own clock once on a second delegation observed mid-drain (see
+    the IMPLEMENTER_DRAIN_TIMEOUT_SECONDS comment above); the reserve on top of
+    that is what `_run_implementer_agent` needs left over to actually commit.
+
+    Matches `_positive_seconds`'s "loud and harmless" policy rather than
+    raising: this runs at import time, so a raise here would make a bad
+    combination of env vars a hard startup failure for every mode that
+    imports this module, not just the implementer. Instead it logs the
+    violation and clamps `IMPLEMENTER_DRAIN_TIMEOUT_SECONDS` down just enough
+    for the mutation reserve to survive, for the tightest work class it
+    checked — clamping the ceiling or the reserve itself would silently erode
+    the two guarantees (a hard cap, and code-mutation time) this contract
+    exists to protect.
+
+    The second assertion — `envelope >= IMPLEMENTER_TEARDOWN_RESERVE_SECONDS +
+    IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS + IMPLEMENTER_MUTATION_RESERVE_SECONDS`
+    — is the same policy applied to the per-command teardown reserve: on
+    violation it clamps `IMPLEMENTER_TEARDOWN_RESERVE_SECONDS` down (never the
+    ceiling, never the mutation reserve — the two guarantees above), so the
+    deadline guard still admits at least one command at the floor budget
+    rather than denying every command on a tight envelope.
+    """
+    global IMPLEMENTER_DRAIN_TIMEOUT_SECONDS, IMPLEMENTER_TEARDOWN_RESERVE_SECONDS
+    for work_class in ("review", "ci-remediation", "mixed"):
+        envelope = implementer_envelope(work_class, n_checks=CI_LOG_MAX_CHECKS)
+        required = 2 * IMPLEMENTER_DRAIN_TIMEOUT_SECONDS + IMPLEMENTER_MUTATION_RESERVE_SECONDS
+        if envelope < required:
+            clamped_drain = max(0.0, (envelope - IMPLEMENTER_MUTATION_RESERVE_SECONDS) / 2)
+            print(
+                f"warn: implementer envelope for work_class={work_class!r} "
+                f"({envelope:g}s) cannot satisfy 2*drain+mutation-reserve "
+                f"({required:g}s); clamping IMPLEMENTER_DRAIN_TIMEOUT_SECONDS "
+                f"{IMPLEMENTER_DRAIN_TIMEOUT_SECONDS:g}s -> {clamped_drain:g}s so the "
+                f"mutation reserve survives",
+                file=sys.stderr,
+            )
+            IMPLEMENTER_DRAIN_TIMEOUT_SECONDS = clamped_drain
+
+        required_reserve = (
+            IMPLEMENTER_TEARDOWN_RESERVE_SECONDS
+            + IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS
+            + IMPLEMENTER_MUTATION_RESERVE_SECONDS
+        )
+        if envelope < required_reserve:
+            clamped_reserve = max(
+                0.0,
+                envelope - IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS - IMPLEMENTER_MUTATION_RESERVE_SECONDS,
+            )
+            print(
+                f"warn: implementer envelope for work_class={work_class!r} "
+                f"({envelope:g}s) cannot satisfy teardown-reserve+min-command-"
+                f"budget+mutation-reserve ({required_reserve:g}s); clamping "
+                f"IMPLEMENTER_TEARDOWN_RESERVE_SECONDS "
+                f"{IMPLEMENTER_TEARDOWN_RESERVE_SECONDS:g}s -> {clamped_reserve:g}s "
+                f"so the minimum command budget and the mutation reserve survive",
+                file=sys.stderr,
+            )
+            if clamped_reserve <= 0.0:
+                # Not the same event as an ordinary clamp, and the drain
+                # clamp's wording does not describe it (claude P3 on
+                # `624a433`). A zero reserve means `command_budget()` hands
+                # the WHOLE remaining envelope to one command, leaving the
+                # run nothing in which to cancel it, write its marker and
+                # return -- so the outer bound, not the guard, becomes what
+                # ends the run, which is the failure mode mctl-agents#430
+                # exists to remove. Still a clamp rather than a raise, to
+                # match this function's standing policy, but it must not be
+                # mistaken for a routine adjustment.
+                print(
+                    f"warn: IMPLEMENTER_TEARDOWN_RESERVE_SECONDS is now 0s for "
+                    f"work_class={work_class!r}: the per-command deadline guard "
+                    f"can no longer hold anything back for teardown, so a run "
+                    f"may be cut off by its outer bound before it can record "
+                    f"its outcome. Raise the envelope or lower "
+                    f"IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS/"
+                    f"IMPLEMENTER_MUTATION_RESERVE_SECONDS.",
+                    file=sys.stderr,
+                )
+            IMPLEMENTER_TEARDOWN_RESERVE_SECONDS = clamped_reserve
+
+
+# Run at import time, not lazily: a bad combination of env vars must be loud
+# the moment this module loads, in whichever process imported it (implementer,
+# shepherd, or a test), not only the first time an implementer run happens to
+# need the clamped value.
+validate_budget_contract()
 # Tier 3 shepherd budget — soft cap per shepherd tick.
 # Covers the shepherd's own spend only: the sub-agent classification call
 # that turns codex findings into the bundle, plus the small amount of
@@ -264,6 +486,306 @@ def _command_audit_hooks() -> dict[HookEventName, list[HookMatcher]]:
     }
 
 
+# A `gh` global option (`-R owner/repo`, `--repo=owner/repo`, `--hostname
+# x`, boolean flags like `-h`) between `gh` and its subcommand. Matched
+# against tokens, not enumerated by name, so any current or future gh global
+# flag is skipped the same way — the alternative (naming `-R`/`--repo`
+# explicitly) is exactly the "exact textual spelling instead of command
+# semantics" mistake this pattern exists to avoid (mctl-agents#423
+# fix-forward, verified Agy P2 on PR #425's merged head).
+#
+# The short-flag branch is `-[A-Za-z]\S*` rather than a bare `-[A-Za-z]`: gh
+# (Go's pflag) accepts an attached shorthand value with no separator at all
+# (`-Rowner/repo`), and `\S*` swallows it as part of the flag token so it is
+# never mistaken for the subcommand. The value branch is `=\S*|\s+\S+`
+# rather than `[=\s]\S+`: the latter treats `=`/whitespace as a single
+# interchangeable character, so `-R  owner/repo` (two spaces — including a
+# continuation normalized to more than one space) left `owner/repo`
+# unconsumed once the first space was spent on `[=\s]` (verified Agy P2,
+# round 2, on this same PR).
+_GH_GLOBAL_FLAG = r"(?:-[A-Za-z]\S*|--[A-Za-z][\w-]*)(?:=\S*|\s+\S+)?"
+_GH_PREFIX = rf"\bgh\b(?:\s+{_GH_GLOBAL_FLAG})*"
+
+# Bash command shapes that fetch a CI log with no bound of their own
+# (mctl-agents#423). Matched against the raw command string a Bash tool call
+# would run — case-insensitive, since `gh`/`curl`/`wget` invocations are
+# lowercase by convention but a model can capitalise anything. The command is
+# normalized (see `_normalize_shell_command`) before matching so a
+# backslash-continued multiline invocation cannot slip past `[^&|;\n]*`
+# stopping at the embedded newline.
+_CI_LOG_DENY_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        rf"{_GH_PREFIX}\s+run\s+view\b[^&|;\n]*--log(-failed)?\b",
+        rf"{_GH_PREFIX}\s+api\b[^&|;\n]*/logs\b",
+        r"\b(curl|wget)\b[^&|;\n]*/logs\b",
+    )
+)
+
+
+async def _ci_log_guard_hook(
+    input_data: Any,
+    _tool_use_id: str | None,
+    _context: Any,
+) -> dict[str, Any]:
+    """Deny unbounded CI-log retrieval on a CI-remediation or mixed run.
+
+    The bundle these runs receive already carries a bounded log excerpt per
+    failing check (`ci_checks.fetch_failure_logs()`, fetched in the shepherd
+    process, outside this run's own envelope) — see
+    `run_implementer._render_ci_failures_section`. Nothing in the prompt can
+    reliably stop the agent from fetching the log itself anyway: the CLI's
+    own Bash-tool timeout backgrounds a slow command rather than failing it
+    (mctlhq/mctl-telegram#652), so a ground rule alone cannot prevent the
+    orphaned-subagent failure this proposal exists to fix. Denying the
+    command before it starts is the only control that actually holds.
+
+    Returns a deny decision (see `claude_agent_sdk.types.
+    PreToolUseHookSpecificOutput`) whose reason points the agent at the
+    bundle's own evidence and at the refusal marker as the correct escape
+    when that evidence is genuinely insufficient.
+    """
+    tool_name = ""
+    command = ""
+    if isinstance(input_data, dict):
+        tool_name = str(input_data.get("tool_name") or "")
+        raw = input_data.get("tool_input") or {}
+        if isinstance(raw, dict):
+            command = str(raw.get("command") or "")
+    if tool_name != "Bash" or not command:
+        return {}
+    normalized = _normalize_shell_command(command)
+    if any(p.search(normalized) for p in _CI_LOG_DENY_PATTERNS):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": (
+                    "Unbounded CI-log retrieval is disabled on this run "
+                    "(mctl-agents#423). The bundle already carries a bounded "
+                    "log excerpt for each failing check under 'Log excerpt "
+                    "(bounded, ...)' — use that evidence; it is what exists. "
+                    "If it is genuinely insufficient for a code decision, do "
+                    "not retry the fetch: stop and write the refusal marker "
+                    "instead, explaining what is missing."
+                ),
+            }
+        }
+    return {}
+
+
+def _ci_log_guard_hooks() -> dict[HookEventName, list[HookMatcher]]:
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="Bash", hooks=[cast(Any, _ci_log_guard_hook)]),
+        ],
+    }
+
+
+def _deadline_guard_hook(
+    deadline_monotonic: float,
+    ledger: CommandBudgetLedger,
+    *,
+    timeout_available: bool,
+):
+    """Factory: bind one run's absolute deadline and ledger, return the hook.
+
+    A FACTORY rather than a free function reading `anyio.current_effective_
+    deadline()` — the SDK may dispatch a `PreToolUse` hook outside the
+    caller's own cancel scope, where that call returns `inf` and the guard
+    would silently become a no-op. Closing over an absolute monotonic
+    deadline computed once, next to `anyio.fail_after(envelope_s)`, avoids
+    that (mctl-agents#430; see `run_implementer._run_implementer_agent`).
+
+    Per `Bash` tool call:
+
+    1. `run_in_background: true`, or a detached form (`detachment_match`,
+       read against the QUOTE-MASKED command so quoted text is data) — deny,
+       ledger `denied_background += 1`, reason naming the detachment form.
+    2. `command_budget(...) is None` (the remaining envelope, minus the
+       teardown reserve, cannot clear the floor) — deny, ledger
+       `denied_exhausted += 1`, `exhausted = True`, reason telling the agent
+       to stop and record the bounded outcome.
+    3. otherwise — allow, with `updatedInput` carrying the derived bound: the
+       tool-input `timeout` (milliseconds) is only ever NARROWED (`min`
+       against any caller-supplied value — clamping is one-directional), and
+       — unless `IMPLEMENTER_BOUND_COMMANDS` is off, `timeout_available` is
+       False, or the command is shell-state-only (`is_shell_state_only`) —
+       the `command` itself is rewritten under `wrap_bounded()`, at the SAME
+       effective bound as the clamp (never the wider envelope one), so
+       the bound is enforced at the OS level, not only by the CLI's own tool
+       timeout (which backgrounds rather than fails an over-running command,
+       ADR-011 "Containment"). Ledger `clamped += 1`.
+
+    Non-`Bash` tools return `{}`, untouched.
+
+    Documented fallback if a future CLI/SDK pair stops honouring
+    `updatedInput` on an `allow` decision (see task T8 / the SDK-contract
+    pin): DENY the unbounded form instead, with the exact `timeout`-wrapped
+    command to re-issue in the reason. That needs no SDK support at all,
+    unlike relying on `updatedInput` being applied.
+    """
+
+    async def _hook(
+        input_data: Any,
+        _tool_use_id: str | None,
+        _context: Any,
+    ) -> dict[str, Any]:
+        tool_name = ""
+        tool_input: dict[str, Any] = {}
+        if isinstance(input_data, dict):
+            tool_name = str(input_data.get("tool_name") or "")
+            raw = input_data.get("tool_input") or {}
+            if isinstance(raw, dict):
+                tool_input = raw
+        if tool_name != "Bash":
+            return {}
+        command = str(tool_input.get("command") or "")
+        if not command:
+            return {}
+
+        if tool_input.get("run_in_background") is True:
+            ledger.record_denied_background(command, "`run_in_background: true`")
+            return _deny(
+                "Backgrounding via `run_in_background: true` is disabled on "
+                "this run (mctl-agents#430). Run the command synchronously — "
+                "it will be bounded automatically; wait for its result before "
+                "ending your turn."
+            )
+        normalized = _normalize_shell_command(command)
+        # Quote-aware: `git commit -m "A & B"` carries `&` as data, not as
+        # the async-list operator, and denying it blocked ordinary work
+        # (claude P2 on `630ac27`). `detachment_match` also hands back the
+        # offending fragment so the denial can quote what tripped it.
+        detached = detachment_match(normalized)
+        if detached is not None:
+            detach_form, fragment = detached
+            ledger.record_denied_background(command, detach_form)
+            return _deny(
+                f"Detached execution is disabled on this run "
+                f"(mctl-agents#430). What tripped this: {detach_form} in "
+                f"`{fragment}`. Backgrounding, nohup/setsid/disown and "
+                "polling loops escape the remaining execution budget and are "
+                "blocked outright. Re-run the command synchronously and wait "
+                "for its result before ending your turn. If that text was "
+                "meant as DATA rather than as a shell operator, quote it "
+                "(the guard reads quoted text as data)."
+            )
+
+        budget_s = command_budget(
+            deadline_monotonic,
+            anyio.current_time(),
+            ceiling_s=IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
+            reserve_s=IMPLEMENTER_TEARDOWN_RESERVE_SECONDS,
+            floor_s=IMPLEMENTER_MIN_COMMAND_BUDGET_SECONDS,
+        )
+        if budget_s is None:
+            ledger.record_denied_exhausted(command)
+            return _deny(
+                "The remaining execution budget for this run cannot fit "
+                "another command (mctl-agents#430). Do not run more commands: "
+                "commit what is already proven correct and say so in your "
+                "final message, or — if nothing is safe to commit — write the "
+                "refusal marker with "
+                '`{"refused": true, "verification_budget_exhausted": true, '
+                '"reason": "<what you could not verify>"}`.'
+            )
+
+        # The EFFECTIVE bound: the envelope-derived budget narrowed against
+        # any caller-supplied tool timeout, computed ONCE and used for both
+        # the tool-input clamp and the OS-level wrapper. Deriving them
+        # separately (the wrapper from `budget_s`, the clamp from the
+        # caller's value) leaves the CLI backgrounding the command at the
+        # narrower bound while `timeout` holds the process group until the
+        # wider one -- the orphaned-background-process defect this guard
+        # exists to close, reopened inside the guard itself (agy P2 on
+        # `630ac27`). Clamping stays one-directional: `min` never widens.
+        # The Bash tool's own ceiling binds the EFFECTIVE budget, not just
+        # the number written into `timeout`. Clamping only the tool input
+        # would leave the OS bound above the CLI's real timer and put the CLI
+        # first again -- the ordering this guard depends on.
+        effective_s = min(budget_s, BASH_TOOL_MAX_TIMEOUT_MS / 1000.0)
+        existing_timeout_ms = tool_input.get("timeout")
+        if (
+            isinstance(existing_timeout_ms, int | float)
+            and not isinstance(existing_timeout_ms, bool)
+            and existing_timeout_ms > 0
+        ):
+            effective_s = min(effective_s, float(existing_timeout_ms) / 1000.0)
+
+        ledger.record_clamped(command, effective_s)
+        updated_input = dict(tool_input)
+        # A command built only from shell-state builtins (`cd`, `export`, …)
+        # is admitted UNWRAPPED: the Bash tool carries that state across
+        # calls, and `bash -c` would discard it, so `cd /repo` would stop
+        # applying to the next call (claude P2 on `630ac27`). Such a command
+        # cannot run long, so the OS-level bound buys nothing anyway; the
+        # tool-input clamp below still applies.
+        if (
+            IMPLEMENTER_BOUND_COMMANDS
+            and timeout_available
+            and not is_shell_state_only(normalized)
+        ):
+            updated_input["command"] = wrap_bounded(
+                command, effective_s, kill_after_s=IMPLEMENTER_COMMAND_KILL_GRACE_SECONDS
+            )
+        updated_input["timeout"] = int(effective_s * 1000)
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": updated_input,
+            }
+        }
+
+    return _hook
+
+
+def _deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _deadline_guard_hooks(
+    deadline_monotonic: float,
+    ledger: CommandBudgetLedger,
+    *,
+    timeout_available: bool,
+) -> dict[HookEventName, list[HookMatcher]]:
+    return {
+        "PreToolUse": [
+            HookMatcher(
+                matcher="Bash",
+                hooks=[cast(Any, _deadline_guard_hook(
+                    deadline_monotonic, ledger, timeout_available=timeout_available,
+                ))],
+            ),
+        ],
+    }
+
+
+def _compose_hooks(
+    *hook_maps: dict[HookEventName, list[HookMatcher]],
+) -> dict[HookEventName, list[HookMatcher]]:
+    """Merge hook maps additively: every matcher from every map is kept, on
+    whichever event name it was registered under. Used to add the CI-log
+    guard hook to a builder WITHOUT dropping `_command_audit_hooks()` —
+    `subagent_wait.drain_until_settled`'s precondition is that `hooks` stays
+    truthy on every drainable driver, so replacing rather than composing
+    would silently break the #366 drain for every CI-remediation run.
+    """
+    merged: dict[HookEventName, list[HookMatcher]] = {}
+    for hook_map in hook_maps:
+        for event, matchers in hook_map.items():
+            merged.setdefault(event, []).extend(matchers)
+    return merged
+
+
 def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     """For services that scan sibling repos, expand the workspace to include them."""
     if service_name not in SERVICES_NEEDING_SIBLING_ACCESS:
@@ -297,7 +819,16 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
     )
 
 
-def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Path | None = None) -> ClaudeAgentOptions:
+def build_implementer_agent_options(
+    repo_dir: Path,
+    model: str,
+    proposal_dir: Path | None = None,
+    *,
+    work_class: str = "review",
+    deadline_monotonic: float | None = None,
+    budget_ledger: CommandBudgetLedger | None = None,
+    timeout_available: bool = True,
+) -> ClaudeAgentOptions:
     """Options for the Tier 2 implementer agent.
 
     Runs with cwd inside the cloned sibling repo (not agents/<svc>/).
@@ -313,10 +844,34 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Pa
     GITHUB_TOKEN is forwarded from the parent env — the gh CLI in the
     Python wrapper needs it for clone + pr create, but the SDK agent
     itself does not (the agent commits, never pushes).
+
+    ``work_class`` (mctl-agents#423): ``"ci-remediation"`` or ``"mixed"``
+    additionally install `_ci_log_guard_hook()`, composed WITH (never
+    replacing) `_command_audit_hooks()` — see that function's docstring for
+    why. ``"review"`` (the default — every pre-#423 caller) is unaffected.
+
+    ``deadline_monotonic``/``budget_ledger``/``timeout_available``
+    (mctl-agents#430): when BOTH ``deadline_monotonic`` and ``budget_ledger``
+    are supplied, the deadline guard (`_deadline_guard_hook`) is composed in
+    for EVERY work class — the defect it fixes (an agent-issued command
+    outliving the remaining envelope) is generic, not CI-remediation-only.
+    Omitting either keeps today's behaviour byte-identical: every existing
+    caller and test that does not pass them resolves the exact same
+    `ClaudeAgentOptions` as before this parameter existed.
     """
     env = {**os.environ}
     if proposal_dir is not None:
         env["PROPOSAL_DIR"] = str(proposal_dir)
+    hooks = _command_audit_hooks()
+    if work_class in ("ci-remediation", "mixed"):
+        hooks = _compose_hooks(hooks, _ci_log_guard_hooks())
+    if deadline_monotonic is not None and budget_ledger is not None:
+        hooks = _compose_hooks(
+            hooks,
+            _deadline_guard_hooks(
+                deadline_monotonic, budget_ledger, timeout_available=timeout_available,
+            ),
+        )
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
@@ -327,7 +882,7 @@ def build_implementer_agent_options(repo_dir: Path, model: str, proposal_dir: Pa
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
         env=env,
-        hooks=_command_audit_hooks(),
+        hooks=hooks,
     )
 
 
