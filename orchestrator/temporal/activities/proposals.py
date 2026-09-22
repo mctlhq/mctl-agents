@@ -12,21 +12,37 @@ the commit step's existing rebase-retry resolves cleanly.
 
 The slug is resolved from GitHub (mctl-gitops main), not from a local
 agents-state checkout: the Temporal worker pod deliberately mounts no gitops
-clone, and GitHub is the authoritative state anyway. No YAML parsing is
-needed — ``run_issue_investigator`` derives every slug deterministically as
-``issue-<N>-<kebab-title>``, so a directory-name prefix match on
-``issue-<N>-`` is exact (the trailing dash rules out issue-9 matching
-issue-98's directory).
+clone, and GitHub is the authoritative state anyway. ``run_issue_investigator``
+derives every slug deterministically as ``issue-<N>-<kebab-title>``, so a
+directory-name prefix match on ``issue-<N>-`` is exact (the trailing dash
+rules out issue-9 matching issue-98's directory).
+
+One prefix match needs no more than that. Only when SEVERAL directories
+match does this activity read their ``.status.yaml`` files, to retire the
+``rejected`` ones through ``proposal_identity.select_proposal_slug`` — the
+same decision ``run_issue_investigator.resolve_slug`` makes locally. Those
+extra reads happen only on the path that used to fail outright, so the
+steady-state cost of a lookup is unchanged.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import os
 from pathlib import Path
+from typing import cast
 
 import httpx
+import yaml
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
+
+from orchestrator.proposal_identity import (
+    AmbiguousProposalError,
+    ProposalCandidate,
+    select_proposal_slug,
+)
 
 GITOPS_REPO = "mctlhq/mctl-gitops"
 AGENTS_STATE_PREFIX = "platform-gitops/agents-state"
@@ -97,48 +113,139 @@ async def find_proposal_slug(service: str, issue_number: str) -> str | None:
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
             response = await client.get(url, params={"ref": "main"}, headers=headers)
+
+            if response.status_code == 404:
+                # Service never had a proposal committed — same "not found"
+                # as an empty listing, not an infrastructure failure.
+                return None
+            if response.status_code != 200:
+                raise ProposalListingError(
+                    f"listing {url} returned HTTP {response.status_code}: {response.text[:200]}"
+                )
+
+            entries = response.json()
+            if not isinstance(entries, list):
+                raise ProposalListingError(f"unexpected non-directory response from {url}")
+            if len(entries) >= CONTENTS_API_LISTING_CAP:
+                # The contents API silently truncates directory listings at
+                # 1000 entries with no pagination — a missing match in a
+                # truncated listing proves nothing. Refuse rather than
+                # misreport "no proposal" (and prune old proposal dirs if
+                # this ever fires).
+                raise ApplicationError(
+                    f"{url} returned {len(entries)} entries — at or above the "
+                    "contents-API listing cap; result would be unreliable until old "
+                    "proposal dirs are pruned",
+                    non_retryable=True,
+                )
+
+            matches = sorted(
+                entry["name"]
+                for entry in entries
+                if entry.get("type") == "dir"
+                and str(entry.get("name", "")).startswith(prefix)
+            )
+            if len(matches) <= 1:
+                # The common path: no status read at all, exactly as before.
+                return matches[0] if matches else None
+
+            # Several directories claim this issue. Read each one's status
+            # so a `rejected` leftover — the shape mctl-agents#438 leaves
+            # behind after a closed-unmerged PR — stops blocking its
+            # replacement. Statuses are fetched concurrently because this
+            # sits on DevLoopWorkflow's critical path.
+            # `return_exceptions=True` so a failing read does not unwind out
+            # of the `async with` while its siblings are still in flight: the
+            # client would close under them and the worker's event loop would
+            # then log "Task exception was never retrieved" once per orphan.
+            # The first exception is re-raised unchanged, so the failure a
+            # caller sees is identical.
+            statuses = _raise_first(
+                await asyncio.gather(
+                    *(_read_proposal_status(client, headers, service, slug) for slug in matches),
+                    return_exceptions=True,
+                )
+            )
+            candidates = [
+                ProposalCandidate(slug=slug, status=status)
+                for slug, status in zip(matches, statuses, strict=True)
+            ]
+            try:
+                return select_proposal_slug(candidates)
+            except AmbiguousProposalError as exc:
+                # Non-retryable for the same reason the flat refusal was:
+                # no number of retries turns two live proposals into one.
+                raise ApplicationError(
+                    f"cannot resolve {prefix}* under {service}: {exc}",
+                    non_retryable=True,
+                ) from exc
     except httpx.RequestError as exc:
         raise ProposalListingError(f"listing {url} failed: {exc}") from exc
 
+
+def _raise_first(results: list[str | BaseException | None]) -> list[str | None]:
+    """Re-raise the first failed status read; otherwise narrow the list.
+
+    ``asyncio.gather(..., return_exceptions=True)`` is used so one failing
+    read cannot unwind while its siblings are still in flight — but the
+    outcome must stay fail-closed: ONE unreadable status is enough to
+    abandon the whole resolution, because a partial candidate set could
+    resolve to a different slug than the complete one would. Raising here
+    rather than filtering says that in one place.
+    """
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    # Every element is `str | None` by now; the cast is what the loop above
+    # just proved, and keeping it here stops the caller from looking like
+    # it tolerates partial failures.
+    return cast("list[str | None]", results)
+
+
+async def _read_proposal_status(
+    client: httpx.AsyncClient,
+    headers: dict[str, str],
+    service: str,
+    slug: str,
+) -> str | None:
+    """The ``status:`` in one proposal's ``.status.yaml``, or None.
+
+    None means "could not be read", which
+    ``proposal_identity.select_proposal_slug`` treats as live — a proposal
+    is never retired on missing evidence. A transport error or an
+    unexpected HTTP status raises instead, so a GitHub outage cannot look
+    like an unreadable status and silently change which slug wins.
+
+    Transport failures are caught here rather than by the caller's own
+    ``httpx.RequestError`` handler: that one names the listing URL, which
+    answered fine, and would point an operator at the wrong request.
+    """
+    url = (
+        f"https://api.github.com/repos/{GITOPS_REPO}/contents/"
+        f"{AGENTS_STATE_PREFIX}/{service}/proposals/{slug}/.status.yaml"
+    )
+    try:
+        response = await client.get(url, params={"ref": "main"}, headers=headers)
+    except httpx.RequestError as exc:
+        raise ProposalListingError(f"reading {url} failed: {exc}") from exc
     if response.status_code == 404:
-        # Service never had a proposal committed — same "not found" as an
-        # empty listing, not an infrastructure failure.
         return None
     if response.status_code != 200:
         raise ProposalListingError(
-            f"listing {url} returned HTTP {response.status_code}: {response.text[:200]}"
+            f"reading {url} returned HTTP {response.status_code}: {response.text[:200]}"
         )
 
-    entries = response.json()
-    if not isinstance(entries, list):
-        raise ProposalListingError(f"unexpected non-directory response from {url}")
-    if len(entries) >= CONTENTS_API_LISTING_CAP:
-        # The contents API silently truncates directory listings at 1000
-        # entries with no pagination — a missing match in a truncated
-        # listing proves nothing. Refuse rather than misreport "no
-        # proposal" (and prune old proposal dirs if this ever fires).
-        raise ApplicationError(
-            f"{url} returned {len(entries)} entries — at or above the "
-            "contents-API listing cap; result would be unreliable until old "
-            "proposal dirs are pruned",
-            non_retryable=True,
-        )
-
-    matches = sorted(
-        entry["name"]
-        for entry in entries
-        if entry.get("type") == "dir" and str(entry.get("name", "")).startswith(prefix)
-    )
-    if len(matches) > 1:
-        # Two directories for one issue means the investigator forked the
-        # proposal — which it did whenever the issue was renamed between
-        # runs, because the slug is deterministic on (number, TITLE), not
-        # on the number alone. resolve_slug now reuses an existing
-        # issue-<N>-* dir (#246), so this should no longer be reachable
-        # from the normal path; refuse to guess rather than implement the
-        # wrong one, and leave the pair for a human to reconcile.
-        raise ApplicationError(
-            f"multiple proposal dirs match {prefix}* under {service}: {matches}",
-            non_retryable=True,
-        )
-    return matches[0] if matches else None
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("encoding") != "base64":
+        return None
+    try:
+        text = base64.b64decode(payload.get("content", "")).decode("utf-8")
+        data = yaml.safe_load(text)
+    except (binascii.Error, ValueError, yaml.YAMLError):
+        # A hand-edited or half-written status file is missing evidence,
+        # not a reason to fail the whole lookup.
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    return status if isinstance(status, str) else None

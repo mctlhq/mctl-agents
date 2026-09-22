@@ -70,6 +70,17 @@ Idempotency:
     `--dry-run` reports a blocked proposal in its summary but never writes
     the marker and never changes the exit code.
 
+    A fourth gate sits between the GitHub preflight and the model call: when
+    the preflight finds no existing branch or PR at all, the implementer
+    also reads the proposal's source GitHub issue (`source:` in
+    `.status.yaml`, written by the investigator) and refuses -- writing
+    `needs-triage` with `failure.code` `source-resolved` or
+    `source-not-planned` at `failure.stage: admission` -- if that issue is
+    already closed, so subscription quota is never spent on work that is
+    already done or abandoned (mctl-agents#410). A proposal with no
+    `source` block, or whose issue is still open, is unaffected; an
+    unreadable GitHub leaves it `accepted` and untouched.
+
 Usage:
     python -m orchestrator.run_implementer
     python -m orchestrator.run_implementer --service mctl-web
@@ -79,6 +90,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -104,6 +116,7 @@ from config.settings import (
     SERVICES,
 )
 from orchestrator.auth import ensure_auth_for_sdk
+from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout
@@ -125,8 +138,11 @@ from orchestrator.mcp_guard import ensure_mctl_connected
 from orchestrator.options import (
     IMPLEMENTER_COMMAND_TIMEOUT_SECONDS,
     IMPLEMENTER_DRAIN_TIMEOUT_SECONDS,
+    IMPLEMENTER_TEARDOWN_GRACE_SECONDS,
+    IMPLEMENTER_TIMEOUT_CEILING_SECONDS,
     IMPLEMENTER_TIMEOUT_SECONDS,
     build_implementer_agent_options,
+    implementer_envelope,
 )
 from orchestrator.proc import describe_output, run_capturing
 from orchestrator.proposal_state import (
@@ -136,6 +152,7 @@ from orchestrator.proposal_state import (
     now_iso,
     update_status_file,
 )
+from orchestrator.source_issue import SourceIssueVerdict, read_source_issue
 from orchestrator.subagent_wait import (
     LiveTaskLedger,
     OrphanedSubagentError,
@@ -226,6 +243,30 @@ EXIT_FENCED = 48
 # it repeats every tick for the life of a leaked lease (claude P3 on
 # `31232dc`).
 EXIT_CLAIM_REFUSED = 49
+# The agent ran, but the bounded CI-log evidence the bundle carried could not
+# support a code decision, and it said so via the refusal marker (below),
+# distinguished from a plain refusal by `"insufficient_evidence": true`
+# (mctl-agents#423). Distinct from EXIT_DELIBERATE_NO_OP (47): a 47 means "the
+# findings are addressed, or an operator forbade the change" -- a considered
+# NO on the merits. A 50 means "I cannot tell, on what I was handed" -- the
+# agent never reached a merits decision at all, so charging it to `refusals`
+# (bounded by MAX_REFUSALS) would misrepresent a platform-supplied-evidence
+# gap as the agent repeatedly declining to act. It joins the shepherd's
+# harness set instead: blameless, and bounded by the same
+# MAX_HARNESS_FAILURES an orphaned sub-agent is (see
+# run_shepherd._followup_code_sets).
+EXIT_CI_EVIDENCE_INSUFFICIENT = 50
+# The run ended with the per-command execution budget exhausted: every
+# agent-issued Bash command is bounded to what remains of the run's envelope
+# (mctl-agents#430, `orchestrator/exec_budget.py`'s deadline guard), and this
+# run ran out of budget for another command before it could commit or refuse
+# on the merits. Distinct from EXIT_ORPHANED_SUBAGENT (46): 46 means our own
+# handoff lost a live child; 51 means the run stayed inside its envelope the
+# whole time and the STRUCTURED ledger (never model prose) says so -- the
+# same "no live agent-launched child process survives" guarantee, reached
+# deliberately instead of by a hard cancellation. Joins the shepherd's
+# harness set: blameless, bounded by the same MAX_HARNESS_FAILURES.
+EXIT_VERIFICATION_BUDGET_EXHAUSTED = 51
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -243,6 +284,14 @@ REFUSAL_ERROR_PREFIX = "deliberate no-op:"
 FENCED_ERROR_PREFIX = "fenced:"
 # Prefix mapped to EXIT_CLAIM_REFUSED, raised by ImplementerClaimRefused.
 CLAIM_REFUSED_ERROR_PREFIX = "claim-refused:"
+# Prefix mapped to EXIT_CI_EVIDENCE_INSUFFICIENT. Same style, used when the
+# refusal marker carries `"insufficient_evidence": true` (mctl-agents#423).
+CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX = "ci-evidence-insufficient:"
+# Prefix mapped to EXIT_VERIFICATION_BUDGET_EXHAUSTED (mctl-agents#430). Used
+# both when the ORCHESTRATOR-derived ledger reports `exhausted` with no
+# commit and no other refusal, and when the agent's own marker carries
+# `"verification_budget_exhausted": true`.
+VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX = "verification-budget-exhausted:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -259,8 +308,33 @@ MAX_REFUSAL_REASON_CHARS = 600
 MAX_REFUSAL_MARKER_BYTES = 64 * 1024
 
 
-def _read_refusal_marker(repo_dir: Path) -> str | None:
-    """Return the refusal reason iff this run produced a valid refusal marker.
+@dataclass(frozen=True)
+class RefusalMarker:
+    """A validated `.implementer-refusal.json` (see `_read_refusal_marker`).
+
+    `insufficient_evidence` (mctl-agents#423) distinguishes a considered "no"
+    on the merits (the ordinary refusal, exit 47 — findings addressed, or an
+    operator decision forbids the change) from "the bounded CI-log evidence
+    I was handed cannot support a code decision" (exit 50 — the agent never
+    reached a merits decision at all). Both share the same marker shape and
+    the same validation; only the mapped exit code, and therefore the
+    shepherd's charging behaviour, differs.
+
+    `verification_budget_exhausted` (mctl-agents#430) is the third form: the
+    agent decided, on its own, that the remaining per-command execution
+    budget could not fit another verification step and recorded that
+    deliberately rather than being cut off by the deadline guard's own
+    denial. Maps to the same EXIT_VERIFICATION_BUDGET_EXHAUSTED the
+    ORCHESTRATOR-derived ledger produces when it observes the same fact.
+    """
+
+    reason: str
+    insufficient_evidence: bool = False
+    verification_budget_exhausted: bool = False
+
+
+def _read_refusal_marker(repo_dir: Path) -> RefusalMarker | None:
+    """Return the refusal marker iff this run produced a valid one.
 
     Every check below exists to make "the agent refused" something that cannot
     be produced by accident:
@@ -387,7 +461,11 @@ def _read_refusal_marker(repo_dir: Path) -> str | None:
     if not isinstance(reason, str) or not reason.strip():
         print(f"warn: {REFUSAL_MARKER_FILENAME} carries no reason; ignoring")
         return None
-    return " ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS]
+    return RefusalMarker(
+        reason=" ".join(reason.split())[:MAX_REFUSAL_REASON_CHARS],
+        insufficient_evidence=data.get("insufficient_evidence") is True,
+        verification_budget_exhausted=data.get("verification_budget_exhausted") is True,
+    )
 
 
 def _write_refusal_out(path: Path, reason: str) -> None:
@@ -408,6 +486,34 @@ def _write_refusal_out(path: Path, reason: str) -> None:
         # an escape would replace a correctly-classified refusal with an
         # uncaught traceback and exit 1 — the counter-less transient arm. The
         # reason is advisory; the exit code is what matters.
+        print(
+            f"warn: could not write refusal reason to {path} "
+            f"({type(e).__name__}: {e}); the exit code still carries the decision",
+            file=sys.stderr,
+        )
+
+
+def _write_verification_budget_exhausted_out(
+    path: Path, reason: str, ledger: CommandBudgetLedger | None,
+) -> None:
+    """Hand the ORCHESTRATOR-derived ledger summary to the shepherd as JSON
+    (mctl-agents#430) — the structured evidence `EXIT_VERIFICATION_BUDGET_
+    EXHAUSTED` exists to provide, not model prose. `reason` overrides the
+    ledger's own `describe()` text: for the marker-derived path it is the
+    agent's own (capped) explanation, which is more useful to an operator
+    than the orchestrator's clamp/deny counters alone; those counters still
+    ride along from `ledger.as_dict()` when a ledger is available.
+
+    Best-effort, same as `_write_refusal_out`: the exit code alone already
+    carries the decision that matters.
+    """
+    payload: dict[str, Any] = ledger.as_dict() if ledger is not None else {}
+    payload["reason"] = reason
+    payload["refused"] = True
+    payload["verification_budget_exhausted"] = True
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — advisory write; see _write_refusal_out
         print(
             f"warn: could not write refusal reason to {path} "
             f"({type(e).__name__}: {e}); the exit code still carries the decision",
@@ -457,6 +563,23 @@ def _review_feedback_exit_code(error: str) -> int:
         because "a claim stood this attempt down" is what the operator needs
         to read either way.
 
+      - 50: the bounded CI-log evidence in the bundle could not support a
+        code decision, and the agent said so via the refusal marker's
+        `insufficient_evidence` flag (mctl-agents#423). Distinct from 47: the
+        agent never reached a merits decision, so the shepherd treats it as
+        blameless the way it treats an orphaned sub-agent (its own harness
+        counter, bounded by MAX_HARNESS_FAILURES) rather than charging it to
+        `refusals`.
+
+      - 51: the run ended with the per-command execution budget exhausted
+        (mctl-agents#430) — every agent-issued Bash command is bounded to
+        what remains of the run's envelope, and either the orchestrator's
+        own ledger observed that budget run out with no commit produced, or
+        the agent recorded the same fact itself via the refusal marker's
+        `verification_budget_exhausted` flag. Blameless the same way 46 and
+        50 are: the run stayed inside its envelope and said so structurally,
+        rather than being cut off by the outer bound.
+
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
     the shepherd treats it as transient.
@@ -478,6 +601,10 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_FENCED
     if error.startswith(CLAIM_REFUSED_ERROR_PREFIX):
         return EXIT_CLAIM_REFUSED
+    if error.startswith(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):
+        return EXIT_CI_EVIDENCE_INSUFFICIENT
+    if error.startswith(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):
+        return EXIT_VERIFICATION_BUDGET_EXHAUSTED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -528,6 +655,33 @@ class ImplementResult:
     # `main()` avoid re-failing forever on a permanently blocked proposal.
     blocked_is_new: bool = False
     counts_toward_limit: bool = True
+    # Set only on the admission gate's refusal arm (mctl-agents#410): the
+    # `(code, issue_ref)` pair `main()` prints in `=== Stale source ===`.
+    # Distinct from `blocked` -- this is a `needs-triage` write (the
+    # proposal leaves the accepted queue), not a durable `accepted` park.
+    stale_source: tuple[str, str] | None = None
+    # Set only on the EXIT_VERIFICATION_BUDGET_EXHAUSTED path (mctl-agents#430):
+    # the ledger `_run_implementer_agent`'s deadline guard populated, carried
+    # here so `main()` can write its structured counts (not just `error`'s
+    # reason text) to `--refusal-out`. `None` on every other path.
+    budget_ledger: CommandBudgetLedger | None = None
+    # True only on `implement_one`'s budget hand-back arm (mctl-agents#430):
+    # the proposal was handed back to `accepted` with an incremented
+    # `budget_handbacks` tally. Classified ahead of `error` by
+    # `_batch_outcome` so the tick exits 0 and the downstream gitops commit
+    # that makes the tally durable is never skipped -- the same reason
+    # `stale_source` is excluded from `failed`. Without it the cap can never
+    # advance and the paid retry loop it bounds stays unbounded (claude P2
+    # on `4449024`).
+    budget_handback: bool = False
+    # True only when the cap's terminal `needs-triage` write actually landed
+    # on THIS tick. Bucketed with the hand-back rather than with `failed` for
+    # the same reason: that write is what ENDS the loop, and a red tick can
+    # cost it the gitops commit. Unlike the hand-back there is no catch-up --
+    # every later tick re-enters the same branch and loses the same write --
+    # so a red tick here turns an unbounded green retry loop into an
+    # unbounded red one at identical model cost (claude P2 on `8465c6e`).
+    budget_terminal: bool = False
 
 
 @dataclass(frozen=True)
@@ -538,6 +692,16 @@ class BatchOutcome:
     # Trailing and defaulted so existing positional/keyword constructions
     # (e.g. BatchOutcome(succeeded=1, failed=1, skipped=1)) keep working.
     blocked: int = 0
+    # Admission-gate refusals (mctl-agents#410 codex follow-up). Counted
+    # separately from `failed` so a batch that also implemented a real
+    # proposal on the same tick is not reported red for a refusal that
+    # worked exactly as designed -- see the exit-code comment in `main()`.
+    stale_source: int = 0
+    # Verification-budget outcomes (mctl-agents#430): a hand-back, or the
+    # cap's terminal write. Counted separately from `failed` for the same
+    # reason as `stale_source` -- each arm's whole purpose is a durable
+    # `.status.yaml` write, which a non-zero exit can cost us.
+    verification_budget: int = 0
 
 
 @dataclass(frozen=True)
@@ -721,10 +885,19 @@ REVIEW_CLAIM_LEASE_FLOOR = timedelta(minutes=30)
 def _review_claim_lease_default() -> timedelta:
     """The review lease floor, widened to cover the run it has to outlive.
 
-    `IMPLEMENTER_TIMEOUT_SECONDS` bounds the SDK run; the git work around it
-    is bounded by `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which
-    the clone before and the push after are the two that matter. The margin
-    is deliberately the whole of both rather than a fraction, because the two
+    `IMPLEMENTER_TIMEOUT_CEILING_SECONDS` (mctl-agents#423) bounds the WIDEST
+    envelope any work class can select -- not `IMPLEMENTER_TIMEOUT_SECONDS`
+    alone, which since #423 is only the review-class envelope. A
+    CI-remediation or mixed follow-up can run up to the ceiling, and the
+    lease has to outlive whichever class this attempt turns out to be before
+    the class is even known (the claim is acquired before the bundle's work
+    class is derived) -- so it is sized for the worst case unconditionally,
+    the same way it was sized for the only case before #423 gave the
+    envelope more than one value.
+    The git work around the SDK run is bounded by
+    `IMPLEMENTER_COMMAND_TIMEOUT_SECONDS` per command, of which the clone
+    before and the push after are the two that matter. The margin is
+    deliberately the whole of both rather than a fraction, because the two
     errors are not symmetric in the way they look: expiring EARLY refuses a
     live attempt at its own push, and expiring LATE strands the entity for the
     rest of the lease whenever the holder cannot run its own `finally` — a
@@ -734,7 +907,7 @@ def _review_claim_lease_default() -> timedelta:
     one needs a crash.
     """
     bound = timedelta(
-        seconds=IMPLEMENTER_TIMEOUT_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
+        seconds=IMPLEMENTER_TIMEOUT_CEILING_SECONDS + 2 * IMPLEMENTER_COMMAND_TIMEOUT_SECONDS
     )
     return max(REVIEW_CLAIM_LEASE_FLOOR, bound)
 
@@ -1088,15 +1261,41 @@ def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> b
     return False
 
 
-def _hand_back_if_still_ours(ref: ProposalRef, attempt_id: str) -> bool:
+def _hand_back_if_still_ours(
+    ref: ProposalRef, attempt_id: str, *, budget_handbacks: int | None = None
+) -> bool:
     """Restore `accepted` only while `.status.yaml` still names our attempt.
 
-    Returns True when the hand-back was written.
+    Returns True when the hand-back was written. ``budget_handbacks``
+    (mctl-agents#430) records how many times THIS proposal has been handed
+    back for an exhausted verification budget, so the retry it enables stays
+    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`.
     """
     if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
         return False
-    update_status_yaml(ref, "accepted", attempt=None, failure=None)
+    fields: dict[str, Any] = {"attempt": None, "failure": None}
+    if budget_handbacks is not None:
+        fields["budget_handbacks"] = budget_handbacks
+    update_status_yaml(ref, "accepted", **fields)
     return True
+
+
+# The consecutive budget-exhausted attempt at which an implement run stops
+# being handed back and becomes terminal. Read it exactly as
+# `run_shepherd.MAX_HARNESS_FAILURES`, which it mirrors down to the
+# comparison (`new >= MAX`): the Nth occurrence is the one that stops the
+# loop, so N-1 hand-backs actually happen. Deliberately the same shape rather
+# than the more obvious "N hand-backs allowed" -- two sibling caps that read
+# alike but count differently is a worse trap than one slightly terse rule
+# (agy P2 on `61595a0` read it the other way, which is the evidence that the
+# wording, not the comparison, was what needed fixing).
+#
+# A cap is needed at all because the implement driver has no
+# `review_attempts`/`harness_failures` budget of its own -- the sibling
+# `except ImplementerOrphanedSubagent` arm stays terminal for exactly that
+# reason -- so an unconditional hand-back would trade a wrong terminal state
+# for an unbounded PAID retry loop (claude P2 on `624a433`).
+IMPLEMENT_MAX_BUDGET_HANDBACKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1373,69 @@ def find_accepted_proposals(
     return refs
 
 
+def build_adopted_ref(state_dir: Path, pr_url: str) -> ProposalRef:
+    """Build a ``ProposalRef`` for a proposal-less adopted PR
+    (mctlhq/mctl-agents#334): ``--adopted-pr <url>`` drives an EXISTING
+    adoption record, never creates one — only the shepherd's own discovery
+    pass (``orchestrator.pr_adoption.discover_adoptable``) adopts. A missing
+    record is a hard exit; there is no fallback that invents one here.
+
+    Returns an ordinary ``ProposalRef`` (this module's class, not a
+    ``pr_adoption.PRRef`` — that class lives in a module this one must not
+    import at module level, since ``pr_adoption`` imports ``run_shepherd``,
+    not this file, and duck-typing across the two ``ProposalRef`` shapes is
+    the established pattern here, see ``run_shepherd.reconcile_one``'s
+    cross-module call into this module). ``proposal_dir`` is the record's
+    own directory and ``status_path`` is overridden to point at
+    ``.prref.yaml`` instead of the base class's ``.status.yaml``.
+    """
+    parsed = _parse_pr_url(pr_url)
+    if parsed is None:
+        print(f"--adopted-pr is not a GitHub PR URL: {pr_url!r}", file=sys.stderr)
+        sys.exit(2)
+    repo, number = parsed
+    service = repo.split("/")[-1]
+    proposal_dir = state_dir / service / "adopted-prs" / f"pr-{number}"
+    status_path = proposal_dir / ".prref.yaml"
+    if not status_path.exists():
+        print(
+            f"No adoption record found at {status_path}. The implementer "
+            "never adopts a PR itself — only the shepherd's discovery pass "
+            "does (mctlhq/mctl-agents#334).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    data = load_status(status_path)
+    ref = ProposalRef(
+        service=service,
+        slug=f"pr-{number}",
+        proposal_dir=proposal_dir,
+        status=str(data.get("status", "adopted")),
+    )
+    ref.status_path = status_path
+    return ref
+
+
+def _adopted_pr_is_fork(repo: str, number: int) -> bool:
+    """Second, independent fork check (mctlhq/mctl-agents#334) — defence in
+    depth. The shepherd's own discovery pass already refuses a fork PR; this
+    repeats the check inside the process that will actually push, and
+    immediately before the clone, so the one mutation this feature performs
+    is never gated on the scheduler alone having gotten it right.
+    """
+    data = _github_json(["gh", "api", f"repos/{repo}/pulls/{number}"])
+    if not isinstance(data, dict):
+        raise GitHubPreflightError(f"unexpected response shape for {repo}#{number}")
+    head = data.get("head") or {}
+    head_repo = head.get("repo") or {}
+    if bool(head_repo.get("fork")):
+        return True
+    base_repo = (data.get("base") or {}).get("repo") or {}
+    head_owner = (head_repo.get("owner") or {}).get("login") or ""
+    base_owner = (base_repo.get("owner") or {}).get("login") or ""
+    return bool(head_owner) and head_owner != base_owner
+
+
 # ---------------------------------------------------------------------------
 # Implementation
 # ---------------------------------------------------------------------------
@@ -1214,6 +1476,19 @@ def _github_json(cmd: list[str]) -> Any:
         return json.loads(proc.stdout or "null")
     except json.JSONDecodeError as exc:
         raise GitHubPreflightError(f"invalid JSON from {' '.join(cmd[:3])}") from exc
+
+
+def _gh_api_json(args: list[str]) -> Any:
+    """`read_source_issue`'s `gh_api_json` adapter, routed through the
+    bounded `_github_json` (mctl-agents#410 code review).
+
+    `read_source_issue`'s own default reader calls `run_capturing` with
+    `timeout=None` -- unbounded -- and skips `_run`'s token refresh and
+    `$ gh api ...` log line. Passing this adapter instead keeps the
+    admission gate's GitHub read on the same bounded, logged path as every
+    other `gh` call in this module, `_superseding_pr_urls` included.
+    """
+    return _github_json(["gh", "api", *args])
 
 
 def _clone_target(service: str, slug: str) -> Path:
@@ -1286,7 +1561,26 @@ def _stage_implementer_agent(target: Path, service: str) -> None:
                 f.write(f"{entry}\n")
 
 
-def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
+def _adopted_pr_number(ref: ProposalRef) -> int | None:
+    """The PR number for an adopted ref, recovered from `slug = "pr-<n>"`
+    (mctlhq/mctl-agents#334). Kept a pure function of `ref.slug` rather than
+    reading `.prref.yaml` here, so `_build_prompt` stays a pure formatter
+    with no I/O of its own — same contract it already has.
+    """
+    if ref.slug.startswith("pr-"):
+        try:
+            return int(ref.slug[len("pr-"):])
+        except ValueError:
+            return None
+    return None
+
+
+def _build_prompt(
+    ref: ProposalRef,
+    review_feedback: dict | None = None,
+    branch: str | None = None,
+    adopted: bool = False,
+) -> str:
     """Prompt that delegates to the `implementer` sub-agent.
 
     The sub-agent is told (in its frontmatter and body) to read the spec
@@ -1296,43 +1590,148 @@ def _build_prompt(ref: ProposalRef, review_feedback: dict | None = None) -> str:
     When ``review_feedback`` is set the prompt is the follow-up variant:
     the agent is told the branch is already checked out, points to the
     existing PR, and addresses each codex finding from the bundle.
+
+    ``branch`` overrides the deterministic `feat/agents-<slug>` branch name
+    — the adopted-PR path (mctlhq/mctl-agents#334) passes the PR's own head
+    branch, read from `.prref.yaml`, never a model-supplied value.
+    ``adopted`` drops the proposal-spec sentence and commit trailer in
+    favour of a plain PR reference, since an adoption record carries no
+    requirements/design/tasks triplet to read.
     """
-    branch = f"feat/agents-{ref.slug}"
+    branch = branch or f"feat/agents-{ref.slug}"
 
     if review_feedback is not None:
         feedback_md = _render_review_feedback(review_feedback)
+        ci_only = _bundle_is_ci_only(review_feedback)
+        # What the run is actually about. Every one of these was hardcoded to
+        # the code-review framing; a CI-only bundle then read as a
+        # self-contradiction (mctl-agents#411 review).
+        work_items = "failing required checks" if ci_only else "codex findings"
+        if ci_only:
+            trigger_line = (
+                "- A required CI check is FAILING on this PR. The code review "
+                "is clean — there are no P1/P2 review findings to address. The "
+                "failing-check evidence is below."
+            )
+            read_line = (
+                "Read the failing-check evidence (below) and the relevant "
+                "lines in the working tree."
+            )
+            apply_line = (
+                "Apply the MINIMAL change that makes each failing check pass. "
+                "Stay in scope —\n   do not refactor outside the touched files."
+            )
+            refusal_line = (
+                "5. If a failing check is not something a code change can fix "
+                "(an infrastructure\n   outage, a flake), is already fixed in "
+                "the working tree, or must NOT be acted\n   on because of an "
+                "explicit operator decision recorded on the PR, do not commit."
+            )
+        else:
+            trigger_line = (
+                "- Code review left P1/P2 findings on this PR — they are listed below."
+            )
+            read_line = (
+                "Read the codex findings (below) and\n   the relevant lines in "
+                "the working tree."
+            )
+            apply_line = (
+                "Apply the MINIMAL change that resolves each finding. Stay in scope —\n"
+                "   do not refactor outside the touched files."
+            )
+            refusal_line = (
+                "5. If a finding is invalid, is already addressed, or must NOT "
+                "be acted on\n   because of an explicit operator decision "
+                "recorded on the PR, do not commit."
+            )
+        if adopted:
+            number = _adopted_pr_number(ref)
+            pr_url = f"https://github.com/mctlhq/{ref.service}/pull/{number}"
+            subject = (
+                f"fix(ci): fix failing required checks on mctlhq/{ref.service}#{number}"
+                if ci_only
+                else f"fix(review): address P1/P2 findings on mctlhq/{ref.service}#{number}"
+            )
+            context_spec_line = (
+                "- `$PROPOSAL_DIR` (env var) holds an adoption record "
+                "(`.prref.yaml`), NOT a requirements/design/tasks triplet — "
+                "this PR has no proposal. Ground yourself in the evidence "
+                "below and the diff on this branch."
+            )
+            commit_body_line = f"Body should reference the PR: `PR: {pr_url}`."
+        else:
+            context_spec_line = (
+                "- Spec files live at `$PROPOSAL_DIR` (env var): "
+                "requirements.md, design.md, tasks.md."
+            )
+            subject = (
+                f"fix(ci): fix failing required checks on {ref.slug}"
+                if ci_only
+                else f"fix(agents): address P1/P2 codex findings on {ref.slug}"
+            )
+            commit_body_line = (
+                "Body should reference the proposal: "
+                f"`Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`."
+            )
+        # mctl-agents#423: a bundle carrying CI failures already has the
+        # log evidence it will get — retrieved, bounded and paid for OUTSIDE
+        # this run's own execution envelope. Nothing else can stop the agent
+        # from fetching more itself (the CLI backgrounds a slow Bash command
+        # past its own tool timeout rather than failing it), so the prompt
+        # states the rule and the `_ci_log_guard_hook()` PreToolUse hook
+        # (see options.py) is the actual enforcement.
+        has_ci_failures = bool(review_feedback.get("ci_failures"))
+        ci_log_ground_rule = (
+            "- The log excerpt(s) under \"Log excerpt (bounded, ...)\" above are "
+            "ALL the CI-log evidence you will get for this run — already "
+            "retrieved and bounded before this run started. Do NOT run `gh run "
+            "view --log`/`--log-failed`, `gh api .../logs`, or `curl`/`wget` a "
+            "logs URL to fetch more; those commands are blocked. If the bounded "
+            "excerpt is genuinely insufficient to decide on a code change, do "
+            "not retry the fetch: write the refusal marker with "
+            "`\"insufficient_evidence\": true` (see below) instead.\n"
+            if has_ci_failures
+            else ""
+        )
+        insufficient_evidence_note = (
+            "\n   When the reason is specifically that the bounded CI-log "
+            "evidence above cannot support a code decision (not merely that "
+            "the check is fine or infrastructure-flaky), add "
+            "`\"insufficient_evidence\": true` to the same marker:\n\n"
+            "   {\"refused\": true, \"insufficient_evidence\": true, "
+            "\"reason\": \"<what evidence is missing>\"}\n"
+            if has_ci_failures
+            else ""
+        )
         return f"""\
 Tier 2 implementer follow-up for proposal `{ref.service}/{ref.slug}`.
 
 Context:
 - Branch `{branch}` is already checked out on the existing PR.
-- Code review left P1/P2 findings on this PR — they are listed below.
-- Spec files live at `$PROPOSAL_DIR` (env var): requirements.md, design.md, tasks.md.
+{trigger_line}
+{context_spec_line}
 
 Workflow:
-1. Use the `implementer` sub-agent. Read the codex findings (below) and
-   the relevant lines in the working tree.
-2. Apply the MINIMAL change that resolves each finding. Stay in scope —
-   do not refactor outside the touched files.
+1. Use the `implementer` sub-agent. {read_line}
+2. {apply_line}
 3. Stage and commit on the SAME branch (`{branch}`). Conventional Commits
-   subject: `fix(agents): address P1/P2 codex findings on {ref.slug}`.
-   Body should reference the proposal:
-   `Proposal: platform-gitops/agents-state/{ref.service}/proposals/{ref.slug}/`.
+   subject: `{subject}`.
+   {commit_body_line}
 4. DO NOT push and DO NOT open a PR — the orchestrator will push to the
    existing branch after you finish. The PR auto-updates because the
    head ref does not change.
-5. If a finding is invalid, is already addressed, or must NOT be acted on
-   because of an explicit operator decision recorded on the PR, do not
-   commit. Instead write the refusal marker file
+{refusal_line}
+   Instead write the refusal marker file
    `{REFUSAL_MARKER_FILENAME}` in the root of the current working
    directory, with exactly this shape — one line, valid JSON:
 
    {{"refused": true, "reason": "<what you declined, and why>"}}
 
-   In `reason`, give the evidence: quote the operator note, or the code
-   that already satisfies the finding. Explain the same reasoning in your
-   final message.
-
+   In `reason`, give the evidence: quote the operator note, the code
+   that already satisfies it, or the log line showing the failure is an
+   infrastructure outage rather than a defect. Explain the same reasoning
+   in your final message.
+{insufficient_evidence_note}
    Write this file ONLY when you deliberately decided that changing nothing
    is the correct outcome. Never write it next to a commit, never as a
    progress note, and never with an empty or placeholder reason: the
@@ -1345,19 +1744,29 @@ Workflow:
 
 Ground rules:
 - One commit per run is fine; multiple small commits are also fine.
-- Stay strictly within scope — fixing the codex findings only.
+- Stay strictly within scope — fixing the {work_items} only.
 - Work ONLY inside the current working directory (the cloned target repo).
   NEVER create, edit, commit, or push files anywhere else — in particular
   the mounted gitops worktree under `/workdir`. If a finding implies a
   change in another repository, do NOT make it; describe it in your final
   message so a human can route it.
-- Never defer work to "the background." This run is a single, one-shot
+{ci_log_ground_rule}- Never defer work to "the background." This run is a single, one-shot
   turn — there is no later turn for you to resume into, no polling loop,
   and nothing will notify you when a backgrounded command finishes. Run
   every command synchronously and wait for its result before ending your
   turn. A slow build or test is fine — wait for it inline. Do NOT end your
   turn saying you will "keep working" or "report back once it's done":
   ending the turn ends the run, and anything not committed by then is lost.
+- Every command you run is bounded automatically to what remains of this
+  run's execution budget — you do not choose the bound and cannot widen it.
+  Backgrounding (a trailing `&`), `nohup`, `setsid`, `disown`, and starting a
+  background process to poll it in a loop are BLOCKED outright, not merely
+  discouraged: the tool call is denied. If the remaining budget cannot fit
+  another command, you will be told so; at that point, commit what is
+  already proven correct and say so in your final message, or — if nothing
+  is safe to commit — write the refusal marker with
+  `{{"refused": true, "verification_budget_exhausted": true, "reason":
+  "<what you could not verify>"}}`.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -1396,6 +1805,13 @@ Ground rules:
   turn. A slow build or test is fine — wait for it inline. Do NOT end your
   turn saying you will "keep working" or "report back once it's done":
   ending the turn ends the run, and anything not committed by then is lost.
+- Every command you run is bounded automatically to what remains of this
+  run's execution budget — you do not choose the bound and cannot widen it.
+  Backgrounding (a trailing `&`), `nohup`, `setsid`, `disown`, and starting a
+  background process to poll it in a loop are BLOCKED outright, not merely
+  discouraged: the tool call is denied. If the remaining budget cannot fit
+  another command, commit what is already proven correct and say so in your
+  final message.
 - No emoji in code or commit messages.
 - English only.
 """
@@ -1427,9 +1843,119 @@ def _load_review_feedback(path: Path) -> dict:
     return data
 
 
+def _render_ci_failures_section(ci_failures: list) -> str:
+    """Render the ``## Failing required CI checks (fix each)`` section.
+
+    Deterministic, sourced entirely from `bundle["ci_failures"]` — the
+    shepherd builds these records straight from GitHub check-run data
+    (mctlhq/mctl-agents#411) and never routes them through its summariser
+    SDK, so nothing here is model-rewritten. Each record's fields are
+    optional (a `StatusContext` has no job/step, some checks have no run
+    URL, a pre-#423 bundle has no `log_*` keys at all), so every line is
+    rendered defensively.
+
+    `log_excerpt`/`log_status`/`log_truncated` (mctl-agents#423) render as a
+    second, clearly bounded block: the CI-variant prompt ground rule tells
+    the agent this is the whole of the evidence it will get and not to fetch
+    more, so the heading has to say plainly that it IS bounded and whether
+    it was truncated, rather than reading like an ordinary quoted excerpt.
+    """
+    records = [item for item in ci_failures if isinstance(item, dict)]
+    if not records:
+        # The header was emitted before any record was known to render, so a
+        # list whose items are all non-dict produced a bare heading with
+        # nothing under it — and, in a CI-only bundle, a whole prompt telling
+        # the agent to fix checks it is never shown (review P3).
+        return ""
+
+    lines: list[str] = ["## Failing required CI checks (fix each)", ""]
+    for i, item in enumerate(records, 1):
+        check = item.get("check") or "(unknown check)"
+        workflow = item.get("workflow")
+        job = item.get("job")
+        step = item.get("step")
+        conclusion = item.get("conclusion") or "?"
+        url = item.get("url")
+        head = item.get("head_sha")
+        excerpt = (item.get("excerpt") or "").strip()
+        log_excerpt = (item.get("log_excerpt") or "").strip()
+        log_status = item.get("log_status") or "skipped"
+        log_truncated = bool(item.get("log_truncated"))
+        loc_bits = [b for b in (workflow, job, step) if b]
+        loc = " / ".join(loc_bits)
+        header = f"### Check {i}: {check} [{conclusion}]"
+        if loc:
+            header += f" — {loc}"
+        lines.append(header)
+        if head:
+            lines.append(f"Head SHA: {head}")
+        if url:
+            lines.append(f"Run: {url}")
+        if excerpt:
+            lines.append(excerpt)
+        if log_excerpt:
+            lines.append("")
+            lines.append(f"Log excerpt (bounded, {log_status}):")
+            if log_truncated:
+                lines.append(
+                    "(truncated — this is a head+tail slice of the log, not "
+                    "the whole thing)"
+                )
+            lines.append(log_excerpt)
+        elif log_status != "ok":
+            # mctl-agents#423 review P2: a non-"ok" status with no excerpt
+            # means retrieval was skipped, timed out, or came back
+            # unavailable — say so instead of leaving the agent to guess why
+            # there is no log evidence for this check.
+            lines.append("")
+            lines.append(f"Log excerpt: none ({log_status}).")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _bundle_is_ci_only(bundle: dict) -> bool:
+    """True when the bundle carries failing-check evidence and NO review findings.
+
+    mctl-agents#411 made this bundle shape reachable (an actionable required
+    check failed while the review is clean). The prompt built around it has to
+    know, because every sentence of the follow-up variant was written for the
+    other shape: "Code review left P1/P2 findings on this PR", "Read the codex
+    findings (below)", "if a finding is already addressed ... write the refusal
+    marker", "fixing the codex findings only". Spliced above a bundle that says
+    there are no findings, that plausibly produces a refusal (which charges
+    `refusals`) or an empty commit (a deterministic content failure), either of
+    which spends one of MAX_REVIEW_ATTEMPTS — so the check stays red, the same
+    bundle is rebuilt next tick, and the proposal walks to review-stuck over a
+    lint/mypy failure nobody ever asked the implementer to fix.
+    """
+    return not (bundle.get("summaries") or []) and bool(bundle.get("ci_failures") or [])
+
+
+def _bundle_work_class(bundle: dict) -> str:
+    """`"ci-remediation"`, `"mixed"` or `"review"` — the work class
+    `implementer_envelope()` derives the execution envelope from
+    (mctl-agents#423).
+
+    Reuses `_bundle_is_ci_only`'s exact predicate for the CI-only case
+    rather than restating it, so the two can never silently diverge: a
+    bundle read the prompt one way and the envelope another would be worse
+    than either one being wrong consistently. `"review"` (plain findings, or
+    a bundle carrying neither — the pre-#411 shape and every pre-#423
+    caller) is the unconditional default: `implementer_envelope("review")`
+    always resolves to the base `IMPLEMENTER_TIMEOUT_SECONDS`, so this is
+    the "nothing changes" branch.
+    """
+    if _bundle_is_ci_only(bundle):
+        return "ci-remediation"
+    if bundle.get("ci_failures"):
+        return "mixed"
+    return "review"
+
+
 def _render_review_feedback(bundle: dict) -> str:
     """Format the JSON bundle as a Markdown section for the sub-agent."""
     summaries = bundle.get("summaries") or []
+    ci_failures = bundle.get("ci_failures") or []
     has_p1 = bool(bundle.get("p1"))
     has_p2 = bool(bundle.get("p2"))
 
@@ -1443,24 +1969,34 @@ def _render_review_feedback(bundle: dict) -> str:
     lines.append("")
 
     if not summaries:
-        lines.append("(No summaries in bundle — re-read the PR's code review on GitHub.)")
-        return "\n".join(lines)
-
-    for i, item in enumerate(summaries, 1):
-        if isinstance(item, dict):
-            severity = item.get("severity") or "?"
-            file_ = item.get("file") or item.get("path") or "(top-level comment)"
-            line = item.get("line")
-            body = (item.get("body") or "").strip()
-            loc = file_ + (f":{line}" if line else "")
-            lines.append(f"### Finding {i} [{severity}] — {loc}")
-            if body:
-                lines.append(body)
-            lines.append("")
+        # A CI-only bundle (mctlhq/mctl-agents#411: an actionable required
+        # check failed with a clean review) still has something useful to
+        # say — render the CI section below instead of the old dead end.
+        if ci_failures:
+            lines.append("(No code review findings in this bundle.)")
         else:
-            # Fallback shape: plain string summary.
-            lines.append(f"- {str(item).strip()}")
-    return "\n".join(lines).rstrip() + "\n"
+            lines.append("(No summaries in bundle — re-read the PR's code review on GitHub.)")
+            return "\n".join(lines)
+    else:
+        for i, item in enumerate(summaries, 1):
+            if isinstance(item, dict):
+                severity = item.get("severity") or "?"
+                file_ = item.get("file") or item.get("path") or "(top-level comment)"
+                line = item.get("line")
+                body = (item.get("body") or "").strip()
+                loc = file_ + (f":{line}" if line else "")
+                lines.append(f"### Finding {i} [{severity}] — {loc}")
+                if body:
+                    lines.append(body)
+                lines.append("")
+            else:
+                # Fallback shape: plain string summary.
+                lines.append(f"- {str(item).strip()}")
+
+    rendered = "\n".join(lines).rstrip() + "\n"
+    if ci_failures:
+        rendered += "\n" + _render_ci_failures_section(ci_failures)
+    return rendered
 
 
 def _branch_exists_on_origin(repo_dir: Path, branch: str) -> bool:
@@ -1494,8 +2030,59 @@ def _push_followup(
     )
 
 
-async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
-    options = build_implementer_agent_options(repo_dir, SERVICE_AGENT_MODEL, proposal_dir)
+async def _run_implementer_agent(
+    repo_dir: Path,
+    prompt: str,
+    proposal_dir: Path,
+    *,
+    envelope_s: float | None = None,
+    work_class: str = "review",
+    budget_ledger: CommandBudgetLedger | None = None,
+) -> None:
+    """Run the implementer's Claude Code turn under one outer wall-clock bound.
+
+    ``envelope_s``/``work_class`` (mctl-agents#423): the caller derives both
+    from the bundle it is driving (`review_feedback_one` via
+    `_bundle_work_class` + `implementer_envelope`) and passes them through so
+    every failure message below names which budget expired, not just that
+    "N seconds expired". ``envelope_s=None`` (the default -- every plain
+    `implement_one` call, and every existing test that only passes the first
+    three positional args) resolves to `IMPLEMENTER_TIMEOUT_SECONDS` read at
+    CALL time, not at function-definition time, so monkeypatching that module
+    attribute still works exactly as it did before this parameter existed.
+
+    ``budget_ledger`` (mctl-agents#430): when supplied, every agent-issued
+    Bash command is bounded to what remains of THIS run's envelope via
+    `options._deadline_guard_hook` -- see `build_implementer_agent_options`.
+    The absolute deadline is computed HERE, immediately before
+    `anyio.fail_after(envelope_s)` below, on the SAME monotonic clock
+    (`anyio.current_time()`) that call uses, so the guard's remaining-budget
+    arithmetic and the outer bound agree on what "now" and "the deadline"
+    mean. ``budget_ledger=None`` (every caller and test that predates this
+    parameter) omits the guard entirely and reproduces today's behaviour
+    byte-for-byte -- see `build_implementer_agent_options`'s docstring.
+    """
+    if envelope_s is None:
+        envelope_s = IMPLEMENTER_TIMEOUT_SECONDS
+    deadline_monotonic = anyio.current_time() + envelope_s
+    # One-shot probe, not per-command: `shutil.which` is cheap but there is no
+    # reason to pay it once per Bash call, and the fallback (skip wrapping,
+    # keep the tool-input clamp and the detachment denials) is a property of
+    # the whole run, not of any one command.
+    timeout_available = shutil.which("timeout") is not None
+    if not timeout_available:
+        print(
+            "warn: `timeout` binary not found on PATH; falling back to "
+            "tool-input clamping and detachment denials only -- commands are "
+            "no longer bounded at the OS level (mctl-agents#430)",
+            file=sys.stderr,
+        )
+    options = build_implementer_agent_options(
+        repo_dir, SERVICE_AGENT_MODEL, proposal_dir, work_class=work_class,
+        deadline_monotonic=deadline_monotonic,
+        budget_ledger=budget_ledger,
+        timeout_available=timeout_available,
+    )
     mcp_configured = bool(options.mcp_servers)
     # A budget bounds spend but not a stalled network/model stream. Keep one
     # proposal inside the workflow's larger deadline (incident e3649b04).
@@ -1506,8 +2093,12 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
     # that point on the work is on disk, so an outer expiry during teardown must
     # not throw it away -- see the TimeoutError handler.
     drain_completed = False
+    # Bound so mypy (and a human) can see the TimeoutError handler's
+    # `ledger.live` guard makes referencing `client` there safe even though a
+    # deadline that fires during `ClaudeSDKClient.__aenter__` never assigns it.
+    client: Any = None
     try:
-        with anyio.fail_after(IMPLEMENTER_TIMEOUT_SECONDS):
+        with anyio.fail_after(envelope_s):
             async with ClaudeSDKClient(options=options) as client:
                 if mcp_configured:
                     # fatal=False — see orchestrator/mcp_guard.py. The
@@ -1571,12 +2162,57 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
         # drain, so it exited 44 -- deterministic, charged, MAX_HARNESS_FAILURES
         # bypassed -- for a child that was demonstrably still running.
         if ledger.live:
+            # mctl-agents#423: a shielded, bounded teardown before re-raising.
+            # Without the shield, `client.disconnect()` here awaits inside the
+            # scope `fail_after` just cancelled -- the first checkpoint inside
+            # it raises immediately, the teardown is skipped, and whatever CLI
+            # child the SDK spawned outlives this process. `move_on_after`
+            # bounds the shield itself: a wedged disconnect must not turn a
+            # harness failure into a hang.
+            if client is not None:
+                with anyio.CancelScope(shield=True):
+                    with anyio.move_on_after(IMPLEMENTER_TEARDOWN_GRACE_SECONDS):
+                        # Resolved before disconnect() runs, not after: the
+                        # belt-and-suspenders check below must still have it
+                        # when the grace clamp cancels mid-`disconnect()` --
+                        # the exact case it exists for. Only reached when the
+                        # SDK exposes it -- a fake test client legitimately
+                        # does not.
+                        transport = getattr(client, "_transport", None)
+                        process = getattr(transport, "_process", None)
+                        try:
+                            await client.disconnect()
+                        except Exception as teardown_exc:  # noqa: BLE001 — best-effort teardown
+                            print(
+                                f"warn: shielded teardown disconnect failed "
+                                f"({type(teardown_exc).__name__}: {teardown_exc})"
+                            )
+                        finally:
+                            # Belt-and-suspenders: disconnect() above should
+                            # have torn down the transport's CLI child
+                            # already, but a disconnect that itself got cut
+                            # short by the grace clamp (still bounded above,
+                            # just possibly incomplete) must not leave that
+                            # child running. This has to be a `finally`, not
+                            # code after the `try` -- code after the `try`
+                            # is skipped when `move_on_after` cancels
+                            # mid-`disconnect()` (the cancellation is not an
+                            # `Exception`, so it is not caught above, and it
+                            # unwinds straight past anything that isn't a
+                            # `finally`). `process.terminate()` itself has no
+                            # `await`, so it still runs to completion here
+                            # even while the scope is cancelled.
+                            if process is not None and getattr(process, "returncode", None) is None:
+                                try:
+                                    process.terminate()
+                                except ProcessLookupError:
+                                    pass
             # The outer wall-clock bound, not the drain's own -- but the cause
             # is still a child we could not await, so it is charged to the
             # harness, not to the proposal.
             raise ImplementerOrphanedSubagent(
-                f"orphaned sub-agent: outer timeout of "
-                f"{IMPLEMENTER_TIMEOUT_SECONDS:g}s expired while awaiting "
+                f"orphaned sub-agent: outer timeout of {envelope_s:g}s "
+                f"(work class: {work_class}) expired while awaiting "
                 f"{ledger.describe()}"
             ) from exc
         if drain_completed:
@@ -1590,14 +2226,14 @@ async def _run_implementer_agent(repo_dir: Path, prompt: str, proposal_dir: Path
             # just spent the whole drain waiting for would go in the bin with the
             # tmp clone. Return instead and let the git check adjudicate.
             print(
-                f"warn: outer bound of {IMPLEMENTER_TIMEOUT_SECONDS:g}s expired "
-                f"after the sub-agent was awaited; proceeding on what is "
+                f"warn: outer bound of {envelope_s:g}s (work class: {work_class}) "
+                f"expired after the sub-agent was awaited; proceeding on what is "
                 f"already in the worktree"
             )
             return
         raise ImplementerOperationTimeout(
-            f"operation exceeded {IMPLEMENTER_TIMEOUT_SECONDS:g}s "
-            f"(model stream, client construction, or mctl connectivity check)"
+            f"operation exceeded {envelope_s:g}s (work class: {work_class}; "
+            f"model stream, client construction, or mctl connectivity check)"
         ) from exc
 
 
@@ -1619,14 +2255,20 @@ def review_feedback_one(
     ref: ProposalRef,
     bundle: dict,
     dry_run: bool = False,
+    branch: str | None = None,
 ) -> ImplementResult:
     """Apply code review feedback as a follow-up commit on the existing PR.
 
     Pre-conditions (caller's responsibility):
-    - ``feat/agents-<slug>`` exists on origin (the shepherd only invokes
-      this mode after observing an open PR).
+    - ``feat/agents-<slug>`` (or ``branch``, when set) exists on origin (the
+      shepherd only invokes this mode after observing an open PR).
     - ``ref`` has a ``pr`` URL set in `.status.yaml` (used for logging
       only — we do not re-open a PR).
+
+    ``branch`` overrides the deterministic ``feat/agents-<slug>`` name — the
+    adopted-PR path (mctlhq/mctl-agents#334) passes the PR's own head
+    branch, read from ``.prref.yaml`` by the caller, never a model-supplied
+    value. ``None`` (the default) reproduces today's behaviour exactly.
 
     On success: pushes a follow-up commit to the existing branch and
     returns an ``ImplementResult`` whose ``pr_url`` is the existing PR
@@ -1662,7 +2304,11 @@ def review_feedback_one(
     # answers says who holds the claim, so all three are the case this rule is
     # for. `LIFECYCLE_OWNERSHIP_REQUIRED=false` is the break-glass.
     release_claim = True
-    branch = f"feat/agents-{ref.slug}"
+    # An explicit branch means the caller resolved a PRRef, i.e. the
+    # adopted-PR path (mctlhq/mctl-agents#334) — captured BEFORE the
+    # default-branch fallback below collapses the distinction.
+    adopted = branch is not None
+    branch = branch or f"feat/agents-{ref.slug}"
     try:
         # 1. Clone the sibling repo. The shepherd's bundle path holds the
         # findings; cloning fresh keeps the worktree clean (avoids
@@ -1719,9 +2365,26 @@ def review_feedback_one(
                 ),
             )
 
-        # 5. Run the SDK with the bundle baked into the prompt.
-        prompt = _build_prompt(ref, review_feedback=bundle)
-        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
+        # 5. Run the SDK with the bundle baked into the prompt. The execution
+        # envelope is derived from the work class the bundle actually carries
+        # (mctl-agents#423) -- a CI-remediation or mixed bundle gets a wider,
+        # capped envelope than the review-only default, and its own guard
+        # hook (see build_implementer_agent_options). `budget_ledger`
+        # (mctl-agents#430) is populated by the deadline guard as the run
+        # progresses -- created here, before the SDK call, so it is
+        # available below regardless of how the run ends.
+        work_class = _bundle_work_class(bundle)
+        n_checks = len(bundle.get("ci_failures") or [])
+        envelope_s = implementer_envelope(work_class, n_checks=n_checks)
+        budget_ledger = CommandBudgetLedger()
+        prompt = _build_prompt(ref, review_feedback=bundle, branch=branch, adopted=adopted)
+        anyio.run(
+            functools.partial(
+                _run_implementer_agent,
+                envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
+            ),
+            target, prompt, ref.proposal_dir.resolve(),
+        )
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
         if not _has_new_commits(target, base=old_head):
@@ -1730,11 +2393,69 @@ def review_feedback_one(
             # Only a valid marker separates the two (mctl-agents#360).
             refusal = _read_refusal_marker(target)
             if refusal:
+                if refusal.verification_budget_exhausted:
+                    # mctl-agents#430: the agent itself decided the remaining
+                    # command budget could not fit another verification step
+                    # -- the same outcome the ledger reports below, recorded
+                    # deliberately rather than observed by the guard's denial.
+                    release_reason = "no follow-up: verification budget exhausted"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {refusal.reason}",
+                        budget_ledger=budget_ledger,
+                    )
+                if refusal.insufficient_evidence:
+                    # mctl-agents#423: the bounded CI-log evidence could not
+                    # support a code decision -- distinct from an ordinary
+                    # refusal (see EXIT_CI_EVIDENCE_INSUFFICIENT's comment).
+                    release_reason = "no follow-up: ci evidence insufficient"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=f"{CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX} {refusal.reason}",
+                    )
+                if budget_ledger.exhausted:
+                    # The agent wrote a marker but left
+                    # `verification_budget_exhausted` unset, while the
+                    # ORCHESTRATOR's own ledger recorded the budget running
+                    # out. Falling through to the generic refusal would map
+                    # this to EXIT_DELIBERATE_NO_OP (47), which the shepherd
+                    # charges to `review_attempts` as a decision on the
+                    # merits -- charging the proposal for a fact about the
+                    # runner because a model omitted an optional boolean
+                    # (agy P2 on `624a433`). Structured orchestrator evidence
+                    # outranks model prose, which is the whole reason the
+                    # ledger exists; the agent's own reason still rides along.
+                    release_reason = "no follow-up: verification budget exhausted"
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=(
+                            f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} "
+                            f"{refusal.reason} [{budget_ledger.describe()}]"
+                        ),
+                        budget_ledger=budget_ledger,
+                    )
                 release_reason = "no follow-up: refused"
                 return ImplementResult(
                     ref=ref,
                     pr_url=None,
-                    error=f"{REFUSAL_ERROR_PREFIX} {refusal}",
+                    error=f"{REFUSAL_ERROR_PREFIX} {refusal.reason}",
+                )
+            if budget_ledger.exhausted:
+                # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
+                # prose -- observed the command budget run out with nothing
+                # committed and no marker written. Distinct from a plain
+                # EXIT_NO_FOLLOWUP_COMMITS: re-running with a bigger reserve
+                # or a faster verification step may still make progress,
+                # whereas a plain no-commit is deterministic.
+                release_reason = "no follow-up: verification budget exhausted"
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {budget_ledger.describe()}",
+                    budget_ledger=budget_ledger,
                 )
             release_reason = "no follow-up commits"
             return ImplementResult(
@@ -1752,9 +2473,13 @@ def review_feedback_one(
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
+        # Print the ledger summary even on success (mctl-agents#430): commits
+        # present is EXIT_OK regardless of any clamping/truncation along the
+        # way, but that truncation must still be visible in the Argo log.
         existing = _load_status(ref.status_path)
         pr_url = existing.get("pr")
         release_reason = "follow-up pushed"
+        print(f"info: command budget ledger: {budget_ledger.describe()}")
         result = ImplementResult(ref=ref, pr_url=pr_url)
         return result
 
@@ -2276,6 +3001,7 @@ def _mark_needs_triage(
     pr_url: str | None = None,
     attempt: dict[str, Any] | None = None,
     claim_context: _ClaimContext | None = None,
+    extra_fields: dict[str, Any] | None = None,
 ) -> bool:
     """Record a terminal failure on the proposal. True when it was written.
 
@@ -2290,6 +3016,8 @@ def _mark_needs_triage(
         },
         "notes": f"{stage}: {message[:500]}",
     }
+    if extra_fields:
+        fields.update(extra_fields)
     if pr_url:
         fields["pr"] = pr_url
     if attempt:
@@ -2353,6 +3081,107 @@ def _mark_blocked(
     }
     update_status_yaml(ref, "accepted", blocked=block)
     return True
+
+
+def _superseding_pr_urls(repo: str, number: int) -> list[str]:
+    """Best-effort lookup of merged PRs GitHub already recorded as closing
+    `repo#number` (mctl-agents#410, the honest version of "closed but
+    superseded").
+
+    Only called on the closed-as-completed arm -- there is nothing to
+    supersede a `not_planned` issue with. Diagnostics only: any failure
+    (network, JSON, unexpected shape) or an empty result returns `[]`, and
+    the caller must never let that change the admission verdict -- this
+    lookup never runs before the refusal is decided, only after, to build
+    the message.
+    """
+    try:
+        events = _github_json(["gh", "api", f"repos/{repo}/issues/{number}/timeline"])
+    except Exception:  # noqa: BLE001 -- diagnostics only, never propagate
+        return []
+    if not isinstance(events, list):
+        return []
+
+    dated: list[tuple[str, str]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("event")
+        if kind == "cross-referenced":
+            source_issue = (event.get("source") or {}).get("issue") or {}
+            pr = source_issue.get("pull_request") or {}
+            merged_at = pr.get("merged_at")
+            url = source_issue.get("html_url")
+            if merged_at and url:
+                dated.append((merged_at, url))
+        elif kind == "closed" and event.get("commit_id"):
+            # A closing commit with no accompanying cross-reference event
+            # still proves supersession -- look up the PR(s) that commit
+            # belongs to. Best-effort per commit: one bad lookup must not
+            # discard URLs already found from other events.
+            try:
+                prs = _github_json(
+                    ["gh", "api", f"repos/{repo}/commits/{event['commit_id']}/pulls"]
+                )
+            except Exception as exc:  # noqa: BLE001 -- diagnostics only
+                print(f"warn: could not look up PRs for commit {event['commit_id']}: {exc}")
+                continue
+            if isinstance(prs, list):
+                for pr in prs:
+                    if not isinstance(pr, dict):
+                        continue
+                    merged_at = pr.get("merged_at")
+                    url = pr.get("html_url")
+                    if merged_at and url:
+                        dated.append((merged_at, url))
+
+    if not dated:
+        return []
+    dated.sort(key=lambda item: item[0], reverse=True)
+    seen: set[str] = set()
+    urls: list[str] = []
+    for _, url in dated:
+        if url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
+        if len(urls) == 3:
+            break
+    return urls
+
+
+def _stale_source_message(ref: ProposalRef, verdict: SourceIssueVerdict) -> str:
+    """Compose the admission-refusal message for a proposal's closed source
+    issue (mctl-agents#410).
+
+    Names the issue reference, close reason and close timestamp, and the
+    one supported recovery -- reopening the issue, or re-publishing the
+    proposal as 'proposed' -- rather than a re-check the implementer would
+    never run on its own. Deterministic for a fixed verdict, and stays
+    comfortably under the 2000-char clamp `_mark_needs_triage` applies to
+    `failure.message`.
+    """
+    not_planned = verdict.state_reason == "not_planned"
+    reason = "not planned" if not_planned else "completed"
+    closed_at = f" (closed {verdict.closed_at})" if verdict.closed_at else ""
+    message = (
+        f"source issue {verdict.issue_ref} is closed as {reason}{closed_at}; "
+        f"admission refused before any model attempt."
+    )
+    if not not_planned:
+        # Nothing to supersede a not-planned issue with -- only look on the
+        # completed arm.
+        source = _load_status(ref.status_path).get("source") or {}
+        repo = source.get("repo")
+        number = source.get("issue")
+        urls = _superseding_pr_urls(repo, number) if repo and number else []
+        if urls:
+            message += " Superseded by: " + ", ".join(urls) + "."
+    message += (
+        " Reopen the issue, or re-publish this proposal as 'proposed', to "
+        "make it runnable again."
+    )
+    return message
 
 
 def _push_and_open_pr(
@@ -2534,6 +3363,50 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             error=existing.reason or "existing result needs triage",
         )
 
+    # Admission gate (mctl-agents#410): only reachable on `existing.action
+    # == "none"` -- no branch, no PR for this proposal at all -- because
+    # every other preflight outcome above already returned. That ordering
+    # matters: a proposal the implementer already carried to a `merged` PR
+    # *has* a closed source issue (the PR body says `Closes <repo>#<N>`),
+    # and gating before the preflight would relabel it stale on the very
+    # tick that re-selects it.
+    #
+    # Spends nothing: no SDK auth, no ExecutionClaim acquire, no `attempt`
+    # lease, no clone -- the whole point is to refuse before any of that,
+    # not after.
+    verdict = read_source_issue(
+        _load_status(ref.status_path), stage="admission", gh_api_json=_gh_api_json
+    )
+    if verdict.linked and not verdict.known:
+        # GitHub did not answer. Not evidence about the proposal -- the
+        # same rule the shepherd's `linked and not known` guard follows.
+        # Leave it `accepted` and untouched; do not charge the batch
+        # budget for a GitHub blip.
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            skipped_reason="source issue unreadable; deferring",
+            counts_toward_limit=False,
+        )
+    if verdict.failure:
+        message = _stale_source_message(ref, verdict)
+        recorded = _mark_needs_triage(
+            ref,
+            code=verdict.failure["code"],
+            stage="admission",
+            message=message,
+        )
+        return ImplementResult(
+            ref=ref,
+            pr_url=None,
+            error=_triage_error(message, recorded),
+            counts_toward_limit=False,
+            stale_source=(verdict.failure["code"], verdict.issue_ref or "?"),
+        )
+    # `not verdict.linked` (no usable source block -- incident-responder
+    # shape) or the issue is open: nothing to refuse, fall through to the
+    # model exactly as today.
+
     try:
         ensure_auth_for_sdk()
     except (Exception, SystemExit) as exc:
@@ -2616,11 +3489,104 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         _stage_implementer_agent(target, ref.service)
 
         # 5. Run the SDK with PROPOSAL_DIR pointing at the gitops worktree.
+        # `budget_ledger` (mctl-agents#430): the same per-command deadline
+        # guard `review_feedback_one` wires in -- the boundary this proposal
+        # draws is generic over the driver, not review-remediation-only.
         prompt = _build_prompt(ref)
-        anyio.run(_run_implementer_agent, target, prompt, ref.proposal_dir.resolve())
+        budget_ledger = CommandBudgetLedger()
+        anyio.run(
+            functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
+            target, prompt, ref.proposal_dir.resolve(),
+        )
+        print(f"info: command budget ledger: {budget_ledger.describe()}")
 
         # 6. Did the agent actually commit something?
         if not _has_new_commits(target):
+            if budget_ledger.exhausted:
+                prior_handbacks = int(
+                    _load_status(ref.status_path).get("budget_handbacks", 0) or 0
+                )
+                # mctl-agents#430: the ORCHESTRATOR's own ledger -- not model
+                # prose -- observed the per-command budget run out with
+                # nothing committed. That is a fact about THIS RUN's envelope,
+                # not about the proposal, so it must not be charged to the
+                # proposal: `needs-triage` is terminal by contract (a retry
+                # needs an operator-reviewed gitops change moving it back to
+                # `accepted`), and parking a perfectly good proposal there
+                # for a busy runner is exactly the misattribution this PR
+                # removes on the review path and left in place here (claude
+                # P2 on `630ac27`). Hand back instead: release the claim and
+                # restore `accepted` under the same compare-and-swap the
+                # claim-vanished arm uses, so the next attempt re-runs
+                # against the current world.
+                if prior_handbacks + 1 >= IMPLEMENT_MAX_BUDGET_HANDBACKS:
+                    # The hand-back budget is spent. Blamelessness does not
+                    # mean "retry forever at cost": record it terminally, but
+                    # under its OWN code so the proposal's history still says
+                    # "the runner ran out of budget", not "this proposal
+                    # produces no commits".
+                    exhausted_msg = (
+                        "verification budget exhausted on "
+                        f"{prior_handbacks + 1} consecutive attempts "
+                        f"(limit {IMPLEMENT_MAX_BUDGET_HANDBACKS}): "
+                        f"{budget_ledger.describe()}"
+                    )
+                    recorded = _mark_needs_triage(
+                        ref,
+                        code="verification-budget-exhausted",
+                        stage="agent",
+                        message=exhausted_msg,
+                        attempt=attempt,
+                        claim_context=claim_ctx,
+                        # The operator gate out of `needs-triage` is a
+                        # deliberate human decision to try again, so it must
+                        # start from a clean budget. `_mark_needs_triage`
+                        # preserves unrelated fields, so without this the next
+                        # run to exhaust its budget would go terminal at once
+                        # with zero hand-backs, printing "consecutive
+                        # attempts" on what is really the first (claude P3 on
+                        # `8465c6e`).
+                        extra_fields={"budget_handbacks": None},
+                    )
+                    return ImplementResult(
+                        ref=ref,
+                        pr_url=None,
+                        error=_triage_error(exhausted_msg, recorded),
+                        budget_terminal=recorded,
+                        budget_ledger=budget_ledger,
+                    )
+                message = (
+                    "implementer produced no commits: "
+                    f"{budget_ledger.describe()} "
+                    f"(attempt {prior_handbacks + 1} of "
+                    f"{IMPLEMENT_MAX_BUDGET_HANDBACKS})"
+                )
+                # Status first, claim second -- the order every sibling arm
+                # uses (`_mark_needs_triage`, the `implemented` write). The
+                # reverse frees mutual exclusion while `.status.yaml` still
+                # names our live attempt, so a second executor can acquire
+                # the claim inside that window and either lose its own write
+                # to our hand-back or make our compare-and-swap decline
+                # (agy P2 on `61595a0`).
+                handed_back = _hand_back_if_still_ours(
+                    ref, attempt_id, budget_handbacks=prior_handbacks + 1
+                )
+                _release_claim(claim_ctx, reason="agent: verification budget exhausted")
+                if not handed_back:
+                    # The CAS declined -- somebody else's attempt is in the
+                    # file, so nothing was handed back and the next tick will
+                    # not retry it. Two different outcomes must not read
+                    # identically in the batch summary.
+                    message = (
+                        f"{message} (left as-is for the attempt that now holds it)"
+                    )
+                return ImplementResult(
+                    ref=ref,
+                    pr_url=None,
+                    error=f"{VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX} {message}",
+                    budget_handback=handed_back,
+                    budget_ledger=budget_ledger,
+                )
             recorded = _mark_needs_triage(
                 ref,
                 code="no-commits",
@@ -2687,6 +3653,10 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
                 "agent": "implementer",
                 "version": execution_context.executor.version,
             },
+            # A run that got through clears the hand-back tally: the cap
+            # bounds CONSECUTIVE budget-exhausted attempts, not the lifetime
+            # of the proposal (mctl-agents#430).
+            budget_handbacks=None,
         )
         _release_claim(claim_ctx, reason="implemented")
         result = ImplementResult(ref=ref, pr_url=pr_url)
@@ -2892,14 +3862,24 @@ def _implement_refs(
 def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
     """Classify every result; partial success must never mask a failure.
 
-    Order matters: error -> blocked -> skipped_reason -> pr_url. A blocked
-    result also carries a `skipped_reason` (for readers of that channel
-    alone), so it must be classified before the `skipped_reason` branch or
-    it would inflate the skip count.
+    Order matters: stale_source -> verification budget -> error -> blocked ->
+    skipped_reason -> pr_url. A stale-source refusal also carries `error` (for readers of
+    that older channel, and for the per-result "fail" summary line), so it
+    must be classified before the `error` branch or a healthy admission
+    refusal would count toward `failed` and force the whole batch red even
+    when another proposal in the same tick succeeded (codex P2 follow-up on
+    mctl-agents#410). A blocked result also carries a `skipped_reason` (for
+    readers of that channel alone), so it must be classified before the
+    `skipped_reason` branch or it would inflate the skip count.
     """
-    succeeded = failed = skipped = blocked = 0
+    succeeded = failed = skipped = blocked = stale_source = 0
+    verification_budget = 0
     for result in results:
-        if result.error:
+        if result.stale_source:
+            stale_source += 1
+        elif result.budget_handback or result.budget_terminal:
+            verification_budget += 1
+        elif result.error:
             failed += 1
         elif result.blocked:
             blocked += 1
@@ -2909,7 +3889,14 @@ def _batch_outcome(results: list[ImplementResult]) -> BatchOutcome:
             succeeded += 1
         else:
             failed += 1
-    return BatchOutcome(succeeded=succeeded, failed=failed, skipped=skipped, blocked=blocked)
+    return BatchOutcome(
+        succeeded=succeeded,
+        failed=failed,
+        skipped=skipped,
+        blocked=blocked,
+        stale_source=stale_source,
+        verification_budget=verification_budget,
+    )
 
 
 def _max_proposals_error(max_proposals: int, dry_run: bool) -> str | None:
@@ -2970,10 +3957,32 @@ def main() -> None:
             "so omitting this only costs the shepherd the structured copy."
         ),
     )
+    ap.add_argument(
+        "--adopted-pr",
+        default="",
+        metavar="URL",
+        help=(
+            "GitHub PR URL of a proposal-less, adopted PR (see "
+            "orchestrator.pr_adoption, mctlhq/mctl-agents#334). Valid only "
+            "together with --review-feedback; mutually exclusive with "
+            "--slug. Drives the PR's OWN head branch instead of "
+            "feat/agents-<slug>. Never adopts a PR itself — only the "
+            "shepherd's discovery pass does; a missing adoption record "
+            "exits 2."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
         print(f"Unknown service '{args.service}'. Available: {', '.join(SERVICES)}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.adopted_pr and args.slug:
+        print("--adopted-pr is mutually exclusive with --slug", file=sys.stderr)
+        sys.exit(2)
+
+    if args.adopted_pr and not args.review_feedback:
+        print("--adopted-pr is only valid together with --review-feedback", file=sys.stderr)
         sys.exit(2)
 
     state_dir = Path(args.state_dir)
@@ -2981,31 +3990,69 @@ def main() -> None:
     # Review-feedback mode: drive the existing PR's branch with codex findings.
     if args.review_feedback:
         ensure_auth_for_sdk()
-        if not (args.service and args.slug):
-            print(
-                "--review-feedback requires --service AND --slug "
-                "(the shepherd always passes both).",
-                file=sys.stderr,
-            )
-            sys.exit(2)
         bundle = _load_review_feedback(Path(args.review_feedback))
-        # In review-feedback mode the proposal is post-implementation —
-        # status is `implemented` or `review-fixing`. Look it up under
-        # those statuses rather than `accepted`.
-        refs = find_accepted_proposals(
-            state_dir,
-            service_filter=args.service,
-            slug_filter=args.slug,
-            statuses={"implemented", "review-fixing"},
-        )
-        if not refs:
-            print(
-                f"No proposal {args.service}/{args.slug} in implemented/review-fixing status; "
-                f"refusing to apply review feedback.",
-                file=sys.stderr,
+
+        if args.adopted_pr:
+            if not args.service:
+                print("--adopted-pr requires --service", file=sys.stderr)
+                sys.exit(2)
+            parsed_adopted = _parse_pr_url(args.adopted_pr)
+            if parsed_adopted is None:
+                print(f"--adopted-pr is not a GitHub PR URL: {args.adopted_pr!r}", file=sys.stderr)
+                sys.exit(2)
+            adopted_repo, adopted_number = parsed_adopted
+            try:
+                if _adopted_pr_is_fork(adopted_repo, adopted_number):
+                    print(
+                        f"--adopted-pr {args.adopted_pr} is a fork PR; "
+                        "refusing to clone or push to it",
+                        file=sys.stderr,
+                    )
+                    sys.exit(2)
+            except GitHubPreflightError as exc:
+                print(
+                    f"--adopted-pr fork check failed closed: could not "
+                    f"verify {adopted_repo}#{adopted_number} is not a fork "
+                    f"({exc})",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            ref = build_adopted_ref(state_dir, args.adopted_pr)
+            record = load_status(ref.status_path)
+            head_branch = record.get("head_branch") or ""
+            if not head_branch:
+                print(
+                    f"adoption record at {ref.status_path} has no head_branch; refusing",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            result = review_feedback_one(ref, bundle, dry_run=args.dry_run, branch=head_branch)
+        else:
+            if not (args.service and args.slug):
+                print(
+                    "--review-feedback requires --service AND --slug "
+                    "(the shepherd always passes both), or --adopted-pr "
+                    "instead of --slug.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            # In review-feedback mode the proposal is post-implementation —
+            # status is `implemented` or `review-fixing`. Look it up under
+            # those statuses rather than `accepted`.
+            refs = find_accepted_proposals(
+                state_dir,
+                service_filter=args.service,
+                slug_filter=args.slug,
+                statuses={"implemented", "review-fixing"},
             )
-            sys.exit(1)
-        result = review_feedback_one(refs[0], bundle, dry_run=args.dry_run)
+            if not refs:
+                print(
+                    f"No proposal {args.service}/{args.slug} in implemented/review-fixing status; "
+                    f"refusing to apply review feedback.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            result = review_feedback_one(refs[0], bundle, dry_run=args.dry_run)
         print("\n=== Review-feedback summary ===")
         if result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
@@ -3015,11 +4062,32 @@ def main() -> None:
             # errors continue to exit 1 so the shepherd's transient-failure
             # path is unchanged.
             code = _review_feedback_exit_code(result.error)
-            if code == EXIT_DELIBERATE_NO_OP and args.refusal_out:
-                _write_refusal_out(
-                    Path(args.refusal_out),
-                    result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
-                )
+            if args.refusal_out:
+                if code == EXIT_DELIBERATE_NO_OP:
+                    _write_refusal_out(
+                        Path(args.refusal_out),
+                        result.error[len(REFUSAL_ERROR_PREFIX):].strip(),
+                    )
+                elif code == EXIT_CI_EVIDENCE_INSUFFICIENT:
+                    # mctl-agents#423 review P2: `result.error` already carries
+                    # the agent's reason (see the insufficient_evidence branch
+                    # above), but this write used to be gated to
+                    # EXIT_DELIBERATE_NO_OP only, so it never reached
+                    # `--refusal-out` and the reason was silently dropped.
+                    _write_refusal_out(
+                        Path(args.refusal_out),
+                        result.error[len(CI_EVIDENCE_INSUFFICIENT_ERROR_PREFIX):].strip(),
+                    )
+                elif code == EXIT_VERIFICATION_BUDGET_EXHAUSTED:
+                    # mctl-agents#430: the structured ledger summary (clamp/
+                    # deny counts, not just the reason text) so the shepherd
+                    # -- and an operator reading the log -- can tell a busy
+                    # runner apart from a reserve tuned too tight.
+                    _write_verification_budget_exhausted_out(
+                        Path(args.refusal_out),
+                        result.error[len(VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX):].strip(),
+                        result.budget_ledger,
+                    )
             sys.exit(code)
         if result.skipped_reason:
             print(f"  skip {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
@@ -3052,7 +4120,13 @@ def main() -> None:
 
     print("\n=== Summary ===")
     for result in results:
-        if result.error:
+        if result.budget_handback or result.budget_terminal:
+            # Not a `fail` line: these arms are excluded from `outcome.failed`
+            # below, and printing them as failures made a proposal retired
+            # cleanly under the cap read one way per result and the opposite
+            # way in `Totals:` (claude P3 on `68f3a05`).
+            print(f"  budget {result.ref.service}/{result.ref.slug}: {result.error}")
+        elif result.error:
             print(f"  fail {result.ref.service}/{result.ref.slug}: {result.error}")
         elif result.blocked:
             print(f"  blocked {result.ref.service}/{result.ref.slug}: {result.skipped_reason}")
@@ -3069,16 +4143,56 @@ def main() -> None:
         for result in blocked_results:
             print(f"  {result.ref.service}/{result.ref.slug}: {result.blocked}")
 
+    stale_sources = [(r, r.stale_source) for r in results if r.stale_source]
+    if stale_sources:
+        print("\n=== Stale source ===")
+        for result, (stale_code, issue_ref) in stale_sources:
+            print(f"  {result.ref.service}/{result.ref.slug}: {stale_code} {issue_ref}")
+
+    budget_results = [r for r in results if r.budget_handback or r.budget_terminal]
+    if budget_results:
+        print("\n=== Verification budget ===")
+        for result in budget_results:
+            print(f"  {result.ref.service}/{result.ref.slug}: {result.error}")
+
     outcome = _batch_outcome(results)
     print(
         "Totals: "
         f"{outcome.succeeded} succeeded, "
         f"{outcome.failed} failed, "
         f"{outcome.skipped} skipped, "
-        f"{outcome.blocked} blocked"
+        f"{outcome.blocked} blocked, "
+        f"{outcome.stale_source} stale source, "
+        f"{outcome.verification_budget} verification budget"
     )
     if outcome.failed:
         sys.exit(1)
+    # A refusal-only batch's `needs-triage` write IS the retirement -- unlike
+    # `blocked`'s idempotent diagnostic marker, there is no "same content
+    # next tick" safety net if it never lands. The write only exists on disk
+    # in this step; turning it into an actual gitops commit happens in the
+    # downstream commit-and-push step. Per the EXIT_BLOCKED_ONLY note above,
+    # the CWFT does not special-case any sentinel exit code today -- both its
+    # `when` gates compare Argo step status strings, so ANY non-zero exit
+    # here marks `implement` Failed and can skip that commit, leaving the
+    # proposal `accepted` so the next tick re-selects it, re-reads GitHub,
+    # and repeats forever -- precisely the loop this gate exists to end
+    # (codex P2 follow-up on mctl-agents#410, PR #416). Exit 0 here so the
+    # write is never put at risk; the `=== Stale source ===` section above
+    # plus the committed `.status.yaml` already carry the signal for
+    # operators, the same tradeoff already made for a mixed batch above.
+    # `outcome.stale_source` is deliberately excluded from `outcome.failed`
+    # above for the same reason. `outcome.verification_budget` is excluded on
+    # exactly the same grounds (mctl-agents#430): that arm hands the proposal
+    # back to `accepted` with an incremented `budget_handbacks`, and that
+    # tally is the ONLY durable bound on the paid retry loop. If a non-zero
+    # exit here marked `implement` Failed and skipped the commit step, every
+    # tick would read `0` and the cap would never be reached -- reintroducing
+    # precisely the unbounded loop the cap was added to close. The cap's own
+    # terminal write is bucketed there too: it is the write that ENDS the
+    # loop, and it has no catch-up path -- a dropped hand-back is recovered by
+    # the next green tick, a dropped terminal write is re-attempted and
+    # re-dropped forever, at full model cost every time.
     # A blocked-only run (no successful implementation to hand a durable
     # .status.yaml -> PR write off to the commit step) is a louder signal
     # than a plain skip -- see EXIT_BLOCKED_ONLY above. A run that also

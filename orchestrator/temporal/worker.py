@@ -4,8 +4,12 @@ Connects to the shared Temporal deployment (TEMPORAL_ADDRESS,
 TEMPORAL_NAMESPACE=mctl-agents — see mctl-gitops's
 infra-components/data/temporal/tenant-namespace-job.yaml for the namespace +
 search-attribute registration) and runs DevLoopWorkflow, ReconcileWorkflow,
-IssuePollWorkflow, IncidentLoopWorkflow plus their activities on task queue TASK_QUEUE.
-Deployed as its own service (mctl-agents-worker, ingress disabled).
+IssuePollWorkflow, IncidentLoopWorkflow, ImplementSweepWorkflow (plus its
+SweptImplementWorkflow child) and their activities on task queue TASK_QUEUE.
+Deployed as its own service (mctl-agents-worker, ingress disabled), with the
+long Argo waits served by sibling deployments selected by `--role`:
+`execution` (mctl-dev-loop-exec, ADR-008) and `implementation`
+(mctl-dev-loop-implement, the admission queue of #395).
 """
 from __future__ import annotations
 
@@ -43,7 +47,8 @@ from orchestrator.temporal.activities.deploy_state import (
 from orchestrator.temporal.activities.discovery import discover_and_project
 from orchestrator.temporal.activities.identity import mint_execution_context
 from orchestrator.temporal.activities.incidents import list_service_incidents
-from orchestrator.temporal.activities.issue_poll import poll_issues_activity
+from orchestrator.temporal.activities.issue_poll import directive_scan_activity, poll_issues_activity
+from orchestrator.temporal.activities.issue_state import get_issue_state
 from orchestrator.temporal.activities.lifecycle import execution_claim, lifecycle_ownership
 from orchestrator.temporal.activities.lifecycle_reconcile import (
     reconcile_lifecycle_ownership,
@@ -53,16 +58,26 @@ from orchestrator.temporal.activities.pr_state import get_pr_state
 from orchestrator.temporal.activities.proposals import find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import record_execution
+from orchestrator.temporal.activities.stranded import find_stranded_accepted
 from orchestrator.temporal.activities.visibility import VisibilityActivities
 from orchestrator.temporal.constants import (
     CONTROL_MAX_CONCURRENT_ACTIVITIES,
     CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
     EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_TASK_QUEUE,
     METRICS_PORT,
     TASK_QUEUE,
+    implement_sweep_grace_minutes,
+    implement_sweep_max_submits,
+    implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
+from orchestrator.temporal.workflows.implement_sweep import (
+    ImplementSweepWorkflow,
+    ImplementSweepWorkflowInput,
+    SweptImplementWorkflow,
+)
 from orchestrator.temporal.workflows.incidents import IncidentLoopWorkflow
 from orchestrator.temporal.workflows.issue_poll import IssuePollWorkflow, IssuePollWorkflowInput
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
@@ -76,7 +91,10 @@ ISSUE_POLL_WORKFLOW_ID = "issue-poll-mctl-agents"
 INCIDENTS_SCHEDULE_ID = "incidents-mctl-agents-schedule"
 INCIDENTS_WORKFLOW_ID = "incidents-mctl-agents"
 
-# The three *_WORKFLOW_ID constants above are the id of the schedule's
+IMPLEMENT_SWEEP_SCHEDULE_ID = "implement-sweep-mctl-agents-schedule"
+IMPLEMENT_SWEEP_WORKFLOW_ID = "implement-sweep-mctl-agents"
+
+# The four *_WORKFLOW_ID constants above are the id of the schedule's
 # ACTION, not the id the started workflow ends up with: Temporal appends the
 # action's nominal time when a schedule fires ("The Action's timestamp is
 # appended to the Workflow Id" — docs.temporal.io/schedule), so each tick
@@ -352,8 +370,47 @@ async def setup_schedules(client: Client) -> None:
 
     await _ensure_schedule(client, INCIDENTS_SCHEDULE_ID, incidents_schedule, "IncidentLoopWorkflow")
 
+    # Ships UNPAUSED, unlike incidents (#179): incidents was paused pending a
+    # manual verification run of code that had never fired in production.
+    # Shipping THIS one paused would reproduce the exact defect it fixes — a
+    # sweeper that exists and is never called (mctl-agents#412's whole
+    # premise, observed 2026-09-19: three approved proposals sat `accepted`
+    # for two hours with no owner). The per-tick submit cap and the
+    # admission queue's own slot limit are the safety bound instead; pausing
+    # remains the documented rollback (`temporal schedule pause
+    # --schedule-id implement-sweep-mctl-agents-schedule`), and
+    # `_ensure_schedule` never touches `state`, so a later pause survives
+    # every redeploy.
+    implement_sweep_schedule = Schedule(
+        action=ScheduleActionStartWorkflow(
+            ImplementSweepWorkflow.run,
+            ImplementSweepWorkflowInput(
+                grace_minutes=implement_sweep_grace_minutes(),
+                max_submits=implement_sweep_max_submits(),
+            ),
+            id=IMPLEMENT_SWEEP_WORKFLOW_ID,
+            task_queue=TASK_QUEUE,
+        ),
+        spec=ScheduleSpec(
+            # 15 min, matching reconcile/issue-poll (not the old, suspended
+            # Argo cron's `*/5`). Offset 12 gives :12/:27/:42/:57 — clear of
+            # reconcile (:03/:18/:33/:48), issue-poll (:07/:22/:37/:52),
+            # incidents (:11), and the Argo cron minutes {0, 15, 30} that
+            # test_no_schedule_lands_on_an_argo_cron_minute pins.
+            intervals=[
+                ScheduleIntervalSpec(
+                    every=timedelta(minutes=15),
+                    offset=timedelta(minutes=12),
+                )
+            ],
+        ),
+        policy=SchedulePolicy(overlap=ScheduleOverlapPolicy.SKIP),
+    )
 
-ROLES = ("all", "control", "execution")
+    await _ensure_schedule(client, IMPLEMENT_SWEEP_SCHEDULE_ID, implement_sweep_schedule, "ImplementSweepWorkflow")
+
+
+ROLES = ("all", "control", "execution", "implementation")
 
 
 @dataclass(frozen=True)
@@ -430,12 +487,17 @@ def telemetry_config() -> TelemetryConfig:
 def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan]:
     """The queue/registration layout for one role — one plan per queue.
 
-    A list, because `all` must poll BOTH queues. It is the documented
-    rollback target, and after the routing flip patched histories schedule
-    submit_and_wait onto the execution queue: an `all` process listening
-    only on the control queue would leave those activities with no poller
-    until they time out, so collapsing the split deployments back would
-    not be a rollback at all (codex P1 on #249).
+    A list, because `all` must poll EVERY queue. It is the documented
+    rollback target, and after a routing flip patched histories schedule
+    submit_and_wait onto the execution or implementation queue: an `all`
+    process listening only on the control queue would leave those
+    activities with no poller until they time out, so collapsing the split
+    deployments back would not be a rollback at all (codex P1 on #249).
+
+    `implementation` is the admission queue (#395): the same activity as
+    `execution`, on its own queue, with a slot limit that IS the number of
+    implementer runs allowed to exist at once. Only the implement submit
+    routes there; everything else long stays on `execution` at 40.
 
     `all` is the default and is byte-for-byte the single-queue worker this
     repo has always run — same queue, same activities, no slot limits — so
@@ -467,6 +529,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         reconcile_lifecycle_ownership,
         find_proposal_slug,
         get_pr_state,
+        get_issue_state,
         resolve_deploy_target,
         get_release_after,
         get_deploy_status,
@@ -474,10 +537,24 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         discover_and_project,
         detect_orphans,
         visibility.list_active_dev_loop_ids,
+        visibility.count_swept_prestart_failures,
         poll_issues_activity,
+        # Second pass of the same tick (#417): reads GitHub issue comments
+        # and, at most, POSTs a `gh issue comment` reply plus one mctl-api
+        # submit — the same shape as poll_issues_activity, so it belongs on
+        # the same queue for the same reason.
+        directive_scan_activity,
+        # Bounded GitHub reads, same shape as detect_orphans two lines up —
+        # the implement-sweep's stranding scan (mctl-agents#412).
+        find_stranded_accepted,
     ]
     workflows: list[type] = [
-        DevLoopWorkflow, ReconcileWorkflow, IssuePollWorkflow, IncidentLoopWorkflow
+        DevLoopWorkflow,
+        ReconcileWorkflow,
+        IssuePollWorkflow,
+        IncidentLoopWorkflow,
+        ImplementSweepWorkflow,
+        SweptImplementWorkflow,
     ]
 
     execution_plan = WorkerPlan(
@@ -487,8 +564,22 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         max_concurrent_activities=EXECUTION_MAX_CONCURRENT_ACTIVITIES,
     )
 
+    # Built lazily: N comes from the environment and a bad value is a
+    # startup refusal, which must only ever hit a role that serves the
+    # admission queue — never a control or execution worker that would
+    # otherwise be perfectly healthy.
+    def implementation_plan() -> WorkerPlan:
+        return WorkerPlan(
+            task_queue=IMPLEMENTATION_TASK_QUEUE,
+            workflows=[],
+            activities=[submit_and_wait],
+            max_concurrent_activities=implementation_max_concurrent_activities(),
+        )
+
     if role == "execution":
         return [execution_plan]
+    if role == "implementation":
+        return [implementation_plan()]
     if role == "control":
         return [WorkerPlan(
             task_queue=TASK_QUEUE,
@@ -501,8 +592,11 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             max_concurrent_activities=CONTROL_MAX_CONCURRENT_ACTIVITIES,
             max_concurrent_workflow_tasks=CONTROL_MAX_CONCURRENT_WORKFLOW_TASKS,
         )]
-    # `all`: one process, both queues, no limits — the pre-split shape plus
-    # a poller for the queue the routing flip starts using.
+    # `all`: one process, every queue, no limits on the control queue — the
+    # pre-split shape plus a poller for each queue a routing flip uses.
+    # The implementation plan keeps its limit even here: `all` polling the
+    # admission queue unbounded would be a rollback that silently removes
+    # the capacity it exists to impose.
     return [
         WorkerPlan(
             task_queue=TASK_QUEUE,
@@ -510,6 +604,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
             activities=[*short_activities, submit_and_wait],
         ),
         execution_plan,
+        implementation_plan(),
     ]
 
 
@@ -537,8 +632,10 @@ async def main() -> None:
         default=os.environ.get("WORKER_ROLE", "all"),
         choices=ROLES,
         help=(
-            "which half of the split this process serves (ADR-008). "
-            "'all' — one process, one queue, as before (default)."
+            "which part of the split this process serves (ADR-008, #395): "
+            "'control', 'execution', 'implementation' (the admission queue, "
+            "capacity from env IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES), or 'all' — "
+            "one process polling every queue (default)."
         ),
     )
     args = parser.parse_args()

@@ -27,10 +27,21 @@ The implement step stays scoped to this issue's own repo AND its own
 proposal slug (see `_target_repo` and `find_proposal_slug` below), so even
 a mis-signalled approve can never implement a different repo's — or a
 different issue's — proposal.
+
+The approval park is bounded (mctl-agents#420): `run()` no longer parks at
+an unbounded `wait_condition`. Under the `approval-watch` patch it polls
+every `APPROVAL_POLL_INTERVAL`, re-reading the source issue's state and
+ending the execution if the issue closed while parked, and gives up at
+`APPROVAL_WAIT_DEADLINE` if nothing resolves the wait first. An `abandon`
+signal (a graceful, cluster-access-free alternative to Temporal
+`terminate`) ends either this park or an in-progress merge watch at their
+next observation point. Every one of these paths records why it ended in
+`DevLoopResult.ended`.
 """
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -65,6 +76,7 @@ with workflow.unsafe.imports_passed_through():
         IncidentQueryResult,
         list_service_incidents,
     )
+    from orchestrator.temporal.activities.issue_state import IssueState, get_issue_state
     from orchestrator.temporal.activities.lifecycle import (
         OwnershipRequest,
         OwnershipResult,
@@ -74,7 +86,12 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.activities.proposals import find_proposal_slug
     from orchestrator.temporal.activities.registry import ResolvedRelease, resolve_agent_release
     from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
-    from orchestrator.temporal.constants import EXECUTION_TASK_QUEUE
+    from orchestrator.temporal.constants import (
+        EXECUTION_TASK_QUEUE,
+        IMPLEMENTATION_OPERATION,
+        IMPLEMENTATION_TASK_QUEUE,
+    )
+    from orchestrator.temporal.implement_outcome import Outcome, classify, finalization_evidence
     from orchestrator.temporal.issue_ref import parse_issue_url
 
 ENVIRONMENT = "production"
@@ -94,6 +111,36 @@ ENVIRONMENT = "production"
 # retry forever.
 SDK_STEP_RETRY_POLICY = RetryPolicy(maximum_attempts=3)
 SDK_STEP_TIMEOUT = timedelta(hours=2)
+# Deliberately no schedule_to_start_timeout and no schedule_to_close_timeout
+# on submit_and_wait — see _run_cwft. On the implementation queue (#395) the
+# schedule-to-start wait IS the admission queue: bounding it would turn
+# "waiting for capacity" into a failure, which is the shape of the bug
+# admission exists to remove.
+
+# How many times an implement submit that never started an implementer pod
+# is re-submitted before the loop gives up (#395, implement_outcome.py).
+# A pre-start failure attempted nothing — it waited on capacity or a mutex
+# and was killed by a deadline, or Argo accepted the workflow and never
+# scheduled the pod — so it is not an implementation attempt and needs no
+# human. Bounded, because a cluster that cannot start pods at all must
+# eventually surface as a failed loop rather than resubmit forever.
+MAX_PRESTART_REQUEUES = 3
+# ...and waited between, so the bound is a time budget and not a burst.
+# A pre-start cause can be fast: Argo accepts the workflow and the pod is
+# never scheduled (quota, taint, an admission webhook), which comes back in
+# seconds. Requeueing straight away would spend all three tries before the
+# transient condition could clear and fail a loop that a minute of patience
+# would have saved. The sleep costs nothing — a requeue is not an attempt,
+# and the wait does not touch the implementation slot, which the completed
+# activity already released.
+#
+# The budget is also spent by the Argo-side mutex: admission lets N
+# implement submits exist at once, so if the CWFT's `synchronization` mutex
+# is narrower than N, the surplus queues inside Argo against its own
+# deadline and comes back pre_start. That is requeued rather than lost, but
+# N and the mutex capacity have to move together — ADR-008 D7 records that
+# the gitops mutex is expected to be at least N.
+PRESTART_REQUEUE_BACKOFF = timedelta(minutes=2)
 SDK_STEP_HEARTBEAT_TIMEOUT = timedelta(minutes=2)
 
 FAST_ACTIVITY_TIMEOUT = timedelta(seconds=30)
@@ -126,6 +173,16 @@ SLUG_LOOKUP_RETRY_POLICY = RetryPolicy(
 # would just mean a wedged mutex holding the loop for hours.
 APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 
+# mctl-agents#420: the approval park (`workflow.wait_condition` a few lines
+# into `run()`) had no bound of its own -- every other stage in this module
+# does. Matched to `MERGE_WATCH_DEADLINE` so the worst-case lifetime of an
+# execution is two bounded fortnights, not infinity: 56 polls over the
+# deadline is a negligible history footprint against Temporal's 50k event
+# limit, two orders of magnitude below the ~1344 polls `_watch_pr` already
+# budgets for its own 14-day watch.
+APPROVAL_POLL_INTERVAL = timedelta(hours=6)
+APPROVAL_WAIT_DEADLINE = timedelta(days=14)
+
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
 # state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
 # responsive enough for a merge event nothing downstream reacts to in
@@ -142,6 +199,23 @@ APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 MERGE_POLL_INTERVAL = timedelta(minutes=15)
 LEGACY_MERGE_POLL_INTERVAL = timedelta(minutes=30)
 MERGE_WATCH_DEADLINE = timedelta(days=14)
+# mctl-agents#404 v2: a complete 14-day watch at MERGE_POLL_INTERVAL is
+# ~15,500 history events, crossing Temporal's default
+# `limit.historyCount.warn` of 10,240. The watch hops via continue_as_new
+# once its history is large enough -- normally decided by the server's own
+# `workflow.info().is_continue_as_new_suggested()`, but the cluster's
+# `temporal-dynamic-config` is empty, so this local floor is what makes the
+# bound not depend on that ever being set. It matches Temporal's documented
+# `limit.historyCount.suggestContinueAsNew` default (4096). A module
+# constant, not a literal, so a test can force a hop deterministically by
+# lowering it.
+MERGE_WATCH_HISTORY_FLOOR = 4096
+# How many times one merge watch is allowed to continue_as_new. The watch
+# is observational, not correctness-critical, so crossing this must never
+# fail the workflow -- past it the loop logs an error and keeps watching in
+# the current run until MERGE_WATCH_DEADLINE, exactly as it did before this
+# change existed.
+MERGE_WATCH_MAX_HOPS = 16
 # The implementer writes the pr: link into .status.yaml in the same commit
 # that flips it to implemented, so the link should be visible on the first
 # poll. A few polls of grace absorb gitops main lag; after that, a missing
@@ -370,6 +444,17 @@ INCIDENT_POLL_INTERVAL = timedelta(minutes=5)
 @dataclass(frozen=True)
 class IssueRef:
     issue_url: str
+    # mctl-agents#404 v2: carries a merge watch's resume record across a
+    # continue_as_new boundary. Defaulted and always None on an ordinary
+    # start, so `run`'s decoded argument list is `[IssueRef]` on EVERY
+    # start -- external or continued (see design.md's "argument-shape
+    # decision"; a second parameter on `run` was rejected for exactly this
+    # reason). `MergeWatchResume` is defined further down this module
+    # (after ImplementExecutionState, which one of its fields needs); that
+    # is fine under `from __future__ import annotations` -- the annotation
+    # is a string until something resolves it, and by then the whole
+    # module has finished loading.
+    resume: MergeWatchResume | None = None
 
 
 @dataclass(frozen=True)
@@ -447,6 +532,21 @@ class LifecycleClaim:
 
 
 @dataclass(frozen=True)
+class AbandonState:
+    """Whether an operator told this execution to end early, and why.
+
+    mctl-agents#420: a small, dedicated query rather than folding this into
+    `LifecycleClaim` -- that dataclass already uses `abandoned` for a
+    different question (did this loop let go of a lifecycle-ownership row it
+    still held), and conflating the two would make one field answer two
+    unrelated questions depending on which caller is asking.
+    """
+
+    abandoned: bool = False
+    reason: str = ""
+
+
+@dataclass(frozen=True)
 class DevLoopResult:
     investigate: WorkflowResult
     # None if approval was never signalled, investigate failed, or the
@@ -469,6 +569,12 @@ class DevLoopResult:
     # Stage 6.4 (ADR-006, #216): incidents raised against the deployed
     # service during the watch window. None when the stage did not run.
     incidents: IncidentWatch | None = None
+    # mctl-agents#420: why this execution ended, when it ended for a reason
+    # other than running the pipeline to the end -- "abandoned: ...",
+    # "source issue closed ..." (pre- or mid-approval-park), or "approval
+    # wait expired". Empty on the full-pipeline path. Defaulted so results
+    # recorded before this field existed still deserialize.
+    ended: str = ""
 
 
 async def _resolve(agent: str) -> ResolvedRelease | None:
@@ -478,6 +584,52 @@ async def _resolve(agent: str) -> ResolvedRelease | None:
         start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
         retry_policy=FAST_ACTIVITY_RETRY_POLICY,
     )
+
+
+def _first_string(args: tuple[object, ...], key: str) -> str | None:
+    """Best-effort extraction of a signal payload's message string.
+
+    Mirrors `approve`'s own defensive parse: a bare non-empty string is
+    used directly, a dict is probed for ``key``, and anything else -- or
+    no args at all -- yields None. Signal handlers must never raise on an
+    unexpected payload shape.
+    """
+    for arg in args:
+        if isinstance(arg, dict):
+            candidate = arg.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        elif isinstance(arg, str) and arg:
+            return arg
+    return None
+
+
+async def _read_issue_state(issue: IssueRef) -> IssueState | None:
+    """Read the source issue's current state, failing open on error.
+
+    Same fail-open rule the `stale-issue-admission` gate below applies: an
+    `ActivityError` after retries (a GitHub blip) must delay the caller's
+    decision by one interval rather than wedge or fail a workflow that only
+    wants to know whether to keep waiting.
+    """
+    issue_parts = parse_issue_url(issue.issue_url)
+    issue_repo = f"{issue_parts.owner}/{issue_parts.repo}"
+    issue_number_int = int(issue_parts.number)
+    try:
+        return await workflow.execute_activity(
+            get_issue_state,
+            args=[issue_repo, issue_number_int],
+            start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+            retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+        )
+    except ActivityError:
+        workflow.logger.warning(
+            "get_issue_state failed after retries for %s#%s -- proceeding "
+            "without this issue-state check",
+            issue_repo,
+            issue_number_int,
+        )
+        return None
 
 
 async def _run_cwft(
@@ -496,6 +648,24 @@ async def _run_cwft(
     # MERGE_WATCH_DEADLINE. Only executions started after this deploy route
     # to exec. Pinned by tests/test_patch_memoization.py; the opposite was
     # asserted in ADR-008 until agy caught it on #282.
+    #
+    # ADR-008 D7 (#395): the implement submit alone goes one step further,
+    # to the admission queue. Its slot limit is the number of implementer
+    # runs allowed to exist at once; with no free slot this activity stays
+    # Scheduled in Temporal and no Argo workflow is created. The marker is
+    # consulted only for that operation so other operations' histories do
+    # not record a decision they never make, and it nests under exec-queue
+    # in intent: a loop new enough to route implement is new enough to
+    # route everything else to exec.
+    if operation == IMPLEMENTATION_OPERATION and workflow.patched("implement-queue"):
+        return await workflow.execute_activity(
+            submit_and_wait,
+            SubmitAndWaitInput(operation=operation, params=params),
+            task_queue=IMPLEMENTATION_TASK_QUEUE,
+            start_to_close_timeout=step_timeout,
+            heartbeat_timeout=SDK_STEP_HEARTBEAT_TIMEOUT,
+            retry_policy=SDK_STEP_RETRY_POLICY,
+        )
     if workflow.patched("exec-queue"):
         return await workflow.execute_activity(
             submit_and_wait,
@@ -709,9 +879,137 @@ def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
         )
 
 
+@dataclass(frozen=True)
+class ImplementExecutionState:
+    """What THIS workflow knows about its implement step, for #389.
+
+    Deliberately only the orchestrator's half. Whether the activity is
+    still Scheduled (waiting on capacity), admitted, submitted or running
+    is Temporal's and Argo's knowledge — `describe_workflow_execution`'s
+    pending activity plus its heartbeat details carry it — and a query
+    that guessed at it would be a second runtime-state surface.
+    """
+
+    # "" before the implement step; "implementer" from the first submit.
+    stage: str = ""
+    # When the current implement submit was scheduled. Admission wait is
+    # measured from here; a pre-start requeue resets it.
+    queued_at: str | None = None
+    prestart_requeues: int = 0
+    # success | pre_start | execution | finalization, once the step ended.
+    outcome: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeWatchResume:
+    """Everything a continue_as_new'd merge watch needs to pick up where the
+    previous run left off (mctl-agents#404 v2).
+
+    Every field is defaulted -- `IssueRef.resume` is None on an ordinary
+    start, and this dataclass is only ever built by `_watch_pr` (the watch
+    cursor, the decisions already taken, and the lifecycle claim) and then
+    filled in by `run`/`_resume_merge_watch` (the prior stage results). All
+    flat JSON-serialisable data, on the order of a kilobyte.
+    """
+
+    # --- Watch cursor: where _watch_pr left off. ---
+    service: str = ""
+    slug: str = ""
+    # ISO-8601 Z string, not a datetime -- this is the ABSOLUTE merge-watch
+    # deadline the FIRST run computed. A continued run parses it with
+    # _as_utc and must never recompute `workflow.now() +
+    # MERGE_WATCH_DEADLINE`, or the watch would restart its 14-day clock on
+    # every hop instead of staying bounded from the first poll.
+    deadline: str = ""
+    last_pr: PRState | None = None
+    polls_without_pr: int = 0
+    poll_index: int = 0
+    shepherd_ticks: int = 0
+
+    # --- Decisions already taken. Carried rather than re-derived from the
+    # patch markers at the top of _watch_pr, so a continued run cannot
+    # adopt a different cadence/shepherd/ownership behaviour than the run
+    # it replaces just because a marker happened to be re-evaluated. ---
+    fast_cadence: bool = True
+    shepherd_in_loop: bool = False
+    concurrent_ticks: bool = False
+    track_ownership: bool = False
+
+    # --- Lifecycle claim: the ownership row this loop holds, or doesn't.
+    # Must survive the boundary so a hop is invisible to the reconciler and
+    # the cron sweeper. The claim's owner id is workflow_id, which is
+    # stable across continue_as_new -- but every OTHER field describing the
+    # claim lives only in instance state, set in __init__ and mutated
+    # in-loop, and would silently reset to __init__'s empty values on a
+    # fresh run if not carried here. ---
+    owned_entity_id: str = ""
+    owner_epoch: int = 0
+    owned_head_sha: str = ""
+    poll_index_for_heartbeat: int = 0
+    claim_refused: bool = False
+    claim_refused_until_poll: int = 0
+    refused_by_type: str = ""
+    refused_by_id: str = ""
+    refusals_observed: int = 0
+    unknown_acquires: int = 0
+    unknown_progress: int = 0
+    unknown_heartbeats: int = 0
+    proposal_ref: str = ""
+    policy_ref: str = ""
+    last_lifecycle_op: str = ""
+    last_lifecycle_op_landed: bool = False
+    # Deliberately a DIFFERENT question from `abandoned` below -- whether
+    # the ownership ROW was let go without its relinquishing write landing
+    # (see AbandonState's docstring, and LifecycleClaim.abandoned above),
+    # not whether an operator sent the `abandon` signal. Conflating the two
+    # here would lose the same distinction those dataclasses keep apart.
+    claim_abandoned: bool = False
+
+    # --- Abandon state. New versus the superseded design: without these a
+    # hop silently resets the `abandon` signal, and `abandon_state` would
+    # answer False in the continued run while an operator believes the
+    # execution is ending. ---
+    abandoned: bool = False
+    abandon_reason: str | None = None
+
+    # --- Prior stage results. A continued run never re-runs investigate,
+    # approve or implement, so the final DevLoopResult can only report
+    # their outcomes if they are carried here. Filled in by `run` /
+    # `_resume_merge_watch` just before continue_as_new, not by
+    # `_watch_pr` itself, which has no view of them. ---
+    investigate: WorkflowResult | None = None
+    implement: WorkflowResult | None = None
+    approve: WorkflowResult | None = None
+    implement_state: ImplementExecutionState = field(default_factory=ImplementExecutionState)
+    approver: str | None = None
+
+    # --- Bookkeeping: how many times THIS watch has already hopped, so
+    # MERGE_WATCH_MAX_HOPS bounds the whole watch, not just one run. ---
+    hops: int = 0
+
+
+@dataclass(frozen=True)
+class _WatchOutcome:
+    """What `_watch_pr` decided when its loop ended.
+
+    Either the watch is genuinely done (`resume` is None, `last` is its
+    final observed PRState-or-None, exactly what the pre-#404-v2 return
+    value meant) or it is hopping (`resume` carries everything the next
+    run needs). A plain return value, never serialized -- `_watch_pr`
+    returning a decision instead of raising `continue_as_new` itself is the
+    load-bearing structural choice here: raising from inside would unwind
+    through the `try`/`finally` below and release the lifecycle-ownership
+    claim on every hop (see the `finally` block's `hopping` guard).
+    """
+
+    last: PRState | None
+    resume: MergeWatchResume | None = None
+
+
 @workflow.defn
 class DevLoopWorkflow:
     def __init__(self) -> None:
+        self._implement_state = ImplementExecutionState()
         # Which cadence this execution runs at. Bound for real in _watch_pr,
         # once, off the `fast-shepherd-cadence` marker; CADENCE here so every
         # path that reads it before the watch starts (and every unit test that
@@ -749,6 +1047,17 @@ class DevLoopWorkflow:
         self._last_lifecycle_op = ""
         self._last_lifecycle_op_landed = False
         self._claim_abandoned = False
+        # mctl-agents#420: set by the `abandon` signal. Observed by both long
+        # waits (the approval park and _watch_pr's merge watch) so an operator
+        # can end an execution gracefully without Temporal `terminate`, which
+        # would skip _watch_pr's `finally` and its lifecycle-ownership release.
+        self._abandoned = False
+        self._abandon_reason: str | None = None
+
+    @workflow.query
+    def implement_execution(self) -> ImplementExecutionState:
+        """The orchestrator's view of the implement step (#389, #395)."""
+        return self._implement_state
 
     @workflow.query
     def shepherd_in_loop(self) -> bool:
@@ -784,6 +1093,19 @@ class DevLoopWorkflow:
             abandoned=self._claim_abandoned,
         )
 
+    @workflow.query
+    def abandon_state(self) -> AbandonState:
+        """Was this execution told to end early by an operator, and why?
+
+        mctl-agents#420: the `abandon` signal handler below sets this and
+        never raises, so a status reader (`cli.py status`, and eventually
+        mctl-api) can distinguish "still parked" from "an operator ended
+        this" without waiting for the execution to complete.
+        """
+        return AbandonState(
+            abandoned=self._abandoned, reason=self._abandon_reason or ""
+        )
+
     @workflow.signal
     def approve(self, *args: object) -> None:
         # Optional payload for the audit trail: legacy senders signal with no
@@ -799,8 +1121,33 @@ class DevLoopWorkflow:
                 self._approver = arg
         self._approved = True
 
+    @workflow.signal
+    def abandon(self, *args: object) -> None:
+        """Gracefully end this execution at its next observation point.
+
+        mctl-agents#420: the operator-driven, cluster-access-free escape
+        hatch for a wedged execution -- deliberately a signal rather than
+        Temporal `terminate`, because `terminate` skips `_watch_pr`'s
+        `finally`, which is where the lifecycle-ownership row is released
+        (see `_ownership`). A signal handler is not a workflow command, so
+        adding this one needs no `workflow.patched` marker and changes no
+        recorded history. Same defensive parse as `approve`: signals must
+        never raise, so an unrecognised payload shape just falls back to a
+        generic reason instead of erroring.
+        """
+        self._abandon_reason = _first_string(args, "reason") or "abandoned by operator"
+        self._abandoned = True
+
     @workflow.run
     async def run(self, issue: IssueRef) -> DevLoopResult:
+        # mctl-agents#404 v2: a continued run of a hopped merge watch. Every
+        # OTHER start (external, or `USE_EXISTING` attaching to a running
+        # execution) has `issue.resume is None` and falls through to the
+        # full pipeline below -- `run`'s decoded argument list stays
+        # `[IssueRef]` either way (design.md's "argument-shape decision").
+        if issue.resume is not None:
+            return await self._resume_merge_watch(issue)
+
         target_repo = _target_repo(issue)
 
         # Pin the investigator version ONCE, at the start of this step. A
@@ -818,13 +1165,98 @@ class DevLoopWorkflow:
         await _record("issue-investigator", investigator_release, investigate_result, target_repo)
 
         if not investigate_result.succeeded:
-            return DevLoopResult(investigate=investigate_result, implement=None)
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                ended=f"investigate ended {investigate_result.phase}",
+            )
 
         # Durable wait: this workflow can sit here for days without costing
         # anything beyond Temporal's own history storage — exactly the
         # "durable per-issue state" the plan's problem statement calls out
         # as missing from the current polling-cron pipeline.
-        await workflow.wait_condition(lambda: self._approved)
+        #
+        # mctl-agents#420: an unbounded wait_condition here never released on
+        # its own -- not on the source issue closing, not on an `abandon`
+        # signal, not ever, if `approve` never arrived (see the module
+        # docstring addendum). `approval-watch` bounds the park with a poll
+        # loop that re-reads the issue's state on every boundary and expires
+        # at APPROVAL_WAIT_DEADLINE if nothing resolves it first. The
+        # unpatched branch is byte-identical to the historical call apart
+        # from also observing `_abandoned`, which is not itself a new
+        # command (see `abandon`'s docstring): a parked execution has no
+        # history event to diverge from at this position.
+        approval_ended: str | None = None
+        if workflow.patched("approval-watch"):
+            approval_deadline = workflow.now() + APPROVAL_WAIT_DEADLINE
+            while workflow.now() < approval_deadline:
+                try:
+                    # wait_condition with a timeout raises asyncio.TimeoutError
+                    # on expiry rather than returning False -- it never
+                    # returns a value at all (see its own signature).
+                    await workflow.wait_condition(
+                        lambda: self._approved or self._abandoned,
+                        timeout=APPROVAL_POLL_INTERVAL,
+                    )
+                except TimeoutError:
+                    parked_state = await _read_issue_state(issue)
+                    if parked_state is not None and parked_state.state == "closed":
+                        approval_ended = (
+                            "source issue closed while parked "
+                            f"({parked_state.state_reason or 'completed'})"
+                        )
+                        break
+                    continue
+                break
+            else:
+                approval_ended = "approval wait expired"
+        else:
+            await workflow.wait_condition(lambda: self._approved or self._abandoned)
+
+        # mctl-agents#420: an approve or abandon signal landing while the final
+        # poll's in-flight get_issue_state activity was executing must not be
+        # silently discarded just because the wait deadline was crossed.
+        # But if the source issue was confirmed closed on GitHub, a late
+        # approve must NOT resurrect it.
+        if approval_ended is not None:
+            if approval_ended == "approval wait expired" and (
+                self._approved or self._abandoned
+            ):
+                pass
+            else:
+                return DevLoopResult(
+                    investigate=investigate_result, implement=None, ended=approval_ended
+                )
+
+        if self._abandoned:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=None,
+                ended=f"abandoned: {self._abandon_reason}",
+            )
+
+        # mctl-agents#410: the issue that started this loop can close between
+        # the approval signal and this point -- reopened elsewhere,
+        # superseded, or resolved directly. Check BEFORE find_proposal_slug
+        # and BEFORE the mctl-agents-approve CWFT below, so a closed issue is
+        # never spent flipping a proposal to `accepted` (and then
+        # implementing it) for a reason that is already gone.
+        #
+        # workflow.patched: get_issue_state is a brand-new command in every
+        # position it could go, so an unpatched (pre-existing) history must
+        # take the legacy branch untouched -- inserting it unconditionally
+        # would be a command mismatch that wedges every in-flight approved
+        # loop on replay, the same hazard slug-scoped-implement's own guard
+        # exists to avoid two paragraphs down.
+        if workflow.patched("stale-issue-admission"):
+            issue_state = await _read_issue_state(issue)
+            if issue_state is not None and issue_state.state == "closed":
+                return DevLoopResult(
+                    investigate=investigate_result,
+                    implement=None,
+                    approve=None,
+                    ended=f"source issue closed ({issue_state.state_reason or 'completed'})",
+                )
 
         # Scoped to this issue's own proposal, not just its repo. Service
         # scoping alone left a same-repo race: two approved loops for the
@@ -913,6 +1345,7 @@ class DevLoopWorkflow:
                         investigate=investigate_result,
                         implement=None,
                         approve=approve_result,
+                        ended=f"approve flip ended {approve_result.phase}",
                     )
         if atomic_approve:
             # Resolve the implementer only AFTER the approval flip is
@@ -954,17 +1387,147 @@ class DevLoopWorkflow:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
 
-        implement_result = await _run_cwft("mctl-agents-implement", implement_params)
-        await _record("implementer", implementer_release, implement_result, target_repo)
+        implement_result = await self._implement(implementer_release, implement_params, target_repo)
+
+        # mctl-agents#420: an abandon signal arriving while _implement was running
+        # ends the loop immediately without entering the merge watch or deploy stages.
+        if self._abandoned:
+            return DevLoopResult(
+                investigate=investigate_result,
+                implement=implement_result,
+                approve=approve_result,
+                ended=f"abandoned: {self._abandon_reason}",
+            )
 
         # Stage 6.1 merge detection (ADR-006, #214): watch the implement PR
         # until it merges/closes, bounded by MERGE_WATCH_DEADLINE. Requires
         # the slug (the PR is resolved from this proposal's .status.yaml);
         # any execution new enough to record this marker also recorded
         # slug-scoped-implement, so slug is set whenever the branch is taken.
-        pr_state: PRState | None = None
+        outcome = _WatchOutcome(last=None)
         if workflow.patched("merge-detection") and implement_result.succeeded and slug:
-            pr_state = await self._watch_pr(target_repo, slug)
+            outcome = await self._watch_pr(target_repo, slug)
+            if outcome.resume is not None:
+                # The watch's own history grew large enough to hop
+                # (mctl-agents#404 v2). `_watch_pr` never re-runs investigate,
+                # approve or implement, so their results have to be carried
+                # here -- `_watch_pr` itself has no view of them.
+                resume = dataclasses.replace(
+                    outcome.resume,
+                    investigate=investigate_result,
+                    implement=implement_result,
+                    approve=approve_result,
+                    implement_state=self._implement_state,
+                    approver=self._approver,
+                )
+                workflow.continue_as_new(IssueRef(issue_url=issue.issue_url, resume=resume))
+
+        return await self._finish_after_watch(
+            target_repo=target_repo,
+            investigate_result=investigate_result,
+            implement_result=implement_result,
+            approve_result=approve_result,
+            outcome=outcome,
+        )
+
+    async def _resume_merge_watch(self, issue: IssueRef) -> DevLoopResult:
+        """Continue a merge watch that hopped via continue_as_new
+        (mctl-agents#404 v2).
+
+        Rehydrates every piece of instance state carried in `issue.resume`
+        BEFORE the first await, so all four `@workflow.query` handlers
+        answer correctly from the very first workflow task of this run --
+        including `_abandoned`/`_abandon_reason`, re-checked here so an
+        `abandon` observed by the previous run still ends the watch instead
+        of being silently lost at the continue_as_new boundary.
+
+        Never re-runs investigate, the approval park, the stale-issue
+        admission check, `find_proposal_slug`, the approve CWFT or the
+        implement submit -- their results are already in `issue.resume`,
+        produced by an earlier run of this same watch.
+        """
+        resume = issue.resume
+        assert resume is not None  # only called when it is (see `run`)  # noqa: S101
+        target_repo = _target_repo(issue)
+
+        self._implement_state = resume.implement_state
+        self._cadence = CADENCE if resume.fast_cadence else LEGACY_CADENCE
+        self._shepherd_in_loop = resume.shepherd_in_loop
+        self._approved = True
+        self._approver = resume.approver
+        self._owned_entity_id = resume.owned_entity_id
+        self._owner_epoch = resume.owner_epoch
+        self._owned_head_sha = resume.owned_head_sha
+        self._poll_index_for_heartbeat = resume.poll_index_for_heartbeat
+        self._claim_refused = resume.claim_refused
+        self._claim_refused_until_poll = resume.claim_refused_until_poll
+        self._refused_by_type = resume.refused_by_type
+        self._refused_by_id = resume.refused_by_id
+        self._refusals_observed = resume.refusals_observed
+        self._unknown_acquires = resume.unknown_acquires
+        self._unknown_progress = resume.unknown_progress
+        self._unknown_heartbeats = resume.unknown_heartbeats
+        self._proposal_ref = resume.proposal_ref
+        self._policy_ref = resume.policy_ref
+        self._last_lifecycle_op = resume.last_lifecycle_op
+        self._last_lifecycle_op_landed = resume.last_lifecycle_op_landed
+        self._claim_abandoned = resume.claim_abandoned
+        # Re-checked before the first sleep of this run (`_watch_pr`'s own
+        # first statement observes `_abandoned`): a signal that landed in
+        # the previous run, or in the instant between the hop decision and
+        # this run starting, still ends the watch. `resume.abandoned` is
+        # always `False` by construction (`_merge_watch_hop_suggested`
+        # never fires once `_abandoned` is set, so a resume record can
+        # never carry `abandoned=True`) -- OR it in rather than assigning,
+        # so an `abandon` signal delivered in the continue_as_new gap
+        # (applied before `initialize_workflow` per temporalio's job
+        # ordering) is never clobbered by this rehydration.
+        self._abandoned = self._abandoned or resume.abandoned
+        if self._abandoned and not self._abandon_reason:
+            self._abandon_reason = resume.abandon_reason or "abandoned by operator"
+
+        outcome = await self._watch_pr(resume.service, resume.slug, resume=resume)
+        if outcome.resume is not None:
+            next_resume = dataclasses.replace(
+                outcome.resume,
+                investigate=resume.investigate,
+                implement=resume.implement,
+                approve=resume.approve,
+                implement_state=self._implement_state,
+                approver=self._approver,
+            )
+            workflow.continue_as_new(IssueRef(issue_url=issue.issue_url, resume=next_resume))
+
+        investigate_result = resume.investigate
+        # A resume record is only ever built after investigate has already
+        # succeeded (run() only reaches _watch_pr past that point), so this
+        # is always set in practice -- asserted so the type checker (and a
+        # reader) can see the invariant rather than infer it.
+        assert investigate_result is not None  # noqa: S101
+        return await self._finish_after_watch(
+            target_repo=target_repo,
+            investigate_result=investigate_result,
+            implement_result=resume.implement,
+            approve_result=resume.approve,
+            outcome=outcome,
+        )
+
+    async def _finish_after_watch(
+        self,
+        *,
+        target_repo: str,
+        investigate_result: WorkflowResult,
+        implement_result: WorkflowResult | None,
+        approve_result: WorkflowResult | None,
+        outcome: _WatchOutcome,
+    ) -> DevLoopResult:
+        """Shared tail of `run`/`_resume_merge_watch`: deploy observation,
+        incident watch, and the final `DevLoopResult` -- reached whether or
+        not the merge watch hopped across a continue_as_new boundary along
+        the way (mctl-agents#404 v2). Identical to the pre-#404-v2 tail of
+        `run`, just factored out so the resume path does not duplicate it.
+        """
+        pr_state = outcome.last
 
         # Stages 6.2/6.3 (ADR-006, #215): only a merged PR produces a
         # release to observe. A closed-unmerged or still-open PR ends the
@@ -1002,7 +1565,96 @@ class DevLoopWorkflow:
             pr=pr_state,
             deploy=deploy,
             incidents=incidents,
+            # mctl-agents#420: an `abandon` signal delivered during the merge
+            # watch cuts _watch_pr short (its own `while` condition observes
+            # `_abandoned`) rather than raising, so the only place left to
+            # record it is here, on the result the watch's caller returns.
+            # Correct across a hop too: `_abandoned`/`_abandon_reason` are
+            # rehydrated by `_resume_merge_watch` before this is ever
+            # reached (mctl-agents#404 v2).
+            ended=f"abandoned: {self._abandon_reason}" if self._abandoned else "",
         )
+
+    async def _implement(
+        self,
+        implementer_release: ResolvedRelease | None,
+        params: dict[str, str],
+        target_repo: str,
+    ) -> WorkflowResult:
+        """Submit the implementer, requeue pre-start failures, fail loudly.
+
+        Before #395 this was one submit whose result was recorded and then
+        carried to the end of the loop: an implementer that never ran and
+        one that ran and failed both ended the workflow as Completed with
+        `implement.phase == "Failed"`. On 2026-09-19 six such loops read as
+        success while six approved proposals sat untouched.
+
+        Now the outcome is classified (implement_outcome.py) and:
+
+        - `pre_start` is resubmitted, up to MAX_PRESTART_REQUEUES, without
+          counting an implementation attempt — nothing was attempted;
+        - `execution` and `finalization` fail the workflow with a typed
+          ApplicationError carrying the result, so the loop's terminal
+          status is the truth and a human is pointed at the right layer.
+
+        Guarded by `implement-outcome`: an execution that predates the
+        marker keeps the recorded behaviour (single submit, Completed).
+        """
+        requeues = 0
+        while True:
+            self._implement_state = ImplementExecutionState(
+                stage="implementer",
+                queued_at=workflow.now().isoformat().replace("+00:00", "Z"),
+                prestart_requeues=requeues,
+            )
+            result = await _run_cwft(IMPLEMENTATION_OPERATION, params)
+            await _record("implementer", implementer_release, result, target_repo)
+
+            if not workflow.patched("implement-outcome"):
+                return result
+
+            outcome: Outcome = classify(
+                result.phase,
+                implementer_ran=result.implementer_ran,
+                implementer_phase=result.implementer_phase,
+                finalization_phase=result.finalization_phase,
+            )
+            self._implement_state = dataclasses.replace(self._implement_state, outcome=outcome)
+
+            if outcome == "success":
+                return result
+            if outcome == "pre_start" and requeues < MAX_PRESTART_REQUEUES:
+                requeues += 1
+                workflow.logger.warning(
+                    "implementer for %s never started (%s, %s); requeueing %d/%d without "
+                    "counting an attempt",
+                    target_repo,
+                    result.workflow_name,
+                    result.phase,
+                    requeues,
+                    MAX_PRESTART_REQUEUES,
+                )
+                await workflow.sleep(PRESTART_REQUEUE_BACKOFF)
+                continue
+
+            error_type = {
+                "pre_start": "ImplementationNotStarted",
+                "execution": "ImplementationFailed",
+                "finalization": "ImplementationFinalizationFailed",
+            }[outcome]
+            raise ApplicationError(
+                f"implementation of {target_repo} ended {result.phase} ({outcome}) in Argo "
+                f"workflow {result.workflow_name}"
+                + (f" after {requeues} pre-start requeues" if requeues else "")
+                + (
+                    f": {finalization_evidence(result.finalization_phase)}"
+                    if outcome == "finalization"
+                    else ""
+                ),
+                result,
+                type=error_type,
+                non_retryable=True,
+            )
 
     async def _watch_incidents(self, service: str, since: str) -> IncidentWatch:
         """Collect incidents raised against ``service`` during the window.
@@ -2224,90 +2876,257 @@ class DevLoopWorkflow:
             and self._poll_index_for_heartbeat % self._cadence.heartbeat_every_polls != 0
         )
 
-    async def _watch_pr(self, service: str, slug: str) -> PRState | None:
-        """Poll get_pr_state until the PR reaches a terminal state.
+    def _merge_watch_hop_suggested(
+        self,
+        *,
+        polls_this_run: int,
+        tick_task: asyncio.Task[None] | None,
+        hops: int,
+    ) -> bool:
+        """Should the merge watch end this run via continue_as_new right now?
+
+        mctl-agents#404 v2. Pure enough to unit-test by monkeypatching
+        `dev_loop.workflow` (the pattern `TestTickSettling` uses): it reads
+        `workflow.info()` itself, so a test can substitute a fake whose
+        `is_continue_as_new_suggested`/`get_current_history_length` are
+        under its control. Does NOT itself check
+        `workflow.patched("merge-watch-continue-as-new")` -- `_watch_pr`
+        evaluates that once, beside its other markers, and only calls this
+        at all when it is true, so an unpatched execution never reaches it.
+        """
+        if self._abandoned:
+            # An abandon already observed must end the watch through the
+            # existing abandon path below, never be traded for a
+            # continuation that would silently lose it.
+            return False
+        if polls_this_run < 1:
+            # At least one completed poll in THIS run, so a mis-set floor
+            # (or a server that suggests continue-as-new immediately after
+            # a hop) cannot produce a continue-as-new storm.
+            return False
+        if tick_task is not None and not tick_task.done():
+            # Never hop with an in-loop shepherd tick in flight. The
+            # suggestion stays true once crossed, so the hop simply happens
+            # at the next clean boundary instead of here.
+            return False
+        if hops >= MERGE_WATCH_MAX_HOPS:
+            workflow.logger.error(
+                "merge watch has already hopped %d times (MERGE_WATCH_MAX_HOPS=%d) "
+                "-- continuing to watch in this run until the deadline instead "
+                "of hopping again",
+                hops,
+                MERGE_WATCH_MAX_HOPS,
+            )
+            return False
+        info = workflow.info()
+        # `is_continue_as_new_suggested` is a METHOD on `Info` in temporalio
+        # 1.31.0 (temporalio/workflow/_context.py:186), not a property --
+        # reading it without calling it is a bound method object, which is
+        # always truthy, and would hop on the first poll of every watch.
+        if info.is_continue_as_new_suggested():
+            return True
+        return info.get_current_history_length() >= MERGE_WATCH_HISTORY_FLOOR
+
+    async def _watch_pr(
+        self, service: str, slug: str, resume: MergeWatchResume | None = None
+    ) -> _WatchOutcome:
+        """Poll get_pr_state until the PR reaches a terminal state -- or,
+        once this run's history is large enough, break out with a resume
+        record for `run`/`_resume_merge_watch` to continue_as_new with
+        (mctl-agents#404 v2).
 
         Observational, fail-open: a persistently failing read (GitHub outage
         outlasting the activity retries) returns the last known state
         instead of failing a loop whose implement already succeeded. Returns
-        None when no PR link ever appeared within the grace polls.
+        a `last` of None when no PR link ever appeared within the grace
+        polls -- UNLESS this is a resumed run carrying an abandon, in which
+        case the carried `resume.last_pr` is returned instead: task 5a's
+        guard must not erase the PR state an earlier run already observed.
+
+        An already-true `self._abandoned` on a RESUMED call is deliberately
+        NOT an early return here (round 2 on mctl-agents#404 v2, claude +
+        agy P2): an early return before `try` would skip this method's own
+        `finally`, which is what releases the lifecycle-ownership claim a
+        hop kept held. Instead, when `resume` carries the claim
+        (`track_ownership`/`owned_entity_id`, rehydrated by
+        `_resume_merge_watch` before this call), execution falls through to
+        the `while` loop below, whose own `not self._abandoned` condition is
+        already false on entry -- the loop body never runs, but `finally`
+        still does, issuing the same relinquishing write a normal
+        (non-hopped) watch end would. `last` stays `resume.last_pr`,
+        matching what the old guard used to return directly.
+
+        The narrow case that IS still an early return: `resume is None` and
+        `self._abandoned` is already true. Unreachable in production --
+        `run()` checks `self._abandoned` immediately before ever calling
+        `_watch_pr(target_repo, slug)` with no resume (see `run`, just above
+        the `merge-detection` patch check) -- so no ownership claim can be
+        outstanding here to release; this call shape only exists as a direct
+        unit-test entry point with no workflow context.
         """
-        deadline = workflow.now() + MERGE_WATCH_DEADLINE
-        polls_without_pr = 0
-        last: PRState | None = None
-        # In-loop shepherd (#213): evaluated once — the marker also fixes
-        # whether tick commands appear in this execution's history at all.
-        # Poll interval, tick cadence and every poll COUNT below, as one
-        # value (#213 follow-up). Its own marker because it changes both the
-        # timer durations and the number of activities a poll schedules: an
-        # execution recorded under the old 30-min/4-h cadence must keep
-        # replaying it, and `_Cadence` is what lets it.
-        cadence = CADENCE if workflow.patched("fast-shepherd-cadence") else LEGACY_CADENCE
-        self._cadence = cadence
-        shepherd_in_loop = workflow.patched("shepherd-in-loop")
-        # Published to the sweeper via the shepherd_in_loop query the moment
-        # the watch starts, not at the first tick a poll later: between those
-        # two points this execution IS the owner, and the cron must already
-        # be standing down.
-        if shepherd_in_loop and not await _shepherd_is_pinned():
-            # Decline the claim rather than fail (round 2 on #241). The
-            # first fix raised here, which failed the whole workflow after
-            # investigate, approve and implement had all succeeded —
-            # contradicting this function's own fail-open contract and
-            # throwing away merge detection and deploy observation over a
-            # tick that is an optimisation, not correctness. But it cannot
-            # simply be left to _shepherd_tick either: that runs as a
-            # background task whose exceptions it swallows, so the loop
-            # would keep answering shepherd_in_loop=True while the sweeper
-            # stood down and nothing shepherded the PR for 14 days (codex
-            # P1, claude P2). Declining gives the same protection with no
-            # loss: nothing runs unpinned, and the cron sweeper picks the
-            # proposal up exactly as it did before #213.
-            workflow.logger.warning(
-                "no released shepherd image — %s/%s keeps watching but leaves "
-                "shepherding to the cron sweeper",
-                service,
-                slug,
-            )
-            shepherd_in_loop = False
-        self._shepherd_in_loop = shepherd_in_loop
-        # #231: run the tick concurrently so polling continues while it
-        # runs. Awaiting it inline stalled merge detection for the tick's
-        # whole duration — up to the 2 h SDK_STEP_TIMEOUT when the shepherd
-        # spawns a follow-up implementation, against a 30-min poll
-        # interval. Its own marker, because it changes the ORDER of
-        # commands in history: executions that already recorded a
-        # sequential tick must keep replaying one.
-        concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
-        # Lifecycle ownership (mctlhq/.github#57). Gated on the same claim as
-        # the in-loop shepherd: if this execution declined to shepherd, the
-        # cron sweeper owns the PR and this loop must not record itself as the
-        # owner. Its own marker, because it adds commands to history.
-        track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
-        # NOTE (ADR-010 phase 2, #352): there is deliberately no
-        # "lifecycle-claims" patch marker here. This PR reverted the watch-end
-        # write to a bare `release` because nothing in this repository calls
-        # `handoff/complete` yet, so the branch the marker would gate does not
-        # exist. A `workflow.patched` call writes a marker into EVERY new
-        # execution's history and can only be retired through
-        # `deprecate_patch` plus a second deploy — a cost with no branch to
-        # pay for. The marker belongs in the change that actually ships the
-        # handoff (#353), where it will guard a real fork in behaviour.
-        if track_ownership:
-            # ADR-010 §12 asks for the resolved policy to be recorded on the
-            # row, so "why does this actor own it" is answerable without
-            # reconstructing a CWFT env var in another repository. Both are
-            # derived here, once, because this is where service and slug are
-            # in scope — and both are plain strings, so no policy lookup runs
-            # inside workflow code.
-            self._proposal_ref = f"{service}/{slug}"
-            self._policy_ref = f"devloop:{service}"
+        if resume is None and self._abandoned:
+            return _WatchOutcome(last=None)
+        if resume is not None:
+            # The ABSOLUTE deadline the first run of this watch computed.
+            # Never recomputed here -- doing so would restart the 14-day
+            # clock on every hop instead of staying bounded from the first
+            # poll of the watch.
+            deadline = _as_utc(resume.deadline)
+        else:
+            deadline = workflow.now() + MERGE_WATCH_DEADLINE
+        polls_without_pr = resume.polls_without_pr if resume is not None else 0
+        last: PRState | None = resume.last_pr if resume is not None else None
+        # mctl-agents#404 v2: evaluated once, beside the markers below,
+        # exactly like them -- an execution whose history predates this
+        # marker keeps polling in one run for the rest of its life
+        # (migration by attrition, tests/test_patch_memoization.py).
+        hop_enabled = workflow.patched("merge-watch-continue-as-new")
+        if resume is not None:
+            # Carried, not re-derived: a continued run must not adopt a
+            # different cadence/shepherd/ownership behaviour than the run
+            # it replaces just because a patch marker was re-evaluated.
+            cadence = CADENCE if resume.fast_cadence else LEGACY_CADENCE
+            self._cadence = cadence
+            shepherd_in_loop = resume.shepherd_in_loop
+            self._shepherd_in_loop = shepherd_in_loop
+            concurrent_ticks = resume.concurrent_ticks
+            track_ownership = resume.track_ownership
+        else:
+            # In-loop shepherd (#213): evaluated once — the marker also fixes
+            # whether tick commands appear in this execution's history at all.
+            # Poll interval, tick cadence and every poll COUNT below, as one
+            # value (#213 follow-up). Its own marker because it changes both the
+            # timer durations and the number of activities a poll schedules: an
+            # execution recorded under the old 30-min/4-h cadence must keep
+            # replaying it, and `_Cadence` is what lets it.
+            cadence = CADENCE if workflow.patched("fast-shepherd-cadence") else LEGACY_CADENCE
+            self._cadence = cadence
+            shepherd_in_loop = workflow.patched("shepherd-in-loop")
+            # Published to the sweeper via the shepherd_in_loop query the moment
+            # the watch starts, not at the first tick a poll later: between those
+            # two points this execution IS the owner, and the cron must already
+            # be standing down.
+            if shepherd_in_loop and not await _shepherd_is_pinned():
+                # Decline the claim rather than fail (round 2 on #241). The
+                # first fix raised here, which failed the whole workflow after
+                # investigate, approve and implement had all succeeded —
+                # contradicting this function's own fail-open contract and
+                # throwing away merge detection and deploy observation over a
+                # tick that is an optimisation, not correctness. But it cannot
+                # simply be left to _shepherd_tick either: that runs as a
+                # background task whose exceptions it swallows, so the loop
+                # would keep answering shepherd_in_loop=True while the sweeper
+                # stood down and nothing shepherded the PR for 14 days (codex
+                # P1, claude P2). Declining gives the same protection with no
+                # loss: nothing runs unpinned, and the cron sweeper picks the
+                # proposal up exactly as it did before #213.
+                workflow.logger.warning(
+                    "no released shepherd image — %s/%s keeps watching but leaves "
+                    "shepherding to the cron sweeper",
+                    service,
+                    slug,
+                )
+                shepherd_in_loop = False
+            self._shepherd_in_loop = shepherd_in_loop
+            # #231: run the tick concurrently so polling continues while it
+            # runs. Awaiting it inline stalled merge detection for the tick's
+            # whole duration — up to the 2 h SDK_STEP_TIMEOUT when the shepherd
+            # spawns a follow-up implementation, against a 30-min poll
+            # interval. Its own marker, because it changes the ORDER of
+            # commands in history: executions that already recorded a
+            # sequential tick must keep replaying one.
+            concurrent_ticks = shepherd_in_loop and workflow.patched("concurrent-shepherd-tick")
+            # Lifecycle ownership (mctlhq/.github#57). Gated on the same claim as
+            # the in-loop shepherd: if this execution declined to shepherd, the
+            # cron sweeper owns the PR and this loop must not record itself as the
+            # owner. Its own marker, because it adds commands to history.
+            track_ownership = shepherd_in_loop and workflow.patched("lifecycle-ownership")
+            # NOTE (ADR-010 phase 2, #352): there is deliberately no
+            # "lifecycle-claims" patch marker here. This PR reverted the watch-end
+            # write to a bare `release` because nothing in this repository calls
+            # `handoff/complete` yet, so the branch the marker would gate does not
+            # exist. A `workflow.patched` call writes a marker into EVERY new
+            # execution's history and can only be retired through
+            # `deprecate_patch` plus a second deploy — a cost with no branch to
+            # pay for. The marker belongs in the change that actually ships the
+            # handoff (#353), where it will guard a real fork in behaviour.
+            if track_ownership:
+                # ADR-010 §12 asks for the resolved policy to be recorded on the
+                # row, so "why does this actor own it" is answerable without
+                # reconstructing a CWFT env var in another repository. Both are
+                # derived here, once, because this is where service and slug are
+                # in scope — and both are plain strings, so no policy lookup runs
+                # inside workflow code.
+                self._proposal_ref = f"{service}/{slug}"
+                self._policy_ref = f"devloop:{service}"
 
         tick_task: asyncio.Task[None] | None = None
-        poll_index = 0
-        shepherd_ticks = 0
+        poll_index = resume.poll_index if resume is not None else 0
+        shepherd_ticks = resume.shepherd_ticks if resume is not None else 0
+        hops = resume.hops if resume is not None else 0
+        polls_this_run = 0
+        # Set when the loop breaks out to continue_as_new rather than
+        # because the watch genuinely ended. The `finally` block below reads
+        # this to decide whether to issue the relinquishing lifecycle write
+        # -- a hop must keep the claim, never release/terminal it.
+        hopping = False
+        resume_record: MergeWatchResume | None = None
         try:
-            while workflow.now() < deadline:
+            # mctl-agents#420: `and not self._abandoned` lets an `abandon`
+            # signal cut a 14-day merge watch short at its next poll boundary
+            # while still running this `finally` block, so the
+            # lifecycle-ownership row is released rather than left active --
+            # the reason `abandon` is a signal and not a Temporal `terminate`.
+            while workflow.now() < deadline and not self._abandoned:
+                if hop_enabled and self._merge_watch_hop_suggested(
+                    polls_this_run=polls_this_run, tick_task=tick_task, hops=hops
+                ):
+                    hopping = True
+                    remaining = deadline - workflow.now()
+                    workflow.logger.info(
+                        "merge watch for %s/%s hopping via continue_as_new: "
+                        "history_length=%d polls_this_run=%d hop=%d remaining=%s",
+                        service,
+                        slug,
+                        workflow.info().get_current_history_length(),
+                        polls_this_run,
+                        hops + 1,
+                        remaining,
+                    )
+                    resume_record = MergeWatchResume(
+                        service=service,
+                        slug=slug,
+                        deadline=deadline.isoformat().replace("+00:00", "Z"),
+                        last_pr=last,
+                        polls_without_pr=polls_without_pr,
+                        poll_index=poll_index,
+                        shepherd_ticks=shepherd_ticks,
+                        fast_cadence=cadence is CADENCE,
+                        shepherd_in_loop=shepherd_in_loop,
+                        concurrent_ticks=concurrent_ticks,
+                        track_ownership=track_ownership,
+                        owned_entity_id=self._owned_entity_id,
+                        owner_epoch=self._owner_epoch,
+                        owned_head_sha=self._owned_head_sha,
+                        poll_index_for_heartbeat=self._poll_index_for_heartbeat,
+                        claim_refused=self._claim_refused,
+                        claim_refused_until_poll=self._claim_refused_until_poll,
+                        refused_by_type=self._refused_by_type,
+                        refused_by_id=self._refused_by_id,
+                        refusals_observed=self._refusals_observed,
+                        unknown_acquires=self._unknown_acquires,
+                        unknown_progress=self._unknown_progress,
+                        unknown_heartbeats=self._unknown_heartbeats,
+                        proposal_ref=self._proposal_ref,
+                        policy_ref=self._policy_ref,
+                        last_lifecycle_op=self._last_lifecycle_op,
+                        last_lifecycle_op_landed=self._last_lifecycle_op_landed,
+                        claim_abandoned=self._claim_abandoned,
+                        abandoned=self._abandoned,
+                        abandon_reason=self._abandon_reason,
+                        hops=hops + 1,
+                    )
+                    break
                 try:
                     state: PRState = await workflow.execute_activity(
                         get_pr_state,
@@ -2337,7 +3156,7 @@ class DevLoopWorkflow:
                             slug,
                             cause,
                         )
-                        return last
+                        return _WatchOutcome(last=last)
                     workflow.logger.warning(
                         "get_pr_state failed after retries for %s/%s — retrying "
                         "next poll interval",
@@ -2369,7 +3188,7 @@ class DevLoopWorkflow:
                             self._finish_claim(
                                 "terminal", done, state.repo or "", state.number or 0
                             )
-                        return state
+                        return _WatchOutcome(last=state)
                     # Counted only on a successful read, so a transient
                     # get_pr_state failure delays the next tick instead of
                     # consuming its boundary and dropping it for a whole
@@ -2445,11 +3264,24 @@ class DevLoopWorkflow:
                             polls_without_pr,
                             "none" if last is None else (last.pr_url or "unresolved"),
                         )
-                        return last
+                        return _WatchOutcome(last=last)
+                # Counted only after a poll that reached here -- i.e. one
+                # that neither hopped nor returned above -- so "at least one
+                # completed poll in this run" (the hop predicate's own
+                # guard) means what it says.
+                polls_this_run += 1
                 await workflow.sleep(cadence.poll_interval)
         finally:
             await self._settle_tick(tick_task, service, slug)
-            if track_ownership and self._owned_entity_id:
+            # A hop keeps the claim: this run is not the one relinquishing
+            # it, the continued run is still watching, and the owner id
+            # (workflow_id) plus the epoch both stay valid across
+            # continue_as_new. Skipping this block on `hopping` is what
+            # keeps `test_abandon_signal_cuts_short_a_merge_watch_and_releases_ownership`
+            # (an ABANDON, which releases) independent of a HOP (which does
+            # not) -- the two are mutually exclusive by construction, since
+            # the hop predicate refuses to fire while `self._abandoned`.
+            if not hopping and track_ownership and self._owned_entity_id:
                 # The watch ended without the PR reaching a terminal state —
                 # the deadline expired, or the PR stopped resolving. RELEASE,
                 # not terminal: the work remains and somebody must be able to
@@ -2509,7 +3341,13 @@ class DevLoopWorkflow:
                 self._finish_claim(op, done, repo, number)
             # After the LAST relinquishing write of this watch, whichever path
             # made it. One metric line per abandoned entity, not per failed
-            # attempt — see _report_claim_abandonment.
-            if track_ownership:
+            # attempt — see _report_claim_abandonment. Also skipped on a hop:
+            # a hop never attempts a relinquishing write, so `_claim_abandoned`
+            # cannot have changed here, and reporting it again per hop would
+            # turn a once-per-entity metric into one per continuation.
+            if not hopping and track_ownership:
                 self._report_claim_abandonment()
-        return last
+        if hopping:
+            assert resume_record is not None  # noqa: S101 -- set right before every `break` above
+            return _WatchOutcome(last=last, resume=resume_record)
+        return _WatchOutcome(last=last)

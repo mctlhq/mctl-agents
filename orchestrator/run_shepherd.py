@@ -53,6 +53,20 @@ Env:
         shepherd discovers and fixes but never merges (merge owned by
         another PR lifecycle). Wins over SHEPHERD_SKIP_SERVICES when a
         service is listed in both.
+    SHEPHERD_CI_INFRA_RERUN_MAX — max `gh run rerun --failed` calls per
+        head SHA when the only current-head blockers are required checks
+        classified as infrastructure failures (mctl-agents#411; default 2).
+        Never charges review_attempts; exhausting the budget with the check
+        still failing flips the proposal to review-stuck, blamelessly.
+    SHEPHERD_CI_PROBE_FAILURES_MAX — max consecutive required-check probe
+        failures (CIStatus(known=False)) before flipping to review-stuck
+        (default 6). Cleared on any successful probe; never charges
+        review_attempts either.
+    SHEPHERD_CI_REQUIRED_OVERRIDE — optional comma/whitespace-separated
+        allowlist of check names treated as required when GitHub reports no
+        per-context signal AND the branch protection context list is silent
+        on them too. Read by orchestrator.ci_checks; unset means no override
+        (advisory is the default when both real signals are absent).
     GITHUB_TOKEN — required for `gh api` and `gh pr merge` calls.
 
 Usage:
@@ -85,6 +99,7 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
+from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout, shadow
@@ -100,6 +115,7 @@ from orchestrator.lifecycle.contract import (
 from orchestrator.lifecycle.shadow import LEGACY_FREE, LEGACY_OWNED, LEGACY_UNKNOWN
 from orchestrator.proc import run_capturing
 from orchestrator.proposal_state import load_status, now_iso, update_status_file
+from orchestrator.source_issue import SourceIssueVerdict, read_source_issue
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL
 
 # ---------------------------------------------------------------------------
@@ -498,6 +514,28 @@ def _settle_min_from_env() -> int:
 SHEPHERD_MERGE_SETTLE_MIN = _settle_min_from_env()
 
 
+# Bound on `gh run rerun <run_id> --failed` calls per head SHA when the only
+# current-head blockers are non-actionable infrastructure failures
+# (mctl-agents#411). Never charges review_attempts — the proposal is
+# blameless — but the retry itself must still be bounded, on its own
+# per-head counter, mirroring MAX_HARNESS_FAILURES's reasoning.
+def _int_from_env(var: str, default: int) -> int:
+    raw = os.environ.get(var, "")
+    if not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"warn: {var}={raw!r} is not an integer; defaulting to {default}")
+        return default
+
+
+SHEPHERD_CI_INFRA_RERUN_MAX = _int_from_env("SHEPHERD_CI_INFRA_RERUN_MAX", 2)
+# Bound on consecutive required-check probe outages (CIStatus(known=False))
+# before flipping to review-stuck. Cleared on any successful probe.
+SHEPHERD_CI_PROBE_FAILURES_MAX = _int_from_env("SHEPHERD_CI_PROBE_FAILURES_MAX", 6)
+
+
 # Per-service ownership. A repo whose name is listed in SHEPHERD_SKIP_SERVICES
 # is owned by a different PR lifecycle (e.g. mctl-claude-remote's pr-steward)
 # and the shepherd must NOT discover, fix, or merge its proposals — otherwise
@@ -630,6 +668,21 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
       reproduces it, so these consume a ``MAX_REVIEW_ATTEMPTS`` slot.
     - harness: our own plumbing lost the work before the agent could finish
       (mctl-agents#366). The proposal is blameless — never charge it an attempt.
+      ``EXIT_CI_EVIDENCE_INSUFFICIENT`` (mctl-agents#423) joins this set: the
+      agent did run, but the bounded log evidence it was handed could not
+      support a code decision — a platform-supplied-evidence gap, not a
+      proposal defect, so it is blameless the same way an orphaned sub-agent
+      is, bounded by the same ``MAX_HARNESS_FAILURES``.
+      ``EXIT_VERIFICATION_BUDGET_EXHAUSTED`` (mctl-agents#430) joins it too:
+      every agent-issued Bash command is bounded to what remains of the run's
+      envelope, and this code means the run stayed INSIDE that envelope the
+      whole time and a STRUCTURED ledger (never model prose) recorded the
+      command budget running out before a commit or a merits decision was
+      reached. The agent ran and was cut short by a platform-imposed bound —
+      blameless the same way 46 and 50 are, and bounded by the same
+      ``MAX_HARNESS_FAILURES`` — so ``EXIT_ORPHANED_SUBAGENT`` can go back to
+      being the safety net it was designed as, rather than the normal result
+      of a slow test suite.
     """
     from orchestrator import run_implementer  # deferred — see apply_followup
 
@@ -638,7 +691,11 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
         run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
         run_implementer.EXIT_OPERATION_TIMEOUT,
     })
-    harness = frozenset({run_implementer.EXIT_ORPHANED_SUBAGENT})
+    harness = frozenset({
+        run_implementer.EXIT_ORPHANED_SUBAGENT,
+        run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
+        run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED,
+    })
     return deterministic, harness
 
 
@@ -863,6 +920,20 @@ class ProposalRef:
     refusals_head: str | None = None
     pr_url: str | None = None
     mode: str = FULL
+    # True for a PRRef adopted via orchestrator.pr_adoption (a proposal-less,
+    # same-repo PR with fresh blocking findings — mctlhq/mctl-agents#334).
+    # Drives one thing here: process_one passes `--adopted-pr <url>` instead
+    # of `--slug` to the implementer. A plain bool rather than an isinstance
+    # check against pr_adoption.PRRef: that module imports THIS one, so a
+    # module-level import the other way would cycle, and this field lets
+    # process_one stay ignorant of pr_adoption's existence entirely.
+    is_adopted: bool = False
+    # CI blocker bookkeeping (mctl-agents#411), all reset per head exactly
+    # like refusals/refusals_head above — a push moves the branch, so the
+    # next probe is about different CI, not a continuation of the same one.
+    ci_infra_retries: int = 0
+    ci_infra_head: str | None = None
+    ci_probe_failures: int = 0
     status_path: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -885,6 +956,20 @@ class CodexFinding:
     created_at: str | None
     severity: str  # "P1" or "P2"
     author: str | None = None  # bot login; None in fixtures predating #67
+
+
+@dataclass(frozen=True)
+class Blockers:
+    """The union blocker set `decide()` returns with `address-review`
+    (mctl-agents#411): semantic review findings AND failing required CI
+    checks on the current head. A `CheckBlocker` is never coerced into a
+    `CodexFinding` or given a P1/P2 severity — that is the acceptance
+    criterion "without pretending a check failure is a review comment",
+    enforced at the type level.
+    """
+
+    findings: list[CodexFinding]
+    checks: list[CheckBlocker]
 
 
 @dataclass
@@ -972,6 +1057,18 @@ class PRSnapshot:
     checks_green: bool              # required checks all SUCCESS
     is_draft: bool
     review_decision: str = ""       # APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
+    # The two fields adoption needs (mctlhq/mctl-agents#334). Both default so
+    # every existing PRSnapshot(...) construction site and fixture keeps
+    # constructing unchanged.
+    head_branch: str = ""
+    is_cross_repository: bool = False
+    # Raw per-context check/status nodes and the branch-protection required
+    # context list (mctlhq/mctl-agents#411), consumed by
+    # ci_checks.read_required_checks(). Both default so every existing
+    # PRSnapshot(...) construction site (tests/test_pr_adoption.py,
+    # tests/test_temporal_activities.py) keeps constructing unchanged.
+    check_contexts: tuple = ()
+    required_contexts: tuple[str, ...] = ()
 
 
 @dataclass
@@ -1017,7 +1114,10 @@ def update_status(
     # two disagreed for the rest of the tick. Harmless while the only consumer
     # of the returned ref is the summary line, but the harness arm made these
     # refs carry state that a later reader would reasonably trust.
-    for _field in ("review_attempts", "harness_failures", "refusals"):
+    for _field in (
+        "review_attempts", "harness_failures", "refusals",
+        "ci_infra_retries", "ci_probe_failures",
+    ):
         if _field in fields:
             _value = fields[_field]
             setattr(ref, _field, 0 if _value is None else int(_value))
@@ -1025,6 +1125,9 @@ def update_status(
     if "refusals_head" in fields:
         _head = fields["refusals_head"]
         ref.refusals_head = str(_head) if _head else None
+    if "ci_infra_head" in fields:
+        _ci_head = fields["ci_infra_head"]
+        ref.ci_infra_head = str(_ci_head) if _ci_head else None
 
 
 # ---------------------------------------------------------------------------
@@ -1131,6 +1234,9 @@ def _discover_refs(
                     refusals_head=(data.get("refusals_head") or None),
                     pr_url=pr_url,
                     mode=mode,
+                    ci_infra_retries=int(data.get("ci_infra_retries", 0) or 0),
+                    ci_infra_head=(data.get("ci_infra_head") or None),
+                    ci_probe_failures=int(data.get("ci_probe_failures", 0) or 0),
                 )
             )
     return refs
@@ -1232,31 +1338,6 @@ SOURCE_RECHECKED_FAILURE_CODES = frozenset(
 )
 
 
-@dataclass(frozen=True)
-class SourceIssueVerdict:
-    """What the source issue says about a PR-less proposal.
-
-    `known` and `failure` are deliberately two fields rather than one
-    nullable one.  Collapsing them loses the distinction between "GitHub
-    answered: the issue is open" and "GitHub did not answer", and those want
-    opposite handling: the first may rewrite a stale `source-resolved` back
-    to `missing-pr`, the second must not touch the status at all.
-
-    Folding them together is not hypothetical — it was the first version of
-    this code, and agy's P1 on PR #279 caught it: a 502 during a sweep would
-    have flapped every parked `source-resolved` proposal to `missing-pr`,
-    two GitOps commits per proposal per blip, erasing the very signal an
-    operator was reading.
-    """
-
-    known: bool
-    failure: dict[str, str] | None = None
-
-
-_SOURCE_UNKNOWN = SourceIssueVerdict(known=False)
-_SOURCE_ISSUE_OPEN = SourceIssueVerdict(known=True, failure=None)
-
-
 def _source_issue_state(status_data: dict[str, Any]) -> SourceIssueVerdict:
     """Read the proposal's source issue and say what it implies.
 
@@ -1267,52 +1348,20 @@ def _source_issue_state(status_data: dict[str, Any]) -> SourceIssueVerdict:
     accumulates silently — every issue the platform investigates but a human
     then resolves directly produces one (#276).
 
-    Returns `_SOURCE_UNKNOWN` when the question cannot be answered at all:
-    the proposal predates `source:`, the block is partial, or GitHub could
-    not be read.  Callers must treat that as "change nothing", the same
+    A thin wrapper over `orchestrator.source_issue.read_source_issue`
+    (mctl-agents#410), which also backs the Tier 2 implementer's admission
+    gate. `gh_api_json=_gh_api_json` keeps the GitHub read routed through
+    this module's own token-refreshing, logging `_run` wrapper — and keeps
+    it patchable by the existing reconcile tests, which stub
+    `run_shepherd._gh_api_json` rather than the network.
+
+    `known=False` answers "the question cannot be answered at all": the
+    proposal predates `source:`, the block is partial, or GitHub could not
+    be read. Callers must treat that as "change nothing", the same
     reasoning as the `discovered_url` guard in `reconcile_one` — an
     unreadable GitHub is not evidence about the proposal.
     """
-    source = status_data.get("source")
-    if not isinstance(source, dict):
-        return _SOURCE_UNKNOWN
-    repo = source.get("repo")
-    number = source.get("issue")
-    if not repo or not number:
-        return _SOURCE_UNKNOWN
-    try:
-        issue = _gh_api_json([f"repos/{repo}/issues/{number}"])
-    except Exception as exc:  # noqa: BLE001 — any gh/JSON failure is unknown
-        print(f"warn: could not read source issue {repo}#{number}: {exc}")
-        return _SOURCE_UNKNOWN
-    if not isinstance(issue, dict) or "state" not in issue:
-        # A response we cannot interpret is not an answer.  Reading it as
-        # "open" would be a guess dressed up as a fact.
-        print(f"warn: unreadable source issue payload for {repo}#{number}")
-        return _SOURCE_UNKNOWN
-    if issue["state"] != "closed":
-        return _SOURCE_ISSUE_OPEN
-    # state_reason is null on issues closed before GitHub introduced it, and
-    # on some API paths.  Treat "closed, reason unknown" as completed: the
-    # actionable half of the message ("no PR ever existed for this slug, the
-    # issue is closed") is true either way, and the operator confirms.
-    not_planned = issue.get("state_reason") == "not_planned"
-    code = "source-not-planned" if not_planned else "source-resolved"
-    reason = "not planned" if not_planned else "completed"
-    return SourceIssueVerdict(
-        known=True,
-        failure={
-            "code": code,
-            "stage": "reconcile",
-            "message": (
-                f"No canonical PR exists for the deterministic result branch, "
-                f"and the source issue {repo}#{number} is closed as {reason}. "
-                f"The branch is missing because this proposal was abandoned, "
-                f"not because a PR was lost. Retire it with a terminal status "
-                f"(agents-state/OPERATOR.md) or reopen the issue."
-            ),
-        },
-    )
+    return read_source_issue(status_data, stage="reconcile", gh_api_json=_gh_api_json)
 
 
 # ---------------------------------------------------------------------------
@@ -1322,21 +1371,61 @@ def find_pr_for_proposal(
     service: str,
     slug: str,
     state_dir: Path | None = None,
+    status_path: Path | None = None,
 ) -> PRSnapshot | None:
     """Read the linked PR for a proposal.
 
     If `.status.yaml` has no `pr:` URL, discover it from the deterministic
     implementer branch. Crucially this does NOT filter to state=open — closed
     and merged PRs are returned too.
+
+    ``status_path`` overrides the default ``proposals/<slug>/.status.yaml``
+    location — a ``pr_adoption.PRRef`` passes its own ``.prref.yaml`` so the
+    ``pr:`` URL resolves from the adoption record instead of a proposal
+    directory that does not exist (mctlhq/mctl-agents#334).
     """
     sd = state_dir or DEFAULT_STATE_DIR
-    status_path = sd / service / "proposals" / slug / ".status.yaml"
+    status_path = status_path or (sd / service / "proposals" / slug / ".status.yaml")
     data = _load_status(status_path)
     pr_url = data.get("pr") or _find_pr_url_by_branch(service, slug)
     if not pr_url:
         return None
     owner, repo, number = _parse_pr_url(pr_url)
     return _fetch_pr_snapshot(f"{owner}/{repo}", number)
+
+
+def _fetch_required_status_check_contexts(
+    owner: str, repo_name: str, base_ref_name: str
+) -> tuple[str, ...]:
+    """Best-effort fetch of the base branch's required-status-check list.
+
+    `branchProtectionRule` requires admin access to the repository; a token
+    without that scope makes the WHOLE GraphQL response carry a FORBIDDEN
+    error, which `gh api graphql` treats as a failure. Kept in its own call,
+    separate from the PR snapshot query that gates every shepherd decision,
+    so a permission shortfall here degrades to "no branch-protection
+    fallback" instead of failing _fetch_pr_snapshot for every PR
+    (mctl-agents#411 review).
+    """
+    if not base_ref_name:
+        return ()
+    try:
+        resp = _gh_api_json([
+            "graphql", "-f",
+            "query=query($owner:String!,$repo:String!,$ref:String!){repository(owner:$owner,name:$repo){ref(qualifiedName:$ref){branchProtectionRule{requiredStatusCheckContexts}}}}",
+            "-F", f"owner={owner}",
+            "-F", f"repo={repo_name}",
+            "-F", f"ref=refs/heads/{base_ref_name}",
+        ])
+    except subprocess.CalledProcessError as e:
+        print(
+            f"warn: gh graphql branch-protection probe failed for "
+            f"{owner}/{repo_name}@{base_ref_name}: {(e.stderr or '').strip() or e}"
+        )
+        return ()
+    ref = ((resp or {}).get("data") or {}).get("repository") or {}
+    ref = ref.get("ref") or {}
+    return tuple(((ref.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts")) or ())
 
 
 def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
@@ -1350,7 +1439,7 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
     try:
         view = _gh_api_json([
             "graphql", "-f",
-            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
+            "query=query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){number state merged mergedAt mergeStateStatus reviewDecision isDraft headRefOid headRefName isCrossRepository headRepositoryOwner{login} baseRepository{owner{login}} baseRefName mergeCommit{oid} timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT,PULL_REQUEST_COMMIT],last:50){nodes{__typename ... on PullRequestCommit{commit{oid committedDate}} ... on HeadRefForcePushedEvent{createdAt afterCommit{oid}}}} commits(last:1){nodes{commit{oid committedDate pushedDate statusCheckRollup{state contexts(last:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl isRequired(pullRequestNumber:$number) title summary databaseId checkSuite{databaseId workflowRun{databaseId url workflow{name}}}} ... on StatusContext{context state targetUrl isRequired(pullRequestNumber:$number)}}}}}}} statusCheckRollup{state}}}}",  # noqa: E501 — single-line GraphQL query, not the kind of prose the line-length limit is meant to keep readable
             "-F", f"owner={repo.split('/')[0]}",
             "-F", f"repo={repo.split('/')[1]}",
             "-F", f"number={number}",
@@ -1404,6 +1493,41 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         )
         head_pushed_at = None
 
+    # Per-context check/status nodes off the SAME commits(last:1) node read
+    # above for head_pushed_at — that is what makes them head-pinned by
+    # construction (mctl-agents#411): every node here is tagged with the
+    # enclosing commit's own oid, and ci_checks.read_required_checks()
+    # discards any tagged with an oid other than head_sha. required_contexts
+    # is the base branch's protection list, consulted as the second-choice
+    # requiredness signal when a context carries no per-context isRequired.
+    check_contexts: list[dict[str, Any]] = []
+    if commits_nodes:
+        commit_obj = (commits_nodes[0] or {}).get("commit") or {}
+        commit_oid = commit_obj.get("oid") or head_sha
+        rollup2 = commit_obj.get("statusCheckRollup") or {}
+        for node in (rollup2.get("contexts") or {}).get("nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            tagged = dict(node)
+            tagged["_commit_oid"] = commit_oid
+            check_contexts.append(tagged)
+    required_contexts = _fetch_required_status_check_contexts(
+        repo.split("/")[0], repo.split("/")[1], pr.get("baseRefName") or ""
+    )
+
+    # Fork check (mctlhq/mctl-agents#334): true when GitHub says so directly,
+    # OR when the head repository's owner differs from the base repository's
+    # — belt-and-braces, since a renamed/transferred fork could in principle
+    # carry a stale isCrossRepository. Base repository owner falls back to
+    # the requested owner when the field is absent (older GraphQL schema).
+    head_repo_owner = (pr.get("headRepositoryOwner") or {}).get("login") or ""
+    base_repo_owner = (
+        (pr.get("baseRepository") or {}).get("owner") or {}
+    ).get("login") or repo.split("/")[0]
+    is_cross_repository = bool(pr.get("isCrossRepository")) or (
+        bool(head_repo_owner) and head_repo_owner != base_repo_owner
+    )
+
     closed_unmerged = state == "CLOSED" and not merged
     close_comment_or_default = (
         "PR was closed without merging."
@@ -1447,6 +1571,10 @@ def _fetch_pr_snapshot(repo: str, number: int) -> PRSnapshot | None:
         checks_green=checks_green,
         is_draft=bool(pr.get("isDraft")),
         review_decision=(pr.get("reviewDecision") or "").upper(),
+        head_branch=pr.get("headRefName") or "",
+        is_cross_repository=is_cross_repository,
+        check_contexts=tuple(check_contexts),
+        required_contexts=required_contexts,
     )
 
 
@@ -1786,8 +1914,9 @@ def decide(
     now: datetime | None = None,
     *,
     fix_only: bool = False,
+    ci: CIStatus | None = None,
 ) -> tuple[str, Any]:
-    """Return one of the six decisions per design.md L62-75.
+    """Return one of the decisions per design.md (mctl-agents#411).
 
     Pure: only depends on its arguments. `now` is injected so the settling
     window stays deterministic in tests; it defaults to the current UTC time.
@@ -1798,6 +1927,17 @@ def decide(
     proposal that would otherwise merge is instead returned as `defer-merge`
     so callers hand the merge off to another PR lifecycle (e.g. pr-steward)
     without touching `.status.yaml`'s `status`.
+
+    `ci` is the required-check probe (mctl-agents#411), positional-or-
+    keyword-defaulted to `None` so every pre-existing call site is
+    untouched. With `ci=None` this function is behaviourally IDENTICAL to
+    before that change, including the exact `address-review` payload shape
+    (a plain `list[CodexFinding]`, not `Blockers`) — the ~40 tests that
+    predate #411 assert that shape directly and must not be weakened to
+    accommodate the union (see T12 in tasks.md). Only once a caller
+    actually supplies a `CIStatus` does the payload widen to `Blockers` and
+    do the three new arms (`ci-infra`, `ci-unknown`, and the CI-pending
+    `wait`) become reachable.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -1810,28 +1950,57 @@ def decide(
     if not codex_review.has_responded:
         # Codex still parsing the PR head.
         return ("wait", None)
-    # Two gates, and the order matters.
-    #
     # FIRST, anything raised against THIS head still blocks, whoever raised it
     # and whatever the primary reviewer concluded. #67 (mctl-gitops#626) is the
     # case: claude approves clean, the connector posts a real inline P2 two
     # minutes later. An approval is a statement about what its author read, not
-    # a licence to ignore a second reviewer.
+    # a licence to ignore a second reviewer. #411 extends the same principle to
+    # a failing REQUIRED check: a clean review is not a licence to ignore CI.
     #
-    # The filter that makes this safe is `created_at`, not the anchor. GitHub
-    # RE-ANCHORS surviving inline comments onto every new head, so a P2 written
-    # five commits ago comes back pointing at the current one: on portfolio#56
-    # that reported 14 "findings" against a head the same reviewer had just
-    # APPROVED with 0 P1 and 0 P2, and the shepherd burned every tick on
-    # address-review until the cap flipped it to review-stuck. It had to be
-    # merged by hand. Re-anchoring rewrites WHERE a comment points, never WHEN
-    # it was written, so the time filter is the one that discriminates.
-    # mctl-agents#359, and #336 for the same mechanism from the other side.
+    # The filter that makes the findings side safe is `created_at`, not the
+    # anchor. GitHub RE-ANCHORS surviving inline comments onto every new head,
+    # so a P2 written five commits ago comes back pointing at the current one:
+    # on portfolio#56 that reported 14 "findings" against a head the same
+    # reviewer had just APPROVED with 0 P1 and 0 P2, and the shepherd burned
+    # every tick on address-review until the cap flipped it to review-stuck. It
+    # had to be merged by hand. Re-anchoring rewrites WHERE a comment points,
+    # never WHEN it was written, so the time filter is the one that
+    # discriminates. mctl-agents#359, and #336 for the same mechanism from the
+    # other side. The CI side is safe by construction instead:
+    # `ci_checks.read_required_checks` only ever returns blockers observed on
+    # `pr.head_sha` itself.
     findings = codex_review.fresh_findings_p1_p2(at=pr.head_sha, since=pr.head_pushed_at)
-    if findings:
-        return ("address-review", findings)
+    checks = list(ci.actionable) if (ci is not None and ci.known) else []
+    if findings or checks:
+        if ci is None:
+            return ("address-review", findings)
+        return ("address-review", Blockers(list(findings), checks))
 
-    # SECOND, with nothing outstanding, merge on the primary reviewer's ruling
+    # SECOND (mctl-agents#411): non-actionable required-check state, ahead of
+    # the head_verdict gates below on purpose. Neither arm here merges or
+    # hands anything to the implementer -- `ci-infra` only re-runs a workflow,
+    # `ci-unknown` only waits -- so nothing about them depends on what the
+    # primary reviewer ruled. Gating them behind an on-this-head APPROVED (the
+    # only value that clears both head_verdict checks) made one common infra
+    # wedge unreachable: a runner outage hit while codex sits on
+    # CHANGES_REQUESTED for an unrelated reason never got a retry. This
+    # reorder fixes that case. A runner outage hit before codex has even
+    # responded is a separate wedge that this reorder does NOT touch: it is
+    # still gated by the unconditional `has_responded` check above, which
+    # stays first by design (see design.md's "# unchanged" annotation) and is
+    # covered by its own has_responded=False -> wait test. Both arms here are
+    # unreachable when `ci` is None, preserving the pre-#411 decision surface
+    # exactly.
+    if ci is not None and ci.known and ci.infrastructure:
+        # Only non-actionable (infra) blockers remain — never hand these to
+        # the implementer as a code defect. process_one re-runs them.
+        return ("ci-infra", list(ci.infrastructure))
+    if ci is not None and not ci.known:
+        # The probe failed (API error, malformed response, a truncated
+        # contexts page). Fail closed: no merge/defer-merge this tick.
+        return ("ci-unknown", None)
+
+    # THIRD, with nothing outstanding, merge on the primary reviewer's ruling
     # for this head rather than on the absence of comments. A verdict review is
     # anchored to the commit it judged and is never rewritten afterwards, which
     # is exactly the property the inline anchor lacks.
@@ -1843,6 +2012,10 @@ def decide(
         # Responded on this head but never ruled on it. Some reviewers only
         # ever post findings -- the connector is one -- so this is a normal
         # resting state, not an error.
+        return ("wait", None)
+    if ci is not None and ci.known and ci.pending:
+        # A required check is still QUEUED/IN_PROGRESS. Incomplete signal,
+        # not evidence of anything — wait, emit nothing.
         return ("wait", None)
     if pr.merge_state_status not in MERGEABLE_STATES:
         # BLOCKED, BEHIND, DIRTY, UNKNOWN, DRAFT — retry next tick.
@@ -2060,14 +2233,71 @@ def _fallback_bundle(findings: list[CodexFinding]) -> dict:
 # Address-review followup — subprocess into run_implementer.py with
 # --review-feedback (Task 3, landed in this branch).
 # ---------------------------------------------------------------------------
+def _augment_bundle_with_ci(bundle: dict, checks: list[CheckBlocker]) -> dict:
+    """Append deterministic CI blocker records to a bundle (mctl-agents#411).
+
+    Additive and applied AFTER the SDK/fallback bundle is built — a
+    `CheckBlocker` is never routed through the summariser SDK, so its
+    run/URL/SHA cannot be model-rewritten or hallucinated. `excerpt` is
+    tag-neutralised the same way review-finding text is before it reaches
+    any prompt: check output is attacker-influenceable on a fork PR the
+    same way a review comment body is.
+
+    mctl-agents#423: also emits the bounded CI-log evidence
+    (`fetch_failure_logs()` has already run on `checks` by the time this is
+    called — see `apply_followup`) plus top-level `work_class` and
+    `budget_report`, both consumed by `run_implementer` to derive its
+    execution envelope and to log a one-line operator-facing attribution for
+    a future timeout.
+    """
+    if not checks:
+        return bundle
+    bundle = dict(bundle)
+    bundle["head_sha"] = checks[0].head_sha
+    bundle["ci_failures"] = [
+        {
+            "check": c.name,
+            "workflow": c.workflow,
+            "job": c.job,
+            "step": c.step,
+            "conclusion": c.conclusion,
+            "url": c.url,
+            "run_id": c.run_id,
+            "head_sha": c.head_sha,
+            "excerpt": _neutralize_findings_tags(c.excerpt),
+            "log_excerpt": _neutralize_findings_tags(c.log_excerpt),
+            "log_status": c.log_status,
+            "log_truncated": c.log_truncated,
+        }
+        for c in checks
+    ]
+    bundle["work_class"] = "mixed" if (bundle.get("summaries") or []) else "ci-remediation"
+    bundle["budget_report"] = {
+        "n_checks": len(checks),
+        "log_statuses": [c.log_status for c in checks],
+        "log_bytes_total": sum(c.log_bytes for c in checks),
+        "log_excerpt_chars_total": sum(len(c.log_excerpt) for c in checks),
+    }
+    return bundle
+
+
 def apply_followup(
     service: str,
     slug: str,
-    findings: list[CodexFinding],
+    blockers: Blockers | list[CodexFinding],
     skip_subprocess: bool = False,
     state_dir: Path | None = None,
+    adopted_pr: str | None = None,
+    repo: str | None = None,
 ) -> dict:
-    """Bundle findings + invoke the Tier 2 implementer with --review-feedback.
+    """Bundle findings + CI blockers, invoke the Tier 2 implementer with
+    --review-feedback.
+
+    ``blockers`` accepts either the new `Blockers` container or a bare
+    `list[CodexFinding]` — the shape every pre-#411 caller (and the many
+    existing tests) already passes. A bare list is treated as
+    ``Blockers(findings=list, checks=[])``, so nothing outside `decide()`'s
+    own `address-review` payload shape needs to change.
 
     Returns the bundle dict so callers (and tests) can inspect what the
     SDK produced. ``skip_subprocess`` is kept as a test-only escape hatch
@@ -2081,8 +2311,46 @@ def apply_followup(
     and the implementer could not find the proposal in
     ``implemented/review-fixing`` — exiting non-zero and triggering an
     avoidable ``review-stuck`` flip.
+
+    ``adopted_pr`` (a PR URL) substitutes ``--adopted-pr <url>`` for
+    ``--slug`` in the subprocess argv — the proposal-less adoption path
+    (mctlhq/mctl-agents#334). Everything else about this function is
+    unchanged for that path: the bundle, the ``--refusal-out`` temp file,
+    the ``--state-dir`` forwarding and the exit-code classification below
+    all apply identically.
+
+    ``repo`` (mctl-agents#423) is the ``owner/name`` string CI-log retrieval
+    fetches against — ``process_one`` passes ``pr.repo`` (the actual repo the
+    PR lives in, which differs from the deterministic ``mctlhq/<service>``
+    guess for an adopted PR). Falls back to ``mctlhq/{service}`` when unset
+    (every existing direct caller, including the many tests that construct a
+    bare ``list[CodexFinding]`` and therefore never reach the CI branch at
+    all).
     """
-    bundle = anyio.run(_format_bundle_via_sdk, findings)
+    if isinstance(blockers, Blockers):
+        findings = blockers.findings
+        checks = blockers.checks
+    else:
+        findings = list(blockers)
+        checks = []
+
+    if checks:
+        # Bounded, best-effort log retrieval — in THIS process, before the
+        # implementer subprocess below is forked, so the cost is paid
+        # outside the execution envelope it used to threaten (mctl-agents#423).
+        # Never raises (see fetch_failure_logs' docstring); a review-only
+        # bundle (checks == []) never reaches this line at all.
+        checks = list(fetch_failure_logs(repo or f"mctlhq/{service}", tuple(checks)))
+
+    if findings:
+        bundle = anyio.run(_format_bundle_via_sdk, findings)
+    else:
+        # CI-only follow-up: skip the summariser SDK call entirely rather
+        # than pay for a round trip over an empty <findings></findings>
+        # block, whose ungrounded output would otherwise be rendered to
+        # the implementer as if it were real review findings.
+        bundle = _fallback_bundle(findings)
+    bundle = _augment_bundle_with_ci(bundle, checks)
 
     if skip_subprocess:
         # Tests / dry-run: build the bundle but do not fork. The shepherd's
@@ -2125,7 +2393,12 @@ def apply_followup(
         cmd = [
             sys.executable, "-m", "orchestrator.run_implementer",
             "--service", service,
-            "--slug", slug,
+        ]
+        if adopted_pr:
+            cmd += ["--adopted-pr", adopted_pr]
+        else:
+            cmd += ["--slug", slug]
+        cmd += [
             "--review-feedback", bundle_path,
             "--refusal-out", refusal_path,
         ]
@@ -2138,15 +2411,30 @@ def apply_followup(
             cmd.extend(["--state-dir", str(state_dir)])
         print(f"$ {' '.join(cmd)}")
         proc = subprocess.run(cmd, check=False, text=True)  # noqa: S603 — cmd is list[str], built above
-        # Gated on the refusal codes, NOT read unconditionally. `mkstemp`
-        # leaves the file empty, so reading it on every tick parsed zero bytes
-        # and warned on 100% of healthy runs — destroying the greppable signal
-        # this feature exists to produce, and burying a real refusal warning
-        # under one from every success. The reason is only meaningful when the
-        # child exited on a refusal sentinel anyway.
+        # Gated on the codes `run_implementer` actually writes `--refusal-out`
+        # for, NOT read unconditionally. `mkstemp` leaves the file empty, so
+        # reading it on every tick parsed zero bytes and warned on 100% of
+        # healthy runs — destroying the greppable signal this feature exists
+        # to produce, and burying a real refusal warning under one from every
+        # success. `EXIT_CI_EVIDENCE_INSUFFICIENT` (mctl-agents#423 review P2)
+        # joins the plain refusal codes here: `run_implementer.main` writes
+        # the same `--refusal-out` file for it (see its `elif code ==
+        # EXIT_CI_EVIDENCE_INSUFFICIENT` branch), so leaving it out of this
+        # gate meant the reason was written but never read back — and the
+        # file is unlinked in the `finally` below regardless, so a later read
+        # is not an option.
         refusal_reason = (
             _read_refusal_reason(refusal_path)
-            if proc.returncode in _refusal_codes()
+            if proc.returncode in _refusal_codes() | {
+                run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
+                # mctl-agents#430: `run_implementer.main` writes the same
+                # `--refusal-out` file for this code too (see its `elif code
+                # == EXIT_VERIFICATION_BUDGET_EXHAUSTED` arm) — gate it in
+                # here for the same reason EXIT_CI_EVIDENCE_INSUFFICIENT is:
+                # the file is unlinked in the `finally` below regardless, so
+                # a later read is not an option.
+                run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED,
+            }
             else None
         )
     finally:
@@ -2201,6 +2489,12 @@ def apply_followup(
             kind = "fenced"
         elif proc.returncode in harness_codes:
             kind = "harness"
+            # `EXIT_CI_EVIDENCE_INSUFFICIENT` and (mctl-agents#430)
+            # `EXIT_VERIFICATION_BUDGET_EXHAUSTED` = 51 both have a reason on
+            # this path (see the `refusal_reason` gate above);
+            # `EXIT_ORPHANED_SUBAGENT` never gets one, so `refusal_reason` is
+            # `None` for it and this stays a no-op there.
+            reason = refusal_reason
         elif proc.returncode in deterministic_codes:
             kind = "deterministic"
         else:
@@ -2293,6 +2587,26 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     return (True, merge_commit)
 
 
+def _format_check_name(c: CheckBlocker) -> str:
+    """"<workflow> / <check>" when the workflow is known, else the bare name."""
+    return f"{c.workflow} / {c.name}" if c.workflow else c.name
+
+
+def _rerun_check_run(repo: str, run_id: str) -> bool:
+    """`gh run rerun <run_id> --failed`. Best-effort — never raises.
+
+    A re-run failure (the run already re-ran, permissions, a transient API
+    error) is logged and treated as "nothing to do this tick"; the infra
+    counter still advances so the budget in process_one converges either way.
+    """
+    proc = _run(["gh", "run", "rerun", run_id, "--failed", "--repo", repo], check=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        print(f"warn: gh run rerun {run_id} --repo {repo} failed: {detail}")
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Outer state machine — orchestrates one proposal per tick.
 # ---------------------------------------------------------------------------
@@ -2316,7 +2630,9 @@ def process_one(
     so a non-default ``--state-dir`` is honoured end-to-end and we do
     not silently re-read from the env path.
     """
-    pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
+    pr = find_pr_for_proposal(
+        ref.service, ref.slug, state_dir=state_dir, status_path=ref.status_path,
+    )
     if pr is None:
         return ShepherdResult(
             ref=ref,
@@ -2353,21 +2669,134 @@ def process_one(
 
     codex = read_codex_review(pr)
     copilot = read_copilot_review(pr)  # observed only — never gates
-    decision, payload = decide(pr, codex, fix_only=(ref.mode == FIX_ONLY))
+    ci = read_required_checks(pr)
+    if ci.known and ref.ci_probe_failures:
+        # Any successful probe clears the outage counter (mctl-agents#411) —
+        # a change-only write so a healthy run does not touch .status.yaml.
+        _update_status_if_changed(ref, ref.status, ci_probe_failures=None)
+    decision, payload = decide(pr, codex, fix_only=(ref.mode == FIX_ONLY), ci=ci)
 
+    ci_required_failed = len(ci.blockers) if ci.known else 0
+    ci_check_names = ", ".join(sorted({c.name for c in ci.blockers})) if ci.known else ""
     # Per-tick operator log line — Copilot's findings ride along here so
-    # they are visible without gating the merge.
+    # they are visible without gating the merge. ci_known/ci_required_failed/
+    # ci_checks are #411: the required-check side of the blocker set.
     print(
         f"info: pr={pr.repo}#{pr.number} head={pr.head_sha[:8]} "
         f"merge_state={pr.merge_state_status} checks_green={pr.checks_green} "
         f"codex_responded={codex.has_responded} codex_findings={len(codex.findings)} "
         f"connector_findings={sum(1 for f in codex.findings if f.author == CODEX_CONNECTOR_BOT)} "
         f"copilot_responded={copilot.has_responded} copilot_findings={copilot.findings_count} "
+        f"ci_known={ci.known} ci_required_failed={ci_required_failed} ci_checks={ci_check_names} "
         f"-> {decision}"
     )
 
+    if not (pr.merged or pr.closed_unmerged) and ci.known:
+        # Head-pinned CI-blocker projection (mctl-agents#411): written every
+        # tick so a follow-up push that turns a required check green clears
+        # it with no operator action — self-clearing falls straight out of
+        # head pinning, since the next probe only ever reads the new head.
+        # Change-only write; a healthy run with nothing outstanding touches
+        # .status.yaml zero times.
+        #
+        # Gated on `ci.known`: a probe outage carries no information about
+        # this head's checks either way, so it must not touch this
+        # projection at all. Writing `ci_blockers=None` here on an outage
+        # would DELETE whatever blocker names the last successful probe
+        # recorded, and `.status.yaml` would then read "no CI blockers" at
+        # exactly the tick the shepherd knows nothing — the same false
+        # "all clear" this proposal exists to remove from the merge gate.
+        # `ci_probe_failures` (above) is the dedicated unknown-vs-known-empty
+        # signal for the outage itself; skipping the write here just leaves
+        # the last known-good projection standing, stale but not false, until
+        # a successful probe corrects it.
+        current_ci_names = sorted({_format_check_name(c) for c in ci.actionable})
+        _update_status_if_changed(
+            ref, ref.status,
+            ci_blockers_head=(pr.head_sha if current_ci_names else None),
+            ci_blockers=(current_ci_names or None),
+        )
+
     if decision == "wait":
         return ShepherdResult(ref=ref, decision="wait")
+
+    if decision == "ci-infra":
+        # Only non-actionable (infrastructure) required-check failures
+        # remain on this head (mctl-agents#411). Re-run them, bounded and
+        # per-head — never charges review_attempts, the proposal is
+        # blameless — and escalate once the budget is exhausted.
+        checks: list[CheckBlocker] = payload
+        check_names = ", ".join(sorted({_format_check_name(c) for c in checks})) or "(unknown check)"
+        same_head = ref.ci_infra_head in (None, pr.head_sha)
+        new_retries = ref.ci_infra_retries + 1 if same_head else 1
+        if new_retries > SHEPHERD_CI_INFRA_RERUN_MAX:
+            update_status(
+                ref,
+                "review-stuck",
+                notes=(
+                    f"Required check(s) {check_names} classified as "
+                    f"infrastructure failures on head {pr.head_sha[:7]} "
+                    f"persisted after {SHEPHERD_CI_INFRA_RERUN_MAX} re-run "
+                    f"attempt(s); proposal is blameless. Human triage "
+                    f"required."
+                ),
+                ci_infra_retries=new_retries,
+                ci_infra_head=pr.head_sha,
+            )
+            return ShepherdResult(
+                ref=ref,
+                decision="review-stuck",
+                notes="ci infra rerun budget exhausted; proposal not at fault",
+            )
+        run_ids = sorted({c.run_id for c in checks if c.run_id})
+        for run_id in run_ids:
+            _rerun_check_run(pr.repo, run_id)
+        print(
+            f"info: {ref.service}/{ref.slug}: re-ran infrastructure-classified "
+            f"check(s) {check_names} on head {pr.head_sha[:7]}; not charging a "
+            f"review attempt; ci_infra_retries {ref.ci_infra_retries} -> "
+            f"{new_retries}"
+        )
+        update_status(ref, ref.status, ci_infra_retries=new_retries, ci_infra_head=pr.head_sha)
+        return ShepherdResult(
+            ref=ref,
+            decision="ci-infra",
+            notes=f"re-ran {check_names}; retries={new_retries}",
+        )
+
+    if decision == "ci-unknown":
+        # The required-check probe failed this tick (mctl-agents#411) —
+        # fail closed (decide() already refused merge/defer-merge). wait,
+        # plus a bounded consecutive-outage counter; any successful probe
+        # clears it (see the read_required_checks() call above).
+        new_failures = ref.ci_probe_failures + 1
+        if new_failures >= SHEPHERD_CI_PROBE_FAILURES_MAX:
+            update_status(
+                ref,
+                "review-stuck",
+                notes=(
+                    f"The required-check probe failed {new_failures} "
+                    f"consecutive time(s); review_attempts was never "
+                    f"charged. Human triage required."
+                ),
+                ci_probe_failures=new_failures,
+            )
+            return ShepherdResult(
+                ref=ref,
+                decision="review-stuck",
+                notes="ci probe outage budget exhausted; proposal not at fault",
+            )
+        print(
+            f"warn: {ref.service}/{ref.slug}: required-check probe failed; "
+            f"not charging a review attempt; ci_probe_failures "
+            f"{ref.ci_probe_failures} -> {new_failures}"
+        )
+        update_status(ref, ref.status, ci_probe_failures=new_failures)
+        return ShepherdResult(
+            ref=ref,
+            decision="wait",
+            notes="required-check probe failed; will retry next tick",
+        )
 
     if decision == "flip-to-merged":
         update_status(
@@ -2380,6 +2809,11 @@ def process_one(
             refusals=None,
             refusals_head=None,
             merge_owner=None,
+            ci_infra_retries=None,
+            ci_infra_head=None,
+            ci_probe_failures=None,
+            ci_blockers_head=None,
+            ci_blockers=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-merged")
 
@@ -2393,6 +2827,11 @@ def process_one(
             refusals=None,
             refusals_head=None,
             merge_owner=None,
+            ci_infra_retries=None,
+            ci_infra_head=None,
+            ci_probe_failures=None,
+            ci_blockers_head=None,
+            ci_blockers=None,
         )
         return ShepherdResult(ref=ref, decision="flip-to-rejected")
 
@@ -2417,14 +2856,35 @@ def process_one(
         #   tick 6: counter=5 == MAX_REVIEW_ATTEMPTS -> flip to
         #     review-stuck, NO call
         if ref.review_attempts >= MAX_REVIEW_ATTEMPTS:
+            # mctl-agents#411: enumerate what is actually unresolved on the
+            # current head — by reviewer AND by check name — rather than
+            # naming codex findings unconditionally, since the persisting
+            # blocker set may now be CI-only, findings-only, or both.
+            blockers_findings = payload.findings if isinstance(payload, Blockers) else list(payload)
+            blockers_checks = payload.checks if isinstance(payload, Blockers) else []
+            reviewers = sorted({f.author or "reviewer" for f in blockers_findings})
+            stuck_check_names = sorted({_format_check_name(c) for c in blockers_checks})
+            parts = []
+            if blockers_findings:
+                parts.append(
+                    f"{len(blockers_findings)} review finding(s) ({', '.join(reviewers)})"
+                )
+            if blockers_checks:
+                parts.append(
+                    f"{len(blockers_checks)} failing required check(s) "
+                    f"({', '.join(stuck_check_names)})"
+                )
+            summary = "; ".join(parts) if parts else "no current-head blockers recorded"
             update_status(
                 ref,
                 "review-stuck",
                 notes=(
-                    f"Codex P1/P2 findings persisted across "
-                    f"{MAX_REVIEW_ATTEMPTS} follow-up attempts; "
-                    f"human triage required."
+                    f"Current-head blockers persisted across "
+                    f"{MAX_REVIEW_ATTEMPTS} follow-up attempts: {summary}. "
+                    f"Human triage required."
                 ),
+                ci_blockers_head=(pr.head_sha if stuck_check_names else None),
+                ci_blockers=(stuck_check_names or None),
             )
             return ShepherdResult(ref=ref, decision="review-stuck")
 
@@ -2447,6 +2907,8 @@ def process_one(
                 ref.service, ref.slug, payload,
                 skip_subprocess=skip_subprocess,
                 state_dir=state_dir,
+                adopted_pr=(ref.pr_url if ref.is_adopted else None),
+                repo=pr.repo,
             )
         except FollowupSubprocessError as e:
             if e.kind == "refused":
@@ -2527,11 +2989,18 @@ def process_one(
                 # re-clone the repo and re-run a paid SDK call every tick with
                 # no terminal state.
                 new_failures = ref.harness_failures + 1
+                # `e.reason` is set for `EXIT_CI_EVIDENCE_INSUFFICIENT`
+                # (mctl-agents#423 review P2) and for
+                # `EXIT_VERIFICATION_BUDGET_EXHAUSTED` (mctl-agents#430, which
+                # carries the ledger summary) — `EXIT_ORPHANED_SUBAGENT` never
+                # carries one, so this is a no-op suffix on that path only.
+                reason_suffix = f" Reason: {e.reason}" if e.reason else ""
                 print(
                     f"warn: {ref.service}/{ref.slug}: harness failure — not "
                     f"charging a review attempt ({e}); leaving "
                     f"review_attempts={ref.review_attempts}, "
                     f"harness_failures {ref.harness_failures} -> {new_failures}"
+                    f"{reason_suffix}"
                 )
                 if new_failures >= MAX_HARNESS_FAILURES:
                     update_status(
@@ -2543,7 +3012,7 @@ def process_one(
                             f"{new_failures} time(s) in a row ({e}). This is a "
                             f"harness defect, not a problem with the proposal — "
                             f"review_attempts was never charged. Human triage "
-                            f"required; see mctl-agents#366."
+                            f"required; see mctl-agents#366.{reason_suffix}"
                         ),
                     )
                     return ShepherdResult(
@@ -2555,7 +3024,7 @@ def process_one(
                 return ShepherdResult(
                     ref=ref,
                     decision="wait",
-                    notes="harness failure (orphaned sub-agent); will retry next tick",
+                    notes=f"harness failure; will retry next tick{reason_suffix}",
                 )
             if e.kind == "fenced":
                 # Not a failure of the proposal or the findings — an
@@ -2706,6 +3175,11 @@ def process_one(
             refusals=None,
             refusals_head=None,
             merge_owner=None,
+            ci_infra_retries=None,
+            ci_infra_head=None,
+            ci_probe_failures=None,
+            ci_blockers_head=None,
+            ci_blockers=None,
         )
         return ShepherdResult(ref=ref, decision="merge")
 
@@ -3255,6 +3729,15 @@ def main() -> None:
             "a blanket override). Cannot be combined with --reconcile."
         ),
     )
+    ap.add_argument(
+        "--adopt-prs", action="store_true",
+        help=(
+            "Force PR-adoption discovery on for this run, regardless of "
+            "SHEPHERD_ADOPT_PRS (mctlhq/mctl-agents#334). Still adopts "
+            "nothing unless SHEPHERD_ADOPT_REPOS names at least one repo. "
+            "A targeted local one-shot; ignored with --reconcile or --slug."
+        ),
+    )
     args = ap.parse_args()
 
     if args.service and args.service not in SERVICES:
@@ -3305,6 +3788,23 @@ def main() -> None:
         execution_context = mint_local(executor_type="shepherd", workflow_type="review-fix", agent="shepherd")
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
 
+    # PR adoption (mctlhq/mctl-agents#334) — deferred: pr_adoption imports
+    # this module, so a module-level import here would cycle. With neither
+    # SHEPHERD_ADOPT_PRS nor --adopt-prs set, `adopt_prs` is False and
+    # nothing below this point calls pr_adoption at all — run_shepherd's
+    # observable behaviour is therefore byte-identical to before this flag
+    # existed.
+    from orchestrator import pr_adoption  # deferred — pr_adoption imports this module
+
+    adopt_prs = args.adopt_prs or pr_adoption.adoption_enabled()
+    if adopt_prs:
+        print(
+            "warn: PR adoption is enabled (SHEPHERD_ADOPT_PRS/--adopt-prs); "
+            "agents-state/*/adopted-prs/** is not staged back to gitops "
+            "until mctlhq/mctl-gitops#1278 lands, so review_attempts/"
+            "harness_failures/refusals on an adopted PR reset every tick"
+        )
+
     # Skip SDK auth init in dry-run AND reconcile modes: both are read-only
     # (reconcile only reads PR state + writes terminal status) and must work
     # in environments without Claude credentials.
@@ -3332,6 +3832,16 @@ def main() -> None:
     # and terminal states must be projected even for owned slugs).
     if not args.slug and not args.reconcile:
         refs = _filter_dev_loop_owned(refs)
+
+    # PR adoption (mctlhq/mctl-agents#334): sweep mode only, same as the
+    # DevLoop filter above — a targeted --slug run and --reconcile never
+    # touch adoption records.
+    if adopt_prs and not args.slug and not args.reconcile:
+        refs.extend(
+            pr_adoption.discover_adoptable(
+                state_dir, dry_run=args.dry_run, service_filter=args.service or None,
+            )
+        )
 
     if not refs:
         if args.reconcile:
@@ -3395,6 +3905,20 @@ def main() -> None:
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate
+        # PR adoption (mctlhq/mctl-agents#334 code review): `_adopt` acquires
+        # the ownership row directly, but nothing released it once the
+        # remediation loop finished — process_one stays ignorant of
+        # pr_adoption's existence (see ProposalRef.is_adopted's own comment),
+        # so the release lives here instead, in the one function that already
+        # imports pr_adoption and already observes ref.status post-transition.
+        # isinstance, not the bare `is_adopted` bool, so this narrows back to
+        # the `repo`/`number` fields release_ownership needs — safe here (this
+        # import is function-scoped, so it cannot cycle the way a module-level
+        # isinstance check against pr_adoption.PRRef would).
+        if isinstance(ref, pr_adoption.PRRef) and ref.status in pr_adoption.TERMINAL_STATUSES:
+            pr_adoption.release_ownership(
+                ref, reason=f"adopted PR reached terminal status {ref.status!r}"
+            )
 
     _print_summary(results)
 

@@ -73,6 +73,10 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
     A proposal with no ``control`` block does NOT require approval. The
     incident-responder writes ``status: accepted`` with no control block at
     all, and defaulting to deny would strand that entire path.
+
+    Do NOT reuse this to decide whether to START work on a record nobody is
+    watching — see ``execution_authorization`` below, which answers that
+    separately and fails closed.
     """
     control = data.get("control")
     if control is None:
@@ -114,6 +118,85 @@ def human_approval_satisfied(data: dict[str, Any]) -> bool:
     if not isinstance(approved_by, str):
         return False
     return approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
+
+
+# Execution authorization (mctl-agents#412, the 2026-09-19 product decision).
+#
+# `human_approval_satisfied` above answers a WRITE-TIME question: "does this
+# record meet its own declared approval requirement?" An absent `control` block
+# answers it True, because the record never asked for approval — which is the
+# right default for a writer checking its own write.
+#
+# It is the WRONG question for anything that submits execution on a record
+# nobody is watching. There, "never asked for approval" and "a human authorised
+# this" are different facts, and only the second may start work. The implement
+# sweep learned this the hard way: 69 `incident-*` records sat in `accepted`
+# since August, written by the incident responder's own auto-accept with no
+# control block at all, and every predicate that read them as "approval not
+# required" would have submitted all 69 implementer runs on the first tick.
+#
+# So this is a SEPARATE predicate, deliberately not layered on the one above:
+#   - missing metadata is never authorization;
+#   - provenance of who WROTE a record is never authorization (a writer
+#     allowlist was the rejected answer — an agent's own auto-accept cannot be
+#     the authorization for the agent's own execution);
+#   - `requires_human_approval: false` is a waiver of a gate, not a grant of
+#     authority, so it authorizes nothing by itself.
+#
+# Two things authorize execution. Today only the first exists.
+AUTHORIZATION_HUMAN_APPROVAL = "human-approval"
+#: Reserved for the separately-defined explicit autonomy policy the product
+#: decision names as the second authorization path. No policy is defined yet,
+#: so nothing carries this today and the predicate below never returns it —
+#: the constant exists so the seam has a name and a single place to grow.
+AUTHORIZATION_AUTONOMY_POLICY = "autonomy-policy"
+
+#: Stable reason for a record that carries no approval metadata at all — the
+#: 69 legacy `incident-*` proposals' exact shape. Not an error: it means this
+#: record has never been through a human, so it is quarantined from execution
+#: and belongs in human triage.
+UNAUTHORIZED_LEGACY_AUTO_ACCEPTED = "legacy auto-accepted / unreviewed"
+#: Stable reason for a record that WAS approved, by a path that recorded no
+#: approver identity. A different situation with a different remedy, and it
+#: must not be reported as the one above: `dev_loop` submits the approve CWFT
+#: with `"approver": self._approver or "unknown"`, and a payload-less approve
+#: signal lands the same value, so this is a real human approval whose
+#: identity the approve path dropped — the motivating path for the sweep, not
+#: an August artifact. Refusing to execute it is still right (an approval that
+#: names nobody cannot be audited); telling an operator it is legacy junk is
+#: not, because the fix is to re-approve with an identity, not to triage a
+#: stale proposal.
+UNAUTHORIZED_ANONYMOUS_APPROVER = "approved with no recorded approver identity"
+
+
+def execution_authorization(data: dict[str, Any]) -> tuple[str | None, str | None]:
+    """``(authorization, unauthorized_reason)`` for executing this proposal.
+
+    Exactly one side is ever set. Fail-closed by construction: every path that
+    does not positively identify an authorization returns ``(None, <reason>)``,
+    and the reason distinguishes the two unauthorized shapes because they have
+    opposite remedies. See the block comment above for why this is not
+    `human_approval_satisfied`.
+    """
+    approval = data.get("approval")
+    if isinstance(approval, dict):
+        approved_by = approval.get("approved_by")
+        if (
+            isinstance(approved_by, str)
+            and approved_by.strip().lower() not in _ANONYMOUS_APPROVERS
+        ):
+            return AUTHORIZATION_HUMAN_APPROVAL, None
+        # The presence of an `approval` block is what separates the two
+        # reasons, not the readability of the identity inside it. `approval:
+        # {}`, a missing key, an explicit null and a non-string are all the
+        # same situation: SOME approve path ran and recorded no usable
+        # approver. That is the anonymous case, whose remedy is to re-approve.
+        # Routing it to `legacy auto-accepted / unreviewed` would send a real
+        # approval to human triage as if it had never been reviewed (agy P2).
+        return None, UNAUTHORIZED_ANONYMOUS_APPROVER
+    # The autonomy-policy arm goes here once a policy is defined. Until then
+    # there is deliberately no second way to reach a non-None authorization.
+    return None, UNAUTHORIZED_LEGACY_AUTO_ACCEPTED
 
 
 def unrunnable_reason(data: dict[str, Any]) -> str | None:

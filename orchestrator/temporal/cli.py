@@ -34,13 +34,46 @@ async def approve(workflow_id: str, approver: str) -> None:
     print(f"signalled approve on {workflow_id} as {approver}")
 
 
+async def abandon(workflow_id: str, reason: str) -> None:
+    """Gracefully end a `DevLoopWorkflow` at its next observation point.
+
+    mctl-agents#420: the cluster-access-free way to end a stuck execution
+    without Temporal `terminate` (which would skip the lifecycle-ownership
+    cleanup in `_watch_pr`'s `finally`).
+    """
+    client = await connect()
+    handle = client.get_workflow_handle(workflow_id)
+    await handle.signal(DevLoopWorkflow.abandon, {"reason": reason})
+    print(f"signalled abandon on {workflow_id}: {reason}")
+
+
 async def status(workflow_id: str) -> None:
     client = await connect()
     handle = client.get_workflow_handle(workflow_id)
     desc = await handle.describe()
     print(f"{workflow_id}: {desc.status}")
+    if desc.status is not None and desc.status.name == "RUNNING":
+        # mctl-agents#420: the whole point of a dedicated query is telling
+        # "still parked" apart from "an operator ended this" WITHOUT waiting
+        # for the execution to complete (see `abandon_state`'s docstring) --
+        # once it has completed, `result.ended` below already carries the
+        # same "abandoned: <reason>" text, so querying again would just
+        # print it twice.
+        try:
+            abandon_state = await handle.query(DevLoopWorkflow.abandon_state)
+            if abandon_state.abandoned:
+                print(f"  abandoned:   {abandon_state.reason}")
+        except Exception:  # noqa: BLE001, S110 — query failure must not fail status print
+            pass
     if desc.status is not None and desc.status.name == "COMPLETED":
         result: DevLoopResult = await handle.result()
+        # mctl-agents#420: why this execution ended, when it ended for a
+        # reason other than running the pipeline to the end (abandoned, the
+        # source issue closed while parked, or the approval wait expired).
+        # Empty -- and so silent here -- on the full-pipeline path and on
+        # results recorded before this field existed.
+        if result.ended:
+            print(f"  ended:       {result.ended}")
         print(f"  investigate: {result.investigate.phase} ({result.investigate.workflow_name})")
         if result.approve:
             print(f"  approve:     {result.approve.phase} ({result.approve.workflow_name})")
@@ -117,6 +150,20 @@ def build_parser() -> argparse.ArgumentParser:
              "the mctl-api approve endpoint, which takes it from the caller)",
     )
 
+    p_abandon = sub.add_parser(
+        "abandon", help="Gracefully end a running DevLoopWorkflow (mctl-agents#420)"
+    )
+    p_abandon.add_argument("workflow_id")
+    # Required, and deliberately not defaulted, for the same reason
+    # `--approver` is on `approve`: a recorded reason of "unknown" is worse
+    # than no affordance, and this is the audit trail for an operator ending
+    # an execution instead of letting it run.
+    p_abandon.add_argument(
+        "--reason",
+        required=True,
+        help="Why this execution is being ended (recorded in the result)",
+    )
+
     p_status = sub.add_parser("status", help="Print a DevLoopWorkflow's status (and result, if complete)")
     p_status.add_argument("workflow_id")
 
@@ -129,6 +176,8 @@ def main() -> None:
         asyncio.run(start(args.issue_url))
     elif args.command == "approve":
         asyncio.run(approve(args.workflow_id, args.approver))
+    elif args.command == "abandon":
+        asyncio.run(abandon(args.workflow_id, args.reason))
     elif args.command == "status":
         asyncio.run(status(args.workflow_id))
 

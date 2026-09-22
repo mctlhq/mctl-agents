@@ -19,15 +19,22 @@ from temporalio import activity
 from temporalio.client import WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import UnsandboxedWorkflowRunner
 
 from orchestrator.lifecycle.contract import Owner, answer_from
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
+from orchestrator.temporal.activities.issue_state import IssueState
 from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest, OwnershipResult
 from orchestrator.temporal.activities.pr_state import PRState
 from orchestrator.temporal.activities.registry import ResolvedRelease
 from orchestrator.temporal.activities.state import ExecutionRecord
+from orchestrator.temporal.constants import (
+    EXECUTION_TASK_QUEUE,
+    IMPLEMENTATION_TASK_QUEUE,
+    implementation_max_concurrent_activities,
+)
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
@@ -36,10 +43,13 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_REFUSAL_GIVE_UP,
     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
+    MERGE_WATCH_MAX_HOPS,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
+    AbandonState,
     DevLoopWorkflow,
     IssueRef,
+    MergeWatchResume,
 )
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
@@ -125,6 +135,14 @@ async def _fake_find_proposal_slug(service: str, issue_number: str) -> str | Non
     return f"issue-{issue_number}-fake-title"
 
 
+@activity.defn(name="get_issue_state")
+async def _fake_get_issue_state_open(repo: str, issue_number: int) -> IssueState:
+    """The stale-issue gate's default fake for tests that build their own
+    activity list by hand (mctl-agents#410): open, so the gate never fires
+    and every existing test's command sequence is unaffected."""
+    return IssueState(state="open")
+
+
 pytestmark = pytest.mark.anyio
 
 TASK_QUEUE = "test-mctl-dev-loop"
@@ -140,6 +158,11 @@ def _fake_activities(
     *,
     released: bool,
     investigate_phase: str = "Succeeded",
+    # mctl-agents#410: defaults to "open" so every pre-existing test in this
+    # module (none of which cares about the stale-issue gate) reaches
+    # find_proposal_slug/approve exactly as before.
+    issue_state: str = "open",
+    issue_state_raises: bool = False,
     pr_states: list[PRState] | None = None,
     pr_state_raises_after: int | None = None,
     pr_state_error_type: str | None = None,
@@ -202,6 +225,16 @@ def _fake_activities(
         if agent in (unpinned or set()):
             return None
         return resolved.get(agent) if released else None
+
+    @activity.defn(name="get_issue_state")
+    async def fake_get_issue_state(repo: str, issue_number: int) -> IssueState:
+        if issue_state_raises:
+            raise ApplicationError("github unreachable", non_retryable=True)
+        return IssueState(
+            state=issue_state,
+            state_reason="completed" if issue_state == "closed" else None,
+            closed_at="2026-09-06T00:00:00Z" if issue_state == "closed" else None,
+        )
 
     calls: list[str] = []
     ownership_ops: list[OwnershipRequest] = []
@@ -494,6 +527,7 @@ def _fake_activities(
         fake_submit_and_wait,
         fake_record_execution,
         _fake_find_proposal_slug,
+        fake_get_issue_state,
         fake_get_pr_state,
         fake_resolve_deploy_target,
         fake_get_release_after,
@@ -534,6 +568,307 @@ class TestDevLoopWorkflow:
         assert result.approve.phase == "Succeeded"
         assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
 
+    async def test_closed_issue_skips_approve_and_implement(self, env):
+        """mctl-agents#410: an issue closed while this loop sat at the
+        approval wait must stop the loop right there -- no approve CWFT, no
+        implement CWFT, and a result that carries no PR/implement outcome."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, issue_state="closed",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/510"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.investigate.phase == "Succeeded"
+        assert result.implement is None
+        assert result.approve is None
+        # Neither approve nor implement were ever submitted to Argo.
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_get_issue_state_failure_fails_open(self, env):
+        """A GitHub blip on the stale-issue check must never wedge the loop
+        -- the implementer's own admission gate is the authoritative check,
+        so this side proceeds exactly as if the issue were open."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, issue_state_raises=True,
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/511"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+
+    # --- mctl-agents#420: the approval park is bounded and observant -------
+
+    async def test_abandon_signal_ends_a_parked_loop(self, env):
+        """An `abandon` signal delivered while parked at approval must end
+        the execution gracefully (not fail, not hang) with the reason
+        recorded, and must submit neither the approve nor the implement
+        CWFT."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/420"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+
+            # Query abandon_state while parked before abandon signal
+            state_before = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_before == AbandonState(abandoned=False, reason="")
+
+            # Exercise dict payload {"reason": ...} (mctl-agents#420, mirroring cli.py abandon)
+            await handle.signal(DevLoopWorkflow.abandon, {"reason": "operator cleanup"})
+
+            # Query abandon_state immediately after signal while still running
+            state_after = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_after == AbandonState(abandoned=True, reason="operator cleanup")
+
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.approve is None
+        assert result.ended == "abandoned: operator cleanup"
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_parked_loop_ends_when_the_source_issue_closes(self, env):
+        """The direct regression for dev-loop-mctlhq-portfolio-98
+        (mctl-agents#420): a loop that never receives `approve` must not
+        wait forever once GitHub reports the source issue closed. The
+        time-skipping environment fast-forwards the poll interval."""
+        state_calls = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_then_closed(repo: str, issue_number: int) -> IssueState:
+            state_calls["i"] += 1
+            if state_calls["i"] == 1:
+                return IssueState(state="open")
+            return IssueState(state="closed", state_reason="completed")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_then_closed)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/421"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            # Never signal approve -- the loop must end on its own.
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.ended == "source issue closed while parked (completed)"
+        assert calls == ["mctl-agents-investigate"]
+        assert state_calls["i"] >= 2
+
+    async def test_parked_loop_expires_at_the_approval_deadline(self, env):
+        """No signal, an issue that stays open: the park must still end,
+        bounded by APPROVAL_WAIT_DEADLINE, rather than wait forever."""
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, issue_state="open",
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/422"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.ended == "approval wait expired"
+        assert calls == ["mctl-agents-investigate"]
+
+    async def test_issue_state_failure_while_parked_keeps_waiting(self, env):
+        """A GitHub blip on the PARKED poll must not end the loop early --
+        matching the fail-open rule the stale-issue-admission gate applies
+        after the wait resolves. An approve signal must still reach
+        implement."""
+        poll_count = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_fail_first_then_open(repo: str, issue_number: int) -> IssueState:
+            poll_count["i"] += 1
+            if poll_count["i"] == 1:
+                # Signal approve right from the first parked poll before raising,
+                # ensuring the parked fail-open branch executes first and the subsequent
+                # wait_condition loop observes the approval.
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.approve)
+                raise ApplicationError("github unreachable", non_retryable=True)
+            return IssueState(state="open")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_fail_first_then_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/423"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert calls == ["mctl-agents-investigate", "mctl-agents-approve", "mctl-agents-implement"]
+        assert poll_count["i"] >= 2
+
+    async def test_approve_signal_landing_during_final_poll_proceeds_to_implement(self, env):
+        """mctl-agents#420: an approve signal landing while the final poll's
+        get_issue_state activity is in flight must not be discarded just because
+        the deadline was reached. The workflow must proceed to implement."""
+        poll_count = {"i": 0}
+
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_signal_on_final(repo: str, issue_number: int) -> IssueState:
+            poll_count["i"] += 1
+            if poll_count["i"] == 56:
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.approve, {"approver": "reviewer"})
+            return IssueState(state="open")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_signal_on_final)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/424"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is not None
+        assert result.implement.phase == "Succeeded"
+        assert result.approve is not None
+        assert result.approve.phase == "Succeeded"
+        assert result.ended == ""
+        assert "mctl-agents-implement" in calls
+
+    async def test_parked_closed_issue_not_resurrected_by_late_approve(self, env):
+        """mctl-agents#420: if a poll confirms the source issue was closed,
+        a concurrent approve signal landing during that activity must NOT
+        resurrect the closed issue or proceed to implement."""
+        @activity.defn(name="get_issue_state")
+        async def fake_get_issue_state_closed_and_signal_approve(repo: str, issue_number: int) -> IssueState:
+            info = activity.info()
+            handle = env.client.get_workflow_handle(info.workflow_id)
+            # Concurrently signal approve while returning closed state
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "late_approver"})
+            return IssueState(state="closed", state_reason="completed")
+
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in activities if getattr(a, "__name__", "") != "fake_get_issue_state"
+        ]
+        activities.append(fake_get_issue_state_closed_and_signal_approve)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/428"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            result = await handle.result()
+
+        assert result.implement is None
+        assert result.approve is None
+        assert result.ended == "source issue closed while parked (completed)"
+        assert "mctl-agents-implement" not in calls
+
     async def test_implement_step_is_scoped_to_issues_own_repo(self, env):
         """The implement CWFT must only be allowed to touch proposals under
         this issue's own repo (the `service` param) — otherwise approve()
@@ -567,6 +902,7 @@ class TestDevLoopWorkflow:
             capturing_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -652,6 +988,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -699,6 +1036,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -753,6 +1091,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             fake_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
         async with Worker(
             env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
@@ -908,6 +1247,7 @@ class TestDevLoopWorkflow:
             fake_submit_and_wait,
             always_failing_record_execution,
             _fake_find_proposal_slug,
+            _fake_get_issue_state_open,
         ]
 
         async with Worker(
@@ -970,6 +1310,7 @@ class TestDevLoopWorkflow:
                 fake_submit_and_wait,
                 fake_record_execution,
                 missing_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1022,6 +1363,7 @@ class TestDevLoopWorkflow:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1071,6 +1413,7 @@ class TestDevLoopWorkflow:
                 capturing_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1125,6 +1468,7 @@ class TestDevLoopWorkflow:
                 failing_approve_submit_and_wait,
                 fake_record_execution,
                 _fake_find_proposal_slug,
+                _fake_get_issue_state_open,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -1182,6 +1526,182 @@ class TestDevLoopWorkflow:
         assert result.pr.state == "MERGED"
         assert result.pr.merged is True
         assert result.pr.merge_commit == "cafe1234"
+
+    async def test_merged_pr_ends_the_watch_within_one_poll(self, env):
+        """Regression guard (mctl-agents#420) for behaviour that already
+        works: once get_pr_state reports MERGED, _watch_pr returns on that
+        very read rather than polling further."""
+        open_pr = PRState(
+            found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo,
+            number=MERGED_PR.number, state="OPEN",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/424"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.state == "MERGED"
+        assert result.pr.merged is True
+
+    async def test_closed_pr_without_merge_ends_the_watch(self, env):
+        """A CLOSED-but-not-merged PR is also terminal for the watch --
+        paired with the MERGED case above so both halves of "reached a
+        terminal pull-request state" are covered."""
+        closed_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="CLOSED",
+            merged=False,
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[closed_pr]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/425"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None
+        assert result.pr.state == "CLOSED"
+        assert result.pr.merged is False
+        # Nothing merged, so nothing to deploy or watch for incidents.
+        assert result.deploy is None
+        assert result.incidents is None
+
+    async def test_abandon_signal_cuts_short_a_merge_watch_and_releases_ownership(self, env):
+        """mctl-agents#420: `abandon` must also work on the OTHER unbounded
+        wait -- a merge watch on a PR that stays open. The execution must
+        complete (not fail, not need Temporal `terminate`), and the
+        lifecycle-ownership row must still be released via _watch_pr's
+        `finally` -- the reason `abandon` is a signal and not `terminate`."""
+        open_pr = PRState(
+            found=True,
+            pr_url="https://github.com/mctlhq/mctl-telegram/pull/426",
+            repo="mctlhq/mctl-telegram",
+            number=426,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        base_activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True,
+        )
+        first_poll = anyio.Event()
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_sticky_open(service: str, slug: str) -> PRState:
+            first_poll.set()
+            return open_pr
+
+        activities = [
+            a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"
+        ]
+        activities.append(fake_get_pr_state_sticky_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/426"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            # Wait for at least one PR poll (so ownership is claimed) before
+            # abandoning, or the watch could exit before ever acquiring the
+            # row it is supposed to release.
+            with anyio.fail_after(10):
+                await first_poll.wait()
+            await handle.signal(DevLoopWorkflow.abandon, "operator cleanup")
+            state_after = await handle.query(DevLoopWorkflow.abandon_state)
+            assert state_after == AbandonState(abandoned=True, reason="operator cleanup")
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.ended.startswith("abandoned:")
+        assert "operator cleanup" in result.ended
+        assert result.pr is not None
+        assert result.pr.state == "OPEN"
+        assert any(op.op == "release" for op in ownership_ops)
+
+    async def test_abandon_signal_before_pr_watch_terminates_cleanly(self, env):
+        """mctl-agents#420: an abandon signal delivered before _watch_pr begins
+        (while implement is running) must end the execution gracefully
+        without UnboundLocalError, without calling _watch_pr, and without leaking ownership."""
+        base_activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+        )
+        old_submit = next(a for a in base_activities if getattr(a, "__name__", "") == "fake_submit_and_wait")
+
+        @activity.defn(name="submit_and_wait")
+        async def fake_submit_and_wait_abandon_on_implement(
+            input: SubmitAndWaitInput,
+        ) -> WorkflowResult:
+            if input.operation == "mctl-agents-implement":
+                info = activity.info()
+                handle = env.client.get_workflow_handle(info.workflow_id)
+                await handle.signal(DevLoopWorkflow.abandon, "cleanup during implement")
+            return await old_submit(input)
+
+        activities = [a for a in base_activities if getattr(a, "__name__", "") != "fake_submit_and_wait"] + [
+            fake_submit_and_wait_abandon_on_implement
+        ]
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/427"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.ended == "abandoned: cleanup during implement"
+        assert result.pr is None
 
     async def _run_ownership_loop_with_logs(
         self, env, *, pr_states, issue: int, caplog, **kwargs
@@ -3885,3 +4405,691 @@ class TestTickSettling:
 
         assert "unexpected RuntimeError" in caplog.text
         assert SERVICE in caplog.text and SLUG in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Admission (#395, #396): the implement submit goes to its own queue, waits
+# there when capacity is taken, requeues when nothing ran, and fails the
+# loop honestly when something did.
+# ---------------------------------------------------------------------------
+def _admission_activities(implement_results, *, seen_queues=None, running=None):
+    """Fakes for the admission tests.
+
+    `implement_results` is a list of WorkflowResult (or exceptions) the
+    implement submit returns in order; `seen_queues` records which task
+    queue each operation ran on; `running` is an optional gate the
+    implement fake blocks on so concurrency can be observed.
+    """
+    seen_queues = seen_queues if seen_queues is not None else {}
+    implement_calls: list[str] = []
+    records: list[ExecutionRecord] = []
+    investigate_ran = anyio.Event()
+
+    @activity.defn(name="resolve_agent_release")
+    async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+        return ResolvedRelease(
+            agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+        )
+
+    @activity.defn(name="submit_and_wait")
+    async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+        seen_queues.setdefault(input.operation, []).append(activity.info().task_queue)
+        if input.operation == "mctl-agents-investigate":
+            investigate_ran.set()
+            return WorkflowResult(workflow_name="investigate-fake", phase="Succeeded")
+        if input.operation == "mctl-agents-implement":
+            implement_calls.append(activity.info().workflow_id)
+            if running is not None:
+                await running.enter()
+                try:
+                    pass
+                finally:
+                    await running.leave()
+            outcome = implement_results[min(len(implement_calls), len(implement_results)) - 1]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+    @activity.defn(name="record_execution")
+    async def fake_record_execution(record: ExecutionRecord) -> None:
+        records.append(record)
+
+    activities = [
+        fake_resolve_agent_release,
+        fake_submit_and_wait,
+        fake_record_execution,
+        _fake_find_proposal_slug,
+    ]
+    return activities, implement_calls, records, investigate_ran
+
+
+class _Gate:
+    """Counts implement fakes inside the critical section and holds them there."""
+
+    def __init__(self) -> None:
+        self.inside = 0
+        self.peak = 0
+        self.entered_total = 0
+        self.release = anyio.Event()
+        self.changed = anyio.Event()
+
+    async def enter(self) -> None:
+        self.inside += 1
+        self.entered_total += 1
+        self.peak = max(self.peak, self.inside)
+        self.changed.set()
+        await self.release.wait()
+
+    async def leave(self) -> None:
+        self.inside -= 1
+
+
+def _implement_result(phase="Succeeded", *, ran=True, implementer_phase=None, finalization=None):
+    return WorkflowResult(
+        workflow_name="mctl-agents-implement-fake",
+        phase=phase,
+        implementer_ran=ran,
+        implementer_phase=implementer_phase or ("Succeeded" if phase == "Succeeded" else "Failed"),
+        finalization_phase=finalization,
+    )
+
+
+async def _start_and_approve(env, issue_number: int):
+    handle = await env.client.start_workflow(
+        DevLoopWorkflow.run,
+        IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue_number}"),
+        id=f"dev-loop-admission-{issue_number}-{uuid.uuid4()}",
+        task_queue=TASK_QUEUE,
+    )
+    return handle
+
+
+class TestImplementationAdmission:
+    async def test_only_the_implement_submit_routes_to_the_admission_queue(self, env):
+        """Investigate and approve stay on exec; implement alone goes to the
+        admission queue. Read off `activity.info().task_queue` — the one
+        place routing is visible from inside a test worker."""
+        seen: dict[str, list[str]] = {}
+        activities, _calls, _records, investigate_ran = _admission_activities(
+            [_implement_result()], seen_queues=seen
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 1)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.implement is not None and result.implement.succeeded
+        assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE]
+        assert seen["mctl-agents-investigate"] == [EXECUTION_TASK_QUEUE]
+        assert seen["mctl-agents-approve"] == [EXECUTION_TASK_QUEUE]
+
+    async def test_a_burst_of_approvals_is_admitted_n_at_a_time(self, env):
+        """The 2026-09-19 incident as a regression test (#395 DoD).
+
+        Nine loops approved at once, N=3: exactly three implement submits
+        start, six stay Scheduled in Temporal — no submit fake runs for
+        them, which in production is "no Argo workflow exists" — and as
+        the gate opens the rest drain with no intervention. The wait costs
+        no execution budget: nothing here times out.
+        """
+        n = implementation_max_concurrent_activities()
+        assert n == 3, "the DoD is written for N=3; the harness runs the production default"
+        gate = _Gate()
+        seen: dict[str, list[str]] = {}
+        activities, calls, _records, _ = _admission_activities(
+            [_implement_result()], seen_queues=seen, running=gate
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handles = [await _start_and_approve(env, 100 + i) for i in range(9)]
+            for handle in handles:
+                await handle.signal(DevLoopWorkflow.approve)
+
+            # Wait until the pool is full, then hold there long enough for a
+            # fourth to start if admission were not working.
+            with anyio.fail_after(60):
+                while gate.inside < n:
+                    gate.changed = anyio.Event()
+                    await gate.changed.wait()
+            await asyncio.sleep(3)
+            assert gate.inside == n
+            assert gate.entered_total == n, "a queued loop submitted while the pool was full"
+            assert len(calls) == n
+
+            gate.release.set()
+            results = [await handle.result() for handle in handles]
+
+        assert all(r.implement is not None and r.implement.succeeded for r in results)
+        assert gate.peak == n
+        assert len(calls) == 9
+        assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE] * 9
+
+    async def test_a_pre_start_failure_is_requeued_without_an_attempt(self, env):
+        """An implementer that never ran is resubmitted, and the loop then
+        completes on the second submit. Two execution records, because
+        both Argo workflows existed; one attempt, because only one ran."""
+        activities, calls, records, investigate_ran = _admission_activities(
+            [_implement_result("Failed", ran=False), _implement_result()]
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 2)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+            state = await handle.query(DevLoopWorkflow.implement_execution)
+
+        assert result.implement is not None and result.implement.succeeded
+        assert len(calls) == 2
+        assert [r.phase for r in records if r.agent == "implementer"] == ["Failed", "Succeeded"]
+        assert state.stage == "implementer"
+        assert state.prestart_requeues == 1
+        assert state.outcome == "success"
+
+    async def test_pre_start_requeues_are_bounded(self, env):
+        activities, calls, _records, investigate_ran = _admission_activities(
+            [_implement_result("Failed", ran=False)]
+        )
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 3)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+
+        assert len(calls) == 1 + dev_loop.MAX_PRESTART_REQUEUES
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationNotStarted"
+
+    @pytest.mark.parametrize(
+        ("result", "error_type"),
+        [
+            (_implement_result("Failed", ran=True), "ImplementationFailed"),
+            (
+                _implement_result("Failed", ran=True, implementer_phase="Succeeded", finalization="Failed"),
+                "ImplementationFinalizationFailed",
+            ),
+            # No node graph: unknown is treated as a run, never requeued.
+            (WorkflowResult(workflow_name="legacy", phase="Failed"), "ImplementationFailed"),
+        ],
+        ids=["execution", "finalization", "unknown"],
+    )
+    async def test_an_implementer_that_ran_and_failed_fails_the_loop(self, env, result, error_type):
+        """Completed-with-Failed-inside is what hid six lost proposals. The
+        loop's terminal status now says what happened, typed by layer."""
+        activities, calls, records, investigate_ran = _admission_activities([result])
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handle = await _start_and_approve(env, 4)
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with pytest.raises(WorkflowFailureError) as excinfo:
+                await handle.result()
+            state = await handle.query(DevLoopWorkflow.implement_execution)
+
+        assert len(calls) == 1, "an implementer that ran must never be resubmitted"
+        cause = excinfo.value.cause
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == error_type
+        # The execution record was still written before the loop failed.
+        assert [r.phase for r in records if r.agent == "implementer"] == ["Failed"]
+        assert state.outcome in ("execution", "finalization")
+
+
+# ---------------------------------------------------------------------------
+# mctl-agents#404 v2: bound the merge watch's history with continue_as_new.
+# ---------------------------------------------------------------------------
+class _FakeContinueAsNewInfo:
+    """Stands in for `workflow.info()` inside `_merge_watch_hop_suggested`'s
+    unit tests -- only the two methods that function reads."""
+
+    def __init__(self, *, suggested: bool, history_length: int) -> None:
+        self._suggested = suggested
+        self._history_length = history_length
+
+    def is_continue_as_new_suggested(self) -> bool:
+        return self._suggested
+
+    def get_current_history_length(self) -> int:
+        return self._history_length
+
+
+class TestMergeWatchHopPredicate:
+    """T8: direct unit tests on a bare `DevLoopWorkflow()` with a
+    monkeypatched `dev_loop.workflow`, the `TestTickSettling` pattern --
+    exercising `_merge_watch_hop_suggested`'s safety rails without a real
+    Temporal worker."""
+
+    def test_no_hop_before_one_completed_poll(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
+        )
+        wf = DevLoopWorkflow()
+        assert wf._merge_watch_hop_suggested(polls_this_run=0, tick_task=None, hops=0) is False
+
+    async def test_no_hop_with_an_in_flight_tick(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
+        )
+        wf = DevLoopWorkflow()
+
+        async def never_finishes() -> None:
+            await asyncio.sleep(3600)
+
+        tick_task = asyncio.create_task(never_finishes())
+        try:
+            await asyncio.sleep(0)  # let it actually start
+            assert not tick_task.done()
+            assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=tick_task, hops=0) is False
+        finally:
+            tick_task.cancel()
+            try:
+                await tick_task
+            except asyncio.CancelledError:
+                pass
+
+    def test_no_hop_past_max_hops(
+        self, monkeypatch: pytest.MonkeyPatch, tick_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(
+            dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
+        )
+        wf = DevLoopWorkflow()
+        with caplog.at_level(logging.ERROR, logger=tick_logger.name):
+            hopped = wf._merge_watch_hop_suggested(
+                polls_this_run=5, tick_task=None, hops=MERGE_WATCH_MAX_HOPS
+            )
+        assert hopped is False
+        assert "already hopped" in caplog.text
+
+    def test_no_hop_while_abandoned(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
+        )
+        wf = DevLoopWorkflow()
+        wf._abandoned = True
+        assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is False
+
+    def test_hop_when_only_the_server_suggestion_is_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`is_continue_as_new_suggested` is a METHOD, not a property --
+        this pins that the predicate calls it rather than reading a bound
+        method object (always truthy)."""
+        monkeypatch.setattr(
+            dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=0)
+        )
+        wf = DevLoopWorkflow()
+        assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is True
+
+    def test_hop_when_only_the_local_history_floor_is_crossed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            dev_loop.workflow,
+            "info",
+            lambda: _FakeContinueAsNewInfo(
+                suggested=False, history_length=dev_loop.MERGE_WATCH_HISTORY_FLOOR
+            ),
+        )
+        wf = DevLoopWorkflow()
+        assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is True
+
+    def test_no_hop_below_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            dev_loop.workflow,
+            "info",
+            lambda: _FakeContinueAsNewInfo(
+                suggested=False, history_length=dev_loop.MERGE_WATCH_HISTORY_FLOOR - 1
+            ),
+        )
+        wf = DevLoopWorkflow()
+        assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is False
+
+
+class TestMergeWatchAbandonGuard:
+    """T5a, plus the round-2 P2 fix (claude + agy against commit 0e4bcf1):
+    a carried abandon must not erase the PR state a PREVIOUS run already
+    observed, AND must not skip `_watch_pr`'s `finally` -- the block that
+    releases the lifecycle-ownership claim a hop kept held. The
+    resume-carrying case now falls through into the `while`/`try`/`finally`
+    machinery (its own `not self._abandoned` loop condition is what ends it
+    immediately), so it needs a real Temporal worker to supply
+    `workflow.now()`/`workflow.patched()`/the ownership activity -- see
+    `test_carried_abandon_releases_the_ownership_claim` below. Only the
+    resume=None case is still reachable with no workflow context at all
+    (that call shape is dead in production; see `_watch_pr`'s docstring),
+    so `test_unpatched_non_resume_abandon_guard_still_returns_none` keeps
+    driving it directly on a bare instance."""
+
+    pytestmark = pytest.mark.anyio
+
+    async def test_carried_abandon_releases_the_ownership_claim(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resumed run (`issue.resume is not None`) whose carried
+        `abandoned` is already True on entry must still run `_watch_pr`'s
+        `finally`: `self._owned_entity_id`/`track_ownership` are rehydrated
+        by `_resume_merge_watch` before `_watch_pr` is ever called, exactly
+        as they would be for a resume that is NOT already abandoned, so the
+        relinquishing write must land here too. Asserted the same way
+        `test_no_ownership_churn_across_a_hop` asserts the absence of one:
+        by inspecting the captured `ownership_ops`."""
+        activities, _calls, _investigate_ran, ownership_ops = _fake_activities(released=True)
+        carried_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        resume = MergeWatchResume(
+            service="mctl-telegram",
+            slug="issue-1-x",
+            deadline="2026-01-01T00:00:00Z",
+            last_pr=carried_pr,
+            track_ownership=True,
+            owned_entity_id=f"{MERGED_PR.repo}#{MERGED_PR.number}",
+            owner_epoch=1,
+            abandoned=True,
+            abandon_reason="operator cleanup",
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/963", resume=resume
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        # The guard took the resume path (task 5a): the carried PR state
+        # survives, it is not erased to None.
+        assert result.pr == carried_pr
+        assert result.ended == "abandoned: operator cleanup"
+        # The fix under test: the ownership claim was released, not
+        # orphaned. A hop skips this write on purpose (`hopping=True`); an
+        # abandon -- carried or not -- must not.
+        release_ops = [
+            op for op in ownership_ops if op.op in ("release", "terminal")
+        ]
+        assert len(release_ops) == 1, f"expected exactly one relinquishing write, got {ownership_ops}"
+        assert release_ops[0].op == "release"
+        assert release_ops[0].entity_id == f"{MERGED_PR.repo}#{MERGED_PR.number}"
+        assert release_ops[0].epoch == 1
+
+    async def test_unpatched_non_resume_abandon_guard_still_returns_none(self) -> None:
+        """The pre-existing (non-resume) path is unchanged: nothing was
+        carried, so there is nothing to preserve and the guard still
+        answers None exactly as it did before this change."""
+        wf = DevLoopWorkflow()
+        wf._abandoned = True
+        outcome = await wf._watch_pr("mctl-telegram", "issue-1-x")
+        assert outcome.last is None
+        assert outcome.resume is None
+
+
+class TestMergeWatchContinueAsNew:
+    """T2/T3/T5/T7: end-to-end merge-watch hops through a real Temporal
+    worker. `MERGE_WATCH_HISTORY_FLOOR` is forced low so a hop is
+    deterministic without actually growing a history to 4096 events; the
+    worker runs unsandboxed so that monkeypatch is visible to the workflow
+    code (the sandbox otherwise re-executes dev_loop.py in an isolated
+    module copy the test process cannot reach -- confirmed empirically,
+    not assumed)."""
+
+    def test_issue_ref_decodes_as_a_single_argument(self) -> None:
+        """T2: `run`'s decoded argument list stays [IssueRef] on every
+        start -- external or continued -- because `resume` is a defaulted
+        FIELD on IssueRef, not a second parameter on `run`. This is the
+        exact claim the superseded slug's implementation (PR #437) got
+        wrong."""
+        from temporalio.workflow._definition import _Definition
+
+        defn = _Definition.from_class(DevLoopWorkflow)
+        assert defn is not None
+        assert defn.arg_types == [IssueRef]
+
+        ref = IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1")
+        assert ref.resume is None
+
+    async def test_forced_hop_still_reaches_merged_with_full_results(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T3: a watch forced to hop repeatedly still ends on MERGED, and
+        the final DevLoopResult carries the investigate/implement/approve
+        results produced by the very first run."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/960"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert result.investigate is not None and result.investigate.phase == "Succeeded"
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert result.approve is not None and result.approve.phase == "Succeeded"
+        assert result.ended == ""
+
+    async def test_deadline_is_carried_not_recomputed_across_hops(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T3 follow-up (codex P2): the ADR addendum calls "the deadline is
+        an INPUT, not a recomputation" the first load-bearing property of
+        this change, but nothing pinned it -- every other test here would
+        pass unchanged if `_watch_pr` recomputed
+        `workflow.now() + MERGE_WATCH_DEADLINE` on every resume instead of
+        carrying `resume.deadline`, which is exactly the regression that
+        turns a bounded 14-day watch into an unbounded one.
+
+        Forces both the history floor (a hop after every single poll) and
+        the deadline itself down to a few poll intervals, then feeds a PR
+        that never resolves to a terminal state and counts how many times
+        `get_pr_state` is actually called. A 40-minute deadline at the
+        15-minute fast-cadence poll interval allows at most 3 polls (t=0,
+        15, 30) before the watch ends at t=45 -- a per-hop recomputation
+        instead keeps the deadline 40 minutes ahead of "now" on every one
+        of the up to MERGE_WATCH_MAX_HOPS=16 hops this low floor forces,
+        which blows a generous bound wide open long before the watch would
+        ever end on its own."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_DEADLINE", timedelta(minutes=40))
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        base_activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        poll_count = {"n": 0}
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_counting_open(service: str, slug: str) -> PRState:
+            poll_count["n"] += 1
+            return open_pr
+
+        activities = [a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"]
+        activities.append(fake_get_pr_state_counting_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/962"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "OPEN"
+        assert result.ended == ""
+        assert poll_count["n"] <= 5
+
+    async def test_abandon_beats_a_pending_hop(self, env, monkeypatch: pytest.MonkeyPatch) -> None:
+        """T5: an `abandon` signal must win a race with the hop predicate.
+        The history floor is forced low enough that a hop would otherwise
+        be certain on the very next poll boundary -- and it must never
+        fire once the watch is abandoned."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        base_activities, _calls, investigate_ran, ownership_ops = _fake_activities(released=True)
+        first_poll = anyio.Event()
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_sticky_open(service: str, slug: str) -> PRState:
+            first_poll.set()
+            return open_pr
+
+        activities = [a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"]
+        activities.append(fake_get_pr_state_sticky_open)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/961"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(10):
+                await first_poll.wait()
+            await handle.signal(DevLoopWorkflow.abandon, "operator cleanup during a pending hop")
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert result.ended.startswith("abandoned:")
+        assert "operator cleanup during a pending hop" in result.ended
+        assert result.pr is not None and result.pr.state == "OPEN"
+        # The abandon path RELEASES the ownership row -- a hop never would
+        # have (see TestMergeWatchOwnershipAcrossHops below). Seeing a
+        # release here is evidence the hop the low floor made imminent
+        # never actually fired.
+        assert any(op.op == "release" for op in ownership_ops)
+
+    async def test_no_ownership_churn_across_a_hop(self, env, monkeypatch: pytest.MonkeyPatch) -> None:
+        """T7: hopping must never release or terminal the lifecycle claim
+        -- only the watch's genuine end (here, the PR merging) may. The
+        epoch carried after the hop(s) must equal the one acquired before
+        them."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/962"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(30):
+                result = await handle.result()
+            claim = await handle.query(DevLoopWorkflow.lifecycle_claim)
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert ownership_ops, "the loop recorded no ownership at all"
+        relinquishing = [op for op in ownership_ops if op.op in ("release", "terminal")]
+        # Exactly the ONE terminal write the MERGED poll itself issues --
+        # zero from every hop along the way (a hop must skip this write
+        # entirely, never issue a spurious "release").
+        assert len(relinquishing) == 1
+        assert relinquishing[0].op == "terminal"
+        acquires = [op for op in ownership_ops if op.op == "acquire"]
+        # Exactly ONE acquire for the whole watch. `_track_ownership` only
+        # re-acquires when `_owned_entity_id` is empty; a hop that failed to
+        # carry the claim (owned_entity_id/owner_epoch reset to __init__'s
+        # empty defaults instead of the resume record's values) would show
+        # up here as a SECOND acquire after the hop, believing the claim had
+        # been lost.
+        assert len(acquires) == 1, f"expected exactly one acquire, got {ownership_ops}"
+        # The fake's "owned-by-me" response always answers epoch=1, so the
+        # terminal write -- issued by whichever run of the watch actually
+        # sees MERGED, possibly several hops after the claiming acquire --
+        # must carry that SAME epoch, not the __init__ default of 0 a lost
+        # carry-over would produce.
+        assert relinquishing[0].epoch == 1
+        assert claim.entity_id == "", "a terminal MERGED write clears the claim"
+        assert claim.last_op == "terminal"
+        assert claim.last_op_landed is True
+        assert claim.epoch == 0, "_finish_claim zeroes the epoch once the claim is released"

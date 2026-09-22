@@ -137,7 +137,7 @@ def _dev_loop_build() -> tuple[list[Any], dict[str, Any]]:
     # pytest's plugins loaded.
     from tests.test_dev_loop_workflow import _fake_activities
 
-    activities, calls, investigate_ran = _fake_activities(released=True)
+    activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
     return activities, {"calls": calls, "investigate_ran": investigate_ran}
 
 

@@ -18,7 +18,11 @@ from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
-from orchestrator.temporal.activities.discovery import ProposalProjection, ReconcileDiscoveryResult
+from orchestrator.temporal.activities.discovery import (
+    ProposalProjection,
+    ReconcileDiscoveryResult,
+    StaleDirective,
+)
 from orchestrator.temporal.activities.lifecycle_reconcile import LifecycleReconcileResult
 from orchestrator.temporal.activities.orphans import OrphanDetectionResult, OrphanSignal
 from orchestrator.temporal.workflows.reconcile import ReconcileWorkflow, ReconcileWorkflowInput
@@ -43,13 +47,16 @@ def _fake_activities(
     submit_fails: bool = False,
     submit_phase: str = "Succeeded",
     lifecycle_fails: bool = False,
+    stale_directives: list[StaleDirective] | None = None,
 ):
     received: dict = {}
     received["submits"] = []
 
     @activity.defn(name="discover_and_project")
     async def fake_discover_and_project(state_dir_path: str) -> ReconcileDiscoveryResult:
-        return ReconcileDiscoveryResult(total_inspected=1, projections=projections or [])
+        return ReconcileDiscoveryResult(
+            total_inspected=1, projections=projections or [], stale_directives=stale_directives
+        )
 
     @activity.defn(name="submit_and_wait")
     async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
@@ -175,6 +182,34 @@ class TestReconcileWorkflow:
         assert "visibility" in result.orphans.skipped_reason
         # Discovery still ran and is reported.
         assert result.discovery.total_inspected == 1
+
+    async def test_stale_directives_flow_into_the_result(self, env):
+        """mctlhq/mctl-agents#417: a directive-shaped comment run_issue_
+        directive_poller has not yet acknowledged is surfaced on the tick's
+        result, unconditionally — reconcile never dispatches or writes for
+        this condition."""
+        stale = [
+            StaleDirective(
+                service="mctl-web",
+                slug="issue-9-fix",
+                issue_url="https://github.com/mctlhq/mctl-web/issues/9",
+                comment_id="c1",
+                author="octocat",
+            )
+        ]
+        activities, received = _fake_activities(active_ids=[], stale_directives=stale)
+        result = await _run(env, activities)
+
+        assert result.stale_directives == stale
+        # No submit for the stale directive itself — only the ones
+        # projections/orphans/lifecycle already trigger via submit_and_wait.
+        assert received["submits"] == []
+
+    async def test_no_stale_directives_reports_none(self, env):
+        activities, _received = _fake_activities(active_ids=[])
+        result = await _run(env, activities)
+
+        assert result.stale_directives is None
 
 
 DRIFT = [
