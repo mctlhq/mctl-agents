@@ -4038,3 +4038,191 @@ def test_seal_side_wiring_carries_work_context_end_to_end(tmp_path, monkeypatch)
     assert wc.actor_id == "carol"
     # The derived id is exactly what the help text promises.
     assert wc.execution_id == execution_id_for("wi-1", 2, "cli")
+
+
+def test_mismatched_work_item_warns_at_observe_and_refuses_at_enforce(tmp_path, monkeypatch, capsys):
+    """#408 round 3 (claude P2): the CLI now makes the same identity
+    cross-check `DevLoopWorkflow.resume` makes (`work-item-mismatch`) — a
+    --work-item-id about a DIFFERENT issue must never veto this run or seal
+    its identity into this issue's snapshot."""
+    from orchestrator.work_context.contract import WORK_ITEM_FOUND, WorkItem, WorkItemAnswer
+
+    item = WorkItem(
+        work_item_id="wi-other",
+        state="in-progress",
+        service="mctl-telegram",
+        slug="issue-40-other",
+        issue_url="https://github.com/mctlhq/mctl-telegram/issues/40",
+    )
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    _investigate_harness(
+        tmp_path, monkeypatch, number=103, title="Mismatch guard",
+        agent=lambda repo_dir, prompt, proposal_dir: pytest.fail("agent must not run under dry_run"),
+    )
+
+    def _boom(**kwargs):
+        pytest.fail("a mismatched work item must never reach _work_context_ref")
+
+    monkeypatch.setattr(run_issue_investigator, "_work_context_ref", _boom)
+
+    # observe: warn and proceed, with NO work-context block for this run.
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/103",
+        state_dir=tmp_path,
+        dry_run=True,
+        work_item_id="wi-other",
+    )
+    # The run proceeded all the way to the dry-run print — it was not
+    # refused, only stripped of the mismatched work context.
+    assert result.skipped_reason == "dry-run"
+    assert "work-item mismatch" in capsys.readouterr().out
+
+    # enforce: the mismatch refuses the run instead of vetoing it on a
+    # foreign work item's terminal state or sealing a foreign identity.
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.ENFORCE)
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/103",
+        state_dir=tmp_path,
+        dry_run=True,
+        work_item_id="wi-other",
+    )
+    assert result.skipped_reason is not None
+    assert "work-item mismatch" in result.skipped_reason
+
+
+def test_derived_execution_id_matches_the_sealed_sequence(tmp_path, monkeypatch):
+    """#408 round 3 (claude P3): when --resume-from-execution-id names an
+    execution the store has not recorded, the derived --execution-id and the
+    sealed execution_sequence must be computed from the SAME prior list —
+    an id that does not match its own sealed sequence is not reproducible
+    from the document."""
+    from orchestrator.work_context.contract import (
+        WORK_ITEM_FOUND,
+        ExecutionRef,
+        WorkItem,
+        WorkItemAnswer,
+        execution_id_for,
+    )
+
+    monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    item = WorkItem(
+        work_item_id="wi-1",
+        revision="r7",
+        state="in-progress",
+        service="mctl-telegram",
+        slug="issue-104-skew",
+        executions=(ExecutionRef(execution_id="e1", sequence=1),),
+    )
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.get",
+        lambda self, work_item_id: WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=item),
+    )
+    captured: dict[str, object] = {}
+    real_ref = run_issue_investigator._work_context_ref
+
+    def capturing_ref(**kwargs):
+        ref = real_ref(**kwargs)
+        captured["ref"] = ref
+        return ref
+
+    monkeypatch.setattr(run_issue_investigator, "_work_context_ref", capturing_ref)
+    _investigate_harness(
+        tmp_path, monkeypatch, number=104, title="Sequence skew",
+        agent=lambda repo_dir, prompt, proposal_dir: [
+            (proposal_dir / name).write_text(f"x {name}")
+            for name in ("requirements.md", "design.md", "tasks.md")
+        ],
+    )
+    result = investigate(
+        "https://github.com/mctlhq/mctl-telegram/issues/104",
+        state_dir=tmp_path,
+        work_item_id="wi-1",
+        resume_from_execution_id="e-unrecorded",
+        surface="cli",
+        actor_kind="human",
+        actor_id="carol",
+    )
+    assert result.error is None
+    ref = captured["ref"]
+    assert ref.prior_execution_ids == ("e1", "e-unrecorded")
+    assert ref.execution_sequence == 3
+    assert ref.execution_id == execution_id_for("wi-1", 3, "cli")
+
+
+def test_surface_transition_baselines_on_the_last_execution_not_origin():
+    """#408 round 3 (claude P3): `surface_transition` here must answer the
+    same question as `ExecutionRef.surface_transition` — did THIS execution
+    change the surface OR ACTOR relative to the one before it — not
+    "does the surface differ from where the work item originated"."""
+    from orchestrator.work_context.contract import (
+        ActorRef,
+        CanonicalState,
+        ExecutionRef,
+        SurfaceRef,
+        WorkItem,
+    )
+
+    canonical = CanonicalState(
+        work_item_id="wi-1", state="in-progress", prior_execution_ids=("e1", "e2")
+    )
+    item = WorkItem(
+        work_item_id="wi-1",
+        revision="r7",
+        origin=SurfaceRef(kind="github"),
+        executions=(
+            ExecutionRef(execution_id="e1", sequence=1, surface=SurfaceRef(kind="github")),
+            ExecutionRef(
+                execution_id="e2",
+                sequence=2,
+                surface=SurfaceRef(kind="telegram"),
+                actor=ActorRef(kind="human", actor_id="bob"),
+            ),
+        ),
+    )
+
+    def ref(**kwargs):
+        return run_issue_investigator._work_context_ref(
+            canonical=canonical, item=item, execution_id="e3",
+            resume_from_execution_id=None, **kwargs,
+        )
+
+    # Same surface and actor as the last execution: NOT a transition, even
+    # though the surface differs from the work item's github origin.
+    same = ref(surface="telegram", actor_kind="human", actor_id="bob")
+    assert same.surface_transition is False
+    # Surface moved back to the origin — still a change from the baseline.
+    moved = ref(surface="github", actor_kind="human", actor_id="bob")
+    assert moved.surface_transition is True
+    # Same surface, different actor: the actor axis counts too.
+    other_actor = ref(surface="telegram", actor_kind="human", actor_id="mallory")
+    assert other_actor.surface_transition is True
+
+
+def test_prior_ids_clamp_to_the_ceiling_but_the_sequence_counts_all():
+    """#408 round 3 (claude P3): a work item with more recorded executions
+    than MAX_PRIOR_EXECUTION_IDS must still seal — the newest entries are
+    kept, and the sequence keeps counting every prior execution."""
+    from orchestrator.context_snapshot import MAX_PRIOR_EXECUTION_IDS
+    from orchestrator.work_context.contract import CanonicalState, WorkItem
+
+    priors = tuple(f"e{i}" for i in range(1, MAX_PRIOR_EXECUTION_IDS + 2))  # 65 entries
+    canonical = CanonicalState(
+        work_item_id="wi-1", state="in-progress", prior_execution_ids=priors
+    )
+    ref = run_issue_investigator._work_context_ref(
+        canonical=canonical,
+        item=WorkItem(work_item_id="wi-1", revision="r7"),
+        execution_id="e-current",
+        resume_from_execution_id=None,
+        surface=None,
+        actor_kind=None,
+        actor_id=None,
+    )
+    assert ref.execution_sequence == MAX_PRIOR_EXECUTION_IDS + 2
+    assert len(ref.prior_execution_ids) == MAX_PRIOR_EXECUTION_IDS
+    assert ref.prior_execution_ids[0] == "e2"  # oldest dropped
+    assert ref.prior_execution_ids[-1] == f"e{MAX_PRIOR_EXECUTION_IDS + 1}"

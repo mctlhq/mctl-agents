@@ -80,7 +80,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
 from orchestrator import context_assembly
-from orchestrator.context_snapshot import ContextSnapshot, WorkContextRef
+from orchestrator.context_snapshot import MAX_PRIOR_EXECUTION_IDS, ContextSnapshot, WorkContextRef
 from orchestrator.github_token import refresh_github_token
 from orchestrator.proc import CommandFailed, run_capturing
 from orchestrator.proposal_identity import (
@@ -1725,6 +1725,23 @@ def _assemble_context(
 # so the published path still cannot leave agents-state. Making even the
 # contents trustworthy means not running the agent as this uid, which is
 # #149's territory.
+def _prior_execution_ids(
+    canonical: Any, *, execution_id: str, resume_from_execution_id: str | None
+) -> tuple[str, ...]:
+    """The prior-execution list BOTH a derived --execution-id and the sealed
+    `execution_sequence` are computed from — one function so the sequence the
+    id encodes can never skew from the sequence the snapshot seals (they
+    disagreed when --resume-from-execution-id named an execution the store
+    had not recorded)."""
+    # The store may already have recorded THIS execution (the dev_loop seeds
+    # execution #1 before the investigator runs) — a prior list containing
+    # ourselves would claim one sequence too many.
+    prior_ids = tuple(pid for pid in canonical.prior_execution_ids if pid != execution_id)
+    if resume_from_execution_id and resume_from_execution_id not in prior_ids:
+        prior_ids = (*prior_ids, resume_from_execution_id)
+    return prior_ids
+
+
 def _work_context_ref(
     *,
     canonical: Any,
@@ -1740,23 +1757,47 @@ def _work_context_ref(
     mctl-agents#267). `canonical` is a `CanonicalState`, `item` a
     `WorkItem` — typed as Any only to keep this module's lazy-import
     discipline for the work_context package (see investigate())."""
-    # The store may already have recorded THIS execution (the dev_loop seeds
-    # execution #1 before the investigator runs) — a prior list containing
-    # ourselves would claim one sequence too many.
-    prior_ids = tuple(pid for pid in canonical.prior_execution_ids if pid != execution_id)
-    if resume_from_execution_id and resume_from_execution_id not in prior_ids:
-        prior_ids = (*prior_ids, resume_from_execution_id)
+    prior_ids = _prior_execution_ids(
+        canonical, execution_id=execution_id, resume_from_execution_id=resume_from_execution_id
+    )
+    # The sequence counts every prior execution; the sealed prior list is
+    # then clamped to the newest MAX_PRIOR_EXECUTION_IDS entries, so a
+    # work item with more recorded executions than the ADR 009 ceiling
+    # still seals instead of failing validate() in seal().
+    execution_sequence = len(prior_ids) + 1
+    if len(prior_ids) > MAX_PRIOR_EXECUTION_IDS:
+        prior_ids = prior_ids[-MAX_PRIOR_EXECUTION_IDS:]
+    # `surface_transition` matches ExecutionRef's definition — did THIS
+    # execution change the surface or actor relative to the one before it —
+    # so the baseline is the last recorded execution, falling back to the
+    # work item's origin when none is recorded. Only comparisons where both
+    # sides are known can claim a change: unlike the dev_loop signal, an
+    # undeclared side here is an optional CLI flag, not a rejected resume.
+    last = max(
+        (e for e in item.executions if e.execution_id),
+        key=lambda e: e.sequence,
+        default=None,
+    )
+    baseline_surface = last.surface.kind if last else item.origin.kind
+    baseline_actor = last.actor if last else None
+    surface_changed = bool(surface and baseline_surface and surface != baseline_surface)
+    actor_changed = bool(
+        actor_kind
+        and baseline_actor is not None
+        and baseline_actor.kind
+        and (actor_kind != baseline_actor.kind or (actor_id or "") != baseline_actor.actor_id)
+    )
     return WorkContextRef(
         work_item_id=canonical.work_item_id,
         work_item_revision=item.revision,
         execution_id=execution_id,
-        execution_sequence=len(prior_ids) + 1,
+        execution_sequence=execution_sequence,
         prior_execution_ids=prior_ids,
         origin_surface=item.origin.kind,
         current_surface=surface or "",
         actor_kind=actor_kind or "",
         actor_id=actor_id or "",
-        surface_transition=bool(surface and item.origin.kind and surface != item.origin.kind),
+        surface_transition=surface_changed or actor_changed,
     )
 
 
@@ -1852,39 +1893,71 @@ def investigate(
                 # WorkItem and to the execution it resumed from. Metadata
                 # only — no transcript, per the contract's own rule.
                 #
-                # An omitted --execution-id derives deterministically from
-                # the work item and the store's recorded executions, exactly
-                # as the flag's help text promises — the same
-                # execution_id_for the dev_loop seed uses, with a fixed
-                # "cli" attempt salt so a re-run of the identical invocation
-                # derives the SAME id (a retry, not a fork; see
-                # execution_id_for's own docstring).
-                if not execution_id:
-                    from orchestrator.work_context.contract import execution_id_for
-
-                    execution_id = execution_id_for(
-                        canonical.work_item_id, len(canonical.prior_execution_ids) + 1, "cli"
-                    )
-                work_context_ref = _work_context_ref(
-                    canonical=canonical,
-                    item=answer.item,
-                    execution_id=execution_id,
-                    resume_from_execution_id=resume_from_execution_id,
-                    surface=surface,
-                    actor_kind=actor_kind,
-                    actor_id=actor_id,
-                )
-                # `enforce`/`only`: the reconstructed state may VETO this run
-                # (a work item already in a terminal state) but never
-                # LICENSE one the issue path would have refused on its own —
-                # requirements.md's "Rollout staging" acceptance criteria.
-                if _work_context_rollout.new_answer_may_veto() and canonical.state in TERMINAL_WORK_ITEM_STATES:
+                # The one identity cross-check the workflow's `resume` signal
+                # makes (`work-item-mismatch`) and the CLI otherwise lacks:
+                # a --work-item-id about a DIFFERENT issue must not veto this
+                # run or seal its identity into this issue's snapshot. Warn
+                # at `observe`, refuse where the store's answer has teeth.
+                if canonical.issue_url and canonical.issue_url != issue.ref.url:
                     reason = (
-                        f"work item {work_item_id} is already in terminal state "
-                        f"{canonical.state!r} — refusing to re-investigate"
+                        f"work item {work_item_id} is about {canonical.issue_url}, "
+                        f"not {issue.ref.url} — work-item mismatch"
                     )
-                    print(f"warn: {reason}")
-                    return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                    if _work_context_rollout.new_answer_may_veto():
+                        print(f"warn: {reason}")
+                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                    print(f"warn: {reason} (observe mode — proceeding without work context)")
+                    work_context_ref = None
+                    canonical = None
+                if canonical is not None:
+                    # An omitted --execution-id derives deterministically from
+                    # the work item and the store's recorded executions,
+                    # exactly as the flag's help text promises — with a fixed
+                    # "cli" attempt salt so a re-run of the identical
+                    # invocation derives the SAME id (a retry, not a fork; see
+                    # execution_id_for's own docstring). Derived from the same
+                    # prior list `_work_context_ref` seals the sequence from,
+                    # so the sequence the id encodes cannot skew from the
+                    # sealed one.
+                    if not execution_id:
+                        from orchestrator.work_context.contract import execution_id_for
+
+                        execution_id = execution_id_for(
+                            canonical.work_item_id,
+                            len(
+                                _prior_execution_ids(
+                                    canonical,
+                                    execution_id="",
+                                    resume_from_execution_id=resume_from_execution_id,
+                                )
+                            )
+                            + 1,
+                            "cli",
+                        )
+                    work_context_ref = _work_context_ref(
+                        canonical=canonical,
+                        item=answer.item,
+                        execution_id=execution_id,
+                        resume_from_execution_id=resume_from_execution_id,
+                        surface=surface,
+                        actor_kind=actor_kind,
+                        actor_id=actor_id,
+                    )
+                    # `enforce`/`only`: the reconstructed state may VETO this
+                    # run (a work item already in a terminal state) but never
+                    # LICENSE one the issue path would have refused on its own
+                    # — requirements.md's "Rollout staging" acceptance
+                    # criteria.
+                    if (
+                        _work_context_rollout.new_answer_may_veto()
+                        and canonical.state in TERMINAL_WORK_ITEM_STATES
+                    ):
+                        reason = (
+                            f"work item {work_item_id} is already in terminal state "
+                            f"{canonical.state!r} — refusing to re-investigate"
+                        )
+                        print(f"warn: {reason}")
+                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
             elif _work_context_rollout.blocks_on_unknown():
                 reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
                 print(f"warn: {reason}")

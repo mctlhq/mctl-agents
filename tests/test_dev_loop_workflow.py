@@ -50,7 +50,9 @@ from orchestrator.temporal.workflows.dev_loop import (
     DevLoopWorkflow,
     IssueRef,
     MergeWatchResume,
+    ResumeRejection,
 )
+from orchestrator.work_context.contract import ActorRef, ExecutionRef, SurfaceRef
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
 
 # The watch loop skips poll 1 (it runs at t=0, before the first sleep), so the
@@ -5362,6 +5364,136 @@ class TestMergeWatchContinueAsNew:
         assert result.implement is not None and result.implement.phase == "Succeeded"
         assert result.approve is not None and result.approve.phase == "Succeeded"
         assert result.ended == ""
+
+    async def test_work_context_survives_a_merge_watch_hop(
+        self, env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mctlhq/mctl-agents#267: the work-context binding must cross the
+        continue_as_new boundary. Both hop sites fold it into
+        MergeWatchResume (`_carry_work_context`) and `_resume_merge_watch`
+        rehydrates it, so after forced hops the `work_context` query on the
+        FINAL run of the chain still answers the binding the first run
+        seeded — instead of resetting to empty, which would also make the
+        `work-item-mismatch` guard vacuous and forget
+        `_seen_execution_ids`."""
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/964",
+                    work_item_id="wi-hop-1",
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+            state = await handle.query(DevLoopWorkflow.work_context)
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        # The seeded execution #1 survived the hops the low floor forced.
+        assert state.work_item_id == "wi-hop-1"
+        assert [e.sequence for e in state.executions] == [1]
+        assert state.executions[0].execution_id
+
+    async def test_carried_work_context_is_rehydrated_on_a_resumed_run(self, env) -> None:
+        """The rehydration half in isolation: a resume record carrying a
+        full work-context binding (two executions, a rejection, a telegram
+        baseline) must answer verbatim from the continued run's
+        `work_context` query — the fields `_resume_merge_watch` assigns,
+        not `__init__`'s empty defaults."""
+        activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(released=True)
+        carried_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        resume = MergeWatchResume(
+            service="mctl-telegram",
+            slug="issue-1-x",
+            deadline="2026-01-01T00:00:00Z",
+            last_pr=carried_pr,
+            abandoned=True,
+            abandon_reason="operator cleanup",
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+            work_item_id="wi-9",
+            executions=(
+                ExecutionRef(
+                    execution_id="e1",
+                    sequence=1,
+                    surface=SurfaceRef(kind="github"),
+                    actor=ActorRef(kind="agent"),
+                ),
+                ExecutionRef(
+                    execution_id="e2",
+                    sequence=2,
+                    surface=SurfaceRef(kind="telegram"),
+                    actor=ActorRef(kind="human", actor_id="bob"),
+                    surface_transition=True,
+                ),
+            ),
+            seen_execution_ids=("e1", "e2"),
+            current_surface=SurfaceRef(kind="telegram"),
+            current_actor=ActorRef(kind="human", actor_id="bob"),
+            resume_rejections=(
+                ResumeRejection(execution_id="e9", work_item_id="wi-other", reason="work-item-mismatch"),
+            ),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+            workflow_runner=UnsandboxedWorkflowRunner(),
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/965",
+                    work_item_id="wi-9",
+                    resume=resume,
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                await handle.result()
+
+            state = await handle.query(DevLoopWorkflow.work_context)
+
+        assert state.work_item_id == "wi-9"
+        assert [e.execution_id for e in state.executions] == ["e1", "e2"]
+        assert state.executions[1].surface_transition is True
+        assert state.last_surface == SurfaceRef(kind="telegram")
+        assert state.last_actor == ActorRef(kind="human", actor_id="bob")
+        assert [r.reason for r in state.resume_rejections] == ["work-item-mismatch"]
 
     async def test_deadline_is_carried_not_recomputed_across_hops(
         self, env, monkeypatch: pytest.MonkeyPatch

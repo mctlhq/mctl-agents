@@ -1015,6 +1015,23 @@ class MergeWatchResume:
     abandoned: bool = False
     abandon_reason: str | None = None
 
+    # --- Work-context binding (mctlhq/mctl-agents#267, ADR 011). The
+    # `work_context` query's state: without these a hop resets the query
+    # to empty for the rest of the watch, makes `resume`'s
+    # `work-item-mismatch` guard vacuous (an empty binding accepts a
+    # foreign work_item_id), and forgets `_seen_execution_ids`, so a
+    # retrying surface callback's duplicate execution_id forks a new
+    # execution instead of being the documented no-op.
+    # `seen_execution_ids` is carried sorted, not as a set — set iteration
+    # order depends on str hash randomisation, which a workflow must not
+    # let into its recorded state. ---
+    work_item_id: str = ""
+    executions: tuple[ExecutionRef, ...] = ()
+    seen_execution_ids: tuple[str, ...] = ()
+    current_surface: SurfaceRef = field(default_factory=SurfaceRef)
+    current_actor: ActorRef = field(default_factory=ActorRef)
+    resume_rejections: tuple[ResumeRejection, ...] = ()
+
     # --- Prior stage results. A continued run never re-runs investigate,
     # approve or implement, so the final DevLoopResult can only report
     # their outcomes if they are carried here. Filled in by `run` /
@@ -1717,15 +1734,19 @@ class DevLoopWorkflow:
                 # (mctl-agents#404 v2). `_watch_pr` never re-runs investigate,
                 # approve or implement, so their results have to be carried
                 # here -- `_watch_pr` itself has no view of them.
-                resume = dataclasses.replace(
-                    outcome.resume,
-                    investigate=investigate_result,
-                    implement=implement_result,
-                    approve=approve_result,
-                    implement_state=self._implement_state,
-                    approver=self._approver,
+                resume = self._carry_work_context(
+                    dataclasses.replace(
+                        outcome.resume,
+                        investigate=investigate_result,
+                        implement=implement_result,
+                        approve=approve_result,
+                        implement_state=self._implement_state,
+                        approver=self._approver,
+                    )
                 )
-                workflow.continue_as_new(IssueRef(issue_url=issue.issue_url, resume=resume))
+                workflow.continue_as_new(
+                    IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=resume)
+                )
 
         return await self._finish_after_watch(
             target_repo=target_repo,
@@ -1733,6 +1754,21 @@ class DevLoopWorkflow:
             implement_result=implement_result,
             approve_result=approve_result,
             outcome=outcome,
+        )
+
+    def _carry_work_context(self, resume: MergeWatchResume) -> MergeWatchResume:
+        """Fold the work-context instance state into a hop's resume record
+        (mctlhq/mctl-agents#267) — the counterpart of the rehydration block
+        in `_resume_merge_watch`, kept in one place so the two hop sites
+        cannot drift."""
+        return dataclasses.replace(
+            resume,
+            work_item_id=self._work_item_id,
+            executions=tuple(self._executions),
+            seen_execution_ids=tuple(sorted(self._seen_execution_ids)),
+            current_surface=self._current_surface,
+            current_actor=self._current_actor,
+            resume_rejections=tuple(self._resume_rejections),
         )
 
     async def _resume_merge_watch(self, issue: IssueRef) -> DevLoopResult:
@@ -1791,17 +1827,60 @@ class DevLoopWorkflow:
         if self._abandoned and not self._abandon_reason:
             self._abandon_reason = resume.abandon_reason or "abandoned by operator"
 
+        # Work-context binding (#267): same clobber hazard as `abandoned`
+        # above — a `resume` signal delivered in the continue_as_new gap ran
+        # against __init__'s empty state before this method did. Rehydrate
+        # the carried binding first, then re-apply whatever the gap signals
+        # recorded on top of it, re-deriving sequence and transition against
+        # the carried baseline instead of the empty one.
+        gap_executions = self._executions
+        gap_rejections = self._resume_rejections
+        self._work_item_id = resume.work_item_id or self._work_item_id
+        self._executions = list(resume.executions)
+        self._seen_execution_ids = set(resume.seen_execution_ids)
+        self._current_surface = resume.current_surface
+        self._current_actor = resume.current_actor
+        self._resume_rejections = list(resume.resume_rejections)
+        for execution in gap_executions:
+            if execution.execution_id in self._seen_execution_ids:
+                continue
+            self._seen_execution_ids.add(execution.execution_id)
+            transition = (
+                execution.surface != self._current_surface or execution.actor != self._current_actor
+            )
+            self._executions.append(
+                dataclasses.replace(
+                    execution,
+                    sequence=len(self._executions) + 1,
+                    surface_transition=transition,
+                )
+            )
+            if execution.surface.kind:
+                self._current_surface = execution.surface
+            if execution.actor.kind:
+                self._current_actor = execution.actor
+        for rejection in gap_rejections:
+            if not any(
+                r.execution_id == rejection.execution_id and r.reason == rejection.reason
+                for r in self._resume_rejections
+            ):
+                self._resume_rejections.append(rejection)
+
         outcome = await self._watch_pr(resume.service, resume.slug, resume=resume)
         if outcome.resume is not None:
-            next_resume = dataclasses.replace(
-                outcome.resume,
-                investigate=resume.investigate,
-                implement=resume.implement,
-                approve=resume.approve,
-                implement_state=self._implement_state,
-                approver=self._approver,
+            next_resume = self._carry_work_context(
+                dataclasses.replace(
+                    outcome.resume,
+                    investigate=resume.investigate,
+                    implement=resume.implement,
+                    approve=resume.approve,
+                    implement_state=self._implement_state,
+                    approver=self._approver,
+                )
             )
-            workflow.continue_as_new(IssueRef(issue_url=issue.issue_url, resume=next_resume))
+            workflow.continue_as_new(
+                IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=next_resume)
+            )
 
         investigate_result = resume.investigate
         # A resume record is only ever built after investigate has already
