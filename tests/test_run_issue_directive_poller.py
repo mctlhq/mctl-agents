@@ -17,7 +17,9 @@ import httpx
 import pytest
 
 from orchestrator import run_issue_directive_poller
-from orchestrator.directives import Directive
+from dataclasses import replace
+
+from orchestrator.directives import BOT_LOGINS, Directive, ack_trailer, acked_comment_ids
 from orchestrator.run_issue_directive_poller import (
     DirectiveScanResult,
     DispatchOutcomeAmbiguous,
@@ -43,9 +45,18 @@ def _mock_async_client(monkeypatch, handler):
 
 class FakeGitHub:
     """Stands in for `gh` (via `_run`): a per-issue comment list that
-    `gh issue view` reads and `gh issue comment` appends to — so a reply
-    posted by one scan() call is visible to the next, the same as real
-    GitHub."""
+    `gh api .../issues/<n>/comments` reads and `gh issue comment` appends to
+    — so a reply posted by one scan() call is visible to the next, the same
+    as real GitHub.
+
+    Comments are stored in the REST shape the poller actually parses
+    (`node_id`, `user.login`, `created_at`, `author_association`). The
+    previous version of this fake stored the GraphQL shape AND spelled the
+    bot author `mctl-agents[bot]` in it — a combination real GitHub never
+    produces, since GraphQL reports a Bot actor as the bare app slug. That
+    single wrong character is why every test here passed while production
+    re-dispatched the same directives for three days (mctl-agents#444).
+    """
 
     def __init__(self) -> None:
         self.comments: dict[str, list[dict]] = {}
@@ -64,40 +75,52 @@ class FakeGitHub:
         cid = f"c{self._next_id}"
         self._next_id += 1
         self.comments.setdefault(issue_url, []).append({
-            "id": cid,
-            "author": {"login": author},
-            "createdAt": "2026-09-19T10:00:00Z",
+            "id": self._next_id,
+            "node_id": cid,
+            "user": {"login": author},
+            "created_at": "2026-09-19T10:00:00Z",
             "body": body,
-            "authorAssociation": association,
+            "author_association": association,
         })
         return cid
 
     def run(self, cmd: list[str]) -> subprocess.CompletedProcess:
         if cmd[:3] == ["gh", "api", "graphql"]:
             return subprocess.CompletedProcess(cmd, 0, stdout=self.login + "\n", stderr="")
-        if cmd[:3] == ["gh", "issue", "view"]:
-            issue_url = cmd[-1]
-            payload = {
-                "number": 1, "url": issue_url, "state": "OPEN",
-                "comments": self.comments.get(issue_url, []),
-            }
-            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+        if cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/comments"):
+            issue_url = self._url_for_rest_path(cmd[-1])
+            # `--jq '.[]'` output: one compact JSON object per line.
+            body = "".join(
+                json.dumps(c) + "\n" for c in self.comments.get(issue_url, [])
+            )
+            return subprocess.CompletedProcess(cmd, 0, stdout=body, stderr="")
         if cmd[:3] == ["gh", "issue", "comment"]:
             issue_url = cmd[3]
             body = cmd[cmd.index("--body") + 1]
-            self.comments.setdefault(issue_url, []).append({
-                "id": f"ack{self._next_id}",
-                "author": {"login": "mctl-agents[bot]"},
-                "createdAt": "2026-09-19T10:05:00Z",
-                "body": body,
-                "authorAssociation": "NONE",
-            })
             self._next_id += 1
+            self.comments.setdefault(issue_url, []).append({
+                "id": self._next_id,
+                "node_id": f"ack{self._next_id}",
+                # REST spelling, which is what BOT_LOGINS holds. See the class
+                # docstring: getting this wrong is the whole of #444.
+                "user": {"login": "mctl-agents[bot]"},
+                "created_at": "2026-09-19T10:05:00Z",
+                "body": body,
+                "author_association": "NONE",
+            })
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         if cmd[:3] == ["gh", "issue", "edit"]:
             self.edit_calls.append(cmd)
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
         raise AssertionError(f"unexpected _run call: {cmd}")
+
+    @staticmethod
+    def _url_for_rest_path(path: str) -> str:
+        # "repos/<owner>/<repo>/issues/<n>/comments" -> the issue URL the
+        # comments are keyed by, so the fake stays keyed the way the tests
+        # construct it (via issue_url_for).
+        parts = path.split("/")
+        return f"https://github.com/{parts[1]}/{parts[2]}/issues/{parts[4]}"
 
 
 def _ref(service="mctl-web", slug="issue-9-fix", status="proposed") -> ProposalStateRef:
@@ -342,7 +365,7 @@ def test_dispatch_failure_leaves_no_ack_and_retries_next_tick(monkeypatch):
     assert all(
         "mctl-directive-ack" not in c["body"]
         for c in gh.comments[issue_url]
-        if c["author"]["login"] == "mctl-agents[bot]"
+        if c["user"]["login"] == "mctl-agents[bot]"
     )
 
     result = _run_scan(max_directives=10)
@@ -416,7 +439,7 @@ def test_dispatch_failure_gives_up_after_max_attempts_and_acks(monkeypatch):
         _run_scan(max_directives=10)
 
     assert attempts["n"] == run_issue_directive_poller.MAX_DISPATCH_ATTEMPTS
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     give_up_comments = [c for c in bot_comments if "mctl-directive-ack" in c["body"]]
     assert give_up_comments, "the give-up reply must carry the ack trailer, not vanish silently"
     assert "giving up" in give_up_comments[-1]["body"].lower()
@@ -469,7 +492,7 @@ def test_transient_marker_post_failure_does_not_escalate_to_give_up(monkeypatch)
     assert attempts["n"] == 1
     assert result.dispatched == 0
     assert comment_calls["n"] == 2, "the first (failed) attempt must be retried in-process"
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     assert bot_comments, "the retry-marker reply must have been posted after the retry"
     assert all("mctl-directive-ack" not in c["body"] for c in bot_comments), (
         "a transient marker-post blip must not escalate to the give-up (acked) reply"
@@ -520,7 +543,7 @@ def test_persistent_marker_post_failure_still_escalates_to_give_up(monkeypatch):
         "the marker post must be retried MARKER_POST_ATTEMPTS times before the give-up "
         "reply (which succeeds) is posted"
     )
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     give_up_comments = [c for c in bot_comments if "mctl-directive-ack" in c["body"]]
     assert give_up_comments, "persistent marker-post failure must still escalate to give-up"
     body = give_up_comments[-1]["body"].lower()
@@ -650,8 +673,8 @@ def test_ambiguous_same_issue_proposals_are_scanned_and_replied_once(monkeypatch
     real_run = gh.run
 
     def counting_run(cmd):
-        if cmd[:3] == ["gh", "issue", "view"]:
-            read_calls.append(cmd[-1])
+        if cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/comments"):
+            read_calls.append(FakeGitHub._url_for_rest_path(cmd[-1]))
         return real_run(cmd)
 
     monkeypatch.setattr(run_issue_directive_poller, "_run", counting_run)
@@ -676,7 +699,7 @@ def test_a_gh_failure_on_one_issue_does_not_stop_the_scan(monkeypatch):
     gh.add_comment(good_url)
 
     def flaky_run(cmd):
-        if cmd[:3] == ["gh", "issue", "view"] and cmd[-1] == bad_url:
+        if cmd[:2] == ["gh", "api"] and cmd[-1].endswith(f"/issues/1/comments"):
             raise subprocess.CalledProcessError(1, cmd, stderr="boom")
         return gh.run(cmd)
 
@@ -691,7 +714,7 @@ def test_a_gh_failure_on_one_issue_does_not_stop_the_scan(monkeypatch):
 
 
 def test_a_malformed_gh_payload_does_not_stop_the_scan(monkeypatch):
-    """A `gh issue view` reply that is not valid JSON (a bad/unexpected `gh`
+    """A `gh api` reply that is not valid JSON (a bad/unexpected `gh`
     payload) must be a per-issue failure, not a tick-ending crash — mirrors
     test_a_gh_failure_on_one_issue_does_not_stop_the_scan but for a
     JSONDecodeError instead of a CalledProcessError (codex review on
@@ -704,7 +727,7 @@ def test_a_malformed_gh_payload_does_not_stop_the_scan(monkeypatch):
     gh.add_comment(good_url)
 
     def flaky_run(cmd):
-        if cmd[:3] == ["gh", "issue", "view"] and cmd[-1] == bad_url:
+        if cmd[:2] == ["gh", "api"] and cmd[-1].endswith("/issues/1/comments"):
             return subprocess.CompletedProcess(cmd, 0, stdout="not valid json", stderr="")
         return gh.run(cmd)
 
@@ -862,7 +885,7 @@ def test_ambiguous_dispatch_outcome_acks_immediately_and_is_not_resubmitted(monk
     assert result.dispatched == 0
     assert result.failed == 1
 
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     assert bot_comments, "the ambiguous outcome must still reply"
     assert any("mctl-directive-ack" in c["body"] for c in bot_comments), (
         "an ambiguous outcome must ack immediately, on the very first occurrence — "
@@ -895,7 +918,7 @@ def test_ambiguous_dispatch_outcome_is_distinct_from_plain_dispatch_failure(monk
     monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", failing_submit)
 
     result = _run_scan(max_directives=10)
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     assert all("mctl-directive-ack" not in c["body"] for c in bot_comments), (
         "a plain (non-ambiguous) failure must NOT ack immediately — it still gets "
         "a bounded number of retries first"
@@ -932,7 +955,7 @@ def test_a_transient_ack_post_blip_after_successful_dispatch_is_absorbed(monkeyp
 
     assert result.dispatched == 1
     assert comment_calls["n"] == 2, "the first (failed) ack write must be retried in-process"
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     assert any("mctl-directive-ack" in c["body"] for c in bot_comments)
 
     # Already acked — a further tick must not resubmit.
@@ -1008,7 +1031,104 @@ def test_a_persistent_ack_post_failure_after_an_ambiguous_outcome_is_reported_no
     assert result.dispatched == 0
     assert result.failed == 1
     assert comment_calls["n"] == run_issue_directive_poller.MARKER_POST_ATTEMPTS
-    bot_comments = [c for c in gh.comments[issue_url] if c["author"]["login"] == "mctl-agents[bot]"]
+    bot_comments = [c for c in gh.comments[issue_url] if c["user"]["login"] == "mctl-agents[bot]"]
     assert not any("mctl-directive-ack" in c["body"] for c in bot_comments), (
         "the ambiguous ack must not appear as posted when every write attempt failed"
     )
+
+
+# ---------------------------------------------------------------------------
+# mctl-agents#444 — the read path must spell the bot the way BOT_LOGINS does
+# ---------------------------------------------------------------------------
+def test_read_issue_comments_maps_the_rest_shape(monkeypatch):
+    """`read_issue_comments` reads REST, and the identity it must preserve is
+    `node_id` — the GraphQL id every ack marker already on GitHub was written
+    with. Using REST's integer `id` here would make every existing marker
+    unmatchable and restart the loop #444 is about."""
+    payload = {
+        "id": 12345,
+        "node_id": "IC_kwDOSNnDY88AAAABVk47mg",
+        "user": {"login": "mctl-agents[bot]"},
+        "created_at": "2026-09-20T14:37:51Z",
+        "body": "@MCTL reinvestigate",
+        "author_association": "CONTRIBUTOR",
+    }
+    captured: list[list[str]] = []
+
+    def fake_run(cmd):
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload) + "\n", stderr="")
+
+    monkeypatch.setattr(run_issue_directive_poller, "_run", fake_run)
+    got = run_issue_directive_poller.read_issue_comments(
+        "https://github.com/mctlhq/mctl-agents/issues/395")
+
+    assert captured[0][:2] == ["gh", "api"], "must read REST, not `gh issue view` (#444)"
+    assert "--paginate" in captured[0], (
+        "REST pages comments at 30; without --paginate a directive that falls "
+        "off page one reads as unacked and is re-dispatched"
+    )
+    assert captured[0][-1] == "repos/mctlhq/mctl-agents/issues/395/comments"
+    assert len(got) == 1
+    assert got[0].id == "IC_kwDOSNnDY88AAAABVk47mg", "the GraphQL node id, not REST's integer id"
+    assert got[0].author == "mctl-agents[bot]"
+    assert got[0].created_at == "2026-09-20T14:37:51Z"
+    assert got[0].author_association == "CONTRIBUTOR"
+
+
+def test_the_read_path_spells_the_bot_the_way_bot_logins_does(monkeypatch):
+    """The whole of #444 in one assertion.
+
+    `acked_comment_ids` and `failed_attempt_counts` only honour markers whose
+    author is in `BOT_LOGINS`. The poller used to read comments through
+    `gh issue view`, whose GraphQL backend reports a Bot actor as the bare app
+    slug (`mctl-agents`), while `BOT_LOGINS` holds the REST spelling
+    (`mctl-agents[bot]`) because that is what the poller authenticates and
+    posts as. So it could not recognise its own markers and re-handled every
+    directive on every tick — 221 acks across three comments on
+    mctlhq/mctl-agents#395 before anyone noticed, and an unbounded series of
+    paid SDK runs had any of those directives been authorized.
+
+    `bot_login_mismatch` guards the WRITE login and was correct throughout.
+    Nothing guarded that the read path agrees with it. This does.
+    """
+    payload = {
+        "id": 1,
+        "node_id": "IC_x",
+        "user": {"login": "mctl-agents[bot]"},
+        "created_at": "2026-09-20T14:37:51Z",
+        "body": f"reply\n\n{ack_trailer('IC_seed')}",
+        "author_association": "CONTRIBUTOR",
+    }
+    monkeypatch.setattr(
+        run_issue_directive_poller, "_run",
+        lambda cmd: subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload) + "\n", stderr=""))
+
+    comments = run_issue_directive_poller.read_issue_comments(
+        "https://github.com/mctlhq/mctl-agents/issues/395")
+
+    assert comments[0].author in BOT_LOGINS, (
+        f"read path produced {comments[0].author!r}, which BOT_LOGINS "
+        f"{sorted(BOT_LOGINS)} does not contain — the dedup is blind and every "
+        "directive will be re-dispatched forever (#444)"
+    )
+    assert acked_comment_ids(comments) == {"IC_seed"}
+
+    # The failing spelling, stated explicitly so the hazard is named rather
+    # than only avoided: GraphQL's bare slug is NOT trusted, and must not be
+    # added to BOT_LOGINS — a human could hold that account name.
+    graphql_spelled = [replace(comments[0], author="mctl-agents")]
+    assert acked_comment_ids(graphql_spelled) == set()
+
+
+def test_read_issue_comments_rejects_a_url_it_cannot_turn_into_a_rest_path(monkeypatch):
+    """A URL shape the poller cannot parse must raise, not return `[]`: an
+    empty comment list reads as "no directives on this issue" and would
+    silently disable the scan for it."""
+    monkeypatch.setattr(
+        run_issue_directive_poller, "_run",
+        lambda cmd: pytest.fail(f"must not reach gh for an unparseable URL: {cmd}"))
+    for bad in ("", "https://github.com/mctlhq/mctl-agents/pull/336",
+                "https://example.com/mctlhq/mctl-agents/issues/395"):
+        with pytest.raises(ValueError):
+            run_issue_directive_poller.read_issue_comments(bad)

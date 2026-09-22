@@ -177,26 +177,82 @@ def _issue_number(slug: str) -> str | None:
     return match.group(1) if match else None
 
 
+# `https://github.com/<owner>/<repo>/issues/<n>` — the only shape
+# `issue_url_for` produces, and the only one `read_issue_comments` can turn
+# into a REST path. Anything else is a programming error, not a GitHub
+# failure, so it raises rather than returning an empty comment list: an empty
+# list reads as "no directives here" and would silently disable the scan.
+_ISSUE_URL_RE = re.compile(
+    r"^https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/issues/(?P<number>\d+)/?$"
+)
+
+
 def read_issue_comments(issue_url: str) -> list[RawComment]:
-    """One `gh issue view` call, reduced to the `RawComment` shape
+    """Every comment on one issue, reduced to the `RawComment` shape
     `orchestrator.directives` reads. Raises `subprocess.CalledProcessError`
     on a `gh` failure — the caller logs it and continues with the rest, per
     the same per-issue tolerance `run_issue_poller.poll()` has.
+
+    REST (`gh api`), NOT `gh issue view --json comments` (mctl-agents#444).
+    The two disagree about how a GitHub App's author login is spelled:
+    `gh issue view` goes through GraphQL, where a Bot actor's `login` is the
+    bare app slug (`mctl-agents`), while REST returns `mctl-agents[bot]` —
+    which is what the poller actually authenticates and posts as, and
+    therefore what `directives.BOT_LOGINS` contains.
+
+    That one missing suffix disabled the entire ack/fail-trailer dedup:
+    `acked_comment_ids` and `failed_attempt_counts` only honour markers
+    authored by a trusted login, so the poller could not recognise its OWN
+    markers and re-handled every directive on every tick, forever. Observed
+    on mctlhq/mctl-agents#395: 221 ack markers across three directive
+    comments over three days, one reply every ~15 minutes. Those directives
+    were unauthorized, so the cost was comment spam — but on an AUTHORIZED
+    directive the same loop is an unbounded series of paid SDK runs, which is
+    the exact failure the marker mechanism was added in #417 to prevent.
+
+    `bot_login_mismatch` did not catch it: it validates the login this
+    process WRITES as, which was correct all along. The drift was on the read
+    side, and comparing the two spellings is the point of reading them from
+    the same API.
+
+    `node_id`, not `id`, is the comment identity: `id` is REST's integer,
+    while the markers already written to GitHub carry the GraphQL node id
+    (`IC_...`) that `gh issue view` returned. Round-tripping `node_id` keeps
+    every marker posted before this fix readable, so the loops above stop on
+    the first tick after deploy instead of needing the history cleaned first.
+
+    `--paginate` is required, not incidental: REST pages comments at 30 and
+    silently returns only the first page without it, and a directive that
+    falls off page one reads as unacked. (`gh issue view` had no such cap —
+    checked against #395 at 231 comments, it returned all of them — so
+    pagination is a cost of the transport change, not a second bug fixed by
+    it.)
     """
+    match = _ISSUE_URL_RE.match((issue_url or "").strip())
+    if not match:
+        raise ValueError(f"not an issue URL this poller can read: {issue_url!r}")
+    # `--jq '.[]'` rather than `--slurp`: with `--paginate` the raw body is
+    # several JSON arrays concatenated, which `json.loads` cannot read, and
+    # `--jq` streams one compact object per line on every `gh` version this
+    # image has shipped. Bodies keep their newlines escaped inside the JSON
+    # string, so one line really is one comment.
     proc = _run([
-        "gh", "issue", "view",
-        "--json", "number,url,state,comments",
-        "--", issue_url,
+        "gh", "api", "--paginate",
+        "--jq", ".[]",
+        f"repos/{match['owner']}/{match['repo']}/issues/{match['number']}/comments",
     ])
-    data = json.loads(proc.stdout)
     comments: list[RawComment] = []
-    for c in data.get("comments") or []:
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        c = json.loads(line)
         comments.append(RawComment(
-            id=str(c.get("id") or ""),
-            author=((c.get("author") or {}).get("login")) or "",
-            created_at=c.get("createdAt") or "",
+            id=str(c.get("node_id") or ""),
+            author=((c.get("user") or {}).get("login")) or "",
+            created_at=c.get("created_at") or "",
             body=c.get("body") or "",
-            author_association=str(c.get("authorAssociation") or ""),
+            author_association=str(c.get("author_association") or ""),
         ))
     return comments
 
