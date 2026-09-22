@@ -141,11 +141,13 @@ an explicit `ServiceSkillSet` contract:
   against a **pinned SHA**, never `Path.read_*` against the worktree
   (`service_skills._tree_entries`/`_blob_text`/`_blob_size`).
 - The pinned SHA is `git rev-parse HEAD` for a read-only agent, but the
-  **merge-base with `origin/HEAD`** for an agent-authored branch
-  (`implementer`/`shepherd` on `feat/agents-*`) — `service_skills.pin_sha`
-  — so a skill edit a previous run of the SAME agent committed cannot
-  become policy for the next run without a human merging it into the
-  default branch first.
+  **merge-base with `origin/HEAD`** for an agent-authored run
+  (`implementer`/`shepherd` on any named branch — `feat/agents-*` or an
+  adopted PR's own head branch) — `service_skills.pin_sha`, and the same
+  rule derived directly in `resolver._resolve_service_skill_bundle_for_plan`
+  on the declarative path — so a skill edit a previous run of the SAME
+  agent committed cannot become policy for the next run without a human
+  merging it into the default branch first.
 - Enablement and ceilings (`enabled`/`root`/`maxSkills`/`maxSkillBytes`/
   `maxTotalBytes`) are a `spec.serviceSkills` block on the PLATFORM side:
   `agents/_manifests/<agent>/agent.yaml` for a v1alpha1 agent, or

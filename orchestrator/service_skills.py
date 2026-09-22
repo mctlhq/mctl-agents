@@ -422,6 +422,15 @@ def pin_sha(repo_dir: Path, *, agent: str, branch: str | None, timeout: float = 
     PR's own head branch, which need not start with `feat/agents-`, and a
     previous remediation run may have committed `.mctl/skills/**` edits
     there just the same (R6/ADR 007).
+
+    `branch` is therefore only a statement of WHO is running: pass the
+    branch the run is on (any truthy name) for an agent that commits to
+    its own branch, and `None` only when the caller is not on a work
+    branch at all (a read-only agent pinning HEAD). An agent-authored
+    caller must never pass `None`. The declarative path
+    (`resolver._resolve_service_skill_bundle_for_plan`) does not go
+    through this function -- it derives the merge-base directly for an
+    agent in `AGENT_AUTHORED_AGENTS`, unconditionally.
     """
     if agent in AGENT_AUTHORED_AGENTS and branch:
         return _merge_base_with_default_branch(repo_dir, timeout=timeout)

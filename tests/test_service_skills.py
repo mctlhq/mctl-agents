@@ -932,6 +932,15 @@ def test_cli_validate_refuses_under_kill_switch(tmp_path, capsys, monkeypatch):
     assert "kill switch" in capsys.readouterr().out
 
 
+def test_cli_validate_unknown_agent_fails_before_touching_repo(tmp_path, capsys):
+    repo = _init_repo(tmp_path)
+    _write_manifest(repo, bindings={"implementer": ["a"]}, skills={"a": _skill_text("a")})
+    _commit_all(repo, "clean")
+    assert service_skills._cli_validate(["--validate", str(repo), "--agent", "implementor"]) == 1
+    out = capsys.readouterr().out
+    assert "unknown agent" in out and "implementor" in out
+
+
 def test_cli_validate_non_git_repo_fails_cleanly(tmp_path, capsys):
     not_a_repo = tmp_path / "empty"
     not_a_repo.mkdir()
