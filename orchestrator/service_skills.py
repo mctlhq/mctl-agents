@@ -216,8 +216,15 @@ class ServiceSkillBundle:
         if not self.skills:
             return ""
         source = f"{repo_slug}@{self.resolved_from_sha}" if repo_slug else self.resolved_from_sha
+        # `resolve_bundle` already rejects ids outside `_SKILL_ID_RE`'s
+        # charset (no `<`, `>`, whitespace or newlines can reach here by
+        # construction), but the id is still repository-owned input, so it
+        # goes through the same neutralizer as the body: render-time defense
+        # must not depend on every constructor of this dataclass having
+        # validated.
         sections = [
-            f"### {skill.skill_id}\n\n{_neutralize_service_skill_tags(skill.text)}"
+            f"### {_neutralize_service_skill_tags(skill.skill_id)}\n\n"
+            f"{_neutralize_service_skill_tags(skill.text)}"
             for skill in self.skills
         ]
         body = "\n\n".join(sections)
@@ -509,9 +516,10 @@ def resolve_bundle(
         )
 
     # Bound the manifest read on SIZE before materializing content, the same
-    # guard the skill bodies get below -- an oversized manifest.yaml (or a
-    # YAML alias bomb padded into one) must be rejected before its bytes
-    # enter this process, not after `yaml.safe_load` has expanded it.
+    # guard the skill bodies get below -- an oversized manifest.yaml must be
+    # rejected before its bytes enter this process. (This bounds the read
+    # only; `yaml.safe_load`'s own alias handling is what stands between a
+    # small document and a large parse.)
     manifest_size = _blob_size(repo_dir, pinned_sha, manifest_path, timeout=timeout)
     if manifest_size > MAX_MANIFEST_BYTES:
         raise ServiceSkillError(
@@ -542,6 +550,14 @@ def resolve_bundle(
     skills_decl = _require_mapping(spec.get("skills") or {}, where=f"{manifest_path}: spec.skills")
 
     known = _known_agent_names(known_agents)
+    non_string_keys = [k for k in bindings if not isinstance(k, str)]
+    if non_string_keys:
+        # YAML keys need not be strings; a bare `1:` key would otherwise
+        # escape as a TypeError from sorted() below, breaking the "every
+        # failure mode is ServiceSkillError" contract.
+        raise ServiceSkillError(
+            f"{manifest_path}: spec.bindings keys must be strings, got {non_string_keys!r}"
+        )
     unknown_agents = sorted(set(bindings) - known)
     if unknown_agents:
         raise ServiceSkillError(
@@ -601,6 +617,15 @@ def resolve_bundle(
                 "accepts Markdown SKILL.md content only, R12)"
             )
         _validate_under_root(path, root=policy.root)
+        if posixpath.dirname(path) == posixpath.normpath(policy.root):
+            # A skill directly at the skills root would put the root itself
+            # into the R12 containment set below, turning every undeclared
+            # file under the root into a bundle-wide rejection. R12's unit
+            # is a skill's OWN directory, so require one.
+            raise ServiceSkillError(
+                f"{manifest_path}: spec.skills.{skill_id}.path {path!r} must live in its own "
+                f"directory under {policy.root!r}, not directly at the root (R12)"
+            )
         mode = entries.get(path)
         if mode is None:
             raise ServiceSkillError(
@@ -710,10 +735,22 @@ def _cli_validate(argv: Sequence[str] | None = None) -> int:
 
     from orchestrator import manifest as _manifest
 
+    if _kill_switch_engaged():
+        # The kill switch is an operator break-glass for RESOLUTION; a target
+        # repository's own PR gate must not be silenceable by an unrelated
+        # env var. Refuse loudly rather than printing a vacuous all-OK.
+        print("FAIL: MCTL_SERVICE_SKILLS=off -- the kill switch disables resolution, "
+              "so this validator cannot check anything; unset it to validate")
+        return 1
+
     manifests = _manifest.load_all()
     known_agents = sorted(manifests.keys())
     agents = args.agent or known_agents
-    sha = _head_sha(args.repo, timeout=_GIT_TIMEOUT_SECONDS)
+    try:
+        sha = _head_sha(args.repo, timeout=_GIT_TIMEOUT_SECONDS)
+    except ServiceSkillError as exc:
+        print(f"FAIL: {exc}")
+        return 1
 
     failed = False
     for agent_name in agents:

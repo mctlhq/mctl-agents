@@ -1489,6 +1489,13 @@ human reviewer should look at carefully (especially open questions).
         # legacy case) leaves this function byte-identical to before this
         # parameter existed.
         anchor = "\n## What to produce\n"
+        if anchor not in prompt:
+            # Fail closed (mctl-agents#305 posture): a silently dropped
+            # skills block is worse than a loud template drift.
+            raise RuntimeError(
+                "investigator prompt template drifted: splice anchor "
+                f"{anchor!r} not found while a service_skills block is present"
+            )
         prompt = prompt.replace(anchor, f"\n{service_skills_block}\n{anchor.lstrip()}", 1)
     if context is not None and context.mode == "on":
         prompt += _render_assembled_context_section(context)

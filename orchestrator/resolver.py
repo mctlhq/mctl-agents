@@ -975,13 +975,20 @@ def _resolve_service_skill_bundle_for_plan(
             root=profile.service_skills.root,
             manifest_hash=None,
         )
-    return _resolve_service_skill_bundle(
-        agent=agent,
-        repo_dir=task.target_repo_dir,
-        policy=profile.service_skills,
-        tool_allow=profile.tools,
-        pinned_sha=task.target_repository_sha.strip(),
-    )
+    from orchestrator.service_skills import ServiceSkillError
+
+    try:
+        return _resolve_service_skill_bundle(
+            agent=agent,
+            repo_dir=task.target_repo_dir,
+            policy=profile.service_skills,
+            tool_allow=profile.tools,
+            pinned_sha=task.target_repository_sha.strip(),
+        )
+    except ServiceSkillError as exc:
+        # Same conversion `_parse_service_skills_policy` performs: every
+        # malformed input surfaced through `execute()` raises ResolverError.
+        raise ResolverError(f"service skill bundle for {agent!r}: {exc}") from exc
 
 
 def resolve_service_skill_bundle(agent: str, task: Task) -> ServiceSkillBundle:

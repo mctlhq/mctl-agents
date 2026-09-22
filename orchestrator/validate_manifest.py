@@ -776,8 +776,10 @@ def check_service_skills_limits(manifests: dict[str, AgentManifest]) -> list[str
     the comparison needs BOTH files, and only this repository can read both.
 
     `policy.yaml`'s `limits.maxServiceSkills` / `limits.maxServiceSkillBytes`
-    keys are themselves additive and optional (mctlhq/mctl-agents#305
-    tasks.md task 16, a separate mctl-gitops PR) -- until that PR lands, or
+    / `limits.maxServiceTotalBytes` keys are themselves additive and optional
+    (mctlhq/mctl-agents#305 tasks.md task 16, a separate mctl-gitops PR;
+    the third key bounds the AGGREGATE `maxTotalBytes` and must be created
+    alongside the other two) -- until that PR lands, or
     for an agent with no declared block at all, there is nothing to compare
     against and this reports no error. An agent whose block declares a
     ceiling ABOVE a configured platform ceiling is the one thing this

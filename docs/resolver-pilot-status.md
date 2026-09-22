@@ -159,7 +159,11 @@ an explicit `ServiceSkillSet` contract:
   lives in the target repo;
   the PERMISSION to read it plus its limits lives on the platform side —
   `ExecutionProfile.spec.skills` (the pre-existing platform-skill mechanism)
-  is unrelated and unchanged.
+  is unrelated and unchanged. The platform-wide ceilings the gitops task-16
+  PR adds to `agent-platform/policy.yaml` are `limits.maxServiceSkills`,
+  `limits.maxServiceSkillBytes` and `limits.maxServiceTotalBytes` — the
+  third bounds the aggregate `maxTotalBytes` and is compared only against
+  it (`check_service_skills_limits`), never against the per-skill ceiling.
 - `resolve_bundle()` is a type boundary, not a runtime check: a
   `ServiceSkillBundle` exposes only skill text and identifiers, never
   `allowed_tools`/`mcp_servers`/`permission_mode`/`max_budget_usd`/
