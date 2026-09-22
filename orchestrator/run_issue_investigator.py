@@ -80,7 +80,12 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
 from orchestrator import context_assembly
-from orchestrator.context_snapshot import MAX_PRIOR_EXECUTION_IDS, ContextSnapshot, WorkContextRef
+from orchestrator.context_snapshot import (
+    MAX_PRIOR_EXECUTION_IDS,
+    MAX_WORK_CONTEXT_ID_LENGTH,
+    ContextSnapshot,
+    WorkContextRef,
+)
 from orchestrator.execution_identity import (
     ExecutionContext,
     ExecutionIdentityError,
@@ -1862,7 +1867,12 @@ def _work_context_ref(
     )
     return WorkContextRef(
         work_item_id=canonical.work_item_id,
-        work_item_revision=item.revision,
+        # Store-supplied and unbounded on the way in — clamped like
+        # prior_execution_ids above, so an over-long revision string cannot
+        # fail validate() at seal time. Informational only (ADR 011), so a
+        # truncated tail loses nothing an authorization or correlation
+        # decision reads.
+        work_item_revision=item.revision[:MAX_WORK_CONTEXT_ID_LENGTH],
         execution_id=execution_id,
         execution_sequence=execution_sequence,
         prior_execution_ids=prior_ids,
@@ -2697,6 +2707,20 @@ def _work_context_from_args(args: argparse.Namespace) -> None:
         raise SystemExit(f"--surface must be one of {sorted(SURFACE_KINDS)}, got {args.surface!r}")
     if args.actor_kind is not None and args.actor_kind not in ACTOR_KINDS:
         raise SystemExit(f"--actor-kind must be one of {sorted(ACTOR_KINDS)}, got {args.actor_kind!r}")
+    # The id-shaped flags seal into fields ContextSnapshot.validate()
+    # bounds at MAX_WORK_CONTEXT_ID_LENGTH — refuse them here, where the
+    # CLI can say why, instead of letting seal() crash the investigation.
+    for flag, value in (
+        ("--work-item-id", args.work_item_id),
+        ("--execution-id", args.execution_id),
+        ("--resume-from-execution-id", args.resume_from_execution_id),
+        ("--actor-id", args.actor_id),
+    ):
+        if value is not None and len(value) > MAX_WORK_CONTEXT_ID_LENGTH:
+            raise SystemExit(
+                f"{flag} exceeds {MAX_WORK_CONTEXT_ID_LENGTH} characters "
+                f"(the context snapshot's id ceiling)"
+            )
     if not args.issue_url and not (
         args.work_item_id and _work_context_rollout.at_least(_work_context_rollout.ONLY)
     ):

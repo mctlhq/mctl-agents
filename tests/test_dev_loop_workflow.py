@@ -9,6 +9,7 @@ server binary (cached under ~/.cache after the first run).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 from datetime import timedelta
@@ -5758,3 +5759,27 @@ class TestWorkContextGapMerge:
         assert fresh._current_actor == ActorRef(kind="human", actor_id="alice")
         assert fresh._resume_rejections == list(wf._resume_rejections)
         assert fresh._resume_pending is True
+
+    def test_gap_resume_is_rejected_while_a_carried_resume_is_pending(self) -> None:
+        """#408 round 5 (claude P2): the carried record can say one accepted
+        resume is still awaiting fresh approval (`resume_pending=True`, and
+        only `approve` closes that window) — a gap resume must be rejected
+        `resume-already-pending` against that restored value, exactly as the
+        identical signal a second earlier or later would have been."""
+        wf = DevLoopWorkflow()
+        wf.resume(
+            {
+                "work_item_id": "wi-1", "execution_id": "e3", "surface": "web",
+                "actor_kind": "human", "actor_id": "mallory",
+            }
+        )
+        carried = dataclasses.replace(self._carried(), resume_pending=True)
+        wf._rehydrate_work_context(carried)
+        assert [e.execution_id for e in wf._executions] == ["e1"]
+        assert "e3" not in wf._seen_execution_ids
+        assert [(r.execution_id, r.reason) for r in wf._resume_rejections] == [
+            ("e3", "resume-already-pending")
+        ]
+        # The window itself survives the hop.
+        assert wf._resume_pending is True
+        assert wf._current_surface == SurfaceRef(kind="github")

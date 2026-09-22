@@ -24,7 +24,6 @@ from urllib.parse import quote
 
 from orchestrator.work_context.contract import (
     WORK_ITEM_UNKNOWN,
-    ExecutionRef,
     WorkItemAnswer,
     answer_from,
 )
@@ -36,7 +35,6 @@ DEFAULT_TIMEOUT_S = 10
 # this clone (open question in requirements.md).
 ROUTES = {
     "get_work_item": "/api/v1/work-items/{id}",
-    "record_execution": "/api/v1/work-items/{id}/executions",
 }
 
 
@@ -140,20 +138,8 @@ class WorkItemClient:
     # `get`'s WorkItem. Add a typed listing parser with the first real
     # consumer instead of guessing mctl-api#227's response shape here.
 
-    # -- writes -------------------------------------------------------------
-
-    def record_execution(self, work_item_id: str, execution: ExecutionRef) -> WorkItemAnswer:
-        payload = {
-            "execution_id": execution.execution_id,
-            "sequence": execution.sequence,
-            "temporal_workflow_id": execution.temporal_workflow_id,
-            "started_at": execution.started_at,
-            "surface": {"kind": execution.surface.kind, "surface_id": execution.surface.surface_id,
-                        "thread_ref": execution.surface.thread_ref},
-            "actor": {"kind": execution.actor.kind, "actor_id": execution.actor.actor_id},
-        }
-        try:
-            res = self._request("POST", ROUTES["record_execution"].format(id=_q(work_item_id)), payload)
-        except WorkItemUnavailable as exc:
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=str(exc))
-        return answer_from(res.status, res.payload, path=res.status_path, body_empty=res.body_empty)
+    # No record_execution write either, for the same reason: the POST's
+    # response is the created execution record, not a WorkItem envelope, so
+    # `answer_from` would answer a SUCCESSFUL write with verdict UNKNOWN —
+    # and nothing in this repo consumes the route yet. Both arrive together
+    # with the first real consumer.

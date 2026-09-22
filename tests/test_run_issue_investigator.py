@@ -4355,3 +4355,38 @@ def test_surface_transition_baseline_excludes_self_and_kindless_executions():
     )
     out = ref(only_seed, surface="telegram")
     assert out.surface_transition is True
+
+
+def test_id_shaped_flags_are_length_bounded_at_the_cli():
+    """#408 round 5 (claude P3): validate() bounds these fields at
+    MAX_WORK_CONTEXT_ID_LENGTH — the CLI refuses them with a reason instead
+    of letting seal() crash at context mode `on`."""
+    from orchestrator.context_snapshot import MAX_WORK_CONTEXT_ID_LENGTH
+
+    too_long = "x" * (MAX_WORK_CONTEXT_ID_LENGTH + 1)
+    with pytest.raises(SystemExit, match="--actor-id"):
+        run_issue_investigator._work_context_from_args(_args(actor_id=too_long))
+    with pytest.raises(SystemExit, match="--work-item-id"):
+        run_issue_investigator._work_context_from_args(_args(work_item_id=too_long))
+    # At the ceiling is fine.
+    run_issue_investigator._work_context_from_args(
+        _args(actor_id="x" * MAX_WORK_CONTEXT_ID_LENGTH)
+    )
+
+
+def test_store_supplied_revision_is_clamped_not_a_seal_trap():
+    """#408 round 5 (claude P3): `work_item_revision` comes from the store,
+    unbounded — clamp it where it enters, same as prior_execution_ids."""
+    from orchestrator.context_snapshot import MAX_WORK_CONTEXT_ID_LENGTH
+    from orchestrator.work_context.contract import CanonicalState, WorkItem
+
+    ref = run_issue_investigator._work_context_ref(
+        canonical=CanonicalState(work_item_id="wi-1", state="open"),
+        item=WorkItem(work_item_id="wi-1", revision="r" * (MAX_WORK_CONTEXT_ID_LENGTH + 50)),
+        execution_id="e1",
+        resume_from_execution_id=None,
+        surface=None,
+        actor_kind=None,
+        actor_id=None,
+    )
+    assert len(ref.work_item_revision) == MAX_WORK_CONTEXT_ID_LENGTH

@@ -1782,7 +1782,14 @@ class DevLoopWorkflow:
         binding, then re-apply whatever `resume` signals delivered in the
         continue_as_new gap recorded against __init__'s empty state —
         re-deriving sequence and transition against the carried baseline,
-        and re-checking the one guard the empty state made vacuous."""
+        and re-checking the two guards the empty state made vacuous
+        (work-item-mismatch, resume-already-pending).
+
+        A transitioning gap resume also cleared `_approved`, which
+        `_resume_merge_watch` has already force-set back to True before
+        calling this — deliberately harmless: a continued run reaches no
+        approval gate (investigate/approve/implement never re-run), so the
+        cleared approval has nothing left to gate."""
         gap_work_item_id = self._work_item_id
         gap_executions = self._executions
         gap_rejections = self._resume_rejections
@@ -1811,6 +1818,16 @@ class DevLoopWorkflow:
                 self._reject_resume(execution.execution_id, gap_work_item_id, "work-item-mismatch")
                 continue
             if execution.execution_id in self._seen_execution_ids:
+                continue
+            # The other guard the empty gap state made vacuous: the carried
+            # record may say one accepted resume is still awaiting fresh
+            # approval, and a gap resume must be rejected against that
+            # window exactly as `resume` itself would have rejected it a
+            # second earlier or later.
+            if self._resume_pending:
+                self._reject_resume(
+                    execution.execution_id, self._work_item_id, "resume-already-pending"
+                )
                 continue
             self._seen_execution_ids.add(execution.execution_id)
             transition = (

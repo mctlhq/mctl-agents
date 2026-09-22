@@ -20,7 +20,6 @@ from orchestrator.work_context.contract import (
     WORK_ITEM_CONFLICT,
     WORK_ITEM_FOUND,
     WORK_ITEM_UNKNOWN,
-    ExecutionRef,
 )
 
 
@@ -129,16 +128,3 @@ def test_a_3xx_is_surfaced_never_followed(monkeypatch: pytest.MonkeyPatch) -> No
     assert answer.verdict == WORK_ITEM_UNKNOWN
 
 
-def test_record_execution_posts_and_reads_the_response(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: dict[str, Any] = {}
-
-    def _handler(req: Any) -> Any:
-        captured["body"] = json.loads(req.data)
-        captured["url"] = req.full_url
-        return _FakeResponse(json.dumps(WORK_ITEM_PAYLOAD).encode())
-
-    execution = ExecutionRef(execution_id="e2", sequence=2)
-    answer = _client(monkeypatch, _handler).record_execution("wi-1", execution)
-    assert answer.verdict == WORK_ITEM_FOUND
-    assert captured["body"]["execution_id"] == "e2"
-    assert captured["url"].endswith("/api/v1/work-items/wi-1/executions")
