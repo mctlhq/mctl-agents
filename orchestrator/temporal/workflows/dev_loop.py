@@ -590,7 +590,7 @@ class HumanInputOutcome:
     `human_input_response` param and (b) record the outcome in
     `DevLoopResult` — never the question or the raw surface transcript."""
 
-    outcome: str = ""  # "answered" | "timed_out"
+    outcome: str = ""  # "answered" | "timed_out" | "abandoned"
     request_id: str = ""
     request_hash: str = ""
     # `Any`, not bare `object`: temporalio's value_to_type special-cases Any
@@ -1613,8 +1613,22 @@ class DevLoopWorkflow:
                 extra={"human_input": human_input.request_log_dict(request)},
             )
             return None
+        def _abandoned_outcome() -> HumanInputOutcome:
+            # mctl-agents#420's escape hatch, honoured inside this park too:
+            # checked BEFORE any delivered answer is consumed, so an operator
+            # abandon always wins over a response racing it.
+            workflow.logger.info(
+                "human_input.abandoned", extra={"human_input": human_input.request_log_dict(request)}
+            )
+            return HumanInputOutcome(
+                outcome="abandoned", request_id=request.request_id,
+                round=request.round, resume_count=self._human_input_resume_count,
+            )
+
         consumed = 0
         while True:
+            if self._abandoned:
+                return _abandoned_outcome()
             remaining = (expires_at - workflow.now()).total_seconds()
             if remaining <= 0:
                 self._human_input_state = _state(INPUT_TIMED_OUT)
@@ -1627,7 +1641,7 @@ class DevLoopWorkflow:
                 )
             try:
                 def _answer_arrived(threshold: int = consumed) -> bool:
-                    return len(self._input_responses) > threshold
+                    return len(self._input_responses) > threshold or self._abandoned
 
                 await workflow.wait_condition(_answer_arrived, timeout=remaining)
             except TimeoutError:
@@ -1644,6 +1658,9 @@ class DevLoopWorkflow:
                     "human_input.cancelled", extra={"human_input": human_input.request_log_dict(request)}
                 )
                 raise
+
+            if self._abandoned:
+                return _abandoned_outcome()
 
             raw_response = self._input_responses[consumed]
             consumed += 1
@@ -1779,9 +1796,17 @@ class DevLoopWorkflow:
                 if hi_outcome is None:
                     break
                 human_input_outcome = hi_outcome
+                if hi_outcome.outcome == "abandoned":
+                    return DevLoopResult(
+                        investigate=investigate_result, implement=None,
+                        human_input=human_input_outcome,
+                        ended=f"abandoned: {self._abandon_reason}",
+                    )
                 if hi_outcome.outcome == "timed_out":
                     return DevLoopResult(
-                        investigate=investigate_result, implement=None, human_input=human_input_outcome
+                        investigate=investigate_result, implement=None,
+                        human_input=human_input_outcome,
+                        ended=f"human input wait expired for request {hi_outcome.request_id}",
                     )
                 # "answered": resubmit investigate with the answer as a
                 # `human_input_response` param (request_id/request_hash/value/
@@ -1802,7 +1827,9 @@ class DevLoopWorkflow:
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
                 if not investigate_result.succeeded:
                     return DevLoopResult(
-                        investigate=investigate_result, implement=None, human_input=human_input_outcome
+                        investigate=investigate_result, implement=None,
+                        human_input=human_input_outcome,
+                        ended=f"investigate ended {investigate_result.phase}",
                     )
 
         # Durable wait: this workflow can sit here for days without costing

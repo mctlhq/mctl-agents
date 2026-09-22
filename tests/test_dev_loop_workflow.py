@@ -4567,6 +4567,7 @@ class TestWorkContextResume:
                 fake_record_execution,
                 gated_find_proposal_slug,
                 _fake_get_issue_state_open,
+                _fake_find_human_input_request_none,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -4655,6 +4656,7 @@ class TestWorkContextResume:
                 fake_record_execution,
                 gated_find_proposal_slug,
                 _fake_get_issue_state_open,
+                _fake_find_human_input_request_none,
             ],
         ):
             handle = await env.client.start_workflow(
@@ -5093,6 +5095,36 @@ class TestDevLoopHumanInput:
 
         assert result.human_input is None
         assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert calls.count("mctl-agents-investigate") == 1
+
+    async def test_abandon_signal_releases_the_waiting_for_input_park(self, env):
+        """mctl-agents#420's escape hatch must work inside WAITING_FOR_INPUT
+        too (agy P2 on #450): an operator `abandon` unblocks the park
+        immediately — no answer, no timeout wait — and the result records
+        the abandonment, never a successful full pipeline."""
+        request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60)
+        activities, calls, _investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(request)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            await _wait_for_pending_request(handle, request.request_id)
+            await handle.signal(DevLoopWorkflow.abandon, "operator gave up waiting")
+            with anyio.fail_after(15):
+                result = await handle.result()
+
+        assert result.ended == "abandoned: operator gave up waiting"
+        assert result.human_input is not None
+        assert result.human_input.outcome == "abandoned"
+        assert result.implement is None
         assert calls.count("mctl-agents-investigate") == 1
 
     async def test_workflow_owned_resume_count_bounds_agent_written_rounds(self, env):
