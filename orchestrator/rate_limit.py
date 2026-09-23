@@ -6,8 +6,11 @@ quota window (the CLI's terminal ``ResultMessage`` with ``is_error=True`` and
 `orchestrator.run_implementer` did not, and the two SHOULD NOT diverge: both
 drivers watch the same stream shape for the same reason (mctl-agents#364).
 
-This module is the one place that shape is inspected, so both call sites stay
-in sync. Every check below is duck-typed --- ``getattr(message, ..., None)``
+This module is meant to be the one place that shape is inspected. Today only
+`run_implementer` uses it: `run_issue_investigator` still keeps its own inline
+429 check and its own `RateLimitExhaustedError`, so an `except` for one class
+does not catch the other. Moving the investigator onto this module is a
+follow-up (mctl-agents#455). Every check below is duck-typed --- ``getattr(message, ..., None)``
 plus a ``type(message).__name__`` comparison, never an ``isinstance`` against
 the SDK's own classes --- because this module MUST be importable at module
 scope by ``orchestrator.run_issue_investigator``, which is itself imported by
@@ -133,6 +136,11 @@ def build_observation(info: object | None, *, detail: str) -> RateLimitObservati
     account-only, with the limit-type/reset fields left ``None``.
     """
     resets_at_epoch = getattr(info, "resets_at", None) if info is not None else None
+    if resets_at_epoch is not None:
+        try:
+            resets_at_epoch = int(resets_at_epoch)
+        except (TypeError, ValueError):
+            resets_at_epoch = None
     rate_limit_type = getattr(info, "rate_limit_type", None) if info is not None else None
     overage_disabled_reason = (
         getattr(info, "overage_disabled_reason", None) if info is not None else None

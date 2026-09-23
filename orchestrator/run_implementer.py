@@ -2238,7 +2238,6 @@ async def _run_implementer_agent(
     # deadline that fires during `ClaudeSDKClient.__aenter__` never assigns it.
     client: Any = None
 
-
     # The latest `rejected` RateLimitEvent seen on the stream, if any --
     # enrichment for the terminal 429 check below, since the CLI is not
     # guaranteed to emit one before the closing ResultMessage
@@ -2572,13 +2571,16 @@ def review_feedback_one(
             adopted=adopted,
             service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}"),
         )
-        anyio.run(
-            functools.partial(
-                _run_implementer_agent,
-                envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
-            ),
-            target, prompt, ref.proposal_dir.resolve(),
-        )
+        try:
+            anyio.run(
+                functools.partial(
+                    _run_implementer_agent,
+                    envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
+                ),
+                target, prompt, ref.proposal_dir.resolve(),
+            )
+        except RateLimitExhaustedError as exc:
+            _keep_commits_past_late_rate_limit(exc, target, base=old_head)
 
         # 6. Did the agent commit anything new (beyond the captured pre-SDK SHA)?
         if not _has_new_commits(target, base=old_head):
@@ -2758,6 +2760,26 @@ def review_feedback_one(
                 shutil.rmtree(target)
             except OSError:
                 pass
+
+
+def _keep_commits_past_late_rate_limit(
+    exc: RateLimitExhaustedError, repo_dir: Path, base: str = "origin/HEAD"
+) -> None:
+    """Re-raise a 429 unless the agent already committed (mctl-agents#364).
+
+    Quota windows are wall-clock, so one can run out on a later turn or during
+    the sub-agent drain, after the work is already in the worktree. Raising
+    there would roll the proposal back to `accepted` and discard the tmp clone,
+    commits and all -- the same loss the `drain_completed` branch of
+    `_run_implementer_agent` avoids. With new commits, the git check below
+    adjudicates exactly as for a run that ended normally.
+    """
+    if not _has_new_commits(repo_dir, base=base):
+        raise exc
+    print(
+        f"warn: rate limited after the agent committed ({exc}); "
+        f"proceeding on the commits already in the worktree"
+    )
 
 
 def _has_new_commits(repo_dir: Path, base: str = "origin/HEAD") -> bool:
@@ -3394,6 +3416,8 @@ def _stale_source_message(ref: ProposalRef, verdict: SourceIssueVerdict) -> str:
         "make it runnable again."
     )
     return message
+
+
 def _mark_rate_limited(
     ref: ProposalRef,
     *,
@@ -3889,10 +3913,13 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             ref, service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}")
         )
         budget_ledger = CommandBudgetLedger()
-        anyio.run(
-            functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
-            target, prompt, ref.proposal_dir.resolve(),
-        )
+        try:
+            anyio.run(
+                functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
+                target, prompt, ref.proposal_dir.resolve(),
+            )
+        except RateLimitExhaustedError as exc:
+            _keep_commits_past_late_rate_limit(exc, target)
         print(f"info: command budget ledger: {budget_ledger.describe()}")
 
         # 6. Did the agent actually commit something?

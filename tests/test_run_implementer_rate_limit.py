@@ -175,6 +175,7 @@ def _rig_implement_one_up_to_the_sdk_call(monkeypatch, tmp_path: Path, *, raiser
     monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a: tmp_path / "clone")
     monkeypatch.setattr(run_implementer, "_run", lambda *_a, **_kw: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: False)
     monkeypatch.setattr(run_implementer.anyio, "run", raiser)
 
 
@@ -397,6 +398,62 @@ def test_rate_limited_block_is_cleared_on_success(tmp_path, monkeypatch) -> None
     assert "rate_limited" not in read_status(ref)
 
 
+def test_late_rate_limit_after_commits_keeps_the_work(tmp_path, monkeypatch) -> None:
+    """A 429 on a later turn or during the drain, after the agent committed,
+    must not roll the proposal back and discard the clone: the run proceeds
+    to the push and PR exactly like one that ended normally."""
+    ref = make_ref(tmp_path)
+    _rig_implement_one_up_to_the_sdk_call(monkeypatch, tmp_path, raiser=_raise_rate_limited())
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a: [])
+    pushed: list[str] = []
+
+    def _push(target, ref_, **_kw):
+        pushed.append(ref_.slug)
+        return "https://github.com/mctlhq/mctl-agents/pull/1"
+
+    monkeypatch.setattr(run_implementer, "_push_and_open_pr", _push)
+
+    result = run_implementer.implement_one(ref)
+
+    assert pushed == [ref.slug]
+    assert result.rate_limited is False
+    assert result.pr_url == "https://github.com/mctlhq/mctl-agents/pull/1"
+    assert "rate_limited" not in read_status(ref)
+
+
+def test_keep_commits_past_late_rate_limit_reraises_without_commits(tmp_path, monkeypatch) -> None:
+    exc = run_implementer.RateLimitExhaustedError("429", _observation())
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: False)
+    with pytest.raises(run_implementer.RateLimitExhaustedError):
+        run_implementer._keep_commits_past_late_rate_limit(exc, tmp_path, base="abc")
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    run_implementer._keep_commits_past_late_rate_limit(exc, tmp_path, base="abc")
+
+
+def test_review_feedback_late_rate_limit_after_commits_is_not_rate_limited(tmp_path, monkeypatch) -> None:
+    """Same rule in review-feedback mode, judged against the pre-SDK SHA."""
+    ref = make_ref(tmp_path)
+    monkeypatch.setattr(run_implementer, "_clone_target", lambda *_a: tmp_path / "clone")
+    monkeypatch.setattr(run_implementer, "_branch_exists_on_origin", lambda *_a: True)
+    monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a: None)
+    monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
+    monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a: "abc123")
+    bases: list[str] = []
+
+    def _commits(_dir, base="origin/HEAD"):
+        bases.append(base)
+        return True
+
+    monkeypatch.setattr(run_implementer, "_has_new_commits", _commits)
+    monkeypatch.setattr(run_implementer.anyio, "run", _raise_rate_limited())
+
+    result = run_implementer.review_feedback_one(ref, {"p1": False, "p2": False, "summaries": []})
+
+    assert result.rate_limited is False
+    assert bases and bases[0] == "abc123"
+
+
 # ---------------------------------------------------------------------------
 # review-feedback mode
 # ---------------------------------------------------------------------------
@@ -407,6 +464,7 @@ def test_review_feedback_rate_limit_exit_code(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(run_implementer, "_checkout_existing_branch", lambda *_a: None)
     monkeypatch.setattr(run_implementer, "_stage_implementer_agent", lambda *_a: None)
     monkeypatch.setattr(run_implementer, "_capture_head_sha", lambda *_a: "abc123")
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: False)
     monkeypatch.setattr(run_implementer.anyio, "run", _raise_rate_limited())
 
     result = run_implementer.review_feedback_one(ref, {"p1": False, "p2": False, "summaries": []})
