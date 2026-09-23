@@ -26,6 +26,7 @@ inside that fake submit, so the snapshot it seals is the real one.
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -331,8 +332,6 @@ async def _end(env: WorkflowEnvironment, workflow_id: str) -> None:
 
 
 def _audit(out: str) -> list[dict]:
-    import json
-
     return [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(dx.AUDIT_PREFIX + " ")]
 
 
@@ -683,19 +682,27 @@ async def test_resume_onto_a_live_loop_is_refused_and_onto_a_finished_loop_conti
 # -- offline end to end ------------------------------------------------------
 
 
-async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatched_execution(
-    api, env, monkeypatch, tmp_path, capsys
-):
-    """request -> claim -> DevLoop start -> fulfil -> the investigator runs
-    under that `we_` -> a ContextSnapshot is sealed for that execution.
+# The investigate CWFT's optional parameters, as it forwards them: each one
+# becomes its flag only when non-empty (gitops#1279, gitops#1345).
+_CWFT_FORWARDED = ("work_item_id", "execution_id", "temporal_workflow_id", "temporal_run_id", "execution_request_id")
 
-    The investigate submit runs the REAL investigator with exactly the
-    arguments the CWFT builds from these parameters (`--issue-url`,
-    `--work-item-id`, `--execution-id`), against the same fake store."""
+
+def _run_real_investigator(params: dict, state_dir: Any) -> Any:
+    """What the investigate pod does with `params`: the real investigator,
+    handed exactly the flags the CWFT would build from them."""
+    from orchestrator.run_issue_investigator import investigate
+
+    forwarded = {name: params[name] for name in _CWFT_FORWARDED if params.get(name)}
+    return investigate(params["issue_url"], state_dir=state_dir, **forwarded)
+
+
+def _real_investigator_setup(monkeypatch, tmp_path) -> list[dict]:
+    """Enforce-mode work context, context assembly `on`, a stubbed clone and
+    agent; returns the list every posted proposal comment is appended to
+    (the real `post_proposal_comment`, with only `gh` captured)."""
     from datetime import UTC, datetime
 
     from orchestrator import run_issue_investigator
-    from orchestrator.run_issue_investigator import investigate
     from orchestrator.work_context import executions as ex
     from orchestrator.work_context import rollout
     from tests.test_run_issue_investigator import _investigate_harness
@@ -714,8 +721,39 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "a" * 40)
     monkeypatch.setattr(_Clock, "current", datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC))
     monkeypatch.setattr(run_issue_investigator.context_assembly, "datetime", _Clock)
+    real_comment = run_issue_investigator.post_proposal_comment
     _investigate_harness(tmp_path, monkeypatch, number=NUMBER, title="Dispatch acceptance", agent=_write_triplet)
+    comments: list[dict] = []
 
+    def capture_gh(cmd, **kw):
+        comments.append({"body": cmd[cmd.index("--body") + 1]})
+
+    def post(issue_url, service, slug, **kwargs):
+        # `_run` swapped only for the comment itself: everything else the
+        # investigator runs is untouched.
+        real_run = run_issue_investigator._run
+        run_issue_investigator._run = capture_gh
+        try:
+            real_comment(issue_url, service, slug, **kwargs)
+        finally:
+            run_issue_investigator._run = real_run
+
+    monkeypatch.setattr(run_issue_investigator, "post_proposal_comment", post)
+    return comments
+
+
+async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatched_execution(
+    api, env, monkeypatch, tmp_path, capsys
+):
+    """request -> claim -> DevLoop start -> fulfil -> the investigator runs
+    under that `we_` -> a ContextSnapshot is sealed for that execution.
+
+    The investigate submit runs the REAL investigator with exactly the
+    arguments the CWFT builds from these parameters (`--issue-url`,
+    `--work-item-id`, `--execution-id`, and the loop's own
+    `--temporal-workflow-id` / `--temporal-run-id` / `--execution-request-id`),
+    against the same fake store."""
+    comments = _real_investigator_setup(monkeypatch, tmp_path)
     runs: list[tuple[dict, Any]] = []
 
     @activity.defn(name="submit_and_wait")
@@ -723,9 +761,7 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
         if input.operation != "mctl-agents-investigate":
             return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
         p = input.params
-        result = investigate(
-            p["issue_url"], state_dir=tmp_path, work_item_id=p.get("work_item_id"), execution_id=p.get("execution_id")
-        )
+        result = _run_real_investigator(p, tmp_path)
         runs.append((dict(p), result))
         ok = result.error is None and result.skipped_reason is None
         return WorkflowResult(workflow_name="mctl-agents-investigate-e2e", phase="Succeeded" if ok else "Failed")
@@ -737,13 +773,17 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
         assert outcome.action == dx.FULFILLED
         await _wait_for(lambda: len(runs) == 1, limit=60)
         await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
-        state = await env.client.get_workflow_handle(loop_id).query(DevLoopWorkflow.work_context)
+        handle = env.client.get_workflow_handle(loop_id)
+        state = await handle.query(DevLoopWorkflow.work_context)
+        run_id = (await handle.describe()).run_id
         await _end(env, loop_id)
 
     we = outcome.execution_id
     params, result = runs[0]
-    # The investigator saw the dispatched identity, and nothing else.
+    # The investigator saw the dispatched identity, and its loop's own ids.
     assert params["work_item_id"] == WID and params["execution_id"] == we
+    assert params["temporal_workflow_id"] == loop_id and params["temporal_run_id"] == run_id
+    assert params["execution_request_id"] == rid
     assert result.error is None and result.skipped_reason is None, result
     # Exactly one execution: the dispatcher's, attached at fulfilment and
     # ended by the loop; the investigator attached none of its own.
@@ -754,11 +794,106 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     assert list(api.snapshots) == [we]
     wc = api.document(we)["work_context"]
     assert wc["work_item_id"] == WID and wc["execution_id"] == we and wc["execution_sequence"] == 1
+    # ...correlated to the loop that really ran it (#461 gap 2, #451), not
+    # to the issue-keyed loop the investigator would otherwise derive.
+    sealed = api.document(we)["execution"]
+    assert sealed["temporal_workflow_id"] == loop_id and sealed["temporal_run_id"] == run_id
+    # The approve instructions name that same loop.
+    assert len(comments) == 1
+    assert f"/dev-loop/{loop_id}/approve" in comments[0]["body"]
+    assert f"cli approve {loop_id} " in comments[0]["body"]
+    assert workflow_id_for(URL) not in comments[0]["body"]
     # The loop carries the same identity.
     assert state.work_item_id == WID and state.execution_id == we and state.execution_sequence == 1
     audit = _audit(capsys.readouterr().out)
     assert [a["event"] for a in audit] == ["claim", "start", "fulfil"]
     assert audit[-1]["execution_id"] == we
+
+
+async def test_a_dispatched_loop_recognises_the_clarification_its_own_investigator_sealed(
+    api, env, monkeypatch, tmp_path
+):
+    """#461 gap 2 / #451, end to end: the real investigator, run with the
+    flags the CWFT builds from the dispatched loop's params, seals the
+    correlation a clarification request carries; the `dev-loop-xr_*` loop
+    must take that request as its own and park on it.
+
+    Before the loop passed its ids, the investigator stamped the issue-keyed
+    `dev-loop-mctlhq-<repo>-<n>`, and `_await_human_input` retired the
+    request as a foreign execution's: the clarification was silently lost
+    and the loop went on to the approval park."""
+    from datetime import UTC, datetime
+
+    from orchestrator import human_input as hi
+    from orchestrator.context_snapshot import ExecutionCorrelation
+
+    _real_investigator_setup(monkeypatch, tmp_path)
+    requests: list[str | None] = [None]
+    runs: list[dict] = []
+
+    @activity.defn(name="submit_and_wait")
+    async def submit(input: SubmitAndWaitInput) -> WorkflowResult:
+        if input.operation != "mctl-agents-investigate":
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+        p = dict(input.params)
+        runs.append(p)
+        result = _run_real_investigator(p, tmp_path)
+        assert result.error is None and result.skipped_reason is None, result
+        if len(runs) == 1:
+            # The clarification the agent asked for in this run, sealed
+            # under the correlation this run's snapshot carries.
+            execution = ExecutionCorrelation.from_dict(api.document(p["execution_id"])["execution"])
+            now = datetime.now(UTC)
+            request = hi.seal_request(
+                work_item_id=WID,
+                execution=execution,
+                question="Library A or library B?",
+                reason="the issue names both",
+                response=hi.ResponseSpec(type="free_text"),
+                requested_from=hi.RequestedFrom(audience="work_item_owner", actor_refs=("github:alice",)),
+                created_at=now.isoformat(),
+                expires_at=(now + timedelta(days=7)).isoformat(),
+            )
+            requests[0] = json.dumps(request.to_dict())
+        return WorkflowResult(workflow_name="mctl-agents-investigate-e2e", phase="Succeeded")
+
+    rid = api.create_request("start")
+    loop_id = dispatched_workflow_id(rid)
+    async with _worker(env, submit, human_input_requests=requests):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        await _wait_for(lambda: len(runs) == 1, limit=60)
+        handle = env.client.get_workflow_handle(loop_id)
+        await _wait_for(lambda: requests[0] is not None, limit=60)
+        state = None
+        for _ in range(400):
+            state = await handle.query(DevLoopWorkflow.human_input_state)
+            if state.state == "WAITING_FOR_INPUT":
+                break
+            await anyio.sleep(0.05)
+        await _end(env, loop_id)
+
+    # The loop took the request as its own and parked on it...
+    assert state is not None and state.state == "WAITING_FOR_INPUT", state
+    assert state.request_id == json.loads(requests[0])["request_id"]
+    # ...because it carries this loop's id, not the issue-keyed one.
+    sealed = json.loads(requests[0])["execution"]
+    assert sealed["temporal_workflow_id"] == loop_id != workflow_id_for(URL)
+
+
+async def test_an_issue_keyed_loop_passes_its_own_ids_and_no_request_id(api, env):
+    """Every loop names itself to its investigator (#451: the run id retires a
+    same-id leftover); only a dispatched one has a request to name."""
+    submit, seen = _investigate_log()
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        handle = await env.client.start_workflow(
+            DevLoopWorkflow.run, IssueRef(issue_url=URL), id=wid, task_queue=TASK_QUEUE
+        )
+        await _wait_for(lambda: len(seen) == 1)
+        await _end(env, wid)
+    assert seen[0]["temporal_workflow_id"] == wid
+    assert seen[0]["temporal_run_id"] == handle.result_run_id
+    assert "execution_request_id" not in seen[0] and "execution_id" not in seen[0]
 
 
 async def test_the_investigator_refuses_a_dispatched_execution_of_another_item(api, monkeypatch, tmp_path):

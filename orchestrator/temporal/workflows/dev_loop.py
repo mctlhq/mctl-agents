@@ -1683,9 +1683,9 @@ class DevLoopWorkflow:
         # its TTL (claude P2 on #450). Three discriminators, any one retires:
         # a foreign workflow id (a different issue's document at this path),
         # a stamped run id that is not this run's (the producer receives this
-        # run's id in investigate_params), and — the one that actually fires
-        # for same-issue re-runs, where `workflow_id_for` makes the workflow
-        # id IDENTICAL and today's producer stamps no run id — a `created_at`
+        # run's id in investigate_params), and — the one that still fires
+        # for same-issue re-runs whose producer stamps no run id, where
+        # `workflow_id_for` makes the workflow id IDENTICAL — a `created_at`
         # that predates this execution's own start. A request this run's
         # investigator sealed cannot be older than the run; the slack absorbs
         # clock skew between the sealing container and Temporal. `created_at`
@@ -2085,16 +2085,26 @@ class DevLoopWorkflow:
             investigator_release = _require_release(
                 "issue-investigator", await _resolve("issue-investigator")
             )
-            # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
-            # NOT passed here yet — the investigate CWFT rejects undeclared
-            # parameters, so the template must declare it first (fail-closed:
-            # gitops before code). Until then the read path's retirement of
-            # same-issue leftovers rests on the `created_at`-vs-start-time
-            # check in `_await_human_input`.
             investigate_params = {"issue_url": issue.issue_url}
             if investigator_release and investigator_release.image_ref:
                 investigate_params["agent_image"] = investigator_release.image_ref
                 investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
+            # This loop's own ids (mctlhq/mctl-agents#461, #451), declared on
+            # the investigate CWFT by gitops#1345 and forwarded as
+            # --temporal-workflow-id / --temporal-run-id. The investigator
+            # names this loop in its approve instructions and stamps both on
+            # what it seals, so `_await_human_input` recognises the request as
+            # its own: a dispatched loop is `dev-loop-xr_*`, which the
+            # investigator cannot derive from the issue URL, and the run id
+            # retires a same-id leftover that the `created_at` check misses.
+            # Inert until mctl-api declares them (mctl-api#372 strips
+            # undeclared params). Replay-safe without a marker: activity
+            # input is not compared on replay (tests/test_workflow_replay.py,
+            # "an extra argument added to an existing activity"), and
+            # `workflow.info()` schedules no command.
+            loop_info = workflow.info()
+            investigate_params["temporal_workflow_id"] = loop_info.workflow_id
+            investigate_params["temporal_run_id"] = loop_info.run_id
             if dispatched is not None:
                 # The investigate CWFT's declared `work_item_id`/`execution_id`
                 # parameters (gitops#1279) become `--work-item-id`/`--execution-id`:
@@ -2103,6 +2113,9 @@ class DevLoopWorkflow:
                 # item about another issue (`work-item mismatch`).
                 investigate_params["work_item_id"] = self._work_item_id
                 investigate_params["execution_id"] = dispatched.execution_id
+                # Correlation only (gitops#1345's `execution_request_id`):
+                # the execution identity is still `execution_id`.
+                investigate_params["execution_request_id"] = str(issue.execution_request_id)
 
             investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
             await _record("issue-investigator", investigator_release, investigate_result, target_repo)

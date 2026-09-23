@@ -3771,6 +3771,9 @@ def _args(**overrides):
         surface=None,
         actor_kind=None,
         actor_id=None,
+        temporal_workflow_id=None,
+        temporal_run_id=None,
+        execution_request_id=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
