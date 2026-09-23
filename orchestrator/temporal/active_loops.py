@@ -29,6 +29,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from orchestrator.temporal.issue_ref import is_dispatched_workflow_id
+
 #: The memo key `start_dispatched_dev_loop` writes the issue-keyed workflow id
 #: under. A memo, not a search attribute: it is returned with every
 #: `list_workflows` row without registering anything on the Temporal server,
@@ -61,10 +63,12 @@ class ActiveLoops:
     #: (issue-keyed id, the real ids of the dispatched loops that carry it),
     #: sorted by alias.
     aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
-    #: Non-empty entries `index` could not read. Each one may be a live loop
-    #: this set cannot show, so a caller whose safety argument IS the active
-    #: set (the implement sweep) must treat a non-zero count as "possibly
-    #: owned" and run nothing; the others log it.
+    #: Entries that may be a live loop this set cannot attribute to a
+    #: proposal: a non-empty entry `index` could not read, and a dispatched
+    #: `dev-loop-xr_*` loop with no alias (its memo was missing or unreadable,
+    #: which the listing reports as a bare id). A caller whose safety argument
+    #: IS the active set (the implement sweep) must treat a non-zero count as
+    #: "possibly owned" and run nothing; the others log it.
     unreadable: int = 0
 
     def owners_of(self, issue_workflow_id: str | None) -> tuple[str, ...]:
@@ -72,7 +76,13 @@ class ActiveLoops:
         names, by its REAL id: the issue-keyed loop itself first (the answer
         these sweeps gave before #474), then any dispatched loop whose memo
         names that issue, sorted so the order does not depend on the listing.
-        Empty when nothing runs for it."""
+        Empty when nothing runs for it.
+
+        Deliberately no single-answer variant. More than one entry is a real
+        state (two execution requests for one issue, or an issue-keyed and a
+        dispatched loop together), and collapsing it to whichever id sorts
+        first would name the wrong loop in evidence. Each caller decides what
+        several owners mean for it."""
         if not issue_workflow_id:
             return ()
         owners: list[str] = []
@@ -82,11 +92,6 @@ class ActiveLoops:
             if alias == issue_workflow_id:
                 owners.extend(o for o in real_ids if o != issue_workflow_id)
         return tuple(owners)
-
-    def owner_of(self, issue_workflow_id: str | None) -> str:
-        """The first of `owners_of`, or ""."""
-        owners = self.owners_of(issue_workflow_id)
-        return owners[0] if owners else ""
 
 
 #: What one listing entry is on the wire, and what the consumer activities
@@ -140,6 +145,11 @@ def index(entries: Iterable[Any] | None) -> ActiveLoops:
         if entry is None:
             continue
         ids.add(entry.workflow_id)
+        if not entry.issue_workflow_id and is_dispatched_workflow_id(entry.workflow_id):
+            # A dispatched loop the listing could not attribute (no memo, or
+            # an unreadable one). Still a real id, for the sweeps that look
+            # loops up by id, but it may own any proposal, so it is counted.
+            unreadable += 1
         if entry.issue_workflow_id and entry.issue_workflow_id != entry.workflow_id:
             aliases.setdefault(entry.issue_workflow_id, set()).add(entry.workflow_id)
     return ActiveLoops(

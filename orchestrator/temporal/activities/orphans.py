@@ -64,7 +64,7 @@ def _sync_detect_orphans(
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
 
-        if active.owner_of(_expected_workflow_id(ref.slug, pr.repo, ref.service)):
+        if active.owners_of(_expected_workflow_id(ref.slug, pr.repo, ref.service)):
             continue
 
         reason = "No active DevLoopWorkflow found for open PR proposal"
@@ -125,7 +125,7 @@ async def _detect_from_github(active: active_loops.ActiveLoops) -> OrphanDetecti
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
 
-        if active.owner_of(_expected_workflow_id(ref.slug, pr.repo, ref.service)):
+        if active.owners_of(_expected_workflow_id(ref.slug, pr.repo, ref.service)):
             continue
 
         orphans.append(

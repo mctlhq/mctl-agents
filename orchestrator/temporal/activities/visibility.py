@@ -165,12 +165,12 @@ class VisibilityActivities:
                 loops.append(wf.id)
         if missing_alias:
             # A dispatched loop started before the memo existed, or one whose
-            # memo could not be read (logged above with its reason). None
-            # should exist: the dispatcher is off unless
-            # EXECUTION_REQUEST_DISPATCHER is set, and the start that writes
-            # the memo shipped with the fix. Said loudly rather than guessed
-            # at, because such a loop is invisible to the proposal lookups
-            # exactly as it was before #474.
+            # memo could not be read (logged above with its reason). It is
+            # emitted as a bare id, which `active_loops.index` counts as
+            # unattributable: the orphan and lifecycle sweeps cannot match it
+            # to its proposal, and the implement sweep holds back every
+            # unowned proposal while it runs rather than risk a second
+            # implementer run on the one it owns.
             activity.logger.warning(
                 "visibility: %d running dispatched DevLoop(s) carry no %r memo "
                 "and cannot be matched to their proposal: %s",

@@ -163,8 +163,8 @@ def _scan(
         # issue-keyed loop, or a dispatched `dev-loop-xr_*` loop whose memo
         # names it (#474). Missing the second one is how a loop still queued
         # for admission got a second implementer run from this sweep.
-        owner = active.owner_of(expected_dev_loop_id(ref.slug, None, ref.service))
-        if not owner and active.unreadable:
+        owners = active.owners_of(expected_dev_loop_id(ref.slug, None, ref.service))
+        if not owners and active.unreadable:
             # Fail CLOSED: an entry the index could not read may be the loop
             # that owns this proposal, and the active set is this sweep's
             # whole argument against a second implementer run.
@@ -172,8 +172,10 @@ def _scan(
                 (key, f"{active.unreadable} unreadable active-loop entr(y/ies); ownership unknown")
             )
             continue
-        if owner:
-            skipped.append((key, f"owned by the live DevLoopWorkflow {owner}"))
+        if owners:
+            # Every one of them, not the first: two loops on one issue is
+            # itself worth an operator's eye, and naming one would hide it.
+            skipped.append((key, f"owned by the live DevLoopWorkflow {', '.join(owners)}"))
             continue
 
         stranded.append(
@@ -212,7 +214,8 @@ async def find_stranded_accepted(
     (`active_loops.index`).
     """
     refs = await list_proposal_refs()
-    result = _scan(refs, active_loops.index(active_workflow_ids), grace_minutes, datetime.now(UTC))
+    active = active_loops.index(active_workflow_ids)
+    result = _scan(refs, active, grace_minutes, datetime.now(UTC))
     activity.logger.info(
         "implement-sweep: %d accepted proposal(s), %d stranded, %d skipped, "
         "%d quarantined unauthorized",
@@ -221,6 +224,16 @@ async def find_stranded_accepted(
         len(result.skipped),
         len(result.unauthorized),
     )
+    if active.unreadable:
+        # Without this line a persistently unreadable entry would disable the
+        # sweep while the summary above reads like a quiet healthy tick.
+        activity.logger.warning(
+            "implement-sweep: %d active-loop entr(y/ies) could not be attributed "
+            "to a proposal (unreadable, or a dispatched loop without its %r "
+            "memo); every unowned accepted proposal is held back this tick",
+            active.unreadable,
+            active_loops.ISSUE_WORKFLOW_ID_MEMO,
+        )
     for key, reason in result.unauthorized:
         activity.logger.warning(
             "UNAUTHORIZED %s: %s — quarantined from execution, needs human triage",

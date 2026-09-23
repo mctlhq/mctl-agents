@@ -335,8 +335,16 @@ def _live_id(ref: ProposalStateRef, repo: str | None, active: active_loops.Activ
     dispatched loop writes its records as `dev-loop-xr_*`: answering the
     alias would turn every healthy dispatched owner into a
     `conflicting-owner` escalation.
+
+    Several live loops for one proposal (two execution requests for one
+    issue, or an issue-keyed and a dispatched loop together) answer ALL of
+    them, comma-joined. That can equal no single record owner, so the table
+    escalates `conflicting-owner` (or `zero-owner-live-worker` with no
+    record) and its evidence names every candidate. Two loops on one entity
+    is the conflict that escalation exists for; picking one would name, in
+    the evidence, a loop that may not be the one the record names.
     """
-    return active.owner_of(_expected_workflow_id(ref.slug, repo, ref.service))
+    return ", ".join(active.owners_of(_expected_workflow_id(ref.slug, repo, ref.service)))
 
 
 async def _fill_ownership(

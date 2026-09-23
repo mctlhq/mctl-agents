@@ -55,6 +55,8 @@ def _loop(workflow_id: str, alias: str) -> dict[str, str]:
 
 
 DISPATCHED_LOOP = _loop(DISPATCHED, ISSUE_KEYED)
+#: A second execution request for the same issue.
+DISPATCHED_2 = dispatched_workflow_id("xr_47400000-0000-4000-8000-000000000475")
 
 
 @pytest.fixture
@@ -210,10 +212,10 @@ class TestTheWireShape:
 
 class TestTheIndex:
     def test_the_issue_keyed_loop_answers_for_itself(self):
-        assert active_loops.index([ISSUE_KEYED]).owner_of(ISSUE_KEYED) == ISSUE_KEYED
+        assert active_loops.index([ISSUE_KEYED]).owners_of(ISSUE_KEYED) == (ISSUE_KEYED,)
 
     def test_a_dispatched_loop_answers_by_its_real_id(self):
-        assert active_loops.index([DISPATCHED_LOOP]).owner_of(ISSUE_KEYED) == DISPATCHED
+        assert active_loops.index([DISPATCHED_LOOP]).owners_of(ISSUE_KEYED) == (DISPATCHED,)
 
     def test_the_alias_is_not_an_id(self):
         """The whole point: the alias must not appear where real ids do."""
@@ -226,7 +228,7 @@ class TestTheIndex:
 
     def test_empty_entries_name_no_loop(self):
         active = active_loops.index([ISSUE_KEYED, "", None])
-        assert active.owner_of(ISSUE_KEYED) == ISSUE_KEYED
+        assert active.owners_of(ISSUE_KEYED) == (ISSUE_KEYED,)
         assert active.ids == frozenset({ISSUE_KEYED})
         assert active.unreadable == 0
 
@@ -237,14 +239,29 @@ class TestTheIndex:
     def test_an_unrecognised_entry_is_counted_not_dropped(self, bad):
         active = active_loops.index([ISSUE_KEYED, bad])
         assert active.unreadable == 1
-        assert active.owner_of(ISSUE_KEYED) == ISSUE_KEYED
+        assert active.owners_of(ISSUE_KEYED) == (ISSUE_KEYED,)
 
     def test_the_index_is_frozen_all_the_way_down(self):
         active = active_loops.index([DISPATCHED_LOOP, ISSUE_KEYED])
         assert hash(active) == hash(active_loops.index([ISSUE_KEYED, DISPATCHED_LOOP]))
 
     def test_nothing_owns_a_slug_without_an_issue(self):
-        assert active_loops.index([DISPATCHED_LOOP]).owner_of(None) == ""
+        assert active_loops.index([DISPATCHED_LOOP]).owners_of(None) == ()
+
+    @pytest.mark.parametrize("entry", [DISPATCHED, {"workflow_id": DISPATCHED, "issue_workflow_id": ""}])
+    def test_a_dispatched_loop_without_an_alias_is_unattributable(self, entry):
+        """What the listing emits when the memo is missing or unreadable: a
+        real id (still found by id) that may own any proposal."""
+        active = active_loops.index([entry])
+        assert DISPATCHED in active.ids
+        assert active.unreadable == 1
+
+    def test_an_issue_keyed_bare_id_is_not_unattributable(self):
+        assert active_loops.index([ISSUE_KEYED, OTHER_ISSUE]).unreadable == 0
+
+    def test_two_dispatched_loops_on_one_issue_are_both_owners(self):
+        active = active_loops.index([_loop(DISPATCHED_2, ISSUE_KEYED), DISPATCHED_LOOP])
+        assert active.owners_of(ISSUE_KEYED) == tuple(sorted((DISPATCHED, DISPATCHED_2)))
 
 
 # --------------------------------------------------------------------------
@@ -285,6 +302,24 @@ class TestImplementSweep:
         result = await _sweep(env, monkeypatch, [ISSUE_KEYED])
         assert result.stranded == []
         assert ISSUE_KEYED in result.skipped[0][1]
+
+    async def test_a_dispatched_loop_with_no_readable_memo_fails_the_sweep_closed(
+        self, env, monkeypatch, caplog
+    ):
+        """The one unattributable input the listing really produces: a bare
+        `dev-loop-xr_*` id. It may be this proposal's loop."""
+        with caplog.at_level(logging.WARNING):
+            result = await _sweep(env, monkeypatch, [DISPATCHED])
+        assert result.stranded == []
+        assert "ownership unknown" in result.skipped[0][1]
+        # Said in the log, not only inside `skipped`.
+        assert any("could not be attributed" in r.getMessage() for r in caplog.records)
+
+    async def test_two_loops_on_one_issue_are_both_named(self, env, monkeypatch):
+        result = await _sweep(env, monkeypatch, [_loop(DISPATCHED_2, ISSUE_KEYED), DISPATCHED_LOOP])
+        assert result.stranded == []
+        reason = result.skipped[0][1]
+        assert DISPATCHED in reason and DISPATCHED_2 in reason
 
     async def test_an_unreadable_entry_fails_the_sweep_closed(self, env, monkeypatch):
         """It may be the loop that owns this proposal."""
@@ -449,6 +484,17 @@ class TestLifecycleReconcile:
         finding, writes = await _reconcile(monkeypatch, None, [DISPATCHED_LOOP])
         assert finding.reason == "zero-owner-live-worker"
         assert DISPATCHED in finding.evidence
+        assert writes == []
+
+    async def test_two_live_loops_escalate_naming_both(self, monkeypatch):
+        """The record names one of two dispatched loops for the issue. Two
+        loops on one entity is a conflict, and the evidence must name every
+        candidate, not whichever id sorts first (which could be the owner)."""
+        finding, writes = await _reconcile(
+            monkeypatch, DISPATCHED, [DISPATCHED_LOOP, _loop(DISPATCHED_2, ISSUE_KEYED)]
+        )
+        assert finding.reason == "conflicting-owner"
+        assert DISPATCHED in finding.evidence and DISPATCHED_2 in finding.evidence
         assert writes == []
 
     async def test_with_no_live_loop_it_stays_no_work(self, monkeypatch):
