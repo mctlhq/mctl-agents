@@ -201,6 +201,11 @@ def test_view_without_a_usable_record_is_unknown():
     ):
         assert wc.answer_from(200, broken).verdict == wc.WORK_ITEM_UNKNOWN, broken
     assert wc.answer_from(200, {"ok": True}).verdict == wc.WORK_ITEM_UNKNOWN
+    # The envelope's state_version must be a real int, not a bool that
+    # happens to compare equal.
+    true_envelope = _view(state_version=1)
+    true_envelope["state_version"] = True
+    assert wc.answer_from(200, true_envelope).verdict == wc.WORK_ITEM_UNKNOWN
     # A bool is not a state_version even when the envelope agrees with it.
     boolean = _view(state_version=True)
     boolean["state_version"] = True
@@ -226,6 +231,22 @@ def test_external_key_is_an_issue_url_only_when_it_is_one():
     # here too: http(s) and an optional trailing slash.
     for url in ("https://github.com/mctlhq/x/issues/3/", "http://github.com/mctlhq/x/issues/3"):
         assert wc.record_of(_view(external_key=url)).issue_url == url
+    assert wc.record_of(_view(external_key="https://github.com/örg/x/issues/3")).issue_url == ""
+
+
+def test_issue_url_rule_is_the_investigators_own():
+    """Pinned against run_issue_investigator's pattern text, which this
+    stdlib-only package cannot import."""
+    src = (Path(__file__).resolve().parent.parent / "orchestrator" / "run_issue_investigator.py").read_text()
+    urls = ("https://github.com/a/b/issues/1", "http://github.com/a/b/issues/1/", "https://github.com/örg/b/issues/1",
+            "https://github.com/a/b/pull/1", "https://github.com/a/b/issues/1#x", "https://gitlab.com/a/b/issues/1")
+    import re as _re
+
+    m = _re.search(r"_ISSUE_URL_RE = re\.compile\(\s*r\"(.+?)\"", src, _re.S)
+    assert m, "run_issue_investigator._ISSUE_URL_RE not found"
+    theirs = _re.compile(m.group(1))
+    for url in urls:
+        assert bool(theirs.match(url)) == bool(wc._ISSUE_URL_RE.match(url)), url
 
 
 def test_a_null_origin_surface_is_no_origin_not_a_broken_record():

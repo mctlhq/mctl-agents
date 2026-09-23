@@ -62,7 +62,7 @@ NOT_FOUND_CODE = "work_item_not_found"
 # issue URL, and only a value of that shape is read as `issue_url`. The same
 # definition as `run_issue_investigator._ISSUE_URL_RE` (http(s), optional
 # trailing slash), so the two never disagree about what an issue URL is.
-_ISSUE_URL_RE = re.compile(r"^https?://github\.com/[\w.-]+/[\w.-]+/issues/\d+/?$")
+_ISSUE_URL_RE = re.compile(r"^https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+/?$")
 
 # The four answers to "does this WorkItem exist, and is it usable" — the same
 # shape as orchestrator/lifecycle/contract.py's OWNED_BY_OTHER/OWNED_BY_ME/
@@ -387,7 +387,8 @@ def envelope_of(payload: Any) -> tuple[WorkItem | None, str]:
         return None, "no work item record in the response"
     if item.schema_version != SCHEMA_VERSION:
         return None, f"work item carries schema_version {item.schema_version!r}, want {SCHEMA_VERSION!r}"
-    if payload.get("state_version") != item.state_version:
+    envelope_version = payload.get("state_version")
+    if type(envelope_version) is not int or envelope_version != item.state_version:
         return None, (
             f"envelope state_version {payload.get('state_version')!r} is not the "
             f"work item's {item.state_version!r}"

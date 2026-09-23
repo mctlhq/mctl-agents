@@ -156,12 +156,22 @@ class WorkItemClient:
         executions, why = executions_from(ex.status, ex.payload, work_item_id)
         if executions is None:
             # `accepted` only when the store actually answered the read.
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=200 <= ex.status < 300)
+            return WorkItemAnswer(
+                verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=200 <= ex.status < 300 and not ex.body_empty
+            )
+        # The two reads must describe the same moment: the ledger ends on
+        # exactly the view's latest execution (or both are empty). An
+        # execution attached between the reads would otherwise overstate
+        # the ledger, and a stale ledger understate it.
         latest = latest_execution_id_of(res.payload)
-        if latest and latest not in {e.execution_id for e in executions}:
+        ledger_latest = executions[-1].execution_id if executions else ""
+        if ledger_latest != latest:
             return WorkItemAnswer(
                 verdict=WORK_ITEM_UNKNOWN,
-                reason=f"executions: the ledger lacks the view's latest execution {latest!r}",
+                reason=(
+                    f"executions: the ledger ends on {ledger_latest!r}, the view's latest "
+                    f"execution is {latest!r}; read again"
+                ),
                 accepted=True,
             )
         # v1 executions carry no surface/actor kinds, so the verdict the view

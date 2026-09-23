@@ -126,12 +126,27 @@ def test_a_failed_executions_read_is_unknown_never_an_understated_ledger(monkeyp
             # Accepted only when the store answered: a 2xx it could not use.
             assert answer.accepted is (executions is wrong_schema)
 
+    def _empty(req: Any) -> Any:
+        return _FakeResponse(b"")
+
+    answer = _client(monkeypatch, _routes(VIEW, _empty)).get(WID)
+    assert answer.verdict == WORK_ITEM_UNKNOWN and answer.accepted is False
+
 
 def test_a_ledger_missing_the_views_latest_execution_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     stale = _fixture("executions-two.json")
     stale["executions"] = stale["executions"][:1]
     answer = _client(monkeypatch, _routes(VIEW, stale)).get(WID)
-    assert answer.verdict == WORK_ITEM_UNKNOWN and "latest execution" in answer.reason
+    assert answer.verdict == WORK_ITEM_UNKNOWN and "latest" in answer.reason
+
+
+def test_a_ledger_newer_than_the_view_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An execution attached between the two reads overstates the ledger."""
+    answer = _client(monkeypatch, _routes(_fixture("get-waiting.json"), _fixture("executions-two.json"))).get(WID)
+    assert answer.verdict == WORK_ITEM_UNKNOWN and "read again" in answer.reason
+    view = _fixture("get-active-no-executions.json")
+    answer = _client(monkeypatch, _routes(view, _fixture("executions-two.json"))).get(WID)
+    assert answer.verdict == WORK_ITEM_UNKNOWN
 
 
 def test_an_answer_about_another_work_item_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

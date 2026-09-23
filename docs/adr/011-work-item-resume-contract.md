@@ -46,7 +46,10 @@ superseded | archived` (terminal: the last three), and the execution ledger
 from `GET /api/v1/work-items/{id}/executions`, read all or nothing. Any other
 `schema_version`, state or vocabulary value is `WORK_ITEM_UNKNOWN`. The test
 fixtures under `tests/fixtures/workitem/` are captured from mctl-api's own
-handlers.
+handlers. The ledger read relies on two mctl-api properties: attempts are
+dense `1..n`, and the executions route is unpaginated. If mctl-api changes
+either one, every read of an item with executions turns `WORK_ITEM_UNKNOWN`
+until this mirror follows.
 
 ### 2. `WorkContextRef` on `ContextSnapshot` — sibling correlation, not chaining
 
