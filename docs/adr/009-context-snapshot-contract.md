@@ -90,6 +90,7 @@ below is owned by exactly one component and every hash carries the
 | `sources` | `ContextSource[]` | assembler | every source considered, included or not |
 | `evidence_refs` | `EvidenceRef[]` | assembler, #199 owns the referent | pointers into the evidence store only |
 | `retention` | `RetentionPolicy` | assembler + the store that persists it | which store honours this snapshot and for how long |
+| `conflicts` | `ContextConflict[]` (optional) | assembler | sources a fixed rule found in conflict — amendment 1 (mctlhq/mctl-agents#471); absent when empty |
 
 **`ExecutionCorrelation`**
 
@@ -323,6 +324,82 @@ tool-call hook that does not exist. The contract's answer: a single
 `selector.mode: agent-directed` is contractually valid and honest. Per-file
 enumeration is an optional refinement a later retrieval implementation may
 add without a schema change — see follow-up (e) below.
+
+## Amendment 1 — conflicting evidence, ranking and freshness (mctlhq/mctl-agents#471)
+
+> **Status:** accepted (owner decision on mctlhq/mctl-agents#471, 2026-09-23:
+> D1 = B, D2 = yes, D3 = yes)
+
+This amendment adds one optional field and one closed vocabulary. It
+reopens nothing sec. 1–7 fixed: the existing field shape, the hash rule,
+the lifecycle, the boundary table and the freshness/trust vocabularies are
+unchanged, and it follows the field-growth rule of sec. 6 ("optional
+fields without an `apiVersion` bump").
+
+**`conflicts` — `ContextConflict[]`, optional, snapshot-level.**
+
+| Field | Type | Meaning |
+|---|---|---|
+| `subject` | str (1..128, `[a-z0-9._-]`) | a code naming the fixed rule that fired, e.g. `prior-proposal-superseded-by-later-comment`; never prose, never payload |
+| `source_ids` | str[] (2..64, distinct) | the `source_id`s of every source involved, in rank order; each must be a source of this snapshot |
+| `resolution_code` | str | closed set: `kept-all-ranked-by-trust-freshness-recency` |
+
+*Hashing.* `conflicts` enters `content_hash` **only when non-empty**, and
+`to_dict()` omits it when empty — the same rule `work_context` already
+follows (`_content_payload`). A snapshot with no conflict therefore keeps
+its canonical bytes and its `snapshot_id`; every snapshot sealed before
+this amendment is such a snapshot. `from_dict` accepts the key and rejects
+any unknown key inside a conflict. `to_log_dict()` adds `conflict_count`
+only when present — a count, never the sources.
+
+*Detection is a fixed rule, not a model.* The only rule today: a prior
+proposal whose `.status.yaml` `updated_at` is strictly earlier than an issue
+comment's `created_at` was written without that comment, so the comment
+supersedes it. The conflict names every prior-proposal source and every
+such later comment. A proposal with no readable `updated_at` cannot be dated
+and never fires the rule. No text is compared and no semantic contradiction
+is inferred.
+
+*Resolution never drops silently.* Every source in a conflict is kept,
+ordered by trust tier, then freshness, then recency; the budget or
+deduplication may still exclude one, recorded as `budget-exhausted` /
+`duplicate-content` like any other, and the conflict record keeps naming it.
+A conflict names at most `MAX_CONFLICT_SOURCE_IDS` (64) sources: every
+prior-proposal document, then the newest later comments. In `on` mode the
+investigator prompt carries a `### Conflicting evidence` notice built from
+source ids and codes only: it keeps the superseded proposal documents and the
+superseding comments apart, names as present only the members actually in the
+prompt, lists any excluded member with its reason code, and omits a conflict
+whose two sides are not both in the prompt.
+
+**Strategy `trust-freshness-ranked` 1.0.0** (ranker `trust-freshness-recency`
+1.0.0), opt-in via `ISSUE_INVESTIGATOR_CONTEXT_STRATEGY`; the default stays
+`deterministic-fixed-order` 1.0.0, byte-for-byte:
+
+- the inline template, the issue and the target repo come first, in
+  collector order;
+- every other source is ordered by trust tier (`authoritative` →
+  `untrusted`), then freshness (`fresh`, `aging`, `unknown`, `stale`), then
+  recency (content time, newest first; undatable last), then collector order;
+- `strategy.ranker_name`/`ranker_version` and every `selection.score` are
+  recorded (`100` for the pinned kinds, otherwise `10 × trust step +
+  freshness step`, so the score orders exactly like trust-then-freshness);
+- the budget cuts from the bottom of that order (`apply_budget` is unchanged:
+  it already walks ascending rank).
+
+**Freshness.** GitHub-fetched sources keep time since retrieval. Under the
+ranked strategy a prior proposal's `freshness.observed_at` is its
+`.status.yaml` `updated_at` (its `retrieved_at` stays the retrieval time);
+without a readable `updated_at` it carries no `max_age_seconds` and so
+classifies `unknown`, never `fresh`. Under the ranked strategy a `stale`
+source is demoted by the order above and flagged `reason_code:
+stale-demoted`, not dropped. The default strategy keeps its retrieval-time
+observation and its `stale` drop, which is what keeps its snapshot ids
+unchanged.
+
+Trust still grants nothing (sec. 5): a tier orders what the model reads,
+never what anyone may do. Wiring promotion/rollback of strategies is
+mctlhq/mctl-agents#472; measuring them is #266.
 
 ## Alternatives
 

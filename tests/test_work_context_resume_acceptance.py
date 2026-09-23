@@ -572,7 +572,9 @@ def test_authority_is_re_resolved_on_resume_and_never_read_from_the_prior_snapsh
     monkeypatch.setenv(rollout.ENV_VAR, mode)
     e1, _ = _run_one(tmp_path, monkeypatch, api)
     c1 = api.document(e1)
-    assert set(c1) == cs._SNAPSHOT_KEYS
+    # `conflicts` (ADR 009 amendment 1, #471) is optional and omitted when
+    # empty, which it is for this default-strategy snapshot.
+    assert set(c1) == cs._SNAPSHOT_KEYS - {"conflicts"}
     assert set(c1["work_context"]) == set(cs.WorkContextRef(
         work_item_id="w", work_item_revision="", execution_id="e", execution_sequence=1).to_dict())
     offending = [k for k in _keys(c1) if any(w in k.lower() for w in _AUTHORITY_WORDS)]
