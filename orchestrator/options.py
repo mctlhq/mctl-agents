@@ -1,4 +1,5 @@
 """Build ClaudeAgentOptions for service agents and the mentor."""
+import functools
 import math
 import os
 import re
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import anyio
+import anyio.to_thread
 from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk.types import HookMatcher
 
@@ -882,6 +884,11 @@ class _PolicyCheckpointHook:
     A frozen dataclass rather than a closure so two builders resolving the
     same grants still compare `==` (see `_audit_pre_tool_use`'s docstring).
     Fails closed: any exception inside the hook is a deny, never a pass.
+
+    The checkpoint is synchronous and, with `MCTL_POLICY_APPROVALS=mctl-api`,
+    makes up to two blocking HTTP calls to mctl-api. It runs in a worker
+    thread so that wait blocks this one tool call, not the SDK's event loop
+    (its stdio transport and every other task on it).
     """
 
     grants: tuple[str, ...]
@@ -894,13 +901,14 @@ class _PolicyCheckpointHook:
                 return _deny("policy checkpoint: unreadable tool call")
             tool_name = str(input_data.get("tool_name") or "")
             tool_input = input_data.get("tool_input")
-            decision = policy_checkpoint.checkpoint(
+            decision = await anyio.to_thread.run_sync(functools.partial(
+                policy_checkpoint.checkpoint,
                 policy_checkpoint.MCP_TOOL_CALL,
                 tool_name,
                 tool_name.split("__")[1] if tool_name.count("__") >= 2 else "",
                 tool_input if tool_input is not None else {},
                 grants=self.grants,
-            )
+            ))
         except Exception as exc:  # noqa: BLE001 — fail closed
             return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
         if decision.permitted:
