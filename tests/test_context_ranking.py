@@ -527,8 +527,8 @@ def test_conflict_notice_renders_only_plain_token_ids():
     sealed = _seal_with(_conflict(subject="some-other-rule", source_ids=("issue", "target-repo")))
     assert ca.render_conflict_notice(sealed) == (
         "\n\n### Conflicting evidence\n\n"
-        "A fixed rule found these sources in conflict. The sources named as in conflict are "
-        "included above, ordered by trust tier, then freshness, then recency:\n\n"
+        "A fixed rule found these sources in conflict, ordered by trust tier, then "
+        "freshness, then recency:\n\n"
         "- some-other-rule: issue, target-repo.\n"
     )
     bad = cs.ContextConflict(
@@ -605,3 +605,40 @@ def test_notice_never_renders_a_source_id_that_is_not_a_plain_token():
     notice = ca.render_conflict_notice(sealed)
     assert "<x>" not in notice and "odd id" not in notice
     assert "- some-other-rule: issue, loki-mctl-api.\n" in notice
+
+
+def test_an_undatable_proposal_sorts_after_a_dated_peer_never_by_retrieval_time():
+    # Same kind, trust and freshness; the undated one's observed_at is the
+    # (newest) retrieval time, which must NOT be used as its recency.
+    dated = _cand("proposal-dir-design.md", kind="proposal-dir", tier="corroborated",
+                  staleness="unknown", content_time="2026-09-01T00:00:00Z")
+    undated = _cand("proposal-dir-requirements.md", kind="proposal-dir", tier="corroborated",
+                    staleness="unknown", content_time=None)
+    assert undated.observed_at == NOW_ISO
+    ordered = ca.rank_candidates([undated, dated])
+    assert [c.source_id for c in ordered] == ["proposal-dir-design.md", "proposal-dir-requirements.md"]
+
+
+def test_a_status_file_cut_by_the_read_ceiling_yields_no_timestamp(tmp_path):
+    proposal_dir = _proposal(tmp_path, status=None)
+    # The reader returns ceiling + 1 bytes. Place that cut right after "T12",
+    # so the kept prefix "2026-09-15T12" is itself a VALID (wrong) timestamp:
+    # 12:00 instead of the file's 12:30.
+    line = "updated_at: 2026-09-15T12:30:00Z\n"
+    keep = line.index(":30:00Z")
+    padding = "#" * (ca._STATUS_READ_CEILING + 1 - keep - 1) + "\n"
+    (proposal_dir / ".status.yaml").write_text(padding + line)
+    assert (padding + line)[: ca._STATUS_READ_CEILING + 1].endswith("updated_at: 2026-09-15T12")
+    assert ca.read_proposal_updated_at(proposal_dir) is None
+
+
+def test_the_conflict_cap_is_counted_in_the_metrics(tmp_path):
+    many = tuple(
+        (f"IC_{i:03d}", "u", f"2026-09-16T{i // 60:02d}:{i % 60:02d}:00Z", f"comment {i}") for i in range(80)
+    )
+    config = _ranked(max_comments=100, max_sources=200, max_bytes=10_000_000)
+    result = _assemble(_input(tmp_path, comments=many, proposal_dir=_proposal(tmp_path), config=config))
+    assert result.metrics.conflict_sources_capped == 80 - 62
+    assert result.metrics.to_log_dict()["conflict_sources_capped"] == 18
+    small = _assemble(_input(tmp_path / "x", comments=COMMENTS, proposal_dir=None, config=_ranked()))
+    assert small.metrics.conflict_sources_capped == 0

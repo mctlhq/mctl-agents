@@ -279,6 +279,7 @@ class AssemblyMetrics:
     snapshot: ContextSnapshot
     stale_demoted: int = 0
     conflict_count: int = 0
+    conflict_sources_capped: int = 0
 
     def to_log_dict(self) -> dict[str, Any]:
         return {
@@ -299,6 +300,7 @@ class AssemblyMetrics:
             "strategy_version": self.strategy_version,
             "stale_demoted": self.stale_demoted,
             "conflict_count": self.conflict_count,
+            "conflict_sources_capped": self.conflict_sources_capped,
             "snapshot": self.snapshot.to_log_dict(),
         }
 
@@ -465,7 +467,11 @@ def _epoch(value: str | None) -> float | None:
 
 
 def _recency(candidate: CandidateSource) -> float | None:
-    return _epoch(candidate.content_time or candidate.observed_at)
+    """The source's own content time, or `None` (sorted last). Never the
+    retrieval/observation time: that is the same moment for every source
+    fetched in one assembly, so falling back to it would rank an undatable
+    source as if it were the newest."""
+    return _epoch(candidate.content_time)
 
 
 def ranking_score(candidate: CandidateSource) -> float:
@@ -511,29 +517,30 @@ def rank_candidates(candidates: Sequence[CandidateSource]) -> list[CandidateSour
     return ordered
 
 
-def flag_stale(candidates: Sequence[CandidateSource]) -> int:
+def flag_stale(candidates: Sequence[CandidateSource]) -> None:
     """Ranked strategy: a stale source stays included — `rank_candidates`
     has already demoted it — and is flagged `reason_code="stale-demoted"`,
     so its staleness is visible in the snapshot instead of silently
-    removing it. Returns the number flagged."""
-    flagged = 0
+    removing it. The metric is counted later, after dedupe and the budget
+    (see `assemble`), so this returns nothing."""
     for candidate in candidates:
         if candidate.included and candidate.freshness_staleness == "stale":
             candidate.reason_code = "stale-demoted"
-            flagged += 1
-    return flagged
 
 
-def detect_conflicts(candidates: Sequence[CandidateSource]) -> list[ContextConflict]:
+def detect_conflicts(candidates: Sequence[CandidateSource]) -> tuple[list[ContextConflict], int]:
     """The one fixed conflict rule — no model, no text comparison: a prior
     proposal whose `.status.yaml` `updated_at` (its `content_time`) predates
     a later issue comment was written without that comment, so the comment
     supersedes it. Every source involved is kept and named, in rank order;
     nothing is dropped. A proposal with no readable `updated_at` cannot be
-    dated and so never fires the rule."""
+    dated and so never fires the rule.
+
+    Returns the conflicts and how many later comments the
+    `MAX_CONFLICT_SOURCE_IDS` cap left out of them (a metric, never hidden)."""
     proposals = [c for c in candidates if c.kind == "proposal-dir" and _epoch(c.content_time) is not None]
     if not proposals:
-        return []
+        return [], 0
     written = max(_epoch(c.content_time) or 0.0 for c in proposals)
     later = [
         c for c in candidates
@@ -543,10 +550,14 @@ def detect_conflicts(candidates: Sequence[CandidateSource]) -> list[ContextConfl
     # busy issue can never make `seal()` reject the snapshot: every proposal
     # document is kept, and of the later comments the newest (the ones that
     # supersede it most) fill the remaining slots.
+    # `len(proposals) <= len(TRIPLET_FILENAMES)` (3): `collect_prior_proposal`
+    # yields at most one candidate per triplet file, so `room` is always >= 61.
     room = MAX_CONFLICT_SOURCE_IDS - len(proposals)
-    later = sorted(later, key=lambda c: (-(_epoch(c.content_time) or 0.0), c.rank))[: max(0, room)]
+    ordered_later = sorted(later, key=lambda c: (-(_epoch(c.content_time) or 0.0), c.rank))
+    later = ordered_later[: max(0, room)]
+    capped = len(ordered_later) - len(later)
     if not later:
-        return []
+        return [], capped
     involved = sorted(proposals + later, key=lambda c: c.rank)
     return [
         ContextConflict(
@@ -554,7 +565,7 @@ def detect_conflicts(candidates: Sequence[CandidateSource]) -> list[ContextConfl
             source_ids=tuple(c.source_id for c in involved),
             resolution_code=CONFLICT_RESOLUTION_KEPT_RANKED,
         )
-    ]
+    ], capped
 
 
 _SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -610,8 +621,8 @@ def render_conflict_notice(snapshot: ContextSnapshot) -> str:
         return ""
     return (
         "\n\n### Conflicting evidence\n\n"
-        "A fixed rule found these sources in conflict. The sources named as in conflict are "
-        "included above, ordered by trust tier, then freshness, then recency:\n\n"
+        "A fixed rule found these sources in conflict, ordered by trust tier, then "
+        "freshness, then recency:\n\n"
         + "\n".join(lines) + "\n"
     )
 
@@ -772,7 +783,11 @@ def read_proposal_updated_at(proposal_dir: Path) -> str | None:
     module stays stdlib-only; the investigator's own writer
     (`_write_status_yaml`) emits exactly one such top-level line."""
     raw = _read_prior_proposal_file(proposal_dir / ".status.yaml", _STATUS_READ_CEILING)
-    if raw is None:
+    # The reader returns up to ceiling + 1 bytes: more than the ceiling means
+    # the file was cut, and a cut line could still parse as a shorter, wrong
+    # timestamp (`...T00:00:00+02:00` read as `...T00:00:00`). Our writer's
+    # file is a few hundred bytes, so an oversized one is not trusted at all.
+    if raw is None or len(raw) > _STATUS_READ_CEILING:
         return None
     match = _UPDATED_AT_LINE.search(raw.decode("utf-8", errors="replace"))
     if match is None:
@@ -976,6 +991,7 @@ def assemble(
     dropped_stale = 0
     stale_demoted = 0
     conflicts: list[ContextConflict] = []
+    conflict_sources_capped = 0
     if config.ranked:
         # mctlhq/mctl-agents#471: freshness first (the ranker orders by it),
         # then rank, then record conflicts and flag — never drop — stale.
@@ -983,7 +999,7 @@ def assemble(
             normalize(candidate)
             classify_freshness(candidate, assembly_input.now)
         candidates = rank_candidates(candidates)
-        conflicts = detect_conflicts(candidates)
+        conflicts, conflict_sources_capped = detect_conflicts(candidates)
         flag_stale(candidates)
         strategy = ContextStrategy(
             name=RANKED_STRATEGY_NAME,
@@ -1055,6 +1071,7 @@ def assemble(
         snapshot=snapshot,
         stale_demoted=stale_demoted,
         conflict_count=len(conflicts),
+        conflict_sources_capped=conflict_sources_capped,
     )
     return AssemblyResult(mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics)
 
