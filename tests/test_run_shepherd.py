@@ -3816,6 +3816,7 @@ def test_harness_code_is_not_in_the_deterministic_set() -> None:
         run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
         run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
         run_implementer.EXIT_OPERATION_TIMEOUT,
+        run_implementer.EXIT_POLICY_REFUSED,
     })
 
 

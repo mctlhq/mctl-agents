@@ -79,7 +79,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # orchestrator.temporal.issue_ref, neither of which pulls in
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
-from orchestrator import context_assembly, tracing
+from orchestrator import context_assembly, policy_checkpoint, tracing
 from orchestrator.context_snapshot import (
     MAX_PRIOR_EXECUTION_IDS,
     MAX_WORK_CONTEXT_ID_LENGTH,
@@ -1331,6 +1331,12 @@ def post_proposal_comment(
         "prefer the mctl-api endpoint, which takes the approver from the "
         "authenticated caller rather than from what the caller types."
     )
+    # The policy checkpoint (#197): on refusal PolicyRefused is raised and
+    # `gh` never runs. The body is recorded only as a digest.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_ISSUE_COMMENT, "comment", issue_url, {"body": body},
+        metadata={"service": service, "slug": slug},
+    ))
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 
 
@@ -2881,6 +2887,10 @@ def _investigate(
                 f"warn: proposal written, but `gh issue comment` failed "
                 f"(non-fatal): {e.stderr or e}"
             )
+        except policy_checkpoint.PolicyRefused as e:
+            # The checkpoint refused the comment (#197): it was not posted.
+            # Non-fatal for the same reason as a failed post.
+            print(f"warn: proposal written, but the policy checkpoint refused the issue comment: {e}")
 
         return InvestigateResult(service, slug, proposal_dir)
 

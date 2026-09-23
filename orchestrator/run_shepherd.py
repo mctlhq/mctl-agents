@@ -99,6 +99,7 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
+from orchestrator import policy_checkpoint
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
@@ -690,11 +691,18 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
         run_implementer.EXIT_NO_FOLLOWUP_COMMITS,
         run_implementer.EXIT_BRANCH_MISSING_ON_ORIGIN,
         run_implementer.EXIT_OPERATION_TIMEOUT,
+        # The policy checkpoint refused the follow-up push (#197). The same
+        # policy refuses the same push again, so it is charged and bounded.
+        run_implementer.EXIT_POLICY_REFUSED,
     })
     harness = frozenset({
         run_implementer.EXIT_ORPHANED_SUBAGENT,
         run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
         run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED,
+        # The policy checkpoint could not decide on the follow-up push
+        # (#197): the platform's failure, never the proposal's, and bounded
+        # because an unreachable or misconfigured approval store stays that way.
+        run_implementer.EXIT_POLICY_UNDECIDED,
     })
     return deterministic, harness
 
@@ -2526,9 +2534,21 @@ def trigger_review(pr: PRSnapshot) -> None:
     mode this function is designed to prevent.
     """
     pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
+    body = "@claude review"
     try:
-        _run(["gh", "pr", "comment", pr_ref, "--body", "@claude review"])
+        # The policy checkpoint (#197): on refusal PolicyRefused is raised
+        # and `gh` never runs; handled below like a failed post.
+        policy_checkpoint.require(policy_checkpoint.checkpoint(
+            policy_checkpoint.GITHUB_PR_COMMENT,
+            "comment:review-trigger",
+            pr_ref,
+            {"body": body, "head_sha": pr.head_sha},
+            metadata={"repo": pr.repo, "pr": str(pr.number)},
+        ))
+        _run(["gh", "pr", "comment", pr_ref, "--body", body])
         print(f"info: posted `@claude review` on {pr.repo}#{pr.number}")
+    except policy_checkpoint.PolicyRefused as e:
+        print(f"warn: not posting `@claude review` on {pr.repo}#{pr.number}: {e}")
     except (subprocess.CalledProcessError, OSError) as e:
         # OSError (e.g. FileNotFoundError when gh isn't on PATH) has no
         # .stderr attribute; fall back to str(e) via getattr.
@@ -2566,6 +2586,21 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
         "--match-head-commit", pr.head_sha,
         pr_ref,
     ]
+    # The policy checkpoint (#197), immediately before the merge: a refusal
+    # is answered like any other failed merge, as `wait`, and `gh` never
+    # runs. The head SHA is in the arguments, so an approval for one head
+    # never merges another.
+    try:
+        policy_checkpoint.require(policy_checkpoint.checkpoint(
+            policy_checkpoint.GITHUB_PR_MERGE,
+            "merge",
+            pr_ref,
+            {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
+            metadata={"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha},
+        ))
+    except policy_checkpoint.PolicyRefused as e:
+        print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
+        return (False, None)
     # Bypasses _run() (this is the one gh call this module makes outside
     # that wrapper), so it needs its own refresh: merge_pr() typically fires
     # after a review/fix cycle long enough to have crossed the token's
@@ -2599,6 +2634,18 @@ def _rerun_check_run(repo: str, run_id: str) -> bool:
     error) is logged and treated as "nothing to do this tick"; the infra
     counter still advances so the budget in process_one converges either way.
     """
+    # The policy checkpoint (#197): a refusal is "nothing to do this tick",
+    # exactly like a failed rerun, and `gh` never runs.
+    decision = policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_RUN_RERUN,
+        "rerun:failed",
+        f"{repo}/actions/runs/{run_id}",
+        {"repo": repo, "run_id": run_id, "failed_only": True},
+        metadata={"repo": repo, "run_id": run_id},
+    )
+    if not decision.permitted:
+        print(f"warn: not rerunning {run_id} --repo {repo}: policy {decision.verdict} ({decision.code})")
+        return False
     proc = _run(["gh", "run", "rerun", run_id, "--failed", "--repo", repo], check=False)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()

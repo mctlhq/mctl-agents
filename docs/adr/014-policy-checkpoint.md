@@ -97,6 +97,55 @@ code says what happened to it. Whether the action ran is therefore
   /operations/mctl-agents-investigate/execute`) decide before the transport
   runs. A refused dispatch is answered once, with its ack marker, and is not
   retried.
+- **The orchestrator's own GitHub mutations.** Each decides immediately
+  before its `gh` / `git` call, and a refusal means the command never runs:
+
+  | Site | Action kind | Operation | Target | Arguments (digest only) | On refusal |
+  |---|---|---|---|---|---|
+  | `run_implementer`: plain `git push -u` (a new branch, and also the fallback when the remote head could not be read, so the branch may exist on origin; the name describes the non-force command, not the remote) | `github.git.push` | `push:new-branch` | `mctlhq/<svc>:<branch>` | remote, branch, lease (empty) | new-branch driver: `needs-triage`, `failure.code: policy-refused`, `stage: policy` |
+  | `run_implementer`: `git push --force-with-lease` (adopting a dead attempt's branch, and the review follow-up) | `github.git.push` | `push:force-with-lease` | `mctlhq/<svc>:<branch>` | remote, branch, lease SHA | new-branch driver: as above. Review follow-up: `EXIT_POLICY_REFUSED` (53), which the shepherd charges as deterministic |
+  | `run_implementer`: `gh pr create` | `github.pull_request.create` | `create` | `mctlhq/<svc>` | title, body, head, base | new-branch driver: as above. Preflight (PR for an orphaned result branch): `GitHubPreflightError`, so the model does not run |
+  | `run_shepherd`: `gh pr merge --merge --match-head-commit` | `github.pull_request.merge` | `merge` | the PR URL | method, delete-branch, head SHA | `merge_pr` answers `(False, None)`, i.e. `wait`, like any failed merge |
+  | `run_shepherd`: `@claude review` comment | `github.pull_request.comment` | `comment:review-trigger` | the PR URL | body, head SHA | logged, best effort, like a failed post |
+  | `run_shepherd`: `gh run rerun --failed` | `github.actions.run.rerun` | `rerun:failed` | `<repo>/actions/runs/<id>` | repo, run id | `False`, "nothing to do this tick", like a failed rerun |
+  | `run_issue_investigator`: proposal comment | `github.issue.comment` | `comment` | the issue URL | body | warning; the investigation still succeeds, like a failed post |
+  | `run_issue_poller`: `gh issue edit --remove-label` | `github.issue.label` | `remove` | the issue URL | label | counted as a per-issue failure; the label stays, like a failed write |
+
+  The push is decided after the ExecutionClaim check, so a claim refusal
+  never spends an approval on a push that was not going to happen. The push
+  binds the branch and the lease it is fenced on, not the pushed commit:
+  the implementer does not read its local head at push time. A future rule
+  that gates a push behind an approval should add that SHA first. The merge
+  binds the head SHA, so an approval for one head never merges another.
+
+  The "on refusal" column is for an answer: DENY, or REQUIRE_APPROVAL
+  without a spent approval. An **undecided** decision (`evaluator_error`,
+  `identity_unavailable`, `approval_lookup_error`: the checkpoint could not
+  answer) is a platform failure and is never recorded as the item's
+  failure. In the implementer it is retryable: the review follow-up exits
+  `EXIT_POLICY_UNDECIDED` (54), which the shepherd classifies as `harness`,
+  so it never charges `review_attempts` but is bounded by
+  `MAX_HARNESS_FAILURES` (an unreachable or misconfigured approval store
+  stays undecided, and every retry is a paid model turn); the new-branch
+  driver hands the proposal back to `accepted` with no triage record and
+  reports a skip, not an error, so the tick stays green and the
+  `implement-fallback` account is not spent on it. That hand-back is
+  bounded the same way the verification-budget hand-back is: a
+  `policy_handbacks` tally in `.status.yaml` (its own counter, reset by a
+  successful run), and at `IMPLEMENT_MAX_POLICY_HANDBACKS` (3) consecutive
+  undecided attempts a terminal `needs-triage` with `failure.code:
+  policy-undecided`, also reported as a skip so the write that ends the loop
+  is committed (if only `gh pr create` was undecided, the retry's
+  preflight opens the PR for the pushed branch without a model run). The
+  other sites already treat both alike without recording anything against
+  the item: a merge waits, the review trigger, rerun and investigator
+  comment are best effort, and the poller keeps the label for the next
+  cycle.
+
+  `EXIT_POLICY_REFUSED` is deterministic, not transient: the shepherd's
+  transient arm re-runs the paid follow-up every tick with no counter, and
+  the same policy refuses the same push again, so the refusal is charged to
+  `MAX_REVIEW_ATTEMPTS` and stays bounded.
 
 Built-in policy `mctl-agents/policy/v1`:
 
@@ -106,6 +155,7 @@ Built-in policy `mctl-agents/policy/v1`:
 | the investigate operation | ALLOW |
 | sealing this execution's context snapshot (`mctl.work_item.write`, `seal:context-snapshot`; insert-only in mctl-api, #431) | ALLOW |
 | attaching this run's own engine run to its work item, or advancing that execution's phase (`mctl.work_item.write`, `attach:work-item-execution`; keyed by `(engine, engine_ref)` in mctl-api, #455) | ALLOW |
+| the orchestrator's own GitHub mutations above: `push:new-branch`, `push:force-with-lease`, `create`, `merge`, `comment:review-trigger`, `rerun:failed`, label `remove` (one rule each) | ALLOW |
 | mctl MCP reads (`get_`, `list_`, `read_`, `search_`, `describe_`, `whoami`, …) and the agent mutations `resolve_incident`, `acknowledge_incident` | ALLOW |
 | every other granted mctl MCP tool, including any added to mctl-api later | REQUIRE_APPROVAL |
 | anything else | DENY |
@@ -220,18 +270,21 @@ A workflow never holds a pod while it waits.
 2. **The mentor.** It has MCP tools but no hooks, and adding any hook makes it
    drainable (#366/#368). Until that is decided separately, its MCP calls are
    not governed.
-3. **Other GitHub mutations.** The implementer's pushes and PR creation,
-   the investigator's comment, the issue poller's label removal, and the
-   shepherd's merge, `@claude review` comment and CI rerun do not go
-   through the checkpoint yet. `run_implementer.py` and
-   `run_issue_investigator.py` are owned by open PRs (#409 and #422). Each
-   one becomes a one-line `require(checkpoint(...))` before its `_run`.
+3. **Other GitHub mutations.** Settled: every GitHub mutation the
+   orchestrator itself makes now goes through the checkpoint (§5). The
+   built-in policy allows each one, so nothing changes by default; whether
+   to gate the merge or the push behind REQUIRE_APPROVAL is a policy change,
+   not a code change. What remains is the agent's own shell (item 4), which
+   is not the orchestrator's call.
 
 4. **Bash as a second transport.** The builders that carry the MCP hook also
    grant `Bash`, and `gh` / `git` are on PATH, so a side effect this slice
    gates through MCP (or a GitHub mutation) is still reachable through a
-   shell command. This slice governs the MCP transport and the
-   orchestrator's own calls, not the shell. Governing it is a separate
+   shell command. The checkpoint governs the MCP transport and the
+   orchestrator's own calls (§5), not the shell. The implementer's pushes and
+   PR creation are the orchestrator's, after the agent's turn, so they are
+   governed; a `git push` or `gh` call the agent makes from Bash during its
+   turn is not. Governing it is a separate
    decision: either put Bash commands through the checkpoint (the existing
    Bash `PreToolUse` hooks are the place) or remove credentials from the
    agent's shell.
