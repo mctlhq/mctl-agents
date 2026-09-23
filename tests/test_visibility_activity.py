@@ -435,10 +435,8 @@ class TestListActiveDevLoopIds:
 
         ids = await env.run(acts.list_active_dev_loop_ids)
 
-        assert ids == [
-            {"workflow_id": wf_a.id, "issue_workflow_id": ""},
-            {"workflow_id": wf_b.id, "issue_workflow_id": ""},
-        ]
+        # Bare ids, exactly the pre-#474 `list[str]`, for loops with no alias.
+        assert ids == [wf_a.id, wf_b.id]
         assert client.queries == [ACTIVE_DEV_LOOPS_QUERY]
 
     async def test_running_only_is_part_of_the_query(self):

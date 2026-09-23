@@ -752,8 +752,7 @@ class TestVisibilityActivities:
         client = _FakeClient()
         acts = VisibilityActivities(client)
         ids = await env.run(acts.list_active_dev_loop_ids)
-        assert [e["workflow_id"] for e in ids] == ["dev-loop-mctlhq-mctl-web-10", "dev-loop-mctlhq-mctl-api-7"]
-        assert all(e["issue_workflow_id"] == "" for e in ids)
+        assert ids == ["dev-loop-mctlhq-mctl-web-10", "dev-loop-mctlhq-mctl-api-7"]
         assert client.query == ACTIVE_DEV_LOOPS_QUERY
         # Running-only is load-bearing: closed DevLoops are exactly the
         # orphan case detect_orphans exists to catch.

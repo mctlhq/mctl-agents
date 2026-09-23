@@ -11,7 +11,6 @@ import asyncio
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -145,7 +144,7 @@ async def _detect_from_github(active: active_loops.ActiveLoops) -> OrphanDetecti
 @activity.defn
 async def detect_orphans(
     state_dir_path: str = "",
-    active_workflow_ids: list[Any] | None = None,
+    active_workflow_ids: list[active_loops.ActiveLoopEntry] | None = None,
 ) -> OrphanDetectionResult:
     """Actionable proposals with an open PR and no DevLoopWorkflow running.
 
@@ -156,10 +155,18 @@ async def detect_orphans(
     distinguished "no orphans" from "never ran".
 
     `active_workflow_ids` is `list_active_dev_loop_ids`' result as the
-    workflow hands it through: `{workflow_id, issue_workflow_id}` entries, or
-    bare ids from a result recorded before #474 (`active_loops.index`).
+    workflow hands it through: bare ids, and `{workflow_id,
+    issue_workflow_id}` dicts for loops carrying the #474 alias
+    (`active_loops.index`).
     """
     active_set = active_loops.index(active_workflow_ids)
+    if active_set.unreadable:
+        # Reported, not failed on: at worst a false orphan line, which is
+        # what this sweep emits for an unknown owner anyway.
+        activity.logger.warning(
+            "detect_orphans: %d unreadable active-loop entr(y/ies) ignored",
+            active_set.unreadable,
+        )
 
     if state_dir_path:
         state_dir = Path(state_dir_path)

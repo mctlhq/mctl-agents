@@ -10,12 +10,14 @@ listing as an alias, and has every consumer match on the alias while reporting
 the real id.
 
 Every consumer test below builds the active set exactly as the listing
-activity returns it after the JSON round trip through the workflow: a list of
-`{workflow_id, issue_workflow_id}` dicts.
+activity returns it after the JSON round trip through the workflow: a bare id
+per loop without an alias, a `{workflow_id, issue_workflow_id}` dict per loop
+with one.
 """
 from __future__ import annotations
 
 import logging
+import typing
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -23,6 +25,7 @@ import pytest
 from temporalio.api.workflow.v1 import WorkflowExecutionInfo
 from temporalio.client import WorkflowExecution
 from temporalio.converter import DataConverter
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from orchestrator.lifecycle import rollout
@@ -47,7 +50,7 @@ REPO = "mctlhq/mctl-web"
 PR_ID = f"{REPO}#42"
 
 
-def _loop(workflow_id: str, alias: str = "") -> dict[str, str]:
+def _loop(workflow_id: str, alias: str) -> dict[str, str]:
     return {"workflow_id": workflow_id, "issue_workflow_id": alias}
 
 
@@ -133,7 +136,7 @@ class TestTheMemoRoundTrip:
 
         loops = await env.run(VisibilityActivities(listing).list_active_dev_loop_ids)  # type: ignore[arg-type]
 
-        assert loops == [DISPATCHED_LOOP, _loop(OTHER_ISSUE)]
+        assert loops == [DISPATCHED_LOOP, OTHER_ISSUE]
         assert listing.queries == [ACTIVE_DEV_LOOPS_QUERY]
 
     async def test_a_dispatched_loop_without_the_memo_is_listed_and_reported(self, env, caplog):
@@ -144,13 +147,70 @@ class TestTheMemoRoundTrip:
         with caplog.at_level(logging.WARNING):
             loops = await env.run(VisibilityActivities(listing).list_active_dev_loop_ids)  # type: ignore[arg-type]
 
-        assert loops == [_loop(DISPATCHED)]
+        assert loops == [DISPATCHED]
         assert any(DISPATCHED in r.getMessage() for r in caplog.records)
+
+    async def test_the_listing_is_plain_strings_without_a_memo(self, env):
+        """The rolling-deploy guarantee: with no dispatched loop running, the
+        payload is exactly the pre-#474 `list[str]`."""
+        listing = _ListClient([await _memo_for(ISSUE_KEYED, None), await _memo_for(OTHER_ISSUE, None)])
+
+        loops = await env.run(VisibilityActivities(listing).list_active_dev_loop_ids)  # type: ignore[arg-type]
+
+        assert loops == [ISSUE_KEYED, OTHER_ISSUE]
+        assert all(isinstance(e, str) for e in loops)
+
+    async def test_an_unreadable_memo_is_logged_with_its_reason(self, env, caplog):
+        row = await _memo_for(DISPATCHED, None)
+
+        async def _boom(*_a, **_k):
+            raise ApplicationError("codec exploded")
+
+        row.memo_value = _boom  # type: ignore[method-assign]
+        with caplog.at_level(logging.WARNING):
+            loops = await env.run(VisibilityActivities(_ListClient([row])).list_active_dev_loop_ids)  # type: ignore[arg-type]
+
+        assert loops == [DISPATCHED]
+        assert any("codec exploded" in r.getMessage() for r in caplog.records)
+
+
+def _hint(fn) -> Any:
+    return typing.get_type_hints(fn)["active_workflow_ids"]
+
+
+_CONSUMERS = [
+    stranded_act.find_stranded_accepted,
+    orphans_act.detect_orphans,
+    lr_act.reconcile_lifecycle_ownership,
+]
+
+
+class TestTheWireShape:
+    """Decoded by temporalio's own payload converter against the declared
+    parameter types, which is what a worker does before an activity body runs."""
+
+    def _roundtrip(self, value: Any, hint: Any) -> Any:
+        pc = DataConverter.default.payload_converter
+        return pc.from_payloads(pc.to_payloads([value]), [hint])[0]
+
+    @pytest.mark.parametrize("consumer", _CONSUMERS, ids=lambda f: f.__name__)
+    def test_a_mixed_list_decodes_under_the_new_consumer_signatures(self, consumer):
+        value = [ISSUE_KEYED, DISPATCHED_LOOP]
+        assert self._roundtrip(value, _hint(consumer)) == value
+
+    def test_a_plain_string_payload_decodes_against_the_old_annotation(self):
+        """An old worker's consumer declares `list[str]`."""
+        assert self._roundtrip([ISSUE_KEYED, OTHER_ISSUE], list[str]) == [ISSUE_KEYED, OTHER_ISSUE]
+
+    def test_a_dict_does_not_decode_against_the_old_annotation(self):
+        """Why the listing emits a dict ONLY for a loop with an alias."""
+        with pytest.raises(TypeError):
+            self._roundtrip([DISPATCHED_LOOP], list[str])
 
 
 class TestTheIndex:
     def test_the_issue_keyed_loop_answers_for_itself(self):
-        assert active_loops.index([_loop(ISSUE_KEYED)]).owner_of(ISSUE_KEYED) == ISSUE_KEYED
+        assert active_loops.index([ISSUE_KEYED]).owner_of(ISSUE_KEYED) == ISSUE_KEYED
 
     def test_a_dispatched_loop_answers_by_its_real_id(self):
         assert active_loops.index([DISPATCHED_LOOP]).owner_of(ISSUE_KEYED) == DISPATCHED
@@ -161,13 +221,27 @@ class TestTheIndex:
         assert ISSUE_KEYED not in active.ids
 
     def test_both_running_lists_the_issue_keyed_loop_first(self):
-        active = active_loops.index([DISPATCHED_LOOP, _loop(ISSUE_KEYED)])
+        active = active_loops.index([DISPATCHED_LOOP, ISSUE_KEYED])
         assert active.owners_of(ISSUE_KEYED) == (ISSUE_KEYED, DISPATCHED)
 
-    def test_bare_ids_from_a_result_recorded_before_474_still_index(self):
-        active = active_loops.index([ISSUE_KEYED, "", None, {"workflow_id": ""}])
+    def test_empty_entries_name_no_loop(self):
+        active = active_loops.index([ISSUE_KEYED, "", None])
         assert active.owner_of(ISSUE_KEYED) == ISSUE_KEYED
         assert active.ids == frozenset({ISSUE_KEYED})
+        assert active.unreadable == 0
+
+    @pytest.mark.parametrize(
+        "bad",
+        [{"workflow_id": ""}, {"issue_workflow_id": ISSUE_KEYED}, {"workflow_id": 7}, 42, ["x"]],
+    )
+    def test_an_unrecognised_entry_is_counted_not_dropped(self, bad):
+        active = active_loops.index([ISSUE_KEYED, bad])
+        assert active.unreadable == 1
+        assert active.owner_of(ISSUE_KEYED) == ISSUE_KEYED
+
+    def test_the_index_is_frozen_all_the_way_down(self):
+        active = active_loops.index([DISPATCHED_LOOP, ISSUE_KEYED])
+        assert hash(active) == hash(active_loops.index([ISSUE_KEYED, DISPATCHED_LOOP]))
 
     def test_nothing_owns_a_slug_without_an_issue(self):
         assert active_loops.index([DISPATCHED_LOOP]).owner_of(None) == ""
@@ -208,14 +282,15 @@ class TestImplementSweep:
         assert DISPATCHED in reason
 
     async def test_an_issue_keyed_loop_still_blocks_it(self, env, monkeypatch):
-        result = await _sweep(env, monkeypatch, [_loop(ISSUE_KEYED)])
+        result = await _sweep(env, monkeypatch, [ISSUE_KEYED])
         assert result.stranded == []
         assert ISSUE_KEYED in result.skipped[0][1]
 
-    async def test_a_bare_issue_keyed_id_still_blocks_it(self, env, monkeypatch):
-        """A tick that recorded the old listing result before the deploy."""
-        result = await _sweep(env, monkeypatch, [ISSUE_KEYED])
+    async def test_an_unreadable_entry_fails_the_sweep_closed(self, env, monkeypatch):
+        """It may be the loop that owns this proposal."""
+        result = await _sweep(env, monkeypatch, [{"workflow_id": DISPATCHED, "issue_workflow_id": 7}])
         assert result.stranded == []
+        assert "ownership unknown" in result.skipped[0][1]
 
     async def test_a_dispatched_loop_for_another_issue_does_not(self, env, monkeypatch):
         result = await _sweep(env, monkeypatch, [_loop(DISPATCHED, OTHER_ISSUE)])
@@ -268,7 +343,7 @@ class TestOrphans:
         assert result.orphans == []
 
     async def test_an_issue_keyed_loop_is_still_not_an_orphan(self, env, monkeypatch):
-        result = await _orphans_from_github(env, monkeypatch, [_loop(ISSUE_KEYED)])
+        result = await _orphans_from_github(env, monkeypatch, [ISSUE_KEYED])
         assert result.orphans == []
 
     async def test_a_dispatched_loop_for_another_issue_leaves_it_an_orphan(self, env, monkeypatch):
@@ -296,7 +371,7 @@ def _record(owner_id: str) -> dict[str, Any]:
     }
 
 
-async def _reconcile(monkeypatch, owner_id: str, active: list[Any]):
+async def _reconcile(monkeypatch, owner_id: str | None, active: list[Any]):
     import json
 
     import httpx
@@ -304,7 +379,7 @@ async def _reconcile(monkeypatch, owner_id: str, active: list[Any]):
     from orchestrator.temporal.activities import lifecycle as ownership_act
 
     real_client = httpx.AsyncClient
-    ownership = {PR_ID: _record(owner_id)}
+    ownership = {PR_ID: _record(owner_id)} if owner_id else {}
     writes: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -352,7 +427,7 @@ class TestLifecycleReconcile:
         assert writes == []
 
     async def test_an_issue_keyed_owner_is_still_left_alone(self, monkeypatch):
-        finding, _ = await _reconcile(monkeypatch, ISSUE_KEYED, [_loop(ISSUE_KEYED)])
+        finding, _ = await _reconcile(monkeypatch, ISSUE_KEYED, [ISSUE_KEYED])
         assert finding.action == "none"
 
     async def test_the_live_id_is_the_real_id(self):
@@ -366,6 +441,19 @@ class TestLifecycleReconcile:
         finding, _ = await _reconcile(monkeypatch, ISSUE_KEYED, [DISPATCHED_LOOP])
         assert finding.reason == "conflicting-owner"
         assert DISPATCHED in finding.evidence
+
+    async def test_a_dispatched_only_live_loop_needs_an_owner(self, monkeypatch):
+        """`_live_id` also feeds `needs_owner`: a dispatched loop running with
+        no ownership record is zero-owner live work, reported exactly as an
+        issue-keyed loop's is (escalated, never adopted), not `no-work`."""
+        finding, writes = await _reconcile(monkeypatch, None, [DISPATCHED_LOOP])
+        assert finding.reason == "zero-owner-live-worker"
+        assert DISPATCHED in finding.evidence
+        assert writes == []
+
+    async def test_with_no_live_loop_it_stays_no_work(self, monkeypatch):
+        finding, _ = await _reconcile(monkeypatch, None, [])
+        assert finding.reason == "no-work"
 
 
 # --------------------------------------------------------------------------
@@ -387,8 +475,10 @@ class TestThroughTheSweepWorkflow:
         monkeypatch.setattr(stranded_act, "list_proposal_refs", _refs)
 
         @activity.defn(name="list_active_dev_loop_ids")
-        async def listing() -> list[dict[str, str]]:
-            return [DISPATCHED_LOOP]
+        async def listing() -> list[active_loops.ActiveLoopEntry]:
+            # Mixed, as a real listing with one dispatched loop is: decoded by
+            # the worker against the real scan's declared signature.
+            return [OTHER_ISSUE, DISPATCHED_LOOP]
 
         fakes, received = _fake_activities()
         # Keep the fake counter, submit and record; swap in the new listing

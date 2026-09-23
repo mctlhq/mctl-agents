@@ -133,7 +133,7 @@ OUTCOME_HELD = "applied-still-held"
 
 @activity.defn
 async def reconcile_lifecycle_ownership(
-    active_workflow_ids: list[Any] | None = None,
+    active_workflow_ids: list[active_loops.ActiveLoopEntry] | None = None,
 ) -> LifecycleReconcileResult:
     """Examine every tracked entity's ownership record and repair what it can.
 
@@ -167,6 +167,14 @@ async def reconcile_lifecycle_ownership(
         [ref for ref in refs if ref.status not in TERMINAL_STATUSES]
     )
     active = active_loops.index(active_workflow_ids)
+    if active.unreadable:
+        # Logged, not failed on: an unreadable entry can only make a live
+        # loop look absent, which is the quiet direction here (no
+        # `needs_owner`, no conflict), never a write.
+        activity.logger.warning(
+            "lifecycle reconcile: %d unreadable active-loop entr(y/ies) ignored",
+            active.unreadable,
+        )
 
     observations = _observe(refs, snapshots, active)
     if not observations:

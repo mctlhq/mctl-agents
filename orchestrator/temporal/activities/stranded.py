@@ -39,7 +39,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 from temporalio import activity
 
@@ -165,6 +164,14 @@ def _scan(
         # names it (#474). Missing the second one is how a loop still queued
         # for admission got a second implementer run from this sweep.
         owner = active.owner_of(expected_dev_loop_id(ref.slug, None, ref.service))
+        if not owner and active.unreadable:
+            # Fail CLOSED: an entry the index could not read may be the loop
+            # that owns this proposal, and the active set is this sweep's
+            # whole argument against a second implementer run.
+            skipped.append(
+                (key, f"{active.unreadable} unreadable active-loop entr(y/ies); ownership unknown")
+            )
+            continue
         if owner:
             skipped.append((key, f"owned by the live DevLoopWorkflow {owner}"))
             continue
@@ -188,7 +195,7 @@ def _scan(
 
 @activity.defn
 async def find_stranded_accepted(
-    active_workflow_ids: list[Any], grace_minutes: int
+    active_workflow_ids: list[active_loops.ActiveLoopEntry], grace_minutes: int
 ) -> StrandedScanResult:
     """`accepted` proposals with no PR, no fresh attempt and no owning loop.
 
@@ -200,8 +207,9 @@ async def find_stranded_accepted(
     earlier.
 
     `active_workflow_ids` is `list_active_dev_loop_ids`' result as the
-    workflow hands it through: `{workflow_id, issue_workflow_id}` entries, or
-    bare ids from a result recorded before #474 (`active_loops.index`).
+    workflow hands it through: bare ids, and `{workflow_id,
+    issue_workflow_id}` dicts for loops carrying the #474 alias
+    (`active_loops.index`).
     """
     refs = await list_proposal_refs()
     result = _scan(refs, active_loops.index(active_workflow_ids), grace_minutes, datetime.now(UTC))

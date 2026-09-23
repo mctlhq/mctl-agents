@@ -13,7 +13,8 @@ time on a proposal whose dispatched loop is still queued.
 The fix is an alias, not a second id in the running set. The dispatcher's
 start (`start.start_dispatched_dev_loop`) records the issue-keyed id in the
 workflow's memo under `ISSUE_WORKFLOW_ID_MEMO`; the listing activity returns
-one `{workflow_id, issue_workflow_id}` entry per running loop; and every
+a bare id per loop without that memo and a `{workflow_id,
+issue_workflow_id}` dict per loop with it; and every
 consumer MATCHES on the alias but REPORTS the real id. Putting the alias into
 the running set as if it were an id would have been wrong: the lifecycle
 reconciler compares the id a record names (`dev-loop-xr_*`) with the live id,
@@ -25,7 +26,7 @@ over a list the workflow hands them, and their tests build that list by hand.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 #: The memo key `start_dispatched_dev_loop` writes the issue-keyed workflow id
@@ -51,10 +52,20 @@ class ActiveDevLoop:
 
 @dataclass(frozen=True)
 class ActiveLoops:
-    """The running set, indexed for `owners_of`. Build with `index`."""
+    """The running set, indexed for `owners_of`. Build with `index`.
+
+    Immutable all the way down (tuples, not a dict), so `frozen` means what
+    it says and the value hashes."""
 
     ids: frozenset[str] = frozenset()
-    by_alias: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    #: (issue-keyed id, the real ids of the dispatched loops that carry it),
+    #: sorted by alias.
+    aliases: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    #: Non-empty entries `index` could not read. Each one may be a live loop
+    #: this set cannot show, so a caller whose safety argument IS the active
+    #: set (the implement sweep) must treat a non-zero count as "possibly
+    #: owned" and run nothing; the others log it.
+    unreadable: int = 0
 
     def owners_of(self, issue_workflow_id: str | None) -> tuple[str, ...]:
         """Every running loop that works on the issue `issue_workflow_id`
@@ -67,7 +78,9 @@ class ActiveLoops:
         owners: list[str] = []
         if issue_workflow_id in self.ids:
             owners.append(issue_workflow_id)
-        owners.extend(o for o in self.by_alias.get(issue_workflow_id, ()) if o != issue_workflow_id)
+        for alias, real_ids in self.aliases:
+            if alias == issue_workflow_id:
+                owners.extend(o for o in real_ids if o != issue_workflow_id)
         return tuple(owners)
 
     def owner_of(self, issue_workflow_id: str | None) -> str:
@@ -76,34 +89,54 @@ class ActiveLoops:
         return owners[0] if owners else ""
 
 
+#: What one listing entry is on the wire, and what the consumer activities
+#: declare so temporalio decodes both shapes: a bare workflow id for a loop
+#: without an alias, a `{workflow_id, issue_workflow_id}` dict for one with.
+ActiveLoopEntry = str | dict[str, str]
+
+
+class _Unreadable(Exception):
+    pass
+
+
 def _entry(raw: Any) -> ActiveDevLoop | None:
     """One listing entry, in any shape a workflow history can hand back.
 
-    A bare string is what `list_active_dev_loop_ids` returned before #474;
-    a reconcile or sweep tick that recorded that result before the deploy and
-    replays its next activity on the new worker hands those strings through
-    unchanged. A dict is the new entry after the JSON round trip through the
-    workflow (which calls the activity by name, with no result type).
+    A bare string is an issue-keyed loop (and every entry the listing
+    returned before #474); a dict is a loop carrying the alias memo, after the
+    JSON round trip through the workflow (which calls the activity by name,
+    with no result type). None for an EMPTY entry, which names no loop;
+    `_Unreadable` for anything else, which might.
     """
+    if raw is None or raw == "":
+        return None
     if isinstance(raw, ActiveDevLoop):
         return raw
     if isinstance(raw, str):
-        return ActiveDevLoop(workflow_id=raw) if raw else None
+        return ActiveDevLoop(workflow_id=raw)
     if isinstance(raw, dict):
         workflow_id = raw.get("workflow_id")
-        if not isinstance(workflow_id, str) or not workflow_id:
-            return None
-        alias = raw.get("issue_workflow_id")
-        return ActiveDevLoop(workflow_id=workflow_id, issue_workflow_id=alias if isinstance(alias, str) else "")
-    return None
+        alias = raw.get("issue_workflow_id", "")
+        if isinstance(workflow_id, str) and workflow_id and isinstance(alias, str):
+            return ActiveDevLoop(workflow_id=workflow_id, issue_workflow_id=alias)
+    raise _Unreadable
 
 
 def index(entries: Iterable[Any] | None) -> ActiveLoops:
-    """Index the listing activity's result for the consumers."""
+    """Index the listing activity's result for the consumers.
+
+    Never raises on a bad entry: it is counted in `unreadable` instead, so
+    each consumer decides how to fail (the implement sweep closed, the
+    reporting sweeps by logging)."""
     ids: set[str] = set()
     aliases: dict[str, set[str]] = {}
+    unreadable = 0
     for raw in entries or ():
-        entry = _entry(raw)
+        try:
+            entry = _entry(raw)
+        except _Unreadable:
+            unreadable += 1
+            continue
         if entry is None:
             continue
         ids.add(entry.workflow_id)
@@ -111,5 +144,6 @@ def index(entries: Iterable[Any] | None) -> ActiveLoops:
             aliases.setdefault(entry.issue_workflow_id, set()).add(entry.workflow_id)
     return ActiveLoops(
         ids=frozenset(ids),
-        by_alias={alias: tuple(sorted(owners)) for alias, owners in aliases.items()},
+        aliases=tuple((alias, tuple(sorted(owners))) for alias, owners in sorted(aliases.items())),
+        unreadable=unreadable,
     )

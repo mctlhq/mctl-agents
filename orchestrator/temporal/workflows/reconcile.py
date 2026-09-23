@@ -112,8 +112,8 @@ class ReconcileWorkflow:
 
         if workflow.patched("orphan-active-ids"):
             try:
-                # One `{workflow_id, issue_workflow_id}` entry per running
-                # loop (#474); a bare id in a result recorded before that.
+                # A bare id per running loop, or a `{workflow_id,
+                # issue_workflow_id}` dict for one carrying the #474 alias.
                 active_ids: list[Any] = await workflow.execute_activity(
                     "list_active_dev_loop_ids",
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
