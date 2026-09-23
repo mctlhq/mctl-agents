@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -322,3 +323,25 @@ def test_client_reads_a_snapshot_through_the_real_route(monkeypatch):
 
     monkeypatch.setattr(client, "_request", _down)
     assert client.execution_snapshot(WID, E1).verdict == ws.SNAPSHOT_UNKNOWN
+
+
+def test_a_retry_at_a_later_second_is_a_replay_and_new_content_still_diverges(tmp_path, monkeypatch):
+    """An engine retry of the same execution runs minutes later, so every
+    source's `retrieved_at` / `freshness.observed_at` is restamped: not a
+    divergence (#431 acceptance, found by
+    tests/test_work_context_resume_acceptance.py). What a source observed
+    still counts: a different content hash is a divergence."""
+    monkeypatch.delenv("WORK_CONTEXT_ROLLOUT_MODE", raising=False)  # assemble only, no store
+    t0 = datetime(2026, 9, 23, 12, 0, 0, tzinfo=UTC)
+    first, retry = (
+        ca.assemble_investigator_context(**_assemble_kwargs(tmp_path, _work_context(), _NoCalls()), now=now).snapshot
+        for now in (t0, t0 + timedelta(seconds=90))
+    )
+    assert first.sources and first.sources[0].retrieved_at != retry.sources[0].retrieved_at
+    answer = ws.persist(retry, _Store(stored=cs.canonical_json(first.to_dict())))
+    assert answer.verdict == ws.SNAPSHOT_REPLAYED and answer.snapshot_id == "cs_stored"
+
+    changed = first.to_dict()
+    changed["sources"][0]["content_hash"] = "sha256:" + "0" * 64
+    answer = ws.persist(retry, _Store(stored=cs.canonical_json(changed)))
+    assert answer.verdict == ws.SNAPSHOT_DIVERGED and "differs in: sources" in answer.reason

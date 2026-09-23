@@ -174,15 +174,34 @@ def answer_from_read(status: int, payload: dict[str, Any], *, execution_id: str)
 _RETRY_VOLATILE = frozenset({"created_at", "snapshot_id", "content_hash"})
 
 
+def _retry_stable_source(source: Any) -> Any:
+    """One source without the moment this attempt observed it: collectors
+    stamp `retrieved_at` and `freshness.observed_at` with the assembly
+    clock, like `created_at`, so an engine retry minutes later restamps them
+    all. What was observed (`content_hash`, `byte_count`, the locator,
+    selection and `freshness.staleness`) still counts."""
+    if not isinstance(source, dict):
+        return source
+    stable = {k: v for k, v in source.items() if k != "retrieved_at"}
+    freshness = stable.get("freshness")
+    if isinstance(freshness, dict):
+        stable["freshness"] = {k: v for k, v in freshness.items() if k != "observed_at"}
+    return stable
+
+
 def _retry_stable(document: dict[str, Any]) -> dict[str, Any]:
     """`document` without what a retry may change: the volatile top-level
-    fields, and `work_context.resumed_from_snapshot_id` — a best-effort
+    fields, each source's observation timestamps (`_retry_stable_source`),
+    and `work_context.resumed_from_snapshot_id` — a best-effort
     convenience pointer (ADR 011 §2) whose lookup can fail on one attempt
     and succeed on the next."""
     stable = {k: v for k, v in document.items() if k not in _RETRY_VOLATILE}
     wc = stable.get("work_context")
     if isinstance(wc, dict):
         stable["work_context"] = {k: v for k, v in wc.items() if k != "resumed_from_snapshot_id"}
+    sources = stable.get("sources")
+    if isinstance(sources, list):
+        stable["sources"] = [_retry_stable_source(s) for s in sources]
     return stable
 
 
@@ -232,11 +251,11 @@ def persist(snapshot: ContextSnapshot, client: Any) -> SnapshotAnswer:
     snapshot carries a store execution.
 
     A retry of the same execution (an Argo pod retry) re-assembles the same
-    context with a new `created_at`, so its bytes differ from the stored
-    ones. That is not a divergence: ADR 009's content identity excludes
-    `created_at`. So a 409 is checked against the stored document, and
-    only a document that differs in anything but `created_at` is a real
-    divergence. The stored snapshot is never replaced."""
+    context with a new `created_at` (and, at a later second, new source
+    observation timestamps), so its bytes differ from the stored ones. That
+    is not a divergence. So a 409 is checked against the stored document,
+    and only a document that differs in more than `_retry_stable` removes
+    is a real divergence. The stored snapshot is never replaced."""
     work_context = snapshot.work_context
     if work_context is None or not is_store_execution(work_context.execution_id):
         return SnapshotAnswer(SNAPSHOT_SKIPPED, reason="not a store execution")
