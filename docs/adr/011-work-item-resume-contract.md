@@ -201,6 +201,22 @@ execution by `(work_item_id, engine, engine_ref)` (`POST
   store is down, another execution is active, the ledger moved) stops it
   where `blocks_on_unknown()` holds.
 
+**Who holds the non-terminal slot.** mctl-api allows at most one non-terminal
+execution per work item. Today the dev loop records no store execution, so
+when the investigator attaches its Argo run the slot is free. Once
+mctl-agents#461 dispatches work-item execution requests, the dispatcher
+creates the execution when it fulfils the request and hands its `we_` down.
+The investigator then uses it as-is (case a) and does not attach a second
+one. No layer may hold an open execution while a child layer attaches its
+own: that is a 409 `execution_active`, UNKNOWN, and refused from `enforce`.
+
+**Residual.** An attach whose answer is UNKNOWN (a transport error after the
+request was written, or a 2xx that does not describe our run) is not recorded
+as held, so this run never advances it. A primary/fallback pair self-heals,
+because it shares the engine ref. Any other stranded `Running` row has to be
+closed by the engine's exit path. Closing it blindly from here would instead
+create phantom ended rows on a plain 503.
+
 ## Alternatives
 
 1. **Reuse `StepRef` for cross-execution chaining.** Rejected: it would

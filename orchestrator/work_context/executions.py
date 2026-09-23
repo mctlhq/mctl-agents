@@ -90,7 +90,9 @@ class EngineRun:
 
 def engine_ref_from_env() -> tuple[EngineRun | None, str]:
     """The engine run named by the environment, or None and why not."""
-    engine = os.environ.get(ENGINE_ENV_VAR, "").strip() or ENGINE_ARGO
+    # Normalised like final_attempt() and rollout.mode(): a casing typo in a
+    # gitops env map must not cost the run its identity.
+    engine = os.environ.get(ENGINE_ENV_VAR, "").strip().lower() or ENGINE_ARGO
     if engine not in EXECUTION_ENGINES:
         return None, f"{ENGINE_ENV_VAR}={engine!r} is not one of {sorted(EXECUTION_ENGINES)}"
     for var in (ENGINE_REF_ENV_VAR, WORKFLOW_NAME_ENV_VAR):

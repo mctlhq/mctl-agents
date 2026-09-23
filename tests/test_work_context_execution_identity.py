@@ -502,3 +502,53 @@ def test_an_exception_still_ends_the_execution_and_propagates_unchanged(tmp_path
     assert [body["phase"] for body in store.attaches()] == (
         ["Running", "Failed"] if final == "true" else ["Running"]
     )
+
+
+@pytest.mark.parametrize(
+    ("resume_from", "expected"),
+    [
+        # A re-run of a resume under the same engine run: the resume target
+        # is this execution itself, never its own prior.
+        ("we_e2", ("we_e1",)),
+        # A ledger row recorded after this execution is not its prior either.
+        ("we_e3", ("we_e1",)),
+        # An older execution the ledger already lists is not duplicated.
+        ("we_e1", ("we_e1",)),
+        # A resume target the store has not recorded is carried as a prior.
+        ("we_unrecorded", ("we_e1", "we_unrecorded")),
+    ],
+)
+def test_resume_from_never_names_this_or_a_later_execution_as_prior(resume_from, expected):
+    from types import SimpleNamespace
+
+    from orchestrator import run_issue_investigator
+
+    ledger = tuple(
+        SimpleNamespace(execution_id=f"we_e{n}", sequence=n) for n in (1, 2, 3)
+    )
+    item = SimpleNamespace(executions=ledger)
+    canonical = SimpleNamespace(prior_execution_ids=("we_e1", "we_e2", "we_e3"))
+
+    prior = run_issue_investigator._prior_execution_ids(
+        canonical,
+        item,
+        execution_id="we_e2",
+        execution_sequence=2,
+        resume_from_execution_id=resume_from,
+    )
+
+    assert prior == expected
+
+
+@pytest.mark.parametrize("value", ["Argo", " ARGO ", "argo"])
+def test_engine_name_is_case_insensitive(monkeypatch, value):
+    from orchestrator.work_context import executions
+
+    monkeypatch.setenv(executions.ENGINE_ENV_VAR, value)
+    monkeypatch.setenv(executions.WORKFLOW_NAME_ENV_VAR, "mctl-agents-investigate-x")
+    monkeypatch.delenv(executions.ENGINE_REF_ENV_VAR, raising=False)
+
+    run, why = executions.engine_ref_from_env()
+
+    assert run is not None, why
+    assert run.engine == "argo"
