@@ -60,9 +60,12 @@ UNSUPPORTED_KIND = "unsupported_kind"
 #: Another DevLoop is already live for the item's issue; a second
 #: investigation of the same issue would race it for the same proposal.
 LOOP_ACTIVE = "loop_active"
-#: A resume whose item still has a live DevLoop. v1 does not deliver it; see
-#: `orchestrator.temporal.dispatcher` for why.
-RESUME_ONTO_LIVE_LOOP_UNSUPPORTED = "resume_onto_live_loop_unsupported"
+#: A resume the live DevLoop refused to accept. The loop's own reason, one of
+#: `resume`'s closed vocabulary (`work-item-mismatch`,
+#: `resume-already-pending`, `surface-or-actor-missing`,
+#: `surface-or-actor-unrecognised`), is appended after a colon. Refused
+#: before any fulfil, so no execution was minted for it.
+RESUME_REFUSED = "resume_refused"
 #: The run this request's workflow id names already ended without the
 #: request being fulfilled (it waited for fulfilment and gave up). Starting
 #: it again is refused by the reuse policy, and fulfilling the request with

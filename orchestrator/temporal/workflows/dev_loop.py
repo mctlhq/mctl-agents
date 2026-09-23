@@ -110,7 +110,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.implement_outcome import (
         pre_start_reason as render_pre_start_reason,
     )
-    from orchestrator.temporal.issue_ref import parse_issue_url
+    from orchestrator.temporal.issue_ref import parse_issue_url, resume_engine_ref
     from orchestrator.work_context.contract import (
         ACTOR_KINDS,
         SURFACE_KINDS,
@@ -283,6 +283,31 @@ DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY = RetryPolicy(
 #: whose start input carries an execution request, so no other history
 #: records it.
 EXECUTION_REQUEST_PATCH = "execution-request-dispatch"
+
+# A `resume` execution request delivered onto a LIVE loop (mctlhq/mctl-
+# agents#461, ADR 011 §8). The dispatcher hands the loop the request through
+# the `accept_execution_request` Update BEFORE it fulfils the request, so the
+# loop's own history is the durable "accepted, not yet bound" record; the
+# loop then binds the `we_` the fulfil mints (engine ref `<loop id>#<request
+# id>`, `issue_ref.resume_engine_ref`) and ends it. The patch id is recorded
+# where a delivery starts, so no history without a delivery records it.
+EXECUTION_REQUEST_RESUME_PATCH = "execution-request-resume"
+ACCEPT_EXECUTION_REQUEST_UPDATE = "accept_execution_request"
+#: The Update's only successful answer. A repeated request id answers it too.
+DELIVERY_ACCEPTED = "accepted"
+#: The validator's permanent refusal: the dispatcher rejects the request with
+#: `resume_refused:<reason>`, before any fulfil, so no `we_` is minted.
+RESUME_REFUSED_ERROR_TYPE = "ResumeRefused"
+#: The validator's transient refusal (the loop is not ready, or is ending):
+#: the dispatcher defers, and a later claim delivers or starts a continuation.
+RESUME_DEFERRED_ERROR_TYPE = "ResumeDeferred"
+# How long an exiting loop still waits for an accepted delivery's fulfilment.
+# The dispatcher fulfils within seconds of the Update, and re-checks the loop
+# after the fulfil (failing the execution itself when the loop has closed),
+# so this only has to cover one fulfil round trip. A request still open after
+# it is picked up by a later claim, which finds the loop closed and starts a
+# continuation instead.
+DELIVERY_EXIT_GRACE = timedelta(minutes=2)
 
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
 # state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
@@ -712,6 +737,38 @@ class ResumeRejection:
     execution_id: str = ""
     work_item_id: str = ""
     reason: str = ""
+    #: The execution request (`xr_...`) a refused DELIVERY carried
+    #: (mctlhq/mctl-agents#461); "" for a `resume` signal.
+    execution_request_id: str = ""
+
+
+@dataclass(frozen=True)
+class ResumeDelivery:
+    """A `resume` execution request, as the dispatcher delivers it onto a
+    live loop through the `accept_execution_request` Update
+    (mctlhq/mctl-agents#461). The request id, not a `we_`: the execution is
+    minted by the fulfil that follows an accepted delivery, and the loop
+    binds it itself. Provenance is the request's own: the surface it was
+    made on, and the human it was made by (mctl-api accepts a request only
+    from a person, or a surface relaying for its linked person)."""
+
+    execution_request_id: str
+    work_item_id: str
+    surface: str = ""
+    actor_kind: str = ""
+    actor_id: str = ""
+
+
+@dataclass(frozen=True)
+class OpenDelivery:
+    """An accepted delivery whose execution has not ended yet: carried
+    across continue-as-new, so a loop never forgets a request it said yes
+    to."""
+
+    delivery: ResumeDelivery
+    #: Whether accepting it changed the surface or the actor (and so cleared
+    #: the approval). Decided at acceptance, against the provenance then.
+    surface_transition: bool = False
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1265,14 @@ class MergeWatchResume:
     # so a hop that dropped it would accept an overlapping resume the
     # previous run had promised to reject.
     resume_pending: bool = False
+    # Execution requests delivered onto this loop (mctlhq/mctl-agents#461).
+    # `accepted_request_ids` is every request id any run of this loop said
+    # yes to, sorted (as `seen_execution_ids`): a re-sent Update reaches the
+    # NEXT run with a fresh Temporal update registry, so this set is what
+    # keeps it a no-op there. `open_deliveries` are the accepted ones still
+    # waiting for their fulfilment; the next run binds them.
+    accepted_request_ids: tuple[str, ...] = ()
+    open_deliveries: tuple[OpenDelivery, ...] = ()
 
     # --- Prior stage results. A continued run never re-runs investigate,
     # approve or implement, so the final DevLoopResult can only report
@@ -1320,6 +1385,23 @@ class DevLoopWorkflow:
         # would skip _watch_pr's `finally` and its lifecycle-ownership release.
         self._abandoned = False
         self._abandon_reason: str | None = None
+        # Resume delivery onto this live loop (mctlhq/mctl-agents#461). See
+        # `accept_execution_request`. `_issue_url` and `_initialized` are set
+        # by `run` before its first await (after the rehydration, on a
+        # continued run), so the validator can tell a loop that has its state
+        # from one still in the activation that starts it.
+        self._issue_url = ""
+        self._initialized = False
+        self._accepted_request_ids: set[str] = set()
+        self._open_deliveries: dict[str, OpenDelivery] = {}
+        self._delivery_tasks: dict[str, asyncio.Task[None]] = {}
+        # Set once the implement step is submitted: no approval gate is left
+        # ahead, so a delivered resume has no decision left to wait for.
+        self._gates_passed = False
+        # Set by `_settle_deliveries` right before this run ends (`_exiting`)
+        # or continues as new (`_hopping`).
+        self._exiting = False
+        self._hopping = False
 
     @workflow.query
     def implement_execution(self) -> ImplementExecutionState:
@@ -1410,17 +1492,79 @@ class DevLoopWorkflow:
         # and a subsequent resume is free to open a new window of its own.
         self._resume_pending = False
 
-    def _reject_resume(self, execution_id: str, work_item_id: str, reason: str) -> None:
-        """Record one rejection per (execution_id, reason). A retrying
-        surface callback re-delivering the same rejected payload — for the
-        days this workflow can legitimately stay open — must not grow
+    def _reject_resume(
+        self, execution_id: str, work_item_id: str, reason: str, *, execution_request_id: str = ""
+    ) -> None:
+        """Record one rejection per (execution_id, request id, reason). A
+        retrying surface callback re-delivering the same rejected payload —
+        for the days this workflow can legitimately stay open — must not grow
         workflow state or every `work_context` query response without
         bound."""
-        if any(r.execution_id == execution_id and r.reason == reason for r in self._resume_rejections):
+        if any(
+            r.execution_id == execution_id and r.execution_request_id == execution_request_id and r.reason == reason
+            for r in self._resume_rejections
+        ):
             return
         self._resume_rejections.append(
-            ResumeRejection(execution_id=execution_id, work_item_id=work_item_id, reason=reason)
+            ResumeRejection(
+                execution_id=execution_id,
+                work_item_id=work_item_id,
+                reason=reason,
+                execution_request_id=execution_request_id,
+            )
         )
+
+    @staticmethod
+    def _resume_provenance(surface_raw: object, actor_kind_raw: object, actor_id_raw: object) -> tuple[
+        SurfaceRef, ActorRef, str
+    ]:
+        """A resume's surface and actor, and why they refuse it ("" when they
+        do not). Shared by the `resume` signal and the
+        `accept_execution_request` Update, so both apply the same rules.
+
+        Fail closed on provenance, not open: a resume that does not say
+        where it comes from and who is acting cannot have its approval
+        semantics evaluated at all — accepting it would record an execution
+        while silently keeping the PREVIOUS actor's approval, the exact
+        cross-surface privilege inheritance #267 forbids. And the same
+        closed vocabularies the CLI enforces (_work_context_from_args): an
+        out-of-vocabulary kind would land in `work_context` query responses
+        and, mirrored back into a WorkItem, make `work_item_verdict_for` read
+        the whole item as UNKNOWN."""
+        surface = SurfaceRef(kind=surface_raw) if isinstance(surface_raw, str) and surface_raw else SurfaceRef()
+        actor = (
+            ActorRef(kind=actor_kind_raw, actor_id=actor_id_raw if isinstance(actor_id_raw, str) else "")
+            if isinstance(actor_kind_raw, str) and actor_kind_raw
+            else ActorRef()
+        )
+        if not surface.kind or not actor.kind:
+            return surface, actor, "surface-or-actor-missing"
+        if surface.kind not in SURFACE_KINDS or actor.kind not in ACTOR_KINDS:
+            return surface, actor, "surface-or-actor-unrecognised"
+        return surface, actor, ""
+
+    def _take_resume_provenance(self, surface: SurfaceRef, actor: ActorRef) -> bool:
+        """Adopt an accepted resume's provenance; True when it is a surface
+        or actor transition, which re-arms both approval gates.
+
+        No `self._executions` gate here: production starts
+        (orchestrator/temporal/start.py) construct IssueRef without a
+        work_item_id, so the seeded-execution list is empty for every real
+        loop and a gate on it made this transition inert exactly where it
+        matters. With no recorded baseline, `_current_surface`/
+        `_current_actor` are empty and any declared surface/actor differs
+        from them — the un-provable "same surface, same actor" case
+        deliberately counts as a transition (fail closed)."""
+        transition = (surface != self._current_surface) or (actor != self._current_actor)
+        if surface.kind:
+            self._current_surface = surface
+        if actor.kind:
+            self._current_actor = actor
+        if transition:
+            self._approved = False
+            self._approver = None
+            self._resume_pending = True
+        return transition
 
     async def _await_reapproval(
         self,
@@ -1535,45 +1679,17 @@ class DevLoopWorkflow:
             self._reject_resume(execution_id, work_item_id, "resume-already-pending")
             return
 
-        surface_raw = payload.get("surface")
-        surface = SurfaceRef(kind=surface_raw) if isinstance(surface_raw, str) and surface_raw else SurfaceRef()
-        actor_kind_raw = payload.get("actor_kind")
-        actor_id_raw = payload.get("actor_id")
-        actor = (
-            ActorRef(kind=actor_kind_raw, actor_id=actor_id_raw if isinstance(actor_id_raw, str) else "")
-            if isinstance(actor_kind_raw, str) and actor_kind_raw
-            else ActorRef()
+        # Rejected and recorded, never merely dropped (see _resume_provenance).
+        surface, actor, refusal = self._resume_provenance(
+            payload.get("surface"), payload.get("actor_kind"), payload.get("actor_id")
         )
-
-        # Fail closed on provenance, not open: a resume that does not say
-        # where it comes from and who is acting cannot have its approval
-        # semantics evaluated at all — accepting it would record an
-        # execution while silently keeping the PREVIOUS actor's approval,
-        # the exact cross-surface privilege inheritance #267 forbids. It is
-        # rejected and recorded, never merely dropped.
-        if not surface.kind or not actor.kind:
-            self._reject_resume(execution_id, work_item_id, "surface-or-actor-missing")
-            return
-
-        # Same closed vocabularies the CLI enforces (_work_context_from_args):
-        # an out-of-vocabulary kind would land in `work_context` query
-        # responses and, mirrored back into a WorkItem, make
-        # `work_item_verdict_for` read the whole item as UNKNOWN.
-        if surface.kind not in SURFACE_KINDS or actor.kind not in ACTOR_KINDS:
-            self._reject_resume(execution_id, work_item_id, "surface-or-actor-unrecognised")
+        if refusal:
+            self._reject_resume(execution_id, work_item_id, refusal)
             return
 
         self._work_item_id = self._work_item_id or work_item_id
         self._seen_execution_ids.add(execution_id)
-        # No `self._executions` gate here: production starts
-        # (orchestrator/temporal/start.py) construct IssueRef without a
-        # work_item_id, so the seeded-execution list is empty for every real
-        # loop and a gate on it made this transition inert exactly where it
-        # matters. With no recorded baseline, `_current_surface`/
-        # `_current_actor` are empty and any declared surface/actor differs
-        # from them — the un-provable "same surface, same actor" case
-        # deliberately counts as a transition (fail closed).
-        surface_transition = (surface != self._current_surface) or (actor != self._current_actor)
+        surface_transition = self._take_resume_provenance(surface, actor)
         self._executions.append(
             ExecutionRef(
                 execution_id=execution_id,
@@ -1583,14 +1699,211 @@ class DevLoopWorkflow:
                 surface_transition=surface_transition,
             )
         )
-        if surface.kind:
-            self._current_surface = surface
-        if actor.kind:
-            self._current_actor = actor
-        if surface_transition:
-            self._approved = False
-            self._approver = None
-            self._resume_pending = True
+
+    @workflow.update(name=ACCEPT_EXECUTION_REQUEST_UPDATE)
+    def accept_execution_request(self, delivery: ResumeDelivery) -> str:
+        """Accept a `resume` execution request onto this live loop
+        (mctlhq/mctl-agents#461, ADR 011 §8).
+
+        The dispatcher sends it with `update_id = the request id` BEFORE it
+        fulfils the request. Once accepted, the Update is in this loop's
+        history: that is the durable "accepted, not yet bound" record, so no
+        crash of the dispatcher can lose the request. The handler is
+        synchronous: it records the request and starts `_deliver`, which
+        binds the `we_` once the fulfil has minted it and ends that
+        execution. It must not wait for the bind itself: the dispatcher
+        fulfils only after this Update has answered.
+
+        Idempotent at two levels: Temporal answers a repeated update id in
+        the same run from its own registry without calling this handler, and
+        `_accepted_request_ids` (carried across continue-as-new, where that
+        registry is fresh) makes a repeated request id a no-op here.
+
+        The rules are the `resume` signal's (see `_validate_execution_request`),
+        and so is the approval semantics: a surface or actor transition
+        clears the approval AT ACCEPTANCE, so from the moment this loop says
+        yes to another actor's resume it cannot proceed on the previous
+        actor's approval. A resume never inherits an approval."""
+        rid = delivery.execution_request_id
+        if rid in self._accepted_request_ids:
+            return DELIVERY_ACCEPTED
+        surface, actor, _ = self._resume_provenance(delivery.surface, delivery.actor_kind, delivery.actor_id)
+        self._accepted_request_ids.add(rid)
+        self._work_item_id = self._work_item_id or delivery.work_item_id
+        opened = OpenDelivery(delivery=delivery, surface_transition=self._take_resume_provenance(surface, actor))
+        self._open_deliveries[rid] = opened
+        self._start_delivery(opened)
+        return DELIVERY_ACCEPTED
+
+    @accept_execution_request.validator
+    def _validate_execution_request(self, delivery: ResumeDelivery) -> None:
+        """Refuse before anything is recorded (a rejected Update writes no
+        history event), so the dispatcher can reject the request before a
+        `we_` is minted for a resume this loop would not take.
+
+        Two kinds of no, as `ApplicationError` types the dispatcher reads:
+        `ResumeDeferred` while this loop cannot decide yet or is ending (the
+        request stays claimed; a later claim delivers it, or finds the loop
+        closed and starts a continuation), and `ResumeRefused` with the
+        `resume` signal's own reasons, which reject it."""
+        rid, wid = delivery.execution_request_id, delivery.work_item_id
+
+        def refuse(error_type: str, reason: str) -> ApplicationError:
+            return ApplicationError(
+                f"execution request {rid}: {reason}", reason, type=error_type, non_retryable=True
+            )
+
+        if not isinstance(rid, str) or not rid.startswith("xr_") or not isinstance(wid, str) or not wid:
+            raise refuse(RESUME_REFUSED_ERROR_TYPE, "malformed-delivery")
+        if rid in self._accepted_request_ids:
+            return
+        # Before `run` has its state (the activation that starts this run, or
+        # the continue-as-new gap before the rehydration), every guard below
+        # would be vacuous: an empty binding accepts a foreign item, an empty
+        # set accepts a request the previous run already took.
+        if not self._initialized:
+            raise refuse(RESUME_DEFERRED_ERROR_TYPE, "loop-not-ready")
+        if self._exiting or self._hopping or self._abandoned:
+            raise refuse(RESUME_DEFERRED_ERROR_TYPE, "loop-ending")
+        if self._work_item_id and wid != self._work_item_id:
+            raise refuse(RESUME_REFUSED_ERROR_TYPE, "work-item-mismatch")
+        if self._open_deliveries or self._resume_pending:
+            raise refuse(RESUME_REFUSED_ERROR_TYPE, "resume-already-pending")
+        _, _, refusal = self._resume_provenance(delivery.surface, delivery.actor_kind, delivery.actor_id)
+        if refusal:
+            raise refuse(RESUME_REFUSED_ERROR_TYPE, refusal)
+
+    def _start_delivery(self, opened: OpenDelivery) -> None:
+        rid = opened.delivery.execution_request_id
+        self._delivery_tasks[rid] = asyncio.create_task(self._deliver(opened))
+
+    async def _deliver(self, opened: OpenDelivery) -> None:
+        """Bind an accepted delivery's `we_`, advance it through `Running`,
+        and end it (mctlhq/mctl-agents#461).
+
+        The execution is the resumed run of this loop up to its next
+        approval decision: `Succeeded` once the (re-armed) approval is
+        granted, or at once when no approval gate is left ahead (the
+        implement step was already submitted); `Failed` when the loop is
+        abandoned or ends any other way first (`_settle_deliveries`). A
+        terminal phase on every exit: while it is non-terminal mctl-api
+        refuses every other request for the item.
+
+        The wait for the fulfil never gives up while this loop runs: a
+        re-sent Update is answered from Temporal's registry, not by this
+        loop, so a later claim of the request would fulfil it for this loop
+        whatever this loop had decided. It polls in FULFILMENT_WAIT chunks
+        until the request is fulfilled (bind) or rejected (drop), and stops
+        only when the run hops (the delivery is carried) or ends (one last
+        DELIVERY_EXIT_GRACE poll)."""
+        delivery = opened.delivery
+        rid = delivery.execution_request_id
+        if not workflow.patched(EXECUTION_REQUEST_RESUME_PATCH):
+            # Only a history that took a delivery before this path existed
+            # could answer False, and none can: the Update is new with it.
+            self._end_delivery(opened, "unsupported")
+            return
+        engine_ref = resume_engine_ref(workflow.info().workflow_id, rid)
+        bind = BindInput(
+            work_item_id=delivery.work_item_id,
+            execution_request_id=rid,
+            engine_ref=engine_ref,
+            issue_url=self._issue_url,
+        )
+        bound: BoundExecution | None = None
+        while bound is None:
+            if self._hopping:
+                return  # still open: carried across the hop, bound by the next run
+            if self._exiting:
+                bound = await self._poll_delivery_bind(bind, DELIVERY_EXIT_GRACE, interruptible=False)
+                if bound is None:
+                    self._end_delivery(opened, "request-not-fulfilled")
+                    return
+                break
+            bound = await self._poll_delivery_bind(bind, FULFILMENT_WAIT, interruptible=True)
+        if not bound.bound:
+            # Rejected by the platform, or fulfilled for another loop (a
+            # re-claim that delivered elsewhere): no execution of ours exists.
+            self._end_delivery(opened, bound.outcome)
+            return
+        self._seen_execution_ids.add(bound.execution_id)
+        self._executions.append(
+            ExecutionRef(
+                execution_id=bound.execution_id,
+                sequence=bound.sequence,
+                temporal_workflow_id=engine_ref,
+                surface=SurfaceRef(kind=delivery.surface),
+                actor=ActorRef(kind=delivery.actor_kind, actor_id=delivery.actor_id),
+                surface_transition=opened.surface_transition,
+            )
+        )
+        await workflow.wait_condition(
+            lambda: self._abandoned or self._approved or self._gates_passed or self._exiting
+        )
+        decided = (self._approved or self._gates_passed) and not self._abandoned
+        phase = "Succeeded" if decided else "Failed"
+        policy = DISPATCHED_ADVANCE_RETRY_POLICY if decided and not self._exiting else FAST_ACTIVITY_RETRY_POLICY
+        await self._advance_dispatched_execution(
+            phase, retry_policy=policy, work_item_id=delivery.work_item_id, engine_ref=engine_ref
+        )
+        self._end_delivery(opened, "")
+
+    async def _poll_delivery_bind(
+        self, bind: BindInput, wait: timedelta, *, interruptible: bool
+    ) -> BoundExecution | None:
+        """One bounded wait for the fulfil: the bind activity retries until
+        the request is fulfilled or `wait` runs out (None). An interruptible
+        wait is cancelled as soon as the run starts to hop or end, so
+        neither waits out a whole FULFILMENT_WAIT."""
+        handle = workflow.start_activity(
+            bind_dispatched_execution,
+            bind,
+            start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+            schedule_to_close_timeout=wait,
+            retry_policy=FULFILMENT_POLL_RETRY_POLICY,
+        )
+        cancelled = False
+        if interruptible:
+            await workflow.wait_condition(lambda: handle.done() or self._exiting or self._hopping)
+            if not handle.done():
+                handle.cancel()
+                cancelled = True
+        try:
+            return await handle
+        except ActivityError:
+            return None
+        except asyncio.CancelledError:
+            if not cancelled:
+                raise
+            return None
+
+    def _end_delivery(self, opened: OpenDelivery, refusal: str) -> None:
+        """Close a delivery. The approval it cleared stays cleared (fail
+        closed); the pending window it opened ends with it, so a later
+        resume can be accepted."""
+        delivery = opened.delivery
+        self._open_deliveries.pop(delivery.execution_request_id, None)
+        if opened.surface_transition:
+            self._resume_pending = False
+        if refusal:
+            self._reject_resume(
+                "", delivery.work_item_id, f"delivery-{refusal}", execution_request_id=delivery.execution_request_id
+            )
+
+    async def _settle_deliveries(self, *, hopping: bool) -> None:
+        """Let every delivery of this run finish before the run ends
+        (`hopping=False`: each one binds within DELIVERY_EXIT_GRACE or lets
+        go, and a bound one ends `Failed` unless its decision was already
+        made) or continues as new (`hopping=True`: an unbound one stops and
+        is carried). No command and no await when this run took no
+        delivery, so no history without one changes shape."""
+        if not self._delivery_tasks:
+            return
+        if hopping:
+            self._hopping = True
+        else:
+            self._exiting = True
+        await workflow.wait_condition(lambda: all(t.done() for t in self._delivery_tasks.values()))
 
     @workflow.signal
     def human_input_response(self, *args: object) -> None:
@@ -1980,7 +2293,12 @@ class DevLoopWorkflow:
         return "" if landed else pending
 
     async def _advance_dispatched_execution(
-        self, phase: str, *, retry_policy: RetryPolicy = FAST_ACTIVITY_RETRY_POLICY
+        self,
+        phase: str,
+        *,
+        retry_policy: RetryPolicy = FAST_ACTIVITY_RETRY_POLICY,
+        work_item_id: str | None = None,
+        engine_ref: str | None = None,
     ) -> bool:
         """Best effort, like `_record`: a store that will not take the phase
         must not fail the loop. But an execution left non-terminal blocks
@@ -1993,11 +2311,18 @@ class DevLoopWorkflow:
 
         True when the store answered (the phase landed, or a definite
         refusal that no retry would change); False when every attempt failed
-        without an answer, so the caller can try again later."""
+        without an answer, so the caller can try again later.
+
+        `work_item_id`/`engine_ref` default to this loop's own dispatched
+        execution; a delivered resume passes its own (`<loop id>#<xr id>`)."""
         try:
             outcome = await workflow.execute_activity(
                 advance_dispatched_execution,
-                AdvanceInput(work_item_id=self._work_item_id, engine_ref=workflow.info().workflow_id, phase=phase),
+                AdvanceInput(
+                    work_item_id=self._work_item_id if work_item_id is None else work_item_id,
+                    engine_ref=workflow.info().workflow_id if engine_ref is None else engine_ref,
+                    phase=phase,
+                ),
                 start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
                 retry_policy=retry_policy,
             )
@@ -2026,6 +2351,27 @@ class DevLoopWorkflow:
 
     @workflow.run
     async def run(self, issue: IssueRef) -> DevLoopResult:
+        # Every exit of this run — a result, a failure, a cancellation —
+        # first settles the resume deliveries it accepted
+        # (mctlhq/mctl-agents#461), so each one's execution ends: none left
+        # `Pending`/`Running` behind a loop that no longer runs. Not
+        # BaseException: GeneratorExit and the SDK eviction teardown must
+        # unwind untouched (see `_fail_dispatched_execution`), and a
+        # continue-as-new (`ContinueAsNewError`, a BaseException) settled
+        # its deliveries itself, as a hop, before raising. Without a
+        # delivery nothing here awaits, so no history changes shape.
+        self._issue_url = issue.issue_url
+        if issue.resume is None:
+            self._initialized = True
+        try:
+            result = await self._run_loop(issue)
+        except (Exception, asyncio.CancelledError):
+            await self._settle_deliveries(hopping=False)
+            raise
+        await self._settle_deliveries(hopping=False)
+        return result
+
+    async def _run_loop(self, issue: IssueRef) -> DevLoopResult:
         # mctl-agents#404 v2: a continued run of a hopped merge watch. Every
         # OTHER start (external, or `USE_EXISTING` attaching to a running
         # execution) has `issue.resume is None` and falls through to the
@@ -2483,6 +2829,9 @@ class DevLoopWorkflow:
             if ended is not None:
                 return ended
 
+        # No approval gate is left from here on: a resume delivered from now
+        # (mctlhq/mctl-agents#461) has no decision to wait for.
+        self._gates_passed = True
         implement_result = await self._implement(implementer_release, implement_params, target_repo)
 
         # mctl-agents#420: an abandon signal arriving while _implement was running
@@ -2508,7 +2857,9 @@ class DevLoopWorkflow:
                 # The watch's own history grew large enough to hop
                 # (mctl-agents#404 v2). `_watch_pr` never re-runs investigate,
                 # approve or implement, so their results have to be carried
-                # here -- `_watch_pr` itself has no view of them.
+                # here -- `_watch_pr` itself has no view of them. Deliveries
+                # first: an unbound one is carried, not dropped (#461).
+                await self._settle_deliveries(hopping=True)
                 resume = self._carry_work_context(
                     dataclasses.replace(
                         outcome.resume,
@@ -2547,6 +2898,8 @@ class DevLoopWorkflow:
             current_actor=self._current_actor,
             resume_rejections=tuple(self._resume_rejections),
             resume_pending=self._resume_pending,
+            accepted_request_ids=tuple(sorted(self._accepted_request_ids)),
+            open_deliveries=tuple(self._open_deliveries[rid] for rid in sorted(self._open_deliveries)),
         )
 
     def _rehydrate_work_context(self, resume: MergeWatchResume) -> None:
@@ -2576,6 +2929,10 @@ class DevLoopWorkflow:
         # the gap executions it actually ACCEPTS — a rejected (foreign) gap
         # resume must not leave its window open.
         self._resume_pending = resume.resume_pending
+        # Deliveries (#461) need no gap re-check: the Update's validator
+        # defers until `_initialized`, so none was accepted in the gap.
+        self._accepted_request_ids = set(resume.accepted_request_ids)
+        self._open_deliveries = {d.delivery.execution_request_id: d for d in resume.open_deliveries}
         # A gap `resume` ran against an EMPTY binding, so the
         # work-item-mismatch guard was vacuous for it: a resume naming a
         # foreign work item was accepted there. Re-applying it here would
@@ -2685,9 +3042,18 @@ class DevLoopWorkflow:
         # above — a `resume` signal delivered in the continue_as_new gap ran
         # against __init__'s empty state before this method did.
         self._rehydrate_work_context(resume)
+        # A continued run is past every approval gate (it never re-runs
+        # them), and from here its state is whole: the Update validator may
+        # decide, and the deliveries the previous run left open resume
+        # waiting for their fulfilment (#461).
+        self._gates_passed = True
+        self._initialized = True
+        for rid in sorted(self._open_deliveries):
+            self._start_delivery(self._open_deliveries[rid])
 
         outcome = await self._watch_pr(resume.service, resume.slug, resume=resume)
         if outcome.resume is not None:
+            await self._settle_deliveries(hopping=True)
             next_resume = self._carry_work_context(
                 dataclasses.replace(
                     outcome.resume,

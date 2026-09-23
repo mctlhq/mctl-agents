@@ -17,6 +17,12 @@ this workflow's own engine run. Refusals are values (`BoundExecution`);
 "not fulfilled yet" and an unreadable store raise, so the workflow's retry
 policy turns them into a bounded wait.
 
+The same two activities serve a `resume` delivered onto a LIVE loop
+(`DevLoopWorkflow.accept_execution_request`): there the engine ref the loop
+binds and advances is `<loop id>#<request id>`
+(`issue_ref.resume_engine_ref`), not the loop's own id, and the rules are
+unchanged — the store's execution must be exactly that engine run.
+
 Workflow code never performs this I/O itself (ADR-010 §9, as
 `activities/lifecycle.py`): these activities are the only place it happens.
 """

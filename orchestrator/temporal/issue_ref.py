@@ -72,3 +72,38 @@ def dispatched_workflow_id(execution_request_id: str) -> str:
     same run is the same `we_` execution by mctl-api's
     `(engine, engine_ref)` idempotency."""
     return f"dev-loop-{execution_request_id}"
+
+
+#: Separates the live loop's workflow id from the request id in the engine
+#: ref of a resume delivered onto that loop. Never part of a workflow id:
+#: Temporal ids here are `dev-loop-<owner>-<repo>-<n>` or `dev-loop-xr_<id>`.
+RESUME_ENGINE_REF_SEPARATOR = "#"
+#: mctl-api's `workitems.MaxEngineRefBytes`: a longer ref is refused (400).
+MAX_ENGINE_REF_BYTES = 256
+
+
+def resume_engine_ref(loop_workflow_id: str, execution_request_id: str) -> str:
+    """The `engine_ref` of a resume delivered onto the live DevLoop
+    `loop_workflow_id` (mctlhq/mctl-agents#461): `<loop id>#<request id>`.
+
+    A pure function of (loop, request), so a re-claim of the same request
+    fulfils with the same ref and gets the same `we_` back by mctl-api's
+    `(engine, engine_ref)` idempotency. Unique per item, because a request
+    id is (mctl-api refuses a resume under a ref the item already has). No
+    run id in it, so it survives the loop's continue-as-new.
+
+    NOT a workflow id: anything that turns a ledger entry into a Temporal
+    handle must go through `loop_id_of_engine_ref`."""
+    return f"{loop_workflow_id}{RESUME_ENGINE_REF_SEPARATOR}{execution_request_id}"
+
+
+def is_resume_engine_ref(engine_ref: str) -> bool:
+    """Was `engine_ref` written by the dispatcher for a resume delivered
+    onto a live loop? The `#xr_` suffix is the proof: no workflow id has it."""
+    return f"{RESUME_ENGINE_REF_SEPARATOR}xr_" in engine_ref
+
+
+def loop_id_of_engine_ref(engine_ref: str) -> str:
+    """The DevLoop workflow id behind a Temporal execution's `engine_ref`:
+    the ref itself, or its loop half for a delivered resume."""
+    return engine_ref.split(RESUME_ENGINE_REF_SEPARATOR, 1)[0]
