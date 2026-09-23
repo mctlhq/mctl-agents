@@ -115,6 +115,7 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
+from orchestrator import tracing
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
@@ -4316,5 +4317,16 @@ def main() -> None:
         sys.exit(EXIT_BLOCKED_ONLY)
 
 
+def _traced_main() -> None:
+    """`main()` under the pod's root span (mctl-agents#195).
+
+    Parented on `TRACEPARENT` when the CWFT passes one, so this pod's spans
+    join the Temporal DevLoop trace that submitted it. Inert — not even an
+    SDK import — unless the standard `OTEL_*` endpoint variables are set."""
+    tracing.init_tracing("mctl-agents-implementer")
+    with tracing.pod_root_span("implementer.run", {tracing.AGENT_NAME: "implementer"}):
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    _traced_main()

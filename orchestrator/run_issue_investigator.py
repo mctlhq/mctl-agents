@@ -79,7 +79,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # orchestrator.temporal.issue_ref, neither of which pulls in
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
-from orchestrator import context_assembly
+from orchestrator import context_assembly, tracing
 from orchestrator.context_snapshot import (
     MAX_PRIOR_EXECUTION_IDS,
     MAX_WORK_CONTEXT_ID_LENGTH,
@@ -3091,5 +3091,16 @@ def main() -> None:
     print(f"    {_gitops_tree_url(result.service, result.slug)}")
 
 
+def _traced_main() -> None:
+    """`main()` under the pod's root span (mctl-agents#195).
+
+    Parented on `TRACEPARENT` when the CWFT passes one, so this pod's spans
+    join the Temporal DevLoop trace that submitted it. Inert — not even an
+    SDK import — unless the standard `OTEL_*` endpoint variables are set."""
+    tracing.init_tracing("mctl-agents-investigator")
+    with tracing.pod_root_span("issue-investigator.run", {tracing.AGENT_NAME: "issue-investigator"}):
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    _traced_main()

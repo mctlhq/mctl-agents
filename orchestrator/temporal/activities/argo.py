@@ -34,12 +34,15 @@ activities/state.py's record_execution) rather than re-querying Argo later.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from temporalio import activity
 
+from orchestrator import tracing
 from orchestrator.temporal.constants import IMPLEMENTATION_OPERATION
 from orchestrator.temporal.implement_outcome import ImplementerObservation, PreStartReason, observe_implementer
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
@@ -191,8 +194,50 @@ def _iso(moment: datetime | None) -> str | None:
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+_ISSUE_URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/([0-9]+)$")
+_OPERATION_PREFIX = "mctl-agents-"
+ARGO_PHASE_ATTRIBUTE = "mctl.argo.workflow.phase"
+
+
+def _trace_attributes(input: SubmitAndWaitInput) -> dict[str, Any]:
+    """Correlation attributes for one Argo submission (mctl-agents#195).
+
+    Only identifiers from the operation's own parameters — never the whole
+    params dict, which is caller-shaped. `execution_id` / `work_item_id` are
+    present once the DevLoop passes them (the CWFT declares both); until
+    then the attributes are omitted, not written empty."""
+    attributes: dict[str, Any] = {
+        tracing.WORKFLOW_TYPE: input.operation.removeprefix(_OPERATION_PREFIX),
+    }
+    execution_id = input.params.get("execution_id", "")
+    if execution_id:
+        attributes[tracing.EXECUTION_ID] = execution_id
+    work_item_id = input.params.get("work_item_id", "")
+    if work_item_id:
+        attributes[tracing.WORK_ITEM_ID] = work_item_id
+    match = _ISSUE_URL_RE.match(input.params.get("issue_url", ""))
+    if match:
+        attributes[tracing.REPOSITORY_NAME] = match.group(1)
+        attributes[tracing.ISSUE_NUMBER] = int(match.group(2))
+    elif input.params.get("service"):
+        attributes[tracing.REPOSITORY_NAME] = f"mctlhq/{input.params['service']}"
+    return attributes
+
+
 @activity.defn
 async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+    # One span over the whole Argo run: submit, every poll, the terminal
+    # phase. Its context is what `traceparent` carries into the pod, so the
+    # pod's root span is its child (mctl-agents#195). Tracing off -> no-op.
+    with tracing.span(f"argo.workflow {input.operation}", _trace_attributes(input), kind="client") as trace_span:
+        result = await _submit_and_wait(input, trace_span)
+        trace_span.set_attributes({ARGO_PHASE_ATTRIBUTE: result.phase})
+        if not result.succeeded:
+            trace_span.fail(result.phase)
+        return result
+
+
+async def _submit_and_wait(input: SubmitAndWaitInput, trace_span: tracing.SpanHandle) -> WorkflowResult:
     headers = auth_headers()
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=REQUEST_TIMEOUT_SECONDS) as client:
         # Resume, don't resubmit: a prior attempt of THIS activity execution
@@ -248,7 +293,10 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
         else:
             submit_resp = await client.post(
                 f"/api/v1/operations/{input.operation}/execute",
-                json=input.params,
+                # `traceparent` is added only behind MCTL_TRACE_ARGO_PARAM,
+                # and only here — never in the workflow, so the recorded
+                # activity input (and therefore replay) is unchanged.
+                json=tracing.with_traceparent(input.params),
                 headers=headers,
             )
             submit_resp.raise_for_status()
@@ -268,6 +316,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
             runtime["submitted_at"] = _now_iso()
             activity.heartbeat(workflow_name, dict(runtime))
 
+        trace_span.set(argo_workflow_name=workflow_name)
         consecutive_errors = 0
         # Seeded, not empty, when a previous attempt already saw the pod
         # run: that fact is in the projection this attempt just restored,
