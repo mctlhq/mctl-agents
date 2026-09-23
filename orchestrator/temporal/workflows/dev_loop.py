@@ -283,6 +283,12 @@ DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY = RetryPolicy(
 #: whose start input carries an execution request, so no other history
 #: records it.
 EXECUTION_REQUEST_PATCH = "execution-request-dispatch"
+#: A dispatched loop whose bind is refused while an execution of its own
+#: engine ref exists (`BoundExecution.stranded`) ends that execution `Failed`
+#: before it ends. Consulted only on that path, so no history that did not
+#: reach it records it; a history recorded before it (the loop ended without
+#: the advance) replays unchanged.
+EXECUTION_REQUEST_STRANDED_PATCH = "execution-request-stranded"
 
 # A `resume` execution request delivered onto a LIVE loop (mctlhq/mctl-
 # agents#461, ADR 011 §8). The dispatcher hands the loop the request through
@@ -1631,9 +1637,10 @@ class DevLoopWorkflow:
         Idempotent, never forking: a duplicate `execution_id` (the common
         case, since `execution_id_for` is deterministic) is a no-op; a
         DIFFERENT `execution_id` arriving while one accepted resume is still
-        awaiting fresh approval is rejected with `reason=
-        "resume-already-pending"`; a `work_item_id` that disagrees with the
-        one already bound is rejected with `reason="work-item-mismatch"`.
+        awaiting fresh approval, or while a delivered execution request is
+        still open, is rejected with `reason="resume-already-pending"`; a
+        `work_item_id` that disagrees with the one already bound is rejected
+        with `reason="work-item-mismatch"`.
         Every rejection is recorded, never merely dropped, so `work_context`
         can surface it.
 
@@ -1675,7 +1682,11 @@ class DevLoopWorkflow:
         if execution_id in self._seen_execution_ids:
             return  # idempotent no-op — the same execution resuming again
 
-        if self._resume_pending:
+        # An open delivery (`accept_execution_request`) is a pending resume
+        # too, as its validator says: never two at once, whichever way each
+        # arrived. `_open_deliveries` is non-empty only in a history that took
+        # a delivery, so no history recorded before it changes.
+        if self._resume_pending or self._open_deliveries:
             self._reject_resume(execution_id, work_item_id, "resume-already-pending")
             return
 
@@ -1822,8 +1833,21 @@ class DevLoopWorkflow:
                 break
             bound = await self._poll_delivery_bind(bind, FULFILMENT_WAIT, interruptible=True)
         if not bound.bound:
-            # Rejected by the platform, or fulfilled for another loop (a
-            # re-claim that delivered elsewhere): no execution of ours exists.
+            if bound.stranded:
+                # The fulfil minted an execution under this delivery's engine
+                # ref, but the loop must not run it (the item is about another
+                # issue, or its advance to Running was refused). End it: while
+                # it is non-terminal mctl-api refuses every other request for
+                # the item, and the dispatcher's reconciliation never touches
+                # the execution of a loop that is still RUNNING.
+                await self._advance_dispatched_execution(
+                    "Failed",
+                    retry_policy=FAST_ACTIVITY_RETRY_POLICY if self._exiting else DISPATCHED_ADVANCE_RETRY_POLICY,
+                    work_item_id=delivery.work_item_id,
+                    engine_ref=engine_ref,
+                )
+            # Otherwise rejected by the platform, or fulfilled for another
+            # loop (a re-claim that delivered elsewhere): nothing of ours.
             self._end_delivery(opened, bound.outcome)
             return
         self._seen_execution_ids.add(bound.execution_id)
@@ -2243,6 +2267,11 @@ class DevLoopWorkflow:
         except ActivityError:
             return None, f"execution request {issue.execution_request_id} was not fulfilled within {FULFILMENT_WAIT}"
         if not bound.bound:
+            if bound.stranded and workflow.patched(EXECUTION_REQUEST_STRANDED_PATCH):
+                # An execution of this loop's own engine ref exists that it
+                # must not run: end it before the loop ends (the reconciliation
+                # only runs once a later request for the item is claimed).
+                await self._advance_dispatched_execution("Failed")
             return None, f"execution request {issue.execution_request_id}: {bound.outcome}: {bound.reason}"
         self._seen_execution_ids.add(bound.execution_id)
         self._executions.append(

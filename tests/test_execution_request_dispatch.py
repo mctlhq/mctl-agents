@@ -627,6 +627,32 @@ async def test_a_loop_refuses_an_item_that_is_about_another_issue(api, env):
     )
 
     assert "work-item-mismatch" in result.ended and seen == []
+    # The fulfil minted it under this loop's own ref, so the loop ends it
+    # rather than leave the item wedged behind a Running execution.
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(dispatched_workflow_id(rid), "Failed")]
+
+
+async def test_a_loop_whose_advance_to_running_is_refused_ends_its_execution(api, env):
+    """Its own `we_`, proven by the ledger, but the advance to Running is a
+    definite no: the loop runs nothing, and ends the execution `Failed`."""
+    submit, seen = _investigate_log()
+    rid = api.create_request("start")
+    ref = dispatched_workflow_id(rid)
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+    assert outcome.action == dx.FULFILLED
+    serve = api.request
+
+    def refuse_running(method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+        body = payload or {}
+        if method == "POST" and (body.get("engine_ref"), body.get("phase")) == (ref, "Running"):
+            return _HTTPResult(422, {"code": "policy_denied", "error": "not this one"})
+        return serve(method, path, payload)
+
+    api.request = refuse_running  # type: ignore[method-assign]
+    result = await _run_loop(env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), ref)
+
+    assert "work-item-mismatch" in result.ended and "to Running" in result.ended and seen == []
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Failed")]
 
 
 async def test_a_rejected_request_ends_its_loop_without_running_anything(api, env):

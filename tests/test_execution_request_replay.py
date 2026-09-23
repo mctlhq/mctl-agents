@@ -27,6 +27,14 @@ the resume's Update, fulfil, bind; the re-approval, the resumed execution's
 advance, and the rest of the loop to its end), recorded from
 `record_resumed()`. No other fixture may carry that marker.
 
+A dispatched loop whose bind is refused although its execution was minted
+(the item is about another issue, or the advance to Running is refused) ends
+that execution `Failed` under `workflow.patched("execution-request-stranded")`.
+The path ends the loop in the same workflow task as the refusal, so it is
+guarded by fresh recordings rather than a fixture: today's recording records
+the marker and replays, and one recorded with the gate answering False (the
+released loop's shape) replays against today's code too.
+
 Regenerating the fixtures (only when a path's command shape is MEANT to
 change, and never to turn a red run green): run
 `uv run python -m tests.test_execution_request_replay [dispatched|resumed]`,
@@ -44,14 +52,18 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from temporalio import workflow
 from temporalio.client import WorkflowHistory
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Replayer
 
+from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
     EXECUTION_REQUEST_PATCH,
     EXECUTION_REQUEST_RESUME_PATCH,
+    EXECUTION_REQUEST_STRANDED_PATCH,
     DevLoopWorkflow,
+    IssueRef,
 )
 
 HISTORY_DIR = Path(__file__).resolve().parent / "fixtures" / "histories"
@@ -286,3 +298,95 @@ if __name__ == "__main__":  # pragma: no cover
     import sys
 
     _regenerate(sys.argv[1:])
+
+
+# -- a dispatched loop whose bind is refused, with its execution minted --------
+
+
+async def record_stranded(env: WorkflowEnvironment, workflow: type = DevLoopWorkflow) -> dict[str, Any]:
+    """A dispatched loop whose item turns out to be about another issue, as
+    a history dict: the fulfil minted its `we_`, the bind refuses it."""
+    from temporalio.worker import Worker as TemporalWorker
+
+    from orchestrator.temporal import dispatcher as dx
+    from orchestrator.temporal.constants import TASK_QUEUE
+    from orchestrator.temporal.start import dispatched_workflow_id
+    from orchestrator.work_context.client import WorkItemClient
+    from tests.test_execution_request_dispatch import FakeTemporal, _investigate_log, _loop_activities
+    from tests.test_work_context_resume_acceptance import WID
+
+    api = _CURRENT_API[0]
+    submit, _ = _investigate_log()
+    rid = api.create_request("start")
+    assert (await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()).action == "fulfilled"
+    issue = IssueRef(
+        issue_url="https://github.com/mctlhq/mctl-telegram/issues/9999", work_item_id=WID, execution_request_id=rid
+    )
+    async with TemporalWorker(
+        env.client, task_queue=TASK_QUEUE, workflows=[workflow], activities=_loop_activities(submit)
+    ):
+        handle = await env.client.start_workflow(
+            DevLoopWorkflow.run, issue, id=dispatched_workflow_id(rid), task_queue=TASK_QUEUE
+        )
+        result = await handle.result()
+        history = await handle.fetch_history()
+    assert "work-item-mismatch" in result.ended
+    return history.to_json_dict()
+
+
+async def test_a_stranded_dispatched_loop_records_the_marker_ends_its_execution_and_replays(routed_api):
+    """A fresh recording of the stranded path records its own marker, ends
+    the minted execution with one advance, and replays."""
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        history = await record_stranded(env)
+    events = _events(history)
+    assert EXECUTION_REQUEST_STRANDED_PATCH in _patch_ids(events)
+    assert _scheduled(events) == ["bind_dispatched_execution", "advance_dispatched_execution"]
+    assert [e["phase"] for e in routed_api.executions] == ["Failed"]
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(
+        WorkflowHistory.from_json("replay-dev-loop-stranded-fresh", history)
+    )
+
+
+@workflow.defn(name="DevLoopWorkflow", sandboxed=False)
+class _ReleasedStrandedLoop(DevLoopWorkflow):
+    """Today's loop with the stranded gate answering False: the shape the
+    released loop recorded (the refused bind ends the loop, no advance)."""
+
+    async def _bind_dispatched_execution(self, issue: IssueRef) -> tuple[Any, str]:
+        real = dev_loop.workflow.patched
+
+        def patched(patch_id: str) -> bool:
+            return False if patch_id == EXECUTION_REQUEST_STRANDED_PATCH else real(patch_id)
+
+        dev_loop.workflow.patched = patched  # type: ignore[assignment]
+        try:
+            return await super()._bind_dispatched_execution(issue)
+        finally:
+            dev_loop.workflow.patched = real  # type: ignore[assignment]
+
+    @workflow.run
+    async def run(self, issue: IssueRef) -> Any:
+        return await super().run(issue)
+
+
+async def test_a_stranded_history_recorded_before_the_patch_replays_unchanged(routed_api):
+    """The released loop (1.54.0) ended on the refused bind without ending
+    the execution. Its history, even one whose bind answer already names the
+    stranded execution (a worker rollout that ran the new activity under the
+    old workflow code), must replay: the gate answers False without the
+    marker, so no advance is expected."""
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        history = await record_stranded(env, _ReleasedStrandedLoop)
+    events = _events(history)
+    assert EXECUTION_REQUEST_STRANDED_PATCH not in _patch_ids(events)
+    assert _scheduled(events) == ["bind_dispatched_execution"]
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(
+        WorkflowHistory.from_json("replay-dev-loop-stranded-released", history)
+    )
+
+
+def test_no_committed_history_records_the_stranded_marker():
+    for path in sorted(HISTORY_DIR.glob("*.json")):
+        events = _events(json.loads(path.read_text(encoding="utf-8")))
+        assert EXECUTION_REQUEST_STRANDED_PATCH not in _patch_ids(events), path.name

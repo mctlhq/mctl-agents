@@ -138,6 +138,11 @@ DELIVERY_LOOP_GONE = "delivery-loop-gone"
 RESUME_ACTOR_KIND = "human"
 #: How long one Update round trip may take before the dispatch defers.
 DELIVERY_TIMEOUT_SECONDS = 60.0
+#: The deferral reason of an Update that did not answer in time. The loop may
+#: still have accepted it: the next claim re-sends the same update id (the
+#: request id), which Temporal answers from the loop's registry and the loop's
+#: `accepted_request_ids` covers, so it converges on one delivery.
+DELIVERY_TIMED_OUT = "update-timed-out"
 
 # Dispatch outcomes.
 NOTHING = "nothing"
@@ -296,6 +301,10 @@ class TemporalClientPort:
             cause = exc.cause
             reason = str(cause.details[0]) if isinstance(cause, ApplicationError) and cause.details else str(cause)
             if isinstance(cause, ApplicationError) and cause.type == RESUME_REFUSED_ERROR_TYPE:
+                # Surfaces branch on this reason: only the closed vocabulary,
+                # never the free text of an error without (known) details.
+                if reason not in xr.RESUME_REFUSAL_REASONS:
+                    reason = xr.RESUME_REFUSAL_UNSPECIFIED
                 return DeliveryAnswer(DELIVERY_REFUSED, reason)
             if isinstance(cause, ApplicationError) and cause.type == RESUME_DEFERRED_ERROR_TYPE:
                 return DeliveryAnswer(DELIVERY_DEFERRED, reason)
@@ -303,6 +312,10 @@ class TemporalClientPort:
             # a handler bug) says nothing permanent about the request:
             # rejecting it would destroy a request a fixed build can serve.
             return DeliveryAnswer(DELIVERY_DEFERRED, f"update failed: {reason}")
+        except TimeoutError:
+            # (`asyncio.TimeoutError` is `TimeoutError` since 3.11.) Says
+            # nothing about the request: defer, and let the next claim re-send.
+            return DeliveryAnswer(DELIVERY_DEFERRED, DELIVERY_TIMED_OUT)
         except RPCError as exc:
             if exc.status == RPCStatusCode.NOT_FOUND:
                 return DeliveryAnswer(DELIVERY_LOOP_GONE, str(exc))

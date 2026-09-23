@@ -278,9 +278,13 @@ workflow id; everything that turns a ledger entry into a Temporal handle
 takes the part before `#`.
 
 - **L's validator** applies the `resume` signal's rules (§5): a
-  `work-item-mismatch`, `resume-already-pending`, or missing or
+  `work-item-mismatch`, `resume-already-pending` (another delivery or
+  resume signal still open), a `malformed-delivery`, or missing or
   out-of-vocabulary provenance refuses it, and the dispatcher rejects the
-  request `resume_refused:<reason>` before any `we_` is minted. A loop that
+  request `resume_refused:<reason>` before any `we_` is minted. The
+  dispatcher adds `engine-ref-too-long` itself; any reason outside this
+  closed list (`execution_requests.RESUME_REFUSAL_REASONS`) reaches a
+  surface as `unspecified`, never as free text. A loop that
   cannot decide yet (its state is not rehydrated) or is ending defers the
   request instead. Accepting a resume that changes surface or actor clears
   the approval **at acceptance**: from the moment L says yes to another
@@ -295,7 +299,12 @@ takes the part before `#`.
   registry rather than by L; it stops only when L continues as new (the
   delivery is carried in `MergeWatchResume` with the accepted request ids,
   and the next run binds it) or ends (one last bounded wait, then it lets
-  go).
+  go). A bind that is refused although the fulfil did mint an execution
+  under that ref (the item turned out to be about another issue, or the
+  advance to `Running` was refused) ends that execution `Failed` too: L is
+  still running, so no reconciliation would ever reach it. The same holds
+  for a dispatched loop's own bind (under
+  `workflow.patched("execution-request-stranded")`).
 - **Duplicates** are dropped by Temporal's update id within a run, and by
   L's `accepted_request_ids` across continue-as-new.
 - **Crash windows.** After the Update and before the fulfil: L holds the

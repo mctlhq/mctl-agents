@@ -61,7 +61,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     ResumeDelivery,
 )
 from orchestrator.work_context import execution_requests as xr
-from orchestrator.work_context.client import WorkItemClient
+from orchestrator.work_context.client import WorkItemClient, _HTTPResult
 from orchestrator.work_context.contract import ActorRef
 from tests.temporal_harness import Worker
 from tests.test_execution_request_dispatch import (
@@ -622,13 +622,80 @@ async def test_a_delivery_whose_request_is_rejected_at_fulfil_binds_nothing_and_
     assert api.executions[1]["phase"] == "Failed"
 
 
+# -- refused at the bind, although the fulfil minted an execution -------------
+
+
+async def _rejected_delivery(env: Any, loop: str, rid: str) -> list[tuple[str, str]]:
+    handle = env.client.get_workflow_handle(loop)
+    for _ in range(200):
+        ctx = await handle.query(DevLoopWorkflow.work_context)
+        if any(r.execution_request_id == rid for r in ctx.resume_rejections):
+            break
+        await anyio.sleep(0.05)
+    ctx = await handle.query(DevLoopWorkflow.work_context)
+    return [(r.execution_request_id, r.reason) for r in ctx.resume_rejections]
+
+
+async def test_a_delivery_whose_item_is_about_another_issue_ends_its_minted_execution_failed(api, env):
+    """The fulfil minted the `we_` under `<L>#<xr>`, then the bind finds the
+    item re-pointed at another issue: the loop must not run it, and must END
+    it. Left `Pending` it would wedge the item (mctl-api refuses every other
+    request while it is non-terminal, and the reconciliation never touches
+    the execution of a RUNNING loop)."""
+    submit, ops = _submit_log()
+    async with _worker(env, submit):
+        loop = await _park(api, env)
+        api.external_key = "https://github.com/mctlhq/mctl-telegram/issues/9999"
+        rid = api.create_request("resume")
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{loop}#{rid}"
+
+        assert await _rejected_delivery(env, loop, rid) == [(rid, "delivery-work-item-mismatch")]
+        await _wait_for(lambda: _row(api, f"{loop}#{rid}")["phase"] == "Failed")
+        ctx = await env.client.get_workflow_handle(loop).query(DevLoopWorkflow.work_context)
+        assert outcome.execution_id not in [e.execution_id for e in ctx.executions]  # never adopted
+        await _end(env, loop)
+
+    assert _ops(ops, IMPLEMENTATION_OPERATION) == []
+
+
+async def test_a_delivery_whose_advance_to_running_is_refused_ends_its_minted_execution_failed(api, env):
+    """The ledger proves the `we_` is this delivery's, but mctl-api (or the
+    policy checkpoint) refuses its advance to Running: a definite no, so it
+    must not run, and it is ended `Failed` rather than left `Pending`."""
+    submit, _ = _submit_log()
+    async with _worker(env, submit):
+        loop = await _park(api, env)
+        rid = api.create_request("resume")
+        ref = f"{loop}#{rid}"
+        serve = api.request
+
+        def refuse_running(method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+            body = payload or {}
+            if method == "POST" and path == f"/api/v1/work-items/{WID}/executions" and (
+                body.get("engine_ref"),
+                body.get("phase"),
+            ) == (ref, "Running"):
+                return _HTTPResult(422, {"code": "policy_denied", "error": "not this one"})
+            return serve(method, path, payload)
+
+        api.request = refuse_running  # type: ignore[method-assign]
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED and outcome.engine_ref == ref
+
+        assert await _rejected_delivery(env, loop, rid) == [(rid, "delivery-work-item-mismatch")]
+        await _wait_for(lambda: _row(api, ref)["phase"] == "Failed")
+        await _end(env, loop)
+
+
 # -- refused before any fulfil -------------------------------------------------
 
 
 async def test_a_resume_the_loop_refuses_is_rejected_typed_and_never_fulfilled(api, env):
     """A request made straight on mctl-api carries its default surface
-    `api`, which is not one of the loop's closed surface kinds: the loop's
-    validator refuses it, and the request is rejected before any `we_`."""
+    `api`, which is not (yet: #481 adds it) one of the loop's closed surface
+    kinds: the loop's validator refuses it, and the request is rejected
+    before any `we_`."""
     submit, _ = _submit_log()
     async with _worker(env, submit):
         loop = await _park(api, env)
@@ -688,6 +755,21 @@ def test_the_validator_answers_with_the_resume_rules(state, delivery, error_type
     with pytest.raises(ApplicationError) as exc:
         _validator(**state)._validate_execution_request(delivery)
     assert exc.value.type == error_type and exc.value.details == (reason,)
+    if error_type == RESUME_REFUSED_ERROR_TYPE:
+        assert reason in xr.RESUME_REFUSAL_REASONS  # the documented vocabulary
+
+
+def test_the_resume_signal_is_refused_while_a_delivered_request_is_open():
+    """Never two pending resumes, whichever way each arrived: the validator
+    refuses an Update while a signal's resume is pending, and the signal
+    refuses while a delivery is open, even one that changed nothing (so
+    `_resume_pending` is not set)."""
+    wf = _validator(_work_item_id=WID, _open_deliveries={"xr_1": OpenDelivery(delivery=_delivery("xr_1"))})
+    wf.resume(
+        {"work_item_id": WID, "execution_id": "we_2", "surface": "slack", "actor_kind": "human", "actor_id": "u:b"}
+    )
+    assert [(r.execution_id, r.reason) for r in wf._resume_rejections] == [("we_2", "resume-already-pending")]
+    assert wf._executions == [] and "we_2" not in wf._seen_execution_ids
 
 
 def test_the_validator_takes_a_repeated_request_even_while_it_is_the_open_one():
@@ -771,3 +853,81 @@ async def test_a_refusal_from_the_loop_is_a_typed_reject_and_a_deferral_defers(a
     outcome = await dx.Dispatcher(WorkItemClient(), deferring, lease=60).dispatch_once()
     assert outcome.action == dx.DEFERRED and api.request_state(later)["state"] == "claimed"
     assert api.fulfils() == [] and deferring.started == []
+
+
+# -- what the port answers the dispatcher --------------------------------------
+
+
+class _UpdateClient:
+    """A Temporal client whose only handle answers `execute_update` with
+    `behaviour` (raise it, or await it)."""
+
+    def __init__(self, behaviour: Any) -> None:
+        self.behaviour = behaviour
+
+    def get_workflow_handle(self, workflow_id: str) -> Any:
+        client = self
+
+        class _Handle:
+            async def execute_update(self, *args: Any, **kwargs: Any) -> str:
+                if isinstance(client.behaviour, BaseException):
+                    raise client.behaviour
+                return await client.behaviour()
+
+        return _Handle()
+
+
+class _RunningPort(dx.TemporalClientPort):
+    def __init__(self, client: Any, running: str) -> None:
+        super().__init__(client)
+        self.running = running
+
+    async def loop_state(self, workflow_id: str) -> str:
+        return dx.LOOP_RUNNING if workflow_id == self.running else dx.LOOP_ABSENT
+
+
+@pytest.mark.parametrize(
+    ("details", "reason"),
+    [
+        ((), xr.RESUME_REFUSAL_UNSPECIFIED),
+        (("a-reason-from-a-newer-loop",), xr.RESUME_REFUSAL_UNSPECIFIED),
+        (("work-item-mismatch",), "work-item-mismatch"),
+    ],
+    ids=["no-details", "unknown-reason", "known-reason"],
+)
+async def test_a_loop_refusal_reaches_a_surface_only_in_the_closed_vocabulary(api, capsys, details, reason):
+    """A `ResumeRefused` without details would otherwise surface `str(cause)`,
+    free text a surface cannot branch on."""
+    from temporalio.client import WorkflowUpdateFailedError
+
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    cause = ApplicationError("execution request refused: a sentence", *details, type=RESUME_REFUSED_ERROR_TYPE)
+    port = _RunningPort(_UpdateClient(WorkflowUpdateFailedError(cause)), loop)
+    outcome = await dx.Dispatcher(WorkItemClient(), port, lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["reason"] == f"{xr.RESUME_REFUSED}:{reason}"
+    assert api.fulfils() == []
+
+
+async def test_an_update_that_times_out_defers_with_a_fixed_reason_and_an_audit_line(api, capsys, monkeypatch):
+    """The Update round trip outlasts DELIVERY_TIMEOUT_SECONDS: nothing
+    permanent is known (the loop may even have accepted it; the next claim
+    re-sends the same update id), so the request is deferred, with its
+    `deliver` audit line and a fixed reason, never a free-text crash."""
+    monkeypatch.setattr(dx, "DELIVERY_TIMEOUT_SECONDS", 0.05)
+
+    async def hang() -> str:
+        await asyncio.sleep(5)
+        return DELIVERY_ACCEPTED
+
+    loop = workflow_id_for(URL)
+    rid = api.create_request("resume")
+    outcome = await dx.Dispatcher(WorkItemClient(), _RunningPort(_UpdateClient(hang), loop), lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED
+    assert outcome.reason == f"delivery to {loop}: {dx.DELIVERY_TIMED_OUT}"
+    assert api.request_state(rid)["state"] == "claimed" and api.fulfils() == []
+    deliver = [a for a in _audit(capsys.readouterr().out) if a["event"] == "deliver"]
+    assert [(a["verdict"], a["reason"]) for a in deliver] == [(dx.DELIVERY_DEFERRED, dx.DELIVERY_TIMED_OUT)]
