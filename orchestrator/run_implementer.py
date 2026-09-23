@@ -3781,7 +3781,7 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         return ImplementResult(
             ref=ref,
             pr_url=None,
-            error=f"rate limited: {skip_reason}",
+            error=f"{RATE_LIMITED_ERROR_PREFIX} {skip_reason.removeprefix('rate-limited: ')}",
             skipped_reason=skip_reason,
             rate_limited=True,
             rate_limit_observation=RateLimitObservation(
@@ -4679,10 +4679,11 @@ def main() -> None:
     # and verification-budget arms above, this one MUST stay non-zero: the
     # CWFT's `implement-fallback` step (the second Claude account) is gated on
     # `implement` not Succeeding, and an exhausted primary account is exactly
-    # the case it exists for. Losing this tick's `rate_limited` block to a
-    # skipped commit costs only diagnostics -- the proposal stays `accepted`
-    # in git either way, because the `in-progress` lease is never committed
-    # on its own.
+    # the case it exists for. The non-zero exit does not lose this tick's
+    # `rate_limited` block: in the CWFT both `implement` and
+    # `implement-fallback` run with `continueOn: failed: true` and the
+    # `commit` step after them is unconditional, so the block reaches gitops
+    # and `_skip_while_rate_limited` reads it on the next tick.
     if outcome.rate_limited and not outcome.succeeded:
         limited = next((r for r in results if r.rate_limited), None)
         if limited is not None:

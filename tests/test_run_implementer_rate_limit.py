@@ -733,6 +733,7 @@ def test_implement_one_skips_before_clone_when_window_is_open(tmp_path, monkeypa
     # and main() exits EXIT_RATE_LIMITED so the fallback account runs.
     assert result.rate_limited is True
     assert result.rate_limit_observation is not None
+    assert result.error.startswith("rate limited: account primary window open")
     assert result.rate_limit_observation.account == "primary"
     assert result.rate_limit_observation.resets_at == "2099-01-01T00:00:00Z"
     assert run_implementer._batch_outcome([result]).rate_limited == 1
