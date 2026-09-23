@@ -328,6 +328,13 @@ EXIT_RATE_LIMITED = 52
 # deterministic, so a policy that says no is bounded by MAX_REVIEW_ATTEMPTS
 # instead of re-running a paid model turn every tick (the transient arm).
 EXIT_POLICY_REFUSED = 53
+# The policy checkpoint could not decide on the follow-up push
+# (`Decision.undecided`: evaluator, identity or approval lookup failed), so
+# git never ran. A platform failure, not an answer about the findings: the
+# shepherd classifies it as `harness` — never charged to `review_attempts`,
+# but bounded by MAX_HARNESS_FAILURES, because a misconfigured or unreachable
+# approval store stays undecided and each retry is a paid model turn.
+EXIT_POLICY_UNDECIDED = 54
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -358,6 +365,8 @@ VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX = "verification-budget-exhausted:"
 RATE_LIMITED_ERROR_PREFIX = "rate limited:"
 # Prefix mapped to EXIT_POLICY_REFUSED (mctl-agents#197).
 POLICY_REFUSED_ERROR_PREFIX = "policy-refused:"
+# Prefix mapped to EXIT_POLICY_UNDECIDED (mctl-agents#197).
+POLICY_UNDECIDED_ERROR_PREFIX = "policy-undecided:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -657,6 +666,9 @@ def _review_feedback_exit_code(error: str) -> int:
         ``deterministic_codes``, so it is charged: the same policy refuses
         the same push again, and the transient arm would re-run the paid
         turn every tick.
+      - 54: the policy checkpoint could not decide on that push
+        (``Decision.undecided``). In the shepherd's ``harness`` set: not
+        charged to ``review_attempts``, bounded by ``MAX_HARNESS_FAILURES``.
 
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
@@ -687,6 +699,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_RATE_LIMITED
     if error.startswith(POLICY_REFUSED_ERROR_PREFIX):
         return EXIT_POLICY_REFUSED
+    if error.startswith(POLICY_UNDECIDED_ERROR_PREFIX):
+        return EXIT_POLICY_UNDECIDED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -2771,11 +2785,12 @@ def review_feedback_one(
         if e.decision.undecided:
             # The checkpoint could not decide (evaluator, identity or approval
             # lookup failed): a platform failure, not an answer about these
-            # findings. No prefix, so EXIT_GENERIC_FAILURE, which the shepherd
-            # retries as transient without charging the proposal — the
-            # precedent is the directive poller's `PolicyCheckpointUndecided`.
+            # findings. EXIT_POLICY_UNDECIDED, a `harness` code in the
+            # shepherd: never charged to the proposal (the precedent is the
+            # directive poller's `PolicyCheckpointUndecided`), yet bounded by
+            # MAX_HARNESS_FAILURES, since an undecided store can stay that way.
             release_reason = "policy checkpoint undecided"
-            result = ImplementResult(ref=ref, pr_url=None, error=f"policy checkpoint undecided: {e}")
+            result = ImplementResult(ref=ref, pr_url=None, error=f"{POLICY_UNDECIDED_ERROR_PREFIX} {e}")
             return result
         # An answer (DENY, or REQUIRE_APPROVAL not granted): EXIT_POLICY_REFUSED,
         # which the shepherd charges as deterministic: the same policy answers
@@ -4282,11 +4297,16 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # branch and opens the PR without running the model again.
             # Status first, then the claim: releasing first would free mutual
             # exclusion while `.status.yaml` still names this attempt.
-            msg = f"policy checkpoint undecided: {e}"
+            #
+            # A skip, not an error, like the vanished-claim arm: an error
+            # turns the tick red, which can cost the gitops commit and runs
+            # the CWFT's `implement-fallback` second account on a condition no
+            # account can fix.
+            msg = f"{POLICY_UNDECIDED_ERROR_PREFIX} {e}"
             if not _hand_back_if_still_ours(ref, attempt_id):
                 msg = f"{msg} (left `in-progress` for the attempt that now holds it)"
             _release_claim(claim_ctx, reason="policy checkpoint undecided")
-            return ImplementResult(ref=ref, pr_url=None, error=msg)
+            return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
         # An answer (DENY, or REQUIRE_APPROVAL not granted). Its own triage
         # code, so a policy decision reads as one in the proposal's history
         # rather than as a crash in the generic `unexpected-error` arm.

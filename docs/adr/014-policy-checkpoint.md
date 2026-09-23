@@ -122,10 +122,14 @@ code says what happened to it. Whether the action ran is therefore
   without a spent approval. An **undecided** decision (`evaluator_error`,
   `identity_unavailable`, `approval_lookup_error`: the checkpoint could not
   answer) is a platform failure and is never recorded as the item's
-  failure. In the implementer it is retryable: the review follow-up exits 1,
-  which the shepherd retries as transient without charging an attempt, and
-  the new-branch driver hands the proposal back to `accepted` with no
-  triage record (if only `gh pr create` was undecided, the retry's
+  failure. In the implementer it is retryable: the review follow-up exits
+  `EXIT_POLICY_UNDECIDED` (54), which the shepherd classifies as `harness`,
+  so it never charges `review_attempts` but is bounded by
+  `MAX_HARNESS_FAILURES` (an unreachable or misconfigured approval store
+  stays undecided, and every retry is a paid model turn); the new-branch
+  driver hands the proposal back to `accepted` with no triage record and
+  reports a skip, not an error, so the tick stays green and the
+  `implement-fallback` account is not spent on it (if only `gh pr create` was undecided, the retry's
   preflight opens the PR for the pushed branch without a model run). The
   other sites already treat both alike without recording anything against
   the item: a merge waits, the review trigger, rerun and investigator

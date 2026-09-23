@@ -699,6 +699,10 @@ def _followup_code_sets() -> tuple[frozenset[int], frozenset[int]]:
         run_implementer.EXIT_ORPHANED_SUBAGENT,
         run_implementer.EXIT_CI_EVIDENCE_INSUFFICIENT,
         run_implementer.EXIT_VERIFICATION_BUDGET_EXHAUSTED,
+        # The policy checkpoint could not decide on the follow-up push
+        # (#197): the platform's failure, never the proposal's, and bounded
+        # because an unreachable or misconfigured approval store stays that way.
+        run_implementer.EXIT_POLICY_UNDECIDED,
     })
     return deterministic, harness
 

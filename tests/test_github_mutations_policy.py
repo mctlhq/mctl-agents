@@ -260,9 +260,10 @@ def test_review_feedback_one_reports_a_refused_push_as_policy(repo, monkeypatch)
     assert not [c for c in calls if c[:2] == ["git", "push"]]
 
 
-def test_review_feedback_one_retries_an_undecided_push_as_transient(repo, monkeypatch) -> None:  # noqa: F811
+def test_review_feedback_one_reports_an_undecided_push_as_harness(repo, monkeypatch) -> None:  # noqa: F811
     """An undecided checkpoint is a platform failure, not an answer about the
-    findings: exit 1 (transient in the shepherd, uncharged), never 53."""
+    findings: EXIT_POLICY_UNDECIDED, a harness code (uncharged but bounded),
+    never 53 and never the counter-less transient exit 1."""
     _stub_review_feedback(monkeypatch, repo)
     monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
     calls: list[list[str]] = []
@@ -272,11 +273,65 @@ def test_review_feedback_one_retries_an_undecided_push_as_transient(repo, monkey
     result = run_implementer.review_feedback_one(_feedback_ref(repo), {"summaries": []})
 
     assert result.error is not None
-    assert not result.error.startswith(run_implementer.POLICY_REFUSED_ERROR_PREFIX)
-    assert run_implementer._review_feedback_exit_code(result.error) == run_implementer.EXIT_GENERIC_FAILURE
+    assert result.error.startswith(run_implementer.POLICY_UNDECIDED_ERROR_PREFIX)
+    code = run_implementer._review_feedback_exit_code(result.error)
+    assert code == run_implementer.EXIT_POLICY_UNDECIDED == 54
     deterministic, harness = run_shepherd._followup_code_sets()
-    assert run_implementer.EXIT_GENERIC_FAILURE not in deterministic | harness
+    assert code in harness
+    assert code not in deterministic
     assert not [c for c in calls if c[:2] == ["git", "push"]]
+
+
+def _followup_exits(code: int, monkeypatch) -> None:
+    """The shepherd's real `apply_followup`, with the implementer subprocess
+    answering `code` (the fake it runs in `test_run_shepherd`)."""
+    real = run_shepherd.apply_followup
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    monkeypatch.setattr(run_shepherd, "_format_bundle_via_sdk", fake_format)
+    monkeypatch.setattr(run_shepherd.subprocess, "run", lambda *_a, **_kw: SimpleNamespace(returncode=code))
+    monkeypatch.setattr(run_shepherd, "apply_followup",
+                        lambda *a, **kw: real(*a, **{**kw, "skip_subprocess": False}))
+
+
+def test_shepherd_does_not_charge_an_undecided_push(tmp_path, monkeypatch) -> None:
+    from tests.test_run_shepherd import make_finding, make_ref, read_status
+
+    ref = make_ref(tmp_path, review_attempts=1)
+    _followup_exits(run_implementer.EXIT_POLICY_UNDECIDED, monkeypatch)
+    monkeypatch.setattr(run_shepherd, "find_pr_for_proposal", lambda *_a, **_kw: make_pr())
+    monkeypatch.setattr(run_shepherd, "read_codex_review",
+                        lambda *_a, **_kw: run_shepherd.CodexReview(has_responded=True, findings=[make_finding()]))
+    monkeypatch.setattr(run_shepherd, "read_copilot_review", lambda *_a, **_kw: run_shepherd.CopilotReview(False, 0))
+
+    result = run_shepherd.process_one(ref, skip_subprocess=True)
+
+    final = read_status(ref)
+    assert result.decision == "wait"
+    assert final["review_attempts"] == 1, "an undecided checkpoint is never charged to the proposal"
+    assert final["harness_failures"] == 1
+
+
+def test_shepherd_bounds_an_undecided_push_at_max_harness_failures(tmp_path, monkeypatch) -> None:
+    from tests.test_run_shepherd import make_finding, make_ref, read_status
+
+    ref = make_ref(tmp_path, review_attempts=1)
+    ref.harness_failures = run_shepherd.MAX_HARNESS_FAILURES - 1
+    _followup_exits(run_implementer.EXIT_POLICY_UNDECIDED, monkeypatch)
+    monkeypatch.setattr(run_shepherd, "find_pr_for_proposal", lambda *_a, **_kw: make_pr())
+    monkeypatch.setattr(run_shepherd, "read_codex_review",
+                        lambda *_a, **_kw: run_shepherd.CodexReview(has_responded=True, findings=[make_finding()]))
+    monkeypatch.setattr(run_shepherd, "read_copilot_review", lambda *_a, **_kw: run_shepherd.CopilotReview(False, 0))
+
+    result = run_shepherd.process_one(ref, skip_subprocess=True)
+
+    final = read_status(ref)
+    assert result.decision == "review-stuck"
+    assert final["status"] == "review-stuck"
+    assert final["harness_failures"] == run_shepherd.MAX_HARNESS_FAILURES
+    assert final["review_attempts"] == 1
 
 
 def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path) -> None:
@@ -299,8 +354,13 @@ def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path)
     assert not status.get("failure")
     assert not status.get("attempt")
     assert result.pr_url is None
-    assert result.error is not None and "undecided" in result.error
-    assert not result.error.startswith(run_implementer.POLICY_REFUSED_ERROR_PREFIX)
+    # A skip, not an error: the tick stays green, so the gitops commit is not
+    # skipped and the implement-fallback account is not spent on it.
+    assert result.error is None
+    assert result.skipped_reason is not None
+    assert result.skipped_reason.startswith(run_implementer.POLICY_UNDECIDED_ERROR_PREFIX)
+    outcome = run_implementer._batch_outcome([result])
+    assert (outcome.failed, outcome.skipped) == (0, 1)
     assert not [c for c in calls if c[:2] == ["git", "push"]]
 
 
