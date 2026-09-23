@@ -121,6 +121,11 @@ def account_label() -> str:
         env_var = detect_auth().env_var
     except Exception:  # noqa: BLE001 — no auth configured; fall through to unknown
         return "unknown"
+    # `detect_auth()` names a variable on every path today, including
+    # "(claude CLI session)"; stay total anyway, since this runs inside the
+    # 429 handler and must never raise there.
+    if not isinstance(env_var, str) or not env_var:
+        return "unknown"
     if env_var.endswith("_SECONDARY"):
         return "secondary"
     if env_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):

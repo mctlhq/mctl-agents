@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import types
 
+import pytest
+
 from orchestrator import rate_limit
 
 
@@ -148,3 +150,13 @@ def test_rate_limit_exhausted_error_carries_optional_observation():
     observation = rate_limit.build_observation(None, detail="d")
     carrying = rate_limit.RateLimitExhaustedError("boom", observation)
     assert carrying.observation is observation
+
+
+@pytest.mark.parametrize("env_var", [None, "", "(claude CLI session)"])
+def test_account_label_is_unknown_for_an_unnamed_or_cli_auth(monkeypatch, env_var) -> None:
+    import orchestrator.auth as auth
+
+    monkeypatch.delenv("CLAUDE_OAUTH_ACCOUNT", raising=False)
+    monkeypatch.setattr(auth, "detect_auth", lambda: types.SimpleNamespace(env_var=env_var))
+
+    assert rate_limit.account_label() == "unknown"
