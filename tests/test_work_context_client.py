@@ -212,3 +212,117 @@ def test_a_3xx_is_surfaced_never_followed(monkeypatch: pytest.MonkeyPatch) -> No
     assert answer.verdict == WORK_ITEM_UNKNOWN
 
 
+# -- attach_execution (mctlhq/mctl-agents#455) ------------------------------
+
+
+def _attached(status: int, **overrides: Any) -> dict[str, Any]:
+    execution = {"id": "we_1", "work_item_id": WID, "engine": "argo", "engine_ref": "wf-1", "attempt": 2,
+                 "phase": "Running", **overrides}
+    return {"schema_version": "workitem/v1", "execution": execution}
+
+
+def test_attach_posts_the_engine_run_and_reads_back_the_store_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orchestrator.work_context import executions as ex
+
+    seen: list[tuple[str, str, dict[str, Any]]] = []
+
+    def handler(req: Any) -> Any:
+        seen.append((req.get_method(), req.full_url, json.loads(req.data)))
+        return _FakeResponse(json.dumps(_attached(201)).encode(), status=201)
+
+    answer = _client(monkeypatch, handler).attach_execution(WID, ex.EngineRun("argo", "wf-1"), ex.PHASE_RUNNING)
+    assert (answer.verdict, answer.execution_id, answer.attempt) == (ex.EXECUTION_ATTACHED, "we_1", 2)
+    assert seen == [(
+        "POST", f"https://api.example.test/api/v1/work-items/{WID}/executions",
+        {"engine": "argo", "engine_ref": "wf-1", "phase": "Running"},
+    )]
+
+
+@pytest.mark.parametrize(("status", "payload", "verdict"), [
+    (200, _attached(200), "execution-existing"),
+    (409, {"code": "execution_active", "error": "busy"}, "execution-active"),
+    (409, {"code": "invalid_transition", "error": "already ended Failed"}, "execution-refused"),
+    (409, {"code": "idempotency_key_reused", "error": "x"}, "execution-refused"),
+    (404, {"code": "work_item_not_found", "error": "x"}, "execution-refused"),
+    (403, {"code": "tenant_forbidden", "error": "x"}, "execution-unknown"),
+    (503, {"error": "down"}, "execution-unknown"),
+    # A 2xx counts only when it describes exactly what was sent.
+    (201, _attached(201, id="sha-local"), "execution-unknown"),
+    (201, _attached(201, engine_ref="wf-other"), "execution-unknown"),
+    (201, _attached(201, work_item_id="wi_other"), "execution-unknown"),
+    (201, _attached(201, phase="Pending"), "execution-unknown"),
+    (201, _attached(201, attempt=0), "execution-unknown"),
+    (201, _attached(201, attempt=True), "execution-unknown"),
+    (201, {"schema_version": "workitem/v2", "execution": _attached(201)["execution"]}, "execution-unknown"),
+])
+def test_attach_answers_are_classified(status: int, payload: dict[str, Any], verdict: str) -> None:
+    from orchestrator.work_context import executions as ex
+
+    answer = ex.answer_from_attach(status, payload, work_item_id=WID, run=ex.EngineRun("argo", "wf-1"),
+                                   phase=ex.PHASE_RUNNING)
+    assert answer.verdict == verdict, answer.reason
+    assert answer.usable == (verdict in ("execution-attached", "execution-existing"))
+
+
+def test_attach_unreachable_store_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orchestrator.work_context import executions as ex
+
+    def _down(req: Any) -> Any:
+        raise OSError("connection refused")
+
+    answer = _client(monkeypatch, _down).attach_execution(WID, ex.EngineRun("argo", "wf-1"), ex.PHASE_RUNNING)
+    assert answer.verdict == ex.EXECUTION_UNKNOWN
+
+
+def test_attach_goes_through_the_policy_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orchestrator import policy_checkpoint as pc
+    from orchestrator.work_context import executions as ex
+
+    sent: list[Any] = []
+
+    def handler(req: Any) -> Any:
+        sent.append(req)
+        return _FakeResponse(json.dumps(_attached(201)).encode(), status=201)
+
+    client = _client(monkeypatch, handler)
+    run = ex.EngineRun("argo", "wf-1")
+    assert client.attach_execution(WID, run, ex.PHASE_RUNNING).usable
+    assert len(sent) == 1
+
+    deny = pc.Policy(version="deny-all", rules=())
+    monkeypatch.setattr(pc, "BUILTIN_POLICY", deny)
+    monkeypatch.setattr(pc.checkpoint, "__kwdefaults__", {**pc.checkpoint.__kwdefaults__, "policy": deny})
+    answer = client.attach_execution(WID, run, ex.PHASE_SUCCEEDED)
+    assert answer.verdict == ex.EXECUTION_REFUSED and "policy DENY" in answer.reason
+    assert len(sent) == 1  # nothing sent
+
+
+def test_the_attach_rule_allows_only_the_attach() -> None:
+    from orchestrator import policy_checkpoint as pc
+    from orchestrator.work_context import executions as ex
+
+    decision = pc.checkpoint(pc.MCTL_WORK_ITEM_WRITE, ex.ATTACH_EXECUTION_OPERATION, WID, {"a": 1})
+    assert (decision.code, decision.rule_id) == (pc.CODE_ALLOWED, "mctl-attach-own-execution")
+    for operation in ("resume", "transition:complete", "attach:work-item"):
+        assert pc.checkpoint(pc.MCTL_WORK_ITEM_WRITE, operation, WID, {"a": 1}).code == pc.CODE_NO_RULE
+
+
+def test_the_engine_run_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from orchestrator.work_context import executions as ex
+
+    for var in (ex.ENGINE_ENV_VAR, ex.ENGINE_REF_ENV_VAR, ex.WORKFLOW_NAME_ENV_VAR):
+        monkeypatch.delenv(var, raising=False)
+    run, why = ex.engine_ref_from_env()
+    assert run is None and "neither MCTL_ENGINE_REF nor WORKFLOW_NAME" in why
+
+    monkeypatch.setenv(ex.WORKFLOW_NAME_ENV_VAR, " mctl-agents-investigate-x ")
+    assert ex.engine_ref_from_env()[0] == ex.EngineRun("argo", "mctl-agents-investigate-x", ex.WORKFLOW_NAME_ENV_VAR)
+    monkeypatch.setenv(ex.ENGINE_REF_ENV_VAR, "dev-loop-1")
+    monkeypatch.setenv(ex.ENGINE_ENV_VAR, "temporal")
+    assert ex.engine_ref_from_env()[0] == ex.EngineRun("temporal", "dev-loop-1", ex.ENGINE_REF_ENV_VAR)
+
+    monkeypatch.setenv(ex.ENGINE_ENV_VAR, "jenkins")
+    assert ex.engine_ref_from_env()[0] is None
+    monkeypatch.setenv(ex.ENGINE_ENV_VAR, "argo")
+    monkeypatch.setenv(ex.ENGINE_REF_ENV_VAR, "x" * (ex.MAX_ENGINE_REF_BYTES + 1))
+    assert ex.engine_ref_from_env()[0] is None
