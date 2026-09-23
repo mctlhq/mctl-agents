@@ -393,3 +393,112 @@ def test_prior_ids_exclude_self_and_later_executions_and_the_sequence_is_the_sto
         resume_from_execution_id=None, surface=None, actor_kind=None, actor_id=None,
     )
     assert (ref.execution_sequence, ref.prior_execution_ids) == (2, (E1,))
+
+
+# -- resolve_identity against the ledger read before the attach ------------
+
+
+class _Answering:
+    """A client whose attach answers exactly `answer`, and records the calls."""
+
+    def __init__(self, answer: ex.ExecutionAnswer | None = None) -> None:
+        self.answer = answer
+        self.calls: list[tuple] = []
+
+    def attach_execution(self, work_item_id, run, phase):
+        self.calls.append((work_item_id, run, phase))
+        if self.answer is None:
+            raise AssertionError("attach_execution must not be called")
+        return self.answer
+
+
+E_NEW = "we_33333333-3333-4333-8333-333333333333"
+LEDGER = WorkItem(work_item_id=WID, executions=(ExecutionRef(execution_id=E1, sequence=1),))
+RUN = ex.EngineRun(engine="argo", engine_ref="wf-ledger", source=ex.WORKFLOW_NAME_ENV_VAR)
+
+
+@pytest.fixture
+def workflow_env(monkeypatch):
+    for var in (ex.ENGINE_ENV_VAR, ex.ENGINE_REF_ENV_VAR):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv(ex.WORKFLOW_NAME_ENV_VAR, RUN.engine_ref)
+
+
+def test_an_attach_the_ledger_accounts_for_is_the_identity(workflow_env):
+    """The control for the refusals below: attempt len(ledger)+1, created now."""
+    client = _Answering(ex.ExecutionAnswer(ex.EXECUTION_ATTACHED, execution_id=E_NEW, attempt=2, phase="Running"))
+    identity = ex.resolve_identity(LEDGER, None, client)
+    assert (identity.execution_id, identity.sequence, identity.attached) == (E_NEW, 2, RUN)
+    assert [(e.execution_id, e.sequence) for e in identity.item.executions] == [(E1, 1), (E_NEW, 2)]
+    assert identity.refusal == "" and client.calls == [(WID, RUN, "Running")]
+
+
+@pytest.mark.parametrize("answer", [
+    # 200: mctl-api already had this engine run, but the ledger read before
+    # the attach has no such row.
+    ex.ExecutionAnswer(ex.EXECUTION_EXISTING, execution_id=E_NEW, attempt=2, phase="Running"),
+    # 201 numbered past len(ledger)+1: another execution landed in between.
+    ex.ExecutionAnswer(ex.EXECUTION_ATTACHED, execution_id=E_NEW, attempt=3, phase="Running"),
+    # 201 numbered below it: the store and the read disagree.
+    ex.ExecutionAnswer(ex.EXECUTION_ATTACHED, execution_id=E_NEW, attempt=1, phase="Running"),
+    # A row that is in the ledger, under another attempt.
+    ex.ExecutionAnswer(ex.EXECUTION_EXISTING, execution_id=E1, attempt=2, phase="Running"),
+], ids=["existing-not-in-ledger", "attempt-past-ledger", "attempt-below-ledger", "ledger-row-other-attempt"])
+def test_an_attach_the_ledger_does_not_account_for_is_held_but_refused_as_unknown(workflow_env, answer):
+    """#455: nothing the store disagrees with is sealed. The run attached the
+    execution, so it still owns ending it (`attached`), but it has no
+    identity, and the refusal is an UNKNOWN: a re-read may well succeed."""
+    identity = ex.resolve_identity(LEDGER, None, _Answering(answer))
+    assert identity.execution_id == "" and identity.sequence == 0 and identity.item is None
+    assert identity.attached == RUN
+    assert identity.unknown is True
+    assert "does not account for; read again" in identity.refusal
+
+
+def test_attach_false_sends_nothing_whatever_the_flag(workflow_env):
+    """A dry run: `attach=False` is enforced inside resolve_identity, not by
+    the caller's branch ordering (#460 review)."""
+    for flag in (None, SHA):
+        identity = ex.resolve_identity(LEDGER, flag, _Answering(), attach=False)
+        assert identity.attach_skipped and identity.attached is None and identity.execution_id == ""
+    # A `we_...` flag in the ledger is read, never written.
+    identity = ex.resolve_identity(LEDGER, E1, _Answering(), attach=False)
+    assert (identity.execution_id, identity.sequence, identity.attach_skipped) == (E1, 1, False)
+
+
+def test_a_dry_run_with_a_store_execution_writes_nothing(tmp_path, monkeypatch, store, sealed):
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ENFORCE)
+    monkeypatch.setenv(ex.WORKFLOW_NAME_ENV_VAR, "mctl-agents-investigate-dry-we")
+    assert _run(tmp_path, execution_id=E1, dry_run=True).skipped_reason == "dry-run"
+    assert store.writes == []
+
+
+# -- an exception escaping the investigation --------------------------------
+
+
+class _Killed(BaseException):
+    """What escapes `_investigate`: its own `except Exception` turns every
+    ordinary failure into a result, so only a BaseException (SystemExit on
+    SIGTERM, KeyboardInterrupt) reaches `investigate`'s finally."""
+
+
+def _killed(repo_dir, prompt, proposal_dir):
+    raise _Killed("pod terminated")
+
+
+@pytest.mark.parametrize(("final", "phase"), [("true", "Failed"), ("false", "Running")])
+def test_an_exception_still_ends_the_execution_and_propagates_unchanged(tmp_path, monkeypatch, store, final, phase):
+    """`investigate`'s try/finally: an exception out of `_investigate` leaves
+    no InvestigateResult, yet the attached execution is still advanced
+    (Failed on the final attempt, left Running when the engine retries),
+    and the exception itself reaches the caller untouched."""
+    monkeypatch.setenv(ex.WORKFLOW_NAME_ENV_VAR, "mctl-agents-investigate-crash")
+    monkeypatch.setenv(ex.FINAL_ATTEMPT_ENV_VAR, final)
+    monkeypatch.setattr(run_issue_investigator, "_run_agent", _killed)
+    with pytest.raises(_Killed, match=r"^pod terminated$"):
+        _run(tmp_path)
+    mine = store.by_ref("mctl-agents-investigate-crash")
+    assert mine["phase"] == phase
+    assert [body["phase"] for body in store.attaches()] == (
+        ["Running", "Failed"] if final == "true" else ["Running"]
+    )

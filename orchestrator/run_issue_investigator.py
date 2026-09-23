@@ -1999,16 +1999,15 @@ def _resolve_work_context_ref(
     dry-run attaches nothing and so carries no work context."""
     from orchestrator.work_context import rollout as _work_context_rollout
     from orchestrator.work_context.executions import resolve_identity
-    from orchestrator.work_context.snapshots import is_store_execution
 
-    if dry_run and not is_store_execution(execution_id):
-        print("info: work_context dry-run: no execution attached, no work context")
-        return None, ""
-    identity = resolve_identity(item, execution_id, client)
+    identity = resolve_identity(item, execution_id, client, attach=not dry_run)
     if identity.attached is not None:
         own_execution.hold(client, item.work_item_id, identity.attached)
     if identity.note:
         print(f"info: work_context {identity.note}")
+    if identity.attach_skipped:
+        print("info: work_context dry-run: no execution attached, no work context")
+        return None, ""
     if identity.execution_id and identity.item is not None:
         print(
             f"info: work_context execution_id={identity.execution_id} "

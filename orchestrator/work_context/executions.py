@@ -42,13 +42,11 @@ from orchestrator.work_context.snapshots import is_store_execution
 ATTACH_EXECUTION_OPERATION = "attach:work-item-execution"
 
 ENGINE_ARGO = "argo"
-ENGINE_TEMPORAL = "temporal"
 
 # mctl-api's `workitems.Phase*` constants (internal/workitems/types.go).
 PHASE_RUNNING = "Running"
 PHASE_SUCCEEDED = "Succeeded"
 PHASE_FAILED = "Failed"
-PHASES = frozenset({"Pending", PHASE_RUNNING, PHASE_SUCCEEDED, PHASE_FAILED, "Error"})
 
 #: mctl-api's `workitems.MaxEngineRefBytes`.
 MAX_ENGINE_REF_BYTES = 256
@@ -62,9 +60,11 @@ WORKFLOW_NAME_ENV_VAR = "WORKFLOW_NAME"
 #: must leave the execution open: the store refuses to reopen an ended one.
 FINAL_ATTEMPT_ENV_VAR = "MCTL_ENGINE_FINAL_ATTEMPT"
 
-# mctl-api's typed 409 codes (internal/api/handlers_work_items.go).
+# mctl-api's typed 409 code (internal/api/handlers_work_items.go) for
+# another non-terminal execution. Every other 409, `invalid_transition`
+# included, is a definite refusal through the generic 4xx arm of
+# `answer_from_attach`.
 EXECUTION_ACTIVE_CODE = "execution_active"
-INVALID_TRANSITION_CODE = "invalid_transition"
 
 SCHEMA_VERSION = "workitem/v1"
 
@@ -163,7 +163,10 @@ def answer_from_attach(
     if status == 409 and code == EXECUTION_ACTIVE_CODE:
         return ExecutionAnswer(EXECUTION_ACTIVE, reason=reason)
     if 400 <= status < 500 and status not in (401, 403, 408, 429):
-        # 401/403/408/429 say nothing about the request itself.
+        # 401/403/408/429 say nothing about the request itself. (The seal's
+        # `answer_from_seal` keeps a 403 REFUSED on purpose: there it is the
+        # typed `snapshot_writer_forbidden`, and its caller treats REFUSED
+        # and UNKNOWN alike, under `blocks_on_unknown()`.)
         return ExecutionAnswer(EXECUTION_REFUSED, reason=reason)
     return ExecutionAnswer(EXECUTION_UNKNOWN, reason=reason)
 
@@ -186,6 +189,9 @@ class Identity:
     refusal: str = ""
     unknown: bool = False
     note: str = ""
+    #: `attach=False` (a dry run): nothing was sent, so there is no answer,
+    #: neither a refusal nor an unknown.
+    attach_skipped: bool = False
 
 
 def _own(item: WorkItem, execution_id: str) -> ExecutionRef | None:
@@ -196,10 +202,12 @@ def resolve_identity(item: WorkItem, execution_id_flag: str | None, client: Any,
     """The execution this run is, from the store.
 
     - A `we_...` flag was created by the work-item layer (e.g. the resume
-      route): it must be in this item's ledger, and it is used as-is.
+      route): it must be in this item's ledger, and it is used as-is. This
+      branch reads only; it writes nothing whatever `attach` says.
     - Otherwise this run attaches its own engine run as Running. Any other
       flag (e.g. the dev_loop's seed hash) is correlation only.
-    - No engine run, or `attach=False`: no identity, never a local one."""
+    - `attach=False` (a dry run): nothing is sent, and there is no identity.
+    - No engine run: no identity, never a local one."""
     if is_store_execution(execution_id_flag):
         own = _own(item, str(execution_id_flag))
         if own is None:
@@ -211,11 +219,11 @@ def resolve_identity(item: WorkItem, execution_id_flag: str | None, client: Any,
         f"--execution-id {execution_id_flag} is not a store execution; kept as correlation only"
         if execution_id_flag else ""
     )
+    if not attach:
+        return Identity(refusal="no execution identity: attach skipped", note=note, attach_skipped=True)
     run, why = engine_ref_from_env()
     if run is None:
         return Identity(refusal=f"no execution identity: {why}", note=note)
-    if not attach:
-        return Identity(refusal="no execution identity: attach skipped", note=note)
     answer = client.attach_execution(item.work_item_id, run, PHASE_RUNNING)
     if not answer.usable:
         return Identity(

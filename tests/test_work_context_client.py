@@ -212,8 +212,6 @@ def test_a_3xx_is_surfaced_never_followed(monkeypatch: pytest.MonkeyPatch) -> No
     assert answer.verdict == WORK_ITEM_UNKNOWN
 
 
-
-
 # -- attach_execution (mctlhq/mctl-agents#455) ------------------------------
 
 
