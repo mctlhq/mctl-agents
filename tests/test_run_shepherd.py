@@ -4024,6 +4024,43 @@ def test_apply_followup_labels_plain_failures_transient_not_harness() -> None:
     assert exc.value.kind == "transient"
 
 
+def test_apply_followup_labels_rate_limited_transient_not_deterministic() -> None:
+    """`EXIT_RATE_LIMITED` (mctl-agents#364) must not become chargeable by
+    omission: it is deliberately absent from `_followup_code_sets()`'s
+    `deterministic`/`harness` sets, so it falls to the default
+    `kind="transient"` — the same "never counted toward the budget" contract
+    `orchestrator.run_issue_investigator.RateLimitExhaustedError` already
+    gives the investigator. Pinned the same way
+    `test_apply_followup_labels_plain_failures_transient_not_harness` pins
+    plain exit 1, so a future edit that adds it to either set goes red here
+    instead of silently starting to charge a quota-exhausted run.
+    """
+    deterministic, harness = run_shepherd._followup_code_sets()
+    assert run_implementer.EXIT_RATE_LIMITED not in deterministic
+    assert run_implementer.EXIT_RATE_LIMITED not in harness
+    assert run_implementer.EXIT_RATE_LIMITED not in run_shepherd._refusal_codes()
+    assert run_implementer.EXIT_RATE_LIMITED not in run_shepherd._fenced_codes()
+
+    findings = [make_finding()]
+
+    async def fake_format(_findings):
+        return {"p1": True, "p2": False, "summaries": ["fix"]}
+
+    class _Result:
+        returncode = run_implementer.EXIT_RATE_LIMITED
+
+    def fake_run(cmd, check=False, text=False, **_kwargs):
+        return _Result()
+
+    with patch.object(run_shepherd, "_format_bundle_via_sdk", fake_format), \
+         patch.object(run_shepherd.subprocess, "run", fake_run):
+        with pytest.raises(run_shepherd.FollowupSubprocessError) as exc:
+            run_shepherd.apply_followup("mctl-web", "test-slug", findings)
+
+    assert exc.value.transient is True
+    assert exc.value.kind == "transient"
+
+
 def test_apply_followup_still_labels_no_commits_deterministic() -> None:
     """42/43/44 keep charging an attempt — #366 must not weaken #12's fix."""
     findings = [make_finding()]
