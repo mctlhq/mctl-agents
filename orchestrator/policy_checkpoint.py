@@ -13,8 +13,8 @@ Rules:
 - Fail closed. An evaluator error, an identity that cannot be read in
   require mode, or an approval lookup that fails is a DENY, never an ALLOW.
 - No side effect before ALLOW, or before an approval bound to the exact
-  action digest. A changed argument changes the digest, so it can never
-  reuse an approval.
+  action was spent for it. A changed argument changes the intent, so it can
+  never reuse an approval, and a spent approval never authorizes again.
 - Every decision is recorded — execution id, action identity, target,
   policy version, rule, decision, code, reason, approval ref — as one
   `POLICY_DECISION` line (the structured-log convention of
@@ -23,10 +23,18 @@ Rules:
   recorded as a digest: no raw payload and no secret reaches the record.
 
 The durable approval store is NOT part of this module: `ApprovalLookup` is
-the seam, and the only implementation today (`NO_APPROVALS`) never finds
-one, so REQUIRE_APPROVAL currently always blocks. Where approvals live (the
-mctl-api approval projection of the work-item contract is the candidate) is
-an open decision recorded in the ADR.
+the seam. mctl-api is the approval authority (mctl-api#366); the lookup
+backed by it lives in `orchestrator/action_approvals.py` and is enabled only
+by `MCTL_POLICY_APPROVALS=mctl-api` (`configured_approvals`). Unset, the
+lookup is `NO_APPROVALS` and REQUIRE_APPROVAL always blocks, as before.
+
+Single use. A REQUIRE_APPROVAL decision is permitted only when the lookup
+has just SPENT an approved receipt bound to exactly this action (an atomic
+consume in the store): `decide()` consumes at decision time, and a failed or
+uncertain consume is a refusal. There is no "approved but not yet consumed"
+value a caller could mistake for permission, so every governed path keeps
+its one rule: run the side effect immediately after a permitted decision,
+and never otherwise.
 
 Stdlib-only, like `orchestrator/context_snapshot.py` and
 `orchestrator/execution_identity.py`, so the Temporal worker, the pollers and
@@ -66,6 +74,18 @@ CODE_EVALUATOR_ERROR = "evaluator_error"
 CODE_IDENTITY_UNAVAILABLE = "identity_unavailable"
 CODE_APPROVAL_LOOKUP_ERROR = "approval_lookup_error"
 CODE_INVALID_REQUEST = "invalid_request"
+# Durable approvals (mctl-api#366, #197/#198). Each keeps the rule's
+# REQUIRE_APPROVAL verdict and refuses; only `approved` permits.
+#: A request exists in mctl-api and waits for a human; `approval_ref` names it.
+CODE_APPROVAL_PENDING = "approval_pending"
+CODE_APPROVAL_DENIED = "approval_denied"
+CODE_APPROVAL_EXPIRED = "approval_expired"
+#: The receipt was already spent: it can never authorize a second effect.
+CODE_APPROVAL_CONSUMED = "approval_consumed"
+#: The receipt is bound to a different action than the one presented now.
+CODE_APPROVAL_INTENT_MISMATCH = "approval_intent_mismatch"
+#: The store refused the request itself (invalid, forbidden, not found).
+CODE_APPROVAL_REFUSED = "approval_refused"
 
 #: Codes meaning the checkpoint could not decide, not that it said no: a
 #: caller may retry these within its own bound. Every other refusal is an
@@ -150,6 +170,12 @@ class Decision:
     def undecided(self) -> bool:
         return self.code in UNDECIDED_CODES
 
+    @property
+    def awaiting_approval(self) -> bool:
+        """A human decision is pending on `approval_ref`: a caller (or the
+        #198 Temporal wait) may wait on it and then decide again."""
+        return self.code == CODE_APPROVAL_PENDING and bool(self.approval_ref)
+
 
 class PolicyRefused(RuntimeError):
     """The checkpoint refused an action; its side effect did not run."""
@@ -161,20 +187,95 @@ class PolicyRefused(RuntimeError):
         self.decision = decision
 
 
+# What an ApprovalLookup answers for one REQUIRE_APPROVAL action.
+#: This call spent an approved, unexpired receipt whose intent is exactly
+#: this action. The only outcome that permits.
+APPROVAL_GRANTED = "granted"
+#: No approval store: nothing was asked.
+APPROVAL_NONE = "none"
+APPROVAL_PENDING = "pending"
+APPROVAL_DENIED = "denied"
+APPROVAL_EXPIRED = "expired"
+APPROVAL_CONSUMED = "consumed"
+APPROVAL_MISMATCH = "mismatch"
+APPROVAL_REFUSED = "refused"
+#: The store could not answer (transport, 5xx, malformed answer).
+APPROVAL_UNKNOWN = "unknown"
+
+_APPROVAL_CODES = {
+    APPROVAL_GRANTED: CODE_APPROVED,
+    APPROVAL_NONE: CODE_APPROVAL_REQUIRED,
+    APPROVAL_PENDING: CODE_APPROVAL_PENDING,
+    APPROVAL_DENIED: CODE_APPROVAL_DENIED,
+    APPROVAL_EXPIRED: CODE_APPROVAL_EXPIRED,
+    APPROVAL_CONSUMED: CODE_APPROVAL_CONSUMED,
+    APPROVAL_MISMATCH: CODE_APPROVAL_INTENT_MISMATCH,
+    APPROVAL_REFUSED: CODE_APPROVAL_REFUSED,
+    APPROVAL_UNKNOWN: CODE_APPROVAL_LOOKUP_ERROR,
+}
+
+
+@dataclass(frozen=True)
+class ApprovalOutcome:
+    status: str
+    approval_ref: str = ""
+    reason: str = ""
+
+
 class ApprovalLookup(Protocol):
-    def find(self, action_digest: str, policy_version: str) -> str | None:
-        """The approval reference bound to exactly this action digest under
-        this policy version, or None. Raising means "cannot tell"."""
+    def redeem(
+        self, request: ActionRequest, *, rule_id: str, policy_version: str, approval_ref: str = "",
+    ) -> ApprovalOutcome:
+        """Called for a REQUIRE_APPROVAL action immediately before its side
+        effect. Returns APPROVAL_GRANTED only after spending, in this call,
+        an approved receipt bound to exactly this action under this rule
+        and policy version; otherwise the typed reason it cannot. With
+        `approval_ref`, revalidate that receipt only. Raising means
+        "cannot tell" and is a refusal."""
+        ...
 
 
 @dataclass(frozen=True)
 class _NoApprovals:
-    def find(self, action_digest: str, policy_version: str) -> str | None:
-        return None
+    def redeem(
+        self, request: ActionRequest, *, rule_id: str, policy_version: str, approval_ref: str = "",
+    ) -> ApprovalOutcome:
+        return ApprovalOutcome(APPROVAL_NONE)
 
 
-#: No approval store is wired yet: REQUIRE_APPROVAL always blocks.
+#: No approval store: REQUIRE_APPROVAL always blocks. The default.
 NO_APPROVALS: ApprovalLookup = _NoApprovals()
+
+#: Selects the approval store. Unset, empty or `none`: NO_APPROVALS.
+#: `mctl-api`: the durable store of mctl-api#366
+#: (`orchestrator/action_approvals.py`). Any other value is a
+#: misconfiguration, and every REQUIRE_APPROVAL is then a lookup error.
+APPROVALS_ENV = "MCTL_POLICY_APPROVALS"
+APPROVALS_MCTL_API = "mctl-api"
+
+
+@dataclass(frozen=True)
+class _MisconfiguredApprovals:
+    value: str
+
+    def redeem(
+        self, request: ActionRequest, *, rule_id: str, policy_version: str, approval_ref: str = "",
+    ) -> ApprovalOutcome:
+        return ApprovalOutcome(APPROVAL_UNKNOWN, reason=f"{APPROVALS_ENV}={self.value!r} is not a known store")
+
+
+def configured_approvals() -> ApprovalLookup:
+    """The approval store this process is configured for. Off by default:
+    production behaviour changes only when gitops sets `MCTL_POLICY_APPROVALS`."""
+    value = os.environ.get(APPROVALS_ENV, "").strip()
+    if value in ("", "none"):
+        return NO_APPROVALS
+    if value == APPROVALS_MCTL_API:
+        from orchestrator.action_approvals import MctlApiApprovals
+
+        return MctlApiApprovals()
+    return _MisconfiguredApprovals(value)
+
 
 # The mctl MCP tool set lives in mctl-api, not here, so the default for it
 # is REQUIRE_APPROVAL: a tool this list does not know — including one added
@@ -239,21 +340,60 @@ def evaluate(policy: Policy, request: ActionRequest) -> tuple[Rule | None, str, 
     return None, CODE_NO_RULE, f"no rule covers {request.action_kind} {request.operation}"
 
 
+_APPROVAL_FLOW_CODES = frozenset({
+    CODE_APPROVAL_REQUIRED, CODE_APPROVED, CODE_APPROVAL_PENDING, CODE_APPROVAL_DENIED, CODE_APPROVAL_EXPIRED,
+    CODE_APPROVAL_CONSUMED, CODE_APPROVAL_INTENT_MISMATCH, CODE_APPROVAL_REFUSED,
+})
+
+
 def _verdict_for(code: str) -> str:
     if code == CODE_ALLOWED:
         return ALLOW
-    if code in (CODE_APPROVAL_REQUIRED, CODE_APPROVED):
+    if code in _APPROVAL_FLOW_CODES:
         return REQUIRE_APPROVAL
     return DENY
+
+
+def _redeem(
+    approvals: ApprovalLookup, request: ActionRequest, rule_id: str, policy_version: str, approval_ref: str,
+) -> tuple[str, str, str]:
+    """(code, reason, approval ref) of the approval step. Fails closed:
+    anything but a well-formed GRANTED with a ref is a refusal."""
+    try:
+        outcome = approvals.redeem(request, rule_id=rule_id, policy_version=policy_version,
+                                   approval_ref=approval_ref)
+    except Exception as exc:  # noqa: BLE001 — an unreadable approval store is no approval
+        return CODE_APPROVAL_LOOKUP_ERROR, f"approval lookup failed: {type(exc).__name__}", ""
+    status = getattr(outcome, "status", None)
+    ref = str(getattr(outcome, "approval_ref", "") or "")
+    detail = str(getattr(outcome, "reason", "") or "")
+    code = _APPROVAL_CODES.get(status, CODE_APPROVAL_LOOKUP_ERROR) if isinstance(status, str) else \
+        CODE_APPROVAL_LOOKUP_ERROR
+    if code == CODE_APPROVED and not ref:
+        return CODE_APPROVAL_LOOKUP_ERROR, "approval lookup granted without naming a receipt", ""
+    if code == CODE_APPROVED:
+        return code, f"rule {rule_id}: approval {ref} consumed for this action", ref
+    if code == CODE_APPROVAL_REQUIRED:
+        return code, f"rule {rule_id}: needs an approval bound to {request.action_digest()}", ref
+    if code == CODE_APPROVAL_LOOKUP_ERROR:
+        return code, f"approval lookup failed: {detail or status}", ref
+    return code, f"rule {rule_id}: {code}{f' ({ref})' if ref else ''}{f': {detail}' if detail else ''}", ref
 
 
 def decide(
     request: ActionRequest,
     *,
     policy: Policy = BUILTIN_POLICY,
-    approvals: ApprovalLookup = NO_APPROVALS,
+    approvals: ApprovalLookup | None = None,
+    approval_ref: str = "",
 ) -> Decision:
-    """Decide and record. Never raises: every failure is a DENY decision."""
+    """Decide and record. Never raises: every failure is a DENY decision.
+
+    `approvals` defaults to `configured_approvals()`. For a REQUIRE_APPROVAL
+    action the lookup is asked to spend a matching receipt NOW, so call
+    this only immediately before the side effect it governs: a permitted
+    decision has already used up its approval. `approval_ref` names the
+    receipt to revalidate (the one a caller waited on)."""
     try:
         digest = request.action_digest()
     except Exception as exc:  # noqa: BLE001 — an undescribable action is refused, not raised
@@ -273,19 +413,16 @@ def decide(
                             policy.version, "", digest)
         emit(request, decision)
         return decision
-    approval_ref = ""
+    ref = ""
     if code == CODE_APPROVAL_REQUIRED:
         try:
-            approval_ref = approvals.find(digest, policy.version) or ""
-        except Exception as exc:  # noqa: BLE001 — an unreadable approval store is no approval
-            code, reason = CODE_APPROVAL_LOOKUP_ERROR, f"approval lookup failed: {type(exc).__name__}"
+            lookup = approvals if approvals is not None else configured_approvals()
+        except Exception as exc:  # noqa: BLE001 — a store that cannot be built is no approval
+            code, reason = CODE_APPROVAL_LOOKUP_ERROR, f"approval store unavailable: {type(exc).__name__}"
         else:
-            if approval_ref:
-                code, reason = CODE_APPROVED, f"rule {rule.rule_id if rule else ''}: approved"
-            else:
-                reason = f"rule {rule.rule_id if rule else ''}: needs an approval bound to {digest}"
+            code, reason, ref = _redeem(lookup, request, rule.rule_id if rule else "", policy.version, approval_ref)
     decision = Decision(_verdict_for(code), code, reason, policy.version, rule.rule_id if rule else "",
-                        digest, approval_ref)
+                        digest, ref)
     emit(request, decision)
     return decision
 
@@ -295,11 +432,13 @@ def enforce[T](
     side_effect: Callable[[], T],
     *,
     policy: Policy = BUILTIN_POLICY,
-    approvals: ApprovalLookup = NO_APPROVALS,
+    approvals: ApprovalLookup | None = None,
+    approval_ref: str = "",
 ) -> T:
     """Run `side_effect` only if the decision permits it; otherwise raise
-    `PolicyRefused` without calling it."""
-    decision = decide(request, policy=policy, approvals=approvals)
+    `PolicyRefused` without calling it. The decision (and, for an approved
+    action, the consume of its receipt) happens immediately before."""
+    decision = decide(request, policy=policy, approvals=approvals, approval_ref=approval_ref)
     if not decision.permitted:
         raise PolicyRefused(decision)
     return side_effect()
@@ -425,14 +564,16 @@ def checkpoint(
     grants: tuple[str, ...] = (),
     metadata: Mapping[str, str] | None = None,
     policy: Policy = BUILTIN_POLICY,
-    approvals: ApprovalLookup = NO_APPROVALS,
+    approvals: ApprovalLookup | None = None,
+    approval_ref: str = "",
 ) -> Decision:
-    """`request_for` + `decide`: the one call a governed path makes.
-    Never raises: every failure is a recorded DENY."""
+    """`request_for` + `decide`: the one call a governed path makes,
+    immediately before its side effect. Never raises: every failure is a
+    recorded refusal."""
     request = request_for(action_kind, operation, target, args, grants=grants, metadata=metadata, policy=policy)
     if isinstance(request, Decision):
         return request
-    return decide(request, policy=policy, approvals=approvals)
+    return decide(request, policy=policy, approvals=approvals, approval_ref=approval_ref)
 
 
 def require(decision: Decision) -> None:

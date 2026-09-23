@@ -2,7 +2,7 @@
 
 > **Status:** proposed
 > **Date:** 2026-09-23
-> **Issue:** mctlhq/mctl-agents#197 (related: #195 tracing, #196 execution identity)
+> **Issue:** mctlhq/mctl-agents#197 (related: #195 tracing, #196 execution identity, #198 approvals; mctl-api#366)
 
 ## Context
 
@@ -58,11 +58,11 @@ is set and there is no context, the request is refused.
   raises: an evaluator error, an undescribable request, arguments that
   cannot be digested, a failed approval lookup, and a missing identity in
   require mode.
-- A REQUIRE_APPROVAL is permitted only when the approval store returns an
-  approval bound to the exact `action_digest`. That digest covers kind,
-  operation, target, args digest, execution id and actor. Changing any
-  argument, or the execution, or the actor, produces a different action,
-  and an approval for the old one does not cover it.
+- A REQUIRE_APPROVAL is permitted only when the approval store has just
+  spent, for this call, an approved receipt bound to the exact action (§6).
+  The binding covers kind, operation, target, args digest, execution id and
+  actor. Changing any argument, or the execution, or the actor, produces a
+  different action, and an approval for the old one does not cover it.
 
 ### 4. Record
 
@@ -110,22 +110,119 @@ Built-in policy `mctl-agents/policy/v1`:
 | every other granted mctl MCP tool, including any added to mctl-api later | REQUIRE_APPROVAL |
 | anything else | DENY |
 
+### 6. Durable single-use approvals (mctl-api#366)
+
+The owner's decision: **mctl-api is the durable approval authority**;
+Temporal is only the wait/resume mechanism, and its state is never the
+approval record.
+
+```text
+checkpoint -> REQUIRE_APPROVAL -> ActionApprovalRequest in mctl-api (pending)
+           -> a human decides in mctl-api
+           -> checkpoint again: recompute the intent, revalidate the receipt,
+              consume it (approved -> consumed, atomic)
+           -> the side effect runs
+```
+
+`orchestrator/action_approvals.py` holds the client and the
+`ApprovalLookup` backed by it (`MctlApiApprovals`).
+
+- **Intent.** `intent_hash()` reproduces mctl-api's `IntentHash` byte for
+  byte (pinned by the Go test's vector). The intent of a checkpoint request
+  is `execution_id`, `action_kind` as `<kind>:<operation>`, `target`,
+  `args_digest`, the matching rule id, the policy version, and, as
+  `artifact_hash`, the checkpoint's own action digest, which adds the actor.
+  An approval therefore binds at least what the digest binding did before.
+  The create call sends the locally computed hash, so mctl-api refuses it
+  (`intent_hash_mismatch`) if the two encodings ever disagree.
+- **Find or create.** The idempotency key is derived from the intent hash:
+  the same intent finds its request, and a different intent is a different
+  request. mctl-api answers a replayed key with the stored request whatever
+  its state, so a denied, expired or consumed request stays that way for
+  that intent in that execution. `idempotency_key(intent, attempt)` leaves
+  room for a deliberate re-request with a new human decision; this slice
+  always uses attempt 0.
+- **Consume at decision time.** For a REQUIRE_APPROVAL action, `decide()`
+  asks the lookup to redeem: recompute the intent hash, refuse unless the
+  receipt's stored hash equals it (`approval_intent_mismatch`), refuse
+  unless it is approved and unexpired, then consume it with the fresh hash.
+  Only a consume that mctl-api confirms, for exactly that receipt and hash,
+  permits (`code: approved`, `approval_ref` = the receipt id). A refused,
+  malformed or uncertain consume refuses, so the side effect does not run.
+
+  Why at decision time and not a grant object whose `consume()` the caller
+  calls later: every governed path already treats `Decision.permitted` as
+  "run now" and calls the checkpoint immediately before the side effect.
+  Consuming inside the decision means there is no value meaning "approved
+  but not yet consumed" that a caller could run on by mistake, and no new
+  step that a future call site could forget. The failure it leaves is the
+  safe one: a crash after the consume and before the effect burns the
+  approval without acting, and it never acts twice.
+- **Outcomes.** Each keeps the REQUIRE_APPROVAL verdict, and none permits:
+  `approval_pending` (with the request id in `approval_ref`;
+  `Decision.awaiting_approval`), `approval_denied`, `approval_expired`,
+  `approval_consumed`, `approval_intent_mismatch` and `approval_refused`
+  (the store refused the request itself, or there is no execution identity
+  to bind it to). A store that cannot answer (transport error, 5xx, 408,
+  425, 429, a malformed answer) is `approval_lookup_error`, a DENY that
+  counts as undecided.
+- **Revalidating a named receipt.** `checkpoint(..., approval_ref=...)`
+  revalidates exactly the receipt a caller waited on, instead of finding it
+  by key. A changed action is then `approval_intent_mismatch`, and nothing
+  is consumed.
+- **Off by default.** The lookup is `configured_approvals()`:
+  `MCTL_POLICY_APPROVALS` unset, empty or `none` is `NO_APPROVALS` (no HTTP,
+  REQUIRE_APPROVAL always blocks, as before); `mctl-api` enables this store;
+  any other value is a misconfiguration, and every REQUIRE_APPROVAL then
+  fails closed. `MCTL_POLICY_APPROVAL_TTL_S` sets a new request's expiry
+  (default 24h, capped under mctl-api's 7 days). The client uses the
+  existing `MCTL_TOKEN` and `MCTL_API_BASE_URL`; mctl-api requires a
+  service principal acting directly to create and consume.
+
+### 7. Waiting for an approval (#198, design only)
+
+A workflow never holds a pod while it waits.
+
+1. The activity that performs the side effect calls the checkpoint. On
+   `approval_pending` it returns the decision (with `approval_ref`) as its
+   result and does not raise. The activity ends, and so does any pod it ran
+   in.
+2. The workflow enters `WAITING_FOR_APPROVAL` with the receipt id in its
+   state. It waits on `workflow.wait_condition` for a signal carrying only
+   the receipt id, bounded by a durable timer set from the receipt's
+   `expires_at`. The signal is sent by mctl-api after it records a
+   decision. It is best effort, and it is a wake-up, never an approval: its
+   payload is not trusted.
+3. Because the signal can be lost, the timer also fires on a poll cadence
+   (for example every 15 minutes until expiry), and each firing runs a
+   short read-only activity (`GET /action-approvals/{id}`) that returns the
+   state. Nothing is held between polls.
+4. On any wake, the workflow re-runs the side-effect activity with
+   `approval_ref` set. That activity recomputes the intent and redeems the
+   receipt through the checkpoint (§6). The workflow's own belief about the
+   state never authorizes anything.
+5. The outcome is deterministic. `approved` means the effect ran once;
+   `approval_consumed` on a retry of that activity means it already ran, or
+   crashed after the consume, and it is never re-run. `approval_denied`,
+   `approval_expired` or `approval_intent_mismatch` ends the step according
+   to the workflow's policy, and asking again needs a new request (a new
+   `attempt`) and a new human decision. `approval_lookup_error` is retried
+   with backoff while the timer still runs.
+
 ## Open decisions (not settled here)
 
-1. **The durable approval store.** `ApprovalLookup` is the seam. Its only
-   implementation today, `NO_APPROVALS`, never finds an approval, so
-   REQUIRE_APPROVAL always blocks. That is safe, but it means a gated MCP tool
-   is unusable by an agent until a store exists. The owner requires the store
-   to be durable, bound to the exact request, and invalidated by changed
-   arguments, with a retry that does not duplicate the side effect. The
-   candidate is the approval projection the mctl-api work-item contract
-   already names (`approval_requested` / `approval_decided` events), which is
-   not built yet. Single-use consumption belongs to the same store.
+1. **The approval wait (#198).** §7 is the design. The Temporal workflow,
+   the signal from mctl-api and the approval surfaces (UI, Telegram, GitHub)
+   are not built. Until gitops sets `MCTL_POLICY_APPROVALS=mctl-api`,
+   REQUIRE_APPROVAL keeps blocking. Once it is set, an agent's gated MCP call
+   is refused with `approval_pending` and the request id, and a later
+   identical call in the same execution succeeds once a human has approved.
 2. **The mentor.** It has MCP tools but no hooks, and adding any hook makes it
    drainable (#366/#368). Until that is decided separately, its MCP calls are
    not governed.
-3. **Other GitHub mutations.** The implementer's push and PR creation, the
-   investigator's comment, and the shepherd's merge and rerun do not go
+3. **Other GitHub mutations.** The implementer's pushes and PR creation,
+   the investigator's comment, the issue poller's label removal, and the
+   shepherd's merge, `@claude review` comment and CI rerun do not go
    through the checkpoint yet. `run_implementer.py` and
    `run_issue_investigator.py` are owned by open PRs (#409 and #422). Each
    one becomes a one-line `require(checkpoint(...))` before its `_run`.
@@ -145,3 +242,9 @@ When this ships, an agent that calls a gated mctl tool gets a deny that
 carries the action digest, instead of performing the side effect. That is
 the behaviour change #197 asks for, and it takes effect on the release that
 includes it.
+
+The durable approval store (§6) changes nothing until
+`MCTL_POLICY_APPROVALS=mctl-api` is set. With it set, every checkpoint on a
+REQUIRE_APPROVAL action makes up to two calls to mctl-api (find-or-create,
+then consume) on its write budget. The checkpoint is synchronous, so the MCP
+hook blocks for up to the client timeout (10s per call) while it waits.

@@ -38,13 +38,19 @@ def _mcp(tool: str, args: dict, *, grants=GRANTS, **kw) -> pc.Decision:
 
 
 class _Approvals:
+    """A lookup that grants each approved action digest exactly once."""
+
     def __init__(self, approved: dict[str, str]) -> None:
-        self.approved = approved
+        self.approved = dict(approved)
         self.asked: list[tuple[str, str]] = []
 
-    def find(self, action_digest: str, policy_version: str) -> str | None:
-        self.asked.append((action_digest, policy_version))
-        return self.approved.get(action_digest)
+    def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
+        digest = request.action_digest()
+        self.asked.append((digest, policy_version))
+        ref = self.approved.pop(digest, None)
+        if ref:
+            return pc.ApprovalOutcome(pc.APPROVAL_GRANTED, approval_ref=ref)
+        return pc.ApprovalOutcome(pc.APPROVAL_NONE)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +143,8 @@ def test_an_approval_binds_to_the_exact_action_only():
 
 
 def test_the_default_store_never_approves():
-    assert pc.NO_APPROVALS.find("sha256:x", "v") is None
+    probe = pc.ActionRequest(pc.MCP_TOOL_CALL, DEPLOY, "mctl", "sha256:x")
+    assert pc.NO_APPROVALS.redeem(probe, rule_id="r", policy_version="v").status == pc.APPROVAL_NONE
     assert not _mcp(DEPLOY, {"service": "x"}).permitted
 
 
@@ -147,7 +154,7 @@ def test_every_failure_fails_closed():
     assert (d.verdict, d.code, d.permitted) == (pc.DENY, pc.CODE_EVALUATOR_ERROR, False)
 
     class _Down:
-        def find(self, action_digest: str, policy_version: str) -> str | None:
+        def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
             raise OSError("store unreachable")
 
     d = _mcp(DEPLOY, {}, approvals=_Down())
