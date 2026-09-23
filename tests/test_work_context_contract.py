@@ -149,6 +149,8 @@ def test_every_real_state_fixture_is_found_and_terminal_matches_mctl_api():
         ("get-waiting.json", "waiting", False),
         ("get-active-resumed.json", "active", False),
         ("get-completed.json", "completed", True),
+        ("get-superseded.json", "superseded", True),
+        ("get-archived.json", "archived", True),
     ):
         answer = wc.answer_from(200, _fixture(name))
         assert answer.verdict == wc.WORK_ITEM_FOUND, (name, answer.reason)
