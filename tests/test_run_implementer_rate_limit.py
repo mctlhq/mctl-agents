@@ -13,7 +13,7 @@ import anyio
 import pytest
 import yaml
 
-from orchestrator import run_implementer
+from orchestrator import rate_limit, run_implementer
 from orchestrator.rate_limit import RateLimitObservation
 from tests.conftest import result_message
 
@@ -593,7 +593,7 @@ def test_skip_while_window_open(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN_SECONDARY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY_SECONDARY", raising=False)
-    assert run_implementer.account_label() == "unknown"  # no auth configured in test env
+    assert rate_limit.account_label() == "unknown"  # no auth configured in test env
     # account_label() answers "unknown" without any auth configured, so this
     # guard must fail OPEN here — matching account is required to skip.
     assert run_implementer._skip_while_rate_limited(ref) is None
@@ -737,3 +737,29 @@ def test_implement_one_skips_before_clone_when_window_is_open(tmp_path, monkeypa
     assert result.rate_limit_observation.account == "primary"
     assert result.rate_limit_observation.resets_at == "2099-01-01T00:00:00Z"
     assert run_implementer._batch_outcome([result]).rate_limited == 1
+
+
+def test_skip_needs_an_explicit_account_label(tmp_path, monkeypatch) -> None:
+    """A derived label must not withhold work: with CLAUDE_OAUTH_ACCOUNT
+    unset, the fallback account (injected through the same token variable)
+    would read as the primary and be skipped on its window."""
+    import types
+
+    import orchestrator.auth as auth
+
+    ref = make_ref(tmp_path)
+    run_implementer.update_status_yaml(
+        ref, "accepted",
+        rate_limited={
+            "code": "rate-limited",
+            "account": "primary",
+            "rate_limit_type": "seven_day",
+            "resets_at": "2099-01-01T00:00:00Z",
+        },
+    )
+    monkeypatch.delenv("CLAUDE_OAUTH_ACCOUNT", raising=False)
+    monkeypatch.setattr(
+        auth, "detect_auth", lambda: types.SimpleNamespace(env_var="CLAUDE_CODE_OAUTH_TOKEN"),
+    )
+
+    assert run_implementer._skip_while_rate_limited(ref) is None

@@ -181,7 +181,6 @@ from orchestrator.proposal_state import (
 from orchestrator.rate_limit import (
     RateLimitExhaustedError,
     RateLimitObservation,
-    account_label,
     build_observation,
     is_rate_limit_result,
     observe_rate_limit_event,
@@ -3509,8 +3508,14 @@ def _skip_while_rate_limited(ref: ProposalRef) -> str | None:
     recorded_account = current.get("account")
     if not isinstance(recorded_account, str) or not recorded_account or recorded_account == "unknown":
         return None
-    this_account = account_label()
-    if this_account == "unknown" or this_account != recorded_account:
+    # Withhold work only on an EXPLICIT account label. The derived fallback
+    # (`account_label()` reading `detect_auth().env_var`) cannot tell the
+    # fallback account from the primary when the CWFT injects both through
+    # the same `CLAUDE_CODE_OAUTH_TOKEN`, so the second account would be
+    # skipped on the first account's window. Good enough to record, not to
+    # skip on (claude P2 on #458).
+    this_account = os.getenv("CLAUDE_OAUTH_ACCOUNT", "").strip()
+    if not this_account or this_account == "unknown" or this_account != recorded_account:
         return None
     resets_at = current.get("resets_at")
     if not isinstance(resets_at, str) or not resets_at:
