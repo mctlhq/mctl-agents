@@ -203,10 +203,18 @@ def persist(snapshot: ContextSnapshot, client: Any) -> SnapshotAnswer:
     answer = client.seal_snapshot(wid, eid, seal_body(snapshot, work_context))
     if answer.verdict != SNAPSHOT_DIVERGED:
         return answer
+    # A divergence is reported only once the stored document was read and
+    # really differs; a read that fails or cannot be decoded leaves it
+    # unverified, which is UNKNOWN (governed by `blocks_on_unknown()`),
+    # never a divergence.
     stored = client.execution_snapshot(wid, eid)
-    if stored.verdict == SNAPSHOT_REPLAYED and stored.timeless_hash and (
-        stored.timeless_hash == timeless_hash(snapshot.to_dict())
-    ):
+    if stored.verdict != SNAPSHOT_REPLAYED or not stored.timeless_hash:
+        return SnapshotAnswer(
+            SNAPSHOT_UNKNOWN, content_hash=answer.content_hash,
+            reason=f"409 {DIVERGENCE_CODE}, but the stored snapshot could not be verified: "
+            f"{stored.verdict} {stored.reason}".strip(),
+        )
+    if stored.timeless_hash == timeless_hash(snapshot.to_dict()):
         return SnapshotAnswer(
             SNAPSHOT_REPLAYED, snapshot_id=stored.snapshot_id, content_hash=stored.content_hash,
             reason="same content as the stored snapshot, sealed at another time",

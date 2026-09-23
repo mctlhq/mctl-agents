@@ -231,3 +231,19 @@ def test_persist_itself_never_sends_a_local_execution(tmp_path):
         assert ws.persist(snap, _NoCalls()).verdict == ws.SNAPSHOT_SKIPPED
     linked, answer = ws.resumed_from(_work_context(execution_id="sha-local"), _NoCalls())
     assert answer.verdict == ws.SNAPSHOT_SKIPPED and linked.resumed_from_snapshot_id is None
+
+
+@pytest.mark.parametrize("read", ["down", "undecodable"])
+def test_an_unverifiable_divergence_is_unknown_not_diverged(tmp_path, monkeypatch, read):
+    snap = _sealed(tmp_path)
+    store = _Store(stored=b'{"other":1}')
+    if read == "down":
+        store.execution_snapshot = lambda *a: ws.answer_from_read(503, {"error": "down"}, execution_id=E2)
+    else:
+        bad = {"id": "cs_stored", "execution_id": E2, "content_hash": "sha256:x", "canonical_b64": "not base64!"}
+        store.execution_snapshot = lambda *a: ws.answer_from_read(200, {"snapshot": bad}, execution_id=E2)
+    assert ws.persist(snap, store).verdict == ws.SNAPSHOT_UNKNOWN
+    # So the break-glass governs it, as for any unreachable store.
+    monkeypatch.setenv("WORK_CONTEXT_ROLLOUT_MODE", "enforce")
+    monkeypatch.setenv("WORK_CONTEXT_REQUIRED", "false")
+    ca.assemble_investigator_context(**_assemble_kwargs(tmp_path, _work_context(), store))

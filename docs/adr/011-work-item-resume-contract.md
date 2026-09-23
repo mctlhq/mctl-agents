@@ -143,7 +143,9 @@ exists only when the work-item layer creates a new execution.
   context yields a new `created_at`, so the bytes differ and the store
   answers 409. The stored document is then read back and compared without
   `created_at`; if the rest is identical, the answer is a replay. Only a
-  document that differs in anything else is a divergence. The stored
+  document that differs in anything else is a divergence. If the stored
+  document cannot be read or decoded, the answer is UNKNOWN, never a
+  divergence: a divergence is reported only once it is verified. The stored
   snapshot is never replaced.
 - **Gating.** Nothing is sent unless `WORK_CONTEXT_ROLLOUT_MODE` is at least
   `observe` AND the execution id is a store execution (`we_...`).
