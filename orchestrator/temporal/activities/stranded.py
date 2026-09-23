@@ -23,8 +23,9 @@ hold, checked in this order (design.md §1):
      comment below);
   5. its `updated_at` is inside the stranding grace period — a DevLoopWorkflow
      may be between its approve flip and its own implement submit;
-  6. its derived DevLoop workflow id is in the caller's active set — a live
-     loop already owns it.
+  6. a live loop already owns it: its derived issue-keyed DevLoop id is in
+     the caller's active set, or a running dispatched `dev-loop-xr_*` loop
+     carries that id as its alias (mctlhq/mctl-agents#474, `active_loops`).
 
 Fail-CLOSED on an unknown active set: unlike `detect_orphans` (whose
 projection write is harmless without it), the active set here IS the safety
@@ -38,9 +39,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from temporalio import activity
 
+from orchestrator.temporal import active_loops
 from orchestrator.temporal.activities.gitops_state import ProposalStateRef, list_proposal_refs
 from orchestrator.temporal.activities.orphans import expected_dev_loop_id
 
@@ -108,7 +111,7 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 def _scan(
     refs: list[ProposalStateRef],
-    active_workflow_ids: set[str],
+    active: active_loops.ActiveLoops,
     grace_minutes: int,
     now: datetime,
 ) -> StrandedScanResult:
@@ -157,9 +160,13 @@ def _scan(
             )
             continue
 
-        expected_id = expected_dev_loop_id(ref.slug, None, ref.service)
-        if expected_id and expected_id in active_workflow_ids:
-            skipped.append((key, f"owned by the live DevLoopWorkflow {expected_id}"))
+        # The REAL id of whichever loop runs for this proposal's issue: the
+        # issue-keyed loop, or a dispatched `dev-loop-xr_*` loop whose memo
+        # names it (#474). Missing the second one is how a loop still queued
+        # for admission got a second implementer run from this sweep.
+        owner = active.owner_of(expected_dev_loop_id(ref.slug, None, ref.service))
+        if owner:
+            skipped.append((key, f"owned by the live DevLoopWorkflow {owner}"))
             continue
 
         stranded.append(
@@ -181,7 +188,7 @@ def _scan(
 
 @activity.defn
 async def find_stranded_accepted(
-    active_workflow_ids: list[str], grace_minutes: int
+    active_workflow_ids: list[Any], grace_minutes: int
 ) -> StrandedScanResult:
     """`accepted` proposals with no PR, no fresh attempt and no owning loop.
 
@@ -191,9 +198,13 @@ async def find_stranded_accepted(
     caller (`ImplementSweepWorkflow`) treats that as "unknown", not "clean",
     the same distinction the visibility query's own failure gets one call
     earlier.
+
+    `active_workflow_ids` is `list_active_dev_loop_ids`' result as the
+    workflow hands it through: `{workflow_id, issue_workflow_id}` entries, or
+    bare ids from a result recorded before #474 (`active_loops.index`).
     """
     refs = await list_proposal_refs()
-    result = _scan(refs, set(active_workflow_ids), grace_minutes, datetime.now(UTC))
+    result = _scan(refs, active_loops.index(active_workflow_ids), grace_minutes, datetime.now(UTC))
     activity.logger.info(
         "implement-sweep: %d accepted proposal(s), %d stranded, %d skipped, "
         "%d quarantined unauthorized",

@@ -12,6 +12,7 @@ import os
 from temporalio.client import Client, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
+from orchestrator.temporal.active_loops import ISSUE_WORKFLOW_ID_MEMO
 from orchestrator.temporal.constants import TASK_QUEUE
 
 # workflow_id_for moved to issue_ref (temporalio-free) so agent-container
@@ -92,6 +93,13 @@ async def start_dispatched_dev_loop(client: Client, issue: IssueRef) -> Workflow
       once. Unlike an issue-keyed loop, a failed dispatched run is not
       restartable under the same id: the surface asks again (a new request,
       a new id), which is what keeps one request from ever owning two runs.
+
+    The memo names the issue-keyed id this loop stands in for
+    (mctlhq/mctl-agents#474), so the sweeps that look a proposal's loop up by
+    that id can find this one too (`active_loops`). It is part of the start
+    request, not a workflow command: it lands on the started event and in
+    visibility, the workflow code never reads it, and adding it changes no
+    replay.
     """
     if not issue.execution_request_id:
         raise ValueError("start_dispatched_dev_loop needs an IssueRef with an execution_request_id")
@@ -100,6 +108,7 @@ async def start_dispatched_dev_loop(client: Client, issue: IssueRef) -> Workflow
         issue,
         id=dispatched_workflow_id(issue.execution_request_id),
         task_queue=TASK_QUEUE,
+        memo={ISSUE_WORKFLOW_ID_MEMO: workflow_id_for(issue.issue_url)},
         id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )

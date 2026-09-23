@@ -1,7 +1,9 @@
 """Activity: detect orphan proposals without active DevLoopWorkflow runs.
 
 An orphan is an actionable proposal with a valid GitHub PR that has no matching
-DevLoopWorkflow running in Temporal.
+DevLoopWorkflow running in Temporal: neither its issue-keyed loop nor a
+dispatched `dev-loop-xr_*` loop whose memo names that loop's id
+(mctlhq/mctl-agents#474, `active_loops`).
 """
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import asyncio
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from temporalio import activity
 from temporalio.exceptions import ApplicationError
@@ -17,6 +20,7 @@ from orchestrator.run_shepherd import (
     _discover_refs,
     find_pr_for_proposal,
 )
+from orchestrator.temporal import active_loops
 from orchestrator.temporal.activities.gitops_state import (
     fetch_pr_snapshots,
     list_proposal_refs,
@@ -44,7 +48,9 @@ class OrphanDetectionResult:
     skipped_reason: str | None = None
 
 
-def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None = None) -> OrphanDetectionResult:
+def _sync_detect_orphans(
+    state_dir: Path, active: active_loops.ActiveLoops | None = None
+) -> OrphanDetectionResult:
     if not state_dir.is_dir():
         return OrphanDetectionResult(total_actionable=0, orphans=[])
 
@@ -52,15 +58,14 @@ def _sync_detect_orphans(state_dir: Path, active_workflow_ids: set[str] | None =
     actionable_refs = [r for r in refs if r.status in ACTIONABLE_STATUSES]
 
     orphans: list[OrphanSignal] = []
-    active_ids = active_workflow_ids or set()
+    active = active or active_loops.ActiveLoops()
 
     for ref in actionable_refs:
         pr = find_pr_for_proposal(ref.service, ref.slug, state_dir=state_dir)
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
 
-        expected_workflow_id = _expected_workflow_id(ref.slug, pr.repo, ref.service)
-        if expected_workflow_id and expected_workflow_id in active_ids:
+        if active.owner_of(_expected_workflow_id(ref.slug, pr.repo, ref.service)):
             continue
 
         reason = "No active DevLoopWorkflow found for open PR proposal"
@@ -111,7 +116,7 @@ def expected_dev_loop_id(slug: str, repo: str | None, service: str) -> str | Non
 _expected_workflow_id = expected_dev_loop_id
 
 
-async def _detect_from_github(active_ids: set[str]) -> OrphanDetectionResult:
+async def _detect_from_github(active: active_loops.ActiveLoops) -> OrphanDetectionResult:
     refs = [r for r in await list_proposal_refs() if r.status in ACTIONABLE_STATUSES]
     snapshots = await fetch_pr_snapshots(refs)
 
@@ -121,8 +126,7 @@ async def _detect_from_github(active_ids: set[str]) -> OrphanDetectionResult:
         if pr is None or pr.closed_unmerged or pr.merged:
             continue
 
-        expected = _expected_workflow_id(ref.slug, pr.repo, ref.service)
-        if expected and expected in active_ids:
+        if active.owner_of(_expected_workflow_id(ref.slug, pr.repo, ref.service)):
             continue
 
         orphans.append(
@@ -141,7 +145,7 @@ async def _detect_from_github(active_ids: set[str]) -> OrphanDetectionResult:
 @activity.defn
 async def detect_orphans(
     state_dir_path: str = "",
-    active_workflow_ids: list[str] | None = None,
+    active_workflow_ids: list[Any] | None = None,
 ) -> OrphanDetectionResult:
     """Actionable proposals with an open PR and no DevLoopWorkflow running.
 
@@ -150,8 +154,12 @@ async def detect_orphans(
     default made this sweep a no-op in the worker (#270). This one returned
     its empty result without even a warning, so nothing in the logs
     distinguished "no orphans" from "never ran".
+
+    `active_workflow_ids` is `list_active_dev_loop_ids`' result as the
+    workflow hands it through: `{workflow_id, issue_workflow_id}` entries, or
+    bare ids from a result recorded before #474 (`active_loops.index`).
     """
-    active_set = set(active_workflow_ids) if active_workflow_ids else set()
+    active_set = active_loops.index(active_workflow_ids)
 
     if state_dir_path:
         state_dir = Path(state_dir_path)

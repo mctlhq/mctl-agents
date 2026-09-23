@@ -14,7 +14,9 @@ from temporalio import activity
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 
+from orchestrator.temporal.active_loops import ISSUE_WORKFLOW_ID_MEMO
 from orchestrator.temporal.implement_outcome import PRE_START_ERROR_TYPE
+from orchestrator.temporal.issue_ref import is_dispatched_workflow_id
 
 # Visibility query for the active DevLoop set. WorkflowType is the
 # @workflow.defn class name; ExecutionStatus 'Running' deliberately excludes
@@ -107,18 +109,53 @@ class VisibilityActivities:
         self._client = client
 
     @activity.defn
-    async def list_active_dev_loop_ids(self) -> list[str]:
-        """Return the workflow IDs of all running DevLoopWorkflow executions.
+    async def list_active_dev_loop_ids(self) -> list[dict[str, str]]:
+        """Return every running DevLoopWorkflow as `{workflow_id, issue_workflow_id}`.
+
+        `issue_workflow_id` is the issue-keyed id a dispatched `dev-loop-xr_*`
+        loop stands in for, read from the memo `start_dispatched_dev_loop`
+        writes (mctlhq/mctl-agents#474), or "" when the loop carries none:
+        an issue-keyed loop, whose own id is already the issue-keyed id. The
+        consumers match a proposal on that alias and report the real id
+        (`active_loops`); see that module for why the alias is not simply
+        added to the set as another id.
+
+        Same activity name as before on purpose: the reconcile and sweep
+        workflows schedule it by name, so the schedule command replays
+        unchanged, and every consumer still accepts the bare-string entries a
+        result recorded before this change carries (`active_loops.index`).
 
         Raises on visibility errors — the caller (ReconcileWorkflow) treats a
         failure as "active set unknown" and skips orphan detection for the
         tick rather than reporting every proposal as an orphan.
         """
-        ids: list[str] = []
+        loops: list[dict[str, str]] = []
+        missing_alias: list[str] = []
         async for wf in self._client.list_workflows(ACTIVE_DEV_LOOPS_QUERY):
-            ids.append(wf.id)
-        activity.logger.info("visibility: %d active DevLoopWorkflow run(s)", len(ids))
-        return ids
+            try:
+                alias = await wf.memo_value(ISSUE_WORKFLOW_ID_MEMO, "")
+            except Exception:  # noqa: BLE001 — an unreadable memo is a missing one, not a failed tick
+                alias = ""
+            if not isinstance(alias, str):
+                alias = ""
+            if not alias and is_dispatched_workflow_id(wf.id):
+                missing_alias.append(wf.id)
+            loops.append({"workflow_id": wf.id, "issue_workflow_id": alias})
+        if missing_alias:
+            # A dispatched loop started before the memo existed. None should:
+            # the dispatcher is off unless EXECUTION_REQUEST_DISPATCHER is set,
+            # and the start that writes the memo shipped with the fix. Said
+            # loudly rather than guessed at, because such a loop is invisible
+            # to the proposal lookups exactly as it was before #474.
+            activity.logger.warning(
+                "visibility: %d running dispatched DevLoop(s) carry no %r memo "
+                "and cannot be matched to their proposal: %s",
+                len(missing_alias),
+                ISSUE_WORKFLOW_ID_MEMO,
+                missing_alias,
+            )
+        activity.logger.info("visibility: %d active DevLoopWorkflow run(s)", len(loops))
+        return loops
 
     @activity.defn
     async def count_swept_prestart_failures(self, workflow_ids: list[str]) -> dict[str, int]:

@@ -50,6 +50,7 @@ from orchestrator.lifecycle.contract import (
     OwnershipAnswer,
     batch_answers_from,
 )
+from orchestrator.temporal import active_loops
 from orchestrator.temporal.activities.gitops_state import (
     ProposalStateRef,
     PRSnapshot,
@@ -132,7 +133,7 @@ OUTCOME_HELD = "applied-still-held"
 
 @activity.defn
 async def reconcile_lifecycle_ownership(
-    active_workflow_ids: list[str] | None = None,
+    active_workflow_ids: list[Any] | None = None,
 ) -> LifecycleReconcileResult:
     """Examine every tracked entity's ownership record and repair what it can.
 
@@ -165,7 +166,7 @@ async def reconcile_lifecycle_ownership(
     snapshots = await fetch_pr_snapshots(
         [ref for ref in refs if ref.status not in TERMINAL_STATUSES]
     )
-    active = set(active_workflow_ids or [])
+    active = active_loops.index(active_workflow_ids)
 
     observations = _observe(refs, snapshots, active)
     if not observations:
@@ -223,7 +224,7 @@ async def reconcile_lifecycle_ownership(
 def _observe(
     refs: list[ProposalStateRef],
     snapshots: dict[tuple[str, str], PRSnapshot],
-    active: set[str],
+    active: active_loops.ActiveLoops,
 ) -> list[reconciler.Observation]:
     """One observation per (entity, phase) this sweep can say anything about.
 
@@ -311,7 +312,7 @@ def _observe(
     return out
 
 
-def _live_id(ref: ProposalStateRef, repo: str | None, active: set[str]) -> str:
+def _live_id(ref: ProposalStateRef, repo: str | None, active: active_loops.ActiveLoops) -> str:
     """The DevLoopWorkflow running against this proposal, or "".
 
     Through `_expected_workflow_id`, the orphan sweep's own reconstruction,
@@ -319,9 +320,15 @@ def _live_id(ref: ProposalStateRef, repo: str | None, active: set[str]) -> str:
     that made the ids match at all (#151) and the owner-derivation fix on top
     of it (#212), and a private copy here would be the third answer to a
     question that has been wrong twice.
+
+    The REAL id, never the alias (mctlhq/mctl-agents#474). A dispatched loop
+    is found through the issue-keyed id its memo carries, but the reconciler
+    compares this value with the id an ownership record names, and a
+    dispatched loop writes its records as `dev-loop-xr_*`: answering the
+    alias would turn every healthy dispatched owner into a
+    `conflicting-owner` escalation.
     """
-    expected = _expected_workflow_id(ref.slug, repo, ref.service)
-    return expected if expected and expected in active else ""
+    return active.owner_of(_expected_workflow_id(ref.slug, repo, ref.service))
 
 
 async def _fill_ownership(

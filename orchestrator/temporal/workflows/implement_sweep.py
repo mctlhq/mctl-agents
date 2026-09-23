@@ -34,6 +34,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy, WorkflowIDReusePolicy
@@ -294,7 +295,10 @@ class ImplementSweepWorkflow:
         cfg = input_data or ImplementSweepWorkflowInput()
 
         try:
-            active_ids: list[str] = await workflow.execute_activity(
+            # One `{workflow_id, issue_workflow_id}` entry per running loop
+            # (#474): a dispatched `dev-loop-xr_*` loop is matched to its
+            # proposal by that alias in `find_stranded_accepted`.
+            active_ids: list[Any] = await workflow.execute_activity(
                 "list_active_dev_loop_ids",
                 start_to_close_timeout=ACTIVITY_TIMEOUT,
                 retry_policy=ACTIVITY_RETRY_POLICY,
