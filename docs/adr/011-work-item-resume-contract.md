@@ -119,6 +119,53 @@ new Temporal command when `_approved` is already true, so both are safe for
 every pre-existing history: the investigate → implement command stream is
 byte-identical when no `resume` is ever signalled.
 
+### 6. Sealed snapshots are persisted in mctl-api (#431)
+
+Owner decisions on #431: the durable record is mctl-api's existing Postgres
+(mctl-api#362, insert-only, one snapshot per execution). The retry identity
+is the store's execution id: the same content again is a replay, and
+different content for the same execution fails explicitly. A human-input
+signal continues the execution and seals nothing new. A second snapshot
+exists only when the work-item layer creates a new execution.
+
+`orchestrator/work_context/snapshots.py` is the client side, and
+`context_assembly.assemble_investigator_context` calls it:
+
+- **Before sealing**, `resumed_from` points `resumed_from_snapshot_id` at
+  the snapshot the latest prior store execution sealed. The pointer is part
+  of the sealed content. A failed lookup is logged and never blocks: the
+  pointer is a convenience (§2).
+- **After sealing**, `persist` sends the whole canonical document
+  (`canonical_json(snapshot.to_dict())`, base64). The document carries the
+  strategy name and version, and the store verifies its `sha256`. The
+  policy checkpoint (ADR 014) decides immediately before the POST.
+- **A retry is not a divergence.** Re-assembling the same execution's
+  context yields a new `created_at`, so the bytes differ and the store
+  answers 409. The stored document is then read back and compared without
+  what a retry may change: `created_at`, the snapshot's own id and hash,
+  and `work_context.resumed_from_snapshot_id`, since the prior lookup is
+  best-effort and can succeed on one attempt and fail on the next. If the
+  rest is identical, the answer is a replay. Only a document that differs
+  in anything else is a divergence, and the logged reason names the fields.
+  The usual cause is that the live inputs changed under a retry (e.g. a
+  new issue comment), not corruption. Recovery is a new execution. If the stored
+  document cannot be read or decoded, the answer is UNKNOWN, never a
+  divergence: a divergence is reported only once it is verified. The stored
+  snapshot is never replaced.
+- **Gating.** Nothing is sent unless `WORK_CONTEXT_ROLLOUT_MODE` is at least
+  `observe` AND the execution id is a store execution (`we_...`).
+  - A divergence blocks from `enforce` up, even under the
+    `WORK_CONTEXT_REQUIRED=false` break-glass, because it means this
+    execution already recorded a different context.
+  - An unreachable or refusing store blocks where `blocks_on_unknown()`
+    holds.
+  - Blocking raises `SnapshotNotPersisted`. The investigator propagates it
+    only in context-assembly mode `on`; in `shadow` it logs it, as it does
+    every assembly failure.
+- **Dormant today.** The investigator's `WorkContextRef.execution_id` is
+  still the local `execution_id_for` hash, not a store id (#455 item 1), so
+  nothing is persisted until that is changed in `run_issue_investigator.py`.
+
 ## Alternatives
 
 1. **Reuse `StepRef` for cross-execution chaining.** Rejected: it would
@@ -194,3 +241,5 @@ two cross-repo prerequisites.
 | `--work-item-id` / `--execution-id` / `--resume-from-execution-id` / `--surface` / `--actor-kind` / `--actor-id`, `_work_context_from_args` | `orchestrator/run_issue_investigator.py` |
 | `resume` signal, `work_context` query, `IssueRef.work_item_id`, `ResumeRejection`, `WorkContextState` | `orchestrator/temporal/workflows/dev_loop.py` |
 | Golden fixture | `tests/fixtures/context/investigator-snapshot.json` |
+| `persist`, `resumed_from`, `SnapshotAnswer` (#431) | `orchestrator/work_context/snapshots.py` |
+| `WorkItemClient.seal_snapshot` / `execution_snapshot` | `orchestrator/work_context/client.py` |

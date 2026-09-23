@@ -51,6 +51,8 @@ VERDICTS = frozenset({ALLOW, DENY, REQUIRE_APPROVAL})
 # Action kinds governed today.
 GITHUB_ISSUE_COMMENT = "github.issue.comment"
 MCTL_OPERATION_EXECUTE = "mctl.operation.execute"
+#: A write to the mctl-api work-item store made by the orchestrator itself.
+MCTL_WORK_ITEM_WRITE = "mctl.work_item.write"
 MCP_TOOL_CALL = "mcp.tool.call"
 
 # Decision codes. `allowed`/`approved` permit; every other code refuses.
@@ -200,6 +202,9 @@ BUILTIN_POLICY = Policy(
     rules=(
         Rule("github-issue-comment", GITHUB_ISSUE_COMMENT, "comment", ALLOW),
         Rule("mctl-investigate", MCTL_OPERATION_EXECUTE, "execute:mctl-agents-investigate", ALLOW),
+        # Sealing this execution's context snapshot (mctlhq/mctl-agents#431):
+        # insert-only on the store side, so it can never overwrite anything.
+        Rule("mctl-seal-context-snapshot", MCTL_WORK_ITEM_WRITE, "seal:context-snapshot", ALLOW),
         *(
             Rule("mctl-mcp-read", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True)
             for pattern in (*_mctl_tool_patterns(_READ_VERBS, prefix=True),
