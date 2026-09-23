@@ -139,7 +139,7 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
-from orchestrator import tracing
+from orchestrator import policy_checkpoint, tracing
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
@@ -323,6 +323,18 @@ EXIT_VERIFICATION_BUDGET_EXHAUSTED = 51
 # code and the stderr line printed alongside it instead of guessing prose for
 # every possible implementer failure.
 EXIT_RATE_LIMITED = 52
+# The policy checkpoint (mctlhq/mctl-agents#197, ADR 014) refused the
+# follow-up push: the side effect did not run. The shepherd charges it as
+# deterministic, so a policy that says no is bounded by MAX_REVIEW_ATTEMPTS
+# instead of re-running a paid model turn every tick (the transient arm).
+EXIT_POLICY_REFUSED = 53
+# The policy checkpoint could not decide on the follow-up push
+# (`Decision.undecided`: evaluator, identity or approval lookup failed), so
+# git never ran. A platform failure, not an answer about the findings: the
+# shepherd classifies it as `harness` — never charged to `review_attempts`,
+# but bounded by MAX_HARNESS_FAILURES, because a misconfigured or unreachable
+# approval store stays undecided and each retry is a paid model turn.
+EXIT_POLICY_UNDECIDED = 54
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -351,6 +363,10 @@ VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX = "verification-budget-exhausted:"
 # Prefix mapped to EXIT_RATE_LIMITED, raised by RateLimitExhaustedError
 # (mctl-agents#364).
 RATE_LIMITED_ERROR_PREFIX = "rate limited:"
+# Prefix mapped to EXIT_POLICY_REFUSED (mctl-agents#197).
+POLICY_REFUSED_ERROR_PREFIX = "policy-refused:"
+# Prefix mapped to EXIT_POLICY_UNDECIDED (mctl-agents#197).
+POLICY_UNDECIDED_ERROR_PREFIX = "policy-undecided:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -645,6 +661,14 @@ def _review_feedback_exit_code(error: str) -> int:
         lists, so it falls to ``kind="transient"`` there and no
         ``review_attempts`` slot is charged — re-running is expected to
         succeed once the window resets on its own.
+      - 53: the policy checkpoint refused the follow-up push
+        (mctl-agents#197): git never ran. In the shepherd's
+        ``deterministic_codes``, so it is charged: the same policy refuses
+        the same push again, and the transient arm would re-run the paid
+        turn every tick.
+      - 54: the policy checkpoint could not decide on that push
+        (``Decision.undecided``). In the shepherd's ``harness`` set: not
+        charged to ``review_attempts``, bounded by ``MAX_HARNESS_FAILURES``.
 
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
@@ -673,6 +697,10 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_VERIFICATION_BUDGET_EXHAUSTED
     if error.startswith(RATE_LIMITED_ERROR_PREFIX):
         return EXIT_RATE_LIMITED
+    if error.startswith(POLICY_REFUSED_ERROR_PREFIX):
+        return EXIT_POLICY_REFUSED
+    if error.startswith(POLICY_UNDECIDED_ERROR_PREFIX):
+        return EXIT_POLICY_UNDECIDED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -1348,20 +1376,28 @@ def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> b
 
 
 def _hand_back_if_still_ours(
-    ref: ProposalRef, attempt_id: str, *, budget_handbacks: int | None = None
+    ref: ProposalRef,
+    attempt_id: str,
+    *,
+    budget_handbacks: int | None = None,
+    policy_handbacks: int | None = None,
 ) -> bool:
     """Restore `accepted` only while `.status.yaml` still names our attempt.
 
     Returns True when the hand-back was written. ``budget_handbacks``
     (mctl-agents#430) records how many times THIS proposal has been handed
     back for an exhausted verification budget, so the retry it enables stays
-    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`.
+    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`. ``policy_handbacks``
+    (mctl-agents#197) is the same tally for an undecided policy checkpoint —
+    see `IMPLEMENT_MAX_POLICY_HANDBACKS`.
     """
     if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
         return False
     fields: dict[str, Any] = {"attempt": None, "failure": None}
     if budget_handbacks is not None:
         fields["budget_handbacks"] = budget_handbacks
+    if policy_handbacks is not None:
+        fields["policy_handbacks"] = policy_handbacks
     update_status_yaml(ref, "accepted", **fields)
     return True
 
@@ -1382,6 +1418,20 @@ def _hand_back_if_still_ours(
 # reason -- so an unconditional hand-back would trade a wrong terminal state
 # for an unbounded PAID retry loop (claude P2 on `624a433`).
 IMPLEMENT_MAX_BUDGET_HANDBACKS = 3
+
+# The same bound, with the same comparison, for the undecided-policy
+# hand-back (mctl-agents#197): the checkpoint could not decide on the push or
+# `gh pr create` (evaluator, identity or approval lookup failed). A blip
+# clears by the next tick, but a misconfigured `MCTL_POLICY_APPROVALS`, a
+# missing execution context in require mode, or a long mctl-api outage does
+# not, and every hand-back is a paid model turn. The Nth consecutive one goes
+# terminal as `needs-triage` / `policy-undecided`.
+#
+# Its own counter, `policy_handbacks`, not a share of `budget_handbacks`: the
+# two causes are unrelated (a runner's command budget vs. the policy
+# checkpoint), a mix of them would go terminal under whichever code happened
+# to hit the cap, and each arm's terminal write resets only its own tally.
+IMPLEMENT_MAX_POLICY_HANDBACKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -2159,8 +2209,37 @@ def _remote_head_sha(repo_dir: Path, branch: str) -> str | None:
     return line.split()[0] if line else None
 
 
+def _require_push_policy(repo: str, branch: str, *, lease: str | None) -> None:
+    """The policy checkpoint (mctlhq/mctl-agents#197) for one `git push` of
+    `branch` to `repo`. Raises `policy_checkpoint.PolicyRefused`, before git
+    runs, unless the decision permits the push.
+
+    Called AFTER the claim check and immediately before git: a claim refusal
+    must not spend an approval on a push that was never going to happen.
+    The arguments bind the remote, the branch and the lease the push is
+    fenced on — not the pushed commit, which this module does not read.
+
+    `push:new-branch` names the command (a plain, non-force `git push -u`),
+    not the remote's state: `_push_and_open_pr` also takes that arm when the
+    remote head could not be read, so the branch may already exist on
+    origin. A non-force push cannot rewrite it either way."""
+    mode = "force-with-lease" if lease else "new-branch"
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_GIT_PUSH,
+        f"push:{mode}",
+        f"{repo}:{branch}",
+        {"remote": "origin", "branch": branch, "lease": lease or ""},
+        metadata={"repo": repo, "branch": branch},
+    ))
+
+
 def _push_followup(
-    repo_dir: Path, branch: str, expected_sha: str, *, claim_context: _ClaimContext | None = None
+    repo_dir: Path,
+    branch: str,
+    expected_sha: str,
+    *,
+    claim_context: _ClaimContext | None = None,
+    repo: str,
 ) -> None:
     """Push the follow-up commit to the existing branch (no `-u`).
 
@@ -2168,9 +2247,12 @@ def _push_followup(
     is the AUTHORITATIVE check — the push itself fails if the remote moved,
     independently of the claim. `claim_context`, when given, is the EARLY
     filter checked immediately before this git call (ADR-010 phase 2, #352).
+    The policy checkpoint (#197) follows it; a refusal raises
+    `PolicyRefused` and git never runs.
     """
     if claim_context is not None:
         _check_claim_or_raise(claim_context, entity_version=expected_sha)
+    _require_push_policy(repo, branch, lease=expected_sha)
     _run(
         ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
         cwd=repo_dir,
@@ -2684,7 +2766,7 @@ def review_feedback_one(
         # if the branch moved since step 4, the claim check catches it before
         # git runs, and the push's own lease catches it even if the claim
         # check could not (store unreachable, rollout below `enforce`).
-        _push_followup(target, branch, old_head, claim_context=claim_ctx)
+        _push_followup(target, branch, old_head, claim_context=claim_ctx, repo=f"mctlhq/{ref.service}")
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
@@ -2718,6 +2800,25 @@ def review_feedback_one(
         release_reason = "claim refused"
         release_claim = e.verdict != CLAIM_UNKNOWN
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
+        return result
+    except policy_checkpoint.PolicyRefused as e:
+        # The policy checkpoint refused the follow-up push (#197): git never
+        # ran and nothing reached the branch.
+        if e.decision.undecided:
+            # The checkpoint could not decide (evaluator, identity or approval
+            # lookup failed): a platform failure, not an answer about these
+            # findings. EXIT_POLICY_UNDECIDED, a `harness` code in the
+            # shepherd: never charged to the proposal (the precedent is the
+            # directive poller's `PolicyCheckpointUndecided`), yet bounded by
+            # MAX_HARNESS_FAILURES, since an undecided store can stay that way.
+            release_reason = "policy checkpoint undecided"
+            result = ImplementResult(ref=ref, pr_url=None, error=f"{POLICY_UNDECIDED_ERROR_PREFIX} {e}")
+            return result
+        # An answer (DENY, or REQUIRE_APPROVAL not granted): EXIT_POLICY_REFUSED,
+        # which the shepherd charges as deterministic: the same policy answers
+        # the same way next tick, so re-running the model on it must stay bounded.
+        release_reason = "policy refused"
+        result = ImplementResult(ref=ref, pr_url=None, error=f"{POLICY_REFUSED_ERROR_PREFIX} {e}")
         return result
     except ImplementerOrphanedSubagent as e:
         # The message is already prefixed "orphaned sub-agent:" — that prefix is
@@ -3100,8 +3201,18 @@ def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
     # openclaw/openclaw) `gh pr create` otherwise defaults the base to the parent
     # repo and the non-interactive call fails, so the branch is pushed but no PR
     # is opened. --repo forces the PR into our repo against our own `main`.
+    repo = f"mctlhq/{ref.service}"
+    # The policy checkpoint (#197): on refusal PolicyRefused is raised and
+    # `gh pr create` never runs. Title and body are recorded only as a digest.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_PR_CREATE,
+        "create",
+        repo,
+        {"title": title, "body": body, "head": branch, "base": "main"},
+        metadata={"repo": repo, "head": branch, "base": "main"},
+    ))
     proc = _run(
-        ["gh", "pr", "create", "--repo", f"mctlhq/{ref.service}",
+        ["gh", "pr", "create", "--repo", repo,
          "--title", title, "--body", body, "--head", branch, "--base", "main"],
     )
     pr_url = proc.stdout.strip().splitlines()[-1]
@@ -3190,6 +3301,11 @@ def _preflight_existing_result(
     # Opening the PR is deterministic and avoids spending model quota again.
     try:
         pr_url = _open_pr_for_branch(ref, branch)
+    except policy_checkpoint.PolicyRefused as exc:
+        # The checkpoint refused `gh pr create` (#197): nothing was sent. Fail
+        # the preflight closed, like any other GitHub answer it cannot act on,
+        # so the model does not run and redo work whose PR it may not open.
+        raise GitHubPreflightError(f"opening the PR for the existing result branch: {exc}") from exc
     except subprocess.CalledProcessError as exc:
         # A concurrent actor may have opened it between list and create.
         retry = _github_json([
@@ -3600,6 +3716,7 @@ def _push_and_open_pr(
             # `--force-with-lease` below is the authoritative git CAS and is
             # unaffected either way (agy P2 on ddcdb0e).
             _check_claim_or_raise(claim_context)
+        _require_push_policy(f"mctlhq/{ref.service}", branch, lease=expected_sha)
         _run(
             ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
             cwd=repo_dir,
@@ -3614,6 +3731,7 @@ def _push_and_open_pr(
         # statement about git, not about who is allowed to write.
         if claim_context is not None:
             _check_claim_or_raise(claim_context)
+        _require_push_policy(f"mctlhq/{ref.service}", branch, lease=None)
         _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
     return _open_pr_for_branch(ref, branch)
 
@@ -4104,6 +4222,8 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # bounds CONSECUTIVE budget-exhausted attempts, not the lifetime
             # of the proposal (mctl-agents#430).
             budget_handbacks=None,
+            # Likewise for the undecided-policy tally (#197).
+            policy_handbacks=None,
             rate_limited=None,
         )
         _release_claim(claim_ctx, reason="implemented")
@@ -4188,6 +4308,66 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # prevent.
             pass
         return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
+    except policy_checkpoint.PolicyRefused as e:
+        # The policy checkpoint refused the push or `gh pr create` (#197):
+        # that side effect did not run.
+        if e.decision.undecided:
+            # The checkpoint could not decide (evaluator, identity or approval
+            # lookup failed): a platform failure, never recorded as this
+            # proposal's failure. Hand it back to `accepted` (a CAS, like the
+            # vanished-claim arm) so a later tick retries it; no triage record.
+            # Nothing was pushed, or the push landed and only `gh pr create`
+            # was undecided, in which case the retry's preflight finds the
+            # branch and opens the PR without running the model again.
+            # Status first, then the claim: releasing first would free mutual
+            # exclusion while `.status.yaml` still names this attempt.
+            #
+            # A skip, not an error, like the vanished-claim arm: an error
+            # turns the tick red, which can cost the gitops commit and runs
+            # the CWFT's `implement-fallback` second account on a condition no
+            # account can fix.
+            #
+            # Bounded like the budget hand-back: a `policy_handbacks` tally,
+            # and at IMPLEMENT_MAX_POLICY_HANDBACKS a terminal
+            # `needs-triage` / `policy-undecided` write. Both are skips, so the
+            # tick stays green and the gitops commit that makes the tally (or
+            # the terminal write that ends the loop) durable is never skipped.
+            prior = int(_load_status(ref.status_path).get("policy_handbacks", 0) or 0)
+            if prior + 1 >= IMPLEMENT_MAX_POLICY_HANDBACKS:
+                msg = (
+                    f"{POLICY_UNDECIDED_ERROR_PREFIX} the policy checkpoint could not decide on "
+                    f"{prior + 1} consecutive attempts (limit {IMPLEMENT_MAX_POLICY_HANDBACKS}): {e}"
+                )
+                recorded = _mark_needs_triage(
+                    ref,
+                    code="policy-undecided",
+                    stage="policy",
+                    message=msg,
+                    attempt=attempt,
+                    claim_context=claim_ctx,
+                    # A human moving it back to `accepted` starts a clean tally.
+                    extra_fields={"policy_handbacks": None},
+                )
+                return ImplementResult(ref=ref, pr_url=None, skipped_reason=_triage_error(msg, recorded))
+            msg = f"{POLICY_UNDECIDED_ERROR_PREFIX} {e} (attempt {prior + 1} of {IMPLEMENT_MAX_POLICY_HANDBACKS})"
+            if not _hand_back_if_still_ours(ref, attempt_id, policy_handbacks=prior + 1):
+                msg = f"{msg} (left `in-progress` for the attempt that now holds it)"
+            _release_claim(claim_ctx, reason="policy checkpoint undecided")
+            return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
+        # An answer (DENY, or REQUIRE_APPROVAL not granted). Its own triage
+        # code, so a policy decision reads as one in the proposal's history
+        # rather than as a crash in the generic `unexpected-error` arm.
+        msg = f"{POLICY_REFUSED_ERROR_PREFIX} {e}"
+        recorded = _mark_needs_triage(
+            ref,
+            code="policy-refused",
+            stage="policy",
+            message=msg,
+            attempt=attempt,
+            claim_context=claim_ctx,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
+        return result
     except ImplementerOrphanedSubagent as e:
         # Batch mode has no review-attempt budget, so it needs no sentinel exit
         # code — but it does need its own triage code, otherwise this lands in
