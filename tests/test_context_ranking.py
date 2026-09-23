@@ -167,7 +167,7 @@ def test_a_non_empty_conflicts_block_enters_the_hash():
     ids = tuple(s.source_id for s in snapshot.sources[:2])
     conflict = cs.ContextConflict(
         subject="prior-proposal-superseded-by-later-comment", source_ids=ids,
-        resolution_code="kept-all-ranked-by-trust-then-recency",
+        resolution_code="kept-all-ranked-by-trust-freshness-recency",
     )
     with_conflict = cs.seal(
         execution=snapshot.execution, strategy=snapshot.strategy, budget=snapshot.budget,
@@ -199,7 +199,7 @@ def _seal_with(conflict: cs.ContextConflict) -> cs.ContextSnapshot:
 def _conflict(**overrides) -> cs.ContextConflict:
     ids = tuple(s.source_id for s in _fixture_snapshot().sources[:2])
     fields = dict(subject="prior-proposal-superseded-by-later-comment", source_ids=ids,
-                  resolution_code="kept-all-ranked-by-trust-then-recency")
+                  resolution_code="kept-all-ranked-by-trust-freshness-recency")
     fields.update(overrides)
     return cs.ContextConflict(**fields)
 
@@ -457,15 +457,63 @@ def test_default_strategy_never_records_a_conflict(tmp_path):
 # ---------------------------------------------------------------------------
 # `on`-mode conflict notice
 # ---------------------------------------------------------------------------
+_NOTICE_TAIL = (
+    "Where they disagree, the prior proposal may be out of date: check it against the "
+    "later comments instead of carrying it forward unchanged."
+)
+
+
 def test_on_mode_renders_the_conflict_notice(tmp_path):
     result = _assemble(
         _input(tmp_path, comments=COMMENTS, proposal_dir=_proposal(tmp_path), config=_ranked()), mode="on"
     )
     section = _render_assembled_context_section(result)
     assert "### Conflicting evidence" in section
-    assert "proposal-dir-design.md" in section and "issue-comment-IC_c" in section
     # the notice follows the sources it talks about
     assert section.index("### Conflicting evidence") > section.index("<context_source")
+
+
+def test_notice_keeps_the_superseded_documents_and_the_later_comments_apart(tmp_path):
+    result = _assemble(
+        _input(tmp_path, comments=COMMENTS, proposal_dir=_proposal(tmp_path), config=_ranked()), mode="on"
+    )
+    notice = ca.render_conflict_notice(result.snapshot)
+    expected = (
+        "- Prior proposal documents proposal-dir-requirements.md, proposal-dir-design.md "
+        "were written before later issue comments issue-comment-IC_c, issue-comment-IC_b. "
+        + _NOTICE_TAIL
+    )
+    assert expected + "\n" in notice
+    assert "Also part of this conflict" not in notice
+
+
+def test_notice_names_only_included_members_and_the_excluded_ones_separately(tmp_path):
+    # max_sources=6 keeps IC_c and budget-excludes IC_b, a member of the conflict.
+    result = _assemble(
+        _input(tmp_path, comments=COMMENTS, proposal_dir=_proposal(tmp_path), config=_ranked(max_sources=6)),
+        mode="on",
+    )
+    assert _by_id(result)["issue-comment-IC_b"].selection.reason_code == "budget-exhausted"
+    # the recorded conflict is unchanged: it still names IC_b.
+    assert "issue-comment-IC_b" in result.snapshot.conflicts[0].source_ids
+    notice = ca.render_conflict_notice(result.snapshot)
+    expected = (
+        "- Prior proposal documents proposal-dir-requirements.md, proposal-dir-design.md "
+        "were written before later issue comments issue-comment-IC_c. " + _NOTICE_TAIL
+        + " Also part of this conflict but not in this prompt: issue-comment-IC_b (budget-exhausted).\n"
+    )
+    assert expected in notice
+
+
+def test_notice_omits_a_conflict_whose_superseding_side_is_not_in_the_prompt(tmp_path):
+    # max_sources=5: the pinned three and both proposal documents; no comment.
+    result = _assemble(
+        _input(tmp_path, comments=COMMENTS, proposal_dir=_proposal(tmp_path), config=_ranked(max_sources=5)),
+        mode="on",
+    )
+    assert len(result.snapshot.conflicts) == 1
+    assert ca.render_conflict_notice(result.snapshot) == ""
+    assert "Conflicting evidence" not in _render_assembled_context_section(result)
 
 
 def test_no_notice_without_a_conflict(tmp_path):
@@ -476,15 +524,84 @@ def test_no_notice_without_a_conflict(tmp_path):
 
 def test_conflict_notice_renders_only_plain_token_ids():
     snapshot = _fixture_snapshot()
-    ids = [s.source_id for s in snapshot.sources[:2]]
-    notice_ids = {i for i in ids if ca._SAFE_SOURCE_ID.match(i)}
-    sealed = _seal_with(_conflict(source_ids=tuple(ids)))
-    notice = ca.render_conflict_notice(sealed)
-    assert all(i in notice for i in notice_ids)
+    sealed = _seal_with(_conflict(subject="some-other-rule", source_ids=("issue", "target-repo")))
+    assert ca.render_conflict_notice(sealed) == (
+        "\n\n### Conflicting evidence\n\n"
+        "A fixed rule found these sources in conflict. The sources named as in conflict are "
+        "included above, ordered by trust tier, then freshness, then recency:\n\n"
+        "- some-other-rule: issue, target-repo.\n"
+    )
     bad = cs.ContextConflict(
-        subject=ca.CONFLICT_PRIOR_PROPOSAL_SUPERSEDED, source_ids=("a b<x>", "ok-id"),
+        subject="some-other-rule", source_ids=("a b<x>", "issue", "target-repo"),
         resolution_code=ca.CONFLICT_RESOLUTION_KEPT_RANKED,
     )
     object.__setattr__(sealed, "conflicts", (bad,))
     notice = ca.render_conflict_notice(sealed)
-    assert "ok-id" in notice and "<x>" not in notice
+    assert "issue, target-repo" in notice and "<x>" not in notice
+    assert snapshot.sources  # fixture sanity
+
+
+def test_conflict_subject_must_be_a_token_code():
+    for subject in ("Has Spaces", "prose, with punctuation!", "<tag>", "UPPER"):
+        with pytest.raises(cs.ContextSnapshotError, match="subject"):
+            _seal_with(_conflict(subject=subject))
+
+
+def test_conflict_with_more_than_the_ceiling_of_source_ids_is_rejected():
+    ids = tuple(f"id-{i}" for i in range(cs.MAX_CONFLICT_SOURCE_IDS + 1))
+    with pytest.raises(cs.ContextSnapshotError, match="distinct sources"):
+        _seal_with(_conflict(source_ids=ids))
+
+
+def test_detect_conflicts_caps_at_the_schema_ceiling_and_seal_never_raises(tmp_path):
+    many = tuple(
+        (f"IC_{i:03d}", "u", f"2026-09-16T{i // 60:02d}:{i % 60:02d}:00Z", f"comment {i}") for i in range(80)
+    )
+    config = _ranked(max_comments=100, max_sources=200, max_bytes=10_000_000)
+    result = _assemble(_input(tmp_path, comments=many, proposal_dir=_proposal(tmp_path), config=config))
+    (conflict,) = result.snapshot.conflicts
+    assert len(conflict.source_ids) == cs.MAX_CONFLICT_SOURCE_IDS
+    assert {"proposal-dir-requirements.md", "proposal-dir-design.md"} <= set(conflict.source_ids)
+    comments = [i for i in conflict.source_ids if i.startswith("issue-comment-")]
+    # the newest 62 of the 80 later comments
+    assert sorted(comments) == [f"issue-comment-IC_{i:03d}" for i in range(18, 80)]
+
+
+def test_stale_demoted_is_counted_after_the_budget(tmp_path):
+    # max_sources=4: requirements.md (stale) fits, design.md (stale) is budget-exhausted.
+    result = _assemble(_input(tmp_path, proposal_dir=_proposal(tmp_path), config=_ranked(max_sources=4)))
+    by_id = _by_id(result)
+    assert by_id["proposal-dir-design.md"].selection.reason_code == "budget-exhausted"
+    assert result.metrics.stale_demoted == 1
+
+
+def test_ranking_tables_cover_the_snapshot_vocabularies():
+    assert set(ca._TRUST_ORDER) == cs.TRUST_TIERS
+    assert set(ca._FRESHNESS_ORDER) == cs.FRESHNESS_VALUES
+
+
+def test_notice_omits_any_conflict_with_fewer_than_two_members_in_the_prompt():
+    # `loki-mctl-agents` is an excluded source of the checked-in fixture.
+    sealed = _seal_with(_conflict(subject="some-other-rule", source_ids=("issue", "loki-mctl-agents")))
+    assert not _by_id_snapshot(sealed)["loki-mctl-agents"].selection.included
+    assert ca.render_conflict_notice(sealed) == ""
+
+
+def _by_id_snapshot(snapshot: cs.ContextSnapshot) -> dict[str, cs.ContextSource]:
+    return {s.source_id: s for s in snapshot.sources}
+
+
+def test_notice_never_renders_a_source_id_that_is_not_a_plain_token():
+    import dataclasses
+
+    s = _fixture_snapshot()
+    odd = dataclasses.replace(s.sources[1], source_id="odd id<x>")
+    sources = (s.sources[0], odd, *s.sources[2:])
+    sealed = cs.seal(
+        execution=s.execution, strategy=s.strategy, budget=s.budget, retention=s.retention,
+        created_at=s.created_at, sources=sources,
+        conflicts=(_conflict(subject="some-other-rule", source_ids=("issue", "odd id<x>", "loki-mctl-api")),),
+    )
+    notice = ca.render_conflict_notice(sealed)
+    assert "<x>" not in notice and "odd id" not in notice
+    assert "- some-other-rule: issue, loki-mctl-api.\n" in notice

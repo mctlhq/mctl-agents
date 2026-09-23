@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -70,11 +71,14 @@ RETENTION_CLASSES = frozenset({"telemetry", "execution-record", "gitops"})
 # `resolution_code` is a closed vocabulary like every other enum here: the
 # only resolution a fixed-rule assembler performs today is to keep every
 # source in the conflict and order them (never to drop one silently).
-CONFLICT_RESOLUTION_CODES = frozenset({"kept-all-ranked-by-trust-then-recency"})
+CONFLICT_RESOLUTION_CODES = frozenset({"kept-all-ranked-by-trust-freshness-recency"})
 # A conflict names sources by their snapshot-local `source_id`, never by
 # payload; `subject` is a code, not prose. Same bounded-length spirit as
 # MAX_LOCATOR_LENGTH (ADR 009 sec. 7).
 MAX_CONFLICT_SUBJECT_LENGTH = 128
+# `subject` is a code, like a `reason_code`: lower-case token characters only,
+# so it can never carry prose or markup into a rendered prompt notice.
+_CONFLICT_SUBJECT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 MAX_CONFLICT_SOURCE_IDS = 64
 
 # WorkContextRef closed vocabularies (mctlhq/mctl-agents#267, ADR 011).
@@ -1097,9 +1101,14 @@ def _check_conflicts(conflicts: Sequence[ContextConflict], sources: Sequence[Con
     (ADR 009 amendment 1)."""
     known_ids = {s.source_id for s in sources}
     for conflict in conflicts:
-        if not conflict.subject or len(conflict.subject) > MAX_CONFLICT_SUBJECT_LENGTH:
+        if (
+            not conflict.subject
+            or len(conflict.subject) > MAX_CONFLICT_SUBJECT_LENGTH
+            or not _CONFLICT_SUBJECT_PATTERN.match(conflict.subject)
+        ):
             raise ContextSnapshotError(
-                f"conflict.subject must be 1..{MAX_CONFLICT_SUBJECT_LENGTH} characters"
+                f"conflict.subject must be a 1..{MAX_CONFLICT_SUBJECT_LENGTH} character code "
+                "of [a-z0-9._-]"
             )
         if conflict.resolution_code not in CONFLICT_RESOLUTION_CODES:
             raise ContextSnapshotError(

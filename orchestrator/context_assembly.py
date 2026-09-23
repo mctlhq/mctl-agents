@@ -43,6 +43,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orchestrator.context_snapshot import (
+    FRESHNESS_VALUES,
+    MAX_CONFLICT_SOURCE_IDS,
+    TRUST_TIERS,
     ContextBudget,
     ContextConflict,
     ContextSnapshot,
@@ -87,12 +90,16 @@ _PINNED_KINDS = frozenset({"inline-template", "github-issue", "target-repo"})
 # 5/6): it orders what the model reads, never what anyone may do.
 _TRUST_ORDER = {"authoritative": 0, "corroborated": 1, "reported": 2, "untrusted": 3}
 _FRESHNESS_ORDER = {"fresh": 0, "aging": 1, "unknown": 2, "stale": 3}
+# Both tables are indexed with `[]`; a vocabulary added in context_snapshot
+# without a place here must fail at import, not as a KeyError mid-assembly.
+if set(_TRUST_ORDER) != TRUST_TIERS or set(_FRESHNESS_ORDER) != FRESHNESS_VALUES:
+    raise RuntimeError("context_assembly ranking tables are out of step with context_snapshot's vocabularies")
 _PINNED_SCORE = 100.0
 
 # The one fixed conflict rule (mctlhq/mctl-agents#471) and what the ranked
 # strategy does about it: keep every source, ordered — never drop one.
 CONFLICT_PRIOR_PROPOSAL_SUPERSEDED = "prior-proposal-superseded-by-later-comment"
-CONFLICT_RESOLUTION_KEPT_RANKED = "kept-all-ranked-by-trust-then-recency"
+CONFLICT_RESOLUTION_KEPT_RANKED = "kept-all-ranked-by-trust-freshness-recency"
 
 # A `.status.yaml` is a few hundred bytes; read at most this much of it.
 _STATUS_READ_CEILING = 8192
@@ -532,6 +539,12 @@ def detect_conflicts(candidates: Sequence[CandidateSource]) -> list[ContextConfl
         c for c in candidates
         if c.kind == "github-issue-comment" and (_epoch(c.content_time) or float("-inf")) > written
     ]
+    # Bounded by the schema's own ceiling (`MAX_CONFLICT_SOURCE_IDS`), so a
+    # busy issue can never make `seal()` reject the snapshot: every proposal
+    # document is kept, and of the later comments the newest (the ones that
+    # supersede it most) fill the remaining slots.
+    room = MAX_CONFLICT_SOURCE_IDS - len(proposals)
+    later = sorted(later, key=lambda c: (-(_epoch(c.content_time) or 0.0), c.rank))[: max(0, room)]
     if not later:
         return []
     involved = sorted(proposals + later, key=lambda c: c.rank)
@@ -547,28 +560,59 @@ def detect_conflicts(candidates: Sequence[CandidateSource]) -> list[ContextConfl
 _SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
+def _reason(source: ContextSource) -> str:
+    code = source.selection.reason_code
+    return code if _SAFE_SOURCE_ID.match(code) else "excluded"
+
+
+def _conflict_line(conflict: ContextConflict, by_id: Mapping[str, ContextSource]) -> str | None:
+    """One notice entry, or `None` when fewer than two of the conflict's
+    members are in the prompt (or, for the superseded-proposal rule, when
+    either side is missing) — a conflict the model cannot see both sides of
+    is left recorded in the snapshot but not asserted in the prompt.
+
+    Only included members are named as present; a member the budget or
+    deduplication left out (ADR 009 amendment 1 allows that) is named
+    separately, with its `reason_code`, as not in the prompt."""
+    members = [by_id[i] for i in conflict.source_ids if i in by_id and _SAFE_SOURCE_ID.match(i)]
+    shown = [m for m in members if m.selection.included]
+    left_out = [m for m in members if not m.selection.included]
+    if len(shown) < 2:
+        return None
+    if conflict.subject == CONFLICT_PRIOR_PROPOSAL_SUPERSEDED:
+        documents = [m.source_id for m in shown if m.kind == "proposal-dir"]
+        comments = [m.source_id for m in shown if m.kind == "github-issue-comment"]
+        if not documents or not comments:
+            return None
+        line = (
+            f"- Prior proposal documents {', '.join(documents)} were written before "
+            f"later issue comments {', '.join(comments)}. Where they disagree, the prior "
+            "proposal may be out of date: check it against the later comments instead of "
+            "carrying it forward unchanged."
+        )
+    else:
+        line = f"- {conflict.subject}: {', '.join(m.source_id for m in shown)}."
+    if left_out:
+        excluded = ", ".join(f"{m.source_id} ({_reason(m)})" for m in left_out)
+        line += f" Also part of this conflict but not in this prompt: {excluded}."
+    return line
+
+
 def render_conflict_notice(snapshot: ContextSnapshot) -> str:
     """The `on`-mode prompt notice for the snapshot's recorded conflicts —
-    `""` when there are none, so a conflict-free prompt is unchanged. Built
-    from source ids and codes only (never payload); an id that is not a
-    plain token is left out rather than rendered."""
-    if not snapshot.conflicts:
+    `""` when there are none (or none with both sides in the prompt), so a
+    conflict-free prompt is unchanged. Built from source ids and codes only
+    (never payload); an id that is not a plain token is left out rather than
+    rendered."""
+    by_id = {s.source_id: s for s in snapshot.sources}
+    lines = [line for c in snapshot.conflicts if (line := _conflict_line(c, by_id)) is not None]
+    if not lines:
         return ""
-    lines = []
-    for conflict in snapshot.conflicts:
-        ids = ", ".join(i for i in conflict.source_ids if _SAFE_SOURCE_ID.match(i))
-        if conflict.subject == CONFLICT_PRIOR_PROPOSAL_SUPERSEDED:
-            lines.append(
-                f"- The prior proposal was written before later issue comments ({ids}). "
-                "Where they disagree, the prior proposal may be out of date: check it "
-                "against the later comments instead of carrying it forward unchanged."
-            )
-        else:
-            lines.append(f"- {conflict.subject}: {ids}")
     return (
         "\n\n### Conflicting evidence\n\n"
-        "A fixed rule found these sources in conflict. All of them are kept above, "
-        "ordered by trust tier and then recency:\n\n" + "\n".join(lines) + "\n"
+        "A fixed rule found these sources in conflict. The sources named as in conflict are "
+        "included above, ordered by trust tier, then freshness, then recency:\n\n"
+        + "\n".join(lines) + "\n"
     )
 
 
@@ -940,7 +984,7 @@ def assemble(
             classify_freshness(candidate, assembly_input.now)
         candidates = rank_candidates(candidates)
         conflicts = detect_conflicts(candidates)
-        stale_demoted = flag_stale(candidates)
+        flag_stale(candidates)
         strategy = ContextStrategy(
             name=RANKED_STRATEGY_NAME,
             version=RANKED_STRATEGY_VERSION,
@@ -970,6 +1014,9 @@ def assemble(
 
     budget = apply_budget(candidates, config)
     excluded_budget = sum(1 for c in candidates if c.reason_code == "budget-exhausted")
+    # Counted after deduplication and the budget, which may overwrite a
+    # `stale-demoted` reason: the metric reports what the snapshot shows.
+    stale_demoted = sum(1 for c in candidates if c.reason_code == "stale-demoted")
 
     sources = tuple(_to_context_source(c) for c in sorted(candidates, key=lambda c: c.rank))
     retention = RetentionPolicy(class_="execution-record", expires_after_days=180)

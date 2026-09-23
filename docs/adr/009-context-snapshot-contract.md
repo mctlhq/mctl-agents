@@ -340,9 +340,9 @@ fields without an `apiVersion` bump").
 
 | Field | Type | Meaning |
 |---|---|---|
-| `subject` | str (1..128) | a code naming the fixed rule that fired, e.g. `prior-proposal-superseded-by-later-comment`; never prose, never payload |
+| `subject` | str (1..128, `[a-z0-9._-]`) | a code naming the fixed rule that fired, e.g. `prior-proposal-superseded-by-later-comment`; never prose, never payload |
 | `source_ids` | str[] (2..64, distinct) | the `source_id`s of every source involved, in rank order; each must be a source of this snapshot |
-| `resolution_code` | str | closed set: `kept-all-ranked-by-trust-then-recency` |
+| `resolution_code` | str | closed set: `kept-all-ranked-by-trust-freshness-recency` |
 
 *Hashing.* `conflicts` enters `content_hash` **only when non-empty**, and
 `to_dict()` omits it when empty — the same rule `work_context` already
@@ -361,10 +361,16 @@ and never fires the rule. No text is compared and no semantic contradiction
 is inferred.
 
 *Resolution never drops silently.* Every source in a conflict is kept,
-ordered by trust tier and then recency; the budget may still exclude one,
-recorded as `budget-exhausted` like any other. In `on` mode the investigator
-prompt carries a `### Conflicting evidence` notice built from source ids and
-codes only.
+ordered by trust tier, then freshness, then recency; the budget or
+deduplication may still exclude one, recorded as `budget-exhausted` /
+`duplicate-content` like any other, and the conflict record keeps naming it.
+A conflict names at most `MAX_CONFLICT_SOURCE_IDS` (64) sources: every
+prior-proposal document, then the newest later comments. In `on` mode the
+investigator prompt carries a `### Conflicting evidence` notice built from
+source ids and codes only: it keeps the superseded proposal documents and the
+superseding comments apart, names as present only the members actually in the
+prompt, lists any excluded member with its reason code, and omits a conflict
+whose two sides are not both in the prompt.
 
 **Strategy `trust-freshness-ranked` 1.0.0** (ranker `trust-freshness-recency`
 1.0.0), opt-in via `ISSUE_INVESTIGATOR_CONTEXT_STRATEGY`; the default stays
