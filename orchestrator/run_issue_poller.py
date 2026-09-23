@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from temporalio.exceptions import WorkflowAlreadyStartedError
 
 from config.settings import SERVICES
+from orchestrator import policy_checkpoint
 from orchestrator.run_issue_investigator import IssueRef, _run, try_parse_issue_url
 from orchestrator.temporal.start import connect, start_dev_loop_workflow, workflow_id_for
 
@@ -131,7 +132,14 @@ def search_labeled_issues(label: str) -> list[IssueRef]:
 
 
 def remove_label(issue_url: str, label: str) -> None:
-    """Drop ``label`` from the issue so the next poll cycle skips it."""
+    """Drop ``label`` from the issue so the next poll cycle skips it.
+
+    The policy checkpoint (#197) decides first: on refusal
+    `policy_checkpoint.PolicyRefused` is raised and `gh` never runs."""
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_ISSUE_LABEL, "remove", issue_url, {"label": label},
+        metadata={"label": label},
+    ))
     _run(["gh", "issue", "edit", issue_url, "--remove-label", label])
 
 
@@ -245,6 +253,13 @@ async def poll(
         try:
             remove_label(ref.url, label)
             print(f"  removed '{label}' label")
+        except policy_checkpoint.PolicyRefused as e:
+            # The checkpoint refused the label removal (#197): the label stays,
+            # so, as with a failed write below, the next cycle re-dispatches
+            # (a no-op against the running workflow). Counted as a failure so
+            # the refusal is visible rather than silently repeated.
+            print(f"FAIL: workflow started but '{label}' label removal was refused: {e}")
+            failures += 1
         except subprocess.CalledProcessError as e:
             # The workflow IS started, but the label is still on the issue —
             # so the next cycle re-dispatches it (harmless no-op via

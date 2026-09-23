@@ -139,7 +139,7 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
-from orchestrator import tracing
+from orchestrator import policy_checkpoint, tracing
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
@@ -323,6 +323,11 @@ EXIT_VERIFICATION_BUDGET_EXHAUSTED = 51
 # code and the stderr line printed alongside it instead of guessing prose for
 # every possible implementer failure.
 EXIT_RATE_LIMITED = 52
+# The policy checkpoint (mctlhq/mctl-agents#197, ADR 014) refused the
+# follow-up push: the side effect did not run. The shepherd charges it as
+# deterministic, so a policy that says no is bounded by MAX_REVIEW_ATTEMPTS
+# instead of re-running a paid model turn every tick (the transient arm).
+EXIT_POLICY_REFUSED = 53
 
 # Machine-readable refusal marker, written by the agent in the root of the
 # cloned target repo. A file is deliberately chosen over scraping the final
@@ -351,6 +356,8 @@ VERIFICATION_BUDGET_EXHAUSTED_ERROR_PREFIX = "verification-budget-exhausted:"
 # Prefix mapped to EXIT_RATE_LIMITED, raised by RateLimitExhaustedError
 # (mctl-agents#364).
 RATE_LIMITED_ERROR_PREFIX = "rate limited:"
+# Prefix mapped to EXIT_POLICY_REFUSED (mctl-agents#197).
+POLICY_REFUSED_ERROR_PREFIX = "policy-refused:"
 # The reason travels into a `.status.yaml` note and a summary line; cap it so a
 # verbose model cannot turn the durable projection into a transcript.
 MAX_REFUSAL_REASON_CHARS = 600
@@ -645,6 +652,11 @@ def _review_feedback_exit_code(error: str) -> int:
         lists, so it falls to ``kind="transient"`` there and no
         ``review_attempts`` slot is charged — re-running is expected to
         succeed once the window resets on its own.
+      - 53: the policy checkpoint refused the follow-up push
+        (mctl-agents#197): git never ran. In the shepherd's
+        ``deterministic_codes``, so it is charged: the same policy refuses
+        the same push again, and the transient arm would re-run the paid
+        turn every tick.
 
     Everything else (non-timeout shell failures, SystemExit from missing
     config, unexpected exceptions) is left as ``EXIT_GENERIC_FAILURE`` and
@@ -673,6 +685,8 @@ def _review_feedback_exit_code(error: str) -> int:
         return EXIT_VERIFICATION_BUDGET_EXHAUSTED
     if error.startswith(RATE_LIMITED_ERROR_PREFIX):
         return EXIT_RATE_LIMITED
+    if error.startswith(POLICY_REFUSED_ERROR_PREFIX):
+        return EXIT_POLICY_REFUSED
     if error.startswith("orphaned sub-agent:"):
         return EXIT_ORPHANED_SUBAGENT
     if error.startswith("operation timed out:"):
@@ -2159,8 +2173,32 @@ def _remote_head_sha(repo_dir: Path, branch: str) -> str | None:
     return line.split()[0] if line else None
 
 
+def _require_push_policy(repo: str, branch: str, *, lease: str | None) -> None:
+    """The policy checkpoint (mctlhq/mctl-agents#197) for one `git push` of
+    `branch` to `repo`. Raises `policy_checkpoint.PolicyRefused`, before git
+    runs, unless the decision permits the push.
+
+    Called AFTER the claim check and immediately before git: a claim refusal
+    must not spend an approval on a push that was never going to happen.
+    The arguments bind the remote, the branch and the lease the push is
+    fenced on — not the pushed commit, which this module does not read."""
+    mode = "force-with-lease" if lease else "new-branch"
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_GIT_PUSH,
+        f"push:{mode}",
+        f"{repo}:{branch}" if repo else branch,
+        {"remote": "origin", "branch": branch, "lease": lease or ""},
+        metadata={"repo": repo, "branch": branch},
+    ))
+
+
 def _push_followup(
-    repo_dir: Path, branch: str, expected_sha: str, *, claim_context: _ClaimContext | None = None
+    repo_dir: Path,
+    branch: str,
+    expected_sha: str,
+    *,
+    claim_context: _ClaimContext | None = None,
+    repo: str = "",
 ) -> None:
     """Push the follow-up commit to the existing branch (no `-u`).
 
@@ -2168,9 +2206,12 @@ def _push_followup(
     is the AUTHORITATIVE check — the push itself fails if the remote moved,
     independently of the claim. `claim_context`, when given, is the EARLY
     filter checked immediately before this git call (ADR-010 phase 2, #352).
+    The policy checkpoint (#197) follows it; a refusal raises
+    `PolicyRefused` and git never runs.
     """
     if claim_context is not None:
         _check_claim_or_raise(claim_context, entity_version=expected_sha)
+    _require_push_policy(repo, branch, lease=expected_sha)
     _run(
         ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
         cwd=repo_dir,
@@ -2684,7 +2725,7 @@ def review_feedback_one(
         # if the branch moved since step 4, the claim check catches it before
         # git runs, and the push's own lease catches it even if the claim
         # check could not (store unreachable, rollout below `enforce`).
-        _push_followup(target, branch, old_head, claim_context=claim_ctx)
+        _push_followup(target, branch, old_head, claim_context=claim_ctx, repo=f"mctlhq/{ref.service}")
 
         # 8. Read the existing PR URL from `.status.yaml` for the result
         # surface; do NOT rewrite the status — that belongs to the shepherd.
@@ -2718,6 +2759,14 @@ def review_feedback_one(
         release_reason = "claim refused"
         release_claim = e.verdict != CLAIM_UNKNOWN
         result = ImplementResult(ref=ref, pr_url=None, error=str(e))
+        return result
+    except policy_checkpoint.PolicyRefused as e:
+        # The policy checkpoint refused the follow-up push (#197): git never
+        # ran and nothing reached the branch. EXIT_POLICY_REFUSED, which the
+        # shepherd charges as deterministic: the same policy answers the same
+        # way next tick, so re-running the model on it must stay bounded.
+        release_reason = "policy refused"
+        result = ImplementResult(ref=ref, pr_url=None, error=f"{POLICY_REFUSED_ERROR_PREFIX} {e}")
         return result
     except ImplementerOrphanedSubagent as e:
         # The message is already prefixed "orphaned sub-agent:" — that prefix is
@@ -3100,8 +3149,18 @@ def _open_pr_for_branch(ref: ProposalRef, branch: str) -> str:
     # openclaw/openclaw) `gh pr create` otherwise defaults the base to the parent
     # repo and the non-interactive call fails, so the branch is pushed but no PR
     # is opened. --repo forces the PR into our repo against our own `main`.
+    repo = f"mctlhq/{ref.service}"
+    # The policy checkpoint (#197): on refusal PolicyRefused is raised and
+    # `gh pr create` never runs. Title and body are recorded only as a digest.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_PR_CREATE,
+        "create",
+        repo,
+        {"title": title, "body": body, "head": branch, "base": "main"},
+        metadata={"repo": repo, "head": branch, "base": "main"},
+    ))
     proc = _run(
-        ["gh", "pr", "create", "--repo", f"mctlhq/{ref.service}",
+        ["gh", "pr", "create", "--repo", repo,
          "--title", title, "--body", body, "--head", branch, "--base", "main"],
     )
     pr_url = proc.stdout.strip().splitlines()[-1]
@@ -3190,6 +3249,11 @@ def _preflight_existing_result(
     # Opening the PR is deterministic and avoids spending model quota again.
     try:
         pr_url = _open_pr_for_branch(ref, branch)
+    except policy_checkpoint.PolicyRefused as exc:
+        # The checkpoint refused `gh pr create` (#197): nothing was sent. Fail
+        # the preflight closed, like any other GitHub answer it cannot act on,
+        # so the model does not run and redo work whose PR it may not open.
+        raise GitHubPreflightError(f"opening the PR for the existing result branch: {exc}") from exc
     except subprocess.CalledProcessError as exc:
         # A concurrent actor may have opened it between list and create.
         retry = _github_json([
@@ -3600,6 +3664,7 @@ def _push_and_open_pr(
             # `--force-with-lease` below is the authoritative git CAS and is
             # unaffected either way (agy P2 on ddcdb0e).
             _check_claim_or_raise(claim_context)
+        _require_push_policy(f"mctlhq/{ref.service}", branch, lease=expected_sha)
         _run(
             ["git", "push", f"--force-with-lease={branch}:{expected_sha}", "origin", branch],
             cwd=repo_dir,
@@ -3614,6 +3679,7 @@ def _push_and_open_pr(
         # statement about git, not about who is allowed to write.
         if claim_context is not None:
             _check_claim_or_raise(claim_context)
+        _require_push_policy(f"mctlhq/{ref.service}", branch, lease=None)
         _run(["git", "push", "-u", "origin", branch], cwd=repo_dir)
     return _open_pr_for_branch(ref, branch)
 
@@ -4188,6 +4254,22 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # prevent.
             pass
         return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
+    except policy_checkpoint.PolicyRefused as e:
+        # The policy checkpoint refused the push or `gh pr create` (#197):
+        # that side effect did not run. Its own triage code, so a policy
+        # decision reads as one in the proposal's history rather than as a
+        # crash in the generic `unexpected-error` arm.
+        msg = f"{POLICY_REFUSED_ERROR_PREFIX} {e}"
+        recorded = _mark_needs_triage(
+            ref,
+            code="policy-refused",
+            stage="policy",
+            message=msg,
+            attempt=attempt,
+            claim_context=claim_ctx,
+        )
+        result = ImplementResult(ref=ref, pr_url=None, error=_triage_error(msg, recorded))
+        return result
     except ImplementerOrphanedSubagent as e:
         # Batch mode has no review-attempt budget, so it needs no sentinel exit
         # code — but it does need its own triage code, otherwise this lands in

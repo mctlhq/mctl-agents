@@ -62,6 +62,16 @@ MCTL_OPERATION_EXECUTE = "mctl.operation.execute"
 #: A write to the mctl-api work-item store made by the orchestrator itself.
 MCTL_WORK_ITEM_WRITE = "mctl.work_item.write"
 MCP_TOOL_CALL = "mcp.tool.call"
+# The orchestrator's own GitHub mutations (mctlhq/mctl-agents#197): the
+# implementer's push and PR creation, the shepherd's merge, review trigger and
+# CI rerun, and the issue poller's label removal. `GITHUB_ISSUE_COMMENT`
+# above covers the investigator's and the directive poller's issue comments.
+GITHUB_GIT_PUSH = "github.git.push"
+GITHUB_PR_CREATE = "github.pull_request.create"
+GITHUB_PR_MERGE = "github.pull_request.merge"
+GITHUB_PR_COMMENT = "github.pull_request.comment"
+GITHUB_RUN_RERUN = "github.actions.run.rerun"
+GITHUB_ISSUE_LABEL = "github.issue.label"
 
 # Decision codes. `allowed`/`approved` permit; every other code refuses.
 CODE_ALLOWED = "allowed"
@@ -302,6 +312,20 @@ BUILTIN_POLICY = Policy(
     version="mctl-agents/policy/v1",
     rules=(
         Rule("github-issue-comment", GITHUB_ISSUE_COMMENT, "comment", ALLOW),
+        # The orchestrator's own GitHub mutations (#197), each ALLOW: the
+        # policy states today's behaviour, and a tighter policy (a merge
+        # behind REQUIRE_APPROVAL, say) is one rule change, not a code change.
+        # The implementer pushes only its own `feat/agents-<slug>` branch:
+        # a new branch plainly, an existing one under `--force-with-lease`.
+        Rule("github-push-new-branch", GITHUB_GIT_PUSH, "push:new-branch", ALLOW),
+        Rule("github-push-with-lease", GITHUB_GIT_PUSH, "push:force-with-lease", ALLOW),
+        Rule("github-pr-create", GITHUB_PR_CREATE, "create", ALLOW),
+        # `gh pr merge --merge --match-head-commit`: bound to the reviewed head.
+        Rule("github-pr-merge", GITHUB_PR_MERGE, "merge", ALLOW),
+        # The shepherd's `@claude review` trigger after a fix-up push.
+        Rule("github-pr-review-trigger", GITHUB_PR_COMMENT, "comment:review-trigger", ALLOW),
+        Rule("github-run-rerun-failed", GITHUB_RUN_RERUN, "rerun:failed", ALLOW),
+        Rule("github-issue-label-remove", GITHUB_ISSUE_LABEL, "remove", ALLOW),
         Rule("mctl-investigate", MCTL_OPERATION_EXECUTE, "execute:mctl-agents-investigate", ALLOW),
         # Sealing this execution's context snapshot (mctlhq/mctl-agents#431):
         # insert-only on the store side, so it can never overwrite anything.
