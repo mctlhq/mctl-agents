@@ -66,6 +66,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from orchestrator import policy_checkpoint
 from orchestrator.directives import (
     VERBS,
     Directive,
@@ -308,6 +309,15 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     so nothing could have started and the caller's normal retry is safe.
     """
     params = {"issue_url": issue_url}
+    # The policy checkpoint (#197) sits immediately before the POST: a
+    # refusal raises PolicyRefused before any request leaves this process.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.MCTL_OPERATION_EXECUTE,
+        f"execute:{INVESTIGATE_OPERATION}",
+        INVESTIGATE_OPERATION,
+        params,
+        metadata={"issue_url": issue_url},
+    ))
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=_SUBMIT_TIMEOUT_SECONDS) as client:
         try:
             response = await client.post(
@@ -335,6 +345,11 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
 
 
 def _post_reply(issue_url: str, body: str) -> None:
+    # Governed by the policy checkpoint (#197): on refusal PolicyRefused is
+    # raised and `gh` never runs. The body is recorded only as a digest.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_ISSUE_COMMENT, "comment", issue_url, {"body": body},
+    ))
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 
 
@@ -518,6 +533,15 @@ def _reply_dispatch_marker_write_failed(author: str, error: Exception) -> str:
     )
 
 
+def _reply_policy_refused(author: str, decision: policy_checkpoint.Decision) -> str:
+    return (
+        f"@{author} the re-investigation was not dispatched: the runtime policy checkpoint "
+        f"answered `{decision.verdict}` (`{decision.code}`, rule `{decision.rule_id or '-'}`, "
+        f"policy `{decision.policy_version}`). Nothing was submitted, and this directive will not "
+        "be retried automatically."
+    )
+
+
 def _reply_dispatch_ambiguous(author: str, error: Exception) -> str:
     # Carries the ack trailer immediately, on the FIRST ambiguous outcome —
     # unlike `_reply_dispatch_failed`, there is no retry budget to spend
@@ -559,6 +583,15 @@ class DirectiveScanResult:
     failed: int = 0
 
 
+
+class PolicyCheckpointUndecided(RuntimeError):
+    """The policy checkpoint could not decide on a dispatch; nothing was sent."""
+
+    def __init__(self, decision: policy_checkpoint.Decision) -> None:
+        super().__init__(f"policy checkpoint could not decide ({decision.code}): {decision.reason}")
+        self.decision = decision
+
+
 async def _handle_directive(
     directive: Directive,
     *,
@@ -571,7 +604,7 @@ async def _handle_directive(
     """Run the decision table for one unacked directive. Returns one of:
     "unauthorized", "unrecognised", "no-proposal", "ambiguous",
     "not-overwritable", "dispatched", "dispatch-failed",
-    "dispatch-ambiguous", or "dry-run".
+    "dispatch-ambiguous", "policy-refused", or "dry-run".
 
     `prior_failures` is the number of previously recorded dispatch-failure
     attempts for this exact comment id (`orchestrator.directives.
@@ -644,7 +677,26 @@ async def _handle_directive(
 
     if outcome == "dispatch":
         try:
-            workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+            try:
+                workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+            except policy_checkpoint.PolicyRefused as e:
+                if e.decision.undecided:
+                    # The checkpoint could not decide (evaluator, identity
+                    # or approval lookup failed): nothing was sent, and it
+                    # is retried like any failed dispatch, within
+                    # MAX_DISPATCH_ATTEMPTS, not acked as if it were a "no".
+                    raise PolicyCheckpointUndecided(e.decision) from e
+                raise
+        except policy_checkpoint.PolicyRefused as e:
+            # Nothing was sent. A policy refusal is an answer, not a
+            # transient failure: acked at once, never retried by this path.
+            print(f"POLICY: dispatch for directive comment {directive.comment_id} ({issue_url}) refused: {e}")
+            await asyncio.to_thread(
+                _post_reply_with_retries,
+                issue_url,
+                _with_ack(_reply_policy_refused(directive.author, e.decision), directive.comment_id),
+            )
+            return "policy-refused"
         except DispatchOutcomeAmbiguous as e:
             # mctl-api may already have started the workflow — resubmitting
             # blindly on a later tick would duplicate a real, paid Argo run,
@@ -662,7 +714,7 @@ async def _handle_directive(
                     issue_url,
                     _with_ack(_reply_dispatch_ambiguous(directive.author, e), directive.comment_id),
                 )
-            except subprocess.CalledProcessError as post_e:
+            except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
                 # The exact residual `_reply_dispatched`'s handler below
                 # guards against, on the branch this exception class exists
                 # specifically to protect (claude P3 on #421): mctl-api may
@@ -675,7 +727,7 @@ async def _handle_directive(
                 print(
                     f"FAIL: directive comment {directive.comment_id} ({issue_url}) had an "
                     f"ambiguous dispatch outcome ({type(e).__name__}) and posting the ambiguous "
-                    f"acknowledgement reply also failed after retries ({post_e.stderr or post_e}) — "
+                    f"acknowledgement reply also failed after retries ({getattr(post_e, 'stderr', None) or post_e}) — "
                     "this comment remains unacked and WILL be re-dispatched next tick unless an "
                     f"operator posts a comment containing `{ack_trailer(directive.comment_id)}` first."
                 )
@@ -713,7 +765,7 @@ async def _handle_directive(
                         f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
                         f"{fail_trailer(directive.comment_id)}",
                     )
-                except subprocess.CalledProcessError as post_e:
+                except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
                     # Even after MARKER_POST_ATTEMPTS in-process retries, the
                     # retry-marker write itself failed — `prior_failures` is
                     # only ever recomputed from `fail_trailer` markers
@@ -757,7 +809,7 @@ async def _handle_directive(
                 issue_url,
                 _reply_dispatched(directive.author, directive.comment_id, workflow_name, ref.service, ref.slug),
             )
-        except subprocess.CalledProcessError as post_e:
+        except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
             # Even MARKER_POST_ATTEMPTS in-process retries could not write
             # the ack — the workflow is already running in Argo, but this
             # comment remains unacked and WILL be resubmitted next tick
@@ -767,7 +819,7 @@ async def _handle_directive(
             print(
                 f"FAIL: directive comment {directive.comment_id} ({issue_url}) dispatched "
                 f"successfully (Argo workflow {workflow_name!r} started) but posting the "
-                f"acknowledgement reply failed after retries ({post_e.stderr or post_e}) — "
+                f"acknowledgement reply failed after retries ({getattr(post_e, 'stderr', None) or post_e}) — "
                 "this comment remains unacked and WILL be resubmitted next tick unless an "
                 f"operator posts a comment containing `{ack_trailer(directive.comment_id)}` first."
             )
@@ -947,13 +999,19 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
             print(f"FAIL: could not reply on {issue_url}: {e.stderr or e}")
             failed += 1
             continue
+        except policy_checkpoint.PolicyRefused as e:
+            # A refused reply leaves the comment unacked; it is decided again
+            # (and recorded again) on the next tick.
+            print(f"FAIL: reply on {issue_url} refused by policy: {e}")
+            failed += 1
+            continue
 
         if dry_run:
             continue
         if outcome == "dispatched":
             dispatched += 1
             replied += 1
-        elif outcome in ("dispatch-failed", "dispatch-ambiguous"):
+        elif outcome in ("dispatch-failed", "dispatch-ambiguous", "policy-refused"):
             failed += 1
         else:
             replied += 1
