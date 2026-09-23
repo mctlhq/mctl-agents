@@ -1,6 +1,6 @@
 """`HumanInputRequest`/`HumanInputResponse` — the versioned, hashed contract
 for the durable agent-clarification primitive (mctlhq/mctl-agents#333, ADR
-011: docs/adr/011-human-input-contract.md).
+013: docs/adr/013-human-input-contract.md).
 
 Modelled line for line on `orchestrator/context_snapshot.py`'s hashing,
 versioning and unknown-key-rejection conventions, so the two validate and

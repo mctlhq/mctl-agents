@@ -95,7 +95,7 @@ _DUMMY_MCTL_TOKEN = "validate-manifest-dummy-token"  # noqa: S105 - not a real c
 
 # Capability entries that may appear in a manifest's/catalog profile's
 # `tools`/`spec.tools` list without being a literal SDK tool name (mctl-
-# agents#333, ADR 011). options.py's builders filter these out of
+# agents#333, ADR 013). options.py's builders filter these out of
 # allowed_tools (see HUMAN_INPUT_CAPABILITY there), so a profile that grants
 # one would otherwise make the two set-equality checks below go red the
 # moment mctl-gitops#1277 adds it — this subtraction is what keeps a real

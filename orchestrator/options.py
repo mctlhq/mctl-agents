@@ -136,7 +136,7 @@ def _mctl_tool_globs() -> list[str]:
     return ["mcp__mctl__*"] if mctl_mcp_config() else []
 
 
-# The durable human-clarification primitive (mctlhq/mctl-agents#333, ADR 011).
+# The durable human-clarification primitive (mctlhq/mctl-agents#333, ADR 013).
 # A capability entry in `ExecutionPlan.tools`, not an SDK tool name — a model
 # cannot "call" it, so it must never leak into `allowed_tools` (the CLI would
 # hold a dead allow-list entry). See `plan_grants_human_input` and

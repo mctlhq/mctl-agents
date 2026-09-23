@@ -215,7 +215,7 @@ def test_a_missing_gitops_checkout_fails_under_ci(tmp_path, monkeypatch) -> None
 
 
 def test_catalog_profile_granting_human_request_input_still_matches(tmp_path, monkeypatch) -> None:
-    """T18 (mctl-agents#333, ADR 011): `_CAPABILITY_TOOLS` excuses exactly
+    """T18 (mctl-agents#333, ADR 013): `_CAPABILITY_TOOLS` excuses exactly
     the forward-declared capability, and nothing else.
 
     A profile listing `human.request_input` alongside the real

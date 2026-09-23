@@ -960,6 +960,23 @@ class TestFindHumanInputRequest:
         with pytest.raises(HumanInputListingError, match="encoding"):
             await env.run(find_human_input_request, "mctl-web", "issue-10-test")
 
+    async def test_oversized_file_fails_permanently_not_retryably(self, env, monkeypatch):
+        """The contents API answers `encoding: "none"` for blobs over 1 MB.
+        That is corruption by contract, and it must surface as a
+        NON-retryable ApplicationError — the retryable listing error would
+        re-run the identical read forever (claude P3 on #450)."""
+        monkeypatch.setenv("GITHUB_TOKEN", "gh-test-token")
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"type": "file", "encoding": "none", "content": ""})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(ApplicationError) as excinfo:
+            await env.run(find_human_input_request, "mctl-web", "issue-10-test")
+        assert excinfo.value.type == "human_input_malformed"
+        assert excinfo.value.non_retryable is True
+
 
 class TestGetPRState:
     STATUS_PATH = (

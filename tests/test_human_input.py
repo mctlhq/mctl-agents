@@ -1,4 +1,4 @@
-"""Tests for `orchestrator/human_input.py` (mctlhq/mctl-agents#333, ADR 011).
+"""Tests for `orchestrator/human_input.py` (mctlhq/mctl-agents#333, ADR 013).
 
 Mirrors `tests/test_context_snapshot.py`'s structure and T-numbering where
 the acceptance criteria line up, since the two modules are deliberately
@@ -273,6 +273,16 @@ def _valid_response(request: hi.HumanInputRequest, **overrides) -> hi.HumanInput
 def test_positive_case_is_accepted():
     request = _seal()
     hi.validate_response(request, _valid_response(request), now=NOW)  # does not raise
+
+
+def test_structured_value_must_be_an_object():
+    request = _seal(response=hi.ResponseSpec(type="structured"))
+    hi.validate_response(
+        request, _valid_response(request, value={"choice": "A", "notes": "n"}), now=NOW
+    )  # a mapping is accepted
+    for bad in ("a string", ["a", "list"], 7, None):
+        with pytest.raises(hi.HumanInputError, match="structured"):
+            hi.validate_response(request, _valid_response(request, value=bad), now=NOW)
 
 
 def test_wrong_request_id_is_rejected():

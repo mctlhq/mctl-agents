@@ -8,13 +8,15 @@ Temporal worker pod deliberately mounts no gitops clone (see
 channel from the Argo pod back to Temporal. This activity closes that gap
 the same way `find_proposal_slug` does: a direct GitHub contents-API read of
 mctl-gitops main, structurally identical down to the token resolution and
-the retryable-vs-404 distinction (mctlhq/mctl-agents#333, ADR 011).
+the retryable-vs-404 distinction (mctlhq/mctl-agents#333, ADR 013).
 
 The request lives at
-`platform-gitops/agents-state/<service>/proposals/<slug>/human-input/request.json`,
-written and sealed by `run_issue_investigator.collect_human_input_request`.
-This activity returns its raw text; parsing (`orchestrator.human_input.
-HumanInputRequest.from_dict`) happens in workflow code, which is pure.
+`platform-gitops/agents-state/<service>/proposals/<slug>/human-input/request.json`.
+The producer that writes and seals it (the investigator's agent-container
+side) does not exist yet — it lands with mctl-gitops#1277; until then this
+path is only ever read. This activity returns its raw text; parsing
+(`orchestrator.human_input.HumanInputRequest.from_dict`) happens in
+workflow code, which is pure.
 """
 from __future__ import annotations
 

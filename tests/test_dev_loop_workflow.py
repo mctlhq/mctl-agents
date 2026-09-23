@@ -211,12 +211,13 @@ def _fake_activities(
     ownership_terminal_fails: bool = False,
     ownership_terminal_fails_once: bool = False,
     ownership_raises: bool = False,
-    # Durable clarification (mctlhq/mctl-agents#333, ADR 011). None (the
+    # Durable clarification (mctlhq/mctl-agents#333, ADR 013). None (the
     # default) means "no pending request" — every existing test exercises
     # exactly today's behaviour without knowing this activity exists at all.
     # A list lets a test change the answer across repeated calls (e.g. "a
     # request the first time, none after the model stops asking").
     human_input_requests: list[str | None] | None = None,
+    investigate_params_log: list[dict] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -269,6 +270,8 @@ def _fake_activities(
         calls.append(input.operation)
         if input.operation == "mctl-agents-investigate":
             assert input.params.get("issue_url")
+            if investigate_params_log is not None:
+                investigate_params_log.append(dict(input.params))
             investigate_ran.set()
             return WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase=investigate_phase)
         if input.operation == "mctl-agents-shepherd":
@@ -4904,7 +4907,7 @@ class TestTickSettling:
 
 
 # ---------------------------------------------------------------------------
-# Durable clarification: the WAITING_FOR_INPUT branch itself (#333, ADR 011).
+# Durable clarification: the WAITING_FOR_INPUT branch itself (#333, ADR 013).
 # Everything above only ever proved the branch is a no-op when no request
 # exists; these run it for real — happy continuation, timeout, rejection of
 # an invalid answer, the stale-expired read, the workflow-owned round bound
@@ -5055,9 +5058,15 @@ class TestDevLoopHumanInput:
             bad["request_hash"] = "sha256:" + "0" * 64
             await handle.signal(DevLoopWorkflow.human_input_response, bad)
             # The rejected answer must NOT resume the loop; the state stays
-            # WAITING_FOR_INPUT for the same request.
-            await asyncio.sleep(0.2)
-            state = await handle.query(DevLoopWorkflow.human_input_state)
+            # WAITING_FOR_INPUT for the same request — and the projection
+            # must reflect the rejection WHILE the wait is open, the only
+            # window rejected_count exists for (claude P2 on #450).
+            with anyio.fail_after(10):
+                while True:
+                    state = await handle.query(DevLoopWorkflow.human_input_state)
+                    if state.rejected_count == 1:
+                        break
+                    await asyncio.sleep(0.05)
             assert state.state == "WAITING_FOR_INPUT"
             await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
             with anyio.fail_after(15):
@@ -5235,6 +5244,118 @@ class TestDevLoopHumanInput:
         assert result.human_input is None
         assert result.implement is not None and result.implement.phase == "Succeeded"
         assert calls.count("mctl-agents-investigate") == 1
+
+    async def test_same_workflow_id_leftover_from_a_prior_run_is_retired(self, env):
+        """The realistic leftover (claude P2 on #450): `workflow_id_for` is
+        deterministic per issue, so execution B of the same issue reads a
+        document whose workflow id MATCHES and whose run id is unstamped.
+        The `created_at`-vs-start-time discriminator is what retires it."""
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        leftover = _sealed_request(
+            created=_datetime.now(_UTC) - timedelta(days=2),
+            ttl_seconds=5 * 86400,  # unexpired: ~3 days of TTL left
+            workflow_id=wf_id,  # SAME id — a re-run of the same issue
+        )
+        activities, calls, investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(leftover)]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.human_input is None
+        assert result.implement is not None and result.implement.phase == "Succeeded"
+        assert calls.count("mctl-agents-investigate") == 1
+
+    async def test_rejected_answers_are_pruned_and_do_not_lock_out_the_valid_one(self, env):
+        """A full queue of typos must not block the one correct answer
+        (claude + agy P2 on #450): rejected payloads are pruned as they are
+        rejected, so the cap counts only genuinely pending entries."""
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        request = _sealed_request(ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        activities, calls, _investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(request), None]
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            await _wait_for_pending_request(handle, request.request_id)
+            limit = dev_loop.HUMAN_INPUT_RESPONSE_QUEUE_LIMIT
+            bad = _response_payload(request)
+            bad["request_hash"] = "sha256:" + "0" * 64
+            for _ in range(limit):
+                await handle.signal(DevLoopWorkflow.human_input_response, bad)
+            with anyio.fail_after(15):
+                while True:
+                    state = await handle.query(DevLoopWorkflow.human_input_state)
+                    if state.rejected_count == limit:
+                        break
+                    await asyncio.sleep(0.05)
+            assert state.state == "WAITING_FOR_INPUT"
+            await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            with anyio.fail_after(15):
+                while calls.count("mctl-agents-investigate") < 2:  # noqa: ASYNC110 — polling a fake's call list; no event to await
+                    await asyncio.sleep(0.05)
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.human_input is not None
+        assert result.human_input.outcome == "answered"
+
+    async def test_continuations_accumulate_every_accepted_answer(self, env):
+        """Round N's continuation must carry rounds 1..N as a
+        `human_input_responses` array — a run that only saw the latest
+        answer re-asks earlier questions and the resolved-hash skip then
+        leaves them unanswered (claude P2 on #450)."""
+        wf_id = f"dev-loop-test-{uuid.uuid4()}"
+        first = _sealed_request("Question one?", ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        second = _sealed_request("Question two?", ttl_seconds=hi.MAX_REQUEST_TTL_SECONDS - 60, workflow_id=wf_id)
+        params_log: list[dict] = []
+        activities, _calls, _investigate_ran, _ = _fake_activities(
+            released=True,
+            human_input_requests=[_request_json(first), _request_json(second), None],
+            investigate_params_log=params_log,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"),
+                id=wf_id,
+                task_queue=TASK_QUEUE,
+            )
+            for request in (first, second):
+                await _wait_for_pending_request(handle, request.request_id)
+                await handle.signal(DevLoopWorkflow.human_input_response, _response_payload(request))
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.human_input is not None and result.human_input.resume_count == 2
+        continuations = [p for p in params_log if "human_input_responses" in p]
+        assert len(continuations) == 2
+        first_round = _json.loads(continuations[0]["human_input_responses"])
+        second_round = _json.loads(continuations[1]["human_input_responses"])
+        assert [a["request_id"] for a in first_round] == [first.request_id]
+        assert [a["request_id"] for a in second_round] == [first.request_id, second.request_id]
 
     async def test_workflow_owned_resume_count_bounds_agent_written_rounds(self, env):
         """Every request claims round=1 (the producer bug the reviewer's P2

@@ -108,7 +108,7 @@ with workflow.unsafe.imports_passed_through():
 
 ENVIRONMENT = "production"
 
-# Workflow-phase vocabulary (mctlhq/mctl-agents#333, ADR 011). Introduced
+# Workflow-phase vocabulary (mctlhq/mctl-agents#333, ADR 013). Introduced
 # alongside the durable clarification wait — before this there was no
 # phase vocabulary at all; "WAITING_FOR_APPROVAL" merely NAMES the existing
 # `wait_condition(lambda: self._approved)` below so the two durable gates
@@ -122,8 +122,15 @@ INPUT_TIMED_OUT = "INPUT_TIMED_OUT"
 # valid answer resolves a wait, so anything past a small burst is a
 # misbehaving surface, not a legitimate backlog — payloads beyond the cap
 # (or arriving while no wait is pending) are counted and dropped, mirroring
-# `resume`'s bounded-state invariant.
+# `resume`'s bounded-state invariant. Rejected payloads are pruned as they
+# are rejected, so only genuinely pending entries count toward the cap.
 HUMAN_INPUT_RESPONSE_QUEUE_LIMIT = 16
+
+# How much older than this execution's own start a request's `created_at`
+# may be before the request is retired as another execution's leftover.
+# Generous against clock skew between the sealing container and Temporal,
+# tiny against the hours-to-days age of a real leftover.
+HUMAN_INPUT_PRIOR_RUN_SLACK = timedelta(minutes=10)
 
 # The Argo CWFTs already retry within a run (second-OAuth-account fallback on
 # a 429/five_hour limit) — see activities/argo.py's module docstring. A
@@ -572,7 +579,7 @@ class HumanInputState:
     """What `human_input_state` reports. Every field defaulted, so a loop
     that never entered `WAITING_FOR_INPUT` (no grant, or none requested)
     returns the all-empty/zero shape rather than None (mctlhq/mctl-
-    agents#333, ADR 011) — `mctl-api#261` and the portal can poll this
+    agents#333, ADR 013) — `mctl-api#261` and the portal can poll this
     query unconditionally.
 
     `state` is one of RUNNING / WAITING_FOR_INPUT / INPUT_TIMED_OUT and is
@@ -688,7 +695,7 @@ class DevLoopResult:
     # Stage 6.4 (ADR-006, #216): incidents raised against the deployed
     # service during the watch window. None when the stage did not run.
     incidents: IncidentWatch | None = None
-    # The durable clarification outcome (mctlhq/mctl-agents#333, ADR 011).
+    # The durable clarification outcome (mctlhq/mctl-agents#333, ADR 013).
     # None on histories predating the stage and whenever no request was ever
     # seen (no capability grant, or the agent never asked). Defaulted so
     # results recorded before this field existed still deserialize.
@@ -1198,7 +1205,7 @@ class DevLoopWorkflow:
         self._last_lifecycle_op = ""
         self._last_lifecycle_op_landed = False
         self._claim_abandoned = False
-        # Durable clarification (mctlhq/mctl-agents#333, ADR 011). Raw signal
+        # Durable clarification (mctlhq/mctl-agents#333, ADR 013). Raw signal
         # payloads, processed in delivery order inside _await_human_input —
         # never touched by the signal handler itself, so `human_input_response`
         # can never raise and never needs to know whether the payload it just
@@ -1511,7 +1518,7 @@ class DevLoopWorkflow:
         inside `_await_human_input`, where a rejection can be recorded and
         answered for rather than crashing signal delivery. Deliberately
         never touches `self._approved`: an answer is data with provenance,
-        never an authorization (ADR 011's "clarification is not approval"
+        never an authorization (ADR 013's "clarification is not approval"
         invariant) — a value that reads as an approval, e.g. "use option B
         and merge it", resumes THIS wait and nothing else.
 
@@ -1546,7 +1553,7 @@ class DevLoopWorkflow:
         when the wait actually concluded (answered or timed out).
 
         `find_human_input_request` is a plain GitHub contents-API read
-        (ADR 011's "Transport" open question): no Argo workflow, no Claude
+        (ADR 013's "Transport" open question): no Argo workflow, no Claude
         Agent SDK session and no activity slot are held for any part of the
         wait itself — only this activity call before it, and one more when a
         continuation resubmits `mctl-agents-investigate`.
@@ -1557,7 +1564,10 @@ class DevLoopWorkflow:
             start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
             retry_policy=SLUG_LOOKUP_RETRY_POLICY,
         )
-        if not raw:
+        if raw is None:
+            # `is None` deliberately: None is the activity's "no file"
+            # answer, while a zero-byte request.json is corruption and must
+            # fall through to the malformed guard below, not be skipped.
             return None
 
         try:
@@ -1586,13 +1596,28 @@ class DevLoopWorkflow:
         # per-instance state, so without this check an answered-but-unexpired
         # request.json from an earlier execution of the same issue would park
         # a fresh execution on an already-answered question for the rest of
-        # its TTL (claude P2 on #450). The producer stamps the dev loop's own
-        # workflow id (ADR 009 sec. 4); the run id, when present, retires
-        # leftovers even where workflow ids are deterministic per issue.
+        # its TTL (claude P2 on #450). Three discriminators, any one retires:
+        # a foreign workflow id (a different issue's document at this path),
+        # a stamped run id that is not this run's (the producer receives this
+        # run's id in investigate_params), and — the one that actually fires
+        # for same-issue re-runs, where `workflow_id_for` makes the workflow
+        # id IDENTICAL and today's producer stamps no run id — a `created_at`
+        # that predates this execution's own start. A request this run's
+        # investigator sealed cannot be older than the run; the slack absorbs
+        # clock skew between the sealing container and Temporal. `created_at`
+        # is not hash-covered, but a backdated forgery only retires itself.
         info = workflow.info()
-        if request.execution.temporal_workflow_id != info.workflow_id or (
-            request.execution.temporal_run_id is not None
-            and request.execution.temporal_run_id != info.run_id
+        sealed_before_this_run = (
+            _as_utc(request.created_at)
+            < info.start_time.astimezone(UTC) - HUMAN_INPUT_PRIOR_RUN_SLACK
+        )
+        if (
+            request.execution.temporal_workflow_id != info.workflow_id
+            or (
+                request.execution.temporal_run_id is not None
+                and request.execution.temporal_run_id != info.run_id
+            )
+            or sealed_before_this_run
         ):
             workflow.logger.info(
                 "human_input.foreign_execution",
@@ -1694,10 +1719,10 @@ class DevLoopWorkflow:
         def _abandoned_outcome() -> HumanInputOutcome:
             # mctl-agents#420's escape hatch, honoured inside this park too:
             # checked BEFORE any delivered answer is consumed, so an operator
-            # abandon always wins over a response racing it. The query
-            # projection leaves WAITING_FOR_INPUT here — queries are served
-            # on closed workflows too, and a surface polling one must not
-            # keep prompting for an answer nobody is waiting on any more.
+            # abandon always wins over a response racing it. The projection
+            # is reset OUT of WAITING_FOR_INPUT — queries are served on
+            # closed workflows too, and a surface polling one must not keep
+            # prompting for an answer nobody is waiting on any more.
             self._human_input_state = _state(RUNNING)
             self._input_responses.clear()
             workflow.logger.info(
@@ -1708,7 +1733,6 @@ class DevLoopWorkflow:
                 round=request.round, resume_count=self._human_input_resume_count,
             )
 
-        consumed = 0
         while True:
             if self._abandoned:
                 return _abandoned_outcome()
@@ -1724,8 +1748,8 @@ class DevLoopWorkflow:
                     round=request.round, resume_count=self._human_input_resume_count,
                 )
             try:
-                def _answer_arrived(threshold: int = consumed) -> bool:
-                    return len(self._input_responses) > threshold or self._abandoned
+                def _answer_arrived() -> bool:
+                    return bool(self._input_responses) or self._abandoned
 
                 await workflow.wait_condition(_answer_arrived, timeout=remaining)
             except TimeoutError:
@@ -1747,8 +1771,7 @@ class DevLoopWorkflow:
             if self._abandoned:
                 return _abandoned_outcome()
 
-            raw_response = self._input_responses[consumed]
-            consumed += 1
+            raw_response = self._input_responses[0]
             workflow.logger.info("human_input.delivered", extra={"request_id": request.request_id})
 
             try:
@@ -1756,7 +1779,16 @@ class DevLoopWorkflow:
                 response = human_input.HumanInputResponse.from_dict(payload)
                 human_input.validate_response(request, response, now=workflow.now())
             except (ValueError, TypeError, human_input.HumanInputError):
+                # PRUNE the rejected payload — a rejected entry left queued
+                # would count toward HUMAN_INPUT_RESPONSE_QUEUE_LIMIT for the
+                # rest of the wait, and enough typos would lock the one
+                # correct answer out of the handler forever (claude+agy P2 on
+                # #450). Rebuilding the projection here is what keeps
+                # `rejected_count` live for a polling surface: the state
+                # object is a frozen snapshot, not a view.
+                del self._input_responses[0]
                 self._human_input_rejected_count += 1
+                self._human_input_state = _state(WAITING_FOR_INPUT)
                 workflow.logger.info(
                     "human_input.responded",
                     extra={"request_id": request.request_id, "accepted": False},
@@ -1842,6 +1874,12 @@ class DevLoopWorkflow:
         investigator_release = _require_release(
             "issue-investigator", await _resolve("issue-investigator")
         )
+        # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
+        # NOT passed here yet — the investigate CWFT rejects undeclared
+        # parameters, so the template must declare it first (fail-closed:
+        # gitops before code). Until then the read path's retirement of
+        # same-issue leftovers rests on the `created_at`-vs-start-time
+        # check in `_await_human_input`.
         investigate_params = {"issue_url": issue.issue_url}
         if investigator_release and investigator_release.image_ref:
             investigate_params["agent_image"] = investigator_release.image_ref
@@ -1857,7 +1895,7 @@ class DevLoopWorkflow:
                 ended=f"investigate ended {investigate_result.phase}",
             )
 
-        # Durable clarification (mctlhq/mctl-agents#333, ADR 011), gated so
+        # Durable clarification (mctlhq/mctl-agents#333, ADR 013), gated so
         # an in-flight history recorded before this change takes its old
         # command sequence verbatim: an unconditional find_proposal_slug/
         # find_human_input_request pair here would be exactly the command

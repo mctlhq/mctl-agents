@@ -787,6 +787,13 @@ def test_plan_grants_human_input_tracks_the_capability_in_plan_tools():
     )
     assert options.plan_grants_human_input(ungranted) is False
 
+    # An empty allow-list is the degenerate ungranted case, and near-miss
+    # spellings must not count as the grant (agy P2 on #450: exact literal
+    # membership, nothing fuzzier).
+    assert options.plan_grants_human_input(dataclasses.replace(plan, tools=())) is False
+    near_miss = dataclasses.replace(plan, tools=(options.HUMAN_INPUT_CAPABILITY.upper(),))
+    assert options.plan_grants_human_input(near_miss) is False
+
 
 # ---------------------------------------------------------------------------
 # Per-command execution budget (mctl-agents#430)
