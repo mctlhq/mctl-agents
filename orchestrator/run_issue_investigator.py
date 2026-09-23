@@ -1410,6 +1410,8 @@ def _render_assembled_context_section(context: context_assembly.AssemblyResult) 
     if not blocks:
         return ""
     body = "\n\n".join(blocks)
+    # mctlhq/mctl-agents#471: "" unless the snapshot recorded a conflict.
+    body += context_assembly.render_conflict_notice(context.snapshot)
     return f"""
 
 ## Assembled context

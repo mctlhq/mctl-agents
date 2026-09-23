@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -65,6 +66,20 @@ SOURCE_KINDS = frozenset({
     "human-input-response",
 })
 RETENTION_CLASSES = frozenset({"telemetry", "execution-record", "gitops"})
+
+# Conflicting-evidence records (mctlhq/mctl-agents#471, ADR 009 amendment 1).
+# `resolution_code` is a closed vocabulary like every other enum here: the
+# only resolution a fixed-rule assembler performs today is to keep every
+# source in the conflict and order them (never to drop one silently).
+CONFLICT_RESOLUTION_CODES = frozenset({"kept-all-ranked-by-trust-freshness-recency"})
+# A conflict names sources by their snapshot-local `source_id`, never by
+# payload; `subject` is a code, not prose. Same bounded-length spirit as
+# MAX_LOCATOR_LENGTH (ADR 009 sec. 7).
+MAX_CONFLICT_SUBJECT_LENGTH = 128
+# `subject` is a code, like a `reason_code`: lower-case token characters only,
+# so it can never carry prose or markup into a rendered prompt notice.
+_CONFLICT_SUBJECT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+MAX_CONFLICT_SOURCE_IDS = 64
 
 # WorkContextRef closed vocabularies (mctlhq/mctl-agents#267, ADR 011).
 # Deliberately duplicated rather than imported from
@@ -751,6 +766,46 @@ class RetentionPolicy:
         )
 
 
+@dataclass(frozen=True)
+class ContextConflict:
+    """Two or more sources in this snapshot that a fixed, deterministic rule
+    found in conflict (mctlhq/mctl-agents#471, ADR 009 amendment 1).
+
+    `subject` is a code naming the rule that fired (e.g.
+    `prior-proposal-superseded-by-later-comment`), `source_ids` are the
+    snapshot-local ids of every source involved, in rank order, and
+    `resolution_code` records what the assembler did about it. No payload,
+    no free text: a conflict is provenance, like a source. It grants
+    nothing — see ADR 009 sec. 5."""
+
+    subject: str
+    source_ids: tuple[str, ...]
+    resolution_code: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_ids", tuple(self.source_ids))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "subject": self.subject,
+            "source_ids": list(self.source_ids),
+            "resolution_code": self.resolution_code,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ContextConflict:
+        mapping = _require_mapping(data, where="conflict")
+        _reject_unknown_keys(mapping, frozenset({"subject", "source_ids", "resolution_code"}), where="conflict")
+        ids_raw = mapping.get("source_ids")
+        if not isinstance(ids_raw, list):
+            raise ContextSnapshotError("conflict.source_ids must be a list")
+        return cls(
+            subject=_require_str(mapping.get("subject"), where="conflict.subject"),
+            source_ids=tuple(_require_str(i, where="conflict.source_ids[]") for i in ids_raw),
+            resolution_code=_require_str(mapping.get("resolution_code"), where="conflict.resolution_code"),
+        )
+
+
 # ---------------------------------------------------------------------------
 # ContextSnapshot — the top-level document
 # ---------------------------------------------------------------------------
@@ -759,6 +814,7 @@ class RetentionPolicy:
 _SNAPSHOT_KEYS = frozenset({
     "api_version", "kind", "snapshot_id", "content_hash", "created_at",
     "execution", "step", "work_context", "strategy", "budget", "sources", "evidence_refs", "retention",
+    "conflicts",
 })
 
 
@@ -784,9 +840,13 @@ class ContextSnapshot:
     work_context: WorkContextRef | None = None
     sources: tuple[ContextSource, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
+    # ADR 009 amendment 1 (mctlhq/mctl-agents#471): optional, and absent —
+    # from `to_dict()` and from the hash — whenever empty, so every snapshot
+    # sealed without a conflict keeps its bytes and its `snapshot_id`.
+    conflicts: tuple[ContextConflict, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        doc: dict[str, Any] = {
             "api_version": self.api_version,
             "kind": self.kind,
             "snapshot_id": self.snapshot_id,
@@ -801,6 +861,9 @@ class ContextSnapshot:
             "evidence_refs": [e.to_dict() for e in self.evidence_refs],
             "retention": self.retention.to_dict(),
         }
+        if self.conflicts:
+            doc["conflicts"] = [c.to_dict() for c in self.conflicts]
+        return doc
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ContextSnapshot:
@@ -846,6 +909,11 @@ class ContextSnapshot:
             raise ContextSnapshotError("evidence_refs must be a list")
         evidence_refs = tuple(EvidenceRef.from_dict(e) for e in evidence_raw)
 
+        conflicts_raw = mapping.get("conflicts", [])
+        if not isinstance(conflicts_raw, list):
+            raise ContextSnapshotError("conflicts must be a list")
+        conflicts = tuple(ContextConflict.from_dict(c) for c in conflicts_raw)
+
         snapshot = cls(
             api_version=api_version,
             kind=kind,
@@ -860,6 +928,7 @@ class ContextSnapshot:
             sources=sources,
             evidence_refs=evidence_refs,
             retention=retention,
+            conflicts=conflicts,
         )
         snapshot.validate()
         return snapshot
@@ -886,6 +955,7 @@ class ContextSnapshot:
 
         for source in self.sources:
             _check_source(source)
+        _check_conflicts(self.conflicts, self.sources)
 
         budget = self.budget
         if not budget.truncated:
@@ -1014,11 +1084,47 @@ class ContextSnapshot:
             "used_bytes": self.budget.used_bytes,
             "truncated": self.budget.truncated,
         }
+        # Only when present, so the log line of a conflict-free snapshot is
+        # unchanged; a count, never the subjects' sources.
+        if self.conflicts:
+            log["conflict_count"] = len(self.conflicts)
         if self.work_context is not None:
             log["work_item_id"] = self.work_context.work_item_id
             log["execution_id"] = self.work_context.execution_id
             log["execution_sequence"] = self.work_context.execution_sequence
         return log
+
+
+def _check_conflicts(conflicts: Sequence[ContextConflict], sources: Sequence[ContextSource]) -> None:
+    """A conflict must name at least two distinct sources that exist in this
+    snapshot, carry a bounded `subject` code and a known `resolution_code`
+    (ADR 009 amendment 1)."""
+    known_ids = {s.source_id for s in sources}
+    for conflict in conflicts:
+        if (
+            not conflict.subject
+            or len(conflict.subject) > MAX_CONFLICT_SUBJECT_LENGTH
+            or not _CONFLICT_SUBJECT_PATTERN.match(conflict.subject)
+        ):
+            raise ContextSnapshotError(
+                f"conflict.subject must be a 1..{MAX_CONFLICT_SUBJECT_LENGTH} character code "
+                "of [a-z0-9._-]"
+            )
+        if conflict.resolution_code not in CONFLICT_RESOLUTION_CODES:
+            raise ContextSnapshotError(
+                f"conflict {conflict.subject!r}: resolution_code {conflict.resolution_code!r} is not one of "
+                f"{sorted(CONFLICT_RESOLUTION_CODES)!r}"
+            )
+        ids = conflict.source_ids
+        if len(ids) < 2 or len(set(ids)) != len(ids) or len(ids) > MAX_CONFLICT_SOURCE_IDS:
+            raise ContextSnapshotError(
+                f"conflict {conflict.subject!r}: source_ids must name 2..{MAX_CONFLICT_SOURCE_IDS} distinct sources"
+            )
+        unknown = [i for i in ids if i not in known_ids]
+        if unknown:
+            raise ContextSnapshotError(
+                f"conflict {conflict.subject!r}: source_ids {unknown!r} are not sources of this snapshot"
+            )
 
 
 def _check_source(source: ContextSource) -> None:
@@ -1061,6 +1167,7 @@ def _content_payload(
     evidence_refs: Sequence[EvidenceRef],
     retention: RetentionPolicy,
     work_context: WorkContextRef | None = None,
+    conflicts: Sequence[ContextConflict] = (),
 ) -> dict[str, Any]:
     """Every field that participates in `content_hash` — everything except
     `content_hash`, `snapshot_id` and `created_at` (ADR 009 sec. 2).
@@ -1089,6 +1196,12 @@ def _content_payload(
     }
     if work_context is not None:
         payload["work_context"] = work_context.to_dict()
+    # Same rule as `work_context`, for the same reason (ADR 009 amendment 1,
+    # mctlhq/mctl-agents#471): an empty `conflicts` list is NOT hashed as `[]`,
+    # so every snapshot sealed without a conflict — which is every snapshot
+    # sealed before this field existed — keeps its `content_hash`.
+    if conflicts:
+        payload["conflicts"] = [c.to_dict() for c in conflicts]
     return payload
 
 
@@ -1103,6 +1216,7 @@ def seal(
     work_context: WorkContextRef | None = None,
     sources: Sequence[ContextSource] = (),
     evidence_refs: Sequence[EvidenceRef] = (),
+    conflicts: Sequence[ContextConflict] = (),
 ) -> ContextSnapshot:
     """The only constructor that produces a sealed `ContextSnapshot`.
     Computes `content_hash = "sha256:" + sha256(canonical JSON of every
@@ -1123,6 +1237,7 @@ def seal(
         evidence_refs=evidence_refs,
         retention=retention,
         work_context=work_context,
+        conflicts=conflicts,
     )
     content_hash = _hash_bytes(_canonical_json(payload))
     snapshot_id = "cs-" + content_hash[7:23]
@@ -1140,6 +1255,7 @@ def seal(
         sources=tuple(sources),
         evidence_refs=tuple(evidence_refs),
         retention=retention,
+        conflicts=tuple(conflicts),
     )
     snapshot.validate()
     return snapshot
@@ -1159,6 +1275,7 @@ def recompute_content_hash(snapshot: ContextSnapshot) -> str:
         evidence_refs=snapshot.evidence_refs,
         retention=snapshot.retention,
         work_context=snapshot.work_context,
+        conflicts=snapshot.conflicts,
     )
     return _hash_bytes(_canonical_json(payload))
 
