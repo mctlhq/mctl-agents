@@ -30,8 +30,6 @@ from orchestrator.work_context.contract import (
     executions_from,
     latest_execution_id_of,
     with_executions,
-    work_item_unknown_reason,
-    work_item_verdict_for,
 )
 
 DEFAULT_TIMEOUT_S = 10
@@ -154,10 +152,11 @@ class WorkItemClient:
         try:
             ex = self._request("GET", ROUTES["list_executions"].format(id=_q(work_item_id)))
         except WorkItemUnavailable as exc:
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=f"executions: {exc}", accepted=True)
+            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=f"executions: {exc}")
         executions, why = executions_from(ex.status, ex.payload, work_item_id)
         if executions is None:
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=True)
+            # `accepted` only when the store actually answered the read.
+            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=200 <= ex.status < 300)
         latest = latest_execution_id_of(res.payload)
         if latest and latest not in {e.execution_id for e in executions}:
             return WorkItemAnswer(
@@ -165,10 +164,9 @@ class WorkItemClient:
                 reason=f"executions: the ledger lacks the view's latest execution {latest!r}",
                 accepted=True,
             )
-        item = with_executions(item, executions)
-        verdict = work_item_verdict_for(item)
-        reason = "" if verdict != WORK_ITEM_UNKNOWN else work_item_unknown_reason(item)
-        return WorkItemAnswer(verdict=verdict, item=item, reason=reason, accepted=True)
+        # v1 executions carry no surface/actor kinds, so the verdict the view
+        # already earned is unchanged.
+        return WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=with_executions(item, executions), accepted=True)
 
     # No record_execution write: the POST's response is the created
     # execution record, not a WorkItem view, and nothing in this repo

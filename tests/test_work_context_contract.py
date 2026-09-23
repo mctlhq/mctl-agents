@@ -222,6 +222,16 @@ def test_external_key_is_an_issue_url_only_when_it_is_one():
     assert wc.record_of(_view(external_key="https://github.com/mctlhq/x/issues/3#c")).issue_url == ""
     item = wc.record_of(_view(external_key=None))
     assert item.issue_url == "" and item.external_key == ""
+    # Whatever run_issue_investigator's own parser calls an issue URL is one
+    # here too: http(s) and an optional trailing slash.
+    for url in ("https://github.com/mctlhq/x/issues/3/", "http://github.com/mctlhq/x/issues/3"):
+        assert wc.record_of(_view(external_key=url)).issue_url == url
+
+
+def test_a_null_origin_surface_is_no_origin_not_a_broken_record():
+    item = wc.record_of(_view(origin_surface=None))
+    assert item is not None and item.origin == wc.SurfaceRef()
+    assert wc.answer_from(200, _view(origin_surface=None)).verdict == wc.WORK_ITEM_FOUND
 
 
 def test_out_of_vocabulary_origin_surface_is_unknown():
@@ -264,6 +274,7 @@ def test_executions_listing_is_all_or_nothing():
         mutated(engine="lambda"),
         mutated(phase="Paused"),
         mutated(attempt=1),
+        mutated(attempt=3),
         mutated(id=listing["executions"][0]["id"]),
         {**listing, "schema_version": "workitem/v2"},
         {"schema_version": "workitem/v1"},
@@ -272,6 +283,14 @@ def test_executions_listing_is_all_or_nothing():
         assert executions is None and why, bad
     executions, why = wc.executions_from(503, {"error": "unavailable"}, wid)
     assert executions is None and "unavailable" in why
+
+
+def test_a_truncated_ledger_is_refused_even_with_the_latest_entry_present():
+    listing = _fixture("executions-two.json")
+    wid = listing["executions"][0]["work_item_id"]
+    newest_only = {**listing, "executions": listing["executions"][1:]}
+    executions, why = wc.executions_from(200, newest_only, wid)
+    assert executions is None and "incomplete" in why
 
 
 def test_argo_execution_carries_no_temporal_workflow_id():

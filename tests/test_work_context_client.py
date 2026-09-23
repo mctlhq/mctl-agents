@@ -123,6 +123,8 @@ def test_a_failed_executions_read_is_unknown_never_an_understated_ledger(monkeyp
             answer = _client(monkeypatch, _routes(view, executions)).get(wid)
             assert answer.verdict == WORK_ITEM_UNKNOWN and answer.item is None, answer
             assert answer.reason.startswith("executions:")
+            # Accepted only when the store answered: a 2xx it could not use.
+            assert answer.accepted is (executions is wrong_schema)
 
 
 def test_a_ledger_missing_the_views_latest_execution_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

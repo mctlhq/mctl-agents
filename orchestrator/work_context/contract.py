@@ -59,8 +59,10 @@ EXECUTION_PHASES = frozenset({"Pending", "Running", "Succeeded", "Failed", "Erro
 NOT_FOUND_CODE = "work_item_not_found"
 
 # `external_key` is a free dedupe key; the contract's own example is a GitHub
-# issue URL, and only a value of exactly that shape is read as `issue_url`.
-_ISSUE_URL_RE = re.compile(r"^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/[1-9][0-9]*$")
+# issue URL, and only a value of that shape is read as `issue_url`. The same
+# definition as `run_issue_investigator._ISSUE_URL_RE` (http(s), optional
+# trailing slash), so the two never disagree about what an issue URL is.
+_ISSUE_URL_RE = re.compile(r"^https?://github\.com/[\w.-]+/[\w.-]+/issues/\d+/?$")
 
 # The four answers to "does this WorkItem exist, and is it usable" — the same
 # shape as orchestrator/lifecycle/contract.py's OWNED_BY_OTHER/OWNED_BY_ME/
@@ -282,8 +284,10 @@ class WorkItem:
             return None
         if not isinstance(state_version, int) or isinstance(state_version, bool) or state_version < 1:
             return None
-        origin_surface = data.get("origin_surface", "")
-        if not isinstance(origin_surface, str):
+        origin_surface = data.get("origin_surface")
+        if origin_surface is None:
+            origin_surface = ""  # absent or null: no origin recorded
+        elif not isinstance(origin_surface, str):
             return None
         external_key = _str(data.get("external_key"))
         return WorkItem(
@@ -425,9 +429,15 @@ def executions_from(status: int, payload: Any, work_item_id: str) -> tuple[tuple
         if execution is None:
             return None, f"executions: malformed or foreign execution record for {work_item_id!r}"
         parsed.append(execution)
-    if len({e.execution_id for e in parsed}) != len(parsed) or len({e.sequence for e in parsed}) != len(parsed):
-        return None, "executions: repeated execution id or attempt"
-    return tuple(sorted(parsed, key=lambda e: e.sequence)), ""
+    if len({e.execution_id for e in parsed}) != len(parsed):
+        return None, "executions: repeated execution id"
+    ordered = tuple(sorted(parsed, key=lambda e: e.sequence))
+    # mctl-api numbers attempts 1..n with no gaps (`len(execs)+1` on every
+    # attach) and lists them all, unpaginated. Anything else — a repeat, a
+    # gap, a truncated or paginated listing — is not the whole ledger.
+    if [e.sequence for e in ordered] != list(range(1, len(ordered) + 1)):
+        return None, "executions: attempts are not exactly 1..n; the ledger is incomplete or repeated"
+    return ordered, ""
 
 
 def with_executions(item: WorkItem, executions: tuple[ExecutionRef, ...]) -> WorkItem:
