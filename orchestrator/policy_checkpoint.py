@@ -332,10 +332,33 @@ def decision_record(request: ActionRequest, decision: Decision) -> dict[str, Any
 
 
 def emit(request: ActionRequest, decision: Decision) -> None:
-    """Print one `POLICY_DECISION` line. Never raises."""
+    """Print one `POLICY_DECISION` line, and put the decision on the current
+    trace span as a `mctl.policy.decision` event (mctl-agents#195). Never
+    raises.
+
+    The span event carries the bounded fields only — rule, verdict, code,
+    policy version, action kind and operation. Not the target, not the free
+    text `reason`, not even the args digest: the log line above is the audit
+    record, the event is how a trace shows where in the run the decision
+    fell. `orchestrator.tracing` is imported here rather than at module scope
+    to keep this module's import stdlib-only by construction, and it is a
+    no-op unless tracing is configured."""
     try:
         print(f"{DECISION_PREFIX} {json.dumps(decision_record(request, decision), sort_keys=True)}", flush=True)
     except Exception:  # noqa: BLE001, S110 — recording must never become the reason an action fails
+        pass
+    try:
+        from orchestrator import tracing
+
+        tracing.record_policy_decision(
+            rule_id=decision.rule_id,
+            decision=decision.verdict,
+            code=decision.code,
+            policy_version=decision.policy_version,
+            action_kind=request.action_kind,
+            operation=request.operation,
+        )
+    except Exception:  # noqa: BLE001, S110 — same rule: tracing never fails the action
         pass
 
 

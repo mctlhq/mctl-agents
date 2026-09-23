@@ -161,6 +161,18 @@ def _redacted_status(status: Status) -> Status:
     return Status(status.status_code)
 
 
+_SPAN_NAME = re.compile(r"^[A-Za-z0-9_.:/ -]{1,128}$")
+
+
+def redacted_name(name: str) -> str:
+    """Span names are not attributes, so the key allowlist cannot see them.
+    Ours are fixed vocabulary plus a tool or model name; anything else —
+    too long, odd characters, a credential shape — is replaced whole."""
+    if isinstance(name, str) and _SPAN_NAME.match(name) and not _CREDENTIAL_VALUE.search(name):
+        return name
+    return "redacted"
+
+
 def redacted_copy(span: ReadableSpan, *, error_detail: bool = False) -> ReadableSpan:
     """A copy of `span` carrying only what the guard allows."""
     events = [
@@ -171,7 +183,7 @@ def redacted_copy(span: ReadableSpan, *, error_detail: bool = False) -> Readable
     if not (error_detail and status.description and _scalar_allowed(status.description)):
         status = _redacted_status(status)
     return ReadableSpan(
-        name=span.name,
+        name=redacted_name(span.name),
         context=span.context,
         parent=span.parent,
         resource=span.resource,

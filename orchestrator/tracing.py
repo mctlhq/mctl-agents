@@ -41,6 +41,7 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -427,6 +428,8 @@ def _error_type(exc: BaseException) -> str:
     exit code (the drivers' exit codes are their outcome vocabulary)."""
     if isinstance(exc, SystemExit) and isinstance(exc.code, int):
         return f"exit_{exc.code}"
+    if isinstance(exc, subprocess.CalledProcessError) and isinstance(exc.returncode, int):
+        return f"exit_{exc.returncode}"
     return type(exc).__name__
 
 
@@ -492,7 +495,8 @@ def context_from_traceparent(value: str | None) -> Any:
     tracing is off or the value is not a valid traceparent. Invalid input is
     ignored (logged once), never raised: a malformed env var must not stop a
     pod."""
-    if not _state.enabled or value is None:
+    if not _state.enabled or value is None or not value.strip():
+        # Empty is the CWFT's default for "no parent" — not worth a warning.
         return None
     if not valid_traceparent(value):
         _warn_once("traceparent", "ignoring malformed %s", TRACEPARENT_ENV)
@@ -629,3 +633,381 @@ def record_policy_decision(
             "mctl.policy.operation": operation,
         },
     )
+
+
+ARTIFACT_WRITE_EVENT = "mctl.artifact.write"
+
+
+def record_artifact(name: str, kind: str) -> None:
+    """An artifact this execution produced, as an event on the current span.
+
+    `name` must be a bounded file NAME (`requirements.md`), never a path or
+    contents; `kind` a bounded class (`proposal`)."""
+    if not _state.enabled:
+        return
+    current().event(ARTIFACT_WRITE_EVENT, {"mctl.artifact.name": name, "mctl.artifact.kind": kind})
+
+
+# ---------------------------------------------------------------------------
+# GitHub / git commands
+# ---------------------------------------------------------------------------
+
+_GH_GROUPS = frozenset({"issue", "pr", "api", "repo", "label", "release", "search", "run", "workflow"})
+_GH_SUBCOMMANDS = frozenset({
+    "view", "list", "status", "comment", "create", "edit", "close", "reopen", "merge", "review", "ready",
+    "checks", "diff", "delete", "develop", "lock", "unlock", "transfer", "pin", "unpin", "clone", "fork",
+    "issues", "prs", "code", "repos", "commits", "rerun", "cancel", "watch", "download",
+})
+_GH_MUTATING = frozenset({
+    "comment", "create", "edit", "close", "reopen", "merge", "review", "ready", "delete", "develop", "lock",
+    "unlock", "transfer", "pin", "unpin", "fork", "rerun", "cancel",
+})
+_GH_API_BODY_FLAGS = frozenset({"-f", "-F", "--field", "--raw-field", "--input"})
+_GIT_REMOTE = frozenset({"push", "clone", "fetch", "pull", "ls-remote"})
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GITHUB_URL_RE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?"
+    r"(?:/(issues|pull)/([0-9]+))?/?$"
+)
+
+
+def _gh_api_method(args: list[str]) -> str:
+    for i, arg in enumerate(args):
+        if arg in ("-X", "--method") and i + 1 < len(args):
+            return args[i + 1].upper()
+        if arg.startswith("--method="):
+            return arg.split("=", 1)[1].upper()
+    return "POST" if any(a in _GH_API_BODY_FLAGS for a in args) else "GET"
+
+
+def _git_subcommand(args: list[str]) -> str:
+    skip = False
+    for arg in args:
+        if skip:
+            skip = False
+            continue
+        if arg in ("-C", "-c"):
+            skip = True
+            continue
+        if not arg.startswith("-"):
+            return arg
+    return ""
+
+
+def classify_command(cmd: list[str] | tuple[str, ...]) -> tuple[str, dict[str, Any]] | None:
+    """(span name, attributes) for a GitHub or git-remote command, or None.
+
+    Reads only a fixed vocabulary out of argv — the program, the subcommand,
+    `--repo`, and an owner/repo or issue/PR number parsed from a github.com
+    URL argument. NEVER the rest of argv: a `--body`, a commit message, a
+    `-f` field or a token-bearing remote URL cannot reach an attribute,
+    because nothing here copies an argument it has not matched against a
+    closed pattern."""
+    if not cmd:
+        return None
+    exe = os.path.basename(str(cmd[0]))
+    args = [str(a) for a in cmd[1:]]
+    attributes: dict[str, Any] = {}
+    if exe == "gh" and args and args[0] in _GH_GROUPS:
+        group = args[0]
+        if group == "api":
+            method = _gh_api_method(args[1:])
+            mutation = method != "GET"
+            operation = "api.write" if mutation else "api.read"
+        else:
+            sub = args[1] if len(args) > 1 and args[1] in _GH_SUBCOMMANDS else "other"
+            mutation = sub in _GH_MUTATING
+            operation = f"{group}.{sub}"
+        name = f"github.{operation}"
+    elif exe == "git":
+        sub = _git_subcommand(args)
+        if sub == "commit":
+            operation, mutation = "commit", False
+        elif sub in _GIT_REMOTE:
+            operation, mutation = sub, sub == "push"
+        else:
+            return None
+        name = f"git.{operation}"
+    else:
+        return None
+    attributes["mctl.github.operation"] = operation
+    attributes["mctl.github.mutation"] = mutation
+    for i, arg in enumerate(args):
+        if arg in ("--repo", "-R") and i + 1 < len(args) and _REPO_RE.match(args[i + 1]):
+            attributes.setdefault(REPOSITORY_NAME, args[i + 1])
+        match = _GITHUB_URL_RE.match(arg)
+        if match:
+            attributes.setdefault(REPOSITORY_NAME, match.group(1))
+            if match.group(2) == "issues":
+                attributes.setdefault(ISSUE_NUMBER, int(match.group(3)))
+            elif match.group(2) == "pull":
+                attributes.setdefault(PR_NUMBER, int(match.group(3)))
+    return name, attributes
+
+
+class _CommandSpan:
+    __slots__ = ("handle",)
+
+    def __init__(self, handle: SpanHandle) -> None:
+        self.handle = handle
+
+    def exited(self, returncode: Any) -> None:
+        """Record a non-zero exit of a `check=False` command."""
+        if isinstance(returncode, int) and returncode:
+            self.handle.fail(f"exit_{returncode}")
+
+
+@contextmanager
+def command_span(cmd: list[str] | tuple[str, ...]) -> Iterator[_CommandSpan]:
+    """A span around one GitHub/git command, or a no-op for anything else."""
+    classified = classify_command(cmd) if _state.enabled else None
+    if classified is None:
+        yield _CommandSpan(NOOP)
+        return
+    name, attributes = classified
+    with span(name, attributes, kind="client") as handle:
+        yield _CommandSpan(handle)
+
+
+# ---------------------------------------------------------------------------
+# Claude Agent SDK message stream -> model and tool spans
+# ---------------------------------------------------------------------------
+
+PROVIDER = "anthropic"
+
+
+def _usage_counts(usage: Any) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not isinstance(usage, Mapping):
+        return out
+    pairs = (("input_tokens", "gen_ai.usage.input_tokens"), ("output_tokens", "gen_ai.usage.output_tokens"))
+    for source, target in pairs:
+        value = usage.get(source)
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[target] = value
+    return out
+
+
+def _bounded(value: Any, limit: int = 64) -> str | None:
+    return value if isinstance(value, str) and 0 < len(value) <= limit else None
+
+
+class AgentRunObserver:
+    """Turns an SDK message stream into model (`chat`) and tool spans.
+
+    Duck-typed on the SDK's message and block class names, so this module
+    never imports `claude_agent_sdk` (the worker must not). Reads only:
+    model names, message ids, usage counters, stop/error codes, tool names,
+    tool-use ids and the `is_error` flag. Never a content block's text, a
+    tool's `input`, or a tool result's `content`.
+
+    Span shape, per agent run:
+
+        invoke_agent <agent>                 usage summed over result frames
+          chat <model>                       one per model message (message_id)
+          execute_tool <name>                ToolUseBlock -> matching ToolResultBlock
+            chat <model>                     a sub-agent's turns nest under its Task/Agent tool
+            execute_tool <name>
+
+    A chat span starts when the model's input was complete (the previous
+    event in its scope: the query, a tool result, or its own previous
+    message) and ends at the last block of its message, so its duration is
+    model latency, not tool time.
+    """
+
+    def __init__(self, root: SpanHandle, model: str | None) -> None:
+        self._root = root
+        self._model = model
+        self._tools: dict[str, SpanHandle] = {}
+        self._chats: dict[str | None, tuple[str, SpanHandle, int]] = {}
+        self._last_ns: dict[str | None, int] = {}
+        self._input_tokens = 0
+        self._output_tokens = 0
+        self._saw_usage = False
+
+    # -- public -----------------------------------------------------------
+
+    def observe(self, message: Any) -> None:
+        if not self._root.recording:
+            return
+        try:
+            kind = type(message).__name__
+            if kind == "AssistantMessage":
+                self._assistant(message)
+            elif kind == "UserMessage":
+                self._user(message)
+            elif kind == "ResultMessage":
+                self._result(message)
+        except Exception as exc:  # noqa: BLE001 — observing must never break the stream it observes
+            _warn_once("observe", "could not trace an SDK message (%s)", type(exc).__name__)
+
+    def close(self, error: BaseException | None = None) -> None:
+        try:
+            for scope in list(self._chats):
+                self._end_chat(scope)
+            for handle in self._tools.values():
+                handle.set_attributes({TOOL_STATUS: "incomplete"})
+                handle.end()
+            self._tools.clear()
+            if self._saw_usage:
+                self._root.set_attributes(
+                    {"gen_ai.usage.input_tokens": self._input_tokens, "gen_ai.usage.output_tokens": self._output_tokens}
+                )
+            if error is not None:
+                self._root.fail(_error_type(error))
+        except Exception as exc:  # noqa: BLE001
+            _warn_once("observe-close", "could not close agent spans (%s)", type(exc).__name__)
+
+    # -- internals --------------------------------------------------------
+
+    def _parent_for(self, scope: str | None) -> SpanHandle:
+        if scope is not None and scope in self._tools:
+            return self._tools[scope]
+        return self._root
+
+    def _end_chat(self, scope: str | None) -> None:
+        open_chat = self._chats.pop(scope, None)
+        if open_chat is not None:
+            _message_id, handle, last_seen = open_chat
+            handle.end(last_seen)
+
+    def _assistant(self, message: Any) -> None:
+        now = time.time_ns()
+        scope = getattr(message, "parent_tool_use_id", None)
+        message_id = getattr(message, "message_id", None) or f"anon-{id(message)}"
+        open_chat = self._chats.get(scope)
+        if open_chat is not None and open_chat[0] == message_id:
+            handle = open_chat[1]
+            self._chats[scope] = (message_id, handle, now)
+        else:
+            self._end_chat(scope)
+            model = _bounded(getattr(message, "model", None), 128)
+            attributes: dict[str, Any] = {
+                "gen_ai.operation.name": "chat",
+                "gen_ai.provider.name": PROVIDER,
+            }
+            if self._model:
+                attributes["gen_ai.request.model"] = self._model
+            if model:
+                attributes["gen_ai.response.model"] = model
+            handle = start_span(
+                f"chat {model or self._model or 'model'}",
+                attributes,
+                parent=self._parent_for(scope),
+                start_time_ns=self._last_ns.get(scope, now),
+                kind="client",
+            )
+            self._chats[scope] = (message_id, handle, now)
+        usage = _usage_counts(getattr(message, "usage", None))
+        if usage:
+            handle.set_attributes(usage)
+        error = _bounded(getattr(message, "error", None))
+        if error:
+            handle.fail(error)
+        for block in getattr(message, "content", None) or ():
+            if type(block).__name__ in ("ToolUseBlock", "ServerToolUseBlock"):
+                self._start_tool(block, scope)
+        self._last_ns[scope] = now
+
+    def _start_tool(self, block: Any, scope: str | None) -> None:
+        tool_id = getattr(block, "id", None)
+        name = _bounded(getattr(block, "name", None), 128) or "unknown"
+        if not isinstance(tool_id, str) or tool_id in self._tools:
+            return
+        attributes: dict[str, Any] = {
+            "gen_ai.operation.name": "execute_tool",
+            "gen_ai.tool.name": name,
+            TOOL_NAME: name,
+        }
+        if name.startswith("mcp__"):
+            attributes["mcp.method.name"] = "tools/call"
+        self._tools[tool_id] = start_span(f"execute_tool {name}", attributes, parent=self._parent_for(scope))
+
+    def _user(self, message: Any) -> None:
+        now = time.time_ns()
+        scope = getattr(message, "parent_tool_use_id", None)
+        self._end_chat(scope)
+        content = getattr(message, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                if type(block).__name__ != "ToolResultBlock":
+                    continue
+                tool_use_id = getattr(block, "tool_use_id", None)
+                handle = self._tools.pop(tool_use_id, None) if isinstance(tool_use_id, str) else None
+                if handle is None:
+                    continue
+                if getattr(block, "is_error", None):
+                    handle.set_attributes({TOOL_STATUS: "error"})
+                    handle.fail("tool_error")
+                else:
+                    handle.set_attributes({TOOL_STATUS: "ok"})
+                handle.end()
+        self._last_ns[scope] = now
+
+    def _result(self, message: Any) -> None:
+        for scope in list(self._chats):
+            self._end_chat(scope)
+        usage = _usage_counts(getattr(message, "usage", None))
+        if usage:
+            self._saw_usage = True
+            self._input_tokens += usage.get("gen_ai.usage.input_tokens", 0)
+            self._output_tokens += usage.get("gen_ai.usage.output_tokens", 0)
+        if getattr(message, "is_error", False):
+            status = getattr(message, "api_error_status", None)
+            if isinstance(status, int) and not isinstance(status, bool):
+                self._root.fail(f"http_{status}")
+            else:
+                self._root.fail(_bounded(getattr(message, "subtype", None)) or "agent_error")
+
+
+class _NoopObserver(AgentRunObserver):
+    def __init__(self) -> None:
+        super().__init__(NOOP, None)
+
+    def close(self, error: BaseException | None = None) -> None:
+        return None
+
+
+class agent_run:
+    """The `invoke_agent` span around one SDK client session.
+
+    Usable as `with` or `async with`, so a driver can open it in the same
+    statement as its client — `async with tracing.agent_run(...) as obs,
+    ClaudeSDKClient(...) as client:` — and feed `obs.observe` every message.
+    Tracing off -> a no-op observer and no span."""
+
+    def __init__(self, agent: str, model: str | None) -> None:
+        self._agent = agent
+        self._model = model
+        self._span_cm: Any = None
+        self._observer: AgentRunObserver = _NoopObserver()
+
+    def __enter__(self) -> AgentRunObserver:
+        if not _state.enabled:
+            return self._observer
+        attributes: dict[str, Any] = {
+            "gen_ai.operation.name": "invoke_agent",
+            "gen_ai.provider.name": PROVIDER,
+            "gen_ai.agent.name": self._agent,
+            AGENT_NAME: self._agent,
+        }
+        if self._model:
+            attributes["gen_ai.request.model"] = self._model
+        self._span_cm = span(f"invoke_agent {self._agent}", attributes, kind="client")
+        handle = self._span_cm.__enter__()
+        self._observer = AgentRunObserver(handle, self._model)
+        return self._observer
+
+    def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:
+        self._observer.close(exc)
+        if self._span_cm is not None:
+            # span() re-raises the block's exception itself; returning its
+            # result (None/False) keeps it propagating exactly once.
+            self._span_cm.__exit__(exc_type, exc, tb)
+            self._span_cm = None
+
+    async def __aenter__(self) -> AgentRunObserver:
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:
+        self.__exit__(exc_type, exc, tb)

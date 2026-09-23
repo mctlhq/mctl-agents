@@ -285,7 +285,13 @@ def _run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproc
     """
     refresh_github_token()
     print(f"$ {' '.join(cmd)}" + (f"  (cwd={cwd})" if cwd else ""))
-    return run_capturing(cmd, cwd=cwd, check=check)
+    # A github.* / git.* span for GitHub reads and mutations (mctl-agents#195):
+    # the operation and target only, never argv (a `--body` is an issue
+    # comment). Any other command gets no span.
+    with tracing.command_span(cmd) as traced:
+        result = run_capturing(cmd, cwd=cwd, check=check)
+        traced.exited(getattr(result, "returncode", None))
+        return result
 
 
 class IssueURLError(ValueError):
@@ -1628,7 +1634,12 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
     else:
         options = build_issue_investigator_options(repo_dir, INVESTIGATOR_MODEL, proposal_dir)
     mcp_configured = bool(options.mcp_servers)
-    async with ClaudeSDKClient(options=options) as client:
+    # The model/tool spans of mctl-agents#195: `trace_run.observe` sees every
+    # message `_note` sees, and records names, ids and usage counters only.
+    async with (
+        tracing.agent_run("issue-investigator", getattr(options, "model", None)) as trace_run,
+        ClaudeSDKClient(options=options) as client,
+    ):
         if mcp_configured:
             # fatal=False — see orchestrator/mcp_guard.py. The investigator
             # grounds its proposal in the target repo's own code via
@@ -1657,6 +1668,7 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
             fallback that exists for exactly this case is never taken.
             """
             print(message)
+            trace_run.observe(message)
             if (
                 isinstance(message, ResultMessage)
                 and message.is_error
@@ -2132,9 +2144,21 @@ def investigate(
             requested_comment_url=requested_comment_url,
             own_execution=own_execution,
         )
+        _trace_published(result)
         return result
     finally:
         own_execution.finish(result)
+
+
+def _trace_published(result: InvestigateResult) -> None:
+    """One `mctl.artifact.write` event per proposal file this run published
+    (mctl-agents#195): the file NAME and kind only, never a path or content.
+    Skipped, errored and dry runs published nothing, so they record nothing."""
+    if not tracing.enabled() or result.error or result.skipped_reason:
+        return
+    for name in (*TRIPLET, STATUS_FILENAME):
+        if (result.proposal_dir / name).is_file():
+            tracing.record_artifact(name, "proposal")
 
 
 def _investigate(
@@ -2197,6 +2221,14 @@ def _investigate(
     print(f"[identity] execution_context={json.dumps(execution_context.to_log_dict())}")
 
     issue = gh_issue_view(issue_url)
+    # Correlation for the pod's root span (mctl-agents#195). The `we_`
+    # execution id is added below, once the work-item layer has resolved it.
+    tracing.annotate(
+        workflow_type="investigate",
+        repository=issue.ref.full_repo,
+        issue_number=int(issue.ref.number) if str(issue.ref.number).isdigit() else None,
+        work_item_id=work_item_id,
+    )
     service = issue.ref.repo
     if service not in SERVICES:
         raise SystemExit(
@@ -2309,6 +2341,11 @@ def _investigate(
                     )
                     if refusal:
                         return InvestigateResult(service, slug, proposal_dir, skipped_reason=refusal)
+                    if work_context_ref is not None:
+                        tracing.annotate(
+                            execution_id=work_context_ref.execution_id,
+                            work_item_id=work_context_ref.work_item_id,
+                        )
             elif _work_context_rollout.blocks_on_unknown():
                 reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
                 print(f"warn: {reason}")

@@ -459,6 +459,16 @@ def test_a_malformed_traceparent_starts_a_fresh_trace(exported):
     assert root.parent is None
 
 
+def test_an_empty_traceparent_is_silent(exported, caplog):
+    """The CWFT defaults the parameter to "" — that is "no parent", not an error."""
+    with caplog.at_level(logging.WARNING, logger="orchestrator.tracing"):
+        with tracing.pod_root_span("run", environ={tracing.TRACEPARENT_ENV: ""}):
+            pass
+    (root,) = exported.get_finished_spans()
+    assert root.parent is None
+    assert not [r for r in caplog.records if r.name == "orchestrator.tracing"]
+
+
 def test_with_traceparent_needs_the_rollout_flag(exported):
     with tracing.span("argo"):
         assert tracing.with_traceparent({"issue_url": "u"}, {}) == {"issue_url": "u"}
