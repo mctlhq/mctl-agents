@@ -14,6 +14,10 @@ and policy decision.
   `docs/reference/telemetry-attributes.md`. Names this page introduces that the
   catalog does not list yet are marked **proposed** below. They need a
   reservation PR in mctl-docs before #195 can close. See the checklist.
+- Related: `docs/observability/execution-evidence.md` (#199) — the durable,
+  content-addressed audit record. `trace_id` is the join key between the two
+  documents; evidence does not depend on a trace backend existing or a span
+  being exported.
 
 ## Status
 
