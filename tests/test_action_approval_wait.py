@@ -75,19 +75,48 @@ class _Clock:
         return self.now
 
 
+def _track_workflow_time() -> None:
+    """With `WORLD["track"]`, the fake store's clock (and the lookup's, see
+    the `tracked` fixture) follows Temporal's skipped time, so a receipt
+    really expires while the workflow waits."""
+    if WORLD.get("track"):
+        WORLD["api"].clock.now = activity.info().current_attempt_scheduled_time
+
+
 @activity.defn(name=GATED)
 async def gated_deploy(inp: GatedActionInput) -> GatedActionResult:
     WORLD["calls"].append(inp)
+    _track_workflow_time()
+    args = {"service": inp.payload["service"], "head": WORLD["head"]}
+    if WORLD.get("crash_after_consume") and inp.approval_ref:
+        # The consume lands, then the worker dies before the side effect:
+        # the activity never returns anything.
+        WORLD["crash_after_consume"] = False
+        request = act.gated_request(inp, pc.MCP_TOOL_CALL, DEPLOY, inp.payload["service"], args, grants=GRANTS)
+        assert isinstance(request, pc.ActionRequest)
+        decision = pc.decide(request, approvals=act.approvals_for_attempt(inp.attempt), approval_ref=inp.approval_ref)
+        assert decision.code == pc.CODE_APPROVED
+        raise RuntimeError("worker died between the consume and the side effect")
 
     def _deploy() -> dict[str, Any]:
-        if WORLD.get("crash_after_consume"):
-            WORLD["crash_after_consume"] = False
-            raise RuntimeError("worker died between the consume and the side effect")
+        if WORLD.get("effect_raises"):
+            raise RuntimeError("GitHub answered 502")
         WORLD["effects"] += 1
         return {"deployed": WORLD["head"]}
 
-    args = {"service": inp.payload["service"], "head": WORLD["head"]}
     return act.run_gated(inp, pc.MCP_TOOL_CALL, DEPLOY, inp.payload["service"], args, _deploy, grants=GRANTS)
+
+
+@activity.defn(name="read_action_approval")
+async def tracked_read(approval_id: str) -> act.ApprovalPoll:
+    """The real poll, on workflow time, with a hook after each read."""
+    _track_workflow_time()
+    poll = act._read(approval_id)
+    WORLD["reads"] += 1
+    hook = WORLD.get("after_read")
+    if hook is not None:
+        hook(WORLD["reads"])
+    return poll
 
 
 @pytest.fixture
@@ -103,8 +132,19 @@ def api(monkeypatch, env_vars) -> FakeMctlApi:
     fake = FakeMctlApi(_Clock())  # type: ignore[arg-type]
     monkeypatch.setattr(aa, "_no_redirect_opener", lambda: fake)
     WORLD.clear()
-    WORLD.update({"head": "sha-1", "effects": 0, "calls": []})
+    WORLD.update({"head": "sha-1", "effects": 0, "calls": [], "reads": 0, "api": fake})
     return fake
+
+
+@pytest.fixture
+def tracked(api, monkeypatch) -> FakeMctlApi:
+    """Store and lookup on the workflow's clock, with a short receipt TTL
+    (600s, so the wait ends CONSUME_MARGIN_SECONDS = 300s after it starts)."""
+    monkeypatch.setenv(aa.TTL_ENV, "600")
+    monkeypatch.setattr(act, "approvals_for_attempt",
+                        lambda attempt: aa.MctlApiApprovals(aa.ActionApprovalClient(), now=api.clock, attempt=attempt))
+    WORLD["track"] = True
+    return api
 
 
 @pytest.fixture
@@ -236,10 +276,10 @@ async def test_nobody_answers_times_out_at_the_receipts_expiry(env, api):
         handle = await _start_wait(env, rid)
         await _waiting(handle)
         state = await _state(handle)
-        # The durable timer is bounded by the receipt's own expiry, not by
-        # the 7-day ceiling.
+        # The durable timer is bounded by the receipt's own expiry (less the
+        # consume margin), not by the 7-day ceiling.
         expires = datetime.fromisoformat(api.records[rid]["expires_at"])
-        assert datetime.fromisoformat(state.deadline) == expires
+        assert datetime.fromisoformat(state.deadline) == expires - timedelta(seconds=wf.CONSUME_MARGIN_SECONDS)
         result = await _result(handle)
     assert result.outcome == wf.OUTCOME_TIMED_OUT
     assert result.poll_wakes > 0 and result.rechecks == 0
@@ -328,20 +368,27 @@ async def _rechecked(handle: WorkflowHandle, n: int) -> bool:
     return s.rechecks >= n and s.state == wf.WAITING_FOR_APPROVAL
 
 
-async def test_a_signal_naming_another_receipt_is_ignored(env, api):
+async def test_a_signal_naming_another_receipt_is_ignored(env, api, caplog):
+    caplog.set_level("INFO", logger="temporalio.workflow")
     rid = _pending_receipt(api)
     async with _worker(env):
         handle = await _start_wait(env, rid, max_wait_seconds=120)
         await _waiting(handle)
-        api.decide(rid, "approve")
         await _signal(handle, "aar_" + "f" * 32)
         await handle.signal(wf.DECIDED_SIGNAL, "aar_" + "e" * 32)
-        await _until(lambda: _ignored(handle, 2), "both foreign signals")
+        await handle.signal(wf.DECIDED_SIGNAL)  # no payload names no receipt
+        await _until(lambda: _ignored(handle, 3), "the three foreign signals")
         state = await _state(handle)
         assert state.rechecks == 0 and state.signal_wakes == 0
-        # ...and the poll still finds the real decision.
+        ignored = [r for r in caplog.records if r.getMessage().startswith("action_approval.signal_ignored")]
+        assert [getattr(r, "reason", "")[:28] for r in ignored] == [
+            "the signal names another rec", "the signal names another rec", "the signal names no receipt ",
+        ]
+        # Decided only now, so no tick could have raced the checks above;
+        # the poll still finds it.
+        api.decide(rid, "approve")
         result = await _result(handle)
-    assert result.outcome == wf.OUTCOME_RAN and result.signal_wakes == 0 and result.poll_wakes == 1
+    assert result.outcome == wf.OUTCOME_RAN and result.signal_wakes == 0 and result.poll_wakes >= 1
     _single_use(api)
 
 
@@ -400,7 +447,8 @@ async def test_a_worker_crash_mid_wait_resumes_from_history(env, api):
 async def test_a_crash_after_the_consume_never_runs_the_effect(env, api):
     """The consume succeeds and the worker dies before the side effect: the
     retried activity finds the receipt spent and the wait ends `consumed`.
-    The approval is burned; the action never runs twice (or at all)."""
+    The approval is burned; the action never runs twice (or at all), and
+    `consumed` is not re-requestable."""
     rid = _pending_receipt(api)
     async with _worker(env):
         handle = await _start_wait(env, rid)
@@ -412,6 +460,28 @@ async def test_a_crash_after_the_consume_never_runs_the_effect(env, api):
     assert result.outcome == wf.OUTCOME_CONSUMED
     assert api.spent == 1 and WORLD["effects"] == 0
     assert len(WORLD["calls"]) == 2  # the crashed attempt and its retry
+    with pytest.raises(ValueError):
+        wf.next_attempt(result, _action())
+
+
+async def test_a_side_effect_that_raises_is_effect_failed_and_rerequestable(env, api):
+    """The consume lands and the side effect raises: run_gated reports it
+    instead of letting a Temporal retry answer `approval_consumed`. The
+    receipt is spent and never retried; a re-request is allowed, and needs
+    a new human decision."""
+    rid = _pending_receipt(api)
+    async with _worker(env):
+        handle = await _start_wait(env, rid)
+        await _waiting(handle)
+        api.decide(rid, "approve")
+        WORLD["effect_raises"] = True
+        await _signal(handle, rid)
+        result = await _result(handle)
+    assert result.outcome == wf.OUTCOME_EFFECT_FAILED
+    assert "GitHub answered 502" in result.reason
+    assert api.spent == 1 and WORLD["effects"] == 0
+    assert len(WORLD["calls"]) == 1  # not retried on the spent receipt
+    assert wf.next_attempt(result, _action()).attempt == 1
 
 
 async def test_a_changed_action_is_refused_and_nothing_is_consumed(env, api):
@@ -431,6 +501,85 @@ async def test_a_changed_action_is_refused_and_nothing_is_consumed(env, api):
     assert WORLD["effects"] == 0 and api.consume_calls() == 0
     assert api.records[rid]["state"] == "approved"  # still unspent
     _single_use(api)
+
+
+# ---------------------------------------------------------------------------
+# The deadline: a margin before expiry, and the final read
+# ---------------------------------------------------------------------------
+
+
+def _at_read(n: int, act_on: Callable[[], None]) -> None:
+    """Run `act_on` right after the n-th poll read has answered."""
+    def hook(reads: int) -> None:
+        if reads == n:
+            act_on()
+    WORLD["after_read"] = hook
+
+
+async def _wait_to_deadline(env: WorkflowEnvironment, rid: str) -> ApprovalWaitResult:
+    """One wait with no regular tick before its deadline (poll 3600s, a
+    300s window): read 1 is the first poll, read 2 the timer firing at the
+    deadline (still a regular tick), read 3 the final read."""
+    async with _worker(env, activities=[gated_deploy, tracked_read]):
+        inp = ApprovalWaitInput(approval_id=rid, activity=GATED, action=_action(), poll_seconds=3600)
+        handle = await env.client.start_workflow(
+            ActionApprovalWaitWorkflow.run, inp, id=wf.approval_workflow_id(rid), task_queue=TASK_QUEUE,
+        )
+        return await handle.result()
+
+
+async def test_an_approval_after_the_last_tick_still_runs_before_expiry(env, tracked):
+    """The human approves after the last regular tick and the signal is
+    lost: the final read finds it, and because the wait ends
+    CONSUME_MARGIN_SECONDS before the receipt expires, the re-check can
+    still redeem it."""
+    rid = _pending_receipt(tracked)
+    _at_read(2, lambda: tracked.decide(rid, "approve"))
+    result = await _wait_to_deadline(env, rid)
+    assert result.outcome == wf.OUTCOME_RAN, result
+    assert (result.signal_wakes, result.poll_wakes, result.rechecks) == (0, 1, 1)
+    assert WORLD["reads"] == 3
+    expires = datetime.fromisoformat(tracked.records[rid]["expires_at"])
+    # The redeem ran on workflow time at the deadline, with the margin left.
+    assert expires - tracked.clock.now >= timedelta(seconds=wf.CONSUME_MARGIN_SECONDS - 5)
+    assert WORLD["effects"] == 1
+    _single_use(tracked)
+
+
+async def test_a_denial_found_only_at_the_final_read_is_denied(env, tracked):
+    rid = _pending_receipt(tracked)
+    _at_read(2, lambda: tracked.decide(rid, "deny"))
+    result = await _wait_to_deadline(env, rid)
+    assert result.outcome == wf.OUTCOME_DENIED and result.code == pc.CODE_APPROVAL_DENIED
+    assert WORLD["effects"] == 0
+    _single_use(tracked)
+
+
+async def test_a_receipt_consumed_elsewhere_at_the_final_read_is_consumed_not_rerequestable(env, tracked):
+    rid = _pending_receipt(tracked)
+
+    def spent_elsewhere() -> None:
+        tracked.decide(rid, "approve")
+        tracked.records[rid]["state"] = "consumed"
+
+    _at_read(2, spent_elsewhere)
+    result = await _wait_to_deadline(env, rid)
+    assert result.outcome == wf.OUTCOME_CONSUMED and result.code == pc.CODE_APPROVAL_CONSUMED
+    assert WORLD["effects"] == 0
+    with pytest.raises(ValueError):
+        wf.next_attempt(result, _action())
+
+
+async def test_a_window_shorter_than_the_margin_still_gets_its_final_read(env, tracked, monkeypatch):
+    """A 60s receipt is already inside the margin: the wait ends at once,
+    but still reads and redeems while the receipt is live."""
+    monkeypatch.setenv(aa.TTL_ENV, "60")
+    rid = _pending_receipt(tracked)
+    _at_read(1, lambda: tracked.decide(rid, "approve"))  # after the first poll said pending
+    result = await _wait_to_deadline(env, rid)
+    assert result.outcome == wf.OUTCOME_RAN, result
+    assert result.poll_wakes == 0 and WORLD["reads"] == 2
+    _single_use(tracked)
 
 
 # ---------------------------------------------------------------------------
@@ -510,6 +659,29 @@ async def test_a_rerequest_after_denial_opens_a_new_request(env, api):
     _single_use(api)
 
 
+async def test_a_second_waiter_on_the_same_receipt_is_already_waiting(env, api):
+    """Two callers asking for the same intent (same execution, same attempt)
+    share one receipt. The one already waiting owns it; the other gets
+    `already_waiting`, does not act and cannot re-request."""
+    rid = _pending_receipt(api)
+    async with _worker(env):
+        owner = await _start_wait(env, rid)
+        await _waiting(owner)
+        probe = await _probe(env, max_attempts=2)
+        out = await probe.result()
+        [result] = out.results
+        assert result.outcome == wf.OUTCOME_ALREADY_WAITING and result.approval_id == rid
+        assert len(api.records) == 1  # the same receipt, found by key
+        with pytest.raises(ValueError):
+            wf.next_attempt(result, _action())
+        api.decide(rid, "approve")
+        await _signal(owner, rid)
+        owned = await _result(owner)
+    assert owned.outcome == wf.OUTCOME_RAN
+    assert WORLD["effects"] == 1
+    _single_use(api)
+
+
 async def test_approvals_off_by_default_never_wait(env, api, monkeypatch):
     monkeypatch.delenv(pc.APPROVALS_ENV)
     async with _worker(env):
@@ -578,10 +750,23 @@ def test_run_gated_runs_after_a_spent_receipt():
     assert out.ran and out.code == pc.CODE_APPROVED and out.result == {"ok": True}
 
 
-def test_run_gated_refuses_arguments_it_cannot_digest():
+def test_run_gated_refuses_arguments_it_cannot_digest(capsys):
     out = act.run_gated(_action(), pc.MCP_TOOL_CALL, DEPLOY, "mctl-web", {"a": object()},
                         lambda: pytest.fail("ran"), grants=GRANTS, approvals=_Lookup(pc.APPROVAL_GRANTED))
     assert not out.ran and out.code == pc.CODE_INVALID_REQUEST
+    # The audit line names who attempted it.
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(pc.DECISION_PREFIX))
+    record = json.loads(line.removeprefix(pc.DECISION_PREFIX))
+    assert (record["execution_id"], record["trace_id"], record["actor"]) == ("ctx-198", "tr-198", "system:dev-loop")
+
+
+def test_run_gated_reports_a_side_effect_that_raises():
+    def boom() -> dict[str, Any]:
+        raise RuntimeError("502")
+    out = act.run_gated(_action(), pc.MCP_TOOL_CALL, DEPLOY, "mctl-web", {"a": 1}, boom,
+                        grants=GRANTS, approvals=_Lookup(pc.APPROVAL_GRANTED))
+    assert not out.ran and out.code == pc.CODE_APPROVED and out.effect_error == "RuntimeError: 502"
+    assert wf.outcome_of(out) == wf.OUTCOME_EFFECT_FAILED
 
 
 def test_run_gated_binds_the_identity_the_workflow_passed(api):

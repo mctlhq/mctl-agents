@@ -75,6 +75,9 @@ class GatedActionResult:
     ran: bool = False
     result: dict[str, Any] | None = None
     reason: str = ""
+    #: Set when the decision permitted and `side_effect()` raised: the
+    #: exception type and message. `ran` stays false.
+    effect_error: str = ""
 
     @property
     def awaiting_approval(self) -> bool:
@@ -132,7 +135,8 @@ def gated_request(
     try:
         digest = pc.args_digest_of(args)
     except Exception as exc:  # noqa: BLE001 — arguments that cannot be digested are refused, not raised
-        probe = pc.ActionRequest(action_kind, operation, target, "", grants=grants)
+        probe = pc.ActionRequest(action_kind, operation, target, "", grants=grants,
+                                 execution_id=inp.execution_id, trace_id=inp.trace_id, actor=inp.actor)
         decision = pc.Decision(pc.DENY, pc.CODE_INVALID_REQUEST,
                                f"arguments cannot be digested: {type(exc).__name__}", policy.version, "", "")
         pc.emit(probe, decision)
@@ -164,9 +168,15 @@ def run_gated(
     hashed from them, so a receipt approved for one set of arguments is
     `approval_intent_mismatch` for any other and nothing is consumed.
 
-    A crash between the consume and the side effect burns the receipt
-    without acting; the retried activity then answers `approval_consumed`
-    and the wait ends without running it. It never acts twice."""
+    The side effect should be idempotent and retry its own transient errors
+    before raising. If it raises anyway after an approved receipt was
+    consumed, the exception is caught and answered as `effect_error` with
+    the decision's code (the wait ends `effect_failed`, which a caller may
+    re-request, with a new human decision): the receipt is spent, so a
+    Temporal retry could only answer `approval_consumed`. A worker that dies
+    between the consume and the side effect reports nothing; the retried
+    activity answers `approval_consumed` and the wait ends `consumed`. It
+    never acts twice on one receipt."""
     request = gated_request(inp, action_kind, operation, target, args, grants=grants, metadata=metadata,
                             policy=policy)
     if isinstance(request, pc.Decision):
@@ -175,7 +185,15 @@ def run_gated(
     decision = pc.decide(request, policy=policy, approvals=lookup, approval_ref=inp.approval_ref)
     if not decision.permitted:
         return _result(decision)
-    return _result(decision, ran=True, result=side_effect())
+    try:
+        result = side_effect()
+    except Exception as exc:  # noqa: BLE001 — the receipt is spent: report, never retry on it
+        failed = _result(decision)
+        return GatedActionResult(
+            code=failed.code, verdict=failed.verdict, approval_ref=failed.approval_ref, ran=False,
+            reason=failed.reason, effect_error=f"{type(exc).__name__}: {exc}",
+        )
+    return _result(decision, ran=True, result=result)
 
 
 def _read(approval_id: str) -> ApprovalPoll:

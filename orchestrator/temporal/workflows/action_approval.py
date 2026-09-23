@@ -55,9 +55,32 @@ intent and redeems the receipt through the policy checkpoint.
 - `refused`: the store refused the request itself.
 - `blocked`: the policy refused without an approval flow (DENY, or the
   approval store is off: `approval_required`).
+- `effect_failed`: the receipt was consumed and the side effect then
+  raised. Whether the effect happened is unknown to the workflow, and the
+  receipt is spent, so it is never retried on that receipt; it IS
+  re-requestable, because a re-request needs a new human decision, who sees
+  the failure. A gated side effect should therefore be idempotent and
+  retry its own transient errors (a GitHub 5xx, a secondary rate limit)
+  before raising: every exception that escapes it costs a human decision.
+  A worker that dies between the consume and the side effect never reports
+  anything; the retried activity then finds the receipt spent: `consumed`.
 - `undecided`: from the caller's first call only, the checkpoint could not
   decide (an unreachable store). Inside the wait that is retried with
   backoff while the timer runs, never a terminal outcome.
+- `already_waiting`: from `run_gated_action` only. Another wait on the same
+  receipt is already running: two callers asked for the same intent, in
+  the same execution and attempt, so the idempotency key gave them the
+  same receipt. That wait owns it and its outcome is the action's outcome;
+  this caller ends its step without acting. The receipt is single-use, so
+  at most one of them can ever run the side effect. Not re-requestable:
+  a new attempt would ask a human to approve an action another waiter may
+  still perform.
+
+The wait fails (a `ChildWorkflowError` out of `run_gated_action`) only when
+the wait workflow itself fails, e.g. the poll activity exhausting its retry
+policy. That is the one path where uncertainty is not returned as a value:
+the caller's own failure handling applies, and the receipt is untouched
+unless a re-check had consumed it.
 
 A policy decision is never inherited: every wake decides again in a fresh
 activity, and every attempt is its own request with its own receipt.
@@ -97,6 +120,14 @@ DEFAULT_MAX_WAIT_SECONDS = 7 * 24 * 3600
 MIN_POLL_SECONDS = 1
 #: Re-checks the store could not answer back off from this up to the poll.
 RECHECK_BACKOFF_SECONDS = 30
+#: The wait ends this long before the receipt expires, so the final read
+#: (and the re-check it triggers) still finds an unexpired receipt to
+#: redeem: room for a poll read plus a gated activity's get + consume round
+#: trip (each call has a 10s client timeout, the activity has retries), with
+#: slack for clock skew between the worker and mctl-api. Waiting right up to
+#: `expires_at` would turn an approval given after the last tick, whose
+#: signal was lost, into `expired`.
+CONSUME_MARGIN_SECONDS = 5 * 60
 
 GATED_ACTIVITY_TIMEOUT = timedelta(minutes=10)
 #: A retry re-decides from scratch; after a consume it answers
@@ -118,12 +149,16 @@ OUTCOME_MISMATCH = "mismatch"
 OUTCOME_REFUSED = "refused"
 OUTCOME_BLOCKED = "blocked"
 OUTCOME_UNDECIDED = "undecided"
+#: The receipt was consumed and the side effect raised (run_gated caught it).
+OUTCOME_EFFECT_FAILED = "effect_failed"
 #: Another wait on the same receipt is already running.
 OUTCOME_ALREADY_WAITING = "already_waiting"
 
 #: The outcomes after which asking again is legitimate. Never after `ran`
-#: or `consumed`: that action has happened (or burned its receipt).
-REREQUESTABLE = frozenset({OUTCOME_DENIED, OUTCOME_EXPIRED, OUTCOME_TIMED_OUT})
+#: or `consumed`: that action has happened (or burned its receipt without
+#: telling anyone why). After `effect_failed` the failure is known and a
+#: human decides again.
+REREQUESTABLE = frozenset({OUTCOME_DENIED, OUTCOME_EXPIRED, OUTCOME_TIMED_OUT, OUTCOME_EFFECT_FAILED})
 
 #: Store states that mean "a decision exists": worth a re-check.
 _DECIDED_STATES = frozenset({"approved", "denied", "expired", "consumed"})
@@ -147,6 +182,8 @@ def outcome_of(result: GatedActionResult) -> str | None:
     waiting. Only a call that actually ran is `ran`."""
     if result.ran:
         return OUTCOME_RAN
+    if result.effect_error:
+        return OUTCOME_EFFECT_FAILED
     if result.code in _KEEP_WAITING:
         return None
     return _TERMINAL_CODES.get(result.code, OUTCOME_BLOCKED)
@@ -251,8 +288,20 @@ class ActionApprovalWaitWorkflow:
         """mctl-api's best-effort wake-up after it recorded a decision.
         Several signals before the wait wakes collapse into one re-check;
         a signal naming another receipt is ignored."""
-        if _signal_ref(args) != self._approval_id or self._state == DONE:
+        ref = _signal_ref(args)
+        if ref != self._approval_id or self._state == DONE:
             self._ignored_signals += 1
+            if self._state == DONE:
+                why = "the wait has already ended"
+            elif not ref:
+                why = "the signal names no receipt (expected {\"approval_id\": ...} or the bare id)"
+            else:
+                why = "the signal names another receipt"
+            workflow.logger.info(
+                "action_approval.signal_ignored",
+                extra={"approval_id": self._approval_id, "signal_ref": ref, "reason": why,
+                       "ignored_signals": self._ignored_signals},
+            )
             return
         self._signal_wakes += 1
         self._wake = True
@@ -298,7 +347,7 @@ class ActionApprovalWaitWorkflow:
         return ApprovalWaitResult(
             outcome=outcome, approval_id=inp.approval_id, attempt=self._attempt, code=self._last_code,
             result=result.result if result is not None and result.ran else None,
-            reason=result.reason if result is not None else "",
+            reason=(result.effect_error or result.reason) if result is not None else "",
             signal_wakes=self._signal_wakes, poll_wakes=self._poll_wakes, rechecks=self._rechecks,
         )
 
@@ -308,8 +357,12 @@ class ActionApprovalWaitWorkflow:
         deadline = workflow.now() + timedelta(seconds=max(MIN_POLL_SECONDS, inp.max_wait_seconds))
         first = await self._poll()
         expires = _parse_time(first.expires_at)
-        if expires is not None and expires < deadline:
-            deadline = expires
+        if expires is not None:
+            # Stop CONSUME_MARGIN_SECONDS early so the final read can still
+            # redeem. A window shorter than the margin ends now: the final
+            # read below then runs at once, while the receipt is still live.
+            last_useful = max(workflow.now(), expires - timedelta(seconds=CONSUME_MARGIN_SECONDS))
+            deadline = min(deadline, last_useful)
         self._deadline = deadline.isoformat()
         workflow.logger.info(
             "action_approval.wait_started",
@@ -338,9 +391,13 @@ class ActionApprovalWaitWorkflow:
             remaining = (deadline - workflow.now()).total_seconds()
             if remaining <= 0:
                 # One last read-only look, so a decision that landed after
-                # the last tick (and whose signal was lost) is not dropped.
+                # the last tick (and whose signal was lost) is not dropped,
+                # and is reported as what it is: any decided state goes
+                # through the re-check, which produces the code. A receipt
+                # found consumed here ends `consumed`, never the
+                # re-requestable `timed_out`.
                 last = await self._poll()
-                if last.state == "approved":
+                if last.state in _DECIDED_STATES:
                     result = await self._recheck(inp)
                     outcome = outcome_of(result)
                     if outcome is not None:
@@ -374,7 +431,11 @@ async def run_gated_action(
     by the receipt, and re-run it on every wake. Call from workflow code.
 
     A caller adding this to an existing workflow adds commands, so it must
-    guard the call with its own `workflow.patched()` marker."""
+    guard the call with its own `workflow.patched()` marker.
+
+    Every outcome is returned as a value (see the module docstring),
+    including `already_waiting` when another wait holds this receipt. A
+    failure of the wait workflow itself propagates as `ChildWorkflowError`."""
     first: GatedActionResult = await workflow.execute_activity(
         activity, replace(action, approval_ref=""),
         **_activity_options(timeout_s=int(activity_timeout.total_seconds()), task_queue=activity_task_queue),

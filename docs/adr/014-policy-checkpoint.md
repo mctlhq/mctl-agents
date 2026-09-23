@@ -235,13 +235,26 @@ A workflow never holds a pod while it waits.
   (a signal naming another receipt is ignored; several collapse into one
   re-check); otherwise a durable timer every `poll_seconds` (15 min) runs
   `read_action_approval`, a read-only GET, and re-checks only when the store
-  reports a decision. The timer is bounded by the receipt's `expires_at`
-  (and a 7-day ceiling), with one final read at the deadline.
+  reports a decision. The wait ends `CONSUME_MARGIN_SECONDS` (5 min) before
+  the receipt's `expires_at` (and at a 7-day ceiling), with one final read
+  at the deadline: the margin leaves the re-check an unexpired receipt to
+  redeem, and any decided state found there goes through the re-check, so
+  it is reported as what it is (a spent receipt is `consumed`, never
+  `timed_out`). A window shorter than the margin ends at once, and still
+  gets its final read.
 - **Outcomes** (`ApprovalWaitResult.outcome`): `ran`, `denied`, `expired`,
-  `timed_out`, `consumed`, `mismatch`, `refused`, `blocked`, and, from the
-  caller's first call only, `undecided`.
-- **Re-request.** `next_attempt()` accepts only `denied`, `expired` and
-  `timed_out`, and returns the input with `attempt + 1` and no receipt.
+  `timed_out`, `consumed`, `mismatch`, `refused`, `blocked`,
+  `effect_failed`, and, from `run_gated_action` only, `undecided` and
+  `already_waiting` (another wait holds the same receipt and owns its
+  outcome; the caller does not act).
+- **A side effect that raises.** After the consume, `run_gated` catches it
+  and answers `effect_error`; the wait ends `effect_failed`. The receipt is
+  spent and never retried; a re-request (a new human decision) is allowed.
+  A gated side effect should be idempotent and retry its own transient
+  errors. A worker that dies between the consume and the effect reports
+  nothing, and the retry ends `consumed`, which is not re-requestable.
+- **Re-request.** `next_attempt()` accepts only `denied`, `expired`,
+  `timed_out` and `effect_failed`, and returns the input with `attempt + 1` and no receipt.
   `MctlApiApprovals(attempt=N)` puts the attempt in the idempotency key, so
   the new attempt is a new request that needs a new human decision; the
   intent hash is unchanged.
