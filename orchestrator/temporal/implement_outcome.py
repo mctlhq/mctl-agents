@@ -33,6 +33,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 IMPLEMENTER_TEMPLATE = "run-implementer"
+# The one Argo lock a `lock_wait` reason refers to. Defined HERE rather than
+# in constants.py (which re-exports it as ARGO_IMPLEMENT_MUTEX_NAME and is
+# what validate_manifest checks against the real CWFT): constants imports
+# this module, so this is the only place both can read one spelling from.
+ARGO_IMPLEMENT_MUTEX_NAME = "mctl-agents-proposal-claims"
 FINALIZATION_TEMPLATES = frozenset({"commit-and-push", "assert-attempt"})
 
 FailureClass = Literal["pre_start", "execution", "finalization"]
@@ -91,20 +96,24 @@ def _lock_waiting(node: dict[str, object]) -> bool:
     """Was this node blocked on the mctl-agents-proposal-claims mutex?
 
     Reads the structured mark first — `synchronizationStatus.waiting`, which
-    Argo sets on a node Pending on a lock — and falls back to the node
-    `message`, matching the shape the issue quotes verbatim ("Waiting for
-    argo-workflows/Mutex/mctl-agents-proposal-claims. Lock status: 0/1").
-    The message is a fallback only: it is advisory, and an undetected
-    lock_wait degrades to `unscheduled`/`unknown`, changing nothing about
-    `classify`'s verdict or the requeue.
+    Argo sets to the lock's key on a node Pending on a lock — and falls back
+    to the node `message`, matching the shape the issue quotes verbatim
+    ("Waiting for argo-workflows/Mutex/mctl-agents-proposal-claims. Lock
+    status: 0/1"). Both must name THIS mutex: `Lock status:` alone is
+    emitted for a semaphore wait too, and `lock_wait` means the claims
+    mutex, not any synchronization wait (#459 review). The message is a
+    fallback only: it is advisory, and an undetected lock_wait degrades to
+    `unscheduled`/`unknown`, changing nothing about `classify`'s verdict or
+    the requeue.
     """
+    mutex_key = f"Mutex/{ARGO_IMPLEMENT_MUTEX_NAME}"
     sync_status = node.get("synchronizationStatus")
-    if isinstance(sync_status, dict) and sync_status.get("waiting"):
-        return True
+    if isinstance(sync_status, dict):
+        waiting = sync_status.get("waiting")
+        if isinstance(waiting, str) and mutex_key in waiting:
+            return True
     message = node.get("message")
-    if isinstance(message, str) and ("Mutex/" in message or "Lock status:" in message):
-        return True
-    return False
+    return isinstance(message, str) and mutex_key in message
 
 
 def pre_start_reason(reason: str | None) -> str:

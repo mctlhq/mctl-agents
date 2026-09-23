@@ -435,8 +435,7 @@ class TestRecordExecution:
         assert seen["body"]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-telegram-1"
         assert seen["body"]["phase"] == "Succeeded"
         assert seen["body"]["target_repo"] == "mctl-telegram"
-        # Neither field was set on this record — an mctl-api that has not
-        # grown these columns yet must not see them at all (#418).
+        # Neither field was set on this record, so neither is sent (#418).
         assert "outcome" not in seen["body"]
         assert "pre_start_reason" not in seen["body"]
 
@@ -469,6 +468,94 @@ class TestRecordExecution:
         )
         assert seen["body"]["outcome"] == "pre_start"
         assert seen["body"]["pre_start_reason"] == "lock_wait"
+
+    @staticmethod
+    def _implement_record() -> ExecutionRecord:
+        return ExecutionRecord(
+            temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-1",
+            agent="implementer",
+            environment="production",
+            version="",
+            image_ref="",
+            target_repo="mctl-telegram",
+            argo_workflow_name="mctl-agents-implement-ab12cd34",
+            phase="Failed",
+            outcome="pre_start",
+            pre_start_reason="lock_wait",
+        )
+
+    async def test_a_4xx_on_the_optional_keys_retries_once_without_them(self, env, monkeypatch):
+        """#459 review P2: every implement record carries `outcome`, so an
+        mctl-api that rejects unknown keys must cost those keys, never the
+        whole execution row (callers swallow a failed record_execution)."""
+        bodies: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "outcome" in body or "pre_start_reason" in body:
+                return httpx.Response(400, json={"error": 'json: unknown field "outcome"'})
+            return httpx.Response(201, json={"ok": True})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(record_execution, self._implement_record())
+        assert len(bodies) == 2
+        assert bodies[0]["outcome"] == "pre_start"
+        assert "outcome" not in bodies[1] and "pre_start_reason" not in bodies[1]
+        assert bodies[1]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-telegram-1"
+        assert bodies[1]["phase"] == "Failed"
+
+    async def test_a_4xx_without_optional_keys_is_not_retried(self, env, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(400, json={"error": "invalid"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(
+                record_execution,
+                ExecutionRecord(
+                    temporal_workflow_id="x",
+                    agent="issue-investigator",
+                    environment="production",
+                    version="",
+                    image_ref="",
+                    target_repo="",
+                    argo_workflow_name="wf",
+                    phase="Succeeded",
+                ),
+            )
+        assert len(calls) == 1
+
+    async def test_a_5xx_is_not_retried_without_the_optional_keys(self, env, monkeypatch):
+        """A server error is not a schema mismatch: it surfaces to Temporal's
+        own retry policy with the full body, rather than silently dropping
+        fields mctl-api might well have accepted."""
+        bodies: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return httpx.Response(503, json={"error": "unavailable"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(record_execution, self._implement_record())
+        assert len(bodies) == 1
+        assert bodies[0]["outcome"] == "pre_start"
+
+    async def test_a_4xx_that_persists_without_the_optional_keys_still_raises(self, env, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(400, json={"error": "missing required fields"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(record_execution, self._implement_record())
+        assert len(calls) == 2
 
     async def test_raises_on_error_response(self, env, monkeypatch):
         def handler(request: httpx.Request) -> httpx.Response:

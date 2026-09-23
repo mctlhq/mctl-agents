@@ -82,7 +82,9 @@ class TestPreStartReason:
     node graph was not readable at all"."""
 
     def test_a_structured_lock_wait_mark_is_lock_wait(self) -> None:
-        node = _implementer_node("Failed", synchronizationStatus={"waiting": "argo-workflows/Mutex/x"})
+        node = _implementer_node(
+            "Failed", synchronizationStatus={"waiting": "argo-workflows/Mutex/mctl-agents-proposal-claims"}
+        )
         observation = observe_implementer({"nodes": {"a": node}})
         assert observation.ran is False
         assert observation.pre_start_reason == "lock_wait"
@@ -95,6 +97,23 @@ class TestPreStartReason:
         observation = observe_implementer({"nodes": {"a": node}})
         assert observation.ran is False
         assert observation.pre_start_reason == "lock_wait"
+
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"message": "Waiting for argo-workflows/ConfigMap/limits/workflow. Lock status: 0/2"},
+            {"message": "Waiting for argo-workflows/Mutex/some-other-lock. Lock status: 0/1"},
+            {"synchronizationStatus": {"waiting": "argo-workflows/ConfigMap/limits/workflow"}},
+            {"synchronizationStatus": {"waiting": "argo-workflows/Mutex/some-other-lock"}},
+        ],
+    )
+    def test_a_wait_on_any_other_lock_is_not_lock_wait(self, extra: dict) -> None:
+        """`lock_wait` means the claims mutex (#459 review P3): a semaphore
+        wait (whose message also says `Lock status:`) or another mutex must
+        not be reported as the #418 deadline-vs-claims-lock shape."""
+        observation = observe_implementer({"nodes": {"a": _implementer_node("Failed", **extra)}})
+        assert observation.ran is False
+        assert observation.pre_start_reason == "unscheduled"
 
     def test_a_failed_node_with_no_pod_and_no_lock_mark_is_unscheduled(self) -> None:
         node = _implementer_node("Failed")

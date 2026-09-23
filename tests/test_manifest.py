@@ -576,10 +576,59 @@ class TestImplementAdmissionClampWarnings:
         assert "IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES=3" in warnings[0]
         assert "clamps admission to 1" in warnings[0]
 
-    @pytest.mark.parametrize("n", ["1", None, "three"])
-    def test_n_within_the_width_unset_or_unparseable_is_silent(self, tmp_path, monkeypatch, n) -> None:
+    @pytest.mark.parametrize("n", ["1", None])
+    def test_n_within_the_width_or_unset_is_silent(self, tmp_path, monkeypatch, n) -> None:
         monkeypatch.setattr(validate_manifest_module, "IMPLEMENT_WORKER_VALUES", _write_worker_values(tmp_path, n))
         assert implement_admission_clamp_warnings() == []
+
+    def test_an_absent_values_file_is_silent(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(validate_manifest_module, "IMPLEMENT_WORKER_VALUES", tmp_path / "absent.yaml")
+        assert implement_admission_clamp_warnings() == []
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            # Helm's list form: env.get() was never reached before (#459 review P2).
+            (
+                yaml.safe_dump({"env": [{"name": "IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "value": "3"}]}).encode(),
+                "`env:` is a list",
+            ),
+            (yaml.safe_dump({"env": {"IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES": "three"}}).encode(), "not an integer"),
+            # Invalid UTF-8: read_text() raises UnicodeDecodeError (#459 review P3).
+            (b"env:\n  IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES: \xff\xfe\n", "UnicodeDecodeError"),
+            (b"env: [unclosed\n", "unreadable"),
+        ],
+        ids=["helm-list-env", "non-integer-n", "invalid-utf8", "invalid-yaml"],
+    )
+    def test_a_present_but_unreadable_n_is_a_warning_not_a_silent_pass_or_a_crash(
+        self, tmp_path, monkeypatch, content: bytes, expected: str
+    ) -> None:
+        path = tmp_path / "values.yaml"
+        path.write_bytes(content)
+        monkeypatch.setattr(validate_manifest_module, "IMPLEMENT_WORKER_VALUES", path)
+        warnings = implement_admission_clamp_warnings()
+        assert len(warnings) == 1
+        assert "cannot read IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES" in warnings[0]
+        assert expected in warnings[0]
+
+    def test_the_real_worker_values_file_states_a_readable_n(self) -> None:
+        """Every test above patches IMPLEMENT_WORKER_VALUES (#459 review P2):
+        nothing proved the path or the `env:` shape against the real
+        mctl-gitops file, and a wrong one is exactly what this check could
+        otherwise never notice. Same shape as
+        test_the_real_implement_cwft_satisfies_the_mirror: skip locally,
+        `pytest.fail` under CI."""
+        path = validate_manifest_module.IMPLEMENT_WORKER_VALUES
+        if not path.is_file():
+            if os.environ.get("CI"):
+                pytest.fail(f"{path} not checked out under CI — the implement admission clamp check verified nothing")
+            pytest.skip(f"mctl-gitops not checked out at {path}")
+        configured, problem = validate_manifest_module.configured_implementation_capacity()
+        assert problem is None
+        assert isinstance(configured, int) and configured >= 1
+        ceiling = validate_manifest_module.temporal_constants.argo_admission_width()
+        expected = 1 if ceiling is not None and configured > ceiling else 0
+        assert len(implement_admission_clamp_warnings()) == expected
 
     def test_no_warning_once_the_mutex_moves_off_run_implementer(self, tmp_path, monkeypatch) -> None:
         monkeypatch.setattr(validate_manifest_module, "IMPLEMENT_WORKER_VALUES", _write_worker_values(tmp_path, "3"))

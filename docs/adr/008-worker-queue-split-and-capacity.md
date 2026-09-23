@@ -338,6 +338,17 @@ remains durable lifecycle state; nothing is pushed there mid-attempt.
 > `unscheduled` or `unknown` — so the recovery plane (#353, mctl-api#294)
 > can tell a capacity problem from a cluster one instead of collapsing both
 > into the same unexplained `pre_start`.
+>
+> **Cross-repo dependency (not yet met).** `record_execution` now posts
+> `outcome` and `pre_start_reason` as optional keys on
+> `POST /api/v1/agents/executions`, beyond the eight-field payload ADR-012's
+> correlation contract documents. mctl-api does not store them yet: its
+> `recordExecutionRequest` has no such fields and its plain `json.Decoder`
+> drops unknown keys rather than rejecting them. Until mctl-api grows the two
+> columns the reason is visible in the workflow's own error and history, not
+> in `mctl_list_recent_agent_runs`. Should mctl-api tighten its decoder
+> first, `record_execution` retries a 4xx once without the two keys, so a
+> schema mismatch costs those fields and never the execution row.
 
 ## Rollout order (fail-closed)
 

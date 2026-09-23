@@ -457,6 +457,40 @@ def check_implement_admission_is_safe() -> list[str]:
 IMPLEMENT_WORKER_VALUES = GITOPS_ROOT / "services" / "admins" / "mctl-agents-worker-implement" / "values.yaml"
 
 
+def configured_implementation_capacity() -> tuple[int | None, str | None]:
+    """Read N from IMPLEMENT_WORKER_VALUES: `(n, None)` when it is set to an
+    integer, `(None, None)` when the file is absent or N is simply unset
+    (the worker then uses its own default), and `(None, problem)` when the
+    file exists but N cannot be read from it — an unreadable file, a
+    non-mapping `env:` (e.g. Helm's `[{name, value}]` list form) or a
+    non-integer value.
+
+    Split out of implement_admission_clamp_warnings so the real, unpatched
+    file can be asserted to parse (#459 review): a wrong shape must be a
+    visible problem, not indistinguishable from "N is fine".
+    """
+    if not IMPLEMENT_WORKER_VALUES.is_file():
+        return None, None
+    try:
+        document = yaml.safe_load(IMPLEMENT_WORKER_VALUES.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        return None, f"unreadable ({exc.__class__.__name__}: {exc})"
+    if not isinstance(document, dict):
+        return None, "the document is not a mapping"
+    env = document.get("env")
+    if env is None:
+        return None, None
+    if not isinstance(env, dict):
+        return None, f"`env:` is a {type(env).__name__}, not the NAME: value mapping this check reads"
+    raw = env.get(temporal_constants.IMPLEMENTATION_CAPACITY_ENV)
+    if raw is None:
+        return None, None
+    try:
+        return int(str(raw)), None
+    except ValueError:
+        return None, f"{temporal_constants.IMPLEMENTATION_CAPACITY_ENV}={raw!r} is not an integer"
+
+
 def implement_admission_clamp_warnings() -> list[str]:
     """Advisory, never a failure: say when mctl-gitops configures an
     implementation N that the worker will clamp (mctl-agents#418).
@@ -468,24 +502,21 @@ def implement_admission_clamp_warnings() -> list[str]:
     That is worth a line in the validation output and is deliberately NOT
     an error: mctl-gitops@main pins N="3" against width 1 today, and
     failing every mctl-agents PR on a value the runtime already handles
-    would block unrelated work on a cleanup. An absent or unreadable values
-    file yields no warning — `check_implement_admission_is_safe` is the
-    check that fails closed; this one only informs.
+    would block unrelated work on a cleanup. An absent values file yields
+    no warning (`check_implement_admission_is_safe` is the check that fails
+    closed on a missing checkout); a present one whose N cannot be read
+    yields a warning saying so rather than a silent pass, and never raises.
     """
     ceiling = temporal_constants.argo_admission_width()
-    if ceiling is None or not IMPLEMENT_WORKER_VALUES.is_file():
+    if ceiling is None:
         return []
-    try:
-        document = yaml.safe_load(IMPLEMENT_WORKER_VALUES.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError:
-        return []
-    env = document.get("env") if isinstance(document, dict) else None
-    raw = env.get(temporal_constants.IMPLEMENTATION_CAPACITY_ENV) if isinstance(env, dict) else None
-    try:
-        configured = int(str(raw))
-    except ValueError:
-        return []
-    if configured <= ceiling:
+    configured, problem = configured_implementation_capacity()
+    if problem is not None:
+        return [
+            f"{IMPLEMENT_WORKER_VALUES}: cannot read {temporal_constants.IMPLEMENTATION_CAPACITY_ENV}: "
+            f"{problem}; the implement admission clamp check verified nothing"
+        ]
+    if configured is None or configured <= ceiling:
         return []
     return [
         f"{IMPLEMENT_WORKER_VALUES}: {temporal_constants.IMPLEMENTATION_CAPACITY_ENV}={configured} "

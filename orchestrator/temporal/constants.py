@@ -92,7 +92,8 @@ IMPLEMENTATION_OPERATION = "mctl-agents-implement"
 # mctl-gitops PR that relocates the mutex (task 10 of #418) merges, at which
 # point admission is no longer bound by this lock at all: waiting on a
 # seconds-long commit step does not burn the implementer's two-hour budget.
-ARGO_IMPLEMENT_MUTEX_NAME = "mctl-agents-proposal-claims"
+# Spelled once, in implement_outcome (which cannot import this module).
+ARGO_IMPLEMENT_MUTEX_NAME = implement_outcome.ARGO_IMPLEMENT_MUTEX_NAME
 ARGO_IMPLEMENT_MUTEX_TEMPLATE = "run-implementer"
 ARGO_IMPLEMENT_MUTEX_WIDTH = 1
 
