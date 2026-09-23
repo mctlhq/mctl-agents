@@ -25,6 +25,15 @@ requires-python = ">=3.12,<3.13"
 # (plan phase 4). httpx: promoted from a transitive dep (already pulled in by
 # claude-agent-sdk/mcp) to a direct, deliberately-pinned one because
 # orchestrator/temporal/activities/* now import it directly to call mctl-api.
+#
+# opentelemetry-*: execution traces (mctl-agents#195, docs/observability/
+# execution-traces.md). The three packages temporalio's own `opentelemetry`
+# extra asks for (api + sdk, `>=1.11.1,<2`), plus the http/protobuf OTLP
+# exporter only — not the gRPC one: the platform Collector is reached over
+# http/protobuf on :4318 (mctl-agent#38 found gRPC-only failing silently),
+# and grpcio would be the heaviest wheel in the image. Everything is imported
+# lazily by orchestrator/tracing.py, so an unconfigured process never loads
+# the SDK at all.
 dependencies = [
     "claude-agent-sdk==0.2.136",
     "anyio==4.14.2",
@@ -32,6 +41,9 @@ dependencies = [
     "PyYAML==6.0.3",
     "temporalio==1.31.0",
     "httpx==0.28.1",
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
 ]
 
 [tool.uv]

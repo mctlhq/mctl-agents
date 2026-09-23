@@ -139,6 +139,7 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
+from orchestrator import tracing
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
@@ -1540,7 +1541,14 @@ def _run(
         # run_capturing, not subprocess.run: on check=True a plain
         # CalledProcessError reaches Temporal as "returned non-zero exit
         # status 1" with the captured stderr stranded on the exception.
-        return run_capturing(cmd, cwd=cwd, check=check, timeout=effective_timeout)
+        #
+        # command_span: a github.* / git.* span for GitHub reads, mutations,
+        # commits and pushes (mctl-agents#195) — operation and target only,
+        # never argv. Any other command gets no span.
+        with tracing.command_span(cmd) as traced:
+            result = run_capturing(cmd, cwd=cwd, check=check, timeout=effective_timeout)
+            traced.exited(getattr(result, "returncode", None))
+            return result
     except subprocess.TimeoutExpired as exc:
         # TimeoutExpired carries whatever the command printed before it hung.
         # Dropping it leaves an operator with "command exceeded 600s" and no
@@ -2275,13 +2283,19 @@ async def _run_implementer_agent(
 
     try:
         with anyio.fail_after(envelope_s):
-            async with ClaudeSDKClient(options=options) as client:
+            async with (
+                # Model/tool spans (mctl-agents#195): names, ids and usage
+                # counters only — see orchestrator/tracing.AgentRunObserver.
+                tracing.agent_run("implementer", getattr(options, "model", None)) as trace_run,
+                ClaudeSDKClient(options=options) as client,
+            ):
                 if mcp_configured:
                     # fatal=False — see orchestrator/mcp_guard.py. The
                     # implementer applies an already-written proposal via
                     # Read/Write/Edit/Bash; mctl tools are supplementary.
                     await ensure_mctl_connected(client, fatal=False)
                 await client.query(prompt)
+                trace_run.query_sent()
                 # receive_messages(), NOT receive_response(): the latter returns
                 # at the first ResultMessage, and a ResultMessage ends one TURN,
                 # not the RUN. The prompt asks the agent to delegate to the
@@ -2300,8 +2314,14 @@ async def _run_implementer_agent(
                     "AsyncGenerator[Any, None]", client.receive_messages()
                 )
                 async with aclosing(stream):
-                    async for message in stream:
+                    def _note(message: Any) -> None:
+                        # Trace first, so a terminal 429 frame is recorded
+                        # before _observe raises on it.
+                        trace_run.observe(message)
                         _observe(message)
+
+                    async for message in stream:
+                        _note(message)
                         ledger.observe(message)
                         # Also stop on stream exhaustion (the `async for` ending
                         # on its own): that means the CLI exited.
@@ -2317,7 +2337,7 @@ async def _run_implementer_agent(
                                 stream,
                                 ledger,
                                 timeout_s=IMPLEMENTER_DRAIN_TIMEOUT_SECONDS,
-                                on_message=_observe,
+                                on_message=_note,
                             )
                         except OrphanedSubagentError as exc:
                             raise ImplementerOrphanedSubagent(
@@ -4723,5 +4743,16 @@ def main() -> None:
         sys.exit(EXIT_BLOCKED_ONLY)
 
 
+def _traced_main() -> None:
+    """`main()` under the pod's root span (mctl-agents#195).
+
+    Parented on `TRACEPARENT` when the CWFT passes one, so this pod's spans
+    join the Temporal DevLoop trace that submitted it. Inert — not even an
+    SDK import — unless the standard `OTEL_*` endpoint variables are set."""
+    tracing.init_tracing("mctl-agents-implementer")
+    with tracing.pod_root_span("implementer.run", {tracing.AGENT_NAME: "implementer"}):
+        main()
+
+
 if __name__ == "__main__":
-    main()
+    _traced_main()

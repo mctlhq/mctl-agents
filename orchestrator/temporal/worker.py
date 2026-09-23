@@ -36,8 +36,9 @@ from temporalio.client import (
     ScheduleUpdateInput,
 )
 from temporalio.runtime import PrometheusConfig, Runtime, TelemetryConfig
-from temporalio.worker import Worker
+from temporalio.worker import Interceptor, Worker
 
+from orchestrator import tracing
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.deploy_state import (
     get_deploy_status,
@@ -73,6 +74,7 @@ from orchestrator.temporal.constants import (
     implement_sweep_max_submits,
     implementation_max_concurrent_activities,
 )
+from orchestrator.temporal.tracing import worker_interceptors
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.implement_sweep import (
     ImplementSweepWorkflow,
@@ -610,10 +612,18 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
     ]
 
 
-def build_worker(client: Client, plan: WorkerPlan) -> Worker:
+def build_worker(client: Client, plan: WorkerPlan, interceptors: list[Interceptor] | None = None) -> Worker:
     """Turn a plan into a Worker. Kept trivial on purpose — everything
-    worth testing lives in worker_plans()."""
+    worth testing lives in worker_plans().
+
+    `interceptors` are the execution-trace interceptors (mctl-agents#195,
+    orchestrator/temporal/tracing.py) — empty unless tracing is configured.
+    On the WORKER, not the client: the client also starts DevLoops from the
+    poller's activity, and a client-side interceptor would parent every
+    DevLoop it starts under that poll tick's trace."""
     kwargs: dict[str, Any] = {}
+    if interceptors:
+        kwargs["interceptors"] = interceptors
     if plan.max_concurrent_activities is not None:
         kwargs["max_concurrent_activities"] = plan.max_concurrent_activities
     if plan.max_concurrent_workflow_tasks is not None:
@@ -651,6 +661,11 @@ async def main() -> None:
     # `--role all` both workers share this client and therefore this
     # exporter, and separate by the task_queue label rather than by port.
     runtime = Runtime(telemetry=telemetry_config())
+    # Execution traces (mctl-agents#195): inert unless the standard OTEL_*
+    # endpoint variables are set on the Deployment, and never fatal.
+    tracing.init_tracing("mctl-agents-worker")
+    interceptors = worker_interceptors()
+    logger.info("execution tracing %s", "enabled" if interceptors else "off")
     logger.info("serving metrics on :%d/metrics", METRICS_PORT)
 
     logger.info("connecting to Temporal at %s (namespace=%s)", address, namespace)
@@ -661,7 +676,7 @@ async def main() -> None:
 
     visibility = VisibilityActivities(client)
     plans = worker_plans(args.role, visibility)
-    workers = [build_worker(client, plan) for plan in plans]
+    workers = [build_worker(client, plan, interceptors) for plan in plans]
 
     logger.info(
         "worker starting: role=%s task_queues=%s",
