@@ -1,4 +1,6 @@
-"""Typed client-side mirror of the mctl-api `WorkItem` contract (mctl-api#227).
+"""Typed client-side mirror of the mctl-api `WorkItem` contract (mctl-api#227),
+as mctl-api serves it: `workitem/v1` (docs/work-context-contract.md there,
+mctl-api#349; mirror corrected in mctlhq/mctl-agents#452).
 
 Frozen dataclasses, stdlib only, mirroring `orchestrator/lifecycle/contract.py`
 in structure and in discipline: `from_payload` staticmethods that ignore keys
@@ -24,26 +26,45 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 # --- closed vocabularies ----------------------------------------------------
 
-# The issue's diagram names `waiting` and `completed-with-followup`; mctl-api
-# may use different spellings (open question in requirements.md). A mismatch
-# fails closed — an unrecognised state classifies as WORK_ITEM_UNKNOWN — and
-# is a one-line correction here once #227 is readable.
+#: The only payload label this mirror reads. mctl-api ships a breaking change
+#: as a new label, never as a silent change to this one, so any other value —
+#: or none — is WORK_ITEM_UNKNOWN, never a best-effort parse.
+SCHEMA_VERSION = "workitem/v1"
+
 SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli"})
 ACTOR_KINDS = frozenset({"human", "agent", "system"})
-WORK_ITEM_STATES = frozenset({
-    "open", "in-progress", "waiting", "completed", "completed-with-followup", "abandoned",
-})
+# mctl-api's `workitems.State*` constants. `resumed` is deliberately absent:
+# mctl-api records it only as an event kind, never as a state.
+WORK_ITEM_STATES = frozenset({"active", "waiting", "completed", "superseded", "archived"})
 
 #: States a reconstructed canonical state may VETO a run on, at rollout mode
 #: `enforce` and above (never license one the issue path would refuse — see
-#: rollout.py's `new_answer_may_veto`).
-TERMINAL_WORK_ITEM_STATES = frozenset({"completed", "completed-with-followup", "abandoned"})
+#: rollout.py's `new_answer_may_veto`). Exactly mctl-api's terminal states:
+#: no transition leaves them (`workitems.IsTerminal`).
+TERMINAL_WORK_ITEM_STATES = frozenset({"completed", "superseded", "archived"})
+
+# mctl-api's execution engines (`workitems.Engine*`). The engine decides
+# what `engine_ref` means, so an unknown one refuses the entry. The phase
+# is not checked: nothing here reads it, and a new mctl-api phase must not
+# turn every read of a work item into UNKNOWN.
+EXECUTION_ENGINES = frozenset({"temporal", "argo"})
+
+# The error code mctl-api answers a missing (or invisible) work item with.
+# Only this 404 is ABSENT; any other 404 did not come from the work-items
+# handler.
+NOT_FOUND_CODE = "work_item_not_found"
+
+# `external_key` is a free dedupe key; the contract's own example is a GitHub
+# issue URL, and only a value of that shape is read as `issue_url`. The same
+# definition as `run_issue_investigator._ISSUE_URL_RE` (http(s), optional
+# trailing slash), so the two never disagree about what an issue URL is.
+_ISSUE_URL_RE = re.compile(r"^https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+/?$")
 
 # The four answers to "does this WorkItem exist, and is it usable" — the same
 # shape as orchestrator/lifecycle/contract.py's OWNED_BY_OTHER/OWNED_BY_ME/
@@ -190,11 +211,51 @@ class ExecutionRef:
             surface_transition=bool(data.get("surface_transition", False)),
         )
 
+    @staticmethod
+    def from_v1(data: Any, work_item_id: str) -> ExecutionRef | None:
+        """One entry of mctl-api's `GET /api/v1/work-items/{id}/executions`
+        listing (`workitems.Execution`): `id` -> `execution_id`, `attempt`
+        -> `sequence`, and `engine_ref` -> `temporal_workflow_id` for a
+        Temporal execution. `from_payload` stays the dev-loop's own local
+        shape (workflow history and the `resume` signal).
+
+        None on anything that does not describe an execution of THIS work
+        item: a missing id, a non-positive attempt, another work item's id,
+        or an engine outside mctl-api's closed vocabulary."""
+        if not isinstance(data, dict):
+            return None
+        execution_id = data.get("id")
+        if not isinstance(execution_id, str) or not execution_id:
+            return None
+        if data.get("work_item_id") != work_item_id:
+            return None
+        attempt = data.get("attempt")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            return None
+        engine = data.get("engine")
+        if engine not in EXECUTION_ENGINES:
+            return None
+        return ExecutionRef(
+            execution_id=execution_id,
+            sequence=attempt,
+            temporal_workflow_id=_str(data.get("engine_ref")) if engine == "temporal" else "",
+            started_at=_str(data.get("started_at")),
+        )
+
 
 @dataclass(frozen=True)
 class WorkItem:
-    """The canonical durable task, as mctl-api#227 answers it. `state` is
-    closed vocabulary (`WORK_ITEM_STATES`)."""
+    """The canonical durable task. `state` is closed vocabulary
+    (`WORK_ITEM_STATES`).
+
+    `from_payload` reads mctl-api's `work_item` object (`workitems.WorkItem`):
+    `id` -> `work_item_id`, `state_version` -> `state_version` and, as a
+    string, `revision`; `origin_surface` -> `origin.kind`; `external_key` ->
+    `issue_url` only when it is a GitHub issue URL. `executions` is not part
+    of that object: the client fills it from the executions route.
+    `service` and `slug` are not part of `workitem/v1` and stay empty for a
+    record read from mctl-api.
+    """
 
     work_item_id: str = ""
     revision: str = ""
@@ -204,49 +265,42 @@ class WorkItem:
     issue_url: str = ""
     service: str = ""
     slug: str = ""
+    state_version: int = 0
+    schema_version: str = ""
+    external_key: str = ""
 
     @staticmethod
     def from_payload(data: Any) -> WorkItem | None:
         if not isinstance(data, dict):
             return None
-        work_item_id = data.get("work_item_id")
+        work_item_id = data.get("id")
         state = data.get("state")
-        # A record with no work_item_id or state is not a record — every real
-        # response carries both, and this is the cheapest way to tell a
-        # WorkItem payload from an error envelope that happened to be 200
-        # (mirroring Ownership.from_payload's phase/owner/state check).
+        state_version = data.get("state_version")
+        # A record with no id, state or state_version is not a record —
+        # every real response carries all three, and this is the cheapest
+        # way to tell a WorkItem from an error envelope that happened to be
+        # 200 (mirroring Ownership.from_payload's phase/owner/state check).
         if not isinstance(work_item_id, str) or not work_item_id:
             return None
         if not isinstance(state, str) or not state:
             return None
-
-        origin_raw = data.get("origin")
-        origin = SurfaceRef.from_payload(origin_raw) if origin_raw is not None else SurfaceRef()
-        if origin_raw is not None and origin is None:
+        if not isinstance(state_version, int) or isinstance(state_version, bool) or state_version < 1:
             return None
-
-        executions_raw = data.get("executions", [])
-        if not isinstance(executions_raw, list):
+        origin_surface = data.get("origin_surface")
+        if origin_surface is None:
+            origin_surface = ""  # absent or null: no origin recorded
+        elif not isinstance(origin_surface, str):
             return None
-        executions: list[ExecutionRef] = []
-        for raw in executions_raw:
-            parsed = ExecutionRef.from_payload(raw)
-            if parsed is None:
-                # One malformed execution record makes the whole list
-                # untrustworthy — silently dropping it would understate
-                # prior_execution_ids, which resume's idempotency depends on.
-                return None
-            executions.append(parsed)
-
+        external_key = _str(data.get("external_key"))
         return WorkItem(
             work_item_id=work_item_id,
-            revision=_str(data.get("revision")),
+            revision=str(state_version),
             state=state,
-            origin=origin or SurfaceRef(),
-            executions=tuple(executions),
-            issue_url=_str(data.get("issue_url")),
-            service=_str(data.get("service")),
-            slug=_str(data.get("slug")),
+            origin=SurfaceRef(kind=origin_surface),
+            issue_url=external_key if _ISSUE_URL_RE.match(external_key) else "",
+            state_version=state_version,
+            schema_version=_str(data.get("schema_version")),
+            external_key=external_key,
         )
 
 
@@ -317,20 +371,81 @@ class WorkItemAnswer:
     accepted: bool = False
 
 
-def record_of(payload: dict[str, Any]) -> WorkItem | None:
-    """The `WorkItem` in a response body, top level or nested under
-    `work_item` — mirroring `orchestrator/lifecycle/contract.py`'s
-    `record_of`, which unwraps both the single-record and the enveloped
-    shape with the same function."""
+def envelope_of(payload: Any) -> tuple[WorkItem | None, str]:
+    """The `WorkItem` in a `workitem/v1` view — `{schema_version,
+    work_item, state_version, latest_execution}` — or None and the reason
+    it is not one.
+
+    Fail closed on every disagreement: a missing or other `schema_version`
+    (on the envelope or the item), a missing item, or an envelope
+    `state_version` that is not the item's own."""
     if not isinstance(payload, dict):
-        return None
-    item = WorkItem.from_payload(payload)
-    if item is not None:
-        return item
-    nested = payload.get("work_item")
-    if isinstance(nested, dict):
-        return WorkItem.from_payload(nested)
-    return None
+        return None, "response is not a JSON object"
+    schema = payload.get("schema_version")
+    if schema != SCHEMA_VERSION:
+        return None, f"unsupported schema_version {schema!r}, want {SCHEMA_VERSION!r}"
+    item = WorkItem.from_payload(payload.get("work_item"))
+    if item is None:
+        return None, "no work item record in the response"
+    if item.schema_version != SCHEMA_VERSION:
+        return None, f"work item carries schema_version {item.schema_version!r}, want {SCHEMA_VERSION!r}"
+    envelope_version = payload.get("state_version")
+    if type(envelope_version) is not int or envelope_version != item.state_version:
+        return None, (
+            f"envelope state_version {payload.get('state_version')!r} is not the "
+            f"work item's {item.state_version!r}"
+        )
+    return item, ""
+
+
+def record_of(payload: Any) -> WorkItem | None:
+    """The `WorkItem` in a response body, or None — `envelope_of` without
+    the reason."""
+    return envelope_of(payload)[0]
+
+
+def latest_execution_id_of(payload: Any) -> str:
+    """The id of the view's `latest_execution`, or "" when it names none."""
+    latest = payload.get("latest_execution") if isinstance(payload, dict) else None
+    return _str(latest.get("id")) if isinstance(latest, dict) else ""
+
+
+def executions_from(status: int, payload: Any, work_item_id: str) -> tuple[tuple[ExecutionRef, ...] | None, str]:
+    """Parse one `GET /api/v1/work-items/{id}/executions` response into the
+    work item's executions, oldest attempt first, or None and why not.
+
+    All or nothing: one malformed entry, another item's execution, or a
+    repeated id or attempt makes the whole ledger untrustworthy — silently
+    dropping an entry would understate prior_execution_ids, which resume's
+    idempotency depends on."""
+    if not 200 <= status < 300:
+        return None, f"executions: {_error_of(status, payload)}"
+    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+        schema = payload.get("schema_version") if isinstance(payload, dict) else None
+        return None, f"executions: unsupported schema_version {schema!r}, want {SCHEMA_VERSION!r}"
+    raw = payload.get("executions")
+    if not isinstance(raw, list):
+        return None, "executions: no executions list in the response"
+    parsed: list[ExecutionRef] = []
+    for entry in raw:
+        execution = ExecutionRef.from_v1(entry, work_item_id)
+        if execution is None:
+            return None, f"executions: malformed or foreign execution record for {work_item_id!r}"
+        parsed.append(execution)
+    if len({e.execution_id for e in parsed}) != len(parsed):
+        return None, "executions: repeated execution id"
+    ordered = tuple(sorted(parsed, key=lambda e: e.sequence))
+    # mctl-api numbers attempts 1..n with no gaps (`len(execs)+1` on every
+    # attach) and lists them all, unpaginated. Anything else — a repeat, a
+    # gap, a truncated or paginated listing — is not the whole ledger.
+    if [e.sequence for e in ordered] != list(range(1, len(ordered) + 1)):
+        return None, "executions: attempts are not exactly 1..n; the ledger is incomplete or repeated"
+    return ordered, ""
+
+
+def with_executions(item: WorkItem, executions: tuple[ExecutionRef, ...]) -> WorkItem:
+    """`item` with the executions read from the executions route."""
+    return replace(item, executions=executions)
 
 
 def _error_of(status: int, payload: Any) -> str:
@@ -345,11 +460,11 @@ def answer_from(status: int, payload: dict[str, Any], *, path: str = "", body_em
     transport (an async activity, should one ever exist) must not carry its
     own copy of what an HTTP response means."""
     if 200 <= status < 300:
-        item = record_of(payload)
+        item, why = envelope_of(payload)
         if item is None:
             return WorkItemAnswer(
                 verdict=WORK_ITEM_UNKNOWN,
-                reason=f"no work item record in a {status} response",
+                reason=f"{why} ({status} response)",
                 accepted=not body_empty,
             )
         verdict = work_item_verdict_for(item)
@@ -365,13 +480,15 @@ def answer_from(status: int, payload: dict[str, Any], *, path: str = "", body_em
             return WorkItemAnswer(
                 verdict=WORK_ITEM_UNKNOWN, reason=f"404 with a non-mapping payload from {path or 'a read'}"
             )
-        if not isinstance(payload.get("error"), str) or not payload["error"]:
-            # A 404 with no error envelope did not come from mctl-api — see
-            # the identical guard in orchestrator/lifecycle/contract.py.
-            # Answering ABSENT would report every unreachable route as "no
-            # such work item".
+        if payload.get("code") != NOT_FOUND_CODE:
+            # Only the work-items handler's own typed 404 means "no such
+            # work item" — see the identical guard in
+            # orchestrator/lifecycle/contract.py. Answering ABSENT for any
+            # other 404 would report a wrong route or an ingress rule as a
+            # clean absence.
             return WorkItemAnswer(
-                verdict=WORK_ITEM_UNKNOWN, reason=f"404 with no error envelope from {path or 'a read'}"
+                verdict=WORK_ITEM_UNKNOWN,
+                reason=f"404 without code {NOT_FOUND_CODE!r} from {path or 'a read'}",
             )
         return WorkItemAnswer(verdict=WORK_ITEM_ABSENT, reason="no record")
     if status == 409:

@@ -39,6 +39,18 @@ A new package, structurally identical to `orchestrator/lifecycle/`
 `WORK_CONTEXT_ROLLOUT_MODE`, defaulting to `off`). mctl-api owns the durable
 `WorkItem` row; this package owns no state.
 
+Wire shape (amended by #452): the mirror reads mctl-api's `workitem/v1`
+exactly as served — the `{schema_version, work_item, state_version,
+latest_execution}` view, the states `active | waiting | completed |
+superseded | archived` (terminal: the last three), and the execution ledger
+from `GET /api/v1/work-items/{id}/executions`, read all or nothing. Any other
+`schema_version`, state or vocabulary value is `WORK_ITEM_UNKNOWN`. The test
+fixtures under `tests/fixtures/workitem/` are captured from mctl-api's own
+handlers. The ledger read relies on two mctl-api properties: attempts are
+dense `1..n`, and the executions route is unpaginated. If mctl-api changes
+either one, every read of an item with executions turns `WORK_ITEM_UNKNOWN`
+until this mirror follows.
+
 ### 2. `WorkContextRef` on `ContextSnapshot` — sibling correlation, not chaining
 
 A new frozen dataclass in `orchestrator/context_snapshot.py`:
