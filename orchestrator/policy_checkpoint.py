@@ -205,6 +205,11 @@ BUILTIN_POLICY = Policy(
         # Sealing this execution's context snapshot (mctlhq/mctl-agents#431):
         # insert-only on the store side, so it can never overwrite anything.
         Rule("mctl-seal-context-snapshot", MCTL_WORK_ITEM_WRITE, "seal:context-snapshot", ALLOW),
+        # Attaching this run's own engine run to its work item, or advancing
+        # that execution's phase (mctlhq/mctl-agents#455). The store keys it
+        # by (engine, engine_ref), so the run can only name its own; it
+        # never creates a work item, resumes one or changes its state.
+        Rule("mctl-attach-own-execution", MCTL_WORK_ITEM_WRITE, "attach:work-item-execution", ALLOW),
         *(
             Rule("mctl-mcp-read", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True)
             for pattern in (*_mctl_tool_patterns(_READ_VERBS, prefix=True),

@@ -1852,18 +1852,30 @@ def _canonical_issue_key(url: str) -> str:
 
 
 def _prior_execution_ids(
-    canonical: Any, *, execution_id: str, resume_from_execution_id: str | None
+    canonical: Any,
+    item: Any,
+    *,
+    execution_id: str,
+    execution_sequence: int,
+    resume_from_execution_id: str | None,
 ) -> tuple[str, ...]:
-    """The prior-execution list BOTH a derived --execution-id and the sealed
-    `execution_sequence` are computed from — one function so the sequence the
-    id encodes can never skew from the sequence the snapshot seals (they
-    disagreed when --resume-from-execution-id named an execution the store
-    had not recorded)."""
-    # The store may already have recorded THIS execution (the dev_loop seeds
-    # execution #1 before the investigator runs) — a prior list containing
-    # ourselves would claim one sequence too many.
-    prior_ids = tuple(pid for pid in canonical.prior_execution_ids if pid != execution_id)
-    if resume_from_execution_id and resume_from_execution_id not in prior_ids:
+    """The executions before this one: the store's ledger entries with a
+    lower attempt than this execution's own, oldest first, plus a
+    `--resume-from-execution-id` the store has not recorded.
+
+    `execution_id` is the store's own id (mctlhq/mctl-agents#455), so the
+    self-exclusion really drops this execution's ledger row on a retry, and
+    an execution recorded after this one (a retry of an older execution) is
+    never counted as its prior."""
+    not_prior = {execution_id} | {
+        e.execution_id for e in item.executions if e.sequence >= execution_sequence
+    }
+    prior_ids = tuple(pid for pid in canonical.prior_execution_ids if pid not in not_prior)
+    if (
+        resume_from_execution_id
+        and resume_from_execution_id not in prior_ids
+        and resume_from_execution_id not in not_prior
+    ):
         prior_ids = (*prior_ids, resume_from_execution_id)
     return prior_ids
 
@@ -1873,6 +1885,7 @@ def _work_context_ref(
     canonical: Any,
     item: Any,
     execution_id: str,
+    execution_sequence: int,
     resume_from_execution_id: str | None,
     surface: str | None,
     actor_kind: str | None,
@@ -1881,30 +1894,39 @@ def _work_context_ref(
     """Fold the resolved WorkItem and the caller's provenance flags into the
     `work_context` block a sealed ContextSnapshot carries (mctlhq/
     mctl-agents#267). `canonical` is a `CanonicalState`, `item` a
-    `WorkItem` — typed as Any only to keep this module's lazy-import
-    discipline for the work_context package (see investigate())."""
+    `WorkItem` whose ledger contains this execution — typed as Any only to
+    keep this module's lazy-import discipline for the work_context package
+    (see investigate()).
+
+    `execution_id` and `execution_sequence` are the store execution's id and
+    attempt (mctlhq/mctl-agents#455): the sequence is the store's, never a
+    count made here, so it is the one mctl-api validates the seal against."""
     prior_ids = _prior_execution_ids(
-        canonical, execution_id=execution_id, resume_from_execution_id=resume_from_execution_id
+        canonical,
+        item,
+        execution_id=execution_id,
+        execution_sequence=execution_sequence,
+        resume_from_execution_id=resume_from_execution_id,
     )
-    # The sequence counts every prior execution; the sealed prior list is
-    # then clamped to the newest MAX_PRIOR_EXECUTION_IDS entries, so a
-    # work item with more recorded executions than the ADR 009 ceiling
-    # still seals instead of failing validate() in seal().
-    execution_sequence = len(prior_ids) + 1
+    # The sealed prior list is clamped to the newest MAX_PRIOR_EXECUTION_IDS
+    # entries, so a work item with more recorded executions than the ADR 009
+    # ceiling still seals instead of failing validate() in seal().
     if len(prior_ids) > MAX_PRIOR_EXECUTION_IDS:
         prior_ids = prior_ids[-MAX_PRIOR_EXECUTION_IDS:]
     # `surface_transition` matches ExecutionRef's definition — did THIS
     # execution change the surface or actor relative to the one before it —
     # so the baseline is the newest PRIOR execution with a known kind
-    # (never this execution itself, which the store may already have
-    # recorded — the same self-exclusion `_prior_execution_ids` makes; and
-    # never a kindless seed, which carries no provenance to compare
-    # against), falling back to the work item's origin. Only comparisons
-    # where both sides are known can claim a change: unlike the dev_loop
-    # signal, an undeclared side here is an optional CLI flag, not a
-    # rejected resume.
+    # (never this execution itself, nor one recorded after it — the same
+    # exclusion `_prior_execution_ids` makes; and never a kindless seed,
+    # which carries no provenance to compare against), falling back to the
+    # work item's origin. Only comparisons where both sides are known can
+    # claim a change: unlike the dev_loop signal, an undeclared side here is
+    # an optional CLI flag, not a rejected resume.
     priors_newest_first = sorted(
-        (e for e in item.executions if e.execution_id and e.execution_id != execution_id),
+        (
+            e for e in item.executions
+            if e.execution_id and e.execution_id != execution_id and e.sequence < execution_sequence
+        ),
         key=lambda e: e.sequence,
         reverse=True,
     )
@@ -1938,6 +1960,143 @@ def _work_context_ref(
     )
 
 
+def _resolve_work_context_ref(
+    *,
+    client: Any,
+    canonical: Any,
+    item: Any,
+    execution_id: str | None,
+    resume_from_execution_id: str | None,
+    surface: str | None,
+    actor_kind: str | None,
+    actor_id: str | None,
+    dry_run: bool,
+    own_execution: _OwnExecution,
+) -> tuple[WorkContextRef | None, str]:
+    """This run's `WorkContextRef`, whose execution identity is the store's
+    (mctlhq/mctl-agents#455, owner decision B on #431) — or None and, when
+    the rollout says the run must stop, the refusal.
+
+    - A `we_...` --execution-id came from the work-item layer (e.g. the
+      resume route created it). It must be in this item's ledger, and it is
+      used as-is: nothing is attached, and its owner advances its phase.
+    - Otherwise the run attaches its own engine run (`MCTL_ENGINE_REF`, else
+      the Argo `WORKFLOW_NAME`) as Running, through the policy checkpoint.
+      A retried step of the same workflow gets the same `we_...` back; a new
+      investigation is a new workflow and gets a new one.
+    - Any other --execution-id (e.g. the dev_loop's seed hash) is kept as
+      correlation in the log and is never the identity.
+    - No engine ref: no identity, and none is invented locally.
+
+    Without an identity there is no work context at all: `WorkContextRef`
+    cannot carry an empty execution id, and a snapshot sealed under a local
+    one would claim an identity the store never issued. So the run proceeds
+    without work context at `observe` (nothing is persisted, and the log
+    says why), and stops from `enforce` up — a definite refusal (a foreign
+    `we_...`, no engine ref, a policy DENY, an ended execution) where the new
+    answer may veto, an unanswered one (store down, another execution
+    active, a ledger that moved) where `blocks_on_unknown()` holds. A
+    dry-run attaches nothing and so carries no work context."""
+    from orchestrator.work_context import rollout as _work_context_rollout
+    from orchestrator.work_context.executions import resolve_identity
+    from orchestrator.work_context.snapshots import is_store_execution
+
+    if dry_run and not is_store_execution(execution_id):
+        print("info: work_context dry-run: no execution attached, no work context")
+        return None, ""
+    identity = resolve_identity(item, execution_id, client)
+    if identity.attached is not None:
+        own_execution.hold(client, item.work_item_id, identity.attached)
+    if identity.note:
+        print(f"info: work_context {identity.note}")
+    if identity.execution_id and identity.item is not None:
+        print(
+            f"info: work_context execution_id={identity.execution_id} "
+            f"execution_sequence={identity.sequence}"
+            + (
+                f" engine_ref={identity.attached.engine}/{identity.attached.engine_ref}"
+                if identity.attached is not None else " (from --execution-id)"
+            )
+        )
+        return _work_context_ref(
+            canonical=canonical,
+            item=identity.item,
+            execution_id=identity.execution_id,
+            execution_sequence=identity.sequence,
+            resume_from_execution_id=resume_from_execution_id,
+            surface=surface,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+        ), ""
+    reason = f"work item {item.work_item_id}: {identity.refusal}"
+    blocks = (
+        _work_context_rollout.blocks_on_unknown()
+        if identity.unknown
+        else _work_context_rollout.new_answer_may_veto()
+    )
+    if blocks:
+        print(f"warn: {reason}")
+        return None, reason
+    print(
+        f"warn: {reason} ({_work_context_rollout.mode()} mode — proceeding without work context; "
+        "no snapshot is persisted)"
+    )
+    return None, ""
+
+
+class _OwnExecution:
+    """The store execution this run attached for its own engine run
+    (mctlhq/mctl-agents#455), and the one obligation that comes with it:
+    advancing it to a terminal phase when the run ends.
+
+    Unset unless this run attached one — at rollout `off`, with a `we_...`
+    --execution-id from the work-item layer (whose owner advances it), or
+    with no engine ref, there is nothing to finish."""
+
+    def __init__(self) -> None:
+        self.client: Any = None
+        self.work_item_id = ""
+        self.run: Any = None
+
+    def hold(self, client: Any, work_item_id: str, run: Any) -> None:
+        self.client, self.work_item_id, self.run = client, work_item_id, run
+
+    def finish(self, result: InvestigateResult | None) -> None:
+        """Advance the execution to Succeeded or Failed. Best effort: a
+        refusal or an unreachable store is logged and never changes the
+        investigation's own result.
+
+        A failure the engine will retry under the same engine run (the
+        investigate CWFT's fallback step, `MCTL_ENGINE_FINAL_ATTEMPT=false`)
+        leaves the execution Running: the store never reopens an ended
+        execution, so marking it Failed would refuse the retry its own id."""
+        if self.run is None:
+            return
+        from orchestrator.work_context import executions as _executions
+
+        succeeded = result is not None and result.error is None and result.skipped_reason is None
+        where = f"{self.run.engine}/{self.run.engine_ref} of {self.work_item_id}"
+        if not succeeded and not _executions.final_attempt():
+            print(
+                f"info: work_context execution {where} left {_executions.PHASE_RUNNING}: "
+                f"{_executions.FINAL_ATTEMPT_ENV_VAR}=false, the engine retries this run"
+            )
+            return
+        phase = _executions.PHASE_SUCCEEDED if succeeded else _executions.PHASE_FAILED
+        try:
+            answer = self.client.attach_execution(self.work_item_id, self.run, phase)
+        except Exception as exc:  # noqa: BLE001 — best effort, never the run's outcome
+            print(f"warn: work_context could not advance execution {where} to {phase}: {type(exc).__name__}: {exc}")
+            return
+        if answer.usable:
+            print(f"info: work_context execution {answer.execution_id} ({where}) -> {phase}")
+        else:
+            print(
+                f"warn: work_context could not advance execution {where} to {phase}: "
+                f"{answer.verdict} {answer.reason}".rstrip()
+            )
+
+
 def investigate(
     issue_url: str,
     state_dir: Path = DEFAULT_STATE_DIR,
@@ -1951,6 +2110,48 @@ def investigate(
     actor_id: str | None = None,
     requested_by: str | None = None,
     requested_comment_url: str | None = None,
+) -> InvestigateResult:
+    """Investigate one GitHub issue and write a `proposed` proposal.
+
+    See `_investigate` for the work. This wrapper owns one thing: when the
+    run attached its own store execution (mctlhq/mctl-agents#455), that
+    execution is advanced to its terminal phase however the run ends."""
+    own_execution = _OwnExecution()
+    result: InvestigateResult | None = None
+    try:
+        result = _investigate(
+            issue_url,
+            state_dir,
+            dry_run,
+            work_item_id=work_item_id,
+            execution_id=execution_id,
+            resume_from_execution_id=resume_from_execution_id,
+            surface=surface,
+            actor_kind=actor_kind,
+            actor_id=actor_id,
+            requested_by=requested_by,
+            requested_comment_url=requested_comment_url,
+            own_execution=own_execution,
+        )
+        return result
+    finally:
+        own_execution.finish(result)
+
+
+def _investigate(
+    issue_url: str,
+    state_dir: Path = DEFAULT_STATE_DIR,
+    dry_run: bool = False,
+    *,
+    work_item_id: str | None = None,
+    execution_id: str | None = None,
+    resume_from_execution_id: str | None = None,
+    surface: str | None = None,
+    actor_kind: str | None = None,
+    actor_id: str | None = None,
+    requested_by: str | None = None,
+    requested_comment_url: str | None = None,
+    own_execution: _OwnExecution,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
 
@@ -2042,7 +2243,8 @@ def investigate(
         if _work_context_rollout.computes_new_answer():
             from orchestrator.work_context.client import WorkItemClient
 
-            answer = WorkItemClient().get(work_item_id)
+            client = WorkItemClient()
+            answer = client.get(work_item_id)
             if answer.verdict == WORK_ITEM_FOUND and answer.item is not None:
                 resolved: CanonicalState = reconstruct_canonical_state(answer.item, proposal_dir, ())
                 canonical: CanonicalState | None = resolved
@@ -2078,44 +2280,12 @@ def investigate(
                     work_context_ref = None
                     canonical = None
                 if canonical is not None:
-                    # An omitted --execution-id derives deterministically from
-                    # the work item and the store's recorded executions,
-                    # exactly as the flag's help text promises — with a fixed
-                    # "cli" attempt salt so a re-run of the identical
-                    # invocation derives the SAME id (a retry, not a fork; see
-                    # execution_id_for's own docstring). Derived from the same
-                    # prior list `_work_context_ref` seals the sequence from,
-                    # so the sequence the id encodes cannot skew from the
-                    # sealed one.
-                    if not execution_id:
-                        from orchestrator.work_context.contract import execution_id_for
-
-                        execution_id = execution_id_for(
-                            canonical.work_item_id,
-                            len(
-                                _prior_execution_ids(
-                                    canonical,
-                                    execution_id="",
-                                    resume_from_execution_id=resume_from_execution_id,
-                                )
-                            )
-                            + 1,
-                            "cli",
-                        )
-                    work_context_ref = _work_context_ref(
-                        canonical=canonical,
-                        item=answer.item,
-                        execution_id=execution_id,
-                        resume_from_execution_id=resume_from_execution_id,
-                        surface=surface,
-                        actor_kind=actor_kind,
-                        actor_id=actor_id,
-                    )
                     # `enforce`/`only`: the reconstructed state may VETO this
                     # run (a work item already in a terminal state) but never
                     # LICENSE one the issue path would have refused on its own
                     # — requirements.md's "Rollout staging" acceptance
-                    # criteria.
+                    # criteria. Checked before any execution is attached, so
+                    # a vetoed run writes nothing.
                     if (
                         _work_context_rollout.new_answer_may_veto()
                         and canonical.state in TERMINAL_WORK_ITEM_STATES
@@ -2126,6 +2296,20 @@ def investigate(
                         )
                         print(f"warn: {reason}")
                         return InvestigateResult(service, slug, proposal_dir, skipped_reason=reason)
+                    work_context_ref, refusal = _resolve_work_context_ref(
+                        client=client,
+                        canonical=canonical,
+                        item=answer.item,
+                        execution_id=execution_id,
+                        resume_from_execution_id=resume_from_execution_id,
+                        surface=surface,
+                        actor_kind=actor_kind,
+                        actor_id=actor_id,
+                        dry_run=dry_run,
+                        own_execution=own_execution,
+                    )
+                    if refusal:
+                        return InvestigateResult(service, slug, proposal_dir, skipped_reason=refusal)
             elif _work_context_rollout.blocks_on_unknown():
                 reason = f"work item {work_item_id!r} could not be resolved: {answer.reason}"
                 print(f"warn: {reason}")
@@ -2825,10 +3009,11 @@ def main() -> None:
     ap.add_argument(
         "--execution-id", default=None,
         help=(
-            "This execution's own id; when omitted it is derived "
-            "deterministically from the work item and its recorded "
-            "executions (execution_id_for, attempt salt 'cli'), so an "
-            "identical re-run derives the same id"
+            "A store execution id (we_...) the work-item layer already created "
+            "for this run; it must be in the work item's ledger. When omitted, "
+            "the run attaches its own engine run (MCTL_ENGINE_REF, else the Argo "
+            "WORKFLOW_NAME) and uses the id the store returns. Any other value "
+            "is logged as correlation only, never used as the identity"
         ),
     )
     ap.add_argument(

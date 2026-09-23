@@ -3862,6 +3862,7 @@ def test_work_context_ref_folds_flags_and_canonical_state():
         canonical=canonical,
         item=item,
         execution_id="e2",
+        execution_sequence=2,
         resume_from_execution_id="e1",
         surface="telegram",
         actor_kind="human",
@@ -3884,6 +3885,7 @@ def test_work_context_ref_folds_flags_and_canonical_state():
         canonical=CanonicalState(work_item_id="wi-1", state="new"),
         item=item,
         execution_id="e1",
+        execution_sequence=1,
         resume_from_execution_id=None,
         surface=None,
         actor_kind=None,
@@ -3961,22 +3963,44 @@ def test_enforce_mode_blocks_on_an_unknown_answer(tmp_path, monkeypatch):
     assert "could not be resolved" in result.skipped_reason
 
 
+def _stub_attach(monkeypatch, execution_id, *, attempt):
+    """Answer every attach with `execution_id` at `attempt`, as the store
+    would for this run's own engine run (#455), and keep the snapshot
+    persistence those ids enable away from the network."""
+    from orchestrator.work_context import executions as ex
+
+    monkeypatch.setenv(ex.WORKFLOW_NAME_ENV_VAR, "mctl-agents-investigate-test")
+    monkeypatch.delenv(ex.ENGINE_REF_ENV_VAR, raising=False)
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "orchestrator.work_context.client.WorkItemClient.attach_execution",
+        lambda self, work_item_id, run, phase: ex.ExecutionAnswer(
+            ex.EXECUTION_ATTACHED if phase == ex.PHASE_RUNNING else ex.EXECUTION_EXISTING,
+            execution_id=execution_id, attempt=attempt, phase=phase,
+        ),
+    )
+
+
 def test_seal_side_wiring_carries_work_context_end_to_end(tmp_path, monkeypatch):
     """#408 round 2 (claude P3): drive investigate() with dry_run=False and
     assert the work-context block actually reaches the assembly entry point
-    — including the deterministic --execution-id derivation the help text
-    promises. The assemble→seal half of the join is pinned in
-    test_context_assembly.py::test_assemble_threads_work_context_into_the_sealed_snapshot."""
+    — including the execution identity the help text promises. The
+    assemble→seal half of the join is pinned in
+    test_context_assembly.py::test_assemble_threads_work_context_into_the_sealed_snapshot.
+
+    #455: the execution identity is the store's, attached for this run's
+    engine run (tests/test_work_context_execution_identity.py covers it
+    against a fake store)."""
     from orchestrator.work_context.contract import (
         WORK_ITEM_FOUND,
         ExecutionRef,
         WorkItem,
         WorkItemAnswer,
-        execution_id_for,
     )
 
     monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
     monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_MODE", "shadow")
+    _stub_attach(monkeypatch, "we_e2e", attempt=2)
 
     item = WorkItem(
         work_item_id="wi-1",
@@ -4036,8 +4060,8 @@ def test_seal_side_wiring_carries_work_context_end_to_end(tmp_path, monkeypatch)
     assert wc.current_surface == "telegram"
     assert wc.actor_kind == "human"
     assert wc.actor_id == "carol"
-    # The derived id is exactly what the help text promises.
-    assert wc.execution_id == execution_id_for("wi-1", 2, "cli")
+    # The store's id for this engine run, as the help text promises.
+    assert wc.execution_id == "we_e2e"
 
 
 def test_mismatched_work_item_warns_at_observe_and_refuses_at_enforce(tmp_path, monkeypatch, capsys):
@@ -4094,21 +4118,21 @@ def test_mismatched_work_item_warns_at_observe_and_refuses_at_enforce(tmp_path, 
     assert "work-item mismatch" in result.skipped_reason
 
 
-def test_derived_execution_id_matches_the_sealed_sequence(tmp_path, monkeypatch):
-    """#408 round 3 (claude P3): when --resume-from-execution-id names an
-    execution the store has not recorded, the derived --execution-id and the
-    sealed execution_sequence must be computed from the SAME prior list —
-    an id that does not match its own sealed sequence is not reproducible
-    from the document."""
+def test_the_sealed_sequence_is_the_store_attempt_not_a_prior_count(tmp_path, monkeypatch):
+    """#408 round 3 kept a derived id and the sealed sequence on one prior
+    list. #455 removed the derived id: the sequence is the store's attempt
+    for this execution, so a --resume-from-execution-id the store has not
+    recorded is carried as a prior but does not move the sequence (the one
+    mctl-api validates a seal against)."""
     from orchestrator.work_context.contract import (
         WORK_ITEM_FOUND,
         ExecutionRef,
         WorkItem,
         WorkItemAnswer,
-        execution_id_for,
     )
 
     monkeypatch.setenv(_work_context_rollout.ENV_VAR, _work_context_rollout.OBSERVE)
+    _stub_attach(monkeypatch, "we_skew", attempt=2)
     item = WorkItem(
         work_item_id="wi-1",
         revision="r7",
@@ -4149,8 +4173,8 @@ def test_derived_execution_id_matches_the_sealed_sequence(tmp_path, monkeypatch)
     assert result.error is None
     ref = captured["ref"]
     assert ref.prior_execution_ids == ("e1", "e-unrecorded")
-    assert ref.execution_sequence == 3
-    assert ref.execution_id == execution_id_for("wi-1", 3, "cli")
+    assert ref.execution_sequence == 2
+    assert ref.execution_id == "we_skew"
 
 
 def test_surface_transition_baselines_on_the_last_execution_not_origin():
@@ -4186,7 +4210,7 @@ def test_surface_transition_baselines_on_the_last_execution_not_origin():
 
     def ref(**kwargs):
         return run_issue_investigator._work_context_ref(
-            canonical=canonical, item=item, execution_id="e3",
+            canonical=canonical, item=item, execution_id="e3", execution_sequence=3,
             resume_from_execution_id=None, **kwargs,
         )
 
@@ -4217,6 +4241,8 @@ def test_prior_ids_clamp_to_the_ceiling_but_the_sequence_counts_all():
         canonical=canonical,
         item=WorkItem(work_item_id="wi-1", revision="r7"),
         execution_id="e-current",
+        # The store's attempt: the sequence is never a count made here.
+        execution_sequence=MAX_PRIOR_EXECUTION_IDS + 2,
         resume_from_execution_id=None,
         surface=None,
         actor_kind=None,
@@ -4312,8 +4338,10 @@ def test_surface_transition_baseline_excludes_self_and_kindless_executions():
     canonical = CanonicalState(work_item_id="wi-1", state="in-progress")
 
     def ref(item, execution_id="e-cur", *, surface=None, actor_kind=None, actor_id=None):
+        own = next((e.sequence for e in item.executions if e.execution_id == execution_id), None)
         return run_issue_investigator._work_context_ref(
             canonical=canonical, item=item, execution_id=execution_id,
+            execution_sequence=own or len(item.executions) + 1,
             resume_from_execution_id=None, surface=surface,
             actor_kind=actor_kind, actor_id=actor_id,
         )
@@ -4384,6 +4412,7 @@ def test_store_supplied_revision_is_clamped_not_a_seal_trap():
         canonical=CanonicalState(work_item_id="wi-1", state="open"),
         item=WorkItem(work_item_id="wi-1", revision="r" * (MAX_WORK_CONTEXT_ID_LENGTH + 50)),
         execution_id="e1",
+        execution_sequence=1,
         resume_from_execution_id=None,
         surface=None,
         actor_kind=None,

@@ -162,9 +162,44 @@ exists only when the work-item layer creates a new execution.
   - Blocking raises `SnapshotNotPersisted`. The investigator propagates it
     only in context-assembly mode `on`; in `shadow` it logs it, as it does
     every assembly failure.
-- **Dormant today.** The investigator's `WorkContextRef.execution_id` is
-  still the local `execution_id_for` hash, not a store id (#455 item 1), so
-  nothing is persisted until that is changed in `run_issue_investigator.py`.
+
+### 7. The execution identity is the store's (#455)
+
+Owner decision B on #431: the work-item store is the identity authority, and
+nothing in the investigator invents an execution id. mctl-api keys an
+execution by `(work_item_id, engine, engine_ref)` (`POST
+/api/v1/work-items/{id}/executions`, 201 new, 200 the same one again), so:
+
+- **A `we_...` `--execution-id`** was created by the work-item layer (e.g.
+  the resume route). It must be in the item's ledger, and it is used as-is.
+  Nothing is attached, and its phase stays with the layer that created it.
+- **Otherwise the run attaches its own engine run** as `Running`: engine
+  `MCTL_ENGINE` (`argo` by default, or `temporal`), engine ref
+  `MCTL_ENGINE_REF`, else the Argo `WORKFLOW_NAME` (`{{workflow.name}}`).
+  The returned `we_...` is `WorkContextRef.execution_id`, and its attempt is
+  `execution_sequence`. A retried step of the same workflow gets the same
+  execution back; a new investigation is a new workflow and gets a new one.
+- **Any other `--execution-id`** (the dev_loop's `execution_id_for` seed
+  hash) is logged as correlation and is never the identity.
+- **No engine ref** means no identity, never a local substitute.
+- **The prior list and the sequence** come from the ledger: the priors are
+  the entries with a lower attempt than this execution's, so a retry never
+  counts its own row, and the sequence is the store's attempt.
+- **At the end of the run** the attached execution is advanced to
+  `Succeeded` or `Failed`, best effort: a failed advance is logged and never
+  changes the result. A failure the engine retries under the same engine
+  run (`MCTL_ENGINE_FINAL_ATTEMPT=false`, the CWFT's primary attempt ahead
+  of its fallback) leaves the execution `Running`, because the store never
+  reopens an ended execution.
+- **Gating.** Nothing is attached below `observe`, nor in a dry-run. Both
+  writes go through the policy checkpoint (ADR 014,
+  `attach:work-item-execution`). Without an identity the run has no work
+  context at all (`WorkContextRef` cannot carry an empty id): at `observe`
+  it proceeds and says so, and from `enforce` up it stops. A definite
+  refusal (a foreign `we_...`, no engine ref, a policy DENY, an ended
+  execution) stops it where the new answer may veto. An unanswered one (the
+  store is down, another execution is active, the ledger moved) stops it
+  where `blocks_on_unknown()` holds.
 
 ## Alternatives
 
@@ -243,3 +278,5 @@ two cross-repo prerequisites.
 | Golden fixture | `tests/fixtures/context/investigator-snapshot.json` |
 | `persist`, `resumed_from`, `SnapshotAnswer` (#431) | `orchestrator/work_context/snapshots.py` |
 | `WorkItemClient.seal_snapshot` / `execution_snapshot` | `orchestrator/work_context/client.py` |
+| `resolve_identity`, `engine_ref_from_env`, `answer_from_attach` (#455) | `orchestrator/work_context/executions.py` |
+| `WorkItemClient.attach_execution` (#455) | `orchestrator/work_context/client.py` |
