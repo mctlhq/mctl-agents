@@ -1,0 +1,30 @@
+{
+  "schema_version": "workitem/v1",
+  "work_item": {
+    "id": "wi_a342ab25-6245-4c4b-995e-7bd5b230eceb",
+    "tenant": "wi-1790168961507745000",
+    "owner_principal": "github:alice",
+    "visibility": "tenant",
+    "origin_surface": "telegram",
+    "title": "ship it",
+    "external_key": "https://github.com/mctlhq/mctl-telegram/issues/443",
+    "state": "completed",
+    "state_version": 4,
+    "created_by": "github:alice",
+    "created_at": "2026-09-23T13:09:21.510552Z",
+    "updated_at": "2026-09-23T13:09:21.548809Z",
+    "completed_at": "2026-09-23T13:09:21.548809Z",
+    "schema_version": "workitem/v1"
+  },
+  "state_version": 4,
+  "latest_execution": {
+    "id": "we_a11b5572-fed2-482b-bedf-2b4160476cb9",
+    "work_item_id": "wi_a342ab25-6245-4c4b-995e-7bd5b230eceb",
+    "engine": "temporal",
+    "engine_ref": "dev-loop-mctlhq-mctl-telegram-443-r2",
+    "attempt": 2,
+    "resumed_from_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+    "phase": "Pending",
+    "started_at": "2026-09-23T13:09:21.541529Z"
+  }
+}

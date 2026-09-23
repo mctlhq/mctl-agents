@@ -23,18 +23,23 @@ from typing import Any
 from urllib.parse import quote
 
 from orchestrator.work_context.contract import (
+    WORK_ITEM_FOUND,
     WORK_ITEM_UNKNOWN,
     WorkItemAnswer,
     answer_from,
+    executions_from,
+    latest_execution_id_of,
+    with_executions,
+    work_item_unknown_reason,
+    work_item_verdict_for,
 )
 
 DEFAULT_TIMEOUT_S = 10
 
-# Written by analogy with orchestrator/lifecycle/client.py's
-# `/api/v1/lifecycle/ownership/...` table — mctl-api#227 is not readable from
-# this clone (open question in requirements.md).
+# mctl-api's `workitem/v1` read routes (internal/api/router.go there).
 ROUTES = {
     "get_work_item": "/api/v1/work-items/{id}",
+    "list_executions": "/api/v1/work-items/{id}/executions",
 }
 
 
@@ -125,21 +130,46 @@ class WorkItemClient:
     # -- reads ------------------------------------------------------------
 
     def get(self, work_item_id: str) -> WorkItemAnswer:
+        """The work item and its full execution ledger.
+
+        mctl-api's view carries only `latest_execution`, so a FOUND item is
+        completed from the executions route. That second read is all or
+        nothing: if it fails, or the ledger does not contain the view's own
+        latest execution, the answer is WORK_ITEM_UNKNOWN — never a FOUND
+        item with an understated execution list."""
         try:
             res = self._request("GET", ROUTES["get_work_item"].format(id=_q(work_item_id)))
         except WorkItemUnavailable as exc:
             return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=str(exc))
-        return answer_from(res.status, res.payload, path=res.status_path, body_empty=res.body_empty)
+        answer = answer_from(res.status, res.payload, path=res.status_path, body_empty=res.body_empty)
+        if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
+            return answer
+        item = answer.item
+        if item.work_item_id != work_item_id:
+            return WorkItemAnswer(
+                verdict=WORK_ITEM_UNKNOWN,
+                reason=f"asked for {work_item_id!r}, the store answered {item.work_item_id!r}",
+                accepted=True,
+            )
+        try:
+            ex = self._request("GET", ROUTES["list_executions"].format(id=_q(work_item_id)))
+        except WorkItemUnavailable as exc:
+            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=f"executions: {exc}", accepted=True)
+        executions, why = executions_from(ex.status, ex.payload, work_item_id)
+        if executions is None:
+            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=True)
+        latest = latest_execution_id_of(res.payload)
+        if latest and latest not in {e.execution_id for e in executions}:
+            return WorkItemAnswer(
+                verdict=WORK_ITEM_UNKNOWN,
+                reason=f"executions: the ledger lacks the view's latest execution {latest!r}",
+                accepted=True,
+            )
+        item = with_executions(item, executions)
+        verdict = work_item_verdict_for(item)
+        reason = "" if verdict != WORK_ITEM_UNKNOWN else work_item_unknown_reason(item)
+        return WorkItemAnswer(verdict=verdict, item=item, reason=reason, accepted=True)
 
-    # No list_executions read: `GET .../executions` returns an execution
-    # LISTING, not a WorkItem envelope, so `answer_from` (which parses a
-    # WorkItem) is the wrong reader for it — and nothing in this repo
-    # consumes the route. The executions this repo needs arrive embedded in
-    # `get`'s WorkItem. Add a typed listing parser with the first real
-    # consumer instead of guessing mctl-api#227's response shape here.
-
-    # No record_execution write either, for the same reason: the POST's
-    # response is the created execution record, not a WorkItem envelope, so
-    # `answer_from` would answer a SUCCESSFUL write with verdict UNKNOWN —
-    # and nothing in this repo consumes the route yet. Both arrive together
-    # with the first real consumer.
+    # No record_execution write: the POST's response is the created
+    # execution record, not a WorkItem view, and nothing in this repo
+    # consumes the route yet. It arrives with the first real consumer.

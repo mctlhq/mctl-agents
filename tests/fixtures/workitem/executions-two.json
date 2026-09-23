@@ -1,0 +1,25 @@
+{
+  "executions": [
+    {
+      "id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+      "work_item_id": "wi_a342ab25-6245-4c4b-995e-7bd5b230eceb",
+      "engine": "temporal",
+      "engine_ref": "dev-loop-mctlhq-mctl-telegram-443",
+      "attempt": 1,
+      "phase": "Failed",
+      "started_at": "2026-09-23T13:09:21.524964Z",
+      "ended_at": "2026-09-23T13:09:21.530355Z"
+    },
+    {
+      "id": "we_a11b5572-fed2-482b-bedf-2b4160476cb9",
+      "work_item_id": "wi_a342ab25-6245-4c4b-995e-7bd5b230eceb",
+      "engine": "temporal",
+      "engine_ref": "dev-loop-mctlhq-mctl-telegram-443-r2",
+      "attempt": 2,
+      "resumed_from_execution_id": "we_7ea4cf0c-d8ba-4825-9191-888e17a47eec",
+      "phase": "Pending",
+      "started_at": "2026-09-23T13:09:21.541529Z"
+    }
+  ],
+  "schema_version": "workitem/v1"
+}

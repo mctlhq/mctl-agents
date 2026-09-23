@@ -1,7 +1,9 @@
 """Tests for orchestrator/work_context/client.py (mctlhq/mctl-agents#267).
 
 T4 in the proposal's tasks.md: monkeypatched urllib, in the style of
-tests/test_lifecycle_client.py: 200 -> WORK_ITEM_FOUND, 404 -> WORK_ITEM_ABSENT,
+tests/test_lifecycle_client.py, answering with real mctl-api `workitem/v1`
+responses (#452): 200 view + executions ledger -> WORK_ITEM_FOUND, the
+work-items 404 -> WORK_ITEM_ABSENT,
 409 -> WORK_ITEM_CONFLICT, transport error / non-https base / missing
 MCTL_TOKEN -> WORK_ITEM_UNKNOWN; a 3xx is surfaced, never followed.
 """
@@ -10,6 +12,7 @@ from __future__ import annotations
 import io
 import json
 import urllib.error
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -62,27 +65,91 @@ def _http_error(status: int, payload: dict[str, Any]) -> Any:
     return _raise
 
 
-WORK_ITEM_PAYLOAD = {
-    "work_item_id": "wi-1",
-    "revision": "1",
-    "state": "open",
-    "issue_url": "https://github.com/mctlhq/mctl-agents/issues/267",
-    "service": "mctl-agents",
-    "slug": "issue-267-x",
-    "executions": [],
-}
+# Real mctl-api responses (see tests/test_work_context_contract.py).
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "workitem"
 
 
-def test_get_200_is_found(monkeypatch: pytest.MonkeyPatch) -> None:
-    answer = _client(monkeypatch, _ok(WORK_ITEM_PAYLOAD)).get("wi-1")
-    assert answer.verdict == WORK_ITEM_FOUND
+def _fixture(name: str) -> dict[str, Any]:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+VIEW = _fixture("get-active-resumed.json")
+WID = VIEW["work_item"]["id"]
+
+
+def _routes(view: Any, executions: Any) -> Any:
+    """Answer the view and the executions route; each may be a payload or a
+    handler of its own (to raise an HTTP error)."""
+    seen: list[str] = []
+
+    def _handle(req: Any) -> Any:
+        seen.append(req.full_url)
+        target = executions if req.full_url.endswith("/executions") else view
+        return target(req) if callable(target) else _FakeResponse(json.dumps(target).encode())
+
+    _handle.seen = seen  # type: ignore[attr-defined]
+    return _handle
+
+
+def test_get_reads_the_view_and_the_whole_execution_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = _routes(VIEW, _fixture("executions-two.json"))
+    answer = _client(monkeypatch, handler).get(WID)
+    assert answer.verdict == WORK_ITEM_FOUND, answer.reason
     assert answer.item is not None
-    assert answer.item.work_item_id == "wi-1"
+    assert answer.item.work_item_id == WID and answer.item.state_version == 3
+    assert [e.sequence for e in answer.item.executions] == [1, 2]
+    assert handler.seen == [
+        f"https://api.example.test/api/v1/work-items/{WID}",
+        f"https://api.example.test/api/v1/work-items/{WID}/executions",
+    ]
 
 
-def test_get_404_with_error_envelope_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    answer = _client(monkeypatch, _http_error(404, {"error": "no such work item"})).get("wi-1")
+def test_get_item_with_no_executions_is_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    view = _fixture("get-active-no-executions.json")
+    answer = _client(monkeypatch, _routes(view, _fixture("executions-empty.json"))).get(view["work_item"]["id"])
+    assert answer.verdict == WORK_ITEM_FOUND and answer.item.executions == ()
+
+
+def test_a_failed_executions_read_is_unknown_never_an_understated_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _boom(req: Any) -> Any:
+        raise OSError("connection reset")
+
+    wrong_schema = {"schema_version": "workitem/v2", "executions": []}
+    # Also with a view that names no latest execution, so nothing but the
+    # failed read itself can refuse the answer.
+    for view in (VIEW, _fixture("get-active-no-executions.json")):
+        wid = view["work_item"]["id"]
+        for executions in (_http_error(503, {"error": "store down"}), _boom, wrong_schema):
+            answer = _client(monkeypatch, _routes(view, executions)).get(wid)
+            assert answer.verdict == WORK_ITEM_UNKNOWN and answer.item is None, answer
+            assert answer.reason.startswith("executions:")
+
+
+def test_a_ledger_missing_the_views_latest_execution_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    stale = _fixture("executions-two.json")
+    stale["executions"] = stale["executions"][:1]
+    answer = _client(monkeypatch, _routes(VIEW, stale)).get(WID)
+    assert answer.verdict == WORK_ITEM_UNKNOWN and "latest execution" in answer.reason
+
+
+def test_an_answer_about_another_work_item_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = _routes(VIEW, _fixture("executions-two.json"))
+    answer = _client(monkeypatch, handler).get("wi_other")
+    assert answer.verdict == WORK_ITEM_UNKNOWN and "the store answered" in answer.reason
+    assert len(handler.seen) == 1  # refused before reading anyone's executions
+
+
+def test_a_terminal_item_is_found_with_its_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    view = _fixture("get-completed.json")
+    answer = _client(monkeypatch, _routes(view, _fixture("executions-two.json"))).get(WID)
+    assert answer.verdict == WORK_ITEM_FOUND and answer.item.state == "completed"
+
+
+def test_get_real_404_is_absent_and_reads_nothing_else(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = _routes(_http_error(404, _fixture("get-not-found.json")), _fixture("executions-two.json"))
+    answer = _client(monkeypatch, handler).get(WID)
     assert answer.verdict == WORK_ITEM_ABSENT
+    assert len(handler.seen) == 1
 
 
 def test_get_404_without_error_envelope_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -94,7 +161,7 @@ def test_get_404_without_error_envelope_is_unknown(monkeypatch: pytest.MonkeyPat
 
 
 def test_get_409_is_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
-    answer = _client(monkeypatch, _http_error(409, {"error": "conflict", **WORK_ITEM_PAYLOAD})).get("wi-1")
+    answer = _client(monkeypatch, _http_error(409, {"error": "conflict", "code": "state_version_conflict"})).get("wi-1")
     assert answer.verdict == WORK_ITEM_CONFLICT
 
 
