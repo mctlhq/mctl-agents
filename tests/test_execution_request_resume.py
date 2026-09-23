@@ -692,15 +692,15 @@ async def test_a_delivery_whose_advance_to_running_is_refused_ends_its_minted_ex
 
 
 async def test_a_resume_the_loop_refuses_is_rejected_typed_and_never_fulfilled(api, env):
-    """A request made straight on mctl-api carries its default surface
-    `api`, which is not (yet: #481 adds it) one of the loop's closed surface
-    kinds: the loop's validator refuses it, and the request is rejected
-    before any `we_`."""
+    """A request whose surface is outside the loop's closed surface kinds
+    (here `slack`) is refused by the loop's validator, and the request is
+    rejected before any `we_`. (mctl-api's own default surface `api` is in
+    the vocabulary since #481: see the validator test below.)"""
     submit, _ = _submit_log()
     async with _worker(env, submit):
         loop = await _park(api, env)
         rid = api.create_request("resume")
-        api.xrs[rid]["surface"] = "api"
+        api.xrs[rid]["surface"] = "slack"
         outcome = await _dispatcher(env).dispatch_once()
         events = await _events(env, loop)
         await _end(env, loop)
@@ -735,7 +735,7 @@ def _validator(**state: Any) -> DevLoopWorkflow:
             "resume-already-pending",
         ),
         ({}, _delivery("xr_1", surface=""), RESUME_REFUSED_ERROR_TYPE, "surface-or-actor-missing"),
-        ({}, _delivery("xr_1", surface="api"), RESUME_REFUSED_ERROR_TYPE, "surface-or-actor-unrecognised"),
+        ({}, _delivery("xr_1", surface="slack"), RESUME_REFUSED_ERROR_TYPE, "surface-or-actor-unrecognised"),
         ({}, _delivery("not-a-request"), RESUME_REFUSED_ERROR_TYPE, "malformed-delivery"),
     ],
     ids=[
@@ -747,7 +747,7 @@ def _validator(**state: Any) -> DevLoopWorkflow:
         "signal-pending",
         "delivery-open",
         "no-surface",
-        "api-surface",
+        "unknown-surface",
         "malformed",
     ],
 )
@@ -757,6 +757,13 @@ def test_the_validator_answers_with_the_resume_rules(state, delivery, error_type
     assert exc.value.type == error_type and exc.value.details == (reason,)
     if error_type == RESUME_REFUSED_ERROR_TYPE:
         assert reason in xr.RESUME_REFUSAL_REASONS  # the documented vocabulary
+
+
+def test_the_validator_accepts_mctl_apis_default_surface_api():
+    """A resume made straight on mctl-api carries its default surface `api`
+    (`defaultWorkItemSurface`); since #481 that is in the closed vocabulary,
+    so the loop accepts the delivery rather than refusing it."""
+    _validator()._validate_execution_request(_delivery("xr_1", surface="api"))
 
 
 def test_the_resume_signal_is_refused_while_a_delivered_request_is_open():
