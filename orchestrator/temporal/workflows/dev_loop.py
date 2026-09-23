@@ -2521,7 +2521,10 @@ class DevLoopWorkflow:
                     )
                 )
                 workflow.continue_as_new(
-                    IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=resume)
+                    IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=resume),
+                    # The dispatched loop's `issue_workflow_id` alias (#474),
+                    # carried explicitly; None (unchanged command) without one.
+                    memo=dict(workflow.memo()) or None,
                 )
 
         return await self._finish_after_watch(
@@ -2700,7 +2703,10 @@ class DevLoopWorkflow:
                 )
             )
             workflow.continue_as_new(
-                IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=next_resume)
+                IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=next_resume),
+                # The dispatched loop's `issue_workflow_id` alias (#474),
+                # carried explicitly; None (unchanged command) without one.
+                memo=dict(workflow.memo()) or None,
             )
 
         investigate_result = resume.investigate

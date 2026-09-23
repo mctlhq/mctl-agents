@@ -16,6 +16,7 @@ with one.
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import typing
 from datetime import UTC, datetime, timedelta
@@ -315,6 +316,16 @@ class TestImplementSweep:
         # Said in the log, not only inside `skipped`.
         assert any("could not be attributed" in r.getMessage() for r in caplog.records)
 
+    async def test_an_issueless_slug_is_not_held_back_by_an_unattributed_loop(self, env, monkeypatch):
+        """A slug with no `issue-<N>-` prefix can never have a loop, so an
+        unattributed dispatched loop cannot own it: it stays a candidate."""
+        async def _refs():
+            return [dataclasses.replace(_accepted(), slug="incident-2026-09-23-outage")]
+
+        monkeypatch.setattr(stranded_act, "list_proposal_refs", _refs)
+        result = await env.run(stranded_act.find_stranded_accepted, [DISPATCHED], 20)
+        assert [p.slug for p in result.stranded] == ["incident-2026-09-23-outage"]
+
     async def test_two_loops_on_one_issue_are_both_named(self, env, monkeypatch):
         result = await _sweep(env, monkeypatch, [_loop(DISPATCHED_2, ISSUE_KEYED), DISPATCHED_LOOP])
         assert result.stranded == []
@@ -536,3 +547,98 @@ class TestThroughTheSweepWorkflow:
 
         assert received["submits"] == []
         assert result.submitted == 0
+
+
+# --------------------------------------------------------------------------
+# The alias across a merge-watch continue_as_new.
+# --------------------------------------------------------------------------
+
+
+class TestTheAliasSurvivesContinueAsNew:
+    """`_watch_pr` hops via continue_as_new under the same workflow id. The
+    memo is carried explicitly at both hop sites rather than trusted to the
+    server; without it the post-hop run would list as a bare `dev-loop-xr_*`
+    id, which `index` counts as unattributable and which then holds back the
+    whole implement sweep for as long as the loop watches its PR.
+
+    Driven the way `TestMergeWatchContinueAsNew` in test_dev_loop_workflow.py
+    forces a hop: `MERGE_WATCH_HISTORY_FLOOR` low, an unsandboxed worker.
+
+    What this pins is the end-to-end guarantee, not the `memo=` line alone:
+    temporalio 1.31's core also re-uses the current memo when a
+    continue_as_new command leaves it unset ("If unset, re-uses the current
+    workflow's memo", workflow_commands.proto), so dropping the explicit
+    `memo=` still passes here. The explicit carry is kept so the guarantee
+    does not rest on that default alone; this test is what fails if both
+    ever stop carrying it."""
+
+    async def _run_with_hops(self, monkeypatch, memo: dict[str, str] | None):
+        import uuid
+
+        import anyio
+        from temporalio.testing import WorkflowEnvironment
+        from temporalio.worker import UnsandboxedWorkflowRunner
+
+        from orchestrator.temporal.activities.pr_state import PRState
+        from orchestrator.temporal.workflows import dev_loop
+        from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+        from tests.temporal_harness import Worker
+        from tests.test_dev_loop_workflow import MERGED_PR, TASK_QUEUE, _fake_activities
+
+        monkeypatch.setattr(dev_loop, "MERGE_WATCH_HISTORY_FLOOR", 1)
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="deadbeef",
+        )
+        activities, _calls, investigate_ran, _ops = _fake_activities(
+            released=True, pr_states=[open_pr, open_pr, MERGED_PR]
+        )
+        # A `dev-loop-xr_*` id, as the dispatcher starts it; the unique suffix
+        # keeps the test server's id reuse policy out of the picture.
+        workflow_id = f"{DISPATCHED}-{uuid.uuid4().hex[:8]}"
+        async with await WorkflowEnvironment.start_time_skipping() as env:
+            async with Worker(
+                env.client,
+                task_queue=TASK_QUEUE,
+                workflows=[DevLoopWorkflow],
+                activities=activities,
+                workflow_runner=UnsandboxedWorkflowRunner(),
+            ):
+                handle = await env.client.start_workflow(
+                    DevLoopWorkflow.run,
+                    IssueRef(issue_url=ISSUE_URL),
+                    id=workflow_id,
+                    task_queue=TASK_QUEUE,
+                    memo=memo,
+                )
+                first_run = handle.result_run_id
+                with anyio.fail_after(30):
+                    await investigate_ran.wait()
+                await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+                with anyio.fail_after(30):
+                    result = await handle.result()
+                # The LATEST run of the chain, as visibility lists it.
+                latest = await env.client.get_workflow_handle(workflow_id).describe()
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert latest.run_id != first_run, "no merge-watch hop happened; the test proves nothing"
+        return workflow_id, latest
+
+    async def test_a_dispatched_loop_keeps_its_alias_after_a_hop(self, monkeypatch):
+        memo = {active_loops.ISSUE_WORKFLOW_ID_MEMO: ISSUE_KEYED}
+        workflow_id, latest = await self._run_with_hops(monkeypatch, memo)
+
+        assert await latest.memo_value(active_loops.ISSUE_WORKFLOW_ID_MEMO, "") == ISSUE_KEYED
+        # And the listing, fed the continued run, still emits the alias.
+        loops = await ActivityEnvironment().run(
+            VisibilityActivities(_ListClient([latest])).list_active_dev_loop_ids  # type: ignore[arg-type]
+        )
+        assert loops == [{"workflow_id": workflow_id, "issue_workflow_id": ISSUE_KEYED}]
+
+    async def test_a_loop_without_a_memo_gains_none_across_a_hop(self, monkeypatch):
+        """The unchanged-command half: an issue-keyed loop carries nothing."""
+        _workflow_id, latest = await self._run_with_hops(monkeypatch, None)
+        assert await latest.memo() == {}

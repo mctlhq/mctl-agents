@@ -163,11 +163,15 @@ def _scan(
         # issue-keyed loop, or a dispatched `dev-loop-xr_*` loop whose memo
         # names it (#474). Missing the second one is how a loop still queued
         # for admission got a second implementer run from this sweep.
-        owners = active.owners_of(expected_dev_loop_id(ref.slug, None, ref.service))
-        if not owners and active.unreadable:
+        expected_id = expected_dev_loop_id(ref.slug, None, ref.service)
+        owners = active.owners_of(expected_id)
+        if expected_id and not owners and active.unreadable:
             # Fail CLOSED: an entry the index could not read may be the loop
             # that owns this proposal, and the active set is this sweep's
-            # whole argument against a second implementer run.
+            # whole argument against a second implementer run. Only for a
+            # slug that CAN have a loop: one with no `issue-<N>-` prefix
+            # never had one (`expected_dev_loop_id` is None), so an
+            # unattributed loop cannot own it and the unknown does not apply.
             skipped.append(
                 (key, f"{active.unreadable} unreadable active-loop entr(y/ies); ownership unknown")
             )
