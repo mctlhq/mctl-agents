@@ -9,6 +9,16 @@ candidates from a fixed, declared set of collectors (the
 `context_snapshot`'s own rule, classify freshness, deduplicate, truncate
 oversized sources, apply a source/byte budget, and call `seal()`.
 
+A second, opt-in strategy, `trust-freshness-ranked` (mctlhq/mctl-agents#471,
+ADR 009 amendment 1), selected by `ISSUE_INVESTIGATOR_CONTEXT_STRATEGY`:
+the pinned primaries (inline template, issue, target repo) first, then every
+other source ordered by trust tier, then freshness, then recency, with the
+ranker's identity and each source's `Selection.score` recorded. Stale sources
+are demoted and flagged rather than dropped, a prior proposal is aged by its
+own `.status.yaml` `updated_at`, and a fixed rule records conflicting
+evidence in the snapshot's `conflicts` block. The default strategy is
+untouched: its snapshots keep their bytes and their `snapshot_id`s.
+
 Stdlib only, deliberately, mirroring `context_snapshot.py`: imports from
 `orchestrator.context_snapshot` and `orchestrator.temporal.issue_ref` only
 (both stdlib-only themselves), so this module stays importable by whatever
@@ -23,6 +33,7 @@ never authorization".
 from __future__ import annotations
 
 import os
+import re
 import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -33,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 
 from orchestrator.context_snapshot import (
     ContextBudget,
+    ContextConflict,
     ContextSnapshot,
     ContextSource,
     ContextStrategy,
@@ -53,6 +65,37 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
 
 STRATEGY_NAME = "deterministic-fixed-order"
 STRATEGY_VERSION = "1.0.0"
+
+# mctlhq/mctl-agents#471: the opt-in ranked strategy and its ranker. The
+# strategy names the whole assembly procedure; the ranker names the ordering
+# function inside it, so either can move version independently (ADR 009
+# sec. 1, `ContextStrategy`).
+RANKED_STRATEGY_NAME = "trust-freshness-ranked"
+RANKED_STRATEGY_VERSION = "1.0.0"
+RANKER_NAME = "trust-freshness-recency"
+RANKER_VERSION = "1.0.0"
+
+STRATEGY_ENV_VAR = "ISSUE_INVESTIGATOR_CONTEXT_STRATEGY"
+STRATEGIES = (STRATEGY_NAME, RANKED_STRATEGY_NAME)
+
+# The ranked strategy keeps these kinds first, in collector order: the
+# scaffold, the problem statement and the tree the model explores. Ranking
+# only ever reorders what comes after them.
+_PINNED_KINDS = frozenset({"inline-template", "github-issue", "target-repo"})
+
+# Lower sorts first. Trust is origin-only and grants nothing (ADR 009 sec.
+# 5/6): it orders what the model reads, never what anyone may do.
+_TRUST_ORDER = {"authoritative": 0, "corroborated": 1, "reported": 2, "untrusted": 3}
+_FRESHNESS_ORDER = {"fresh": 0, "aging": 1, "unknown": 2, "stale": 3}
+_PINNED_SCORE = 100.0
+
+# The one fixed conflict rule (mctlhq/mctl-agents#471) and what the ranked
+# strategy does about it: keep every source, ordered — never drop one.
+CONFLICT_PRIOR_PROPOSAL_SUPERSEDED = "prior-proposal-superseded-by-later-comment"
+CONFLICT_RESOLUTION_KEPT_RANKED = "kept-all-ranked-by-trust-then-recency"
+
+# A `.status.yaml` is a few hundred bytes; read at most this much of it.
+_STATUS_READ_CEILING = 8192
 
 # The one legacy AgentDefinition file `build_execution_correlation`'s legacy
 # branch hashes for `definition_content_hash` (see its docstring).
@@ -127,6 +170,15 @@ class CandidateSource:
     reason_code: str
     strategy_step: str | None = None
     render_text: str | None = None
+    # mctlhq/mctl-agents#471 (ranked strategy only reads these). When the
+    # source's content carries its own time — a comment's `created_at`, a
+    # prior proposal's `updated_at` — `content_time` is it, and recency
+    # orders by it. `retrieved_at`, when set, is the retrieval moment for a
+    # source whose `observed_at` is its content time instead; unset means
+    # the two are the same moment, as for every default-strategy source.
+    content_time: str | None = None
+    retrieved_at: str | None = None
+    score: float | None = None
     rank: int = 0
     included: bool = True
     content_hash: str = ""
@@ -155,10 +207,20 @@ class AssemblyConfig:
     freshness_table: Mapping[str, int | None] = field(
         default_factory=lambda: dict(_DEFAULT_FRESHNESS_TABLE)
     )
+    strategy: str = STRATEGY_NAME
+
+    def __post_init__(self) -> None:
+        if self.strategy not in STRATEGIES:
+            raise ValueError(f"{STRATEGY_ENV_VAR} must be one of {STRATEGIES}, got {self.strategy!r}")
+
+    @property
+    def ranked(self) -> bool:
+        return self.strategy == RANKED_STRATEGY_NAME
 
     @classmethod
     def from_env(cls) -> AssemblyConfig:
         return cls(
+            strategy=os.getenv(STRATEGY_ENV_VAR, STRATEGY_NAME).strip().lower() or STRATEGY_NAME,
             max_sources=int(os.getenv("ISSUE_INVESTIGATOR_CONTEXT_MAX_SOURCES", "12")),
             max_bytes=int(os.getenv("ISSUE_INVESTIGATOR_CONTEXT_MAX_BYTES", "120000")),
             max_bytes_per_source=int(
@@ -208,6 +270,8 @@ class AssemblyMetrics:
     strategy_name: str
     strategy_version: str
     snapshot: ContextSnapshot
+    stale_demoted: int = 0
+    conflict_count: int = 0
 
     def to_log_dict(self) -> dict[str, Any]:
         return {
@@ -226,6 +290,8 @@ class AssemblyMetrics:
             "collector_calls": self.collector_calls,
             "strategy_name": self.strategy_name,
             "strategy_version": self.strategy_version,
+            "stale_demoted": self.stale_demoted,
+            "conflict_count": self.conflict_count,
             "snapshot": self.snapshot.to_log_dict(),
         }
 
@@ -251,7 +317,7 @@ def _to_context_source(candidate: CandidateSource) -> ContextSource:
         selector=candidate.selector,
         content_hash=candidate.content_hash,
         byte_count=candidate.byte_count,
-        retrieved_at=candidate.observed_at,
+        retrieved_at=candidate.retrieved_at or candidate.observed_at,
         freshness=Freshness(
             observed_at=candidate.observed_at,
             staleness=candidate.freshness_staleness,
@@ -262,6 +328,7 @@ def _to_context_source(candidate: CandidateSource) -> ContextSource:
             rank=candidate.rank,
             reason_code=candidate.reason_code,
             included=candidate.included,
+            score=candidate.score,
             strategy_step=candidate.strategy_step,
         ),
     )
@@ -377,6 +444,135 @@ def apply_budget(candidates: Sequence[CandidateSource], config: AssemblyConfig) 
 
 
 # ---------------------------------------------------------------------------
+# `trust-freshness-ranked` stages (mctlhq/mctl-agents#471)
+# ---------------------------------------------------------------------------
+
+
+def _epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return _parse_iso(value).timestamp()
+    except ValueError:
+        return None
+
+
+def _recency(candidate: CandidateSource) -> float | None:
+    return _epoch(candidate.content_time or candidate.observed_at)
+
+
+def ranking_score(candidate: CandidateSource) -> float:
+    """The score recorded in `Selection.score`: pinned kinds outrank
+    everything; otherwise ten points per trust step and one per freshness
+    step, so trust always dominates freshness — the same precedence the
+    sort key in `rank_candidates` applies (recency only breaks ties, and so
+    is not part of the score)."""
+    if candidate.kind in _PINNED_KINDS:
+        return _PINNED_SCORE
+    trust = len(_TRUST_ORDER) - 1 - _TRUST_ORDER[candidate.trust_tier]
+    freshness = len(_FRESHNESS_ORDER) - 1 - _FRESHNESS_ORDER[candidate.freshness_staleness]
+    return float(10 * trust + freshness)
+
+
+def rank_candidates(candidates: Sequence[CandidateSource]) -> list[CandidateSource]:
+    """Order for the ranked strategy and assign 1-based ranks and scores.
+
+    Pinned kinds keep their collector order at the top. Every other
+    candidate follows, ordered by trust tier, then freshness (so a stale
+    source is demoted below a fresher one of the same tier), then recency
+    (newest first; a source with no readable time sorts last), then
+    collector order — a total order, so the result is deterministic. Must
+    run after `classify_freshness`."""
+    indexed = list(enumerate(candidates))
+    pinned = [c for _, c in indexed if c.kind in _PINNED_KINDS]
+
+    def key(item: tuple[int, CandidateSource]) -> tuple[int, int, float, int]:
+        index, candidate = item
+        recency = _recency(candidate)
+        return (
+            _TRUST_ORDER[candidate.trust_tier],
+            _FRESHNESS_ORDER[candidate.freshness_staleness],
+            -recency if recency is not None else float("inf"),
+            index,
+        )
+
+    rest = [c for _, c in sorted((i for i in indexed if i[1].kind not in _PINNED_KINDS), key=key)]
+    ordered = pinned + rest
+    for rank, candidate in enumerate(ordered, start=1):
+        candidate.rank = rank
+        candidate.score = ranking_score(candidate)
+    return ordered
+
+
+def flag_stale(candidates: Sequence[CandidateSource]) -> int:
+    """Ranked strategy: a stale source stays included — `rank_candidates`
+    has already demoted it — and is flagged `reason_code="stale-demoted"`,
+    so its staleness is visible in the snapshot instead of silently
+    removing it. Returns the number flagged."""
+    flagged = 0
+    for candidate in candidates:
+        if candidate.included and candidate.freshness_staleness == "stale":
+            candidate.reason_code = "stale-demoted"
+            flagged += 1
+    return flagged
+
+
+def detect_conflicts(candidates: Sequence[CandidateSource]) -> list[ContextConflict]:
+    """The one fixed conflict rule — no model, no text comparison: a prior
+    proposal whose `.status.yaml` `updated_at` (its `content_time`) predates
+    a later issue comment was written without that comment, so the comment
+    supersedes it. Every source involved is kept and named, in rank order;
+    nothing is dropped. A proposal with no readable `updated_at` cannot be
+    dated and so never fires the rule."""
+    proposals = [c for c in candidates if c.kind == "proposal-dir" and _epoch(c.content_time) is not None]
+    if not proposals:
+        return []
+    written = max(_epoch(c.content_time) or 0.0 for c in proposals)
+    later = [
+        c for c in candidates
+        if c.kind == "github-issue-comment" and (_epoch(c.content_time) or float("-inf")) > written
+    ]
+    if not later:
+        return []
+    involved = sorted(proposals + later, key=lambda c: c.rank)
+    return [
+        ContextConflict(
+            subject=CONFLICT_PRIOR_PROPOSAL_SUPERSEDED,
+            source_ids=tuple(c.source_id for c in involved),
+            resolution_code=CONFLICT_RESOLUTION_KEPT_RANKED,
+        )
+    ]
+
+
+_SAFE_SOURCE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def render_conflict_notice(snapshot: ContextSnapshot) -> str:
+    """The `on`-mode prompt notice for the snapshot's recorded conflicts —
+    `""` when there are none, so a conflict-free prompt is unchanged. Built
+    from source ids and codes only (never payload); an id that is not a
+    plain token is left out rather than rendered."""
+    if not snapshot.conflicts:
+        return ""
+    lines = []
+    for conflict in snapshot.conflicts:
+        ids = ", ".join(i for i in conflict.source_ids if _SAFE_SOURCE_ID.match(i))
+        if conflict.subject == CONFLICT_PRIOR_PROPOSAL_SUPERSEDED:
+            lines.append(
+                f"- The prior proposal was written before later issue comments ({ids}). "
+                "Where they disagree, the prior proposal may be out of date: check it "
+                "against the later comments instead of carrying it forward unchanged."
+            )
+        else:
+            lines.append(f"- {conflict.subject}: {ids}")
+    return (
+        "\n\n### Conflicting evidence\n\n"
+        "A fixed rule found these sources in conflict. All of them are kept above, "
+        "ordered by trust tier and then recency:\n\n" + "\n".join(lines) + "\n"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Collectors (tasks.md #4) — five heterogeneous kinds, fixed order.
 # loki-logs/incident are out of scope (requirements.md): reachable today
 # only through mcp__mctl__* tools the MODEL calls, not this Python wrapper.
@@ -468,6 +664,7 @@ def collect_issue_comments(assembly_input: AssemblyInput) -> list[CandidateSourc
                 reason_code="issue-comment",
                 strategy_step="secondary",
                 render_text=f"Comment by {author} at {created_at}:\n{body}",
+                content_time=created_at,
             )
         )
     return candidates
@@ -519,12 +716,54 @@ def _read_prior_proposal_file(path: Path, max_bytes: int) -> bytes | None:
         os.close(fd)
 
 
+_UPDATED_AT_LINE = re.compile(r"""^updated_at:\s*['"]?([0-9T:.+\-Z]+)['"]?\s*$""", re.MULTILINE)
+
+
+def read_proposal_updated_at(proposal_dir: Path) -> str | None:
+    """The top-level `updated_at` of a prior proposal's `.status.yaml`, or
+    `None` when it is missing, unreadable or not an ISO-8601 timestamp.
+
+    Read with the same symlink-refusing bounded reader as the triplet, and
+    matched with one anchored line pattern rather than a YAML parser, so this
+    module stays stdlib-only; the investigator's own writer
+    (`_write_status_yaml`) emits exactly one such top-level line."""
+    raw = _read_prior_proposal_file(proposal_dir / ".status.yaml", _STATUS_READ_CEILING)
+    if raw is None:
+        return None
+    match = _UPDATED_AT_LINE.search(raw.decode("utf-8", errors="replace"))
+    if match is None:
+        return None
+    value = match.group(1)
+    try:
+        return _iso(_parse_iso(value))
+    except ValueError:
+        return None
+
+
 def collect_prior_proposal(assembly_input: AssemblyInput) -> list[CandidateSource]:
     """The existing requirements/design/tasks triplet, when re-investigating
     a `proposed` proposal directory. A first investigation's proposal
-    directory does not exist yet (or is empty), so this yields nothing."""
+    directory does not exist yet (or is empty), so this yields nothing.
+
+    Under the ranked strategy (mctlhq/mctl-agents#471) a prior proposal is
+    aged by its content, not by this retrieval: `observed_at` is its
+    `.status.yaml` `updated_at`. Without a readable `updated_at` its age is
+    unknown, so it carries no `max_age_seconds` and classifies `unknown` —
+    never `fresh` by default (ADR 009 sec. 6). The default strategy keeps
+    the retrieval time, so its snapshots are unchanged."""
     max_age = assembly_input.config.freshness_table.get("proposal-dir")
     read_ceiling = assembly_input.config.max_bytes_per_source
+    now_iso = _iso(assembly_input.now)
+    observed_at = now_iso
+    content_time: str | None = None
+    retrieved_at: str | None = None
+    if assembly_input.config.ranked:
+        content_time = read_proposal_updated_at(assembly_input.proposal_dir)
+        retrieved_at = now_iso
+        if content_time is None:
+            max_age = None
+        else:
+            observed_at = content_time
     candidates = []
     for name in TRIPLET_FILENAMES:
         path = assembly_input.proposal_dir / name
@@ -539,13 +778,15 @@ def collect_prior_proposal(assembly_input: AssemblyInput) -> list[CandidateSourc
                 locator=locator,
                 selector={"path": name},
                 raw=raw,
-                observed_at=_iso(assembly_input.now),
+                observed_at=observed_at,
                 max_age_seconds=max_age,
                 trust_tier="corroborated",
                 trust_rationale="prior-agent-authored-proposal",
                 reason_code="prior-proposal-document",
                 strategy_step="secondary",
                 render_text=raw.decode("utf-8", errors="replace"),
+                content_time=content_time,
+                retrieved_at=retrieved_at,
             )
         )
     return candidates
@@ -688,18 +929,37 @@ def assemble(
         candidates_dropped_pre_budget += len(candidates) - config.max_candidates
         candidates = candidates[: config.max_candidates]
 
-    assign_ranks(candidates)
-    for candidate in candidates:
-        normalize(candidate)
-    for candidate in candidates:
-        classify_freshness(candidate, assembly_input.now)
-
     dropped_stale = 0
-    for candidate in candidates:
-        if candidate.included and candidate.freshness_staleness == "stale":
-            candidate.included = False
-            candidate.reason_code = "stale"
-            dropped_stale += 1
+    stale_demoted = 0
+    conflicts: list[ContextConflict] = []
+    if config.ranked:
+        # mctlhq/mctl-agents#471: freshness first (the ranker orders by it),
+        # then rank, then record conflicts and flag — never drop — stale.
+        for candidate in candidates:
+            normalize(candidate)
+            classify_freshness(candidate, assembly_input.now)
+        candidates = rank_candidates(candidates)
+        conflicts = detect_conflicts(candidates)
+        stale_demoted = flag_stale(candidates)
+        strategy = ContextStrategy(
+            name=RANKED_STRATEGY_NAME,
+            version=RANKED_STRATEGY_VERSION,
+            ranker_name=RANKER_NAME,
+            ranker_version=RANKER_VERSION,
+        )
+    else:
+        assign_ranks(candidates)
+        for candidate in candidates:
+            normalize(candidate)
+        for candidate in candidates:
+            classify_freshness(candidate, assembly_input.now)
+
+        for candidate in candidates:
+            if candidate.included and candidate.freshness_staleness == "stale":
+                candidate.included = False
+                candidate.reason_code = "stale"
+                dropped_stale += 1
+        strategy = ContextStrategy(name=STRATEGY_NAME, version=STRATEGY_VERSION)
 
     dropped_duplicate = deduplicate(candidates)
 
@@ -712,7 +972,6 @@ def assemble(
     excluded_budget = sum(1 for c in candidates if c.reason_code == "budget-exhausted")
 
     sources = tuple(_to_context_source(c) for c in sorted(candidates, key=lambda c: c.rank))
-    strategy = ContextStrategy(name=STRATEGY_NAME, version=STRATEGY_VERSION)
     retention = RetentionPolicy(class_="execution-record", expires_after_days=180)
     snapshot = seal(
         execution=execution,
@@ -723,6 +982,7 @@ def assemble(
         work_context=work_context,
         sources=sources,
         evidence_refs=(),
+        conflicts=conflicts,
     )
 
     latency_ms = (time.monotonic() - start) * 1000
@@ -743,9 +1003,11 @@ def assemble(
         used_bytes=budget.used_bytes,
         assembly_latency_ms=latency_ms,
         collector_calls=collector_calls,
-        strategy_name=STRATEGY_NAME,
-        strategy_version=STRATEGY_VERSION,
+        strategy_name=strategy.name,
+        strategy_version=strategy.version,
         snapshot=snapshot,
+        stale_demoted=stale_demoted,
+        conflict_count=len(conflicts),
     )
     return AssemblyResult(mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics)
 
