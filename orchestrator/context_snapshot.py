@@ -445,7 +445,8 @@ class ContextSource:
 class ExecutionCorrelation:
     """Joins a snapshot to the execution that produced it, entirely from
     fields both sides already have (ADR 009 sec. 4): `temporal_workflow_id`
-    matches `issue_ref.workflow_id_for`, `argo_workflow_name` matches
+    matches `issue_ref.loop_workflow_id` (the loop's own id when it passed
+    one, else the issue-keyed `workflow_id_for`), `argo_workflow_name` matches
     `ExecutionRecord.argo_workflow_name`, and the four version/hash pins plus
     `target_repository_sha` are copied straight off `ExecutionPlan`."""
 
