@@ -72,6 +72,8 @@ class DispatchFakeApi(FakeMctlApi):
         self.tokens_minted: list[str] = []
         #: Commit the next fulfil, then lose its answer (a transport error).
         self.lose_next_fulfil_answer = False
+        #: phase -> how many attaches advancing to it answer 503 first.
+        self.unavailable_advances: dict[str, int] = {}
 
     # -- tests' own writes ----------------------------------------------
 
@@ -105,6 +107,11 @@ class DispatchFakeApi(FakeMctlApi):
         return view
 
     def request(self, method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+        phase = (payload or {}).get("phase")
+        if method == "POST" and path == f"/api/v1/work-items/{WID}/executions" and self.unavailable_advances.get(phase):
+            self.unavailable_advances[phase] -= 1
+            self.requests.append((method, path, copy.deepcopy(payload)))
+            return _HTTPResult(503, {"code": "unavailable", "error": "mctl-api restarting"})
         if (method, path) in self.fail and path.startswith("/api/v1/execution-requests/"):
             self.requests.append((method, path, copy.deepcopy(payload)))
             return self.fail[(method, path)]
@@ -1025,3 +1032,93 @@ async def test_stop_dispatcher_cancels_and_awaits_a_loop_that_does_not_stop():
     task = asyncio.create_task(asyncio.sleep(3600))
     await worker_module.stop_dispatcher(task, stop, grace=0.05)  # type: ignore[arg-type]
     assert stop.is_set() and task.cancelled()
+
+
+# -- review round 2 (PR #468) ------------------------------------------------
+#
+# P2: the success-path advance is patient, and re-attempted before the park.
+
+
+def _advance_attempts(api: DispatchFakeApi, phase: str) -> int:
+    path = f"/api/v1/work-items/{WID}/executions"
+    return len([b for m, p, b in api.requests if m == "POST" and p == path and (b or {}).get("phase") == phase])
+
+
+def _scheduled_advances(history: Any) -> int:
+    return sum(
+        1
+        for e in history.to_json_dict()["events"]
+        if e["eventType"] == "EVENT_TYPE_ACTIVITY_TASK_SCHEDULED"
+        and e["activityTaskScheduledEventAttributes"]["activityType"]["name"] == "advance_dispatched_execution"
+    )
+
+
+async def _run_to_the_park(api, env, unavailable: int) -> tuple[str, Any]:
+    submit, seen = _investigate_log()
+    api.unavailable_advances["Succeeded"] = unavailable
+    rid = api.create_request("start")
+    wid = dispatched_workflow_id(rid)
+    async with _worker(env, submit):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        # Skip past every retry backoff; the loop then sits at approval.
+        await env.sleep(timedelta(hours=3))
+        handle = env.client.get_workflow_handle(wid)
+        assert (await handle.describe()).status == WorkflowExecutionStatus.RUNNING
+        history = await handle.fetch_history()
+        await _end(env, wid)
+    assert len(seen) == 1
+    return wid, history
+
+
+async def test_a_transient_advance_failure_on_the_success_path_ends_succeeded_before_the_park(api, env):
+    """mctl-api unavailable for longer than FAST's five attempts: the patient
+    policy still lands the advance, in ONE activity, before the park."""
+    wid, history = await _run_to_the_park(api, env, unavailable=7)
+
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Succeeded")]
+    assert _advance_attempts(api, "Succeeded") == 8
+    assert _scheduled_advances(history) == 1
+
+
+async def test_an_advance_that_outlasts_its_retries_is_re_attempted_before_the_park(api, env):
+    """Unavailable past the whole patient policy: the loop goes on (best
+    effort), re-attempts once before the approval park, and that lands."""
+    wid, history = await _run_to_the_park(api, env, unavailable=12)
+
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Succeeded")]
+    assert _scheduled_advances(history) == 2
+    from temporalio.worker import Replayer
+
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)
+
+
+# P3: an absent dispatched loop is reconciled like a closed one.
+
+
+async def test_the_reconciliation_fails_the_execution_of_a_loop_temporal_no_longer_knows(api, capsys):
+    gone = dispatched_workflow_id("xr_99999999-0000-4000-8000-000000000461")
+    _ledger_entry(api, "temporal", gone, "Running")
+    api.create_request("resume")
+    temporal = FakeTemporal()  # every loop ABSENT: retention expired
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert api.executions[0]["phase"] == "Failed"
+    assert outcome.action == dx.FULFILLED
+    reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert [a["workflow_id"] for a in reconcile] == [gone]
+
+
+# P3: a reject answered `execution_request_closed` is CLOSED, not DEFERRED.
+
+
+async def test_a_reject_that_finds_the_request_closed_reports_closed(api):
+    api.external_key = ""  # no runnable target: the dispatcher rejects
+    rid = api.create_request("start")
+    api.fail[("POST", f"/api/v1/execution-requests/{rid}/reject")] = _HTTPResult(
+        409, {"code": xr.CLOSED_CODE, "error": "closed", "details": {"execution_id": "we_x"}}
+    )
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.CLOSED and outcome.execution_id == "we_x"

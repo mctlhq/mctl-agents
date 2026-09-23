@@ -247,6 +247,23 @@ FULFILMENT_POLL_RETRY_POLICY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_interval=timedelta(seconds=30),
 )
+# The success-path advance of a dispatched execution (mctlhq/mctl-agents#461).
+# Patient, in the style of SLUG_LOOKUP_RETRY_POLICY: the loop is about to park
+# at approval for up to APPROVAL_WAIT_DEADLINE, and while the `we_` stays
+# Running mctl-api refuses every other request for the item
+# (`execution_active`) — a state the dispatcher's reconciliation cannot heal,
+# because the loop is still RUNNING. One cheap POST, retried over roughly an
+# hour (10 s doubling to a 10-minute cap, 10 attempts), costs nothing
+# against a multi-day park. Bounded, so a store that stays down still lets the
+# loop reach the park; `run` then re-attempts once right before it. The
+# unwind path (`_fail_dispatched_execution`) keeps FAST_ACTIVITY_RETRY_POLICY:
+# that loop closes next, and a closed dispatched loop is reconciled.
+DISPATCHED_ADVANCE_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=10),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=10),
+    maximum_attempts=10,
+)
 #: The patch id guarding the dispatched path. Consulted only for a loop
 #: whose start input carries an execution request, so no other history
 #: records it.
@@ -1930,23 +1947,30 @@ class DevLoopWorkflow:
         that gap (`dispatcher._reconcile_closed_loops`)."""
         await self._advance_dispatched_execution("Failed")
 
-    async def _advance_dispatched_execution(self, phase: str) -> None:
+    async def _advance_dispatched_execution(self, phase: str, *, patient: bool = False) -> bool:
         """Best effort, like `_record`: a store that will not take the phase
         must not fail the loop. But an execution left non-terminal blocks
         EVERY later request for the item, not only a resume: mctl-api's
         attach rule refuses any new non-terminal execution while one is
         (`execution_active`). The dispatcher reconciles one it can prove
-        dead (`dispatcher._reconcile_closed_loops`)."""
+        dead (`dispatcher._reconcile_closed_loops`), but not one whose loop
+        is still RUNNING: hence `patient` on the success path.
+
+        True when the store answered (the phase landed, or a definite
+        refusal that no retry would change); False when every attempt failed
+        without an answer, so the caller can try again later."""
         try:
             outcome = await workflow.execute_activity(
                 advance_dispatched_execution,
                 AdvanceInput(work_item_id=self._work_item_id, engine_ref=workflow.info().workflow_id, phase=phase),
                 start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+                retry_policy=DISPATCHED_ADVANCE_RETRY_POLICY if patient else FAST_ACTIVITY_RETRY_POLICY,
             )
             workflow.logger.info("dispatched execution -> %s: %s", phase, outcome)
+            return True
         except ActivityError:
             workflow.logger.warning("dispatched execution could not be advanced to %s", phase)
+            return False
 
     @workflow.signal
     def abandon(self, *args: object) -> None:
@@ -2053,13 +2077,16 @@ class DevLoopWorkflow:
             if dispatched is not None:
                 await self._fail_dispatched_execution()
             raise
+        # The phase the dispatched execution still has to reach, when its
+        # advance below did not land (mctlhq/mctl-agents#461); "" otherwise.
+        dispatched_advance_pending = ""
         if dispatched is not None:
             # The dispatched execution IS this investigator run: it ends
             # here, whatever the loop does next, so the item's one
-            # non-terminal slot is free again for a later resume.
-            await self._advance_dispatched_execution(
-                "Succeeded" if investigate_result.succeeded else "Failed"
-            )
+            # non-terminal slot is free again for a later request.
+            advance_phase = "Succeeded" if investigate_result.succeeded else "Failed"
+            if not await self._advance_dispatched_execution(advance_phase, patient=investigate_result.succeeded):
+                dispatched_advance_pending = advance_phase
 
         if not investigate_result.succeeded:
             return DevLoopResult(
@@ -2159,6 +2186,13 @@ class DevLoopWorkflow:
         # from also observing `_abandoned`, which is not itself a new
         # command (see `abandon`'s docstring): a parked execution has no
         # history event to diverge from at this position.
+        if dispatched_advance_pending:
+            # The success-path advance never got an answer. Once more before
+            # the park, which may last days with the loop RUNNING — the one
+            # state the dispatcher's reconciliation must not touch. Still best
+            # effort: the loop's outcome does not depend on it. Dispatched
+            # loops only; an undispatched loop never gets here.
+            await self._advance_dispatched_execution(dispatched_advance_pending, patient=True)
         approval_ended: str | None = None
         if workflow.patched("approval-watch"):
             approval_deadline = workflow.now() + APPROVAL_WAIT_DEADLINE

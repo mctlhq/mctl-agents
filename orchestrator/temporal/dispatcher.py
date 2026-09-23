@@ -347,9 +347,12 @@ class Dispatcher:
         block every later request for the item (`execution_active`). Narrow
         on purpose: only a Temporal execution whose engine ref is a
         dispatched loop id (this dispatcher's own runs), only while it is
-        non-terminal, and only once Temporal says that run is CLOSED. An
-        execution of another engine, of an issue-keyed loop, of a run that
-        is still RUNNING or that Temporal does not know (ABSENT) is never
+        non-terminal, and only once Temporal says that run is not RUNNING:
+        CLOSED, or ABSENT. ABSENT counts because the `dev-loop-xr_` prefix
+        already proves this dispatcher started the run, and Temporal forgets
+        a started workflow only after it closed and its namespace retention
+        expired; a RUNNING workflow is always found. An execution of another
+        engine, of an issue-keyed loop, or of a RUNNING run is never
         touched. The write is the same attach-or-advance the loop itself
         uses, through the policy checkpoint; its answer is logged and never
         stops the dispatch (mctl-api's fulfil re-decides regardless)."""
@@ -361,7 +364,7 @@ class Dispatcher:
                 continue
             if not execution.phase or execution.phase in TERMINAL_PHASES:
                 continue
-            if await self._temporal.loop_state(ref) != LOOP_CLOSED:
+            if await self._temporal.loop_state(ref) == LOOP_RUNNING:
                 continue
             answer = await asyncio.to_thread(
                 self._api.attach_execution, item.work_item_id, EngineRun(engine=ENGINE, engine_ref=ref), "Failed"
@@ -387,6 +390,10 @@ class Dispatcher:
             return DispatchOutcome(REJECTED, **ids, reason=reason)
         if answer.verdict == xr.NOT_CLAIMED:
             return DispatchOutcome(FENCED, **ids, reason=answer.reason)
+        if answer.verdict == xr.CLOSED:
+            # Fulfilled with another run, or already rejected, while we held
+            # it: terminal, never claimable again — not a deferral.
+            return DispatchOutcome(CLOSED, **ids, execution_id=answer.execution_id, reason=answer.reason)
         return DispatchOutcome(DEFERRED, **ids, reason=f"reject {answer.verdict}: {answer.reason}")
 
     def _defer(self, request: xr.ExecutionRequest, own_id: str, reason: str) -> DispatchOutcome:
