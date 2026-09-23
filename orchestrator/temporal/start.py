@@ -17,7 +17,12 @@ from orchestrator.temporal.constants import TASK_QUEUE
 # workflow_id_for moved to issue_ref (temporalio-free) so agent-container
 # callers can import it without the SDK; re-exported here because this
 # module is where every Temporal-side caller historically found it.
-from orchestrator.temporal.issue_ref import workflow_id_for
+from orchestrator.temporal.issue_ref import (  # noqa: F401 — re-exported for Temporal-side callers
+    DISPATCHED_WORKFLOW_PREFIX,
+    dispatched_workflow_id,
+    is_dispatched_workflow_id,
+    workflow_id_for,
+)
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 
 
@@ -70,17 +75,6 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )
-
-
-def dispatched_workflow_id(execution_request_id: str) -> str:
-    """The DevLoop workflow id for one mctl-api execution request
-    (mctlhq/mctl-agents#461): a pure function of the request id, so every
-    claim of the same request — the first, or a re-claim after a crash and
-    a lapsed lease, under a new claim token — names the same run. It is
-    also the `engine_ref` the dispatcher fulfils the request with, so the
-    same run is the same `we_` execution by mctl-api's
-    `(engine, engine_ref)` idempotency."""
-    return f"dev-loop-{execution_request_id}"
 
 
 async def start_dispatched_dev_loop(client: Client, issue: IssueRef) -> WorkflowHandle:

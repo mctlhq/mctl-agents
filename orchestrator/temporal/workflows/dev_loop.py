@@ -1909,11 +1909,34 @@ class DevLoopWorkflow:
         )
         return bound, ""
 
+    async def _fail_dispatched_execution(self) -> None:
+        """Advance the dispatched execution to `Failed` while the loop is
+        unwinding, including on a workflow cancellation.
+
+        Awaited in place from the `except` handler, NOT wrapped in
+        `asyncio.shield`: a Temporal cancellation cancels the workflow's task
+        once, and an activity scheduled from the handler that caught it runs
+        to completion (the SDK's cleanup idiom), which
+        `test_a_cancelled_dispatched_loop_still_ends_its_execution` pins. A
+        shield would add nothing for that, and costs a separate task that an
+        EVICTION cannot account for: the SDK tears an evicted workflow down
+        by cancelling its tasks, and a task created in that teardown outlives
+        it and later runs on another event loop (measured: a terminated
+        dispatched loop did exactly that). Awaiting in place, the eviction's
+        own `_WorkflowBeingEvictedError` stops the attempt before any command
+        is scheduled.
+
+        A loop TERMINATED instead runs no code at all; the dispatcher closes
+        that gap (`dispatcher._reconcile_closed_loops`)."""
+        await self._advance_dispatched_execution("Failed")
+
     async def _advance_dispatched_execution(self, phase: str) -> None:
-        """Best effort, like `_record`: the investigator already ran, so a
-        store that will not take the phase must not fail the loop. An
-        execution left non-terminal blocks only a later resume of the item,
-        which mctl-api refuses as `execution_active` and says so."""
+        """Best effort, like `_record`: a store that will not take the phase
+        must not fail the loop. But an execution left non-terminal blocks
+        EVERY later request for the item, not only a resume: mctl-api's
+        attach rule refuses any new non-terminal execution while one is
+        (`execution_active`). The dispatcher reconciles one it can prove
+        dead (`dispatcher._reconcile_closed_loops`)."""
         try:
             outcome = await workflow.execute_activity(
                 advance_dispatched_execution,
@@ -1987,33 +2010,49 @@ class DevLoopWorkflow:
                 )
             )
 
-        # Pin the investigator version ONCE, at the start of this step. A
-        # later promote/rollback in the registry must not retroactively
-        # change what an in-flight (or replayed) workflow already ran.
-        investigator_release = _require_release(
-            "issue-investigator", await _resolve("issue-investigator")
-        )
-        # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
-        # NOT passed here yet — the investigate CWFT rejects undeclared
-        # parameters, so the template must declare it first (fail-closed:
-        # gitops before code). Until then the read path's retirement of
-        # same-issue leftovers rests on the `created_at`-vs-start-time
-        # check in `_await_human_input`.
-        investigate_params = {"issue_url": issue.issue_url}
-        if investigator_release and investigator_release.image_ref:
-            investigate_params["agent_image"] = investigator_release.image_ref
-            investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
-        if dispatched is not None:
-            # The investigate CWFT's declared `work_item_id`/`execution_id`
-            # parameters (gitops#1279) become `--work-item-id`/`--execution-id`:
-            # the investigator uses this `we_` as its execution identity and
-            # refuses it unless it is in that item's ledger, and refuses an
-            # item about another issue (`work-item mismatch`).
-            investigate_params["work_item_id"] = self._work_item_id
-            investigate_params["execution_id"] = dispatched.execution_id
+        # A dispatched execution must end on EVERY exit from here to its
+        # advance below, not only the successful one: the investigator
+        # container, handed a `we_`, never writes it, so an exception here
+        # (an unpinned release, an Argo submit that exhausted its retries or
+        # its timeout, a cancelled workflow) would otherwise leave it
+        # non-terminal forever, and mctl-api refuses every later request for
+        # the item while it is (`execution_active`). No command is added on
+        # the path that does not raise, and none at all for an undispatched
+        # loop, so no history recorded before this changes shape.
+        try:
+            # Pin the investigator version ONCE, at the start of this step. A
+            # later promote/rollback in the registry must not retroactively
+            # change what an in-flight (or replayed) workflow already ran.
+            investigator_release = _require_release(
+                "issue-investigator", await _resolve("issue-investigator")
+            )
+            # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
+            # NOT passed here yet — the investigate CWFT rejects undeclared
+            # parameters, so the template must declare it first (fail-closed:
+            # gitops before code). Until then the read path's retirement of
+            # same-issue leftovers rests on the `created_at`-vs-start-time
+            # check in `_await_human_input`.
+            investigate_params = {"issue_url": issue.issue_url}
+            if investigator_release and investigator_release.image_ref:
+                investigate_params["agent_image"] = investigator_release.image_ref
+                investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
+            if dispatched is not None:
+                # The investigate CWFT's declared `work_item_id`/`execution_id`
+                # parameters (gitops#1279) become `--work-item-id`/`--execution-id`:
+                # the investigator uses this `we_` as its execution identity and
+                # refuses it unless it is in that item's ledger, and refuses an
+                # item about another issue (`work-item mismatch`).
+                investigate_params["work_item_id"] = self._work_item_id
+                investigate_params["execution_id"] = dispatched.execution_id
 
-        investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
-        await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+            investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
+            await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+        except (Exception, asyncio.CancelledError):
+            # Not BaseException: GeneratorExit and the SDK eviction teardown
+            # must unwind untouched (see `_fail_dispatched_execution`).
+            if dispatched is not None:
+                await self._fail_dispatched_execution()
+            raise
         if dispatched is not None:
             # The dispatched execution IS this investigator run: it ends
             # here, whatever the loop does next, so the item's one

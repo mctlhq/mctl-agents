@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -695,8 +696,28 @@ async def main() -> None:
         await run_until_signalled(workers)
     finally:
         if dispatcher_task is not None:
-            dispatcher_stop.set()
-            dispatcher_task.cancel()
+            await stop_dispatcher(dispatcher_task, dispatcher_stop)
+
+
+#: How long the dispatcher gets to finish the dispatch in flight once asked to
+#: stop, before it is cancelled. A dispatch cut short converges anyway (the
+#: lease lapses and the next claim takes the same run), so this is courtesy,
+#: not correctness; it stays well inside the pod's termination grace.
+DISPATCHER_STOP_GRACE_SECONDS = 5.0
+
+
+async def stop_dispatcher(
+    task: asyncio.Task[None], stop: asyncio.Event, *, grace: float = DISPATCHER_STOP_GRACE_SECONDS
+) -> None:
+    """Ask the dispatcher loop to stop, give it `grace` seconds to finish the
+    dispatch in flight, then cancel it — and always await it, so the task is
+    never destroyed pending at interpreter exit."""
+    stop.set()
+    done, _ = await asyncio.wait({task}, timeout=grace)
+    if not done:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 def runs_dispatcher(role: str) -> bool:

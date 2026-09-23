@@ -230,7 +230,7 @@ as the service principal, turns the request into a run:
    again under a new token, and fulfil/reject are fenced by the token).
 2. **Decide from the store.** v1 runs the investigator for an item bound to
    a mctlhq GitHub issue; any other item is rejected `no_runnable_target`.
-   A live DevLoop for the item (the latest Temporal execution in its ledger,
+   A live DevLoop for the item (behind any Temporal execution in its ledger,
    or the issue-keyed loop) refuses a `start` (`loop_active`) and a
    `resume` (`resume_onto_live_loop_unsupported`, below). With no live loop,
    a `resume` starts a continuation exactly as `start` starts a first run.
@@ -245,12 +245,19 @@ next claim derives the same workflow id and engine ref; after it, the loop
 reads its `we_` from the fulfilled request itself (the
 `bind_dispatched_execution` activity), which also refuses a request of
 another item, an item about another issue, or an execution that is not the
-loop's own engine run (`work-item-mismatch`). The loop passes
+loop's own engine run (`work-item-mismatch`); a definite refusal of the
+request read is the same mismatch, never a 30-minute retry. The loop passes
 `work_item_id` and the `we_` to the investigate CWFT's declared parameters;
 the investigator uses it as-is (case a in §7). The dispatched execution is
 the first investigator run: the loop advances it to `Succeeded`/`Failed`
-when that run ends, which frees the item's non-terminal slot for a later
-resume. Human-input continuations run without it (their context differs,
+when that run ends, and to `Failed` on every exit before that (a missing
+release, an exhausted or timed-out submit, a cancellation, shielded), since
+a non-terminal execution makes mctl-api refuse every later request for the
+item (`execution_active`). A terminated loop runs no code, so the dispatcher
+fails a non-terminal execution whose engine ref is a dispatched loop id
+once Temporal reports that loop CLOSED, and touches nothing else. Only the
+typed re-decisions `state_version_conflict` and `invalid_transition` reject
+a request at fulfil; anything else defers to a later claim. Human-input continuations run without it (their context differs,
 and one execution seals one snapshot).
 
 **Resume onto a live loop is refused in v1**, not delivered. The `resume`

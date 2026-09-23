@@ -13,7 +13,7 @@ One dispatch, in order:
 2. **Decide** what to run, from the store, never guessed:
    - v1 runs the investigator for an item bound to a mctlhq GitHub issue
      (`issue_url`). Anything else is rejected `no_runnable_target`.
-   - A DevLoop already live for the item (the latest Temporal execution in
+   - A DevLoop already live for the item (behind any Temporal execution in
      its ledger, or the issue's own `dev-loop-<owner>-<repo>-<n>` loop)
      refuses a `start` (`loop_active`) and a `resume`
      (`resume_onto_live_loop_unsupported`, see below). No live loop: a
@@ -66,7 +66,12 @@ import os
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from orchestrator.temporal.issue_ref import parse_issue_url, workflow_id_for
+from orchestrator.temporal.issue_ref import (
+    dispatched_workflow_id,
+    is_dispatched_workflow_id,
+    parse_issue_url,
+    workflow_id_for,
+)
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.contract import WORK_ITEM_FOUND
 
@@ -111,6 +116,34 @@ CLOSED = "closed"
 CLAIM_FAILED = "claim-failed"
 
 _TRUTHY = {"1", "true", "yes", "on"}
+
+#: mctl-api's terminal execution phases (`workitems.IsTerminalPhase`).
+TERMINAL_PHASES = frozenset({"Succeeded", "Failed", "Error"})
+
+#: The ONLY fulfil refusals that reject the request. Both are mctl-api's
+#: typed re-decision of the item at fulfilment (`checkStart`/`checkRunnable`/
+#: `resumeTx` in internal/workitems), and both are permanent for THIS request,
+#: because its `expected_state_version` and kind never change:
+#:
+#: - `state_version_conflict`: the item moved past the version the surface
+#:   asked about. No later fulfil of this request can match it again.
+#: - `invalid_transition`: the item is terminal, or cannot take this kind
+#:   any more (a `start` for an item that has run, or is waiting).
+#:
+#: Everything else DEFERS (the lease lapses, a later claim retries) because it
+#: says nothing permanent about the request:
+#:
+#: - `execution_active`: another execution is non-terminal. That ends — the
+#:   live run finishes, or `_reconcile_closed_loops` fails one whose
+#:   dispatched loop is gone — and until then a retry is the right answer.
+#:   It cannot defer forever: this request's own loop gives up after
+#:   FULFILMENT_WAIT, and the next claim then rejects `engine_run_ended`.
+#: - `invalid_request` and any other untyped or unknown 4xx: most likely a
+#:   schema skew between this build and mctl-api; rejecting would destroy
+#:   every request that a fixed build could still serve.
+#: - a local policy-checkpoint DENY (no code at all): a statement about this
+#:   worker's identity or configuration, not about the request.
+TERMINAL_FULFIL_CODES = frozenset({"state_version_conflict", "invalid_transition"})
 
 
 def enabled() -> bool:
@@ -228,7 +261,7 @@ class Dispatcher:
             audit("claim_failed", verdict=claim.verdict, reason=claim.reason)
             return DispatchOutcome(CLAIM_FAILED, reason=claim.reason)
         request, token = claim.request, claim.claim_token
-        own_id = _own_workflow_id(request.request_id)
+        own_id = dispatched_workflow_id(request.request_id)
         audit(
             "claim",
             execution_request_id=request.request_id,
@@ -256,6 +289,8 @@ class Dispatcher:
         issue_url = runnable_issue_url(item.issue_url)
         if not issue_url:
             return await self._reject(request, token, own_id, xr.NO_RUNNABLE_TARGET)
+
+        await self._reconcile_closed_loops(request, item, own_id)
 
         for candidate in _live_loop_candidates(item, issue_url, own_id):
             if await self._temporal.loop_state(candidate) == LOOP_RUNNING:
@@ -296,12 +331,51 @@ class Dispatcher:
         if answer.verdict == xr.CLOSED:
             audit("closed", **ids, execution_id=answer.execution_id, reason=answer.reason)
             return DispatchOutcome(CLOSED, **ids, execution_id=answer.execution_id, reason=answer.reason)
-        if answer.verdict == xr.REFUSED:
-            # mctl-api re-decided the item and said no (it moved since the
-            # request was made). The request stays claimed for us to reject;
-            # the started loop reads the rejection and ends without running.
-            return await self._reject(request, token, own_id, f"{xr.FULFIL_REFUSED}:{answer.code or 'refused'}")
+        if answer.verdict == xr.REFUSED and answer.code in TERMINAL_FULFIL_CODES:
+            # mctl-api re-decided the item and said a permanent no (see
+            # TERMINAL_FULFIL_CODES). The request stays claimed for us to
+            # reject; the started loop reads the rejection and ends.
+            return await self._reject(request, token, own_id, f"{xr.FULFIL_REFUSED}:{answer.code}")
         return self._defer(request, own_id, f"fulfil {answer.verdict}: {answer.reason}")
+
+    async def _reconcile_closed_loops(self, request: xr.ExecutionRequest, item: Any, own_id: str) -> None:
+        """Fail every execution that a dispatched loop left non-terminal and
+        can no longer end itself (mctlhq/mctl-agents#461).
+
+        A dispatched loop ends its own `we_` on every exit it can run code
+        on, but a TERMINATED workflow runs none, and its execution would then
+        block every later request for the item (`execution_active`). Narrow
+        on purpose: only a Temporal execution whose engine ref is a
+        dispatched loop id (this dispatcher's own runs), only while it is
+        non-terminal, and only once Temporal says that run is CLOSED. An
+        execution of another engine, of an issue-keyed loop, of a run that
+        is still RUNNING or that Temporal does not know (ABSENT) is never
+        touched. The write is the same attach-or-advance the loop itself
+        uses, through the policy checkpoint; its answer is logged and never
+        stops the dispatch (mctl-api's fulfil re-decides regardless)."""
+        from orchestrator.work_context.executions import EngineRun
+
+        for execution in item.executions:
+            ref = execution.temporal_workflow_id
+            if not ref or ref == own_id or not is_dispatched_workflow_id(ref):
+                continue
+            if not execution.phase or execution.phase in TERMINAL_PHASES:
+                continue
+            if await self._temporal.loop_state(ref) != LOOP_CLOSED:
+                continue
+            answer = await asyncio.to_thread(
+                self._api.attach_execution, item.work_item_id, EngineRun(engine=ENGINE, engine_ref=ref), "Failed"
+            )
+            audit(
+                "reconcile",
+                execution_request_id=request.request_id,
+                work_item_id=item.work_item_id,
+                workflow_id=ref,
+                execution_id=execution.execution_id,
+                phase_was=execution.phase,
+                verdict=answer.verdict,
+                reason=answer.reason,
+            )
 
     async def _reject(
         self, request: xr.ExecutionRequest, token: str, own_id: str, reason: str, *, live_loop: str = ""
@@ -332,23 +406,17 @@ class Dispatcher:
         )
 
 
-def _own_workflow_id(request_id: str) -> str:
-    # Imported lazily: start.py pulls in temporalio, which callers of the
-    # pure parts of this module (and the tests' fakes) do not need.
-    from orchestrator.temporal.start import dispatched_workflow_id
-
-    return dispatched_workflow_id(request_id)
-
-
 def _live_loop_candidates(item: Any, issue_url: str, own_id: str) -> list[str]:
     """DevLoops that may be live for this item, other than this request's
-    own run (which is a convergence, never a conflict): the loop behind the
-    item's latest Temporal execution, and the issue-keyed loop the
-    `agents:intake` label path starts."""
-    candidates: list[str] = []
-    temporal_refs = [e.temporal_workflow_id for e in item.executions if e.temporal_workflow_id]
-    if temporal_refs:
-        candidates.append(temporal_refs[-1])
+    own run (which is a convergence, never a conflict): the loop behind
+    EVERY Temporal execution in its ledger, and the issue-keyed loop the
+    `agents:intake` label path starts.
+
+    Every one, not the latest: a dispatched loop ends its execution after
+    the investigator run and then stays RUNNING for days at the approval
+    gate or in the merge watch, so a newer execution from another loop says
+    nothing about whether an older loop is still alive."""
+    candidates = [e.temporal_workflow_id for e in item.executions if e.temporal_workflow_id]
     candidates.append(workflow_id_for(issue_url))
     return [c for c in dict.fromkeys(candidates) if c != own_id]
 

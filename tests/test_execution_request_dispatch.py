@@ -34,6 +34,7 @@ import anyio
 import pytest
 from temporalio import activity
 from temporalio.client import WorkflowExecutionStatus
+from temporalio.exceptions import ApplicationError
 from temporalio.testing import WorkflowEnvironment
 
 from orchestrator.temporal import dispatcher as dx
@@ -104,6 +105,9 @@ class DispatchFakeApi(FakeMctlApi):
         return view
 
     def request(self, method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+        if (method, path) in self.fail and path.startswith("/api/v1/execution-requests/"):
+            self.requests.append((method, path, copy.deepcopy(payload)))
+            return self.fail[(method, path)]
         if method == "POST" and path == "/api/v1/execution-requests/claim":
             self.requests.append((method, path, copy.deepcopy(payload)))
             return self._claim(payload or {})
@@ -284,16 +288,18 @@ def _investigate_log() -> tuple[Any, list[dict]]:
     return submit, seen
 
 
-def _loop_activities(submit: Any) -> list[Any]:
+def _loop_activities(submit: Any, **fakes: Any) -> list[Any]:
     from tests.test_dev_loop_workflow import _fake_activities
 
-    activities, *_ = _fake_activities(released=True)
+    activities, *_ = _fake_activities(released=True, **fakes)
     activities = [a for a in activities if a.__temporal_activity_definition.name != "submit_and_wait"]
     return [*activities, submit, bind_dispatched_execution, advance_dispatched_execution]
 
 
-def _worker(env: WorkflowEnvironment, submit: Any) -> Worker:
-    return Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=_loop_activities(submit))
+def _worker(env: WorkflowEnvironment, submit: Any, **fakes: Any) -> Worker:
+    return Worker(
+        env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=_loop_activities(submit, **fakes)
+    )
 
 
 def _dispatcher(env: WorkflowEnvironment, client: Any = None) -> dx.Dispatcher:
@@ -759,3 +765,263 @@ async def test_the_investigator_refuses_a_dispatched_execution_of_another_item(a
     assert answer.item is not None
     identity = resolve_identity(answer.item, "we_99999999-0000-4000-8000-000000000000", Client())
     assert identity.execution_id == "" and "is not an execution of work item" in identity.refusal
+
+
+# -- review round 1 (PR #468) ------------------------------------------------
+#
+# P2-1: every exit after a successful bind ends the dispatched execution.
+
+
+def _failing_submit(error: BaseException | None = None, *, block: bool = False) -> tuple[Any, anyio.Event]:
+    """An investigate submit that raises (or never returns, to be cancelled)."""
+    entered = anyio.Event()
+
+    @activity.defn(name="submit_and_wait")
+    async def submit(input: SubmitAndWaitInput) -> WorkflowResult:
+        if input.operation != "mctl-agents-investigate":
+            return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+        entered.set()
+        if block:
+            await anyio.sleep(10_000)
+        raise error or ApplicationError("argo unreachable", non_retryable=True)
+
+    return submit, entered
+
+
+async def _dispatch_and_fail(api, env, submit, *, expect_failure=True, **fakes) -> tuple[str, Any]:
+    """Dispatch one start request into a loop that fails; the loop's history."""
+    from temporalio.client import WorkflowFailureError
+
+    rid = api.create_request("start")
+    wid = dispatched_workflow_id(rid)
+    async with _worker(env, submit, **fakes):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        with pytest.raises(WorkflowFailureError):
+            await env.client.get_workflow_handle(wid).result()
+        history = await env.client.get_workflow_handle(wid).fetch_history()
+    return wid, history
+
+
+async def test_a_dispatched_loop_whose_investigate_submit_fails_still_ends_its_execution(api, env):
+    submit, _ = _failing_submit()
+    wid, history = await _dispatch_and_fail(api, env, submit)
+
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Failed")]
+    # The failure path replays: its extra command is on the dispatched path only.
+    from temporalio.worker import Replayer
+
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)
+
+
+async def test_a_dispatched_loop_without_a_pinned_investigator_still_ends_its_execution(api, env):
+    submit, entered = _failing_submit()
+    wid, _ = await _dispatch_and_fail(api, env, submit, unpinned={"issue-investigator"})
+
+    assert not entered.is_set()  # `_require_release` raised before any submit
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Failed")]
+
+
+async def test_a_cancelled_dispatched_loop_still_ends_its_execution(api, env):
+    from temporalio.client import WorkflowFailureError
+
+    submit, entered = _failing_submit(block=True)
+    rid = api.create_request("start")
+    wid = dispatched_workflow_id(rid)
+    async with _worker(env, submit):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        await _wait_for(entered.is_set)
+        assert api.executions[0]["phase"] == "Running"
+        handle = env.client.get_workflow_handle(wid)
+        await handle.cancel()
+        with pytest.raises(WorkflowFailureError):
+            await handle.result()
+        desc = await handle.describe()
+
+    assert desc.status == WorkflowExecutionStatus.CANCELED
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Failed")]
+
+
+async def test_the_dispatcher_fails_the_execution_of_a_terminated_dispatched_loop(api, env, capsys):
+    """A terminated loop runs no code, so its `we_` stays Running and every
+    later request would meet `execution_active`. The next dispatch fails it,
+    and only it, once Temporal reports that loop closed."""
+    submit, entered = _failing_submit(block=True)
+    first = api.create_request("start")
+    first_loop = dispatched_workflow_id(first)
+    async with _worker(env, submit):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        await _wait_for(entered.is_set)
+        await env.client.get_workflow_handle(first_loop).terminate("operator")
+        assert api.executions[0]["phase"] == "Running"
+
+        second = api.create_request("resume")
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED, outcome
+        await env.client.get_workflow_handle(outcome.workflow_id).terminate("test over")
+
+    assert (api.executions[0]["engine_ref"], api.executions[0]["phase"]) == (first_loop, "Failed")
+    assert api.executions[1]["engine_ref"] == dispatched_workflow_id(second)
+    reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert [(a["workflow_id"], a["phase_was"]) for a in reconcile] == [(first_loop, "Running")]
+
+
+def _ledger_entry(api: DispatchFakeApi, engine: str, ref: str, phase: str) -> None:
+    api._next += 1
+    api.executions.append(
+        {
+            "id": f"we_{api._next:08d}-0000-4000-8000-000000000000",
+            "work_item_id": WID,
+            "engine": engine,
+            "engine_ref": ref,
+            "attempt": len(api.executions) + 1,
+            "phase": phase,
+            "started_at": "2026-09-23T00:00:00Z",
+        }
+    )
+
+
+async def test_the_reconciliation_never_touches_another_engine_or_a_non_dispatched_loop(api, capsys):
+    """Non-terminal executions of an Argo run and of an issue-keyed loop that
+    Temporal says is closed are left alone; the fulfil then meets
+    `execution_active` and defers (the request stays claimed)."""
+    _ledger_entry(api, "argo", "mctl-agents-investigate-abcde", "Succeeded")
+    _ledger_entry(api, "temporal", workflow_id_for(URL), "Running")
+    _ledger_entry(api, "argo", "mctl-agents-investigate-fghij", "Running")
+    rid = api.create_request("resume")
+    temporal = FakeTemporal({workflow_id_for(URL): dx.LOOP_CLOSED})
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED and "execution_active" in outcome.reason
+    assert api.request_state(rid)["state"] == "claimed"
+    assert [e["phase"] for e in api.executions] == ["Succeeded", "Running", "Running"]
+    assert not [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert not [p for m, p, b in api.requests if m == "POST" and p.endswith("/executions")]
+
+
+async def test_the_reconciliation_leaves_a_running_dispatched_loop_alone(api):
+    live = dispatched_workflow_id("xr_99999999-0000-4000-8000-000000000461")
+    _ledger_entry(api, "temporal", live, "Running")
+    api.create_request("resume")
+    temporal = FakeTemporal({live: dx.LOOP_RUNNING})
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED and outcome.reason == xr.RESUME_ONTO_LIVE_LOOP_UNSUPPORTED
+    assert api.executions[0]["phase"] == "Running"
+
+
+# P2-2: every loop in the ledger is checked, not only the latest.
+
+
+async def test_an_older_live_loop_is_found_behind_a_newer_closed_one(api):
+    older = dispatched_workflow_id("xr_00000009-0000-4000-8000-000000000461")
+    _ledger_entry(api, "temporal", older, "Succeeded")  # ended its run, still parked at approval
+    _ledger_entry(api, "temporal", workflow_id_for(URL), "Succeeded")  # the label loop, finished
+    rid = api.create_request("resume")
+    temporal = FakeTemporal({older: dx.LOOP_RUNNING, workflow_id_for(URL): dx.LOOP_CLOSED})
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["reason"] == xr.RESUME_ONTO_LIVE_LOOP_UNSUPPORTED
+    assert temporal.started == [] and api.fulfils() == []
+
+
+# P2-3: only mctl-api's typed re-decisions reject; everything else defers.
+
+
+async def test_a_typed_re_decision_at_fulfil_rejects_the_request(api):
+    rid = api.create_request("start")
+    api.state_version += 1  # the item moved after the surface asked
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED
+    assert api.request_state(rid)["reason"] == f"{xr.FULFIL_REFUSED}:state_version_conflict"
+
+
+async def test_an_untyped_400_at_fulfil_defers_instead_of_rejecting(api):
+    rid = api.create_request("start")
+    api.fail[("POST", f"/api/v1/execution-requests/{rid}/fulfil")] = _HTTPResult(
+        400, {"code": "invalid_request", "error": "unknown field engine_ref"}
+    )
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED
+    assert api.request_state(rid)["state"] == "claimed" and api.executions == []
+
+
+async def test_a_codeless_4xx_at_fulfil_defers_instead_of_rejecting(api):
+    rid = api.create_request("start")
+    api.fail[("POST", f"/api/v1/execution-requests/{rid}/fulfil")] = _HTTPResult(422, {})
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED and api.request_state(rid)["state"] == "claimed"
+
+
+async def test_a_policy_checkpoint_deny_at_fulfil_defers_instead_of_rejecting(api, monkeypatch):
+    from orchestrator import policy_checkpoint as pc
+
+    real = pc.checkpoint
+
+    def deny_fulfil(action_kind, operation, *args, **kwargs):
+        if operation == xr.FULFIL_OPERATION:
+            return pc.Decision(pc.DENY, pc.CODE_IDENTITY_UNAVAILABLE, "no sealed context", "v", "", "")
+        return real(action_kind, operation, *args, **kwargs)
+
+    monkeypatch.setattr(pc, "checkpoint", deny_fulfil)
+    rid = api.create_request("start")
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED
+    assert api.request_state(rid)["state"] == "claimed" and api.fulfils() == []
+
+
+# P3-4: a definite refusal of the request read is a mismatch, not a retry.
+
+
+async def test_a_refused_request_read_is_a_mismatch_not_a_thirty_minute_retry(api, env):
+    submit, seen = _investigate_log()
+    missing = "xr_77777777-0000-4000-8000-000000000461"  # the scoped route answers 404
+
+    result = await _run_loop(
+        env,
+        submit,
+        IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=missing),
+        dispatched_workflow_id(missing),
+    )
+
+    assert "work-item-mismatch" in result.ended and "not fulfilled" not in result.ended
+    assert seen == []
+    reads = [p for m, p, _ in api.requests if m == "GET" and p.endswith(missing)]
+    assert len(reads) == 1
+
+
+# P3-5: the dispatcher is stopped gracefully, then cancelled, and always awaited.
+
+
+async def test_stop_dispatcher_lets_the_loop_finish_within_the_grace():
+    import asyncio
+
+    class Idle:
+        async def dispatch_once(self) -> dx.DispatchOutcome:
+            return dx.DispatchOutcome(dx.NOTHING)
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(dx.run_dispatcher(Idle(), stop, interval=3600))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    await worker_module.stop_dispatcher(task, stop, grace=5)
+    assert task.done() and not task.cancelled()
+
+
+async def test_stop_dispatcher_cancels_and_awaits_a_loop_that_does_not_stop():
+    import asyncio
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(asyncio.sleep(3600))
+    await worker_module.stop_dispatcher(task, stop, grace=0.05)  # type: ignore[arg-type]
+    assert stop.is_set() and task.cancelled()

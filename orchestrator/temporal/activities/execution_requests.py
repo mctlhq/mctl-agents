@@ -93,6 +93,14 @@ async def bind_dispatched_execution(input: BindInput) -> BoundExecution:
     CREATE an execution, which is exactly what this loop must never do."""
     client = _client()
     read = await asyncio.to_thread(client.execution_request, input.work_item_id, input.execution_request_id)
+    if read.verdict == xr.REFUSED:
+        # A definite no from mctl-api (e.g. 404 on the item-scoped route: no
+        # such request under THIS work item). Retrying it for FULFILMENT_WAIT
+        # would only end in a misleading "not fulfilled"; it is a mismatch.
+        return BoundExecution(
+            MISMATCH,
+            reason=f"execution request {input.execution_request_id} of {input.work_item_id}: {read.reason}",
+        )
     if read.verdict != xr.FOUND or read.request is None:
         raise ApplicationError(
             f"execution request {input.execution_request_id}: {read.verdict} {read.reason}".strip(),
