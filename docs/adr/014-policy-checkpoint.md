@@ -104,6 +104,7 @@ Built-in policy `mctl-agents/policy/v1`:
 |---|---|
 | issue comments | ALLOW |
 | the investigate operation | ALLOW |
+| sealing this execution's context snapshot (`mctl.work_item.write`, `seal:context-snapshot`; insert-only in mctl-api, #431) | ALLOW |
 | mctl MCP reads (`get_`, `list_`, `read_`, `search_`, `describe_`, `whoami`, …) and the agent mutations `resolve_incident`, `acknowledge_incident` | ALLOW |
 | every other granted mctl MCP tool, including any added to mctl-api later | REQUIRE_APPROVAL |
 | anything else | DENY |

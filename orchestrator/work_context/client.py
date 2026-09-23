@@ -31,6 +31,14 @@ from orchestrator.work_context.contract import (
     latest_execution_id_of,
     with_executions,
 )
+from orchestrator.work_context.snapshots import (
+    SEAL_SNAPSHOT_OPERATION,
+    SNAPSHOT_REFUSED,
+    SNAPSHOT_UNKNOWN,
+    SnapshotAnswer,
+    answer_from_read,
+    answer_from_seal,
+)
 
 DEFAULT_TIMEOUT_S = 10
 
@@ -38,6 +46,8 @@ DEFAULT_TIMEOUT_S = 10
 ROUTES = {
     "get_work_item": "/api/v1/work-items/{id}",
     "list_executions": "/api/v1/work-items/{id}/executions",
+    # Sealed ContextSnapshots (mctl-api#362, mctlhq/mctl-agents#431).
+    "execution_snapshot": "/api/v1/work-items/{id}/executions/{execution_id}/snapshot",
 }
 
 
@@ -179,6 +189,45 @@ class WorkItemClient:
         # v1 executions carry no surface/actor kinds, so the verdict the view
         # already earned is unchanged.
         return WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=with_executions(item, executions), accepted=True)
+
+    # -- sealed snapshots (mctlhq/mctl-agents#431) ------------------------
+
+    def execution_snapshot(self, work_item_id: str, execution_id: str) -> SnapshotAnswer:
+        """The snapshot `execution_id` sealed: REPLAYED with its id, ABSENT
+        when it sealed none, UNKNOWN otherwise."""
+        path = ROUTES["execution_snapshot"].format(id=_q(work_item_id), execution_id=_q(execution_id))
+        try:
+            res = self._request("GET", path)
+        except WorkItemUnavailable as exc:
+            return SnapshotAnswer(SNAPSHOT_UNKNOWN, reason=str(exc))
+        return answer_from_read(res.status, res.payload, execution_id=execution_id)
+
+    def seal_snapshot(self, work_item_id: str, execution_id: str, body: dict[str, Any]) -> SnapshotAnswer:
+        """Seal `body` as `execution_id`'s snapshot. The policy checkpoint
+        (#197) sits immediately before the POST; a refusal is answered as
+        REFUSED and nothing is sent."""
+        from orchestrator import policy_checkpoint
+
+        decision = policy_checkpoint.checkpoint(
+            policy_checkpoint.MCTL_WORK_ITEM_WRITE,
+            SEAL_SNAPSHOT_OPERATION,
+            work_item_id,
+            body,
+            metadata={"work_item_id": work_item_id, "execution_id": execution_id},
+        )
+        if not decision.permitted:
+            return SnapshotAnswer(
+                SNAPSHOT_REFUSED, content_hash=str(body.get("content_hash", "")),
+                reason=f"policy {decision.verdict} ({decision.code})",
+            )
+        path = ROUTES["execution_snapshot"].format(id=_q(work_item_id), execution_id=_q(execution_id))
+        try:
+            res = self._request("POST", path, body)
+        except WorkItemUnavailable as exc:
+            return SnapshotAnswer(SNAPSHOT_UNKNOWN, content_hash=str(body.get("content_hash", "")), reason=str(exc))
+        return answer_from_seal(
+            res.status, res.payload, content_hash=str(body.get("content_hash", "")), execution_id=execution_id
+        )
 
     # No record_execution write: the POST's response is the created
     # execution record, not a WorkItem view, and nothing in this repo

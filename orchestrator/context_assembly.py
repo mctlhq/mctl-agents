@@ -766,10 +766,15 @@ def assemble_investigator_context(
     config: AssemblyConfig | None = None,
     now: datetime | None = None,
     work_context: WorkContextRef | None = None,
+    work_item_client: Any | None = None,
 ) -> AssemblyResult | None:
     """The feature-gated entry point `run_issue_investigator.investigate()`
     calls. Returns `None` when `mode == "off"` — no collector runs, no
-    snapshot is sealed, matching today's behaviour byte-for-byte."""
+    snapshot is sealed, matching today's behaviour byte-for-byte.
+
+    With the work-context rollout at `observe` or above and a store
+    execution (`we_...`), the sealed snapshot is also persisted to mctl-api
+    (mctlhq/mctl-agents#431, `_persist_to_work_item_store`)."""
     if mode == "off":
         return None
 
@@ -798,4 +803,80 @@ def assemble_investigator_context(
         now=resolved_now,
         config=resolved_config,
     )
-    return assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
+    work_context = _link_prior_snapshot(work_context, work_item_client)
+    result = assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
+    _persist_to_work_item_store(result.snapshot, work_item_client)
+    return result
+
+
+class SnapshotNotPersisted(RuntimeError):
+    """The sealed snapshot could not be stored as this execution's, at a
+    rollout stage where that blocks the run."""
+
+
+def _emit_snapshot_answer(step: str, answer: Any) -> None:
+    import json
+
+    print(
+        "WORK_CONTEXT_SNAPSHOT "
+        + json.dumps(
+            {"step": step, "verdict": answer.verdict, "snapshot_id": answer.snapshot_id,
+             "content_hash": answer.content_hash, "reason": answer.reason},
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def _work_context_active(work_context: WorkContextRef | None) -> bool:
+    from orchestrator.work_context import rollout
+    from orchestrator.work_context.snapshots import is_store_execution
+
+    return (
+        work_context is not None
+        and is_store_execution(work_context.execution_id)
+        and rollout.at_least(rollout.OBSERVE)
+    )
+
+
+def _client(work_item_client: Any | None) -> Any:
+    if work_item_client is not None:
+        return work_item_client
+    from orchestrator.work_context.client import WorkItemClient
+
+    return WorkItemClient()
+
+
+def _link_prior_snapshot(work_context: WorkContextRef | None, work_item_client: Any | None) -> WorkContextRef | None:
+    """Point `resumed_from_snapshot_id` at the prior execution's sealed
+    snapshot before this execution's is sealed. A convenience pointer
+    (ADR 011): a failed lookup is logged and never blocks."""
+    if work_context is None or not _work_context_active(work_context):
+        return work_context
+    from orchestrator.work_context.snapshots import SNAPSHOT_SKIPPED, resumed_from
+
+    linked, answer = resumed_from(work_context, _client(work_item_client))
+    if answer.verdict != SNAPSHOT_SKIPPED:
+        _emit_snapshot_answer("resumed_from", answer)
+    return linked
+
+
+def _persist_to_work_item_store(snapshot: ContextSnapshot, work_item_client: Any | None) -> None:
+    """Store the sealed snapshot as its execution's (mctl-api, insert-only).
+
+    A divergence — this execution already sealed a different context — is
+    refused by the store and never overwritten. It blocks the run from
+    `enforce` up, like any answer that leaves the store without this
+    execution's snapshot when `blocks_on_unknown()` holds; at `observe` it is
+    logged and the issue path still decides."""
+    if not _work_context_active(snapshot.work_context):
+        return
+    from orchestrator.work_context import rollout
+    from orchestrator.work_context.snapshots import SNAPSHOT_DIVERGED, persist
+
+    answer = persist(snapshot, _client(work_item_client))
+    _emit_snapshot_answer("persist", answer)
+    if answer.stored:
+        return
+    if (answer.verdict == SNAPSHOT_DIVERGED and rollout.new_answer_may_veto()) or rollout.blocks_on_unknown():
+        raise SnapshotNotPersisted(f"{answer.verdict}: {answer.reason}")
