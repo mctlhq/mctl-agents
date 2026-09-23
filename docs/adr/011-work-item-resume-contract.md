@@ -219,6 +219,63 @@ because it shares the engine ref. Any other stranded `Running` row has to be
 closed by the engine's exit path. Closing it blindly from here would instead
 create phantom ended rows on a plain 503.
 
+### 8. Execution requests are dispatched by the platform (#461)
+
+A surface asks for a run by creating an mctl-api execution request
+(mctl-api#368); it never names the engine, the run or the execution. The
+dispatcher in `orchestrator/temporal/dispatcher.py`, running in the worker
+as the service principal, turns the request into a run:
+
+1. **Claim** under a lease (mctl-api's CAS; a lapsed lease is claimable
+   again under a new token, and fulfil/reject are fenced by the token).
+2. **Decide from the store.** v1 runs the investigator for an item bound to
+   a mctlhq GitHub issue; any other item is rejected `no_runnable_target`.
+   A live DevLoop for the item (the latest Temporal execution in its ledger,
+   or the issue-keyed loop) refuses a `start` (`loop_active`) and a
+   `resume` (`resume_onto_live_loop_unsupported`, below). With no live loop,
+   a `resume` starts a continuation exactly as `start` starts a first run.
+3. **Start** `DevLoopWorkflow` under `dev-loop-<request id>`: `USE_EXISTING`
+   on conflict, `REJECT_DUPLICATE` on reuse. A request is run once.
+4. **Fulfil** with `(temporal, <that workflow id>)`. mctl-api attaches the
+   `we_` (`start`: Running; `resume`: Pending under the `/resume` rule,
+   which re-decides the item and its approval is the new run's own).
+
+Start precedes fulfil so that every crash converges: before the fulfil, the
+next claim derives the same workflow id and engine ref; after it, the loop
+reads its `we_` from the fulfilled request itself (the
+`bind_dispatched_execution` activity), which also refuses a request of
+another item, an item about another issue, or an execution that is not the
+loop's own engine run (`work-item-mismatch`). The loop passes
+`work_item_id` and the `we_` to the investigate CWFT's declared parameters;
+the investigator uses it as-is (case a in §7). The dispatched execution is
+the first investigator run: the loop advances it to `Succeeded`/`Failed`
+when that run ends, which frees the item's non-terminal slot for a later
+resume. Human-input continuations run without it (their context differs,
+and one execution seals one snapshot).
+
+**Resume onto a live loop is refused in v1**, not delivered. The `resume`
+signal carries the resumed execution's `we_`, which exists only after the
+fulfil, and a fulfilled request is never claimable again: a crash between
+fulfil and signal would lose the resume with nothing left to retry it, and
+the resumed execution would stay `Pending`, blocking the item. Delivering it
+durably needs a record of "fulfilled, not yet delivered" outside the
+dispatcher process, which this ADR has not decided (Alternative 3 below
+rejects a workflow per execution).
+
+Off by default (`EXECUTION_REQUEST_DISPATCHER`). Claim, fulfil and reject go
+through the policy checkpoint (ADR 014) and each dispatch step prints an
+`EXECUTION_REQUEST_DISPATCH` audit line with the request, item, workflow
+and execution ids. The dispatched path in `DevLoopWorkflow` is guarded by
+`workflow.patched("execution-request-dispatch")` and replayed from
+`tests/fixtures/histories/dev_loop_dispatched.json`.
+
+**Known gap.** Everything else that names a DevLoop derives the
+issue-keyed id (`workflow_id_for`): the investigator's approve instructions
+on the issue, the shepherd's legacy liveness check and the orphan sweep. A
+dispatched loop is `dev-loop-<request id>`, so it is approved through the
+mctl-api approve route with its own id (it is in the item's ledger as the
+execution's `engine_ref`), and the legacy checks do not see it.
+
 ## Alternatives
 
 1. **Reuse `StepRef` for cross-execution chaining.** Rejected: it would
@@ -298,3 +355,8 @@ two cross-repo prerequisites.
 | `WorkItemClient.seal_snapshot` / `execution_snapshot` | `orchestrator/work_context/client.py` |
 | `resolve_identity`, `engine_ref_from_env`, `answer_from_attach` (#455) | `orchestrator/work_context/executions.py` |
 | `WorkItemClient.attach_execution` (#455) | `orchestrator/work_context/client.py` |
+| Execution-request contract mirror, typed reject reasons (#461) | `orchestrator/work_context/execution_requests.py` |
+| `WorkItemClient.claim_execution_request` / `fulfil_execution_request` / `reject_execution_request` / `execution_request` (#461) | `orchestrator/work_context/client.py` |
+| Dispatcher, `EXECUTION_REQUEST_DISPATCHER` (#461) | `orchestrator/temporal/dispatcher.py`, `worker.py`, `cli.py dispatch-once` |
+| `dispatched_workflow_id`, `start_dispatched_dev_loop` (#461) | `orchestrator/temporal/start.py` |
+| `bind_dispatched_execution`, `advance_dispatched_execution` (#461) | `orchestrator/temporal/activities/execution_requests.py` |

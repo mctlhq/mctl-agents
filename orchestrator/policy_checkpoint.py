@@ -311,6 +311,15 @@ BUILTIN_POLICY = Policy(
         # by (engine, engine_ref), so the run can only name its own; it
         # never creates a work item, resumes one or changes its state.
         Rule("mctl-attach-own-execution", MCTL_WORK_ITEM_WRITE, "attach:work-item-execution", ALLOW),
+        # The execution-request dispatcher (mctlhq/mctl-agents#461, mctl-api#368):
+        # claim a surface's request under a lease, fulfil it with the engine
+        # run the dispatcher started, or reject it with a typed reason.
+        # mctl-api admits only the service principal, fences fulfil/reject
+        # by the claim token, and re-decides the item's state at fulfilment,
+        # so none of these can start work on an item that did not ask for it.
+        Rule("mctl-claim-execution-request", MCTL_WORK_ITEM_WRITE, "claim:execution-request", ALLOW),
+        Rule("mctl-fulfil-execution-request", MCTL_WORK_ITEM_WRITE, "fulfil:execution-request", ALLOW),
+        Rule("mctl-reject-execution-request", MCTL_WORK_ITEM_WRITE, "reject:execution-request", ALLOW),
         *(
             Rule("mctl-mcp-read", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True)
             for pattern in (*_mctl_tool_patterns(_READ_VERBS, prefix=True),

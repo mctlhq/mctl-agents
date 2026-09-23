@@ -119,6 +119,28 @@ async def status(workflow_id: str) -> None:
                 print(f"    detail:    {w.detail}")
 
 
+async def dispatch_once() -> None:
+    """Claim and dispatch one execution request (mctlhq/mctl-agents#461).
+
+    The same code path as the worker's dispatcher loop, one claim at a time,
+    for an operator verifying the dispatcher end to end. Off unless
+    `EXECUTION_REQUEST_DISPATCHER` is on, exactly like the loop: an operator
+    command must not be the way around the switch."""
+    from orchestrator.temporal import dispatcher
+    from orchestrator.work_context.client import WorkItemClient
+
+    if not dispatcher.enabled():
+        print(
+            f"error: the execution-request dispatcher is off; set {dispatcher.ENABLED_ENV_VAR}=true to run it",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    client = await connect()
+    outcome = await dispatcher.Dispatcher(WorkItemClient(), dispatcher.TemporalClientPort(client)).dispatch_once()
+    print(f"{outcome.action}: request={outcome.execution_request_id or '-'} "
+          f"workflow={outcome.workflow_id or '-'} execution={outcome.execution_id or '-'} {outcome.reason}".rstrip())
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI's argument parser.
 
@@ -167,6 +189,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Print a DevLoopWorkflow's status (and result, if complete)")
     p_status.add_argument("workflow_id")
 
+    sub.add_parser(
+        "dispatch-once",
+        help="Claim and dispatch one mctl-api execution request (mctl-agents#461; "
+             "needs EXECUTION_REQUEST_DISPATCHER=true)",
+    )
+
     return parser
 
 
@@ -180,6 +208,8 @@ def main() -> None:
         asyncio.run(abandon(args.workflow_id, args.reason))
     elif args.command == "status":
         asyncio.run(status(args.workflow_id))
+    elif args.command == "dispatch-once":
+        asyncio.run(dispatch_once())
 
 
 if __name__ == "__main__":

@@ -70,3 +70,42 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )
+
+
+def dispatched_workflow_id(execution_request_id: str) -> str:
+    """The DevLoop workflow id for one mctl-api execution request
+    (mctlhq/mctl-agents#461): a pure function of the request id, so every
+    claim of the same request — the first, or a re-claim after a crash and
+    a lapsed lease, under a new claim token — names the same run. It is
+    also the `engine_ref` the dispatcher fulfils the request with, so the
+    same run is the same `we_` execution by mctl-api's
+    `(engine, engine_ref)` idempotency."""
+    return f"dev-loop-{execution_request_id}"
+
+
+async def start_dispatched_dev_loop(client: Client, issue: IssueRef) -> WorkflowHandle:
+    """Start (or attach to) the DevLoop for `issue.execution_request_id`.
+
+    The policies are the "never a second run" half of the dispatcher's
+    idempotency, and are deliberately stricter than
+    `start_dev_loop_workflow`'s:
+
+    - `USE_EXISTING` on conflict: a RUNNING loop for the same request is
+      returned as-is — the re-claim after a crash between start and fulfil
+      converges on it instead of starting another.
+    - `REJECT_DUPLICATE` on reuse: a CLOSED loop for the same request raises
+      `WorkflowAlreadyStartedError`, whatever its outcome. A request is run
+      once. Unlike an issue-keyed loop, a failed dispatched run is not
+      restartable under the same id: the surface asks again (a new request,
+      a new id), which is what keeps one request from ever owning two runs.
+    """
+    if not issue.execution_request_id:
+        raise ValueError("start_dispatched_dev_loop needs an IssueRef with an execution_request_id")
+    return await client.start_workflow(
+        DevLoopWorkflow.run,
+        issue,
+        id=dispatched_workflow_id(issue.execution_request_id),
+        task_queue=TASK_QUEUE,
+        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )

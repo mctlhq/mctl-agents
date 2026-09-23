@@ -470,7 +470,13 @@ def test_every_history_actually_reaches_submit_and_wait(scenario: Scenario) -> N
 # was never signalled, and the recording stops there. Unlike the SCENARIOS
 # fixtures it is never re-recorded going forward -- once `approval-watch`
 # ships, no code checkout can produce this shape again.
-_STANDALONE_FIXTURES = {"implement_sweep.json", "swept_implement.json", "dev_loop_parked.json"}
+_STANDALONE_FIXTURES = {
+    "implement_sweep.json",
+    "swept_implement.json",
+    "dev_loop_parked.json",
+    # mctlhq/mctl-agents#461, replayed by tests/test_execution_request_replay.py.
+    "dev_loop_dispatched.json",
+}
 
 
 def test_every_recorded_fixture_belongs_to_a_scenario() -> None:

@@ -74,6 +74,13 @@ with workflow.unsafe.imports_passed_through():
         get_release_after,
         resolve_deploy_target,
     )
+    from orchestrator.temporal.activities.execution_requests import (
+        AdvanceInput,
+        BindInput,
+        BoundExecution,
+        advance_dispatched_execution,
+        bind_dispatched_execution,
+    )
     from orchestrator.temporal.activities.human_input import find_human_input_request
     from orchestrator.temporal.activities.incidents import (
         Incident,
@@ -225,6 +232,25 @@ APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 # budgets for its own 14-day watch.
 APPROVAL_POLL_INTERVAL = timedelta(hours=6)
 APPROVAL_WAIT_DEADLINE = timedelta(days=14)
+
+# A dispatched loop (mctlhq/mctl-agents#461) waits for its execution request
+# to be fulfilled before it runs anything: the dispatcher starts the loop
+# first and fulfils second. The wait is the bind activity's retry policy,
+# bounded by FULFILMENT_WAIT. Longer than mctl-api's longest claim lease
+# (15 min), so a dispatcher that crashed between the start and the fulfil
+# has one full lease to lapse and the next claim to converge on this loop
+# before it gives up. A loop that gives up ends; the next claim of its
+# request then finds the run ended and rejects the request (`engine_run_ended`).
+FULFILMENT_WAIT = timedelta(minutes=30)
+FULFILMENT_POLL_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=30),
+)
+#: The patch id guarding the dispatched path. Consulted only for a loop
+#: whose start input carries an execution request, so no other history
+#: records it.
+EXECUTION_REQUEST_PATCH = "execution-request-dispatch"
 
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
 # state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
@@ -505,6 +531,14 @@ class IssueRef:
     # is a string until something resolves it, and by then the whole
     # module has finished loading.
     resume: MergeWatchResume | None = None
+    #: The mctl-api execution request (`xr_...`) this loop was dispatched
+    #: for (mctlhq/mctl-agents#461). Set only by the dispatcher, always with
+    #: `work_item_id`; None on every other start, and on every history
+    #: recorded before this field existed, which therefore never enters the
+    #: dispatched path. The loop learns its canonical `we_` execution from
+    #: the fulfilled request, not from this input: see
+    #: `activities/execution_requests.py`.
+    execution_request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1837,6 +1871,60 @@ class DevLoopWorkflow:
                 resume_count=self._human_input_resume_count,
             )
 
+    async def _bind_dispatched_execution(self, issue: IssueRef) -> tuple[BoundExecution | None, str]:
+        """Wait for this loop's execution request to be fulfilled with this
+        workflow's own engine run, and adopt the `we_` it was given.
+
+        (bound execution, "") to run; (None, why) to end without running
+        anything: the request was rejected, the store's answer does not
+        describe this loop (`work-item-mismatch`), or it was never fulfilled
+        within FULFILMENT_WAIT."""
+        if not issue.work_item_id:
+            return None, "execution request without a work item: refused"
+        self._work_item_id = issue.work_item_id
+        try:
+            bound = await workflow.execute_activity(
+                bind_dispatched_execution,
+                BindInput(
+                    work_item_id=issue.work_item_id,
+                    execution_request_id=str(issue.execution_request_id),
+                    engine_ref=workflow.info().workflow_id,
+                    issue_url=issue.issue_url,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                schedule_to_close_timeout=FULFILMENT_WAIT,
+                retry_policy=FULFILMENT_POLL_RETRY_POLICY,
+            )
+        except ActivityError:
+            return None, f"execution request {issue.execution_request_id} was not fulfilled within {FULFILMENT_WAIT}"
+        if not bound.bound:
+            return None, f"execution request {issue.execution_request_id}: {bound.outcome}: {bound.reason}"
+        self._seen_execution_ids.add(bound.execution_id)
+        self._executions.append(
+            ExecutionRef(
+                execution_id=bound.execution_id,
+                sequence=bound.sequence,
+                temporal_workflow_id=workflow.info().workflow_id,
+            )
+        )
+        return bound, ""
+
+    async def _advance_dispatched_execution(self, phase: str) -> None:
+        """Best effort, like `_record`: the investigator already ran, so a
+        store that will not take the phase must not fail the loop. An
+        execution left non-terminal blocks only a later resume of the item,
+        which mctl-api refuses as `execution_active` and says so."""
+        try:
+            outcome = await workflow.execute_activity(
+                advance_dispatched_execution,
+                AdvanceInput(work_item_id=self._work_item_id, engine_ref=workflow.info().workflow_id, phase=phase),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+            workflow.logger.info("dispatched execution -> %s: %s", phase, outcome)
+        except ActivityError:
+            workflow.logger.warning("dispatched execution could not be advanced to %s", phase)
+
     @workflow.signal
     def abandon(self, *args: object) -> None:
         """Gracefully end this execution at its next observation point.
@@ -1874,7 +1962,20 @@ class DevLoopWorkflow:
         # mutations (see that signal's docstring for why no
         # `workflow.patched` gate is needed here: nothing below schedules a
         # new command as a result).
-        if issue.work_item_id:
+        # A dispatched loop (mctlhq/mctl-agents#461) is bound to exactly one
+        # work item and one execution request, and its execution #1 is the
+        # store's canonical `we_`, never a locally derived id: it runs nothing
+        # until the request is fulfilled with this workflow's own engine run.
+        dispatched: BoundExecution | None = None
+        if issue.execution_request_id and workflow.patched(EXECUTION_REQUEST_PATCH):
+            dispatched, refused = await self._bind_dispatched_execution(issue)
+            if dispatched is None:
+                return DevLoopResult(
+                    investigate=WorkflowResult(workflow_name="", phase="NotStarted"),
+                    implement=None,
+                    ended=refused,
+                )
+        elif issue.work_item_id:
             self._work_item_id = issue.work_item_id
             seed_execution_id = execution_id_for(issue.work_item_id, 1, str(workflow.info().attempt))
             self._seen_execution_ids.add(seed_execution_id)
@@ -1902,9 +2003,24 @@ class DevLoopWorkflow:
         if investigator_release and investigator_release.image_ref:
             investigate_params["agent_image"] = investigator_release.image_ref
             investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
+        if dispatched is not None:
+            # The investigate CWFT's declared `work_item_id`/`execution_id`
+            # parameters (gitops#1279) become `--work-item-id`/`--execution-id`:
+            # the investigator uses this `we_` as its execution identity and
+            # refuses it unless it is in that item's ledger, and refuses an
+            # item about another issue (`work-item mismatch`).
+            investigate_params["work_item_id"] = self._work_item_id
+            investigate_params["execution_id"] = dispatched.execution_id
 
         investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
         await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+        if dispatched is not None:
+            # The dispatched execution IS this investigator run: it ends
+            # here, whatever the loop does next, so the item's one
+            # non-terminal slot is free again for a later resume.
+            await self._advance_dispatched_execution(
+                "Succeeded" if investigate_result.succeeded else "Failed"
+            )
 
         if not investigate_result.succeeded:
             return DevLoopResult(
@@ -1972,6 +2088,13 @@ class DevLoopWorkflow:
                     "received_at": hi_outcome.received_at,
                 })
                 continuation_params = dict(investigate_params)
+                if dispatched is not None:
+                    # The dispatched `we_` ended with the first run and sealed
+                    # that run's context; a continuation is a different
+                    # context, which the store would refuse as a divergence
+                    # under the same execution. It runs without the identity.
+                    continuation_params.pop("work_item_id", None)
+                    continuation_params.pop("execution_id", None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
