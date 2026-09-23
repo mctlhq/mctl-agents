@@ -143,7 +143,9 @@ exists only when the work-item layer creates a new execution.
   context yields a new `created_at`, so the bytes differ and the store
   answers 409. The stored document is then read back and compared without
   what a retry may change: `created_at`, the snapshot's own id and hash,
-  and `work_context.resumed_from_snapshot_id`, since the prior lookup is
+  each source's `retrieved_at` and `freshness.observed_at` (stamped with
+  the assembly clock, so a retry at a later second restamps them), and
+  `work_context.resumed_from_snapshot_id`, since the prior lookup is
   best-effort and can succeed on one attempt and fail on the next. If the
   rest is identical, the answer is a replay. Only a document that differs
   in anything else is a divergence, and the logged reason names the fields.
