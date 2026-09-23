@@ -477,6 +477,8 @@ _STANDALONE_FIXTURES = {
     # mctlhq/mctl-agents#461, replayed by tests/test_execution_request_replay.py.
     "dev_loop_dispatched.json",
     "dev_loop_resumed.json",
+    # mctlhq/mctl-agents#198, replayed by tests/test_action_approval_wait.py.
+    "action_approval_wait.json",
 }
 
 

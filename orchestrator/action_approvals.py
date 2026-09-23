@@ -154,7 +154,10 @@ def idempotency_key(intent: ActionIntent, attempt: int = 0) -> str:
     intent is a different key. mctl-api answers a replayed key with the
     stored request whatever its state, so once that request is denied,
     expired or consumed the same intent needs a new `attempt` (a new human
-    decision) to be asked again. This slice always uses attempt 0."""
+    decision) to be asked again. `MctlApiApprovals(attempt=N)` asks with
+    attempt N; the #198 wait (`orchestrator/temporal/workflows/
+    action_approval.py`) is the only caller that ever sets it above 0, and
+    only for a deliberate re-request after a denial or an expiry."""
     if attempt < 0:
         raise ValueError("attempt must be >= 0")
     return f"mctl-agents/intent/{intent_hash(intent).removeprefix('sha256:')}/{attempt}"
@@ -374,10 +377,29 @@ class MctlApiApprovals:
     """
 
     def __init__(
-        self, client: ActionApprovalClient | None = None, *, now: Callable[[], datetime] | None = None,
+        self,
+        client: ActionApprovalClient | None = None,
+        *,
+        now: Callable[[], datetime] | None = None,
+        attempt: int = 0,
     ) -> None:
+        if attempt < 0:
+            raise ValueError("attempt must be >= 0")
         self._client = client or ActionApprovalClient()
         self._now = now or (lambda: datetime.now(UTC))
+        self._attempt = attempt
+
+    @property
+    def attempt(self) -> int:
+        return self._attempt
+
+    def for_attempt(self, attempt: int) -> MctlApiApprovals:
+        """The same store, asking with `attempt`: a deliberate re-request
+        (#198) after the previous attempt's receipt was denied or expired.
+        A new attempt is a new idempotency key, so it opens a new request
+        that needs a new human decision; nothing decided for an earlier
+        attempt carries over."""
+        return MctlApiApprovals(self._client, now=self._now, attempt=attempt)
 
     def redeem(
         self, request: pc.ActionRequest, *, rule_id: str, policy_version: str, approval_ref: str = "",
@@ -392,7 +414,8 @@ class MctlApiApprovals:
             answer = self._client.get(approval_ref)
         else:
             answer = self._client.create(
-                intent, key=idempotency_key(intent), expires_at=self._now() + timedelta(seconds=_ttl_s()),
+                intent, key=idempotency_key(intent, self._attempt),
+                expires_at=self._now() + timedelta(seconds=_ttl_s()),
             )
         rec = answer.record
         if rec is None:

@@ -100,6 +100,23 @@ def test_the_implement_sweep_registers_on_the_control_queue_only(visibility):
             assert SweptImplementWorkflow not in plan.workflows
 
 
+def test_the_approval_wait_registers_on_the_control_queue_only(visibility):
+    """The durable approval wait (#198) is a control-queue workflow: it is
+    started as a child by name, and it schedules its poll by STRING name,
+    so a dropped registration is not a type error anywhere; the child
+    would never start, or its poll would time out on every wake."""
+    from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow
+
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
+    assert ActionApprovalWaitWorkflow in control.workflows
+    assert "read_action_approval" in control.activity_names
+
+    for role in ("execution", "implementation"):
+        for plan in worker_plans(role, visibility):
+            assert ActionApprovalWaitWorkflow not in plan.workflows
+            assert "read_action_approval" not in plan.activity_names
+
+
 def test_implement_sweep_tunables_are_read_from_the_environment(monkeypatch):
     """Same `_int_env` rule IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES follows
     (mctl-agents#412): env override, default, refusal on a bad value."""

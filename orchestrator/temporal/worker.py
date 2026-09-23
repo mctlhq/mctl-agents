@@ -5,7 +5,8 @@ TEMPORAL_NAMESPACE=mctl-agents — see mctl-gitops's
 infra-components/data/temporal/tenant-namespace-job.yaml for the namespace +
 search-attribute registration) and runs DevLoopWorkflow, ReconcileWorkflow,
 IssuePollWorkflow, IncidentLoopWorkflow, ImplementSweepWorkflow (plus its
-SweptImplementWorkflow child) and their activities on task queue TASK_QUEUE.
+SweptImplementWorkflow child), ActionApprovalWaitWorkflow and their activities on
+task queue TASK_QUEUE.
 Deployed as its own service (mctl-agents-worker, ingress disabled), with the
 long Argo waits served by sibling deployments selected by `--role`:
 `execution` (mctl-dev-loop-exec, ADR-008) and `implementation`
@@ -40,6 +41,7 @@ from temporalio.runtime import PrometheusConfig, Runtime, TelemetryConfig
 from temporalio.worker import Interceptor, Worker
 
 from orchestrator import tracing
+from orchestrator.temporal.activities.action_approval import read_action_approval
 from orchestrator.temporal.activities.argo import submit_and_wait
 from orchestrator.temporal.activities.deploy_state import (
     get_deploy_status,
@@ -80,6 +82,7 @@ from orchestrator.temporal.constants import (
     implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.tracing import worker_interceptors
+from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
 from orchestrator.temporal.workflows.implement_sweep import (
     ImplementSweepWorkflow,
@@ -558,6 +561,9 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         find_stranded_accepted,
         bind_dispatched_execution,
         advance_dispatched_execution,
+        # The approval wait's read-only poll (#198, ADR-014 §7): one GET of
+        # one ActionApprovalRequest, never a mutation.
+        read_action_approval,
     ]
     workflows: list[type] = [
         DevLoopWorkflow,
@@ -566,6 +572,10 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         IncidentLoopWorkflow,
         ImplementSweepWorkflow,
         SweptImplementWorkflow,
+        # The durable wait for a human approval (#198). A new type: started
+        # only as a child of a workflow step whose gated activity answered
+        # `approval_pending`, which needs MCTL_POLICY_APPROVALS=mctl-api.
+        ActionApprovalWaitWorkflow,
     ]
 
     execution_plan = WorkerPlan(

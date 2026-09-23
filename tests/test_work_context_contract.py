@@ -572,3 +572,30 @@ def test_out_of_vocabulary_origin_is_unknown_with_a_named_reason():
 
     no_origin = wc.WorkItem(work_item_id="wi-1", state="active")
     assert wc.work_item_verdict_for(no_origin) == wc.WORK_ITEM_FOUND
+
+
+def test_mctl_api_default_surface_api_is_in_vocabulary():
+    """mctl-api tags a work item, intent or execution request made directly
+    on its API (no `origin_surface`/`surface` in the body) with its default
+    surface `api` (`defaultWorkItemSurface` in handlers_work_items.go). That
+    is the store's own value, not an unknown one: an item created directly on
+    the API, and an execution resumed from such a request, must classify
+    FOUND rather than WORK_ITEM_UNKNOWN."""
+    direct = wc.WorkItem(
+        work_item_id="wi-1",
+        state="active",
+        origin=wc.SurfaceRef(kind="api"),
+        executions=(
+            wc.ExecutionRef(
+                execution_id="e1",
+                sequence=1,
+                surface=wc.SurfaceRef(kind="api"),
+                actor=wc.ActorRef(kind="human", actor_id="github:alice"),
+            ),
+        ),
+    )
+    assert wc.work_item_verdict_for(direct) == wc.WORK_ITEM_FOUND
+    # The vocabulary stays closed: an unknown surface is still refused.
+    assert wc.work_item_verdict_for(
+        wc.WorkItem(work_item_id="wi-1", state="active", origin=wc.SurfaceRef(kind="apis"))
+    ) == wc.WORK_ITEM_UNKNOWN
