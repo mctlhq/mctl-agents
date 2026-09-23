@@ -165,15 +165,24 @@ class _NoApprovals:
 #: No approval store is wired yet: REQUIRE_APPROVAL always blocks.
 NO_APPROVALS: ApprovalLookup = _NoApprovals()
 
-# mctl MCP tools whose side effect is a deployment, a deletion, an
-# access grant, a promotion or an approval — the classes #197 names as
-# needing a human. Matched on the tool name after `mcp__mctl__`.
-_APPROVAL_TOOL_PATTERNS = (
-    "*deploy_*", "*rollback_*", "*delete_*", "*retire_service", "*promote_agent",
-    "*scale_service", "*create_tenant", "*provision_database", "*remove_custom_domain",
-    "*grant_repo_access", "*trigger_approve", "*approve_dev_loop", "*bind_agent_release",
-    "*set_agent_version_lifecycle", "*resume_openclaw_deploy", "*apply_openclaw_resource_profile",
-)
+# The mctl MCP tool set lives in mctl-api, not here, so the default for it
+# is REQUIRE_APPROVAL: a tool this list does not know — including one added
+# to mctl-api tomorrow — is gated, never allowed. Only these are ALLOW:
+# reads, by verb prefix, and the few named mutations agents are built to
+# make on their own. Tool names appear both as `mctl_<verb>_...` (mctl-api's
+# own naming) and as a bare `<verb>_...`, so both spellings are listed.
+_READ_VERBS = ("get_", "list_", "read_", "search_", "describe_")
+_READ_TOOLS = ("whoami", "incident_summary", "resolve_agent")
+#: Mutations an agent performs by design: the incident responder resolves
+#: and acknowledges incidents, and an investigator may open an
+#: investigation. Nothing here deploys, deletes, grants or approves.
+_ALLOWED_MUTATIONS = ("resolve_incident", "acknowledge_incident", "trigger_issue")
+
+
+def _mctl_tool_patterns(names: tuple[str, ...], *, prefix: bool) -> tuple[str, ...]:
+    tail = "*" if prefix else ""
+    return tuple(f"mcp__mctl__{p}{n}{tail}" for n in names for p in ("mctl_", ""))
+
 
 BUILTIN_POLICY = Policy(
     version="mctl-agents/policy/v1",
@@ -181,11 +190,15 @@ BUILTIN_POLICY = Policy(
         Rule("github-issue-comment", GITHUB_ISSUE_COMMENT, "comment", ALLOW),
         Rule("mctl-investigate", MCTL_OPERATION_EXECUTE, "execute:mctl-agents-investigate", ALLOW),
         *(
-            Rule(f"mctl-mcp-approval:{pattern.strip('*')}", MCP_TOOL_CALL, f"mcp__mctl__{pattern}",
-                 REQUIRE_APPROVAL, requires_grant=True)
-            for pattern in _APPROVAL_TOOL_PATTERNS
+            Rule("mctl-mcp-read", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True)
+            for pattern in (*_mctl_tool_patterns(_READ_VERBS, prefix=True),
+                            *_mctl_tool_patterns(_READ_TOOLS, prefix=False))
         ),
-        Rule("mctl-mcp", MCP_TOOL_CALL, "mcp__mctl__*", ALLOW, requires_grant=True),
+        *(
+            Rule("mctl-mcp-agent-mutation", MCP_TOOL_CALL, pattern, ALLOW, requires_grant=True)
+            for pattern in _mctl_tool_patterns(_ALLOWED_MUTATIONS, prefix=False)
+        ),
+        Rule("mctl-mcp-default-approval", MCP_TOOL_CALL, "mcp__mctl__*", REQUIRE_APPROVAL, requires_grant=True),
     ),
 )
 
@@ -331,6 +344,8 @@ def current_identity() -> ExecutionIdentity:
     try:
         ctx = load_from_environment(executor_type="system")
     except ExecutionIdentityError:
+        # Only reachable outside require mode: there, a broken file raises
+        # ExecutionContextRequiredError (a RuntimeError, not caught here).
         return ExecutionIdentity()
     return ExecutionIdentity(execution_id=ctx.context_id, trace_id=ctx.trace_id, actor=_actor_of(ctx))
 
@@ -348,6 +363,7 @@ def request_for(
     *,
     grants: tuple[str, ...] = (),
     metadata: Mapping[str, str] | None = None,
+    policy: Policy = BUILTIN_POLICY,
 ) -> ActionRequest | Decision:
     """Build a request stamped with the current execution identity, or the
     DENY decision (already recorded) when require mode has no identity."""
@@ -356,7 +372,7 @@ def request_for(
     except Exception as exc:  # noqa: BLE001 — arguments that cannot be digested are refused, not raised
         probe = ActionRequest(action_kind, operation, target, "", grants=grants)
         decision = Decision(DENY, CODE_INVALID_REQUEST, f"arguments cannot be digested: {type(exc).__name__}",
-                            BUILTIN_POLICY.version, "", "")
+                            policy.version, "", "")
         emit(probe, decision)
         return decision
     probe = ActionRequest(action_kind, operation, target, args_digest, grants=grants,
@@ -365,7 +381,7 @@ def request_for(
         ident = current_identity()
     except Exception as exc:  # noqa: BLE001 — require mode without a context: refuse
         decision = Decision(DENY, CODE_IDENTITY_UNAVAILABLE, f"execution identity unavailable: {type(exc).__name__}",
-                            BUILTIN_POLICY.version, "", probe.action_digest())
+                            policy.version, "", probe.action_digest())
         emit(probe, decision)
         return decision
     return ActionRequest(
@@ -388,7 +404,7 @@ def checkpoint(
 ) -> Decision:
     """`request_for` + `decide`: the one call a governed path makes.
     Never raises: every failure is a recorded DENY."""
-    request = request_for(action_kind, operation, target, args, grants=grants, metadata=metadata)
+    request = request_for(action_kind, operation, target, args, grants=grants, metadata=metadata, policy=policy)
     if isinstance(request, Decision):
         return request
     return decide(request, policy=policy, approvals=approvals)

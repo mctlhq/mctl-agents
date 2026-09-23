@@ -80,12 +80,17 @@ def test_anything_no_rule_covers_is_denied():
         assert (d.verdict, d.code) == (pc.DENY, pc.CODE_NO_RULE), (kind, op)
 
 
-def test_every_high_risk_mctl_tool_needs_an_approval():
+def test_every_mctl_tool_that_is_not_a_known_read_or_agent_mutation_needs_an_approval():
     for tool in ("mctl_deploy_service", "mctl_rollback_service", "mctl_delete_tenant", "mctl_retire_service",
                  "mctl_promote_agent", "mctl_scale_service", "mctl_grant_repo_access", "mctl_trigger_approve",
-                 "mctl_approve_dev_loop", "mctl_deploy_openclaw"):
+                 "mctl_approve_dev_loop", "mctl_deploy_openclaw",
+                 # verb-final and unknown names are gated too, never allowed
+                 "mctl_trigger_deploy", "mctl_trigger_rollback", "mctl_delete", "mctl_brand_new_tool",
+                 "mctl_set_budget_limit", "deploy_service"):
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_APPROVAL_REQUIRED, tool
-    for tool in ("mctl_list_services", "mctl_get_dev_loop", "mctl_whoami", "mctl_trigger_issue"):
+    for tool in ("mctl_list_services", "mctl_get_dev_loop", "mctl_whoami", "mctl_get_service_status",
+                 "get_service_status", "mctl_incident_summary", "mctl_resolve_incident", "mctl_trigger_issue",
+                 "mctl_acknowledge_incident"):
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_ALLOWED, tool
 
 
@@ -138,6 +143,26 @@ def test_require_mode_without_an_execution_context_is_denied(monkeypatch):
     monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
     d = _mcp(READ, {})
     assert (d.verdict, d.code, d.permitted) == (pc.DENY, pc.CODE_IDENTITY_UNAVAILABLE, False)
+
+
+def test_require_mode_with_a_broken_context_file_is_denied(monkeypatch, tmp_path):
+    broken = tmp_path / "ctx.json"
+    broken.write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(broken))
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    d = _mcp(READ, {})
+    assert (d.verdict, d.code, d.permitted) == (pc.DENY, pc.CODE_IDENTITY_UNAVAILABLE, False)
+    # Outside require mode the same broken file degrades to no identity.
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT")
+    assert _mcp(READ, {}).permitted
+
+
+def test_early_refusals_carry_the_policy_that_was_asked(monkeypatch):
+    other = pc.Policy(version="test/other", rules=())
+    assert pc.checkpoint(pc.MCP_TOOL_CALL, READ, "mctl", {"x": {1}}, policy=other).policy_version == "test/other"
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
+    monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
+    assert pc.checkpoint(pc.MCP_TOOL_CALL, READ, "mctl", {}, policy=other).policy_version == "test/other"
 
 
 def test_the_execution_identity_is_bound_into_the_action(monkeypatch, capsys):
@@ -227,6 +252,7 @@ def test_every_builder_with_mcp_installs_the_hook_on_every_mcp_call(tmp_path, mo
         options.build_incident_responder_options(tmp_path, "m"),
         options.build_issue_investigator_options(tmp_path, "m", tmp_path),
     ]
+    built.append(_plan_options(tmp_path))
     for opts in built:
         matchers = [m for m in (opts.hooks or {}).get("PreToolUse", []) if m.matcher == "mcp__.*"]
         hooks = [h for m in matchers for h in m.hooks if isinstance(h, options._PolicyCheckpointHook)]
@@ -295,3 +321,45 @@ def test_a_refused_dispatch_is_answered_once_and_not_retried(monkeypatch):
     assert len(replies) == 1
     assert "`DENY`" in replies[0] and "mctl-directive-ack: c1" in replies[0]
     assert "mctl-directive-fail" not in replies[0]
+
+
+
+def _plan_options(tmp_path):
+    """The declarative investigator builder, from the resolved real plan."""
+    from orchestrator import resolver
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="d" * 40))
+    return options.build_issue_investigator_options_from_plan(plan, tmp_path, tmp_path)
+
+
+def test_a_refused_ack_after_a_real_dispatch_is_loud_and_not_silent(monkeypatch, capsys):
+    """The ack is the only record that a dispatch happened: a policy refusal
+    there must take the same loud resubmit-warning path as a gh failure."""
+    ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
+
+    async def _submitted(issue_url, slug, requested_by):
+        return "wf-42"
+
+    def _refuse(url, body):
+        raise pc.PolicyRefused(pc.Decision(pc.DENY, pc.CODE_IDENTITY_UNAVAILABLE, "no ctx", "v1", "", "sha256:d"))
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _submitted)
+    monkeypatch.setattr(run_issue_directive_poller, "_post_reply", _refuse)
+    directive = Directive(comment_id="c1", author="octocat", created_at="2026-09-23T10:00:00Z",
+                          verb="reinvestigate", authorized=True)
+    with pytest.raises(pc.PolicyRefused):
+        asyncio.run(run_issue_directive_poller._handle_directive(
+            directive, issue_url=ISSUE, ref=ref, all_refs=[ref], dry_run=False))
+    out = capsys.readouterr().out
+    assert "dispatched successfully" in out and "wf-42" in out and "WILL be resubmitted" in out
+
+
+def test_the_hook_matcher_catches_every_mcp_tool_and_nothing_else():
+    """Claude Code matches `matcher` as a regex against the tool name."""
+    import re
+
+    (matcher,) = options._policy_hooks(["mcp__mctl__*"])["PreToolUse"]
+    for name in (DEPLOY, READ, "mcp__other__x", "mcp__mctl__get_service_status"):
+        assert re.fullmatch(matcher.matcher, name), name
+    for name in ("Bash", "Read", "Write", "WebFetch"):
+        assert not re.fullmatch(matcher.matcher, name), name

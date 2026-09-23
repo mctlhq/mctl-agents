@@ -99,8 +99,8 @@ Built-in policy `mctl-agents/policy/v1`:
 |---|---|
 | issue comments | ALLOW |
 | the investigate operation | ALLOW |
-| mctl MCP tools that deploy, roll back, delete, retire, promote, scale, create tenants, provision databases, remove domains, grant repo access, or approve | REQUIRE_APPROVAL |
-| every other granted mctl MCP tool | ALLOW |
+| mctl MCP reads (`get_`, `list_`, `read_`, `search_`, `describe_`, `whoami`, …) and the agent mutations `resolve_incident`, `acknowledge_incident`, `trigger_issue` | ALLOW |
+| every other granted mctl MCP tool, including any added to mctl-api later | REQUIRE_APPROVAL |
 | anything else | DENY |
 
 ## Open decisions (not settled here)
@@ -122,6 +122,19 @@ Built-in policy `mctl-agents/policy/v1`:
    through the checkpoint yet. `run_implementer.py` and
    `run_issue_investigator.py` are owned by open PRs (#409 and #422). Each
    one becomes a one-line `require(checkpoint(...))` before its `_run`.
+
+4. **Bash as a second transport.** The builders that carry the MCP hook also
+   grant `Bash`, and `gh` / `git` are on PATH, so a side effect this slice
+   gates through MCP (or a GitHub mutation) is still reachable through a
+   shell command. This slice governs the MCP transport and the
+   orchestrator's own calls, not the shell. Governing it is a separate
+   decision: either put Bash commands through the checkpoint (the existing
+   Bash `PreToolUse` hooks are the place) or remove credentials from the
+   agent's shell.
+
+A permitted REQUIRE_APPROVAL is recorded as `decision: REQUIRE_APPROVAL`,
+`code: approved`, with the approval ref. The verdict is the rule's, and the
+code says what happened to it.
 
 ## Consequences
 

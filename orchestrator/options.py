@@ -1083,16 +1083,17 @@ def build_incident_responder_options(
     env = {**os.environ}
     if state_dir is not None:
         env["INCIDENT_STATE_DIR"] = str(state_dir)
+    allowed_tools = ["Read", "Write", "Glob", *_mctl_tool_globs()]
     return ClaudeAgentOptions(
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=["Read", "Write", "Glob", *_mctl_tool_globs()],
+        allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
-        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(["Read", "Write", "Glob", *_mctl_tool_globs()])),
+        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
     )
 
 

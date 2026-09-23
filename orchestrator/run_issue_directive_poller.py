@@ -696,7 +696,7 @@ async def _handle_directive(
                     issue_url,
                     _with_ack(_reply_dispatch_ambiguous(directive.author, e), directive.comment_id),
                 )
-            except subprocess.CalledProcessError as post_e:
+            except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
                 # The exact residual `_reply_dispatched`'s handler below
                 # guards against, on the branch this exception class exists
                 # specifically to protect (claude P3 on #421): mctl-api may
@@ -709,7 +709,7 @@ async def _handle_directive(
                 print(
                     f"FAIL: directive comment {directive.comment_id} ({issue_url}) had an "
                     f"ambiguous dispatch outcome ({type(e).__name__}) and posting the ambiguous "
-                    f"acknowledgement reply also failed after retries ({post_e.stderr or post_e}) — "
+                    f"acknowledgement reply also failed after retries ({getattr(post_e, 'stderr', None) or post_e}) — "
                     "this comment remains unacked and WILL be re-dispatched next tick unless an "
                     f"operator posts a comment containing `{ack_trailer(directive.comment_id)}` first."
                 )
@@ -747,7 +747,7 @@ async def _handle_directive(
                         f"{_reply_dispatch_failed(directive.author, e, attempt)}\n\n"
                         f"{fail_trailer(directive.comment_id)}",
                     )
-                except subprocess.CalledProcessError as post_e:
+                except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
                     # Even after MARKER_POST_ATTEMPTS in-process retries, the
                     # retry-marker write itself failed — `prior_failures` is
                     # only ever recomputed from `fail_trailer` markers
@@ -791,7 +791,7 @@ async def _handle_directive(
                 issue_url,
                 _reply_dispatched(directive.author, directive.comment_id, workflow_name, ref.service, ref.slug),
             )
-        except subprocess.CalledProcessError as post_e:
+        except (subprocess.CalledProcessError, policy_checkpoint.PolicyRefused) as post_e:
             # Even MARKER_POST_ATTEMPTS in-process retries could not write
             # the ack — the workflow is already running in Argo, but this
             # comment remains unacked and WILL be resubmitted next tick
@@ -801,7 +801,7 @@ async def _handle_directive(
             print(
                 f"FAIL: directive comment {directive.comment_id} ({issue_url}) dispatched "
                 f"successfully (Argo workflow {workflow_name!r} started) but posting the "
-                f"acknowledgement reply failed after retries ({post_e.stderr or post_e}) — "
+                f"acknowledgement reply failed after retries ({getattr(post_e, 'stderr', None) or post_e}) — "
                 "this comment remains unacked and WILL be resubmitted next tick unless an "
                 f"operator posts a comment containing `{ack_trailer(directive.comment_id)}` first."
             )
