@@ -604,7 +604,7 @@ async def _handle_directive(
     """Run the decision table for one unacked directive. Returns one of:
     "unauthorized", "unrecognised", "no-proposal", "ambiguous",
     "not-overwritable", "dispatched", "dispatch-failed",
-    "dispatch-ambiguous", or "dry-run".
+    "dispatch-ambiguous", "policy-refused", or "dry-run".
 
     `prior_failures` is the number of previously recorded dispatch-failure
     attempts for this exact comment id (`orchestrator.directives.
