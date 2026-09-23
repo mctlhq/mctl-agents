@@ -2181,12 +2181,17 @@ def _require_push_policy(repo: str, branch: str, *, lease: str | None) -> None:
     Called AFTER the claim check and immediately before git: a claim refusal
     must not spend an approval on a push that was never going to happen.
     The arguments bind the remote, the branch and the lease the push is
-    fenced on — not the pushed commit, which this module does not read."""
+    fenced on — not the pushed commit, which this module does not read.
+
+    `push:new-branch` names the command (a plain, non-force `git push -u`),
+    not the remote's state: `_push_and_open_pr` also takes that arm when the
+    remote head could not be read, so the branch may already exist on
+    origin. A non-force push cannot rewrite it either way."""
     mode = "force-with-lease" if lease else "new-branch"
     policy_checkpoint.require(policy_checkpoint.checkpoint(
         policy_checkpoint.GITHUB_GIT_PUSH,
         f"push:{mode}",
-        f"{repo}:{branch}" if repo else branch,
+        f"{repo}:{branch}",
         {"remote": "origin", "branch": branch, "lease": lease or ""},
         metadata={"repo": repo, "branch": branch},
     ))
@@ -2198,7 +2203,7 @@ def _push_followup(
     expected_sha: str,
     *,
     claim_context: _ClaimContext | None = None,
-    repo: str = "",
+    repo: str,
 ) -> None:
     """Push the follow-up commit to the existing branch (no `-u`).
 
@@ -2762,9 +2767,19 @@ def review_feedback_one(
         return result
     except policy_checkpoint.PolicyRefused as e:
         # The policy checkpoint refused the follow-up push (#197): git never
-        # ran and nothing reached the branch. EXIT_POLICY_REFUSED, which the
-        # shepherd charges as deterministic: the same policy answers the same
-        # way next tick, so re-running the model on it must stay bounded.
+        # ran and nothing reached the branch.
+        if e.decision.undecided:
+            # The checkpoint could not decide (evaluator, identity or approval
+            # lookup failed): a platform failure, not an answer about these
+            # findings. No prefix, so EXIT_GENERIC_FAILURE, which the shepherd
+            # retries as transient without charging the proposal — the
+            # precedent is the directive poller's `PolicyCheckpointUndecided`.
+            release_reason = "policy checkpoint undecided"
+            result = ImplementResult(ref=ref, pr_url=None, error=f"policy checkpoint undecided: {e}")
+            return result
+        # An answer (DENY, or REQUIRE_APPROVAL not granted): EXIT_POLICY_REFUSED,
+        # which the shepherd charges as deterministic: the same policy answers
+        # the same way next tick, so re-running the model on it must stay bounded.
         release_reason = "policy refused"
         result = ImplementResult(ref=ref, pr_url=None, error=f"{POLICY_REFUSED_ERROR_PREFIX} {e}")
         return result
@@ -4256,9 +4271,25 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)
     except policy_checkpoint.PolicyRefused as e:
         # The policy checkpoint refused the push or `gh pr create` (#197):
-        # that side effect did not run. Its own triage code, so a policy
-        # decision reads as one in the proposal's history rather than as a
-        # crash in the generic `unexpected-error` arm.
+        # that side effect did not run.
+        if e.decision.undecided:
+            # The checkpoint could not decide (evaluator, identity or approval
+            # lookup failed): a platform failure, never recorded as this
+            # proposal's failure. Hand it back to `accepted` (a CAS, like the
+            # vanished-claim arm) so a later tick retries it; no triage record.
+            # Nothing was pushed, or the push landed and only `gh pr create`
+            # was undecided, in which case the retry's preflight finds the
+            # branch and opens the PR without running the model again.
+            # Status first, then the claim: releasing first would free mutual
+            # exclusion while `.status.yaml` still names this attempt.
+            msg = f"policy checkpoint undecided: {e}"
+            if not _hand_back_if_still_ours(ref, attempt_id):
+                msg = f"{msg} (left `in-progress` for the attempt that now holds it)"
+            _release_claim(claim_ctx, reason="policy checkpoint undecided")
+            return ImplementResult(ref=ref, pr_url=None, error=msg)
+        # An answer (DENY, or REQUIRE_APPROVAL not granted). Its own triage
+        # code, so a policy decision reads as one in the proposal's history
+        # rather than as a crash in the generic `unexpected-error` arm.
         msg = f"{POLICY_REFUSED_ERROR_PREFIX} {e}"
         recorded = _mark_needs_triage(
             ref,

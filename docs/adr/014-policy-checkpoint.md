@@ -102,7 +102,7 @@ code says what happened to it. Whether the action ran is therefore
 
   | Site | Action kind | Operation | Target | Arguments (digest only) | On refusal |
   |---|---|---|---|---|---|
-  | `run_implementer`: `git push` of a new branch | `github.git.push` | `push:new-branch` | `mctlhq/<svc>:<branch>` | remote, branch, lease (empty) | new-branch driver: `needs-triage`, `failure.code: policy-refused`, `stage: policy` |
+  | `run_implementer`: plain `git push -u` (a new branch, and also the fallback when the remote head could not be read, so the branch may exist on origin; the name describes the non-force command, not the remote) | `github.git.push` | `push:new-branch` | `mctlhq/<svc>:<branch>` | remote, branch, lease (empty) | new-branch driver: `needs-triage`, `failure.code: policy-refused`, `stage: policy` |
   | `run_implementer`: `git push --force-with-lease` (adopting a dead attempt's branch, and the review follow-up) | `github.git.push` | `push:force-with-lease` | `mctlhq/<svc>:<branch>` | remote, branch, lease SHA | new-branch driver: as above. Review follow-up: `EXIT_POLICY_REFUSED` (53), which the shepherd charges as deterministic |
   | `run_implementer`: `gh pr create` | `github.pull_request.create` | `create` | `mctlhq/<svc>` | title, body, head, base | new-branch driver: as above. Preflight (PR for an orphaned result branch): `GitHubPreflightError`, so the model does not run |
   | `run_shepherd`: `gh pr merge --merge --match-head-commit` | `github.pull_request.merge` | `merge` | the PR URL | method, delete-branch, head SHA | `merge_pr` answers `(False, None)`, i.e. `wait`, like any failed merge |
@@ -117,6 +117,20 @@ code says what happened to it. Whether the action ran is therefore
   the implementer does not read its local head at push time. A future rule
   that gates a push behind an approval should add that SHA first. The merge
   binds the head SHA, so an approval for one head never merges another.
+
+  The "on refusal" column is for an answer: DENY, or REQUIRE_APPROVAL
+  without a spent approval. An **undecided** decision (`evaluator_error`,
+  `identity_unavailable`, `approval_lookup_error`: the checkpoint could not
+  answer) is a platform failure and is never recorded as the item's
+  failure. In the implementer it is retryable: the review follow-up exits 1,
+  which the shepherd retries as transient without charging an attempt, and
+  the new-branch driver hands the proposal back to `accepted` with no
+  triage record (if only `gh pr create` was undecided, the retry's
+  preflight opens the PR for the pushed branch without a model run). The
+  other sites already treat both alike without recording anything against
+  the item: a merge waits, the review trigger, rerun and investigator
+  comment are best effort, and the poller keeps the label for the next
+  cycle.
 
   `EXIT_POLICY_REFUSED` is deterministic, not transient: the shepherd's
   transient arm re-runs the paid follow-up every tick with no counter, and

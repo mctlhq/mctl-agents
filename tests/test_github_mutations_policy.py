@@ -46,6 +46,11 @@ GITHUB_KINDS = (
 DENY_GITHUB = pc.Policy("test/deny-github", tuple(
     pc.Rule(f"deny-{kind}", kind, "*", pc.DENY) for kind in GITHUB_KINDS
 ))
+#: A policy the evaluator cannot read (unknown verdict): every decision is
+#: `evaluator_error`, i.e. undecided — the checkpoint could not answer.
+UNDECIDED_GITHUB = pc.Policy("test/broken-github", tuple(
+    pc.Rule(f"broken-{kind}", kind, "*", "MAYBE") for kind in GITHUB_KINDS
+))
 GATE_GITHUB = pc.Policy("test/gate-github", tuple(
     pc.Rule(f"gate-{kind}", kind, "*", pc.REQUIRE_APPROVAL) for kind in GITHUB_KINDS
 ))
@@ -252,6 +257,50 @@ def test_review_feedback_one_reports_a_refused_push_as_policy(repo, monkeypatch)
 
     assert result.error is not None and result.error.startswith(run_implementer.POLICY_REFUSED_ERROR_PREFIX)
     assert run_implementer._review_feedback_exit_code(result.error) == run_implementer.EXIT_POLICY_REFUSED
+    assert not [c for c in calls if c[:2] == ["git", "push"]]
+
+
+def test_review_feedback_one_retries_an_undecided_push_as_transient(repo, monkeypatch) -> None:  # noqa: F811
+    """An undecided checkpoint is a platform failure, not an answer about the
+    findings: exit 1 (transient in the shepherd, uncharged), never 53."""
+    _stub_review_feedback(monkeypatch, repo)
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **_kw: calls.append(cmd))
+    _refuse_with(monkeypatch, UNDECIDED_GITHUB)
+
+    result = run_implementer.review_feedback_one(_feedback_ref(repo), {"summaries": []})
+
+    assert result.error is not None
+    assert not result.error.startswith(run_implementer.POLICY_REFUSED_ERROR_PREFIX)
+    assert run_implementer._review_feedback_exit_code(result.error) == run_implementer.EXIT_GENERIC_FAILURE
+    deterministic, harness = run_shepherd._followup_code_sets()
+    assert run_implementer.EXIT_GENERIC_FAILURE not in deterministic | harness
+    assert not [c for c in calls if c[:2] == ["git", "push"]]
+
+
+def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path) -> None:
+    """The new-branch driver: an undecided checkpoint is never recorded as
+    the proposal's failure. It is handed back to `accepted` for a later tick,
+    with no triage record, and git never pushed."""
+    ref = _make_ref(tmp_path)
+    _reach_the_sdk(monkeypatch, tmp_path, on_run=lambda *_a, **_kw: None)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(run_implementer, "_run", lambda cmd, **_kw: calls.append(cmd))
+    monkeypatch.setattr(run_implementer, "_has_new_commits", lambda *_a, **_kw: True)
+    monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
+    monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
+    _refuse_with(monkeypatch, UNDECIDED_GITHUB)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "accepted"
+    assert not status.get("failure")
+    assert not status.get("attempt")
+    assert result.pr_url is None
+    assert result.error is not None and "undecided" in result.error
+    assert not result.error.startswith(run_implementer.POLICY_REFUSED_ERROR_PREFIX)
     assert not [c for c in calls if c[:2] == ["git", "push"]]
 
 

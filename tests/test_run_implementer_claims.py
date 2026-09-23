@@ -36,7 +36,9 @@ def test_push_followup_uses_the_explicit_force_with_lease_form(monkeypatch: pyte
         return None
 
     monkeypatch.setattr(run_implementer, "_run", _fake_run)
-    run_implementer._push_followup(Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=None)
+    run_implementer._push_followup(
+        Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=None, repo="mctlhq/mctl-web",
+    )
 
     assert len(calls) == 1
     cmd = calls[0]
@@ -67,7 +69,9 @@ def test_push_followup_checks_the_claim_and_aborts_on_fence(monkeypatch: pytest.
         attempt="attempt-1",
     )
     with pytest.raises(run_implementer.ImplementerFenced):
-        run_implementer._push_followup(Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=ctx)
+        run_implementer._push_followup(
+            Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=ctx, repo="mctlhq/mctl-web",
+        )
     # No git subprocess is invoked once the check fences.
     assert calls == []
 
@@ -392,7 +396,7 @@ def test_a_fence_before_a_push_is_advisory_below_enforce(monkeypatch: pytest.Mon
             return ClaimAnswer(verdict=CLAIM_FENCED, reason="epoch moved")
 
     run_implementer._push_followup(
-        Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=_ctx(_FencedClient()),
+        Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=_ctx(_FencedClient()), repo="mctlhq/mctl-web",
     )
     assert len(calls) == 1, calls
 
@@ -610,7 +614,7 @@ def test_the_push_site_refusal_reads_the_same_as_the_acquire_one(
 
     with pytest.raises(run_implementer.ImplementerClaimRefused) as excinfo:
         run_implementer._push_followup(
-            Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=_ctx(_Client()),
+            Path("/tmp/repo"), "feat/agents-slug", "a" * 40, claim_context=_ctx(_Client()), repo="mctlhq/mctl-web",
         )
     message = str(excinfo.value)
     assert forbidden not in message, message
