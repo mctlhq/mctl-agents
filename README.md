@@ -163,7 +163,23 @@ real PR:
 4. The Python wrapper pushes the branch and opens a PR via `gh pr create`.
 5. Flips `.status.yaml` to `status: implemented` with the PR URL. Any
    incomplete/no-commit attempt moves to `needs-triage` and is never
-   automatically retried.
+   automatically retried — **except** when the SDK's terminal message
+   reports the account's OAuth/API-key usage window was already exhausted
+   (`is_error=True, api_error_status=429`, mctl-agents#364): that run never
+   got a real turn, so it is classified `rate_limited` instead, left
+   `status: accepted`, and re-selected automatically once the recorded
+   window resets — no operator action needed. The durable
+   `rate_limited: {code, account, rate_limit_type, resets_at, since, ...}`
+   block is idempotent (an unchanged observation preserves `since`) and is
+   cleared on the next transition that already clears `failure`. A batch
+   run that ends rate-limited with no success exits `52`
+   (`EXIT_RATE_LIMITED`) and prints one stable stderr line naming the
+   account, limit type and reset time; the Tier 3 shepherd treats the same
+   condition from `--review-feedback` mode as transient and does not charge
+   a review attempt. The optional, non-secret `CLAUDE_OAUTH_ACCOUNT` env var
+   labels which account a run is using (falls back to deriving
+   `primary`/`secondary` from the active token env var, else `"unknown"`);
+   it names no credential. See `orchestrator/rate_limit.py`.
 
 The scheduled workflow processes at most one accepted proposal per run.
 There is no unfiltered `--force` mode or automatic second-account retry.
