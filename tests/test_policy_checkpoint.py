@@ -96,6 +96,26 @@ def test_every_mctl_tool_that_is_not_a_known_read_or_agent_mutation_needs_an_app
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_ALLOWED, tool
 
 
+
+def test_the_rule_table_classifies_the_recorded_mctl_tool_inventory():
+    """Cross-check against the inventory this repo records for mctl-api's
+    tools: each one is either allowed or gated, and only reads plus the two
+    named agent mutations are allowed."""
+    import yaml
+
+    facts = yaml.safe_load((Path(__file__).parents[1] / "docs/diagrams/archify/facts.yaml").read_text(encoding="utf-8"))
+    tools = facts["mcp_tools"]
+    assert len(tools) == facts["mcp_tool_count"]
+    allowed = set()
+    for tool in tools:
+        code = _mcp(f"mcp__mctl__{tool}", {}).code
+        assert code in (pc.CODE_ALLOWED, pc.CODE_APPROVAL_REQUIRED), tool
+        if code == pc.CODE_ALLOWED:
+            allowed.add(tool)
+    reads = {t for t in tools if t.removeprefix("mctl_").startswith(("get_", "list_", "read_", "search_", "describe_"))
+             or t.removeprefix("mctl_") in ("whoami", "incident_summary", "resolve_agent")}
+    assert allowed == reads | {"mctl_resolve_incident", "mctl_acknowledge_incident"}
+
 def test_an_approval_binds_to_the_exact_action_only():
     request = pc.ActionRequest(pc.MCP_TOOL_CALL, DEPLOY, "mctl", pc.args_digest_of({"service": "x", "tag": "1.2.0"}),
                                execution_id="ctx-1", actor="human:alice", grants=GRANTS)
