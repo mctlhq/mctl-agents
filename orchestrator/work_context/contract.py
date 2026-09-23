@@ -37,7 +37,11 @@ from typing import Any
 #: or none — is WORK_ITEM_UNKNOWN, never a best-effort parse.
 SCHEMA_VERSION = "workitem/v1"
 
-SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli"})
+# `api` is mctl-api's own default for a work item, intent or execution request
+# created directly on its API with no `origin_surface`/`surface` in the body
+# (`defaultWorkItemSurface`, internal/api/handlers_work_items.go). It is a
+# value the store writes itself, so it must classify FOUND, not UNKNOWN.
+SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli", "api"})
 ACTOR_KINDS = frozenset({"human", "agent", "system"})
 # mctl-api's `workitems.State*` constants. `resumed` is deliberately absent:
 # mctl-api records it only as an event kind, never as a state.

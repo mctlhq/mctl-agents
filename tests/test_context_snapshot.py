@@ -926,3 +926,23 @@ def test_work_context_id_fields_are_length_bounded():
             sources=base.sources,
             evidence_refs=base.evidence_refs,
         )
+
+
+def test_validate_accepts_mctl_api_default_surface_api():
+    """`api` is mctl-api's default surface for a direct API call. A work item
+    it tags that way must seal: `work_item_verdict_for` classifies it FOUND,
+    so rejecting it here would crash the seal at context mode `on`. The two
+    vocabularies are kept identical on purpose (see the comment above
+    WORK_CONTEXT_SURFACE_KINDS)."""
+    snapshot = _minimal_snapshot(work_context=_work_context())
+    ok = dc_replace(
+        snapshot,
+        work_context=dc_replace(snapshot.work_context, origin_surface="api", current_surface="api"),
+    )
+    ok.validate()
+
+
+def test_surface_vocabularies_are_identical():
+    from orchestrator.work_context.contract import SURFACE_KINDS
+
+    assert cs.WORK_CONTEXT_SURFACE_KINDS == SURFACE_KINDS
