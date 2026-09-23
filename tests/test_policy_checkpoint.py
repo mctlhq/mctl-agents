@@ -363,3 +363,28 @@ def test_the_hook_matcher_catches_every_mcp_tool_and_nothing_else():
         assert re.fullmatch(matcher.matcher, name), name
     for name in ("Bash", "Read", "Write", "WebFetch"):
         assert not re.fullmatch(matcher.matcher, name), name
+
+
+@pytest.mark.parametrize("submit_error", ["ambiguous", "failed"])
+def test_a_refused_marker_or_ambiguous_ack_raises_the_refusal_not_an_attribute_error(monkeypatch, capsys, submit_error):
+    """Every ack/marker handler that catches PolicyRefused must survive it:
+    PolicyRefused has no `stderr`."""
+    ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
+
+    async def _submit(issue_url, slug, requested_by):
+        if submit_error == "ambiguous":
+            raise run_issue_directive_poller.DispatchOutcomeAmbiguous("reply lost")
+        raise RuntimeError("mctl-api down")
+
+    def _refuse(url, body):
+        raise pc.PolicyRefused(pc.Decision(pc.DENY, pc.CODE_IDENTITY_UNAVAILABLE, "no ctx", "v1", "", "sha256:d"))
+
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _submit)
+    monkeypatch.setattr(run_issue_directive_poller, "_post_reply", _refuse)
+    monkeypatch.setattr(run_issue_directive_poller.time, "sleep", lambda _s: None)
+    directive = Directive(comment_id="c1", author="octocat", created_at="2026-09-23T10:00:00Z",
+                          verb="reinvestigate", authorized=True)
+    with pytest.raises(pc.PolicyRefused):
+        asyncio.run(run_issue_directive_poller._handle_directive(
+            directive, issue_url=ISSUE, ref=ref, all_refs=[ref], dry_run=False, prior_failures=0))
+    assert "FAIL:" in capsys.readouterr().out
