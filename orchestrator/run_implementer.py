@@ -1376,20 +1376,28 @@ def _status_is_still_ours(ref: ProposalRef, attempt_id: str, *, doing: str) -> b
 
 
 def _hand_back_if_still_ours(
-    ref: ProposalRef, attempt_id: str, *, budget_handbacks: int | None = None
+    ref: ProposalRef,
+    attempt_id: str,
+    *,
+    budget_handbacks: int | None = None,
+    policy_handbacks: int | None = None,
 ) -> bool:
     """Restore `accepted` only while `.status.yaml` still names our attempt.
 
     Returns True when the hand-back was written. ``budget_handbacks``
     (mctl-agents#430) records how many times THIS proposal has been handed
     back for an exhausted verification budget, so the retry it enables stays
-    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`.
+    bounded — see `IMPLEMENT_MAX_BUDGET_HANDBACKS`. ``policy_handbacks``
+    (mctl-agents#197) is the same tally for an undecided policy checkpoint —
+    see `IMPLEMENT_MAX_POLICY_HANDBACKS`.
     """
     if not _status_is_still_ours(ref, attempt_id, doing="handing the proposal back"):
         return False
     fields: dict[str, Any] = {"attempt": None, "failure": None}
     if budget_handbacks is not None:
         fields["budget_handbacks"] = budget_handbacks
+    if policy_handbacks is not None:
+        fields["policy_handbacks"] = policy_handbacks
     update_status_yaml(ref, "accepted", **fields)
     return True
 
@@ -1410,6 +1418,20 @@ def _hand_back_if_still_ours(
 # reason -- so an unconditional hand-back would trade a wrong terminal state
 # for an unbounded PAID retry loop (claude P2 on `624a433`).
 IMPLEMENT_MAX_BUDGET_HANDBACKS = 3
+
+# The same bound, with the same comparison, for the undecided-policy
+# hand-back (mctl-agents#197): the checkpoint could not decide on the push or
+# `gh pr create` (evaluator, identity or approval lookup failed). A blip
+# clears by the next tick, but a misconfigured `MCTL_POLICY_APPROVALS`, a
+# missing execution context in require mode, or a long mctl-api outage does
+# not, and every hand-back is a paid model turn. The Nth consecutive one goes
+# terminal as `needs-triage` / `policy-undecided`.
+#
+# Its own counter, `policy_handbacks`, not a share of `budget_handbacks`: the
+# two causes are unrelated (a runner's command budget vs. the policy
+# checkpoint), a mix of them would go terminal under whichever code happened
+# to hit the cap, and each arm's terminal write resets only its own tally.
+IMPLEMENT_MAX_POLICY_HANDBACKS = 3
 
 
 # ---------------------------------------------------------------------------
@@ -4200,6 +4222,8 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # bounds CONSECUTIVE budget-exhausted attempts, not the lifetime
             # of the proposal (mctl-agents#430).
             budget_handbacks=None,
+            # Likewise for the undecided-policy tally (#197).
+            policy_handbacks=None,
             rate_limited=None,
         )
         _release_claim(claim_ctx, reason="implemented")
@@ -4302,8 +4326,31 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
             # turns the tick red, which can cost the gitops commit and runs
             # the CWFT's `implement-fallback` second account on a condition no
             # account can fix.
-            msg = f"{POLICY_UNDECIDED_ERROR_PREFIX} {e}"
-            if not _hand_back_if_still_ours(ref, attempt_id):
+            #
+            # Bounded like the budget hand-back: a `policy_handbacks` tally,
+            # and at IMPLEMENT_MAX_POLICY_HANDBACKS a terminal
+            # `needs-triage` / `policy-undecided` write. Both are skips, so the
+            # tick stays green and the gitops commit that makes the tally (or
+            # the terminal write that ends the loop) durable is never skipped.
+            prior = int(_load_status(ref.status_path).get("policy_handbacks", 0) or 0)
+            if prior + 1 >= IMPLEMENT_MAX_POLICY_HANDBACKS:
+                msg = (
+                    f"{POLICY_UNDECIDED_ERROR_PREFIX} the policy checkpoint could not decide on "
+                    f"{prior + 1} consecutive attempts (limit {IMPLEMENT_MAX_POLICY_HANDBACKS}): {e}"
+                )
+                recorded = _mark_needs_triage(
+                    ref,
+                    code="policy-undecided",
+                    stage="policy",
+                    message=msg,
+                    attempt=attempt,
+                    claim_context=claim_ctx,
+                    # A human moving it back to `accepted` starts a clean tally.
+                    extra_fields={"policy_handbacks": None},
+                )
+                return ImplementResult(ref=ref, pr_url=None, skipped_reason=_triage_error(msg, recorded))
+            msg = f"{POLICY_UNDECIDED_ERROR_PREFIX} {e} (attempt {prior + 1} of {IMPLEMENT_MAX_POLICY_HANDBACKS})"
+            if not _hand_back_if_still_ours(ref, attempt_id, policy_handbacks=prior + 1):
                 msg = f"{msg} (left `in-progress` for the attempt that now holds it)"
             _release_claim(claim_ctx, reason="policy checkpoint undecided")
             return ImplementResult(ref=ref, pr_url=None, skipped_reason=msg)

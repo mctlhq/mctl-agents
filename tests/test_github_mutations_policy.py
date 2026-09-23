@@ -279,6 +279,10 @@ def test_review_feedback_one_reports_an_undecided_push_as_harness(repo, monkeypa
     deterministic, harness = run_shepherd._followup_code_sets()
     assert code in harness
     assert code not in deterministic
+    # Exclusively harness: in either set below it would move under
+    # MAX_REFUSALS or the fence arm, with every other assertion still green.
+    assert code not in run_shepherd._refusal_codes()
+    assert code not in run_shepherd._fenced_codes()
     assert not [c for c in calls if c[:2] == ["git", "push"]]
 
 
@@ -334,11 +338,14 @@ def test_shepherd_bounds_an_undecided_push_at_max_harness_failures(tmp_path, mon
     assert final["review_attempts"] == 1
 
 
-def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path) -> None:
-    """The new-branch driver: an undecided checkpoint is never recorded as
-    the proposal's failure. It is handed back to `accepted` for a later tick,
-    with no triage record, and git never pushed."""
+def _undecided_push(monkeypatch, tmp_path: Path, *, prior_handbacks: int = 0):
+    """`implement_one` up to a push whose checkpoint cannot decide. Returns
+    (ref, recorded git calls)."""
     ref = _make_ref(tmp_path)
+    if prior_handbacks:
+        status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+        status["policy_handbacks"] = prior_handbacks
+        ref.status_path.write_text(yaml.safe_dump(status), encoding="utf-8")
     _reach_the_sdk(monkeypatch, tmp_path, on_run=lambda *_a, **_kw: None)
     calls: list[list[str]] = []
     monkeypatch.setattr(run_implementer, "_run", lambda cmd, **_kw: calls.append(cmd))
@@ -346,6 +353,14 @@ def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path)
     monkeypatch.setattr(run_implementer, "_detect_chart_major_bumps", lambda *_a, **_kw: [])
     monkeypatch.setattr(run_implementer, "_remote_head_sha", lambda *_a, **_kw: None)
     _refuse_with(monkeypatch, UNDECIDED_GITHUB)
+    return ref, calls
+
+
+def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path) -> None:
+    """The new-branch driver: an undecided checkpoint is never recorded as
+    the proposal's failure. It is handed back to `accepted` for a later tick,
+    with no triage record, the tally goes up by one, and git never pushed."""
+    ref, calls = _undecided_push(monkeypatch, tmp_path)
 
     result = run_implementer.implement_one(ref, dry_run=False)
 
@@ -353,6 +368,8 @@ def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path)
     assert status["status"] == "accepted"
     assert not status.get("failure")
     assert not status.get("attempt")
+    assert status["policy_handbacks"] == 1
+    assert "budget_handbacks" not in status, "its own counter, not the budget one"
     assert result.pr_url is None
     # A skip, not an error: the tick stays green, so the gitops commit is not
     # skipped and the implement-fallback account is not spent on it.
@@ -362,6 +379,54 @@ def test_implement_one_hands_back_an_undecided_push(monkeypatch, tmp_path: Path)
     outcome = run_implementer._batch_outcome([result])
     assert (outcome.failed, outcome.skipped) == (0, 1)
     assert not [c for c in calls if c[:2] == ["git", "push"]]
+
+
+def test_undecided_hand_back_tally_increments_below_the_cap(monkeypatch, tmp_path: Path) -> None:
+    ref, _calls = _undecided_push(
+        monkeypatch, tmp_path, prior_handbacks=run_implementer.IMPLEMENT_MAX_POLICY_HANDBACKS - 2)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "accepted"
+    assert status["policy_handbacks"] == run_implementer.IMPLEMENT_MAX_POLICY_HANDBACKS - 1
+    assert run_implementer._batch_outcome([result]).failed == 0
+
+
+def test_undecided_hand_back_goes_terminal_at_the_cap(monkeypatch, tmp_path: Path) -> None:
+    """A persistent undecided checkpoint stops spending: the Nth consecutive
+    one is `needs-triage` under its own code, the tally is reset for the
+    human's retry, and the tick stays green so that ending write lands."""
+    ref, calls = _undecided_push(
+        monkeypatch, tmp_path, prior_handbacks=run_implementer.IMPLEMENT_MAX_POLICY_HANDBACKS - 1)
+
+    result = run_implementer.implement_one(ref, dry_run=False)
+
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "needs-triage"
+    assert status["failure"]["code"] == "policy-undecided"
+    assert status["failure"]["stage"] == "policy"
+    assert "policy_handbacks" not in status
+    assert result.error is None
+    assert result.skipped_reason is not None
+    assert result.skipped_reason.startswith(run_implementer.POLICY_UNDECIDED_ERROR_PREFIX)
+    outcome = run_implementer._batch_outcome([result])
+    assert (outcome.failed, outcome.skipped) == (0, 1)
+    assert not [c for c in calls if c[:2] == ["git", "push"]]
+
+
+def test_a_successful_run_clears_the_undecided_tally(monkeypatch, tmp_path: Path) -> None:
+    """The cap bounds CONSECUTIVE undecided attempts, not the proposal's
+    lifetime."""
+    ref, _calls = _undecided_push(monkeypatch, tmp_path, prior_handbacks=1)
+    monkeypatch.setattr(pc, "checkpoint", functools.partial(pc.checkpoint.func))  # the built-in policy again
+    monkeypatch.setattr(run_implementer, "_open_pr_for_branch", lambda *_a, **_kw: "https://pr")
+
+    run_implementer.implement_one(ref, dry_run=False)
+
+    status = yaml.safe_load(ref.status_path.read_text(encoding="utf-8"))
+    assert status["status"] == "implemented"
+    assert "policy_handbacks" not in status
 
 
 def test_a_refused_followup_push_is_charged_not_transient() -> None:

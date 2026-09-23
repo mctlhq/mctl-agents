@@ -129,7 +129,13 @@ code says what happened to it. Whether the action ran is therefore
   stays undecided, and every retry is a paid model turn); the new-branch
   driver hands the proposal back to `accepted` with no triage record and
   reports a skip, not an error, so the tick stays green and the
-  `implement-fallback` account is not spent on it (if only `gh pr create` was undecided, the retry's
+  `implement-fallback` account is not spent on it. That hand-back is
+  bounded the same way the verification-budget hand-back is: a
+  `policy_handbacks` tally in `.status.yaml` (its own counter, reset by a
+  successful run), and at `IMPLEMENT_MAX_POLICY_HANDBACKS` (3) consecutive
+  undecided attempts a terminal `needs-triage` with `failure.code:
+  policy-undecided`, also reported as a skip so the write that ends the loop
+  is committed (if only `gh pr create` was undecided, the retry's
   preflight opens the PR for the pushed branch without a model run). The
   other sites already treat both alike without recording anything against
   the item: a merge waits, the review trigger, rerun and investigator
