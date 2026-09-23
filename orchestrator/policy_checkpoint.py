@@ -65,6 +65,11 @@ CODE_IDENTITY_UNAVAILABLE = "identity_unavailable"
 CODE_APPROVAL_LOOKUP_ERROR = "approval_lookup_error"
 CODE_INVALID_REQUEST = "invalid_request"
 
+#: Codes meaning the checkpoint could not decide, not that it said no: a
+#: caller may retry these within its own bound. Every other refusal is an
+#: answer (`invalid_request` included: the same arguments are refused again).
+UNDECIDED_CODES = frozenset({CODE_EVALUATOR_ERROR, CODE_IDENTITY_UNAVAILABLE, CODE_APPROVAL_LOOKUP_ERROR})
+
 DECISION_PREFIX = "POLICY_DECISION"
 
 
@@ -139,6 +144,10 @@ class Decision:
     def permitted(self) -> bool:
         return self.code in (CODE_ALLOWED, CODE_APPROVED)
 
+    @property
+    def undecided(self) -> bool:
+        return self.code in UNDECIDED_CODES
+
 
 class PolicyRefused(RuntimeError):
     """The checkpoint refused an action; its side effect did not run."""
@@ -174,9 +183,11 @@ NO_APPROVALS: ApprovalLookup = _NoApprovals()
 _READ_VERBS = ("get_", "list_", "read_", "search_", "describe_")
 _READ_TOOLS = ("whoami", "incident_summary", "resolve_agent")
 #: Mutations an agent performs by design: the incident responder resolves
-#: and acknowledges incidents, and an investigator may open an
-#: investigation. Nothing here deploys, deletes, grants or approves.
-_ALLOWED_MUTATIONS = ("resolve_incident", "acknowledge_incident", "trigger_issue")
+#: and acknowledges incidents. Nothing here deploys, deletes, grants,
+#: approves or starts a run: `trigger_issue` starts a paid investigator
+#: run (and could fan out recursively), so like every other trigger it is
+#: gated.
+_ALLOWED_MUTATIONS = ("resolve_incident", "acknowledge_incident")
 
 
 def _mctl_tool_patterns(names: tuple[str, ...], *, prefix: bool) -> tuple[str, ...]:
@@ -286,7 +297,11 @@ def enforce[T](
 
 def decision_record(request: ActionRequest, decision: Decision) -> dict[str, Any]:
     """The audit record of one decision. Only identifiers, the args digest
-    and safe metadata: never the arguments themselves."""
+    and safe metadata: never the arguments themselves.
+
+    Whether the action ran is `code in {allowed, approved}` — never the
+    `decision` field alone: a permitted REQUIRE_APPROVAL keeps the rule's
+    verdict and carries `code: approved`."""
     return {
         "execution_id": request.execution_id,
         "trace_id": request.trace_id,

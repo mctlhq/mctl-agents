@@ -80,6 +80,11 @@ line follows the existing structured-log convention
 (`lifecycle/claim.py`'s `_emit`), and its fields are the decision's trace
 attributes when #195 lands.
 
+A permitted REQUIRE_APPROVAL is recorded as `decision: REQUIRE_APPROVAL`,
+`code: approved`, with the approval ref. The verdict is the rule's, and the
+code says what happened to it. Whether the action ran is therefore
+`code in {allowed, approved}`, never the `decision` field alone.
+
 ### 5. Governed paths in this slice
 
 - **MCP.** Every `mcp__.*` tool call made by the service agent, the
@@ -99,7 +104,7 @@ Built-in policy `mctl-agents/policy/v1`:
 |---|---|
 | issue comments | ALLOW |
 | the investigate operation | ALLOW |
-| mctl MCP reads (`get_`, `list_`, `read_`, `search_`, `describe_`, `whoami`, …) and the agent mutations `resolve_incident`, `acknowledge_incident`, `trigger_issue` | ALLOW |
+| mctl MCP reads (`get_`, `list_`, `read_`, `search_`, `describe_`, `whoami`, …) and the agent mutations `resolve_incident`, `acknowledge_incident` | ALLOW |
 | every other granted mctl MCP tool, including any added to mctl-api later | REQUIRE_APPROVAL |
 | anything else | DENY |
 
@@ -131,10 +136,6 @@ Built-in policy `mctl-agents/policy/v1`:
    decision: either put Bash commands through the checkpoint (the existing
    Bash `PreToolUse` hooks are the place) or remove credentials from the
    agent's shell.
-
-A permitted REQUIRE_APPROVAL is recorded as `decision: REQUIRE_APPROVAL`,
-`code: approved`, with the approval ref. The verdict is the rule's, and the
-code says what happened to it.
 
 ## Consequences
 

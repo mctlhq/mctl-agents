@@ -86,10 +86,12 @@ def test_every_mctl_tool_that_is_not_a_known_read_or_agent_mutation_needs_an_app
                  "mctl_approve_dev_loop", "mctl_deploy_openclaw",
                  # verb-final and unknown names are gated too, never allowed
                  "mctl_trigger_deploy", "mctl_trigger_rollback", "mctl_delete", "mctl_brand_new_tool",
-                 "mctl_set_budget_limit", "deploy_service"):
+                 "mctl_set_budget_limit", "deploy_service",
+                 # starting a paid run is a trigger like the others
+                 "mctl_trigger_issue", "trigger_issue"):
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_APPROVAL_REQUIRED, tool
     for tool in ("mctl_list_services", "mctl_get_dev_loop", "mctl_whoami", "mctl_get_service_status",
-                 "get_service_status", "mctl_incident_summary", "mctl_resolve_incident", "mctl_trigger_issue",
+                 "get_service_status", "mctl_incident_summary", "mctl_resolve_incident",
                  "mctl_acknowledge_incident"):
         assert _mcp(f"mcp__mctl__{tool}", {}).code == pc.CODE_ALLOWED, tool
 
@@ -321,6 +323,25 @@ def test_a_refused_dispatch_is_answered_once_and_not_retried(monkeypatch):
     assert len(replies) == 1
     assert "`DENY`" in replies[0] and "mctl-directive-ack: c1" in replies[0]
     assert "mctl-directive-fail" not in replies[0]
+
+
+@pytest.mark.parametrize("code", sorted(pc.UNDECIDED_CODES))
+def test_an_undecided_checkpoint_is_retried_not_acked(monkeypatch, code):
+    ref = ProposalStateRef(service="mctl-web", slug="issue-9-fix", status="proposed", pr_url=None)
+
+    async def _undecided(issue_url, slug, requested_by):
+        raise pc.PolicyRefused(pc.Decision(pc.DENY, code, "could not decide", "v1", "", "sha256:d"))
+
+    replies: list[str] = []
+    monkeypatch.setattr(run_issue_directive_poller, "submit_investigate", _undecided)
+    monkeypatch.setattr(run_issue_directive_poller, "_post_reply", lambda url, body: replies.append(body))
+    directive = Directive(comment_id="c1", author="octocat", created_at="2026-09-23T10:00:00Z",
+                          verb="reinvestigate", authorized=True)
+    outcome = asyncio.run(run_issue_directive_poller._handle_directive(
+        directive, issue_url=ISSUE, ref=ref, all_refs=[ref], dry_run=False))
+    assert outcome == "dispatch-failed"
+    assert len(replies) == 1
+    assert "mctl-directive-fail: c1" in replies[0] and "mctl-directive-ack" not in replies[0]
 
 
 

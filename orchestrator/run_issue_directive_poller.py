@@ -583,6 +583,15 @@ class DirectiveScanResult:
     failed: int = 0
 
 
+
+class PolicyCheckpointUndecided(RuntimeError):
+    """The policy checkpoint could not decide on a dispatch; nothing was sent."""
+
+    def __init__(self, decision: policy_checkpoint.Decision) -> None:
+        super().__init__(f"policy checkpoint could not decide ({decision.code}): {decision.reason}")
+        self.decision = decision
+
+
 async def _handle_directive(
     directive: Directive,
     *,
@@ -668,7 +677,16 @@ async def _handle_directive(
 
     if outcome == "dispatch":
         try:
-            workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+            try:
+                workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+            except policy_checkpoint.PolicyRefused as e:
+                if e.decision.undecided:
+                    # The checkpoint could not decide (evaluator, identity
+                    # or approval lookup failed): nothing was sent, and it
+                    # is retried like any failed dispatch, within
+                    # MAX_DISPATCH_ATTEMPTS, not acked as if it were a "no".
+                    raise PolicyCheckpointUndecided(e.decision) from e
+                raise
         except policy_checkpoint.PolicyRefused as e:
             # Nothing was sent. A policy refusal is an answer, not a
             # transient failure: acked at once, never retried by this path.
