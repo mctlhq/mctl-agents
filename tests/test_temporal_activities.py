@@ -733,6 +733,9 @@ class TestVisibilityActivities:
             def __init__(self, wid: str) -> None:
                 self.id = wid
 
+            async def memo_value(self, key: str, default: str = "") -> str:
+                return default
+
         class _FakeClient:
             def __init__(self) -> None:
                 self.query = None
