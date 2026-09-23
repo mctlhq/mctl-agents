@@ -12,9 +12,10 @@ of `orchestrator.work_context`:
   sealed content).
 - `persist` sends the sealed snapshot's canonical bytes after `seal()`.
 
-Both act only when the rollout is at least `observe` AND the execution id
-is a store execution (`we_...`). Any other id is a local correlation id
-the store has never seen (see mctlhq/mctl-agents#455), so nothing is sent.
+Both act only for a store execution (`we_...`): any other id is a local
+correlation id the store has never seen (see mctlhq/mctl-agents#455), so
+nothing is sent. The rollout gate (`observe` or above) is NOT enforced
+here: it lives in the one caller, `context_assembly._work_context_active`.
 
 Failure is a value (`SnapshotAnswer`), never an exception. The caller
 decides what an unfavourable answer costs: at `observe` it is logged, at
@@ -27,10 +28,10 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, TypeGuard
 
-from orchestrator.context_snapshot import canonical_json, hash_bytes
+from orchestrator.context_snapshot import MAX_WORK_CONTEXT_ID_LENGTH, canonical_json, hash_bytes
 
 if TYPE_CHECKING:
     from orchestrator.context_snapshot import ContextSnapshot, WorkContextRef
@@ -49,6 +50,10 @@ SNAPSHOT_UNKNOWN = "snapshot-unknown"
 #: Nothing was sent: rollout off, or not a store execution.
 SNAPSHOT_SKIPPED = "snapshot-skipped"
 
+#: The label mctl-api puts on every work-item response; another label is a
+#: breaking change this mirror does not understand (as `contract.envelope_of`).
+SCHEMA_VERSION = "workitem/v1"
+
 #: mctl-api's typed codes (internal/api/handlers_work_item_snapshots.go).
 DIVERGENCE_CODE = "snapshot_divergence"
 NOT_FOUND_CODE = "snapshot_not_found"
@@ -60,9 +65,9 @@ class SnapshotAnswer:
     snapshot_id: str = ""
     content_hash: str = ""
     reason: str = ""
-    #: On a read: the hash of the stored document without `created_at`
-    #: (`timeless_hash`), if it decodes; "" otherwise.
-    timeless_hash: str = ""
+    #: On a read: the stored document, decoded, or None when it does not
+    #: decode. Compared by `persist` after a 409; never logged.
+    stored_document: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
     @property
     def stored(self) -> bool:
@@ -105,8 +110,23 @@ def _latest_store_prior(work_context: WorkContextRef) -> str:
 
 
 def _snapshot_of(payload: dict[str, Any]) -> dict[str, Any]:
+    """The `snapshot` of a `workitem/v1` answer, or {} for anything else."""
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        return {}
     snap = payload.get("snapshot")
-    return snap if isinstance(snap, dict) else {}
+    if not isinstance(snap, dict) or snap.get("schema_version") != SCHEMA_VERSION:
+        return {}
+    return snap
+
+
+def _is_snapshot_id(value: Any) -> TypeGuard[str]:
+    """A store snapshot id this side can carry: `cs_`-prefixed and within
+    the length `ContextSnapshot.validate()` accepts for sealed ids."""
+    return (
+        isinstance(value, str)
+        and value.startswith(SNAPSHOT_ID_PREFIX)
+        and len(value) <= MAX_WORK_CONTEXT_ID_LENGTH
+    )
 
 
 def answer_from_seal(status: int, payload: dict[str, Any], *, content_hash: str, execution_id: str) -> SnapshotAnswer:
@@ -116,13 +136,12 @@ def answer_from_seal(status: int, payload: dict[str, Any], *, content_hash: str,
     if status in (200, 201):
         snap = _snapshot_of(payload)
         sid = snap.get("id")
-        if (
-            not isinstance(sid, str)
-            or not sid.startswith(SNAPSHOT_ID_PREFIX)
-            or snap.get("content_hash") != content_hash
-            or snap.get("execution_id") != execution_id
-        ):
-            return SnapshotAnswer(SNAPSHOT_UNKNOWN, reason=f"HTTP {status} does not describe the sealed bytes")
+        describes_ours = snap.get("content_hash") == content_hash and snap.get("execution_id") == execution_id
+        if not _is_snapshot_id(sid) or not describes_ours:
+            return SnapshotAnswer(
+                SNAPSHOT_UNKNOWN, content_hash=content_hash,
+                reason=f"HTTP {status} does not describe the sealed bytes {content_hash} of {execution_id}",
+            )
         return SnapshotAnswer(
             SNAPSHOT_SEALED if status == 201 else SNAPSHOT_REPLAYED, snapshot_id=sid, content_hash=content_hash
         )
@@ -139,38 +158,60 @@ def answer_from_read(status: int, payload: dict[str, Any], *, execution_id: str)
     if status == 200:
         snap = _snapshot_of(payload)
         sid, digest = snap.get("id"), snap.get("content_hash")
-        if (
-            not isinstance(sid, str)
-            or not sid.startswith(SNAPSHOT_ID_PREFIX)
-            or not isinstance(digest, str)
-            or snap.get("execution_id") != execution_id
-        ):
+        if not _is_snapshot_id(sid) or not isinstance(digest, str) or snap.get("execution_id") != execution_id:
             return SnapshotAnswer(SNAPSHOT_UNKNOWN, reason="HTTP 200 does not describe that execution's snapshot")
         return SnapshotAnswer(
-            SNAPSHOT_REPLAYED, snapshot_id=sid, content_hash=digest, timeless_hash=_stored_timeless_hash(snap)
+            SNAPSHOT_REPLAYED, snapshot_id=sid, content_hash=digest, stored_document=_stored_document(snap)
         )
     if status == 404 and payload.get("code") == NOT_FOUND_CODE:
         return SnapshotAnswer(SNAPSHOT_ABSENT, reason="the prior execution sealed no snapshot")
     return SnapshotAnswer(SNAPSHOT_UNKNOWN, reason=f"HTTP {status} {payload.get('code') or ''}".strip())
 
 
-def timeless_hash(document: dict[str, Any]) -> str:
-    """The hash of a snapshot document without `created_at`: what a retry
-    of the same execution reproduces exactly when it assembles the same
-    context. Computed from the document itself, never taken from a field
-    the document declares."""
-    return hash_bytes(canonical_json({k: v for k, v in document.items() if k != "created_at"}))
+#: Top-level fields a retry of the same execution may legitimately change
+#: without having assembled a different context: `created_at`, and the
+#: snapshot's own id/hash, which cover it.
+_RETRY_VOLATILE = frozenset({"created_at", "snapshot_id", "content_hash"})
 
 
-def _stored_timeless_hash(snap: dict[str, Any]) -> str:
+def _retry_stable(document: dict[str, Any]) -> dict[str, Any]:
+    """`document` without what a retry may change: the volatile top-level
+    fields, and `work_context.resumed_from_snapshot_id` — a best-effort
+    convenience pointer (ADR 011 §2) whose lookup can fail on one attempt
+    and succeed on the next."""
+    stable = {k: v for k, v in document.items() if k not in _RETRY_VOLATILE}
+    wc = stable.get("work_context")
+    if isinstance(wc, dict):
+        stable["work_context"] = {k: v for k, v in wc.items() if k != "resumed_from_snapshot_id"}
+    return stable
+
+
+def differing_fields(stored: dict[str, Any], ours: dict[str, Any]) -> list[str]:
+    """The top-level fields (and `work_context.<field>`) in which two
+    snapshot documents differ once what a retry may change is removed.
+    Empty means a retry of the same context."""
+    a, b = _retry_stable(stored), _retry_stable(ours)
+    out = []
+    for key in sorted(set(a) | set(b)):
+        if a.get(key) == b.get(key):
+            continue
+        if key == "work_context" and isinstance(a.get(key), dict) and isinstance(b.get(key), dict):
+            wa, wb = a[key], b[key]
+            out += [f"work_context.{k}" for k in sorted(set(wa) | set(wb)) if wa.get(k) != wb.get(k)]
+        else:
+            out.append(key)
+    return out
+
+
+def _stored_document(snap: dict[str, Any]) -> dict[str, Any] | None:
     raw = snap.get("canonical_b64")
     if not isinstance(raw, str):
-        return ""
+        return None
     try:
         doc = json.loads(base64.b64decode(raw, validate=True))
     except (binascii.Error, ValueError):
-        return ""
-    return timeless_hash(doc) if isinstance(doc, dict) else ""
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def resumed_from(work_context: WorkContextRef, client: Any) -> tuple[WorkContextRef, SnapshotAnswer]:
@@ -208,15 +249,22 @@ def persist(snapshot: ContextSnapshot, client: Any) -> SnapshotAnswer:
     # unverified, which is UNKNOWN (governed by `blocks_on_unknown()`),
     # never a divergence.
     stored = client.execution_snapshot(wid, eid)
-    if stored.verdict != SNAPSHOT_REPLAYED or not stored.timeless_hash:
+    if stored.verdict != SNAPSHOT_REPLAYED or stored.stored_document is None:
         return SnapshotAnswer(
             SNAPSHOT_UNKNOWN, content_hash=answer.content_hash,
             reason=f"409 {DIVERGENCE_CODE}, but the stored snapshot could not be verified: "
             f"{stored.verdict} {stored.reason}".strip(),
         )
-    if stored.timeless_hash == timeless_hash(snapshot.to_dict()):
+    differs = differing_fields(stored.stored_document, snapshot.to_dict())
+    if not differs:
         return SnapshotAnswer(
             SNAPSHOT_REPLAYED, snapshot_id=stored.snapshot_id, content_hash=stored.content_hash,
-            reason="same content as the stored snapshot, sealed at another time",
+            reason="same context as the stored snapshot, assembled on another attempt",
         )
-    return answer
+    # Most often the live inputs changed under a retry (e.g. a new issue
+    # comment): the reason names what differs, so this reads as that, not
+    # as corruption.
+    return SnapshotAnswer(
+        SNAPSHOT_DIVERGED, content_hash=answer.content_hash,
+        reason=f"this execution already sealed a different context; differs in: {', '.join(differs)}",
+    )

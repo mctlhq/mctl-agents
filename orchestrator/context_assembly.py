@@ -803,9 +803,12 @@ def assemble_investigator_context(
         now=resolved_now,
         config=resolved_config,
     )
-    work_context = _link_prior_snapshot(work_context, work_item_client)
+    # One client for the one conversation with the store, and only when
+    # the rollout and the execution id say there is one.
+    client = _client(work_item_client) if _work_context_active(work_context) else None
+    work_context = _link_prior_snapshot(work_context, client)
     result = assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
-    _persist_to_work_item_store(result.snapshot, work_item_client)
+    _persist_to_work_item_store(result.snapshot, client)
     return result
 
 
@@ -847,21 +850,23 @@ def _client(work_item_client: Any | None) -> Any:
     return WorkItemClient()
 
 
-def _link_prior_snapshot(work_context: WorkContextRef | None, work_item_client: Any | None) -> WorkContextRef | None:
+def _link_prior_snapshot(work_context: WorkContextRef | None, client: Any | None) -> WorkContextRef | None:
     """Point `resumed_from_snapshot_id` at the prior execution's sealed
     snapshot before this execution's is sealed. A convenience pointer
-    (ADR 011): a failed lookup is logged and never blocks."""
-    if work_context is None or not _work_context_active(work_context):
+    (ADR 011): a failed lookup is logged and never blocks, and a retry that
+    gets a different answer is not a divergence (`snapshots.differing_fields`
+    ignores the pointer)."""
+    if work_context is None or client is None:
         return work_context
     from orchestrator.work_context.snapshots import SNAPSHOT_SKIPPED, resumed_from
 
-    linked, answer = resumed_from(work_context, _client(work_item_client))
+    linked, answer = resumed_from(work_context, client)
     if answer.verdict != SNAPSHOT_SKIPPED:
         _emit_snapshot_answer("resumed_from", answer)
     return linked
 
 
-def _persist_to_work_item_store(snapshot: ContextSnapshot, work_item_client: Any | None) -> None:
+def _persist_to_work_item_store(snapshot: ContextSnapshot, client: Any | None) -> None:
     """Store the sealed snapshot as its execution's (mctl-api, insert-only).
 
     A divergence — this execution already sealed a different context — is
@@ -869,12 +874,12 @@ def _persist_to_work_item_store(snapshot: ContextSnapshot, work_item_client: Any
     `enforce` up, like any answer that leaves the store without this
     execution's snapshot when `blocks_on_unknown()` holds; at `observe` it is
     logged and the issue path still decides."""
-    if not _work_context_active(snapshot.work_context):
+    if client is None:
         return
     from orchestrator.work_context import rollout
     from orchestrator.work_context.snapshots import SNAPSHOT_DIVERGED, persist
 
-    answer = persist(snapshot, _client(work_item_client))
+    answer = persist(snapshot, client)
     _emit_snapshot_answer("persist", answer)
     if answer.stored:
         return

@@ -5,6 +5,7 @@ import base64
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -13,7 +14,7 @@ from orchestrator import context_snapshot as cs
 from orchestrator import policy_checkpoint as pc
 from orchestrator.run_issue_investigator import IssueData, IssueRef
 from orchestrator.work_context import snapshots as ws
-from orchestrator.work_context.client import WorkItemClient, _HTTPResult
+from orchestrator.work_context.client import WorkItemClient, WorkItemUnavailable, _HTTPResult
 
 WID = "wi_0a70acb2-94c3-440b-bd1f-a898e8bee4a5"
 E1 = "we_11111111-1111-4111-8111-111111111111"
@@ -73,11 +74,11 @@ class _Store:
 
     def execution_snapshot(self, work_item_id, execution_id):
         if execution_id == E1 and self.prior:
-            return ws.answer_from_read(200, {"snapshot": {**self.prior, "execution_id": E1}}, execution_id=E1)
+            return ws.answer_from_read(200, _env({**self.prior, "execution_id": E1}), execution_id=E1)
         if execution_id == E2 and self.stored is not None:
             snap = {"id": "cs_stored", "execution_id": E2, "content_hash": cs.hash_bytes(self.stored),
                     "canonical_b64": base64.b64encode(self.stored).decode()}
-            return ws.answer_from_read(200, {"snapshot": snap}, execution_id=E2)
+            return ws.answer_from_read(200, _env(snap), execution_id=E2)
         return ws.answer_from_read(404, {"code": "snapshot_not_found"}, execution_id=execution_id)
 
     def seal_snapshot(self, work_item_id, execution_id, body):
@@ -90,8 +91,20 @@ class _Store:
                                        content_hash=body["content_hash"], execution_id=execution_id)
         snap = {"id": "cs_new", "execution_id": execution_id, "content_hash": body["content_hash"]}
         return ws.answer_from_seal(
-            201, {"snapshot": snap}, content_hash=body["content_hash"], execution_id=execution_id
+            201, _env(snap), content_hash=body["content_hash"], execution_id=execution_id
         )
+
+
+def _env(snap: dict) -> dict:
+    """A `workitem/v1` snapshot answer, as mctl-api shapes it."""
+    return {"schema_version": "workitem/v1", "snapshot": {"schema_version": "workitem/v1", **snap}}
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "workitem"
+
+
+def _fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -115,13 +128,15 @@ def test_seal_body_carries_the_exact_canonical_document(tmp_path):
 
 
 def test_seal_answers_are_classified_and_a_2xx_must_describe_what_was_sent():
-    ok = {"snapshot": {"id": "cs_1", "execution_id": E2, "content_hash": "sha256:a"}}
+    ok = _env({"id": "cs_1", "execution_id": E2, "content_hash": "sha256:a"})
     assert ws.answer_from_seal(201, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_SEALED
     assert ws.answer_from_seal(200, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_REPLAYED
     for status, payload, hash_, eid in (
         (201, ok, "sha256:b", E2),                                   # other bytes
         (201, ok, "sha256:a", E1),                                   # other execution
-        (201, {"snapshot": {**ok["snapshot"], "id": "x"}}, "sha256:a", E2),
+        (201, _env({**ok["snapshot"], "id": "x"}), "sha256:a", E2),
+        (201, _env({**ok["snapshot"], "id": "cs_" + "a" * 300}), "sha256:a", E2),
+        (201, {**ok, "schema_version": "workitem/v2"}, "sha256:a", E2),
         (201, {}, "sha256:a", E2),
         (500, {"error": "x"}, "sha256:a", E2),
     ):
@@ -135,8 +150,11 @@ def test_seal_answers_are_classified_and_a_2xx_must_describe_what_was_sent():
 
 def test_read_answers_are_classified():
     snap = {"id": "cs_1", "execution_id": E1, "content_hash": "sha256:a"}
-    assert ws.answer_from_read(200, {"snapshot": snap}, execution_id=E1).snapshot_id == "cs_1"
-    assert ws.answer_from_read(200, {"snapshot": snap}, execution_id=E2).verdict == ws.SNAPSHOT_UNKNOWN
+    assert ws.answer_from_read(200, _env(snap), execution_id=E1).snapshot_id == "cs_1"
+    assert ws.answer_from_read(200, _env(snap), execution_id=E2).verdict == ws.SNAPSHOT_UNKNOWN
+    # An id the sealed document could not carry is not an answer.
+    assert ws.answer_from_read(200, _env({**snap, "id": "cs_" + "a" * 300}), execution_id=E1).verdict == (
+        ws.SNAPSHOT_UNKNOWN)
     assert ws.answer_from_read(404, {"code": "snapshot_not_found"}, execution_id=E1).verdict == ws.SNAPSHOT_ABSENT
     # Any other 404 (the work item itself, or the execution) is not "none sealed".
     assert ws.answer_from_read(404, {"code": "work_item_not_found"}, execution_id=E1).verdict == ws.SNAPSHOT_UNKNOWN
@@ -206,7 +224,7 @@ def test_client_seal_goes_through_the_policy_checkpoint(monkeypatch):
     def _request(method, path, payload=None):
         sent.append((method, path, payload))
         snap = {"id": "cs_1", "execution_id": E2, "content_hash": payload["content_hash"]}
-        return _HTTPResult(201, {"snapshot": snap})
+        return _HTTPResult(201, _env(snap))
 
     monkeypatch.setattr(client, "_request", _request)
     body = {"content_hash": "sha256:a", "canonical_b64": "e30="}
@@ -241,9 +259,66 @@ def test_an_unverifiable_divergence_is_unknown_not_diverged(tmp_path, monkeypatc
         store.execution_snapshot = lambda *a: ws.answer_from_read(503, {"error": "down"}, execution_id=E2)
     else:
         bad = {"id": "cs_stored", "execution_id": E2, "content_hash": "sha256:x", "canonical_b64": "not base64!"}
-        store.execution_snapshot = lambda *a: ws.answer_from_read(200, {"snapshot": bad}, execution_id=E2)
+        store.execution_snapshot = lambda *a: ws.answer_from_read(200, _env(bad), execution_id=E2)
     assert ws.persist(snap, store).verdict == ws.SNAPSHOT_UNKNOWN
     # So the break-glass governs it, as for any unreachable store.
     monkeypatch.setenv("WORK_CONTEXT_ROLLOUT_MODE", "enforce")
     monkeypatch.setenv("WORK_CONTEXT_REQUIRED", "false")
     ca.assemble_investigator_context(**_assemble_kwargs(tmp_path, _work_context(), store))
+
+
+def test_real_mctl_api_answers_classify_as_intended():
+    """Captured from mctl-api#362's handlers (seal twice, diverge, read, absent)."""
+    created = _fixture("snapshot-seal-created.json")
+    snap = created["snapshot"]
+    raw = base64.b64decode(snap["canonical_b64"])
+    assert snap["content_hash"] == cs.hash_bytes(raw)  # the store's hash rule is ours
+    kw = {"content_hash": snap["content_hash"], "execution_id": snap["execution_id"]}
+    assert ws.answer_from_seal(201, created, **kw).verdict == ws.SNAPSHOT_SEALED
+    assert ws.answer_from_seal(200, _fixture("snapshot-seal-replayed.json"), **kw).verdict == ws.SNAPSHOT_REPLAYED
+    assert ws.answer_from_seal(409, _fixture("snapshot-seal-diverged.json"), **kw).verdict == ws.SNAPSHOT_DIVERGED
+    read = ws.answer_from_read(200, _fixture("snapshot-read.json"), execution_id=snap["execution_id"])
+    assert (read.verdict, read.snapshot_id, read.stored_document) == (ws.SNAPSHOT_REPLAYED, snap["id"], json.loads(raw))
+    absent = ws.answer_from_read(404, _fixture("snapshot-read-absent.json"), execution_id=snap["execution_id"])
+    assert absent.verdict == ws.SNAPSHOT_ABSENT
+
+
+@pytest.mark.parametrize("first_pointer,retry_pointer", [(None, "cs_prior"), ("cs_prior", None)])
+def test_a_prior_lookup_that_differs_between_attempts_is_not_a_divergence(tmp_path, first_pointer, retry_pointer):
+    first = _sealed(tmp_path, _work_context(resumed_from_snapshot_id=first_pointer))
+    retry = _sealed(tmp_path, _work_context(resumed_from_snapshot_id=retry_pointer))
+    stored = cs.canonical_json(first.to_dict())
+    assert ws.persist(retry, _Store(stored=stored)).verdict == ws.SNAPSHOT_REPLAYED
+
+
+def test_a_divergence_names_what_differs(tmp_path):
+    snap = _sealed(tmp_path)
+    other = cs.canonical_json({**snap.to_dict(), "sources": [{"x": 1}]})
+    answer = ws.persist(snap, _Store(stored=other))
+    assert answer.verdict == ws.SNAPSHOT_DIVERGED and "differs in: sources" in answer.reason
+
+
+def test_an_oversized_prior_id_is_ignored_and_never_breaks_assembly(tmp_path, observe):
+    store = _Store(prior={"id": "cs_" + "a" * 300, "content_hash": "sha256:p"})
+    result = ca.assemble_investigator_context(**_assemble_kwargs(tmp_path, _work_context(), store))
+    assert result.snapshot.work_context.resumed_from_snapshot_id is None
+    result.snapshot.validate()
+
+
+def test_client_reads_a_snapshot_through_the_real_route(monkeypatch):
+    client = WorkItemClient(base_url="https://api.example", token="t")  # noqa: S106 — a test token
+    asked: list[tuple[str, str]] = []
+
+    def _request(method, path, payload=None):
+        asked.append((method, path))
+        return _HTTPResult(404, {"code": "snapshot_not_found"})
+
+    monkeypatch.setattr(client, "_request", _request)
+    assert client.execution_snapshot("wi/1", "we 2").verdict == ws.SNAPSHOT_ABSENT
+    assert asked == [("GET", "/api/v1/work-items/wi%2F1/executions/we%202/snapshot")]
+
+    def _down(method, path, payload=None):
+        raise WorkItemUnavailable("connection refused")
+
+    monkeypatch.setattr(client, "_request", _down)
+    assert client.execution_snapshot(WID, E1).verdict == ws.SNAPSHOT_UNKNOWN

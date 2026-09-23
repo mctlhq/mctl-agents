@@ -142,8 +142,13 @@ exists only when the work-item layer creates a new execution.
 - **A retry is not a divergence.** Re-assembling the same execution's
   context yields a new `created_at`, so the bytes differ and the store
   answers 409. The stored document is then read back and compared without
-  `created_at`; if the rest is identical, the answer is a replay. Only a
-  document that differs in anything else is a divergence. If the stored
+  what a retry may change: `created_at`, the snapshot's own id and hash,
+  and `work_context.resumed_from_snapshot_id`, since the prior lookup is
+  best-effort and can succeed on one attempt and fail on the next. If the
+  rest is identical, the answer is a replay. Only a document that differs
+  in anything else is a divergence, and the logged reason names the fields.
+  The usual cause is that the live inputs changed under a retry (e.g. a
+  new issue comment), not corruption. Recovery is a new execution. If the stored
   document cannot be read or decoded, the answer is UNKNOWN, never a
   divergence: a divergence is reported only once it is verified. The stored
   snapshot is never replaced.
