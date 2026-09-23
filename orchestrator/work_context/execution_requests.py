@@ -60,9 +60,31 @@ UNSUPPORTED_KIND = "unsupported_kind"
 #: Another DevLoop is already live for the item's issue; a second
 #: investigation of the same issue would race it for the same proposal.
 LOOP_ACTIVE = "loop_active"
-#: A resume whose item still has a live DevLoop. v1 does not deliver it; see
-#: `orchestrator.temporal.dispatcher` for why.
-RESUME_ONTO_LIVE_LOOP_UNSUPPORTED = "resume_onto_live_loop_unsupported"
+#: A resume the live DevLoop refused to accept, or one this platform refused
+#: before delivering it. One of RESUME_REFUSAL_REASONS is appended after a
+#: colon, never anything else. Refused before any fulfil, so no execution was
+#: minted for it.
+RESUME_REFUSED = "resume_refused"
+#: The closed vocabulary after `resume_refused:`. The loop's own (its
+#: `accept_execution_request` validator, the `resume` signal's rules):
+#: `malformed-delivery`, `work-item-mismatch`, `resume-already-pending`,
+#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`. The
+#: dispatcher's: `engine-ref-too-long` (the engine ref `<loop>#<request id>`
+#: exceeds mctl-api's limit). And `unspecified`: a refusal whose reason is
+#: missing or outside this list (a loop built with a reason this build does
+#: not know), normalised so a surface never sees free text.
+RESUME_REFUSAL_UNSPECIFIED = "unspecified"
+RESUME_REFUSAL_REASONS = frozenset(
+    {
+        "malformed-delivery",
+        "work-item-mismatch",
+        "resume-already-pending",
+        "surface-or-actor-missing",
+        "surface-or-actor-unrecognised",
+        "engine-ref-too-long",
+        RESUME_REFUSAL_UNSPECIFIED,
+    }
+)
 #: The run this request's workflow id names already ended without the
 #: request being fulfilled (it waited for fulfilment and gave up). Starting
 #: it again is refused by the reuse policy, and fulfilling the request with

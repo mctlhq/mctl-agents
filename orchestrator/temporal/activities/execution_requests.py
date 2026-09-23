@@ -17,6 +17,23 @@ this workflow's own engine run. Refusals are values (`BoundExecution`);
 "not fulfilled yet" and an unreadable store raise, so the workflow's retry
 policy turns them into a bounded wait.
 
+A refusal still names an execution (`BoundExecution.stranded`) when the
+ledger proves one exists under THIS loop's engine ref: the fulfil minted it
+for this loop, and nothing but this loop will ever end it. The item turned
+out to be about another issue, or the advance to `Running` was refused, or
+the engine ref answered with an execution the request does not name: the
+loop must not run it (`work-item-mismatch`, or `execution-refused` for the
+refused advance), but it must end it (`Failed`), or it stays
+non-terminal and mctl-api refuses every later request for the item. A
+refusal with no execution id proved nothing of this loop's exists (a
+rejected request, another item's request, a fulfil for another engine run).
+
+The same two activities serve a `resume` delivered onto a LIVE loop
+(`DevLoopWorkflow.accept_execution_request`): there the engine ref the loop
+binds and advances is `<loop id>#<request id>`
+(`issue_ref.resume_engine_ref`), not the loop's own id, and the rules are
+unchanged — the store's execution must be exactly that engine run.
+
 Workflow code never performs this I/O itself (ADR-010 §9, as
 `activities/lifecycle.py`): these activities are the only place it happens.
 """
@@ -41,6 +58,9 @@ BOUND = "bound"
 REQUEST_REJECTED = "rejected"
 #: The store's answer does not describe this loop.
 MISMATCH = "work-item-mismatch"
+#: The execution is this loop's, but mctl-api (or the policy checkpoint)
+#: refused its advance to `Running`: it exists and may not run (stranded).
+EXECUTION_REFUSED_OUTCOME = "execution-refused"
 
 #: Raised while the request is still pending/claimed, so the retry policy
 #: waits for the dispatcher's fulfil.
@@ -62,6 +82,9 @@ class BindInput:
 @dataclass(frozen=True)
 class BoundExecution:
     outcome: str
+    #: BOUND: the execution this loop is. Any other outcome: the execution
+    #: provably attached under this loop's engine ref that the loop must
+    #: end without running (`stranded`), or "" when none is.
     execution_id: str = ""
     #: The execution's attempt number in the item's ledger.
     sequence: int = 0
@@ -70,6 +93,12 @@ class BoundExecution:
     @property
     def bound(self) -> bool:
         return self.outcome == BOUND
+
+    @property
+    def stranded(self) -> bool:
+        """Refused, but an execution of this loop's engine ref exists: the
+        caller ends it `Failed` (module docstring)."""
+        return not self.bound and bool(self.execution_id)
 
 
 @dataclass(frozen=True)
@@ -123,12 +152,16 @@ async def bind_dispatched_execution(input: BindInput) -> BoundExecution:
             f"work item {input.work_item_id}: {answer.verdict} {answer.reason}", type=UNREADABLE_TYPE
         )
     item = answer.item
+    own = next((e for e in item.executions if e.execution_id == request.execution_id), None)
+    ours = own is not None and own.temporal_workflow_id == input.engine_ref
     if item.issue_url != input.issue_url:
         return BoundExecution(
-            MISMATCH, reason=f"work item {item.work_item_id} is about {item.issue_url!r}, not {input.issue_url!r}"
+            MISMATCH,
+            # The fulfil minted it under this loop's engine ref: stranded.
+            execution_id=request.execution_id if ours else "",
+            reason=f"work item {item.work_item_id} is about {item.issue_url!r}, not {input.issue_url!r}",
         )
-    own = next((e for e in item.executions if e.execution_id == request.execution_id), None)
-    if own is None or own.temporal_workflow_id != input.engine_ref:
+    if not ours:
         return BoundExecution(
             MISMATCH,
             reason=(
@@ -141,15 +174,23 @@ async def bind_dispatched_execution(input: BindInput) -> BoundExecution:
     attached = await asyncio.to_thread(client.attach_execution, input.work_item_id, run, "Running")
     if attached.verdict == EXECUTION_REFUSED:
         # A definite no (an ended execution, a policy DENY): the execution
-        # exists but cannot run. Refused, not retried.
-        return BoundExecution(MISMATCH, reason=f"advance {request.execution_id} to Running: {attached.reason}")
+        # exists (proven above) but cannot run. Refused, not retried, and
+        # stranded: ending an already ended one is a harmless refusal.
+        return BoundExecution(
+            EXECUTION_REFUSED_OUTCOME,
+            execution_id=request.execution_id,
+            reason=f"advance {request.execution_id} to Running: {attached.reason}",
+        )
     if not attached.usable:
         raise ApplicationError(
             f"advance {request.execution_id}: {attached.verdict} {attached.reason}", type=UNREADABLE_TYPE
         )
     if attached.execution_id != request.execution_id:
+        # The advance just moved `attached.execution_id`, the execution under
+        # this loop's engine ref, to Running: stranded, whatever it is.
         return BoundExecution(
             MISMATCH,
+            execution_id=attached.execution_id,
             reason=f"{ENGINE_TEMPORAL}/{input.engine_ref} is {attached.execution_id}, "
             f"the request names {request.execution_id}",
         )

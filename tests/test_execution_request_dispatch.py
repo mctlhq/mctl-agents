@@ -253,9 +253,12 @@ async def env():
 class FakeTemporal:
     """`TemporalPort` for tests that must never reach Temporal."""
 
-    def __init__(self, states: dict[str, str] | None = None) -> None:
+    def __init__(self, states: dict[str, str] | None = None, *, delivery: dx.DeliveryAnswer | None = None) -> None:
         self.states = states or {}
         self.started: list[IssueRef] = []
+        #: What every `deliver_resume` answers (default: accepted).
+        self.delivery = delivery or dx.DeliveryAnswer(dx.DELIVERED)
+        self.delivered: list[tuple[str, Any]] = []
 
     async def start(self, issue: Any) -> str:
         self.started.append(issue)
@@ -263,6 +266,10 @@ class FakeTemporal:
 
     async def loop_state(self, workflow_id: str) -> str:
         return self.states.get(workflow_id, dx.LOOP_ABSENT)
+
+    async def deliver_resume(self, workflow_id: str, delivery: Any) -> dx.DeliveryAnswer:
+        self.delivered.append((workflow_id, delivery))
+        return self.delivery
 
 
 class Crash(BaseException):
@@ -620,6 +627,32 @@ async def test_a_loop_refuses_an_item_that_is_about_another_issue(api, env):
     )
 
     assert "work-item-mismatch" in result.ended and seen == []
+    # The fulfil minted it under this loop's own ref, so the loop ends it
+    # rather than leave the item wedged behind a Running execution.
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(dispatched_workflow_id(rid), "Failed")]
+
+
+async def test_a_loop_whose_advance_to_running_is_refused_ends_its_execution(api, env):
+    """Its own `we_`, proven by the ledger, but the advance to Running is a
+    definite no: the loop runs nothing, and ends the execution `Failed`."""
+    submit, seen = _investigate_log()
+    rid = api.create_request("start")
+    ref = dispatched_workflow_id(rid)
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+    assert outcome.action == dx.FULFILLED
+    serve = api.request
+
+    def refuse_running(method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+        body = payload or {}
+        if method == "POST" and (body.get("engine_ref"), body.get("phase")) == (ref, "Running"):
+            return _HTTPResult(422, {"code": "policy_denied", "error": "not this one"})
+        return serve(method, path, payload)
+
+    api.request = refuse_running  # type: ignore[method-assign]
+    result = await _run_loop(env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), ref)
+
+    assert "execution-refused" in result.ended and "to Running" in result.ended and seen == []
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Failed")]
 
 
 async def test_a_rejected_request_ends_its_loop_without_running_anything(api, env):
@@ -639,7 +672,7 @@ async def test_a_rejected_request_ends_its_loop_without_running_anything(api, en
 # -- resume: onto a live loop versus a finished one ---------------------------
 
 
-async def test_resume_onto_a_live_loop_is_refused_and_onto_a_finished_loop_continues(api, env):
+async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_continues(api, env):
     submit, seen = _investigate_log()
     first = api.create_request("start")
     first_loop = dispatched_workflow_id(first)
@@ -654,29 +687,34 @@ async def test_resume_onto_a_live_loop_is_refused_and_onto_a_finished_loop_conti
         assert desc.status == WorkflowExecutionStatus.RUNNING
 
         live = api.create_request("resume")
-        refused = await _dispatcher(env).dispatch_once()
-        assert refused.action == dx.REJECTED
-        assert api.request_state(live)["reason"] == xr.RESUME_ONTO_LIVE_LOOP_UNSUPPORTED
-        assert len(api.executions) == 1 and len(seen) == 1
+        delivered = await _dispatcher(env).dispatch_once()
+        # Delivered to the live loop and fulfilled for it: no second loop,
+        # no second investigation; the loop binds the `we_` itself.
+        assert delivered.action == dx.FULFILLED and delivered.engine_ref == f"{first_loop}#{live}"
+        await _wait_for(lambda: api.executions[1]["phase"] == "Running")
+        assert len(seen) == 1
 
+        # The loop ends before its re-approval: the resumed execution fails.
         await _end(env, first_loop)
+        assert api.executions[1]["phase"] == "Failed"
+
         finished = api.create_request("resume")
         continued = await _dispatcher(env).dispatch_once()
         assert continued.action == dx.FULFILLED
         assert continued.workflow_id == dispatched_workflow_id(finished) != first_loop
         await _wait_for(lambda: len(seen) == 2)
-        await _wait_for(lambda: api.executions[1]["phase"] == "Succeeded")
+        await _wait_for(lambda: api.executions[2]["phase"] == "Succeeded")
         await _end(env, continued.workflow_id)
 
-    first_we, second_we = (e["id"] for e in api.executions)
-    assert [p["execution_id"] for p in seen] == [first_we, second_we]
+    first_we, _resumed_we, continued_we = (e["id"] for e in api.executions)
+    assert [p["execution_id"] for p in seen] == [first_we, continued_we]
     assert [(e["engine_ref"], e["attempt"]) for e in api.executions] == [
         (first_loop, 1),
-        (continued.workflow_id, 2),
+        (f"{first_loop}#{live}", 2),
+        (continued.workflow_id, 3),
     ]
-    # The continuation passed through Pending (the /resume rule) to Running
-    # and ended; the item moved on under the resume.
-    assert api.state_version == 2
+    # Both resumes passed through Pending (the /resume rule) and moved the item.
+    assert api.state_version == 3
 
 
 # -- offline end to end ------------------------------------------------------
@@ -1049,7 +1087,10 @@ async def test_the_reconciliation_leaves_a_running_dispatched_loop_alone(api):
 
     outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
 
-    assert outcome.action == dx.REJECTED and outcome.reason == xr.RESUME_ONTO_LIVE_LOOP_UNSUPPORTED
+    # Delivered to the live loop, whose execution is untouched; mctl-api's
+    # fulfil then refuses while that execution runs, which defers.
+    assert [loop for loop, _ in temporal.delivered] == [live]
+    assert outcome.action == dx.DEFERRED and "execution_active" in outcome.reason
     assert api.executions[0]["phase"] == "Running"
 
 
@@ -1065,9 +1106,11 @@ async def test_an_older_live_loop_is_found_behind_a_newer_closed_one(api):
 
     outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
 
-    assert outcome.action == dx.REJECTED
-    assert api.request_state(rid)["reason"] == xr.RESUME_ONTO_LIVE_LOOP_UNSUPPORTED
-    assert temporal.started == [] and api.fulfils() == []
+    # The resume goes to the older loop that is still live, not to a
+    # continuation, and not to the closed label loop.
+    assert [loop for loop, _ in temporal.delivered] == [older]
+    assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{older}#{rid}"
+    assert temporal.started == [] and api.request_state(rid)["state"] == "fulfilled"
 
 
 # P2-3: only mctl-api's typed re-decisions reject; everything else defers.
