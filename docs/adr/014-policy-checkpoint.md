@@ -190,8 +190,8 @@ checkpoint -> REQUIRE_APPROVAL -> ActionApprovalRequest in mctl-api (pending)
   request. mctl-api answers a replayed key with the stored request whatever
   its state, so a denied, expired or consumed request stays that way for
   that intent in that execution. `idempotency_key(intent, attempt)` leaves
-  room for a deliberate re-request with a new human decision; this slice
-  always uses attempt 0.
+  room for a deliberate re-request with a new human decision; only the
+  #198 wait's `next_attempt()` (§7) ever asks above attempt 0.
 - **Consume at decision time.** For a REQUIRE_APPROVAL action, `decide()`
   asks the lookup to redeem: recompute the intent hash, refuse unless the
   receipt's stored hash equals it (`approval_intent_mismatch`), refuse
@@ -229,7 +229,7 @@ checkpoint -> REQUIRE_APPROVAL -> ActionApprovalRequest in mctl-api (pending)
   existing `MCTL_TOKEN` and `MCTL_API_BASE_URL`; mctl-api requires a
   service principal acting directly to create and consume.
 
-### 7. Waiting for an approval (#198, design only)
+### 7. Waiting for an approval (#198)
 
 A workflow never holds a pod while it waits.
 
@@ -259,14 +259,68 @@ A workflow never holds a pod while it waits.
    `attempt`) and a new human decision. `approval_lookup_error` is retried
    with backoff while the timer still runs.
 
+**Built** (`orchestrator/temporal/workflows/action_approval.py`,
+`orchestrator/temporal/activities/action_approval.py`):
+
+- **The gated-action contract.** A Temporal activity whose side effect a
+  REQUIRE_APPROVAL rule governs takes a `GatedActionInput` (its own
+  `payload`, plus the `execution_id`/`actor` the approval binds to, the
+  `attempt` and the `approval_ref`) and does its work through `run_gated()`,
+  which decides with that explicit identity (the worker has no
+  `MCTL_EXECUTION_CONTEXT_FILE`) and calls the side effect only on a
+  permitted decision. It must recompute its arguments from the world on
+  every call, so a changed action is `approval_intent_mismatch`.
+- **Where the wait lives: a child workflow keyed by the receipt.**
+  `run_gated_action()` runs the activity once from the caller's workflow; on
+  `approval_pending` it starts `ActionApprovalWaitWorkflow` as a child with
+  id `action-approval-<receipt id>`, which holds no pod and no activity while
+  it waits. No DevLoop step reaches REQUIRE_APPROVAL at the Temporal level
+  today (the only gated calls are an agent's own `mcp__mctl__*` tools inside
+  its pod), so the wait is a reusable helper rather than an edit to a
+  particular step, and it adds no command to any existing workflow. A step
+  that adopts it guards the call with its own `workflow.patched()` marker.
+  Keying the child by the receipt means mctl-api can address the wake-up
+  with nothing but the id it already stores.
+- **Wakes.** Signal `action_approval_decided` with `{"approval_id": ...}`
+  (a signal naming another receipt is ignored; several collapse into one
+  re-check); otherwise a durable timer every `poll_seconds` (15 min) runs
+  `read_action_approval`, a read-only GET, and re-checks only when the store
+  reports a decision. The wait ends `CONSUME_MARGIN_SECONDS` (5 min) before
+  the receipt's `expires_at` (and at a 7-day ceiling), with one final read
+  at the deadline: the margin leaves the re-check an unexpired receipt to
+  redeem, and any decided state found there goes through the re-check, so
+  it is reported as what it is (a spent receipt is `consumed`, never
+  `timed_out`). A window shorter than the margin ends at once, and still
+  gets its final read.
+- **Outcomes** (`ApprovalWaitResult.outcome`): `ran`, `denied`, `expired`,
+  `timed_out`, `consumed`, `mismatch`, `refused`, `blocked`,
+  `effect_failed`, and, from `run_gated_action` only, `undecided` and
+  `already_waiting` (another wait holds the same receipt and owns its
+  outcome; the caller does not act).
+- **A side effect that raises.** After the consume, `run_gated` catches it
+  and answers `effect_error`; the wait ends `effect_failed`. The receipt is
+  spent and never retried; a re-request (a new human decision) is allowed.
+  A gated side effect should be idempotent and retry its own transient
+  errors. A worker that dies between the consume and the effect reports
+  nothing, and the retry ends `consumed`, which is not re-requestable.
+- **Re-request.** `next_attempt()` accepts only `denied`, `expired`,
+  `timed_out` and `effect_failed`, and returns the input with
+  `attempt + 1` and no receipt. `MctlApiApprovals(attempt=N)` puts the
+  attempt in the idempotency key, so the new attempt is a new request that
+  needs a new human decision; the intent hash is unchanged.
+- **Not built.** The mctl-api side of the signal (it signals nothing yet:
+  the poll alone makes the wait work, at up to `poll_seconds` of latency),
+  and the approval surfaces for humans.
+
 ## Open decisions (not settled here)
 
-1. **The approval wait (#198).** §7 is the design. The Temporal workflow,
-   the signal from mctl-api and the approval surfaces (UI, Telegram, GitHub)
-   are not built. Until gitops sets `MCTL_POLICY_APPROVALS=mctl-api`,
-   REQUIRE_APPROVAL keeps blocking. Once it is set, an agent's gated MCP call
-   is refused with `approval_pending` and the request id, and a later
-   identical call in the same execution succeeds once a human has approved.
+1. **The approval wait (#198).** The Temporal wait is built (§7). The
+   signal from mctl-api, the approval surfaces (UI, Telegram, GitHub) and a
+   first step that adopts `run_gated_action` are not. Until gitops sets
+   `MCTL_POLICY_APPROVALS=mctl-api`, REQUIRE_APPROVAL keeps blocking. Once
+   it is set, an agent's gated MCP call is refused with `approval_pending`
+   and the request id, and a later identical call in the same execution
+   succeeds once a human has approved.
 2. **The mentor.** It has MCP tools but no hooks, and adding any hook makes it
    drainable (#366/#368). Until that is decided separately, its MCP calls are
    not governed.
