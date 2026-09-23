@@ -88,7 +88,9 @@ MAX_CONFLICT_SOURCE_IDS = 64
 # design.md is explicit that the two are different jobs that must not share
 # an import edge. A vocabulary mismatch between the two is a one-line fix in
 # whichever module is wrong.
-WORK_CONTEXT_SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli"})
+# `api` = mctl-api's default surface for a direct API call (see SURFACE_KINDS
+# in work_context/contract.py); tests pin the two vocabularies as identical.
+WORK_CONTEXT_SURFACE_KINDS = frozenset({"github", "telegram", "web", "cli", "api"})
 WORK_CONTEXT_ACTOR_KINDS = frozenset({"human", "agent", "system"})
 
 # Bounded-length rule (ADR 009 sec. 7): locator/selector are addresses and
