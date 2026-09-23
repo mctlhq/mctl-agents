@@ -35,3 +35,25 @@ def workflow_id_for(issue_url: str) -> str:
     # which runs inside the agent container — never import temporalio.
     parts = parse_issue_url(issue_url)
     return f"dev-loop-{parts.owner}-{parts.repo}-{parts.number}"
+
+
+#: Every dispatched DevLoop's workflow id starts with this: `dev-loop-`
+#: followed by mctl-api's `xr_` request-id prefix. An issue-keyed loop is
+#: `dev-loop-<owner>-...` and never matches.
+DISPATCHED_WORKFLOW_PREFIX = "dev-loop-xr_"
+
+
+def is_dispatched_workflow_id(workflow_id: str) -> bool:
+    """Was `workflow_id` started by the execution-request dispatcher?"""
+    return workflow_id.startswith(DISPATCHED_WORKFLOW_PREFIX)
+
+
+def dispatched_workflow_id(execution_request_id: str) -> str:
+    """The DevLoop workflow id for one mctl-api execution request
+    (mctlhq/mctl-agents#461): a pure function of the request id, so every
+    claim of the same request — the first, or a re-claim after a crash and
+    a lapsed lease, under a new claim token — names the same run. It is
+    also the `engine_ref` the dispatcher fulfils the request with, so the
+    same run is the same `we_` execution by mctl-api's
+    `(engine, engine_ref)` idempotency."""
+    return f"dev-loop-{execution_request_id}"

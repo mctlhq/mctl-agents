@@ -74,6 +74,13 @@ with workflow.unsafe.imports_passed_through():
         get_release_after,
         resolve_deploy_target,
     )
+    from orchestrator.temporal.activities.execution_requests import (
+        AdvanceInput,
+        BindInput,
+        BoundExecution,
+        advance_dispatched_execution,
+        bind_dispatched_execution,
+    )
     from orchestrator.temporal.activities.human_input import find_human_input_request
     from orchestrator.temporal.activities.incidents import (
         Incident,
@@ -225,6 +232,57 @@ APPROVE_STEP_TIMEOUT = timedelta(minutes=15)
 # budgets for its own 14-day watch.
 APPROVAL_POLL_INTERVAL = timedelta(hours=6)
 APPROVAL_WAIT_DEADLINE = timedelta(days=14)
+
+# A dispatched loop (mctlhq/mctl-agents#461) waits for its execution request
+# to be fulfilled before it runs anything: the dispatcher starts the loop
+# first and fulfils second. The wait is the bind activity's retry policy,
+# bounded by FULFILMENT_WAIT. Longer than mctl-api's longest claim lease
+# (15 min), so a dispatcher that crashed between the start and the fulfil
+# has one full lease to lapse and the next claim to converge on this loop
+# before it gives up. A loop that gives up ends; the next claim of its
+# request then finds the run ended and rejects the request (`engine_run_ended`).
+FULFILMENT_WAIT = timedelta(minutes=30)
+FULFILMENT_POLL_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=30),
+)
+# The success-path advance of a dispatched execution (mctlhq/mctl-agents#461).
+# Patient, in the style of SLUG_LOOKUP_RETRY_POLICY: the loop is about to park
+# at approval for up to APPROVAL_WAIT_DEADLINE, and while the `we_` stays
+# Running mctl-api refuses every other request for the item
+# (`execution_active`) — a state the dispatcher's reconciliation cannot heal,
+# because the loop is still RUNNING. One cheap POST, retried over roughly an
+# hour (10 s doubling to a 10-minute cap, 10 attempts), costs nothing
+# against a multi-day park. Bounded, so a store that stays down still lets the
+# loop reach the park; `run` then re-attempts once right before it. The
+# unwind path (`_fail_dispatched_execution`) keeps FAST_ACTIVITY_RETRY_POLICY:
+# that loop closes next, and a closed dispatched loop is reconciled.
+DISPATCHED_ADVANCE_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=10),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(minutes=10),
+    maximum_attempts=10,
+)
+# The same re-attempt right before a HUMAN-INPUT park, deliberately short
+# (about two minutes at worst: 4 attempts, 2 s doubling to a 15 s cap, each
+# bounded by FAST_ACTIVITY_TIMEOUT). The request that park waits on is not
+# read until `_await_human_input` runs, so its TTL is unknown here, and
+# `human_input` bounds a TTL only from above (MAX_REQUEST_TTL_SECONDS, 7
+# days): any `expires_at` after `created_at` is valid, so no minimum makes an
+# hour-long attempt safe. The default TTL is a day, so two minutes costs the
+# person answering nothing in practice; a pending advance is tried again
+# before every later park, patiently before the approval park.
+DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=15),
+    maximum_attempts=4,
+)
+#: The patch id guarding the dispatched path. Consulted only for a loop
+#: whose start input carries an execution request, so no other history
+#: records it.
+EXECUTION_REQUEST_PATCH = "execution-request-dispatch"
 
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
 # state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
@@ -505,6 +563,14 @@ class IssueRef:
     # is a string until something resolves it, and by then the whole
     # module has finished loading.
     resume: MergeWatchResume | None = None
+    #: The mctl-api execution request (`xr_...`) this loop was dispatched
+    #: for (mctlhq/mctl-agents#461). Set only by the dispatcher, always with
+    #: `work_item_id`; None on every other start, and on every history
+    #: recorded before this field existed, which therefore never enters the
+    #: dispatched path. The loop learns its canonical `we_` execution from
+    #: the fulfilled request, not from this input: see
+    #: `activities/execution_requests.py`.
+    execution_request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1837,6 +1903,110 @@ class DevLoopWorkflow:
                 resume_count=self._human_input_resume_count,
             )
 
+    async def _bind_dispatched_execution(self, issue: IssueRef) -> tuple[BoundExecution | None, str]:
+        """Wait for this loop's execution request to be fulfilled with this
+        workflow's own engine run, and adopt the `we_` it was given.
+
+        (bound execution, "") to run; (None, why) to end without running
+        anything: the request was rejected, the store's answer does not
+        describe this loop (`work-item-mismatch`), or it was never fulfilled
+        within FULFILMENT_WAIT."""
+        if not issue.work_item_id:
+            return None, "execution request without a work item: refused"
+        self._work_item_id = issue.work_item_id
+        try:
+            bound = await workflow.execute_activity(
+                bind_dispatched_execution,
+                BindInput(
+                    work_item_id=issue.work_item_id,
+                    execution_request_id=str(issue.execution_request_id),
+                    engine_ref=workflow.info().workflow_id,
+                    issue_url=issue.issue_url,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                schedule_to_close_timeout=FULFILMENT_WAIT,
+                retry_policy=FULFILMENT_POLL_RETRY_POLICY,
+            )
+        except ActivityError:
+            return None, f"execution request {issue.execution_request_id} was not fulfilled within {FULFILMENT_WAIT}"
+        if not bound.bound:
+            return None, f"execution request {issue.execution_request_id}: {bound.outcome}: {bound.reason}"
+        self._seen_execution_ids.add(bound.execution_id)
+        self._executions.append(
+            ExecutionRef(
+                execution_id=bound.execution_id,
+                sequence=bound.sequence,
+                temporal_workflow_id=workflow.info().workflow_id,
+            )
+        )
+        return bound, ""
+
+    async def _fail_dispatched_execution(self) -> None:
+        """Advance the dispatched execution to `Failed` while the loop is
+        unwinding, including on a workflow cancellation.
+
+        Awaited in place from the `except` handler, NOT wrapped in
+        `asyncio.shield`: a Temporal cancellation cancels the workflow's task
+        once, and an activity scheduled from the handler that caught it runs
+        to completion (the SDK's cleanup idiom), which
+        `test_a_cancelled_dispatched_loop_still_ends_its_execution` pins. A
+        shield would add nothing for that, and costs a separate task that an
+        EVICTION cannot account for: the SDK tears an evicted workflow down
+        by cancelling its tasks, and a task created in that teardown outlives
+        it and later runs on another event loop (measured: a terminated
+        dispatched loop did exactly that). Awaiting in place, the eviction's
+        own `_WorkflowBeingEvictedError` stops the attempt before any command
+        is scheduled.
+
+        A loop TERMINATED instead runs no code at all; the dispatcher closes
+        that gap (`dispatcher._reconcile_closed_loops`)."""
+        await self._advance_dispatched_execution("Failed")
+
+    async def _land_pending_advance(self, pending: str, *, before: str) -> str:
+        """Re-attempt a dispatched execution's advance that has not landed
+        yet, right before a park that holds this loop RUNNING — the one state
+        the dispatcher's reconciliation must not touch. Returns what is still
+        pending ("" once it landed). No-op, and no command, when nothing is
+        pending: always so for an undispatched loop and on the path where
+        the first advance landed.
+
+        `before` is "approval" (patient: that park lasts days and has no
+        deadline of its own to protect) or "human-input" (brief: see
+        DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY)."""
+        if not pending:
+            return ""
+        policy = DISPATCHED_ADVANCE_RETRY_POLICY if before == "approval" else DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY
+        landed = await self._advance_dispatched_execution(pending, retry_policy=policy)
+        return "" if landed else pending
+
+    async def _advance_dispatched_execution(
+        self, phase: str, *, retry_policy: RetryPolicy = FAST_ACTIVITY_RETRY_POLICY
+    ) -> bool:
+        """Best effort, like `_record`: a store that will not take the phase
+        must not fail the loop. But an execution left non-terminal blocks
+        EVERY later request for the item, not only a resume: mctl-api's
+        attach rule refuses any new non-terminal execution while one is
+        (`execution_active`). The dispatcher reconciles one it can prove
+        dead (`dispatcher._reconcile_closed_loops`), but not one whose loop
+        is still RUNNING: hence the patient policy on the success path, and
+        `_land_pending_advance` before every park.
+
+        True when the store answered (the phase landed, or a definite
+        refusal that no retry would change); False when every attempt failed
+        without an answer, so the caller can try again later."""
+        try:
+            outcome = await workflow.execute_activity(
+                advance_dispatched_execution,
+                AdvanceInput(work_item_id=self._work_item_id, engine_ref=workflow.info().workflow_id, phase=phase),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=retry_policy,
+            )
+            workflow.logger.info("dispatched execution -> %s: %s", phase, outcome)
+            return True
+        except ActivityError:
+            workflow.logger.warning("dispatched execution could not be advanced to %s", phase)
+            return False
+
     @workflow.signal
     def abandon(self, *args: object) -> None:
         """Gracefully end this execution at its next observation point.
@@ -1874,7 +2044,20 @@ class DevLoopWorkflow:
         # mutations (see that signal's docstring for why no
         # `workflow.patched` gate is needed here: nothing below schedules a
         # new command as a result).
-        if issue.work_item_id:
+        # A dispatched loop (mctlhq/mctl-agents#461) is bound to exactly one
+        # work item and one execution request, and its execution #1 is the
+        # store's canonical `we_`, never a locally derived id: it runs nothing
+        # until the request is fulfilled with this workflow's own engine run.
+        dispatched: BoundExecution | None = None
+        if issue.execution_request_id and workflow.patched(EXECUTION_REQUEST_PATCH):
+            dispatched, refused = await self._bind_dispatched_execution(issue)
+            if dispatched is None:
+                return DevLoopResult(
+                    investigate=WorkflowResult(workflow_name="", phase="NotStarted"),
+                    implement=None,
+                    ended=refused,
+                )
+        elif issue.work_item_id:
             self._work_item_id = issue.work_item_id
             seed_execution_id = execution_id_for(issue.work_item_id, 1, str(workflow.info().attempt))
             self._seen_execution_ids.add(seed_execution_id)
@@ -1886,25 +2069,60 @@ class DevLoopWorkflow:
                 )
             )
 
-        # Pin the investigator version ONCE, at the start of this step. A
-        # later promote/rollback in the registry must not retroactively
-        # change what an in-flight (or replayed) workflow already ran.
-        investigator_release = _require_release(
-            "issue-investigator", await _resolve("issue-investigator")
-        )
-        # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
-        # NOT passed here yet — the investigate CWFT rejects undeclared
-        # parameters, so the template must declare it first (fail-closed:
-        # gitops before code). Until then the read path's retirement of
-        # same-issue leftovers rests on the `created_at`-vs-start-time
-        # check in `_await_human_input`.
-        investigate_params = {"issue_url": issue.issue_url}
-        if investigator_release and investigator_release.image_ref:
-            investigate_params["agent_image"] = investigator_release.image_ref
-            investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
+        # A dispatched execution must end on EVERY exit from here to its
+        # advance below, not only the successful one: the investigator
+        # container, handed a `we_`, never writes it, so an exception here
+        # (an unpinned release, an Argo submit that exhausted its retries or
+        # its timeout, a cancelled workflow) would otherwise leave it
+        # non-terminal forever, and mctl-api refuses every later request for
+        # the item while it is (`execution_active`). No command is added on
+        # the path that does not raise, and none at all for an undispatched
+        # loop, so no history recorded before this changes shape.
+        try:
+            # Pin the investigator version ONCE, at the start of this step. A
+            # later promote/rollback in the registry must not retroactively
+            # change what an in-flight (or replayed) workflow already ran.
+            investigator_release = _require_release(
+                "issue-investigator", await _resolve("issue-investigator")
+            )
+            # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
+            # NOT passed here yet — the investigate CWFT rejects undeclared
+            # parameters, so the template must declare it first (fail-closed:
+            # gitops before code). Until then the read path's retirement of
+            # same-issue leftovers rests on the `created_at`-vs-start-time
+            # check in `_await_human_input`.
+            investigate_params = {"issue_url": issue.issue_url}
+            if investigator_release and investigator_release.image_ref:
+                investigate_params["agent_image"] = investigator_release.image_ref
+                investigate_params["agent_version"] = f"issue-investigator@{investigator_release.version}"
+            if dispatched is not None:
+                # The investigate CWFT's declared `work_item_id`/`execution_id`
+                # parameters (gitops#1279) become `--work-item-id`/`--execution-id`:
+                # the investigator uses this `we_` as its execution identity and
+                # refuses it unless it is in that item's ledger, and refuses an
+                # item about another issue (`work-item mismatch`).
+                investigate_params["work_item_id"] = self._work_item_id
+                investigate_params["execution_id"] = dispatched.execution_id
 
-        investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
-        await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+            investigate_result = await _run_cwft("mctl-agents-investigate", investigate_params)
+            await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+        except (Exception, asyncio.CancelledError):
+            # Not BaseException: GeneratorExit and the SDK eviction teardown
+            # must unwind untouched (see `_fail_dispatched_execution`).
+            if dispatched is not None:
+                await self._fail_dispatched_execution()
+            raise
+        # The phase the dispatched execution still has to reach, when its
+        # advance below did not land (mctlhq/mctl-agents#461); "" otherwise.
+        dispatched_advance_pending = ""
+        if dispatched is not None:
+            # The dispatched execution IS this investigator run: it ends
+            # here, whatever the loop does next, so the item's one
+            # non-terminal slot is free again for a later request.
+            advance_phase = "Succeeded" if investigate_result.succeeded else "Failed"
+            policy = DISPATCHED_ADVANCE_RETRY_POLICY if investigate_result.succeeded else FAST_ACTIVITY_RETRY_POLICY
+            if not await self._advance_dispatched_execution(advance_phase, retry_policy=policy):
+                dispatched_advance_pending = advance_phase
 
         if not investigate_result.succeeded:
             return DevLoopResult(
@@ -1935,6 +2153,11 @@ class DevLoopWorkflow:
                 retry_policy=SLUG_LOOKUP_RETRY_POLICY,
             )
             while input_slug:
+                # Every park, not only the approval one: a clarification wait
+                # also holds the loop RUNNING, for up to a request's TTL.
+                dispatched_advance_pending = await self._land_pending_advance(
+                    dispatched_advance_pending, before="human-input"
+                )
                 hi_outcome = await self._await_human_input(target_repo, input_slug)
                 if hi_outcome is None:
                     break
@@ -1972,6 +2195,13 @@ class DevLoopWorkflow:
                     "received_at": hi_outcome.received_at,
                 })
                 continuation_params = dict(investigate_params)
+                if dispatched is not None:
+                    # The dispatched `we_` ended with the first run and sealed
+                    # that run's context; a continuation is a different
+                    # context, which the store would refuse as a divergence
+                    # under the same execution. It runs without the identity.
+                    continuation_params.pop("work_item_id", None)
+                    continuation_params.pop("execution_id", None)
                 continuation_params["human_input_responses"] = json.dumps(accepted_answers)
                 investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
                 await _record("issue-investigator", investigator_release, investigate_result, target_repo)
@@ -1997,6 +2227,10 @@ class DevLoopWorkflow:
         # from also observing `_abandoned`, which is not itself a new
         # command (see `abandon`'s docstring): a parked execution has no
         # history event to diverge from at this position.
+        # The success-path advance never got an answer (nor before any
+        # clarification park): once more, patiently, before the approval
+        # park, which may last days with the loop RUNNING. Still best effort.
+        dispatched_advance_pending = await self._land_pending_advance(dispatched_advance_pending, before="approval")
         approval_ended: str | None = None
         if workflow.patched("approval-watch"):
             approval_deadline = workflow.now() + APPROVAL_WAIT_DEADLINE

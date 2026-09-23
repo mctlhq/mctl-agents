@@ -175,6 +175,13 @@ class ExecutionRef:
     surface: SurfaceRef = field(default_factory=SurfaceRef)
     actor: ActorRef = field(default_factory=ActorRef)
     surface_transition: bool = False
+    #: mctl-api's phase for this execution (`Pending`, `Running`, `Succeeded`,
+    #: `Failed`, `Error`), as the ledger read (`from_v1`) reports it; "" in the
+    #: dev-loop's own local shape. Read by the dispatcher to find a dispatched
+    #: execution left non-terminal by a loop that no longer runs
+    #: (mctlhq/mctl-agents#461). Excluded from equality: it describes the
+    #: execution's progress, not which execution it is.
+    phase: str = field(default="", compare=False)
 
     @staticmethod
     def from_payload(data: Any) -> ExecutionRef | None:
@@ -240,6 +247,7 @@ class ExecutionRef:
             sequence=attempt,
             temporal_workflow_id=_str(data.get("engine_ref")) if engine == "temporal" else "",
             started_at=_str(data.get("started_at")),
+            phase=_str(data.get("phase")),
         )
 
 

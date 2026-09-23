@@ -22,6 +22,7 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote
 
+from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.contract import (
     WORK_ITEM_FOUND,
     WORK_ITEM_UNKNOWN,
@@ -59,6 +60,12 @@ ROUTES = {
     "list_executions": "/api/v1/work-items/{id}/executions",
     # Sealed ContextSnapshots (mctl-api#362, mctlhq/mctl-agents#431).
     "execution_snapshot": "/api/v1/work-items/{id}/executions/{execution_id}/snapshot",
+    # Execution requests (mctl-api#368, mctlhq/mctl-agents#461). Claim,
+    # fulfil and reject are the service principal's alone.
+    "execution_request": "/api/v1/work-items/{id}/execution-requests/{request_id}",
+    "claim_execution_request": "/api/v1/execution-requests/claim",
+    "fulfil_execution_request": "/api/v1/execution-requests/{request_id}/fulfil",
+    "reject_execution_request": "/api/v1/execution-requests/{request_id}/reject",
 }
 
 
@@ -270,3 +277,82 @@ class WorkItemClient:
         except WorkItemUnavailable as exc:
             return ExecutionAnswer(EXECUTION_UNKNOWN, reason=str(exc))
         return answer_from_attach(res.status, res.payload, work_item_id=work_item_id, run=run, phase=phase)
+
+    # -- execution requests (mctl-api#368, mctlhq/mctl-agents#461) --------
+    #
+    # The claim token fences a claim: fulfil and reject must present it. It
+    # is a bearer credential for that one claim, so it is sent in the body
+    # and nowhere else — not in the policy checkpoint's args (whose digest
+    # is logged), not in its metadata, not in any log line.
+
+    def _governed(self, operation: str, target: str, args: dict[str, Any], metadata: dict[str, str]) -> str:
+        """The policy checkpoint (#197) immediately before a mutation: ""
+        when permitted, else why not."""
+        from orchestrator import policy_checkpoint
+
+        decision = policy_checkpoint.checkpoint(
+            policy_checkpoint.MCTL_WORK_ITEM_WRITE, operation, target, args, metadata=metadata,
+        )
+        return "" if decision.permitted else f"policy {decision.verdict} ({decision.code})"
+
+    def execution_request(self, work_item_id: str, request_id: str) -> xr.RequestAnswer:
+        """One execution request, as whoever can see the item reads it."""
+        path = ROUTES["execution_request"].format(id=_q(work_item_id), request_id=_q(request_id))
+        try:
+            res = self._request("GET", path)
+        except WorkItemUnavailable as exc:
+            return xr.RequestAnswer(xr.UNKNOWN, reason=str(exc))
+        return xr.answer_from_read(res.status, res.payload, request_id=request_id)
+
+    def claim_execution_request(self, lease_seconds: int) -> xr.RequestAnswer:
+        """Claim the oldest claimable request under a lease of
+        `lease_seconds`. NONE_CLAIMABLE on a 204."""
+        body = {"lease_seconds": lease_seconds}
+        refused = self._governed(xr.CLAIM_OPERATION, "execution-requests", body, {"lease_seconds": str(lease_seconds)})
+        if refused:
+            return xr.RequestAnswer(xr.REFUSED, reason=refused)
+        try:
+            res = self._request("POST", ROUTES["claim_execution_request"], body)
+        except WorkItemUnavailable as exc:
+            return xr.RequestAnswer(xr.UNKNOWN, reason=str(exc))
+        return xr.answer_from_claim(res.status, res.payload, body_empty=res.body_empty)
+
+    def fulfil_execution_request(
+        self, request: xr.ExecutionRequest, claim_token: str, engine: str, engine_ref: str
+    ) -> xr.RequestAnswer:
+        """Attach the canonical execution for `request`: the engine run
+        `(engine, engine_ref)`. The same holder repeating the same engine run
+        gets the same execution back."""
+        governed = {"execution_request_id": request.request_id, "engine": engine, "engine_ref": engine_ref}
+        refused = self._governed(
+            xr.FULFIL_OPERATION, request.work_item_id, governed, {"work_item_id": request.work_item_id, **governed},
+        )
+        if refused:
+            return xr.RequestAnswer(xr.REFUSED, reason=refused)
+        path = ROUTES["fulfil_execution_request"].format(request_id=_q(request.request_id))
+        body = {"claim_token": claim_token, "engine": engine, "engine_ref": engine_ref}
+        try:
+            res = self._request("POST", path, body)
+        except WorkItemUnavailable as exc:
+            return xr.RequestAnswer(xr.UNKNOWN, reason=str(exc))
+        return xr.answer_from_fulfil(
+            res.status, res.payload, request_id=request.request_id, engine=engine, engine_ref=engine_ref
+        )
+
+    def reject_execution_request(
+        self, request: xr.ExecutionRequest, claim_token: str, reason: str
+    ) -> xr.RequestAnswer:
+        """Close the claimed `request` without an execution, for `reason`
+        (one of the typed reasons in `execution_requests`)."""
+        governed = {"execution_request_id": request.request_id, "reason": reason}
+        refused = self._governed(
+            xr.REJECT_OPERATION, request.work_item_id, governed, {"work_item_id": request.work_item_id, **governed},
+        )
+        if refused:
+            return xr.RequestAnswer(xr.REFUSED, reason=refused)
+        path = ROUTES["reject_execution_request"].format(request_id=_q(request.request_id))
+        try:
+            res = self._request("POST", path, {"claim_token": claim_token, "reason": reason})
+        except WorkItemUnavailable as exc:
+            return xr.RequestAnswer(xr.UNKNOWN, reason=str(exc))
+        return xr.answer_from_reject(res.status, res.payload, request_id=request.request_id)

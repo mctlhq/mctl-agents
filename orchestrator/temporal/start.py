@@ -17,7 +17,12 @@ from orchestrator.temporal.constants import TASK_QUEUE
 # workflow_id_for moved to issue_ref (temporalio-free) so agent-container
 # callers can import it without the SDK; re-exported here because this
 # module is where every Temporal-side caller historically found it.
-from orchestrator.temporal.issue_ref import workflow_id_for
+from orchestrator.temporal.issue_ref import (  # noqa: F401 — re-exported for Temporal-side callers
+    DISPATCHED_WORKFLOW_PREFIX,
+    dispatched_workflow_id,
+    is_dispatched_workflow_id,
+    workflow_id_for,
+)
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 
 
@@ -68,5 +73,33 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
         id=workflow_id_for(issue_url),
         task_queue=TASK_QUEUE,
         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+
+
+async def start_dispatched_dev_loop(client: Client, issue: IssueRef) -> WorkflowHandle:
+    """Start (or attach to) the DevLoop for `issue.execution_request_id`.
+
+    The policies are the "never a second run" half of the dispatcher's
+    idempotency, and are deliberately stricter than
+    `start_dev_loop_workflow`'s:
+
+    - `USE_EXISTING` on conflict: a RUNNING loop for the same request is
+      returned as-is — the re-claim after a crash between start and fulfil
+      converges on it instead of starting another.
+    - `REJECT_DUPLICATE` on reuse: a CLOSED loop for the same request raises
+      `WorkflowAlreadyStartedError`, whatever its outcome. A request is run
+      once. Unlike an issue-keyed loop, a failed dispatched run is not
+      restartable under the same id: the surface asks again (a new request,
+      a new id), which is what keeps one request from ever owning two runs.
+    """
+    if not issue.execution_request_id:
+        raise ValueError("start_dispatched_dev_loop needs an IssueRef with an execution_request_id")
+    return await client.start_workflow(
+        DevLoopWorkflow.run,
+        issue,
+        id=dispatched_workflow_id(issue.execution_request_id),
+        task_queue=TASK_QUEUE,
+        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )

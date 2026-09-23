@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -46,6 +47,10 @@ from orchestrator.temporal.activities.deploy_state import (
     resolve_deploy_target,
 )
 from orchestrator.temporal.activities.discovery import discover_and_project
+from orchestrator.temporal.activities.execution_requests import (
+    advance_dispatched_execution,
+    bind_dispatched_execution,
+)
 from orchestrator.temporal.activities.human_input import find_human_input_request
 from orchestrator.temporal.activities.identity import mint_execution_context
 from orchestrator.temporal.activities.incidents import list_service_incidents
@@ -551,6 +556,8 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # Bounded GitHub reads, same shape as detect_orphans two lines up —
         # the implement-sweep's stranding scan (mctl-agents#412).
         find_stranded_accepted,
+        bind_dispatched_execution,
+        advance_dispatched_execution,
     ]
     workflows: list[type] = [
         DevLoopWorkflow,
@@ -683,7 +690,64 @@ async def main() -> None:
         args.role,
         ", ".join(plan.task_queue for plan in plans),
     )
-    await run_until_signalled(workers)
+    dispatcher_stop = asyncio.Event()
+    dispatcher_task = start_dispatcher(client, args.role, dispatcher_stop)
+    try:
+        await run_until_signalled(workers)
+    finally:
+        if dispatcher_task is not None:
+            await stop_dispatcher(dispatcher_task, dispatcher_stop)
+
+
+#: How long the dispatcher gets to finish the dispatch in flight once asked to
+#: stop, before it is cancelled. A dispatch cut short converges anyway (the
+#: lease lapses and the next claim takes the same run), so this is courtesy,
+#: not correctness; it stays well inside the pod's termination grace.
+DISPATCHER_STOP_GRACE_SECONDS = 5.0
+
+
+async def stop_dispatcher(
+    task: asyncio.Task[None], stop: asyncio.Event, *, grace: float = DISPATCHER_STOP_GRACE_SECONDS
+) -> None:
+    """Ask the dispatcher loop to stop, give it `grace` seconds to finish the
+    dispatch in flight, then cancel it — and always await it, so the task is
+    never destroyed pending at interpreter exit."""
+    stop.set()
+    done, _ = await asyncio.wait({task}, timeout=grace)
+    if not done:
+        task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def runs_dispatcher(role: str) -> bool:
+    """Does this process run the execution-request dispatcher
+    (mctlhq/mctl-agents#461)?
+
+    Only when `EXECUTION_REQUEST_DISPATCHER` is explicitly on (off by
+    default), and only on a role that runs the workflows it starts — the
+    same rule as `owns_schedules`. Several such replicas are safe: mctl-api's
+    claim is a lease CAS, so each request has one holder at a time."""
+    from orchestrator.temporal import dispatcher
+
+    return dispatcher.enabled() and owns_schedules(role)
+
+
+def start_dispatcher(client: Client, role: str, stop: asyncio.Event) -> asyncio.Task[None] | None:
+    """The dispatcher loop as a background task, or None when it is off."""
+    if not runs_dispatcher(role):
+        logger.info("execution-request dispatcher off (role=%s)", role)
+        return None
+    from orchestrator.temporal import dispatcher
+    from orchestrator.work_context.client import WorkItemClient
+
+    loop = dispatcher.Dispatcher(WorkItemClient(), dispatcher.TemporalClientPort(client))
+    logger.info(
+        "execution-request dispatcher on: lease=%ss poll=%ss",
+        dispatcher.lease_seconds(),
+        dispatcher.interval_seconds(),
+    )
+    return asyncio.create_task(dispatcher.run_dispatcher(loop, stop))
 
 
 async def run_until_signalled(workers: list[Worker]) -> None:
