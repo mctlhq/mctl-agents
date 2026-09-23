@@ -34,6 +34,8 @@ from orchestrator.manifest import (
     ManifestError,
     load,
 )
+from orchestrator.temporal import constants as temporal_constants
+from orchestrator.temporal import implement_outcome
 
 MODEL_POLICY = REPO_ROOT / "config" / "model-policy.yaml"
 INVENTORY = REPO_ROOT / "docs" / "agent-inventory.yaml"
@@ -303,6 +305,195 @@ def _check_cluster_workflow_template(manifest: AgentManifest) -> list[str]:
             f"not found among {sorted(names)}"
         ]
     return []
+
+
+# The #418 shape restated structurally: a lock and a long deadline on the
+# same node. 1800s (30 min) rather than 0 — a guarded step is still allowed
+# a real budget, just not one long enough that queueing behind the lock can
+# burn hours of it the way run-implementer's 7200s did on 2026-09-19.
+MAX_LOCKED_STEP_DEADLINE_SECONDS = 1800
+
+# The one CWFT this check reads — named explicitly rather than globbed like
+# _check_cluster_workflow_template's `cwft-*.yaml`, because this check
+# verifies ONE specific mutex/template relationship, not "does some CWFT
+# somewhere mention this name".
+IMPLEMENT_CWFT_FILENAME = "cwft-mctl-agents-implement.yaml"
+
+
+def _mutex_names(template: dict[str, Any]) -> set[str]:
+    """Every mutex name a template's `synchronization` block declares.
+
+    Accepts both the long-standing `synchronization.mutex` (singular) shape
+    and Argo 3.6's `synchronization.mutexes` list — a CWFT that migrates to
+    the list form must not silently stop being checked.
+
+    Deliberately does not read workflow-level `spec.synchronization`: the
+    real cwft-mctl-agents-implement.yaml declares
+    `mctl-agents-proposal-claims` per-template, on `run-implementer` alone
+    (asserted against the live file by
+    test_the_real_implement_cwft_satisfies_the_mirror), so a workflow-level
+    lock is not a shape this check has ever had to distinguish. If a future
+    CWFT moves the lock to `spec.synchronization`, every template's
+    `_mutex_names` here returns empty, `guarded` is empty, and
+    `check_implement_admission_is_safe` reports it as the mutex having
+    disappeared — a loud drift error, not a silent pass — rather than
+    resolving the workflow-level shape correctly. That is a known gap, not
+    an unconsidered one.
+    """
+    sync = template.get("synchronization")
+    if not isinstance(sync, dict):
+        return set()
+    names: set[str] = set()
+    mutex = sync.get("mutex")
+    if isinstance(mutex, dict) and mutex.get("name"):
+        names.add(str(mutex["name"]))
+    mutexes = sync.get("mutexes")
+    if isinstance(mutexes, list):
+        for entry in mutexes:
+            if isinstance(entry, dict) and entry.get("name"):
+                names.add(str(entry["name"]))
+    return names
+
+
+def check_implement_admission_is_safe() -> list[str]:
+    """Keep `orchestrator/temporal/constants.py`'s ARGO_IMPLEMENT_MUTEX_*
+    mirror honest against the real CWFT in mctl-gitops (mctl-agents#418).
+
+    ADR-008 D7 bound the implementation queue's admission width N to the
+    Argo mutex width (`orchestrator.temporal.constants.argo_admission_width`),
+    but that binding is only as true as the mirror it reads: NAME, TEMPLATE
+    and WIDTH are copied from `cwft-mctl-agents-implement.yaml` because the
+    worker deployment has no gitops checkout to read them from live (see
+    that module's docstring). This is what makes the copy checkable — the
+    same "mirror plus CI check" shape `orchestrator/resolver.py` already
+    uses for `validate-agent-platform.py`'s COMPAT_RE.
+
+    A no-match here must never read as a pass: absence of the mutex
+    entirely, a guarded template that disagrees with the mirror, and a
+    deadline the mirror's own claim already contradicts are ALL reported as
+    errors — trusting an unreadable or restructured file would be the exact
+    silent no-op `_gitops_missing` exists to prevent one level up.
+    """
+    if not GITOPS_CWFT_DIR.is_dir():
+        return _gitops_missing(GITOPS_CWFT_DIR, "the implement admission mutex binding (mctl-agents#418)")
+
+    cwft_path = GITOPS_CWFT_DIR / IMPLEMENT_CWFT_FILENAME
+    if not cwft_path.is_file():
+        return [f"{cwft_path} not found; cannot verify the implement admission mutex binding"]
+
+    try:
+        document = yaml.safe_load(cwft_path.read_text(encoding="utf-8"))
+        templates = (document.get("spec") or {}).get("templates")
+        if not isinstance(templates, list):
+            raise ManifestError("spec.templates is missing or not a list")
+    except Exception as exc:  # noqa: BLE001 - report as this check's failure, not a crash
+        return [f"{cwft_path}: {exc}"]
+
+    errors: list[str] = []
+    by_name = {t["name"]: t for t in templates if isinstance(t, dict) and t.get("name")}
+
+    mutex_name = temporal_constants.ARGO_IMPLEMENT_MUTEX_NAME
+    mutex_template = temporal_constants.ARGO_IMPLEMENT_MUTEX_TEMPLATE
+    guarded = sorted(name for name, template in by_name.items() if mutex_name in _mutex_names(template))
+
+    if not guarded:
+        errors.append(
+            f"{cwft_path}: no template carries synchronization.mutex(es) named {mutex_name!r}, "
+            f"but orchestrator/temporal/constants.py's ARGO_IMPLEMENT_MUTEX_TEMPLATE mirror still "
+            f"names {mutex_template!r} as the guarded template"
+        )
+    elif guarded != [mutex_template]:
+        errors.append(
+            f"{cwft_path}: synchronization.mutex {mutex_name!r} guards {guarded}, but "
+            f"orchestrator/temporal/constants.py's ARGO_IMPLEMENT_MUTEX_TEMPLATE mirror names "
+            f"{mutex_template!r}"
+        )
+
+    # While the mirror still names IMPLEMENTER_TEMPLATE,
+    # implementation_max_concurrent_activities() (constants.py) clamps the
+    # implementation worker's effective N to this exact mutex's width (with
+    # one warning; never a refusal, because mctl-gitops still pins N="3") —
+    # that binding, not a deadline threshold, is what actually prevents the
+    # 2026-09-19 shape. A long deadline on that one
+    # template is the known, still-migrating state this proposal starts
+    # from (mctl-gitops@main today), not a fresh violation; asserting a
+    # threshold on it here would fail every PR-validation run against real,
+    # current, not-yet-migrated gitops content for a risk admission already
+    # closes. It stops being exempt the moment either repo disagrees with
+    # the mirror, which the checks above already catch.
+    admission_bound = temporal_constants.argo_admission_width() is not None
+    for name in guarded:
+        if admission_bound and name == implement_outcome.IMPLEMENTER_TEMPLATE:
+            continue
+        deadline = by_name[name].get("activeDeadlineSeconds")
+        # A no-match must never read as a pass: a missing or non-int
+        # deadline on a guarded template is not evidence of a bounded
+        # budget, so it is reported exactly like one that is too long.
+        if not isinstance(deadline, int) or deadline > MAX_LOCKED_STEP_DEADLINE_SECONDS:
+            errors.append(
+                f"{cwft_path}: template {name!r} carries synchronization.mutex {mutex_name!r} with "
+                f"activeDeadlineSeconds={deadline!r}, not an int at or under "
+                f"MAX_LOCKED_STEP_DEADLINE_SECONDS={MAX_LOCKED_STEP_DEADLINE_SECONDS} — a lock wait "
+                "on this node counts against a long (or unreadable) deadline, the mctl-agents#418 "
+                "shape restated structurally"
+            )
+
+    implementer_template = by_name.get(implement_outcome.IMPLEMENTER_TEMPLATE)
+    if implementer_template is None:
+        errors.append(
+            f"{cwft_path}: no template named {implement_outcome.IMPLEMENTER_TEMPLATE!r} — this "
+            "check is asserting against a file that has been restructured underneath it"
+        )
+    elif implementer_template.get("activeDeadlineSeconds") is None:
+        errors.append(
+            f"{cwft_path}: template {implement_outcome.IMPLEMENTER_TEMPLATE!r} carries no "
+            "activeDeadlineSeconds at all — this check is asserting against a file that has been "
+            "restructured underneath it"
+        )
+
+    return errors
+
+# Where mctl-gitops sets the implementation worker's configured N.
+IMPLEMENT_WORKER_VALUES = GITOPS_ROOT / "services" / "admins" / "mctl-agents-worker-implement" / "values.yaml"
+
+
+def implement_admission_clamp_warnings() -> list[str]:
+    """Advisory, never a failure: say when mctl-gitops configures an
+    implementation N that the worker will clamp (mctl-agents#418).
+
+    `implementation_max_concurrent_activities()` clamps N to the mirrored
+    mutex width while the mutex still guards `run-implementer`, so a larger
+    configured N is safe — the worker starts and admits `width` at a time —
+    but the values file then states a capacity the worker does not have.
+    That is worth a line in the validation output and is deliberately NOT
+    an error: mctl-gitops@main pins N="3" against width 1 today, and
+    failing every mctl-agents PR on a value the runtime already handles
+    would block unrelated work on a cleanup. An absent or unreadable values
+    file yields no warning — `check_implement_admission_is_safe` is the
+    check that fails closed; this one only informs.
+    """
+    ceiling = temporal_constants.argo_admission_width()
+    if ceiling is None or not IMPLEMENT_WORKER_VALUES.is_file():
+        return []
+    try:
+        document = yaml.safe_load(IMPLEMENT_WORKER_VALUES.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError:
+        return []
+    env = document.get("env") if isinstance(document, dict) else None
+    raw = env.get(temporal_constants.IMPLEMENTATION_CAPACITY_ENV) if isinstance(env, dict) else None
+    try:
+        configured = int(str(raw))
+    except ValueError:
+        return []
+    if configured <= ceiling:
+        return []
+    return [
+        f"{IMPLEMENT_WORKER_VALUES}: {temporal_constants.IMPLEMENTATION_CAPACITY_ENV}={configured} "
+        f"exceeds the Argo mutex width {temporal_constants.ARGO_IMPLEMENT_MUTEX_NAME}={ceiling} "
+        f"guarding {temporal_constants.ARGO_IMPLEMENT_MUTEX_TEMPLATE}; the worker clamps admission "
+        f"to {ceiling} (not a failure — lower it to {ceiling}, or move the mutex off "
+        f"{temporal_constants.ARGO_IMPLEMENT_MUTEX_TEMPLATE}, to make the file match)"
+    ]
 
 
 def _resolve_builder_module_with_clean_env(manifest: AgentManifest) -> tuple[Callable[..., Any], ModuleType]:
@@ -956,6 +1147,16 @@ def main(argv: list[str] | None = None) -> int:
             print("FAIL spec.serviceSkills <-> mctl-gitops agent-platform policy.yaml ceilings:")
             for error in service_skills_errors:
                 print(f"  - {error}")
+
+        admission_errors = check_implement_admission_is_safe()
+        if admission_errors:
+            exit_code = 1
+            print("FAIL implement admission mutex binding (mctl-agents#418):")
+            for error in admission_errors:
+                print(f"  - {error}")
+
+        for warning in implement_admission_clamp_warnings():
+            print(f"WARN implement admission clamp (mctl-agents#418): {warning}")
 
     return exit_code
 

@@ -524,6 +524,88 @@ class TestRecordExecution:
         assert record.phase == "Failed"
 
 
+class TestPreStartReason:
+    """mctl-agents#418: SweptImplementWorkflow classifies its own implement
+    submit, so it must carry WHY a `pre_start` verdict never started onto
+    the execution record and the ImplementationNotStarted error, exactly as
+    DevLoopWorkflow._implement does — otherwise the sweep, the path that
+    recovers stranded proposals, is the one path that still collapses a
+    mutex kill and a scheduling failure into the same bare `pre_start`."""
+
+    async def _run_swept(self, env, submit_result):
+        activities, received = _fake_activities(submit_result=submit_result)
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[ImplementSweepWorkflow, SweptImplementWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                SweptImplementWorkflow.run,
+                SweptImplementInput(service="mctl-web", slug="issue-10-test"),
+                id=f"swept-prestart-reason-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            try:
+                await handle.result()
+                cause = None
+            except WorkflowFailureError as exc:
+                cause = exc.cause
+        return received, cause
+
+    @pytest.mark.parametrize(
+        ("observed", "expected"),
+        [("lock_wait", "lock_wait"), ("unscheduled", "unscheduled"), (None, "unknown")],
+        ids=["lock_wait", "unscheduled", "unreadable-graph-is-unknown"],
+    )
+    async def test_a_pre_start_swept_run_records_and_raises_its_reason(self, env, observed, expected):
+        received, cause = await self._run_swept(
+            env,
+            WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=False,
+                pre_start_reason=observed,
+            ),
+        )
+
+        assert len(received["record_execution"]) == 1
+        record = received["record_execution"][0]
+        assert record.outcome == "pre_start"
+        assert record.pre_start_reason == expected
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationNotStarted"
+        assert f"({expected})" in cause.message
+
+    async def test_a_run_that_started_carries_no_pre_start_reason(self, env):
+        received, cause = await self._run_swept(
+            env,
+            WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=True,
+                implementer_phase="Failed",
+            ),
+        )
+
+        record = received["record_execution"][0]
+        assert record.outcome == "execution"
+        assert record.pre_start_reason == ""
+        assert isinstance(cause, ApplicationError)
+        assert cause.type == "ImplementationFailed"
+        assert "unknown" not in cause.message
+
+    async def test_a_successful_swept_run_records_success_without_a_reason(self, env):
+        received, cause = await self._run_swept(
+            env, WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded")
+        )
+
+        assert cause is None
+        record = received["record_execution"][0]
+        assert record.outcome == "success"
+        assert record.pre_start_reason == ""
+
+
 class TestStrandedScanFailure:
     """review P2: `list_active_dev_loop_ids` was wrapped and this sibling was
     not, so a GitHub 5xx or a malformed listing failed the whole SCHEDULED
