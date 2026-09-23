@@ -17,7 +17,7 @@ import pytest
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
-from orchestrator.temporal.activities.argo import SubmitAndWaitInput, submit_and_wait
+from orchestrator.temporal.activities.argo import SubmitAndWaitInput, _merge_observations, submit_and_wait
 from orchestrator.temporal.activities.human_input import (
     HumanInputListingError,
     find_human_input_request,
@@ -26,6 +26,7 @@ from orchestrator.temporal.activities.identity import MintRequest, mint_executio
 from orchestrator.temporal.activities.proposals import ProposalListingError, find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
 from orchestrator.temporal.activities.state import ExecutionRecord, record_execution
+from orchestrator.temporal.implement_outcome import ImplementerObservation
 
 pytestmark = pytest.mark.anyio
 
@@ -434,6 +435,127 @@ class TestRecordExecution:
         assert seen["body"]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-telegram-1"
         assert seen["body"]["phase"] == "Succeeded"
         assert seen["body"]["target_repo"] == "mctl-telegram"
+        # Neither field was set on this record, so neither is sent (#418).
+        assert "outcome" not in seen["body"]
+        assert "pre_start_reason" not in seen["body"]
+
+    async def test_outcome_and_pre_start_reason_are_posted_only_when_set(self, env, monkeypatch):
+        """#418: the audit trail must be able to tell "killed while queued
+        on the lock" apart from "ran and produced nothing", sent only when
+        non-empty since a `pre_start` record from a non-implement agent
+        never carries a reason at all."""
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(201, json={"ok": True})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(
+            record_execution,
+            ExecutionRecord(
+                temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-1",
+                agent="implementer",
+                environment="production",
+                version="",
+                image_ref="",
+                target_repo="mctl-telegram",
+                argo_workflow_name="mctl-agents-implement-ab12cd34",
+                phase="Failed",
+                outcome="pre_start",
+                pre_start_reason="lock_wait",
+            ),
+        )
+        assert seen["body"]["outcome"] == "pre_start"
+        assert seen["body"]["pre_start_reason"] == "lock_wait"
+
+    @staticmethod
+    def _implement_record() -> ExecutionRecord:
+        return ExecutionRecord(
+            temporal_workflow_id="dev-loop-mctlhq-mctl-telegram-1",
+            agent="implementer",
+            environment="production",
+            version="",
+            image_ref="",
+            target_repo="mctl-telegram",
+            argo_workflow_name="mctl-agents-implement-ab12cd34",
+            phase="Failed",
+            outcome="pre_start",
+            pre_start_reason="lock_wait",
+        )
+
+    async def test_a_4xx_on_the_optional_keys_retries_once_without_them(self, env, monkeypatch):
+        """#459 review P2: every implement record carries `outcome`, so an
+        mctl-api that rejects unknown keys must cost those keys, never the
+        whole execution row (callers swallow a failed record_execution)."""
+        bodies: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "outcome" in body or "pre_start_reason" in body:
+                return httpx.Response(400, json={"error": 'json: unknown field "outcome"'})
+            return httpx.Response(201, json={"ok": True})
+
+        _mock_async_client(monkeypatch, handler)
+        await env.run(record_execution, self._implement_record())
+        assert len(bodies) == 2
+        assert bodies[0]["outcome"] == "pre_start"
+        assert "outcome" not in bodies[1] and "pre_start_reason" not in bodies[1]
+        assert bodies[1]["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-telegram-1"
+        assert bodies[1]["phase"] == "Failed"
+
+    async def test_a_4xx_without_optional_keys_is_not_retried(self, env, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(400, json={"error": "invalid"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(
+                record_execution,
+                ExecutionRecord(
+                    temporal_workflow_id="x",
+                    agent="issue-investigator",
+                    environment="production",
+                    version="",
+                    image_ref="",
+                    target_repo="",
+                    argo_workflow_name="wf",
+                    phase="Succeeded",
+                ),
+            )
+        assert len(calls) == 1
+
+    async def test_a_5xx_is_not_retried_without_the_optional_keys(self, env, monkeypatch):
+        """A server error is not a schema mismatch: it surfaces to Temporal's
+        own retry policy with the full body, rather than silently dropping
+        fields mctl-api might well have accepted."""
+        bodies: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            bodies.append(json.loads(request.content))
+            return httpx.Response(503, json={"error": "unavailable"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(record_execution, self._implement_record())
+        assert len(bodies) == 1
+        assert bodies[0]["outcome"] == "pre_start"
+
+    async def test_a_4xx_that_persists_without_the_optional_keys_still_raises(self, env, monkeypatch):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(400, json={"error": "missing required fields"})
+
+        _mock_async_client(monkeypatch, handler)
+        with pytest.raises(httpx.HTTPStatusError):
+            await env.run(record_execution, self._implement_record())
+        assert len(calls) == 2
 
     async def test_raises_on_error_response(self, env, monkeypatch):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -2441,13 +2563,53 @@ def _implement_status(phase: str, nodes: dict | None) -> dict:
     return {"live": {"status": status}}
 
 
-def _node(template: str, phase: str, *, ran: bool, started_at: str | None = None) -> dict:
+def _node(
+    template: str, phase: str, *, ran: bool, started_at: str | None = None, lock_wait: bool = False
+) -> dict:
     node = {"type": "Pod", "templateName": template, "phase": phase}
     if started_at:
         node["startedAt"] = started_at
     if ran:
         node["hostNodeName"] = "k3s-worker-1"
+    if lock_wait:
+        node["message"] = "Waiting for argo-workflows/Mutex/mctl-agents-proposal-claims. Lock status: 0/1"
     return node
+
+
+class TestMergeObservationsStickyLockWait:
+    """T2: `lock_wait` is sticky the same way `ran=True` is sticky (#418) —
+    a mid-flight poll SEES the lock wait, and the terminal poll the result
+    is built from can find the node message already gone."""
+
+    def _obs(self, ran, reason=None) -> ImplementerObservation:
+        return ImplementerObservation(
+            ran=ran, phase=None, started_at=None, finalization_phase=None, pre_start_reason=reason
+        )
+
+    def test_a_lock_wait_survives_a_later_poll_that_lost_the_message(self) -> None:
+        best = _merge_observations(None, self._obs(False, "lock_wait"))
+        merged = _merge_observations(best, self._obs(False, "unscheduled"))
+        assert merged.ran is False
+        assert merged.pre_start_reason == "lock_wait"
+
+    def test_a_lock_wait_seen_later_still_wins(self) -> None:
+        best = _merge_observations(None, self._obs(False, "unscheduled"))
+        merged = _merge_observations(best, self._obs(False, "lock_wait"))
+        assert merged.pre_start_reason == "lock_wait"
+
+    def test_a_pod_that_ran_clears_the_reason(self) -> None:
+        """`ran=True` from any poll clears the reason — a pod that ran
+        needs no explanation for why it "never started"."""
+        best = _merge_observations(None, self._obs(False, "lock_wait"))
+        merged = _merge_observations(best, self._obs(True, None))
+        assert merged.ran is True
+        assert merged.pre_start_reason is None
+
+    def test_ran_true_first_then_false_still_clears_the_reason(self) -> None:
+        best = _merge_observations(None, self._obs(True, None))
+        merged = _merge_observations(best, self._obs(False, "lock_wait"))
+        assert merged.ran is True
+        assert merged.pre_start_reason is None
 
 
 class TestSubmitAndWaitObservesTheImplementer:
@@ -2494,6 +2656,41 @@ class TestSubmitAndWaitObservesTheImplementer:
         assert result.implementer_started_at is None
         # startedAt on a Pending-on-mutex node is when Argo created it, not
         # when anything ran; it must not leak into the attempt's start.
+        assert all(hb[1]["phase"] != "running" for hb in heartbeats if len(hb) > 1)
+
+    async def test_a_lock_wait_seen_mid_flight_survives_a_terminal_poll_that_lost_it(self, env, monkeypatch):
+        """T3: the poll that SEES the lock wait is mid-flight; the terminal
+        poll the result is built from can find the node message already
+        gone (#418) — the reason must still make it into the result.
+
+        The terminal poll still returns a READABLE node graph, just without
+        the lock mark: on its own that observes as `unscheduled`, so only
+        the sticky merge keeps `lock_wait`. (An empty graph would not test
+        the rule — `unknown` never outranks a definite answer anyway.)"""
+        waiting = _node("run-implementer", "Pending", ran=False, lock_wait=True)
+        mark_gone = _node("run-implementer", "Failed", ran=False)
+        polls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"workflow": {"workflowName": "mctl-agents-implement-0eaa9853"}})
+            polls["n"] += 1
+            if polls["n"] == 1:
+                return httpx.Response(200, json=_implement_status("Running", {"a": waiting}))
+            return httpx.Response(200, json=_implement_status("Failed", {"a": mark_gone}))
+
+        async def no_sleep(_seconds):
+            return None
+
+        monkeypatch.setattr("orchestrator.temporal.activities.argo.asyncio.sleep", no_sleep)
+        _mock_async_client(monkeypatch, handler)
+        heartbeats: list = []
+        env.on_heartbeat = lambda *details: heartbeats.append(details)
+
+        result = await env.run(submit_and_wait, SubmitAndWaitInput(operation="mctl-agents-implement", params={}))
+        assert result.implementer_ran is False
+        assert result.pre_start_reason == "lock_wait"
+        assert result.implementer_started_at is None
         assert all(hb[1]["phase"] != "running" for hb in heartbeats if len(hb) > 1)
 
     async def test_a_pod_that_ran_and_was_killed_is_an_execution_failure(self, env, monkeypatch):

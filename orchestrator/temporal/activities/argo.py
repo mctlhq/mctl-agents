@@ -41,7 +41,7 @@ import httpx
 from temporalio import activity
 
 from orchestrator.temporal.constants import IMPLEMENTATION_OPERATION
-from orchestrator.temporal.implement_outcome import ImplementerObservation, observe_implementer
+from orchestrator.temporal.implement_outcome import ImplementerObservation, PreStartReason, observe_implementer
 from orchestrator.temporal.mctl_client import MCTL_API_BASE_URL, auth_headers
 
 REQUEST_TIMEOUT_SECONDS = 30.0
@@ -84,6 +84,12 @@ class WorkflowResult:
     implementer_phase: str | None = None
     implementer_started_at: str | None = None
     finalization_phase: str | None = None
+    # WHY a pre_start verdict never started (#418) — "lock_wait",
+    # "unscheduled" or "unknown". None when `implementer_ran` is not False
+    # (it ran, or the graph was never readable enough to say). Additive,
+    # like the four fields above: an older recorded payload deserializes
+    # with this defaulting to None.
+    pre_start_reason: str | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -122,7 +128,11 @@ def _merge_observations(
 
     `ran=True` is sticky and keeps the `started_at` and phase that came
     with it; below that, the newest readable answer wins and unknown never
-    outranks a definite one in either direction.
+    outranks a definite one in either direction. `pre_start_reason` follows
+    the same sticky rule as `ran=True`, in the other direction: once a
+    `lock_wait` mark has been seen, a later poll whose terminal node message
+    is gone (Argo can drop it mid-flight -> terminal) must not downgrade the
+    reason to `unscheduled` or `unknown` (#418).
     """
     if best is None:
         return latest
@@ -140,6 +150,17 @@ def _merge_observations(
         ran = latest.ran
     else:
         ran = best.ran
+    if ran is not False:
+        # A pod known (or now known) to have run, or a graph that has never
+        # given a definite answer, carries no pre-start reason at all.
+        reason: PreStartReason | None = None
+    elif best.pre_start_reason == "lock_wait" or latest.pre_start_reason == "lock_wait":
+        # Sticky: the poll that SEES the lock wait is mid-flight, and the
+        # poll the terminal result is built from can find the node message
+        # already gone.
+        reason = "lock_wait"
+    else:
+        reason = latest.pre_start_reason if latest.pre_start_reason is not None else best.pre_start_reason
     return ImplementerObservation(
         ran=ran,
         phase=latest.phase if latest.phase is not None else best.phase,
@@ -147,6 +168,7 @@ def _merge_observations(
         finalization_phase=(
             latest.finalization_phase if latest.finalization_phase is not None else best.finalization_phase
         ),
+        pre_start_reason=reason,
     )
 
 
@@ -346,6 +368,7 @@ async def submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
                     implementer_phase=best.phase if best else None,
                     implementer_started_at=best.started_at if best else None,
                     finalization_phase=best.finalization_phase if best else None,
+                    pre_start_reason=best.pre_start_reason if best else None,
                 )
 
             await asyncio.sleep(POLL_INTERVAL_SECONDS)

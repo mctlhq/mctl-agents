@@ -200,12 +200,14 @@ def test_the_execution_worker_is_untouched_by_the_admission_queue(visibility):
 
 def test_implementation_capacity_is_read_from_the_environment(monkeypatch, visibility):
     """N is the number an operator moves, so it comes from values.yaml via
-    env — not from a constant that needs a code release to change."""
-    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "5")
-    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 5
+    env — not from a constant that needs a code release to change. Bounded
+    at 1 while the mirror still names run-implementer (#418) — see
+    TestImplementationCapacityIsBoundToTheMutex for the ceiling itself."""
+    monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "1")
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 1
 
     monkeypatch.delenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES")
-    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 3
+    assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 1
 
 
 @pytest.mark.parametrize("bad", ["0", "-1", "three", "2.5"])
@@ -215,6 +217,70 @@ def test_a_capacity_that_admits_nothing_is_refused_at_startup(monkeypatch, visib
     monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", bad)
     with pytest.raises(SystemExit):
         worker_plans("implementation", visibility)
+
+
+class TestImplementationCapacityIsBoundToTheMutex:
+    """T5 (#418): N cannot exceed the Argo mutex width while that mutex
+    still guards the timed `run-implementer` step — the 2026-09-19 shape,
+    reproduced at a smaller N. A larger configured N is CLAMPED to the
+    width with one warning, never refused: mctl-gitops pins N="3" against
+    width 1 today, and a refusal would crash-loop the implementation worker.
+    `worker_plans` reads the ceiling through
+    `implementation_max_concurrent_activities()`, so patching the constants
+    module's mirror is enough to drive both states.
+    """
+
+    def test_n_three_against_width_one_is_clamped_to_one_and_does_not_raise(
+        self, monkeypatch, visibility, caplog
+    ):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        with caplog.at_level(logging.WARNING, logger="orchestrator.temporal.constants"):
+            plans = worker_plans("implementation", visibility)
+        assert plans[0].max_concurrent_activities == 1
+
+        warnings = [r for r in caplog.records if r.name == "orchestrator.temporal.constants"]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES=3" in message
+        assert "mctl-agents-proposal-claims=1" in message
+
+    def test_the_clamp_is_the_function_contract_not_only_the_plan(self, monkeypatch):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        assert implementation_max_concurrent_activities() == 1
+
+    def test_n_at_or_under_the_width_is_not_warned_about(self, monkeypatch, visibility, caplog):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "1")
+        with caplog.at_level(logging.WARNING, logger="orchestrator.temporal.constants"):
+            assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 1
+        assert not [r for r in caplog.records if r.name == "orchestrator.temporal.constants"]
+
+    def test_all_is_clamped_the_same_way(self, monkeypatch, visibility):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        plans = {p.task_queue: p for p in worker_plans("all", visibility)}
+        assert plans[IMPLEMENTATION_TASK_QUEUE].max_concurrent_activities == 1
+
+    def test_control_and_execution_are_unaffected(self, monkeypatch, visibility):
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        assert worker_plans("control", visibility)
+        assert worker_plans("execution", visibility)
+
+    def test_n_above_the_width_is_accepted_once_the_mutex_moves_off_run_implementer(
+        self, monkeypatch, visibility
+    ):
+        # Patch the globals of the function worker.py actually calls, not
+        # `from orchestrator.temporal import constants`: in the full suite
+        # the Temporal workflow sandbox re-imports that module, leaving the
+        # package attribute pointing at a different module object than the
+        # one `implementation_max_concurrent_activities` closes over — so a
+        # setattr on the package attribute passed alone and silently patched
+        # nothing in the full run.
+        monkeypatch.setitem(
+            worker_module.implementation_max_concurrent_activities.__globals__,
+            "ARGO_IMPLEMENT_MUTEX_TEMPLATE",
+            "commit-and-push",
+        )
+        monkeypatch.setenv("IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES", "3")
+        assert worker_plans("implementation", visibility)[0].max_concurrent_activities == 3
 
 
 @pytest.mark.parametrize("role", ["control", "execution"])

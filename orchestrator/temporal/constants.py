@@ -2,7 +2,12 @@
 """
 from __future__ import annotations
 
+import logging
 import os
+
+from orchestrator.temporal import implement_outcome
+
+logger = logging.getLogger(__name__)
 
 TASK_QUEUE = "mctl-dev-loop"
 
@@ -67,6 +72,46 @@ IMPLEMENTATION_TASK_QUEUE = "mctl-dev-loop-implement"
 # the dev-loop's submit and the tests all spell the same string.
 IMPLEMENTATION_OPERATION = "mctl-agents-implement"
 
+# Mirror of the CWFT lock that guards the timed implementer step, in the
+# OTHER repository: cwft-mctl-agents-implement.yaml in mctl-gitops
+# (platform-gitops/argo-workflows/cluster-templates/). Not read live — the
+# worker deployment has no gitops checkout, only the implement CWFT mounts
+# one (see run_implementer.py's AGENTS_STATE note) — so it is mirrored here,
+# the same shape orchestrator/resolver.py already uses for
+# validate-agent-platform.py's COMPAT_RE. What keeps the mirror honest is
+# `orchestrator/validate_manifest.py::check_implement_admission_is_safe`,
+# which fails mctl-agents' own PR-validation CI the moment this drifts from
+# the real file (mctl-agents#418).
+#
+# On 2026-09-19 admission (N=3 by default, below) let three implement
+# submits reach Argo while only ONE of them could hold this mutex; the other
+# two queued INSIDE run-implementer's activeDeadlineSeconds=7200 and were
+# killed having executed nothing. ARGO_IMPLEMENT_MUTEX_TEMPLATE names which
+# step actually carries the deadline the mutex wait counts against —
+# `run-implementer` today. It moves to `commit-and-push` once the
+# mctl-gitops PR that relocates the mutex (task 10 of #418) merges, at which
+# point admission is no longer bound by this lock at all: waiting on a
+# seconds-long commit step does not burn the implementer's two-hour budget.
+# Spelled once, in implement_outcome (which cannot import this module).
+ARGO_IMPLEMENT_MUTEX_NAME = implement_outcome.ARGO_IMPLEMENT_MUTEX_NAME
+ARGO_IMPLEMENT_MUTEX_TEMPLATE = "run-implementer"
+ARGO_IMPLEMENT_MUTEX_WIDTH = 1
+
+
+def argo_admission_width() -> int | None:
+    """The ceiling admission must respect, or None once the lock no longer
+    guards timed work.
+
+    Compares against `implement_outcome.IMPLEMENTER_TEMPLATE` rather than a
+    second literal: two independent spellings of "run-implementer" is
+    exactly the kind of drift this mirror exists to prevent. Importing
+    implement_outcome introduces no cycle — that module imports nothing
+    from this one.
+    """
+    if ARGO_IMPLEMENT_MUTEX_TEMPLATE == implement_outcome.IMPLEMENTER_TEMPLATE:
+        return ARGO_IMPLEMENT_MUTEX_WIDTH
+    return None
+
 
 def _int_env(name: str, default: int) -> int:
     """A positive integer from the environment, or the default.
@@ -102,11 +147,44 @@ def _int_env(name: str, default: int) -> int:
 # replicas times N. That is why the implementation deployment is pinned to one
 # replica and mctl-gitops fails CI if that changes (#1285).
 IMPLEMENTATION_CAPACITY_ENV = "IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES"
-DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES = 3
+# 1, not 3: while ARGO_IMPLEMENT_MUTEX_TEMPLATE still names "run-implementer",
+# argo_admission_width() clamps N to the mutex width, and a default above that
+# ceiling would log a clamp warning on every start where nothing overrides it. Restore
+# to 3 in the same one-line commit that flips the mirror to
+# "commit-and-push" after the mctl-gitops PR (task 10 of #418) lands.
+DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES = ARGO_IMPLEMENT_MUTEX_WIDTH
 
 
 def implementation_max_concurrent_activities() -> int:
-    return _int_env(IMPLEMENTATION_CAPACITY_ENV, DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES)
+    """Effective admission width N for the implementation worker.
+
+    While the Argo mutex still guards `run-implementer`
+    (`argo_admission_width()` is not None), a configured N above the mutex
+    width is CLAMPED to that width, with one warning naming both numbers.
+    It is deliberately not a refusal: mctl-gitops pins
+    IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES="3" against a width of 1
+    today, and refusing would crash-loop the one worker that does
+    implementation work, admitting zero instead of one. Admitting more than
+    the width only moves the surplus into Argo, where it queues against
+    run-implementer's own activeDeadlineSeconds — the 2026-09-19 shape
+    (mctl-agents#418).
+    """
+    configured = _int_env(IMPLEMENTATION_CAPACITY_ENV, DEFAULT_IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES)
+    ceiling = argo_admission_width()
+    if ceiling is not None and configured > ceiling:
+        logger.warning(
+            "%s=%d exceeds the Argo mutex width %s=%d, which still guards %s; "
+            "clamping implement admission to %d so the surplus does not queue inside "
+            "Argo against its own activeDeadlineSeconds (mctl-agents#418)",
+            IMPLEMENTATION_CAPACITY_ENV,
+            configured,
+            ARGO_IMPLEMENT_MUTEX_NAME,
+            ceiling,
+            ARGO_IMPLEMENT_MUTEX_TEMPLATE,
+            ceiling,
+        )
+        return ceiling
+    return configured
 
 
 # Implement-sweep tunables (mctl-agents#412). Read the same way as

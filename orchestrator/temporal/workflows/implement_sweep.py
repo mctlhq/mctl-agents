@@ -55,6 +55,9 @@ with workflow.unsafe.imports_passed_through():
         classify,
         finalization_evidence,
     )
+    from orchestrator.temporal.implement_outcome import (
+        pre_start_reason as render_pre_start_reason,
+    )
 
 ACTIVITY_TIMEOUT = timedelta(minutes=5)
 # Heartbeat bound for `count_swept_prestart_failures` only — see its call site.
@@ -104,7 +107,13 @@ class SweptImplementInput:
     slug: str
 
 
-async def _record_swept_execution(input_data: SweptImplementInput, result: WorkflowResult) -> None:
+async def _record_swept_execution(
+    input_data: SweptImplementInput,
+    result: WorkflowResult,
+    *,
+    outcome: str = "",
+    pre_start_reason: str = "",
+) -> None:
     """Best-effort audit-trail write for a swept implement run (mctl-agents#412).
 
     Mirrors dev_loop.py's `_record` / incidents.py's `_record`: without this,
@@ -132,6 +141,8 @@ async def _record_swept_execution(input_data: SweptImplementInput, result: Workf
                 target_repo=input_data.service,
                 argo_workflow_name=result.workflow_name,
                 phase=result.phase,
+                outcome=outcome,
+                pre_start_reason=pre_start_reason,
             ),
             start_to_close_timeout=RECORD_EXECUTION_TIMEOUT,
             retry_policy=RECORD_EXECUTION_RETRY_POLICY,
@@ -165,19 +176,31 @@ class SweptImplementWorkflow:
             retry_policy=SWEEP_STEP_RETRY_POLICY,
         )
 
-        await _record_swept_execution(input_data, result)
-
         # Classified the same way dev_loop._implement classifies its own
         # implement submit (implement_outcome.py) — collapsing straight to
         # `result.phase != "Succeeded"` here would be exactly the reduction
         # to a bare phase implement_outcome.py exists to reject: `Failed`
         # alone cannot say whether the implementer ever ran.
+        #
+        # classify() and render_pre_start_reason() are pure functions of
+        # `result` and issue no workflow command, so computing them before
+        # the record activity (rather than after, as before #418) changes
+        # no command order and replays against existing histories.
         outcome: Outcome = classify(
             result.phase,
             implementer_ran=result.implementer_ran,
             implementer_phase=result.implementer_phase,
             finalization_phase=result.finalization_phase,
         )
+        # #418: WHY a pre_start verdict never started — lock_wait,
+        # unscheduled or unknown — carried onto the durable record and the
+        # error, exactly as dev_loop._implement does. None for any other
+        # outcome: render() maps None to "unknown", and a run that started
+        # must not be given a reason for never starting.
+        reason = render_pre_start_reason(result.pre_start_reason) if outcome == "pre_start" else None
+
+        await _record_swept_execution(input_data, result, outcome=outcome, pre_start_reason=reason or "")
+
         if outcome == "success":
             return result
 
@@ -194,6 +217,7 @@ class SweptImplementWorkflow:
         raise ApplicationError(
             f"swept implement of {input_data.service}/{input_data.slug} ended "
             f"{result.phase} ({outcome}) in Argo workflow {result.workflow_name}"
+            + (f" ({reason})" if outcome == "pre_start" else "")
             + (
                 f": {finalization_evidence(result.finalization_phase)}"
                 if outcome == "finalization"

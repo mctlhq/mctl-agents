@@ -39,6 +39,7 @@ from orchestrator.temporal.activities.state import ExecutionRecord
 from orchestrator.temporal.constants import (
     EXECUTION_TASK_QUEUE,
     IMPLEMENTATION_TASK_QUEUE,
+    argo_admission_width,
     implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.workflows import dev_loop
@@ -5520,6 +5521,87 @@ async def _start_and_approve(env, issue_number: int):
     return handle
 
 
+class _FakeArgoMutex:
+    """Models the real `mctl-agents-proposal-claims` mutex (#418): `width`
+    slots, and a submit that finds no free slot is killed by its
+    `activeDeadlineSeconds` while still queued on the lock — the
+    2026-09-19 shape — rather than waiting for one. `max_concurrent` is
+    the highest number of submits this fake ever saw INSIDE the section at
+    once, which is what the admission binding (N <= mutex width) exists to
+    keep at or below `width`.
+    """
+
+    def __init__(self, width: int) -> None:
+        self.width = width
+        self.current = 0
+        self.max_concurrent = 0
+        self.killed = 0
+
+    async def run(self) -> WorkflowResult:
+        if self.current >= self.width:
+            self.killed += 1
+            return WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Failed",
+                implementer_ran=False,
+                pre_start_reason="lock_wait",
+            )
+        self.current += 1
+        self.max_concurrent = max(self.max_concurrent, self.current)
+        try:
+            # A real submission holds the lock for tens of minutes; a
+            # cooperative yield here is enough to let a SECOND admitted
+            # activity actually overlap in this event loop if admission
+            # were not bounding concurrency — which is exactly the
+            # condition this fake exists to catch.
+            await anyio.sleep(0.05)
+            return WorkflowResult(
+                workflow_name="mctl-agents-implement-fake",
+                phase="Succeeded",
+                implementer_ran=True,
+                implementer_phase="Succeeded",
+            )
+        finally:
+            self.current -= 1
+
+
+def _admission_activities_with_fake_mutex(mutex: _FakeArgoMutex, *, seen_queues=None):
+    """Like `_admission_activities`, but the implement fake is backed by a
+    `_FakeArgoMutex` instead of a fixed result list — for T4's burst replay."""
+    seen_queues = seen_queues if seen_queues is not None else {}
+    implement_calls: list[str] = []
+    records: list[ExecutionRecord] = []
+
+    @activity.defn(name="resolve_agent_release")
+    async def fake_resolve_agent_release(agent: str, environment: str) -> ResolvedRelease | None:
+        return ResolvedRelease(
+            agent=agent, environment=environment, version="1.0.0", image_ref="ghcr.io/x@sha256:aaa"
+        )
+
+    @activity.defn(name="submit_and_wait")
+    async def fake_submit_and_wait(input: SubmitAndWaitInput) -> WorkflowResult:
+        seen_queues.setdefault(input.operation, []).append(activity.info().task_queue)
+        if input.operation == "mctl-agents-investigate":
+            return WorkflowResult(workflow_name="investigate-fake", phase="Succeeded")
+        if input.operation == "mctl-agents-implement":
+            implement_calls.append(activity.info().workflow_id)
+            return await mutex.run()
+        return WorkflowResult(workflow_name=f"{input.operation}-fake", phase="Succeeded")
+
+    @activity.defn(name="record_execution")
+    async def fake_record_execution(record: ExecutionRecord) -> None:
+        records.append(record)
+
+    activities = [
+        fake_resolve_agent_release,
+        fake_submit_and_wait,
+        fake_record_execution,
+        _fake_find_proposal_slug,
+        _fake_find_human_input_request_none,
+    ]
+    return activities, implement_calls, records
+
+
 class TestImplementationAdmission:
     async def test_only_the_implement_submit_routes_to_the_admission_queue(self, env):
         """Investigate and approve stay on exec; implement alone goes to the
@@ -5544,14 +5626,16 @@ class TestImplementationAdmission:
     async def test_a_burst_of_approvals_is_admitted_n_at_a_time(self, env):
         """The 2026-09-19 incident as a regression test (#395 DoD).
 
-        Nine loops approved at once, N=3: exactly three implement submits
-        start, six stay Scheduled in Temporal — no submit fake runs for
-        them, which in production is "no Argo workflow exists" — and as
-        the gate opens the rest drain with no intervention. The wait costs
-        no execution budget: nothing here times out.
+        Nine loops approved at once: exactly N implement submits start (N
+        is whatever `implementation_max_concurrent_activities()` — the
+        production default, bound to the Argo mutex width by #418 — is
+        configured to be), the rest stay Scheduled in Temporal — no submit
+        fake runs for them, which in production is "no Argo workflow
+        exists" — and as the gate opens the rest drain with no
+        intervention. The wait costs no execution budget: nothing here
+        times out.
         """
         n = implementation_max_concurrent_activities()
-        assert n == 3, "the DoD is written for N=3; the harness runs the production default"
         gate = _Gate()
         seen: dict[str, list[str]] = {}
         activities, calls, _records, _ = _admission_activities(
@@ -5581,6 +5665,43 @@ class TestImplementationAdmission:
         assert len(calls) == 9
         assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE] * 9
 
+    async def test_a_burst_replays_the_2026_09_19_shape_and_kills_no_run(self, env):
+        """T4 (#418): the 00:12-00:31Z burst, replayed against a fake Argo
+        that enforces the REAL mutex width and kills any implement submit
+        it finds still queued on the lock — the deadline-vs-lock-wait shape
+        the incident was made of, not just an admission-pool count.
+
+        With N bound to `argo_admission_width()` (the production default
+        after #418), admission alone keeps concurrency at or below the
+        mutex width, so the fake never has to kill anything: the surplus
+        queues as `Scheduled` in Temporal instead of reaching Argo at all.
+        That is the acceptance criterion this proposal exists for — "no run
+        is killed before it has executed" — asserted against a fake that
+        can actually kill one if the binding ever regresses.
+        """
+        n = implementation_max_concurrent_activities()
+        mutex_width = argo_admission_width()
+        assert mutex_width is not None and n <= mutex_width, (
+            "N must not exceed the Argo mutex width — #418's binding is what this test relies on"
+        )
+
+        mutex = _FakeArgoMutex(width=mutex_width)
+        seen: dict[str, list[str]] = {}
+        activities, calls, _records = _admission_activities_with_fake_mutex(mutex, seen_queues=seen)
+        async with Worker(env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities):
+            handles = [await _start_and_approve(env, 300 + i) for i in range(6)]
+            for handle in handles:
+                await handle.signal(DevLoopWorkflow.approve)
+            results = [await handle.result() for handle in handles]
+            states = [await handle.query(DevLoopWorkflow.implement_execution) for handle in handles]
+
+        assert all(r.implement is not None and r.implement.succeeded for r in results)
+        assert all(state.outcome == "success" for state in states)
+        assert len(calls) == 6, "no run should have needed a pre-start requeue"
+        assert mutex.killed == 0, "admission let more submits reach the fake mutex than it could hold"
+        assert mutex.max_concurrent <= mutex_width
+        assert seen["mctl-agents-implement"] == [IMPLEMENTATION_TASK_QUEUE] * 6
+
     async def test_a_pre_start_failure_is_requeued_without_an_attempt(self, env):
         """An implementer that never ran is resubmitted, and the loop then
         completes on the second submit. Two execution records, because
@@ -5599,9 +5720,14 @@ class TestImplementationAdmission:
         assert result.implement is not None and result.implement.succeeded
         assert len(calls) == 2
         assert [r.phase for r in records if r.agent == "implementer"] == ["Failed", "Succeeded"]
+        # #418: the durable record distinguishes the queued-and-killed
+        # attempt from the one that ran, and a success carries no reason.
+        assert [r.outcome for r in records if r.agent == "implementer"] == ["pre_start", "success"]
+        assert [r.pre_start_reason for r in records if r.agent == "implementer"] == ["unknown", ""]
         assert state.stage == "implementer"
         assert state.prestart_requeues == 1
         assert state.outcome == "success"
+        assert state.pre_start_reason is None
 
     async def test_pre_start_requeues_are_bounded(self, env):
         activities, calls, _records, investigate_ran = _admission_activities(
@@ -5619,6 +5745,9 @@ class TestImplementationAdmission:
         cause = excinfo.value.cause
         assert isinstance(cause, ApplicationError)
         assert cause.type == "ImplementationNotStarted"
+        # #418: an unreadable node graph (the fake's default) must render
+        # as "unknown" in the error, never as "unscheduled".
+        assert "unknown" in cause.message
 
     @pytest.mark.parametrize(
         ("result", "error_type"),
