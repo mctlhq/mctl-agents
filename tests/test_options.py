@@ -914,7 +914,7 @@ def test_build_implementer_agent_options_omits_the_guard_without_both_params(tmp
     neither = options.build_implementer_agent_options(tmp_path, "test-model")
     for built in (only_deadline, only_ledger, neither):
         matchers = (built.hooks or {}).get("PreToolUse") or []
-        callbacks = [h for m in matchers for h in m.hooks]
+        callbacks = [h for m in matchers for h in m.hooks if not isinstance(h, options._PolicyCheckpointHook)]
         assert callbacks == [options._audit_pre_tool_use]
 
 
@@ -1079,7 +1079,8 @@ def test_deadline_guard_composes_with_the_ci_log_guard_and_the_audit_hook(tmp_pa
     callbacks = [h for m in matchers for h in m.hooks]
     assert options._audit_pre_tool_use in callbacks
     assert options._ci_log_guard_hook in callbacks
-    assert len(callbacks) == 3  # audit + ci-log + deadline
+    assert sum(isinstance(h, options._PolicyCheckpointHook) for h in callbacks) == 1
+    assert len(callbacks) == 4  # audit + ci-log + deadline + policy checkpoint (#197)
 
 
 def _os_bound_seconds(rendered: str) -> float:

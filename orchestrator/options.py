@@ -3,6 +3,7 @@ import math
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -871,6 +872,55 @@ def _deadline_guard_hooks(
     }
 
 
+@dataclass(frozen=True)
+class _PolicyCheckpointHook:
+    """PreToolUse hook that puts every MCP tool call through the runtime
+    policy checkpoint (mctlhq/mctl-agents#197,
+    docs/adr/014-policy-checkpoint.md) — the last point in mctl-agents
+    before the call leaves for the MCP server.
+
+    A frozen dataclass rather than a closure so two builders resolving the
+    same grants still compare `==` (see `_audit_pre_tool_use`'s docstring).
+    Fails closed: any exception inside the hook is a deny, never a pass.
+    """
+
+    grants: tuple[str, ...]
+
+    async def __call__(self, input_data: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+        from orchestrator import policy_checkpoint
+
+        try:
+            if not isinstance(input_data, dict):
+                return _deny("policy checkpoint: unreadable tool call")
+            tool_name = str(input_data.get("tool_name") or "")
+            tool_input = input_data.get("tool_input")
+            decision = policy_checkpoint.checkpoint(
+                policy_checkpoint.MCP_TOOL_CALL,
+                tool_name,
+                tool_name.split("__")[1] if tool_name.count("__") >= 2 else "",
+                tool_input if tool_input is not None else {},
+                grants=self.grants,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail closed
+            return _deny(f"policy checkpoint failed ({type(exc).__name__}); the call was not made")
+        if decision.permitted:
+            return {}
+        return _deny(
+            f"policy {decision.verdict} ({decision.code}, rule {decision.rule_id or '-'}, "
+            f"policy {decision.policy_version}): {decision.reason}"
+        )
+
+
+def _policy_hooks(allowed_tools: list[str]) -> dict[HookEventName, list[HookMatcher]]:
+    """Every MCP tool call, whatever the server, meets the checkpoint; the
+    builder's own allow-list is the grant set it evaluates against."""
+    return {
+        "PreToolUse": [
+            HookMatcher(matcher="mcp__.*", hooks=[cast(Any, _PolicyCheckpointHook(tuple(allowed_tools)))]),
+        ],
+    }
+
+
 def _compose_hooks(
     *hook_maps: dict[HookEventName, list[HookMatcher]],
 ) -> dict[HookEventName, list[HookMatcher]]:
@@ -902,16 +952,17 @@ def _sibling_add_dirs(service_name: str) -> list[str | Path]:
 
 def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOptions:
     """Options for a service-owner agent."""
+    allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
     return ClaudeAgentOptions(
         cwd=str(service_dir),                  # CLAUDE.md, .claude/, inbox/, proposals/
         setting_sources=["project"],           # pick up .claude/skills and .claude/agents
         model=model,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()],
+        allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",         # non-interactive — meant for cron
         max_budget_usd=SERVICE_AGENT_BUDGET_USD,
         add_dirs=_sibling_add_dirs(service_dir.name),
-        hooks=_command_audit_hooks(),
+        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
         # Extend (NOT replace) parent env — child needs HOME for the Claude
         # credentials lookup, and PATH for `git`/`gh`/`node`/`npm`, which the
         # Bash tool shells out to. The Claude Code CLI itself doesn't need
@@ -974,22 +1025,26 @@ def build_implementer_agent_options(
                 deadline_monotonic, budget_ledger, timeout_available=timeout_available,
             ),
         )
+    allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()],
+        allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
         env=env,
-        hooks=hooks,
+        hooks=_compose_hooks(hooks, _policy_hooks(allowed_tools)),
     )
 
 
 def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
     """Options for the mentor. Read-only across agent repos, writes only to digest/."""
+    # No hooks, so no policy checkpoint either (#197): any hook makes the
+    # mentor drainable (mctl-agents#366/#368), which is its own decision.
+    # Its MCP calls stay ungoverned until that is taken — ADR 014.
     return ClaudeAgentOptions(
         cwd=str(mentor_dir.parent),            # .../agents — so the mentor sees every agent
         setting_sources=["project"],
@@ -1037,7 +1092,7 @@ def build_incident_responder_options(
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
-        hooks=_command_audit_hooks(),
+        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(["Read", "Write", "Glob", *_mctl_tool_globs()])),
     )
 
 
@@ -1062,17 +1117,18 @@ def build_issue_investigator_options(
     the Python wrapper already does the issue read + clone + comment.
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
+    allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
     return ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=model,
-        allowed_tools=["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()],
+        allowed_tools=allowed_tools,
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
         add_dirs=[str(proposal_dir)],
         env=env,
-        hooks=_command_audit_hooks(),
+        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
     )
 
 
@@ -1132,7 +1188,7 @@ def build_issue_investigator_options_from_plan(
         max_budget_usd=plan.budget_usd,
         add_dirs=[str(proposal_dir)],
         env=env,
-        hooks=_command_audit_hooks(),
+        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
     )
 
 

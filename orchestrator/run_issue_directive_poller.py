@@ -66,6 +66,7 @@ from dataclasses import dataclass
 
 import httpx
 
+from orchestrator import policy_checkpoint
 from orchestrator.directives import (
     VERBS,
     Directive,
@@ -308,6 +309,15 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
     so nothing could have started and the caller's normal retry is safe.
     """
     params = {"issue_url": issue_url}
+    # The policy checkpoint (#197) sits immediately before the POST: a
+    # refusal raises PolicyRefused before any request leaves this process.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.MCTL_OPERATION_EXECUTE,
+        f"execute:{INVESTIGATE_OPERATION}",
+        INVESTIGATE_OPERATION,
+        params,
+        metadata={"issue_url": issue_url},
+    ))
     async with httpx.AsyncClient(base_url=MCTL_API_BASE_URL, timeout=_SUBMIT_TIMEOUT_SECONDS) as client:
         try:
             response = await client.post(
@@ -335,6 +345,11 @@ async def submit_investigate(issue_url: str, slug: str, requested_by: str) -> st
 
 
 def _post_reply(issue_url: str, body: str) -> None:
+    # Governed by the policy checkpoint (#197): on refusal PolicyRefused is
+    # raised and `gh` never runs. The body is recorded only as a digest.
+    policy_checkpoint.require(policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_ISSUE_COMMENT, "comment", issue_url, {"body": body},
+    ))
     _run(["gh", "issue", "comment", issue_url, "--body", body])
 
 
@@ -518,6 +533,15 @@ def _reply_dispatch_marker_write_failed(author: str, error: Exception) -> str:
     )
 
 
+def _reply_policy_refused(author: str, decision: policy_checkpoint.Decision) -> str:
+    return (
+        f"@{author} the re-investigation was not dispatched: the runtime policy checkpoint "
+        f"answered `{decision.verdict}` (`{decision.code}`, rule `{decision.rule_id or '-'}`, "
+        f"policy `{decision.policy_version}`). Nothing was submitted, and this directive will not "
+        "be retried automatically."
+    )
+
+
 def _reply_dispatch_ambiguous(author: str, error: Exception) -> str:
     # Carries the ack trailer immediately, on the FIRST ambiguous outcome —
     # unlike `_reply_dispatch_failed`, there is no retry budget to spend
@@ -645,6 +669,16 @@ async def _handle_directive(
     if outcome == "dispatch":
         try:
             workflow_name = await submit_investigate(issue_url, ref.slug, directive.author)
+        except policy_checkpoint.PolicyRefused as e:
+            # Nothing was sent. A policy refusal is an answer, not a
+            # transient failure: acked at once, never retried by this path.
+            print(f"POLICY: dispatch for directive comment {directive.comment_id} ({issue_url}) refused: {e}")
+            await asyncio.to_thread(
+                _post_reply_with_retries,
+                issue_url,
+                _with_ack(_reply_policy_refused(directive.author, e.decision), directive.comment_id),
+            )
+            return "policy-refused"
         except DispatchOutcomeAmbiguous as e:
             # mctl-api may already have started the workflow — resubmitting
             # blindly on a later tick would duplicate a real, paid Argo run,
@@ -947,13 +981,19 @@ async def scan(dry_run: bool = False, max_directives: int = DEFAULT_MAX_DIRECTIV
             print(f"FAIL: could not reply on {issue_url}: {e.stderr or e}")
             failed += 1
             continue
+        except policy_checkpoint.PolicyRefused as e:
+            # A refused reply leaves the comment unacked; it is decided again
+            # (and recorded again) on the next tick.
+            print(f"FAIL: reply on {issue_url} refused by policy: {e}")
+            failed += 1
+            continue
 
         if dry_run:
             continue
         if outcome == "dispatched":
             dispatched += 1
             replied += 1
-        elif outcome in ("dispatch-failed", "dispatch-ambiguous"):
+        elif outcome in ("dispatch-failed", "dispatch-ambiguous", "policy-refused"):
             failed += 1
         else:
             replied += 1
