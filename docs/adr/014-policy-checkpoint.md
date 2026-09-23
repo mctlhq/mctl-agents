@@ -246,5 +246,10 @@ includes it.
 The durable approval store (§6) changes nothing until
 `MCTL_POLICY_APPROVALS=mctl-api` is set. With it set, every checkpoint on a
 REQUIRE_APPROVAL action makes up to two calls to mctl-api (find-or-create,
-then consume) on its write budget. The checkpoint is synchronous, so the MCP
-hook blocks for up to the client timeout (10s per call) while it waits.
+then consume) on its write budget. The client timeout is 10s per call, so a
+single gated checkpoint can wait up to ~20s in the worst case. The checkpoint
+itself is synchronous; the MCP `PreToolUse` hook runs it in a worker thread,
+so that wait holds only the tool call being checked, not the agent SDK's
+event loop. A 401 or an untyped 403 from mctl-api (a rotated `MCTL_TOKEN`, a
+principal without the approval scope) is `approval_lookup_error` — undecided,
+like an outage — not `approval_refused`.

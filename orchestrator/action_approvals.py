@@ -11,7 +11,8 @@ mctl-agents side:
   to perform and compares it with the one the human approved.
 - `ActionApprovalClient` talks to the create / get / consume routes and
   classifies every answer into a typed status. Transport errors, 5xx, 408,
-  429 and malformed answers are UNKNOWN; typed 4xx codes keep their meaning.
+  429, 401, an untyped 403 and malformed answers are UNKNOWN; typed 4xx
+  codes keep their meaning.
 - `MctlApiApprovals` is the `policy_checkpoint.ApprovalLookup` backed by it.
   It answers GRANTED only after it has consumed, in the same call, an
   approved and unexpired receipt whose stored intent hash equals the freshly
@@ -207,7 +208,9 @@ def _record_of(payload: dict[str, Any]) -> ApprovalRecord | None:
     rid, state, digest, expires = raw.get("id"), raw.get("state"), raw.get("intent_hash"), raw.get("expires_at")
     if not (isinstance(rid, str) and rid.startswith(ID_PREFIX) and len(rid) > len(ID_PREFIX)):
         return None
-    if state not in _STATES or not isinstance(digest, str) or not digest.startswith("sha256:"):
+    if not isinstance(state, str) or state not in _STATES:  # an unhashable state must not raise
+        return None
+    if not isinstance(digest, str) or not digest.startswith("sha256:"):
         return None
     if not isinstance(expires, str):
         return None
@@ -224,6 +227,11 @@ def _refusal(status: int, payload: dict[str, Any]) -> ApprovalAnswer:
     typed = _CODES.get(code)
     if typed is not None and ((status == 404) == (typed == NOT_FOUND)):
         return ApprovalAnswer(typed, code=code, reason=reason)
+    if status == 401 or (status == 403 and not code.startswith("approval_")):
+        # This process cannot talk to the store (a rotated MCTL_TOKEN, a
+        # principal without the approval scope): an infrastructure fault,
+        # not the store's answer about this action.
+        return ApprovalAnswer(UNKNOWN, code=code, reason=reason)
     return ApprovalAnswer(REFUSED, code=code, reason=reason)
 
 

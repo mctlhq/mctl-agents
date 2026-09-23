@@ -7,6 +7,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import httpx
@@ -271,6 +272,36 @@ def test_the_mcp_hook_fails_closed_when_the_checkpoint_breaks(monkeypatch):
     monkeypatch.setattr(pc, "checkpoint", _boom)
     answer = _hook_answer(options._PolicyCheckpointHook(GRANTS), READ, {})
     assert _is_deny(answer) and "not made" in answer["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_the_mcp_hook_does_not_block_the_event_loop(monkeypatch):
+    """With the durable store enabled the checkpoint makes blocking HTTP
+    calls; they must wait in a worker thread, not on the SDK's event loop.
+    The fake checkpoint blocks until another task on the loop runs: on the
+    loop thread that task can never run and the wait times out."""
+    loop_ran = threading.Event()
+    waited: list[bool] = []
+    real = pc.checkpoint
+
+    def _blocking_checkpoint(*a, **k):
+        waited.append(loop_ran.wait(timeout=5))
+        return real(*a, **k)
+
+    monkeypatch.setattr(pc, "checkpoint", _blocking_checkpoint)
+
+    async def _other_task() -> None:
+        await asyncio.sleep(0)
+        loop_ran.set()
+
+    async def _both() -> dict:
+        answer, _ = await asyncio.gather(
+            options._PolicyCheckpointHook(GRANTS)({"tool_name": READ, "tool_input": {}}, "tu-1", None),
+            _other_task(),
+        )
+        return answer
+
+    assert asyncio.run(_both()) == {}
+    assert waited == [True]
 
 
 def test_every_builder_with_mcp_installs_the_hook_on_every_mcp_call(tmp_path, monkeypatch):

@@ -377,7 +377,10 @@ def _raise_transport(req: Any) -> Any:
     _raise_transport,
     lambda req: _Resp(b"not json", 200),
     lambda req: _Resp({"schema_version": "actionapproval/v1", "approval": {"id": "aar_x"}}, 200),
-], ids=["consumed", "mismatch", "503", "429", "transport", "malformed", "incomplete"])
+    lambda req: _Resp({"schema_version": "actionapproval/v1", "approval": {
+        "id": "aar_x", "state": [], "intent_hash": "sha256:x", "expires_at": "2099-01-01T00:00:00+00:00"}}, 200),
+    lambda req: FakeMctlApi._err(401, "unauthorized"),
+], ids=["consumed", "mismatch", "503", "429", "transport", "malformed", "incomplete", "state-wrong-type", "401"])
 def test_a_refused_or_uncertain_consume_does_not_run_the_side_effect(api, clock, consume):
     lookup = _lookup(api, clock)
     _approved(api, lookup)
@@ -435,6 +438,20 @@ def test_without_an_execution_identity_no_request_is_made(api, clock, monkeypatc
     assert api.calls == []
 
 
+@pytest.mark.parametrize("state", [[], {}, 1, None, "approved "])
+def test_a_wrong_typed_state_is_malformed_not_an_exception(state):
+    payload = {"schema_version": "actionapproval/v1", "approval": {
+        "id": "aar_x", "state": state, "intent_hash": "sha256:x", "expires_at": "2099-01-01T00:00:00+00:00"}}
+    assert aa._record_of(payload) is None
+
+
+def test_a_rotated_token_is_undecided_not_a_policy_answer(api, clock):
+    lookup = _lookup(api, clock)
+    api.override["create"] = lambda req: FakeMctlApi._err(401, "unauthorized")
+    d = _deploy(lookup, ARGS)
+    assert (d.verdict, d.code, d.permitted, d.undecided) == (pc.DENY, pc.CODE_APPROVAL_LOOKUP_ERROR, False, True)
+
+
 def test_client_classifies_typed_codes():
     cases = {
         (409, "approval_not_approved"): aa.PENDING,
@@ -445,7 +462,12 @@ def test_client_classifies_typed_codes():
         (404, "approval_not_found"): aa.NOT_FOUND,
         (409, "approval_idempotency_conflict"): aa.REFUSED,
         (403, "approval_requester_forbidden"): aa.REFUSED,
-        (401, ""): aa.REFUSED,
+        (403, "approval_reader_forbidden"): aa.REFUSED,
+        (401, ""): aa.UNKNOWN,  # a rotated MCTL_TOKEN is a fault, not an answer
+        (401, "unauthorized"): aa.UNKNOWN,
+        (403, ""): aa.UNKNOWN,  # a principal without the scope, likewise
+        (403, "forbidden"): aa.UNKNOWN,
+        (400, "invalid_request"): aa.REFUSED,
         (503, "work_items_unavailable"): aa.UNKNOWN,
         (502, ""): aa.UNKNOWN,
         (429, ""): aa.UNKNOWN,
@@ -477,6 +499,28 @@ def test_default_config_is_no_approvals_and_makes_no_http(monkeypatch):
     d = pc.checkpoint(pc.MCP_TOOL_CALL, DEPLOY, "mctl", ARGS, grants=GRANTS)
     assert (d.verdict, d.code, d.permitted) == (pc.REQUIRE_APPROVAL, pc.CODE_APPROVAL_REQUIRED, False)
     assert sent == []
+
+
+@pytest.mark.parametrize("ttl,want", [
+    (None, aa.DEFAULT_TTL_S), ("", aa.DEFAULT_TTL_S), ("nonsense", aa.DEFAULT_TTL_S), ("1.5", aa.DEFAULT_TTL_S),
+    ("1", aa.MIN_TTL_S), ("-5", aa.MIN_TTL_S), ("3600", 3600),
+    (str(7 * 24 * 3600), aa.MAX_TTL_S), ("999999999", aa.MAX_TTL_S),
+])
+def test_the_ttl_env_var_is_parsed_and_clamped(monkeypatch, ttl, want):
+    if ttl is None:
+        monkeypatch.delenv(aa.TTL_ENV, raising=False)
+    else:
+        monkeypatch.setenv(aa.TTL_ENV, ttl)
+    assert aa._ttl_s() == want
+
+
+def test_an_over_cap_ttl_still_opens_a_request(api, clock, monkeypatch):
+    """mctl-api refuses a window over 7 days with a 400; the clamp keeps an
+    over-large TTL from turning every gated action into approval_refused."""
+    monkeypatch.setenv(aa.TTL_ENV, str(30 * 24 * 3600))
+    d = _deploy(_lookup(api, clock), ARGS)
+    assert (d.code, d.permitted) == (pc.CODE_APPROVAL_PENDING, False)
+    assert api.only()["state"] == "pending"
 
 
 def test_the_env_var_selects_the_store(monkeypatch):
