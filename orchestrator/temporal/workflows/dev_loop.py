@@ -264,6 +264,21 @@ DISPATCHED_ADVANCE_RETRY_POLICY = RetryPolicy(
     maximum_interval=timedelta(minutes=10),
     maximum_attempts=10,
 )
+# The same re-attempt right before a HUMAN-INPUT park, deliberately short
+# (about two minutes at worst: 4 attempts, 2 s doubling to a 15 s cap, each
+# bounded by FAST_ACTIVITY_TIMEOUT). The request that park waits on is not
+# read until `_await_human_input` runs, so its TTL is unknown here, and
+# `human_input` bounds a TTL only from above (MAX_REQUEST_TTL_SECONDS, 7
+# days): any `expires_at` after `created_at` is valid, so no minimum makes an
+# hour-long attempt safe. The default TTL is a day, so two minutes costs the
+# person answering nothing in practice; a pending advance is tried again
+# before every later park, patiently before the approval park.
+DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=2),
+    backoff_coefficient=2.0,
+    maximum_interval=timedelta(seconds=15),
+    maximum_attempts=4,
+)
 #: The patch id guarding the dispatched path. Consulted only for a loop
 #: whose start input carries an execution request, so no other history
 #: records it.
@@ -1947,14 +1962,34 @@ class DevLoopWorkflow:
         that gap (`dispatcher._reconcile_closed_loops`)."""
         await self._advance_dispatched_execution("Failed")
 
-    async def _advance_dispatched_execution(self, phase: str, *, patient: bool = False) -> bool:
+    async def _land_pending_advance(self, pending: str, *, before: str) -> str:
+        """Re-attempt a dispatched execution's advance that has not landed
+        yet, right before a park that holds this loop RUNNING — the one state
+        the dispatcher's reconciliation must not touch. Returns what is still
+        pending ("" once it landed). No-op, and no command, when nothing is
+        pending: always so for an undispatched loop and on the path where
+        the first advance landed.
+
+        `before` is "approval" (patient: that park lasts days and has no
+        deadline of its own to protect) or "human-input" (brief: see
+        DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY)."""
+        if not pending:
+            return ""
+        policy = DISPATCHED_ADVANCE_RETRY_POLICY if before == "approval" else DISPATCHED_ADVANCE_BRIEF_RETRY_POLICY
+        landed = await self._advance_dispatched_execution(pending, retry_policy=policy)
+        return "" if landed else pending
+
+    async def _advance_dispatched_execution(
+        self, phase: str, *, retry_policy: RetryPolicy = FAST_ACTIVITY_RETRY_POLICY
+    ) -> bool:
         """Best effort, like `_record`: a store that will not take the phase
         must not fail the loop. But an execution left non-terminal blocks
         EVERY later request for the item, not only a resume: mctl-api's
         attach rule refuses any new non-terminal execution while one is
         (`execution_active`). The dispatcher reconciles one it can prove
         dead (`dispatcher._reconcile_closed_loops`), but not one whose loop
-        is still RUNNING: hence `patient` on the success path.
+        is still RUNNING: hence the patient policy on the success path, and
+        `_land_pending_advance` before every park.
 
         True when the store answered (the phase landed, or a definite
         refusal that no retry would change); False when every attempt failed
@@ -1964,7 +1999,7 @@ class DevLoopWorkflow:
                 advance_dispatched_execution,
                 AdvanceInput(work_item_id=self._work_item_id, engine_ref=workflow.info().workflow_id, phase=phase),
                 start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-                retry_policy=DISPATCHED_ADVANCE_RETRY_POLICY if patient else FAST_ACTIVITY_RETRY_POLICY,
+                retry_policy=retry_policy,
             )
             workflow.logger.info("dispatched execution -> %s: %s", phase, outcome)
             return True
@@ -2085,7 +2120,8 @@ class DevLoopWorkflow:
             # here, whatever the loop does next, so the item's one
             # non-terminal slot is free again for a later request.
             advance_phase = "Succeeded" if investigate_result.succeeded else "Failed"
-            if not await self._advance_dispatched_execution(advance_phase, patient=investigate_result.succeeded):
+            policy = DISPATCHED_ADVANCE_RETRY_POLICY if investigate_result.succeeded else FAST_ACTIVITY_RETRY_POLICY
+            if not await self._advance_dispatched_execution(advance_phase, retry_policy=policy):
                 dispatched_advance_pending = advance_phase
 
         if not investigate_result.succeeded:
@@ -2117,6 +2153,11 @@ class DevLoopWorkflow:
                 retry_policy=SLUG_LOOKUP_RETRY_POLICY,
             )
             while input_slug:
+                # Every park, not only the approval one: a clarification wait
+                # also holds the loop RUNNING, for up to a request's TTL.
+                dispatched_advance_pending = await self._land_pending_advance(
+                    dispatched_advance_pending, before="human-input"
+                )
                 hi_outcome = await self._await_human_input(target_repo, input_slug)
                 if hi_outcome is None:
                     break
@@ -2186,13 +2227,10 @@ class DevLoopWorkflow:
         # from also observing `_abandoned`, which is not itself a new
         # command (see `abandon`'s docstring): a parked execution has no
         # history event to diverge from at this position.
-        if dispatched_advance_pending:
-            # The success-path advance never got an answer. Once more before
-            # the park, which may last days with the loop RUNNING — the one
-            # state the dispatcher's reconciliation must not touch. Still best
-            # effort: the loop's outcome does not depend on it. Dispatched
-            # loops only; an undispatched loop never gets here.
-            await self._advance_dispatched_execution(dispatched_advance_pending, patient=True)
+        # The success-path advance never got an answer (nor before any
+        # clarification park): once more, patiently, before the approval
+        # park, which may last days with the loop RUNNING. Still best effort.
+        dispatched_advance_pending = await self._land_pending_advance(dispatched_advance_pending, before="approval")
         approval_ended: str | None = None
         if workflow.patched("approval-watch"):
             approval_deadline = workflow.now() + APPROVAL_WAIT_DEADLINE

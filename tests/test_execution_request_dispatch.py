@@ -1122,3 +1122,39 @@ async def test_a_reject_that_finds_the_request_closed_reports_closed(api):
     outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
 
     assert outcome.action == dx.CLOSED and outcome.execution_id == "we_x"
+
+
+# -- review round 3 (PR #468) ------------------------------------------------
+#
+# P2: a pending advance is re-attempted before EVERY park, including the
+# human-input one.
+
+
+async def test_an_advance_that_outlasts_its_retries_lands_before_a_human_input_park(api, env):
+    from datetime import UTC, datetime
+
+    from tests.test_dev_loop_workflow import _request_json, _sealed_request
+
+    submit, seen = _investigate_log()
+    # More than the whole patient policy (10), fewer than it plus the brief
+    # pre-park attempt (4): only that attempt can land it.
+    api.unavailable_advances["Succeeded"] = 12
+    rid = api.create_request("start")
+    wid = dispatched_workflow_id(rid)
+    # The clarification this run's investigator sealed, for THIS loop.
+    request = _sealed_request(workflow_id=wid, created=datetime.now(UTC), ttl_seconds=7 * 24 * 3600)
+    async with _worker(env, submit, human_input_requests=[_request_json(request), None]):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        await env.sleep(timedelta(hours=3))
+        handle = env.client.get_workflow_handle(wid)
+        state = await handle.query(DevLoopWorkflow.human_input_state)
+        history = await handle.fetch_history()
+        await _end(env, wid)
+
+    # Parked on the clarification, and the execution already ended.
+    assert state.state == "WAITING_FOR_INPUT" and state.request_id == request.request_id
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Succeeded")]
+    assert len(seen) == 1 and _scheduled_advances(history) == 2
+    from temporalio.worker import Replayer
+
+    await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(history)

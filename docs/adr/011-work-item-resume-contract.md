@@ -258,8 +258,10 @@ fails a non-terminal execution whose engine ref is a dispatched loop id
 once Temporal reports that loop closed or no longer knows it (the
 `dev-loop-xr_` prefix proves the dispatcher started it), and touches
 nothing else. The success-path advance retries patiently (about an hour)
-and is re-attempted once before the approval park, because a still-RUNNING
-loop is the one case reconciliation must not touch. Only the
+and, if it still did not land, is re-attempted before every park that
+holds the loop RUNNING (briefly before a clarification wait, whose request
+TTL has no lower bound; patiently before the approval park), because a
+still-RUNNING loop is the one case reconciliation must not touch. Only the
 typed re-decisions `state_version_conflict` and `invalid_transition` reject
 a request at fulfil; anything else defers to a later claim. Human-input continuations run without it (their context differs,
 and one execution seals one snapshot).
