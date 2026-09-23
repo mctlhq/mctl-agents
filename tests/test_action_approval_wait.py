@@ -682,6 +682,35 @@ async def test_a_second_waiter_on_the_same_receipt_is_already_waiting(env, api):
     _single_use(api)
 
 
+@activity.defn(name="gated_comment")
+async def gated_comment(inp: GatedActionInput) -> GatedActionResult:
+    """An action the policy allows without an approval, whose side effect
+    raises: the first call acts at once and fails."""
+    WORLD["calls"].append(inp)
+
+    def _comment() -> dict[str, Any]:
+        raise RuntimeError("GitHub answered 502 on the comment")
+
+    return act.run_gated(inp, pc.GITHUB_ISSUE_COMMENT, "comment", "mctlhq/mctl-agents#198",
+                         {"body": "hello"}, _comment)
+
+
+async def test_a_side_effect_that_raises_on_the_first_call_keeps_its_error(env, api):
+    """No approval needed, so the first call runs the side effect, which
+    raises: the helper ends `effect_failed` without waiting, and the result
+    carries the side effect's own error, not the checkpoint's reason."""
+    async with _worker(env, activities=[gated_comment, read_action_approval]):
+        out = await env.client.execute_workflow(
+            ApprovalProbeWorkflow.run, ProbeInput(activity="gated_comment", action=_action()),
+            id=f"approval-probe-{uuid.uuid4()}", task_queue=TASK_QUEUE,
+        )
+    [result] = out.results
+    assert result.outcome == wf.OUTCOME_EFFECT_FAILED
+    assert "GitHub answered 502 on the comment" in result.reason
+    assert result.approval_id == "" and api.calls == []
+    assert len(WORLD["calls"]) == 1  # no wait, no retry
+
+
 async def test_approvals_off_by_default_never_wait(env, api, monkeypatch):
     monkeypatch.delenv(pc.APPROVALS_ENV)
     async with _worker(env):

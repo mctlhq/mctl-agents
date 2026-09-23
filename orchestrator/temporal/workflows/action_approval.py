@@ -189,6 +189,14 @@ def outcome_of(result: GatedActionResult) -> str | None:
     return _TERMINAL_CODES.get(result.code, OUTCOME_BLOCKED)
 
 
+def reason_of(result: GatedActionResult) -> str:
+    """The reason an ApprovalWaitResult reports for `result`: the side
+    effect's own error when it raised, else the checkpoint's reason. Every
+    place that turns a GatedActionResult into an ApprovalWaitResult uses
+    this, so an `effect_failed` outcome never loses its error."""
+    return result.effect_error or result.reason
+
+
 @dataclass(frozen=True)
 class ApprovalWaitInput:
     approval_id: str
@@ -347,7 +355,7 @@ class ActionApprovalWaitWorkflow:
         return ApprovalWaitResult(
             outcome=outcome, approval_id=inp.approval_id, attempt=self._attempt, code=self._last_code,
             result=result.result if result is not None and result.ran else None,
-            reason=(result.effect_error or result.reason) if result is not None else "",
+            reason=reason_of(result) if result is not None else "",
             signal_wakes=self._signal_wakes, poll_wakes=self._poll_wakes, rechecks=self._rechecks,
         )
 
@@ -444,7 +452,7 @@ async def run_gated_action(
         outcome = outcome_of(first) or OUTCOME_UNDECIDED
         return ApprovalWaitResult(
             outcome=outcome, approval_id=first.approval_ref, attempt=action.attempt, code=first.code,
-            result=first.result if first.ran else None, reason=first.reason,
+            result=first.result if first.ran else None, reason=reason_of(first),
         )
     wait = ApprovalWaitInput(
         approval_id=first.approval_ref, activity=activity, action=replace(action, approval_ref=""),
@@ -465,8 +473,9 @@ async def run_gated_action(
 
 
 def next_attempt(previous: ApprovalWaitResult, action: GatedActionInput) -> GatedActionInput:
-    """The input for a deliberate re-request after `previous` ended denied,
-    expired or timed out: the next `attempt`, and no receipt. The new
+    """The input for a deliberate re-request after `previous` ended in a
+    re-requestable outcome (denied, expired, timed out, or effect_failed:
+    see REREQUESTABLE): the next `attempt`, and no receipt. The new
     attempt opens a new request that needs a new human decision; nothing
     decided for `previous` carries over."""
     if previous.outcome not in REREQUESTABLE:
@@ -484,5 +493,6 @@ __all__ = [
     "approval_workflow_id",
     "next_attempt",
     "outcome_of",
+    "reason_of",
     "run_gated_action",
 ]

@@ -304,10 +304,10 @@ A workflow never holds a pod while it waits.
   errors. A worker that dies between the consume and the effect reports
   nothing, and the retry ends `consumed`, which is not re-requestable.
 - **Re-request.** `next_attempt()` accepts only `denied`, `expired`,
-  `timed_out` and `effect_failed`, and returns the input with `attempt + 1` and no receipt.
-  `MctlApiApprovals(attempt=N)` puts the attempt in the idempotency key, so
-  the new attempt is a new request that needs a new human decision; the
-  intent hash is unchanged.
+  `timed_out` and `effect_failed`, and returns the input with
+  `attempt + 1` and no receipt. `MctlApiApprovals(attempt=N)` puts the
+  attempt in the idempotency key, so the new attempt is a new request that
+  needs a new human decision; the intent hash is unchanged.
 - **Not built.** The mctl-api side of the signal (it signals nothing yet:
   the poll alone makes the wait work, at up to `poll_seconds` of latency),
   and the approval surfaces for humans.
@@ -316,10 +316,11 @@ A workflow never holds a pod while it waits.
 
 1. **The approval wait (#198).** The Temporal wait is built (§7). The
    signal from mctl-api, the approval surfaces (UI, Telegram, GitHub) and a
-   first step that adopts `run_gated_action` are not. Until gitops sets `MCTL_POLICY_APPROVALS=mctl-api`,
-   REQUIRE_APPROVAL keeps blocking. Once it is set, an agent's gated MCP call
-   is refused with `approval_pending` and the request id, and a later
-   identical call in the same execution succeeds once a human has approved.
+   first step that adopts `run_gated_action` are not. Until gitops sets
+   `MCTL_POLICY_APPROVALS=mctl-api`, REQUIRE_APPROVAL keeps blocking. Once
+   it is set, an agent's gated MCP call is refused with `approval_pending`
+   and the request id, and a later identical call in the same execution
+   succeeds once a human has approved.
 2. **The mentor.** It has MCP tools but no hooks, and adding any hook makes it
    drainable (#366/#368). Until that is decided separately, its MCP calls are
    not governed.
