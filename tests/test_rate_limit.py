@@ -160,3 +160,9 @@ def test_account_label_is_unknown_for_an_unnamed_or_cli_auth(monkeypatch, env_va
     monkeypatch.setattr(auth, "detect_auth", lambda: types.SimpleNamespace(env_var=env_var))
 
     assert rate_limit.account_label() == "unknown"
+
+
+def test_an_out_of_range_reset_epoch_degrades_to_unknown() -> None:
+    info = types.SimpleNamespace(resets_at=1_789_509_600_000_000, rate_limit_type="seven_day")
+    observation = rate_limit.build_observation(info, detail="d")
+    assert observation.resets_at is None

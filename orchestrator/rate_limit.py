@@ -68,12 +68,18 @@ def _epoch_to_iso(epoch: int | None) -> str | None:
     formatting convention (no microseconds, ``Z`` suffix)."""
     if epoch is None:
         return None
-    return (
-        datetime.fromtimestamp(epoch, tz=UTC)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    # Runs inside the 429 handler: an out-of-range value (e.g. a
+    # millisecond-scaled `resets_at`) must degrade to "unknown reset", never
+    # raise into the generic unexpected-error arm.
+    try:
+        return (
+            datetime.fromtimestamp(epoch, tz=UTC)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def is_rate_limit_result(message: object) -> bool:
