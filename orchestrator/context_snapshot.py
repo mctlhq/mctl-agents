@@ -57,6 +57,12 @@ SOURCE_KINDS = frozenset({
     "loki-logs",
     "incident",
     "inline-template",
+    # Added for the durable human-clarification primitive (mctl-agents#333,
+    # ADR 011): the human's answer, recorded at trust.tier="reported"
+    # (ADR 011 sec. "Snapshot linkage"). Additive within
+    # context.mctl.ai/v1alpha1 — no field change, from_dict still rejects
+    # unknown keys.
+    "human-input-response",
 })
 RETENTION_CLASSES = frozenset({"telemetry", "execution-record", "gitops"})
 

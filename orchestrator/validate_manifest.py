@@ -93,6 +93,16 @@ _AGENT_BY_CATALOG_PROFILE = {
 # real token or in CI with none.
 _DUMMY_MCTL_TOKEN = "validate-manifest-dummy-token"  # noqa: S105 - not a real credential
 
+# Capability entries that may appear in a manifest's/catalog profile's
+# `tools`/`spec.tools` list without being a literal SDK tool name (mctl-
+# agents#333, ADR 013). options.py's builders filter these out of
+# allowed_tools (see HUMAN_INPUT_CAPABILITY there), so a profile that grants
+# one would otherwise make the two set-equality checks below go red the
+# moment mctl-gitops#1277 adds it — this subtraction is what keeps a real
+# tool-list drift red while excusing exactly this one, forward-declared,
+# non-tool entry.
+_CAPABILITY_TOOLS = frozenset({"human.request_input"})
+
 # None of the build_*_options() functions touch the filesystem at
 # construction time (verified by reading orchestrator/options.py: cwd/add_dirs
 # are stored, not stat'd, except a sibling-repo existence check that safely
@@ -348,8 +358,8 @@ def _check_tool_policy_and_budget_match_options_py(manifest: AgentManifest) -> l
                 os.environ["MCTL_TOKEN"] = previous_token
 
         errors: list[str] = []
-        actual_tools = set(options.allowed_tools or [])
-        declared_tools = set(manifest.tool_allow)
+        actual_tools = set(options.allowed_tools or []) - _CAPABILITY_TOOLS
+        declared_tools = set(manifest.tool_allow) - _CAPABILITY_TOOLS
         if actual_tools != declared_tools:
             errors.append(
                 f"toolPolicy.allow {sorted(declared_tools)} does not match "
@@ -607,7 +617,8 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
             else:
                 os.environ["MCTL_TOKEN"] = previous_token
 
-        actual = set(options.allowed_tools or [])
+        actual = set(options.allowed_tools or []) - _CAPABILITY_TOOLS
+        declared_tools = declared_tools - _CAPABILITY_TOOLS
         if actual != declared_tools:
             errors.append(
                 f"{profile_name}: spec.tools {sorted(declared_tools)} does not match "

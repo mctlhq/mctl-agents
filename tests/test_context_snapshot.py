@@ -391,6 +391,21 @@ def test_validate_rejects_unknown_retention_class():
         bad_snapshot.validate()
 
 
+@pytest.mark.parametrize("value", sorted(cs.SOURCE_KINDS))
+def test_every_documented_source_kind_is_accepted(value):
+    # "human-input-response" (mctl-agents#333, ADR 011) extended this set
+    # additively — this parametrization is what keeps the extension covered
+    # by T7 rather than only by a standalone assertion.
+    snapshot = _minimal_snapshot(
+        sources=[_source(kind=value)], budget=_budget(used_sources=1, used_bytes=100)
+    )
+    snapshot.validate()
+
+
+def test_human_input_response_is_in_the_closed_source_kind_set():
+    assert "human-input-response" in cs.SOURCE_KINDS
+
+
 @pytest.mark.parametrize("value", sorted(cs.FRESHNESS_VALUES))
 def test_every_documented_freshness_value_is_accepted(value):
     freshness = cs.Freshness.from_dict({"observed_at": "2026-09-11T00:00:00Z", "staleness": value})

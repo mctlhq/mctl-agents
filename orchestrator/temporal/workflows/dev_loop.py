@@ -42,8 +42,10 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -56,6 +58,7 @@ from temporalio.exceptions import (
 )
 
 with workflow.unsafe.imports_passed_through():
+    from orchestrator import human_input
     from orchestrator.lifecycle.contract import (
         OWNED_BY_OTHER,
         UNKNOWN,
@@ -71,6 +74,7 @@ with workflow.unsafe.imports_passed_through():
         get_release_after,
         resolve_deploy_target,
     )
+    from orchestrator.temporal.activities.human_input import find_human_input_request
     from orchestrator.temporal.activities.incidents import (
         Incident,
         IncidentQueryResult,
@@ -103,6 +107,30 @@ with workflow.unsafe.imports_passed_through():
     )
 
 ENVIRONMENT = "production"
+
+# Workflow-phase vocabulary (mctlhq/mctl-agents#333, ADR 013). Introduced
+# alongside the durable clarification wait — before this there was no
+# phase vocabulary at all; "WAITING_FOR_APPROVAL" merely NAMES the existing
+# `wait_condition(lambda: self._approved)` below so the two durable gates
+# are distinguishable by construction, not just by comment.
+RUNNING = "RUNNING"
+WAITING_FOR_APPROVAL = "WAITING_FOR_APPROVAL"
+WAITING_FOR_INPUT = "WAITING_FOR_INPUT"
+INPUT_TIMED_OUT = "INPUT_TIMED_OUT"
+
+# Ceiling on queued-but-unvalidated `human_input_response` payloads. One
+# valid answer resolves a wait, so anything past a small burst is a
+# misbehaving surface, not a legitimate backlog — payloads beyond the cap
+# (or arriving while no wait is pending) are counted and dropped, mirroring
+# `resume`'s bounded-state invariant. Rejected payloads are pruned as they
+# are rejected, so only genuinely pending entries count toward the cap.
+HUMAN_INPUT_RESPONSE_QUEUE_LIMIT = 16
+
+# How much older than this execution's own start a request's `created_at`
+# may be before the request is retired as another execution's leftover.
+# Generous against clock skew between the sealing container and Temporal,
+# tiny against the hours-to-days age of a real leftover.
+HUMAN_INPUT_PRIOR_RUN_SLACK = timedelta(minutes=10)
 
 # The Argo CWFTs already retry within a run (second-OAuth-account fallback on
 # a 429/five_hour limit) — see activities/argo.py's module docstring. A
@@ -547,6 +575,61 @@ class LifecycleClaim:
 
 
 @dataclass(frozen=True)
+class HumanInputState:
+    """What `human_input_state` reports. Every field defaulted, so a loop
+    that never entered `WAITING_FOR_INPUT` (no grant, or none requested)
+    returns the all-empty/zero shape rather than None (mctlhq/mctl-
+    agents#333, ADR 013) — `mctl-api#261` and the portal can poll this
+    query unconditionally.
+
+    `state` is one of RUNNING / WAITING_FOR_INPUT / INPUT_TIMED_OUT and is
+    never equal to WAITING_FOR_APPROVAL — the two durable gates answer
+    different questions ("is this authorized?" vs. "what is the answer?")
+    and must stay distinguishable."""
+
+    state: str = RUNNING
+    request_id: str = ""
+    request_hash: str = ""
+    question_hash: str = ""
+    expires_at: str = ""
+    round: int = 0
+    resume_count: int = 0
+    # How many delivered payloads this execution rejected (invalid, dropped
+    # while not waiting, or over the queue cap) — the observable counterpart
+    # of `_human_input_rejected_count`, so a surface can see its answers are
+    # being refused instead of silently swallowed.
+    rejected_count: int = 0
+    # The deadline the wait ACTUALLY uses: `expires_at` bounded against the
+    # workflow clock at MAX_REQUEST_TTL_SECONDS. Differs from `expires_at`
+    # exactly when a model-written far-future timestamp was clamped, so a
+    # poller (and the clamp's test) can see the bound that is really in
+    # force.
+    effective_deadline: str = ""
+
+
+@dataclass(frozen=True)
+class HumanInputOutcome:
+    """What `_await_human_input` returns when a request was actually seen
+    (None means "no pending request, proceed exactly as today"). Carries
+    just enough to (a) resubmit the continuation step with a
+    `human_input_response` param and (b) record the outcome in
+    `DevLoopResult` — never the question or the raw surface transcript."""
+
+    outcome: str = ""  # "answered" | "timed_out" | "abandoned"
+    request_id: str = ""
+    request_hash: str = ""
+    # `Any`, not bare `object`: temporalio's value_to_type special-cases Any
+    # (returned as-is) but has no handler for object, so a recorded outcome
+    # would fail to decode on handle.result() / replay with object here.
+    value: Any = None
+    respondent: str = ""
+    surface: str = ""
+    received_at: str = ""
+    round: int = 0
+    resume_count: int = 0
+
+
+@dataclass(frozen=True)
 class ResumeRejection:
     """A `resume` signal this workflow declined to apply (mctlhq/mctl-
     agents#267). Recorded, never silent: a caller polling `work_context`
@@ -612,6 +695,11 @@ class DevLoopResult:
     # Stage 6.4 (ADR-006, #216): incidents raised against the deployed
     # service during the watch window. None when the stage did not run.
     incidents: IncidentWatch | None = None
+    # The durable clarification outcome (mctlhq/mctl-agents#333, ADR 013).
+    # None on histories predating the stage and whenever no request was ever
+    # seen (no capability grant, or the agent never asked). Defaulted so
+    # results recorded before this field existed still deserialize.
+    human_input: HumanInputOutcome | None = None
     # mctl-agents#420: why this execution ended, when it ended for a reason
     # other than running the pipeline to the end -- "abandoned: ...",
     # "source issue closed ..." (pre- or mid-approval-park), or "approval
@@ -1047,6 +1135,11 @@ class MergeWatchResume:
     approve: WorkflowResult | None = None
     implement_state: ImplementExecutionState = field(default_factory=ImplementExecutionState)
     approver: str | None = None
+    # The clarification round's recorded outcome (mctl-agents#333), a prior
+    # stage result like the three above: human input happens before the
+    # watch ever starts, so a hop that dropped it would erase the round
+    # from the final DevLoopResult.
+    human_input: HumanInputOutcome | None = None
 
     # --- Bookkeeping: how many times THIS watch has already hopped, so
     # MERGE_WATCH_MAX_HOPS bounds the whole watch, not just one run. ---
@@ -1112,6 +1205,19 @@ class DevLoopWorkflow:
         self._last_lifecycle_op = ""
         self._last_lifecycle_op_landed = False
         self._claim_abandoned = False
+        # Durable clarification (mctlhq/mctl-agents#333, ADR 013). Raw signal
+        # payloads, processed in delivery order inside _await_human_input —
+        # never touched by the signal handler itself, so `human_input_response`
+        # can never raise and never needs to know whether the payload it just
+        # received will turn out to be valid.
+        self._input_responses: list[object] = []
+        self._human_input_state = HumanInputState()
+        # question_hash values already answered in THIS execution, so a
+        # continuation step that re-asks (despite being told the ambiguity is
+        # resolved) is ignored rather than re-entering WAITING_FOR_INPUT.
+        self._resolved_question_hashes: set[str] = set()
+        self._human_input_resume_count = 0
+        self._human_input_rejected_count = 0
         # Work-context resume state (mctlhq/mctl-agents#267, ADR 011).
         self._work_item_id = ""
         self._executions: list[ExecutionRef] = []
@@ -1233,7 +1339,11 @@ class DevLoopWorkflow:
         )
 
     async def _await_reapproval(
-        self, investigate_result: WorkflowResult, *, approve: WorkflowResult | None = None
+        self,
+        investigate_result: WorkflowResult,
+        *,
+        approve: WorkflowResult | None = None,
+        human_input: HumanInputOutcome | None = None,
     ) -> DevLoopResult | None:
         """Park until a resume-cleared approval is re-granted — releasable
         and bounded, per #420's rule for every approval park in this
@@ -1258,6 +1368,7 @@ class DevLoopWorkflow:
                     investigate=investigate_result,
                     implement=None,
                     approve=approve,
+                    human_input=human_input,
                     ended="re-approval wait expired",
                 )
         if self._abandoned:
@@ -1265,6 +1376,7 @@ class DevLoopWorkflow:
                 investigate=investigate_result,
                 implement=None,
                 approve=approve,
+                human_input=human_input,
                 ended=f"abandoned: {self._abandon_reason}",
             )
         return None
@@ -1397,6 +1509,317 @@ class DevLoopWorkflow:
             self._resume_pending = True
 
     @workflow.signal
+    def human_input_response(self, *args: object) -> None:
+        """A candidate answer to the pending clarification request.
+
+        Signals must never raise (Temporal delivers them outside any
+        `try/except` the workflow author controls), so this only appends the
+        raw payload — validation (`human_input.validate_response`) happens
+        inside `_await_human_input`, where a rejection can be recorded and
+        answered for rather than crashing signal delivery. Deliberately
+        never touches `self._approved`: an answer is data with provenance,
+        never an authorization (ADR 013's "clarification is not approval"
+        invariant) — a value that reads as an approval, e.g. "use option B
+        and merge it", resumes THIS wait and nothing else.
+
+        Bounded like `resume` right above: a payload arriving while no wait
+        is pending, or beyond the queue cap, is counted and dropped — a
+        misbehaving surface re-delivering for days must not grow workflow
+        state without bound (claude P2 on #450).
+        """
+        for arg in args:
+            if (
+                self._human_input_state.state != WAITING_FOR_INPUT
+                or len(self._input_responses) >= HUMAN_INPUT_RESPONSE_QUEUE_LIMIT
+            ):
+                self._human_input_rejected_count += 1
+                continue
+            self._input_responses.append(arg)
+
+    @workflow.query
+    def human_input_state(self) -> HumanInputState:
+        """The pending (or last) clarification state, for mctl-api#261 and
+        the portal to poll without owning this workflow. Never equal to the
+        approval wait's state string — see HumanInputState's docstring."""
+        return self._human_input_state
+
+    async def _await_human_input(self, service: str, slug: str) -> HumanInputOutcome | None:
+        """Check for, and if present durably wait on, a pending
+        `HumanInputRequest` for this execution's proposal.
+
+        Returns None when there is nothing to wait on (no request written,
+        or the model re-asked an already-resolved question) — the caller
+        proceeds exactly as it does today. Returns a `HumanInputOutcome`
+        when the wait actually concluded (answered or timed out).
+
+        `find_human_input_request` is a plain GitHub contents-API read
+        (ADR 013's "Transport" open question): no Argo workflow, no Claude
+        Agent SDK session and no activity slot are held for any part of the
+        wait itself — only this activity call before it, and one more when a
+        continuation resubmits `mctl-agents-investigate`.
+        """
+        raw = await workflow.execute_activity(
+            find_human_input_request,
+            args=[service, slug],
+            start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+            retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+        )
+        if raw is None:
+            # `is None` deliberately: None is the activity's "no file"
+            # answer, while a zero-byte request.json is corruption and must
+            # fall through to the malformed guard below, not be skipped.
+            return None
+
+        try:
+            request = human_input.HumanInputRequest.from_dict(json.loads(raw))
+        except (ValueError, human_input.HumanInputError, TypeError) as exc:
+            # A corrupt request document is corruption in gitops main, not a
+            # transient condition — fail loudly rather than silently skip
+            # clarification (which would strand the agent's own instruction
+            # to wait for an answer) or wedge on an unparseable document
+            # forever.
+            raise ApplicationError(
+                f"malformed human-input request for {service}/{slug}: {exc}",
+                type="human_input_malformed",
+                non_retryable=True,
+            ) from exc
+
+        if request.question_hash in self._resolved_question_hashes:
+            # Already answered earlier in this execution; the agent re-asked
+            # despite being told the ambiguity is resolved. Ignore rather
+            # than re-enter WAITING_FOR_INPUT for a question with a known
+            # answer.
+            return None
+
+        # A request sealed by a DIFFERENT dev-loop execution is a leftover,
+        # not this run's question: `_resolved_question_hashes` is in-memory
+        # per-instance state, so without this check an answered-but-unexpired
+        # request.json from an earlier execution of the same issue would park
+        # a fresh execution on an already-answered question for the rest of
+        # its TTL (claude P2 on #450). Three discriminators, any one retires:
+        # a foreign workflow id (a different issue's document at this path),
+        # a stamped run id that is not this run's (the producer receives this
+        # run's id in investigate_params), and — the one that actually fires
+        # for same-issue re-runs, where `workflow_id_for` makes the workflow
+        # id IDENTICAL and today's producer stamps no run id — a `created_at`
+        # that predates this execution's own start. A request this run's
+        # investigator sealed cannot be older than the run; the slack absorbs
+        # clock skew between the sealing container and Temporal. `created_at`
+        # is not hash-covered, but a backdated forgery only retires itself.
+        info = workflow.info()
+        sealed_before_this_run = (
+            _as_utc(request.created_at)
+            < info.start_time.astimezone(UTC) - HUMAN_INPUT_PRIOR_RUN_SLACK
+        )
+        if (
+            request.execution.temporal_workflow_id != info.workflow_id
+            or (
+                request.execution.temporal_run_id is not None
+                and request.execution.temporal_run_id != info.run_id
+            )
+            or sealed_before_this_run
+        ):
+            workflow.logger.info(
+                "human_input.foreign_execution",
+                extra={"human_input": human_input.request_log_dict(request)},
+            )
+            return None
+
+        effective_deadline_iso = ""
+
+        def _state(state: str) -> HumanInputState:
+            return HumanInputState(
+                state=state,
+                request_id=request.request_id,
+                request_hash=request.request_hash,
+                question_hash=request.question_hash,
+                expires_at=request.expires_at,
+                round=request.round,
+                resume_count=self._human_input_resume_count,
+                rejected_count=self._human_input_rejected_count,
+                effective_deadline=effective_deadline_iso,
+            )
+
+        try:
+            expires_at = _as_utc(request.expires_at)
+        except (ValueError, TypeError) as exc:
+            # Same failure mode as the malformed-request guard above: an
+            # unhandled exception here is a workflow-task failure that
+            # Temporal retries forever on identical input, not a workflow
+            # failure — a wedged state machine rather than a loud error.
+            raise ApplicationError(
+                f"malformed expires_at for {service}/{slug}: {exc}",
+                type="human_input_malformed",
+                non_retryable=True,
+            ) from exc
+
+        if (expires_at - workflow.now()).total_seconds() <= 0:
+            # Already expired when READ, not watched expiring: a leftover
+            # request.json from an earlier execution that timed out. Treat it
+            # as no pending request rather than as a fresh timeout — a
+            # timed_out return here would end every later execution of the
+            # same issue instantly, forever (the file is never rewritten by a
+            # run that dies on reading it). If the re-run investigator still
+            # needs an answer it seals a fresh request with a fresh
+            # expires_at, overwriting this one; if it did not re-ask,
+            # proceeding is exactly right. No gitops write, replay-safe.
+            # Deliberately BEFORE the round guards below: an expired leftover
+            # whose round is exhausted must be retired, not turned into a
+            # permanent non-retryable failure for every later execution of
+            # the issue (claude P2 on #450).
+            self._human_input_state = _state(RUNNING)
+            workflow.logger.info(
+                "human_input.stale_expired",
+                extra={"human_input": human_input.request_log_dict(request)},
+            )
+            return None
+
+        if request.round > human_input.MAX_CLARIFICATION_ROUNDS:
+            raise ApplicationError(
+                f"clarification rounds exhausted for {service}/{slug}: "
+                f"round={request.round} > MAX_CLARIFICATION_ROUNDS="
+                f"{human_input.MAX_CLARIFICATION_ROUNDS}",
+                type="clarification_rounds_exhausted",
+                non_retryable=True,
+            )
+
+        # The real bound. `request.round` above is agent-written — a producer
+        # that always writes round=1 with a fresh question each time would
+        # never trip it. `_human_input_resume_count` is incremented by THIS
+        # workflow, once per accepted answer, so it bounds the continuation
+        # loop no matter what the producer writes.
+        if self._human_input_resume_count >= human_input.MAX_CLARIFICATION_ROUNDS:
+            raise ApplicationError(
+                f"clarification rounds exhausted for {service}/{slug}: "
+                f"resume_count={self._human_input_resume_count} >= "
+                f"MAX_CLARIFICATION_ROUNDS={human_input.MAX_CLARIFICATION_ROUNDS}",
+                type="clarification_rounds_exhausted",
+                non_retryable=True,
+            )
+
+        workflow.logger.info("human_input.requested", extra={"human_input": human_input.request_log_dict(request)})
+        workflow.logger.info("human_input.wait_started", extra={"human_input": human_input.request_log_dict(request)})
+
+        # The TTL cap in `validate()` is RELATIVE (expires - created); neither
+        # timestamp is compared against a clock there, and request.json is
+        # model-written, so a hallucinated far-future year seals cleanly and
+        # would park this loop for years (claude P1 on #450). Bound the actual
+        # wait against the workflow clock: the request still gets its full
+        # TTL, never more.
+        horizon = workflow.now() + timedelta(seconds=human_input.MAX_REQUEST_TTL_SECONDS)
+        if expires_at > horizon:
+            workflow.logger.info(
+                "human_input.expiry_clamped",
+                extra={"human_input": human_input.request_log_dict(request)},
+            )
+            expires_at = horizon
+        effective_deadline_iso = expires_at.isoformat()
+        self._human_input_state = _state(WAITING_FOR_INPUT)
+
+        def _abandoned_outcome() -> HumanInputOutcome:
+            # mctl-agents#420's escape hatch, honoured inside this park too:
+            # checked BEFORE any delivered answer is consumed, so an operator
+            # abandon always wins over a response racing it. The projection
+            # is reset OUT of WAITING_FOR_INPUT — queries are served on
+            # closed workflows too, and a surface polling one must not keep
+            # prompting for an answer nobody is waiting on any more.
+            self._human_input_state = _state(RUNNING)
+            self._input_responses.clear()
+            workflow.logger.info(
+                "human_input.abandoned", extra={"human_input": human_input.request_log_dict(request)}
+            )
+            return HumanInputOutcome(
+                outcome="abandoned", request_id=request.request_id,
+                round=request.round, resume_count=self._human_input_resume_count,
+            )
+
+        while True:
+            if self._abandoned:
+                return _abandoned_outcome()
+            remaining = (expires_at - workflow.now()).total_seconds()
+            if remaining <= 0:
+                self._input_responses.clear()
+                self._human_input_state = _state(INPUT_TIMED_OUT)
+                workflow.logger.info(
+                    "human_input.timed_out", extra={"human_input": human_input.request_log_dict(request)}
+                )
+                return HumanInputOutcome(
+                    outcome="timed_out", request_id=request.request_id,
+                    round=request.round, resume_count=self._human_input_resume_count,
+                )
+            try:
+                def _answer_arrived() -> bool:
+                    return bool(self._input_responses) or self._abandoned
+
+                await workflow.wait_condition(_answer_arrived, timeout=remaining)
+            except TimeoutError:
+                self._input_responses.clear()
+                self._human_input_state = _state(INPUT_TIMED_OUT)
+                workflow.logger.info(
+                    "human_input.timed_out", extra={"human_input": human_input.request_log_dict(request)}
+                )
+                return HumanInputOutcome(
+                    outcome="timed_out", request_id=request.request_id,
+                    round=request.round, resume_count=self._human_input_resume_count,
+                )
+            except asyncio.CancelledError:
+                workflow.logger.info(
+                    "human_input.cancelled", extra={"human_input": human_input.request_log_dict(request)}
+                )
+                raise
+
+            if self._abandoned:
+                return _abandoned_outcome()
+
+            raw_response = self._input_responses[0]
+            workflow.logger.info("human_input.delivered", extra={"request_id": request.request_id})
+
+            try:
+                payload = raw_response if isinstance(raw_response, dict) else json.loads(str(raw_response))
+                response = human_input.HumanInputResponse.from_dict(payload)
+                human_input.validate_response(request, response, now=workflow.now())
+            except (ValueError, TypeError, human_input.HumanInputError):
+                # PRUNE the rejected payload — a rejected entry left queued
+                # would count toward HUMAN_INPUT_RESPONSE_QUEUE_LIMIT for the
+                # rest of the wait, and enough typos would lock the one
+                # correct answer out of the handler forever (claude+agy P2 on
+                # #450). Rebuilding the projection here is what keeps
+                # `rejected_count` live for a polling surface: the state
+                # object is a frozen snapshot, not a view.
+                del self._input_responses[0]
+                self._human_input_rejected_count += 1
+                self._human_input_state = _state(WAITING_FOR_INPUT)
+                workflow.logger.info(
+                    "human_input.responded",
+                    extra={"request_id": request.request_id, "accepted": False},
+                )
+                continue
+
+            self._resolved_question_hashes.add(request.question_hash)
+            self._human_input_resume_count += 1
+            # A round already answered must not linger for the NEXT wait
+            # this execution enters — clear rather than let a stale queued
+            # item be misread as an answer to a different, later request.
+            self._input_responses.clear()
+            self._human_input_state = _state(RUNNING)
+            workflow.logger.info(
+                "human_input.responded",
+                extra={"human_input": human_input.response_log_dict(response), "accepted": True},
+            )
+            workflow.logger.info("human_input.resumed", extra={"human_input": human_input.response_log_dict(response)})
+            return HumanInputOutcome(
+                outcome="answered",
+                request_id=response.request_id,
+                request_hash=response.request_hash,
+                value=response.value,
+                respondent=response.respondent.reference(),
+                surface=response.surface,
+                received_at=response.received_at,
+                round=request.round,
+                resume_count=self._human_input_resume_count,
+            )
+
+    @workflow.signal
     def abandon(self, *args: object) -> None:
         """Gracefully end this execution at its next observation point.
 
@@ -1451,6 +1874,12 @@ class DevLoopWorkflow:
         investigator_release = _require_release(
             "issue-investigator", await _resolve("issue-investigator")
         )
+        # NOTE (mctlhq/mctl-agents#451): the loop's run id is deliberately
+        # NOT passed here yet — the investigate CWFT rejects undeclared
+        # parameters, so the template must declare it first (fail-closed:
+        # gitops before code). Until then the read path's retirement of
+        # same-issue leftovers rests on the `created_at`-vs-start-time
+        # check in `_await_human_input`.
         investigate_params = {"issue_url": issue.issue_url}
         if investigator_release and investigator_release.image_ref:
             investigate_params["agent_image"] = investigator_release.image_ref
@@ -1465,6 +1894,75 @@ class DevLoopWorkflow:
                 implement=None,
                 ended=f"investigate ended {investigate_result.phase}",
             )
+
+        # Durable clarification (mctlhq/mctl-agents#333, ADR 013), gated so
+        # an in-flight history recorded before this change takes its old
+        # command sequence verbatim: an unconditional find_proposal_slug/
+        # find_human_input_request pair here would be exactly the command
+        # mismatch that wedges a replaying execution (see _run_cwft's
+        # exec-queue comment for the identical rule applied to #251).
+        # Unlike atomic-approve/slug-scoped-implement below, this branch does
+        # its OWN find_proposal_slug lookup rather than hoisting and reusing
+        # the later one — one extra idempotent GitHub GET on a granted,
+        # patched execution, traded for not touching that already-delicate
+        # ordering at all.
+        human_input_outcome: HumanInputOutcome | None = None
+        accepted_answers: list[dict[str, Any]] = []
+        if workflow.patched("human-input"):
+            issue_number_for_input = parse_issue_url(issue.issue_url).number
+            input_slug = await workflow.execute_activity(
+                find_proposal_slug,
+                args=[target_repo, issue_number_for_input],
+                start_to_close_timeout=SLUG_LOOKUP_TIMEOUT,
+                retry_policy=SLUG_LOOKUP_RETRY_POLICY,
+            )
+            while input_slug:
+                hi_outcome = await self._await_human_input(target_repo, input_slug)
+                if hi_outcome is None:
+                    break
+                human_input_outcome = hi_outcome
+                if hi_outcome.outcome == "abandoned":
+                    return DevLoopResult(
+                        investigate=investigate_result, implement=None,
+                        human_input=human_input_outcome,
+                        ended=f"abandoned: {self._abandon_reason}",
+                    )
+                if hi_outcome.outcome == "timed_out":
+                    return DevLoopResult(
+                        investigate=investigate_result, implement=None,
+                        human_input=human_input_outcome,
+                        ended=f"human input wait expired for request {hi_outcome.request_id}",
+                    )
+                # "answered": resubmit investigate with EVERY answer accepted
+                # this execution as a `human_input_responses` JSON array
+                # (request_id/request_hash/value/respondent/surface/
+                # received_at per entry — never a transcript), then loop back
+                # to check whether a further request is pending. The full
+                # history, not just the latest answer: a continuation that
+                # only saw round N's answer would re-ask round 1's question,
+                # which the `_resolved_question_hashes` skip then refuses to
+                # re-answer — the pipeline would proceed on a run that was
+                # still waiting (claude P2 on #450).
+                # MAX_CLARIFICATION_ROUNDS (enforced inside
+                # _await_human_input) bounds this loop.
+                accepted_answers.append({
+                    "request_id": hi_outcome.request_id,
+                    "request_hash": hi_outcome.request_hash,
+                    "value": hi_outcome.value,
+                    "respondent": hi_outcome.respondent,
+                    "surface": hi_outcome.surface,
+                    "received_at": hi_outcome.received_at,
+                })
+                continuation_params = dict(investigate_params)
+                continuation_params["human_input_responses"] = json.dumps(accepted_answers)
+                investigate_result = await _run_cwft("mctl-agents-investigate", continuation_params)
+                await _record("issue-investigator", investigator_release, investigate_result, target_repo)
+                if not investigate_result.succeeded:
+                    return DevLoopResult(
+                        investigate=investigate_result, implement=None,
+                        human_input=human_input_outcome,
+                        ended=f"investigate ended {investigate_result.phase}",
+                    )
 
         # Durable wait: this workflow can sit here for days without costing
         # anything beyond Temporal's own history storage — exactly the
@@ -1520,13 +2018,15 @@ class DevLoopWorkflow:
                 pass
             else:
                 return DevLoopResult(
-                    investigate=investigate_result, implement=None, ended=approval_ended
+                    investigate=investigate_result, implement=None,
+                    human_input=human_input_outcome, ended=approval_ended
                 )
 
         if self._abandoned:
             return DevLoopResult(
                 investigate=investigate_result,
                 implement=None,
+                human_input=human_input_outcome,
                 ended=f"abandoned: {self._abandon_reason}",
             )
 
@@ -1550,6 +2050,7 @@ class DevLoopWorkflow:
                     investigate=investigate_result,
                     implement=None,
                     approve=None,
+                    human_input=human_input_outcome,
                     ended=f"source issue closed ({issue_state.state_reason or 'completed'})",
                 )
 
@@ -1636,7 +2137,7 @@ class DevLoopWorkflow:
                 # implement CWFT covers the later gaps (implementer resolve,
                 # the flip itself).
                 if workflow.patched("work-context-resume"):
-                    ended = await self._await_reapproval(investigate_result)
+                    ended = await self._await_reapproval(investigate_result, human_input=human_input_outcome)
                     if ended is not None:
                         return ended
                 approve_result = await _run_cwft(
@@ -1658,6 +2159,7 @@ class DevLoopWorkflow:
                         investigate=investigate_result,
                         implement=None,
                         approve=approve_result,
+                        human_input=human_input_outcome,
                         ended=f"approve flip ended {approve_result.phase}",
                     )
         if atomic_approve:
@@ -1710,7 +2212,9 @@ class DevLoopWorkflow:
         # Same abandon/deadline semantics as its twin — see the comment
         # there and #420.
         if workflow.patched("work-context-resume"):
-            ended = await self._await_reapproval(investigate_result, approve=approve_result)
+            ended = await self._await_reapproval(
+                investigate_result, approve=approve_result, human_input=human_input_outcome
+            )
             if ended is not None:
                 return ended
 
@@ -1723,6 +2227,7 @@ class DevLoopWorkflow:
                 investigate=investigate_result,
                 implement=implement_result,
                 approve=approve_result,
+                human_input=human_input_outcome,
                 ended=f"abandoned: {self._abandon_reason}",
             )
 
@@ -1747,6 +2252,7 @@ class DevLoopWorkflow:
                         approve=approve_result,
                         implement_state=self._implement_state,
                         approver=self._approver,
+                        human_input=human_input_outcome,
                     )
                 )
                 workflow.continue_as_new(
@@ -1758,6 +2264,7 @@ class DevLoopWorkflow:
             investigate_result=investigate_result,
             implement_result=implement_result,
             approve_result=approve_result,
+            human_input_outcome=human_input_outcome,
             outcome=outcome,
         )
 
@@ -1924,6 +2431,7 @@ class DevLoopWorkflow:
                     approve=resume.approve,
                     implement_state=self._implement_state,
                     approver=self._approver,
+                    human_input=resume.human_input,
                 )
             )
             workflow.continue_as_new(
@@ -1941,6 +2449,7 @@ class DevLoopWorkflow:
             investigate_result=investigate_result,
             implement_result=resume.implement,
             approve_result=resume.approve,
+            human_input_outcome=resume.human_input,
             outcome=outcome,
         )
 
@@ -1951,6 +2460,7 @@ class DevLoopWorkflow:
         investigate_result: WorkflowResult,
         implement_result: WorkflowResult | None,
         approve_result: WorkflowResult | None,
+        human_input_outcome: HumanInputOutcome | None,
         outcome: _WatchOutcome,
     ) -> DevLoopResult:
         """Shared tail of `run`/`_resume_merge_watch`: deploy observation,
@@ -1997,6 +2507,7 @@ class DevLoopWorkflow:
             pr=pr_state,
             deploy=deploy,
             incidents=incidents,
+            human_input=human_input_outcome,
             # mctl-agents#420: an `abandon` signal delivered during the merge
             # watch cuts _watch_pr short (its own `while` condition observes
             # `_abandoned`) rather than raising, so the only place left to

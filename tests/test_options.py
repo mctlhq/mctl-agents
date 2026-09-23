@@ -771,6 +771,30 @@ def test_every_drain_timeout_honours_its_env_override(monkeypatch, name):
         importlib.reload(options)
 
 
+def test_plan_grants_human_input_tracks_the_capability_in_plan_tools():
+    """`plan_grants_human_input` has no caller yet (the producer lands with
+    mctl-gitops#1277); pin its contract directly so it does not rot as dead
+    code in the meantime."""
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="a" * 40))
+
+    granted = dataclasses.replace(
+        plan, tools=(*plan.tools, options.HUMAN_INPUT_CAPABILITY)
+    )
+    assert options.plan_grants_human_input(granted) is True
+
+    ungranted = dataclasses.replace(
+        plan, tools=tuple(t for t in plan.tools if t != options.HUMAN_INPUT_CAPABILITY)
+    )
+    assert options.plan_grants_human_input(ungranted) is False
+
+    # An empty allow-list is the degenerate ungranted case, and near-miss
+    # spellings must not count as the grant (agy P2 on #450: exact literal
+    # membership, nothing fuzzier).
+    assert options.plan_grants_human_input(dataclasses.replace(plan, tools=())) is False
+    near_miss = dataclasses.replace(plan, tools=(options.HUMAN_INPUT_CAPABILITY.upper(),))
+    assert options.plan_grants_human_input(near_miss) is False
+
+
 # ---------------------------------------------------------------------------
 # Per-command execution budget (mctl-agents#430)
 # ---------------------------------------------------------------------------
