@@ -1289,8 +1289,14 @@ def _gitops_tree_url(service: str, slug: str) -> str:
     )
 
 
-def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
-    """Comment on the issue with a link to the freshly written proposal."""
+def post_proposal_comment(
+    issue_url: str, service: str, slug: str, *, temporal_workflow_id: str | None = None
+) -> None:
+    """Comment on the issue with a link to the freshly written proposal.
+
+    `temporal_workflow_id` is the loop that submitted this run, when it said
+    so (mctlhq/mctl-agents#461): a dispatched loop is `dev-loop-xr_*`, and
+    approve instructions naming the issue-keyed id would signal nothing."""
     # Render the CONCRETE workflow id (single source: issue_ref.workflow_id_for,
     # a temporalio-free module — this function runs inside the agent container)
     # so the approve commands below are copy-pasteable — placeholder text
@@ -1302,9 +1308,9 @@ def post_proposal_comment(issue_url: str, service: str, slug: str) -> None:
     # handlers_dev_loop.go ApproveDevLoopWorkflow → TemporalClient.SignalApprove
     # (shipped with the phase-4 dev-loop endpoints), so no grep of THIS repo
     # can find it.
-    from orchestrator.temporal.issue_ref import workflow_id_for
+    from orchestrator.temporal.issue_ref import loop_workflow_id
 
-    workflow_id = workflow_id_for(issue_url)
+    workflow_id = loop_workflow_id(issue_url, temporal_workflow_id)
     body = (
         "mctl-agents issue-investigator has analyzed this issue and created "
         "a proposal:\n\n"
@@ -1761,6 +1767,8 @@ def _assemble_context(
     service: str,
     slug: str,
     work_context: WorkContextRef | None = None,
+    temporal_workflow_id: str | None = None,
+    temporal_run_id: str | None = None,
 ) -> context_assembly.AssemblyResult | None:
     """Assembles and seals this investigation's `ContextSnapshot`
     (mctlhq/mctl-agents#265). Returns `None` in `off` mode without doing any
@@ -1811,6 +1819,8 @@ def _assemble_context(
             legacy_allowed_tools=_LEGACY_ALLOWED_TOOLS,
             legacy_budget_usd=legacy_budget_usd,
             work_context=work_context,
+            temporal_workflow_id=temporal_workflow_id,
+            temporal_run_id=temporal_run_id,
         )
     except Exception as exc:
         if mode == "on":
@@ -2128,6 +2138,9 @@ def investigate(
     actor_id: str | None = None,
     requested_by: str | None = None,
     requested_comment_url: str | None = None,
+    temporal_workflow_id: str | None = None,
+    temporal_run_id: str | None = None,
+    execution_request_id: str | None = None,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
 
@@ -2149,6 +2162,9 @@ def investigate(
             actor_id=actor_id,
             requested_by=requested_by,
             requested_comment_url=requested_comment_url,
+            temporal_workflow_id=temporal_workflow_id,
+            temporal_run_id=temporal_run_id,
+            execution_request_id=execution_request_id,
             own_execution=own_execution,
         )
         _trace_published(result)
@@ -2181,6 +2197,9 @@ def _investigate(
     actor_id: str | None = None,
     requested_by: str | None = None,
     requested_comment_url: str | None = None,
+    temporal_workflow_id: str | None = None,
+    temporal_run_id: str | None = None,
+    execution_request_id: str | None = None,
     own_execution: _OwnExecution,
 ) -> InvestigateResult:
     """Investigate one GitHub issue and write a `proposed` proposal.
@@ -2196,9 +2215,24 @@ def _investigate(
     threaded into `write_status_yaml`'s `request` block. Both default to
     None, in which case the written payload is unchanged from before this
     parameter existed (the label-driven path never passes them).
+
+    `temporal_workflow_id` / `temporal_run_id` / `execution_request_id`
+    (mctlhq/mctl-agents#461, #451) name the DevLoop run that submitted this
+    one and, for a dispatched loop, the execution request it serves. The
+    workflow id replaces the issue-keyed id this run would otherwise derive,
+    in the approve instructions and in the sealed correlation; the run id is
+    sealed beside it. The request id is correlation only, logged here: the
+    snapshot schema has no slot for it, and this run's execution identity is
+    `execution_id`. All three default to None, which is today's behaviour.
     """
     if not state_dir.is_dir():
         raise SystemExit(f"State dir not found: {state_dir}")
+    if temporal_workflow_id or execution_request_id:
+        print(
+            f"info: loop correlation temporal_workflow_id={temporal_workflow_id or '-'} "
+            f"temporal_run_id={temporal_run_id or '-'} "
+            f"execution_request_id={execution_request_id or '-'}"
+        )
 
     # Loaded once per run (mctlhq/mctl-agents#196, ADR 011) and reused for
     # every consumer of this execution's identity — the MCP headers built by
@@ -2413,6 +2447,8 @@ def _investigate(
             service=service,
             slug=slug,
             work_context=work_context_ref,
+            temporal_workflow_id=temporal_workflow_id,
+            temporal_run_id=temporal_run_id,
         )
 
         # 2c. Resolve this investigation's ServiceSkillBundle
@@ -2845,7 +2881,7 @@ def _investigate(
         # failed — the proposal is already written and re-running is
         # idempotent on `proposed`. Downgrade to a warning.
         try:
-            post_proposal_comment(issue.ref.url, service, slug)
+            post_proposal_comment(issue.ref.url, service, slug, temporal_workflow_id=temporal_workflow_id)
         except subprocess.CalledProcessError as e:
             print(
                 f"warn: proposal written, but `gh issue comment` failed "
@@ -2986,6 +3022,9 @@ def _investigate(
                 pass
 
 
+_LOOP_ID_RE = re.compile(r"[A-Za-z0-9._:-]+")
+
+
 def _work_context_from_args(args: argparse.Namespace) -> None:
     """Validate the work-context CLI flags before they reach `investigate()`.
 
@@ -2999,6 +3038,11 @@ def _work_context_from_args(args: argparse.Namespace) -> None:
 
     if args.resume_from_execution_id and not args.work_item_id:
         raise SystemExit("--resume-from-execution-id requires --work-item-id")
+    # A run id is only meaningful beside the workflow id it is a run of:
+    # sealed next to the issue-keyed id instead, it would name a run of a
+    # different workflow (mctl-agents#451).
+    if args.temporal_run_id and not args.temporal_workflow_id:
+        raise SystemExit("--temporal-run-id requires --temporal-workflow-id")
     if args.surface is not None and args.surface not in SURFACE_KINDS:
         raise SystemExit(f"--surface must be one of {sorted(SURFACE_KINDS)}, got {args.surface!r}")
     if args.actor_kind is not None and args.actor_kind not in ACTOR_KINDS:
@@ -3011,12 +3055,25 @@ def _work_context_from_args(args: argparse.Namespace) -> None:
         ("--execution-id", args.execution_id),
         ("--resume-from-execution-id", args.resume_from_execution_id),
         ("--actor-id", args.actor_id),
+        ("--temporal-workflow-id", args.temporal_workflow_id),
+        ("--temporal-run-id", args.temporal_run_id),
+        ("--execution-request-id", args.execution_request_id),
     ):
         if value is not None and len(value) > MAX_WORK_CONTEXT_ID_LENGTH:
             raise SystemExit(
                 f"{flag} exceeds {MAX_WORK_CONTEXT_ID_LENGTH} characters "
                 f"(the context snapshot's id ceiling)"
             )
+    # The loop ids are also rendered into a public issue comment, inside
+    # backticks and a URL path, so they must be plain tokens: Temporal
+    # workflow and run ids and mctl-api `xr_` ids all are.
+    for flag, value in (
+        ("--temporal-workflow-id", args.temporal_workflow_id),
+        ("--temporal-run-id", args.temporal_run_id),
+        ("--execution-request-id", args.execution_request_id),
+    ):
+        if value is not None and not _LOOP_ID_RE.fullmatch(value):
+            raise SystemExit(f"{flag} must be a non-empty [A-Za-z0-9._:-] token, got {value!r}")
     if not args.issue_url and not (
         args.work_item_id and _work_context_rollout.at_least(_work_context_rollout.ONLY)
     ):
@@ -3066,6 +3123,22 @@ def main() -> None:
     ap.add_argument(
         "--resume-from-execution-id", default=None,
         help="The prior execution this run resumes; requires --work-item-id",
+    )
+    ap.add_argument(
+        "--temporal-workflow-id", default=None,
+        help=(
+            "The DevLoopWorkflow that submitted this run (mctlhq/mctl-agents#461). "
+            "Named in the approve instructions and the sealed correlation instead "
+            "of the issue-keyed id derived from --issue-url"
+        ),
+    )
+    ap.add_argument(
+        "--temporal-run-id", default=None,
+        help="That DevLoopWorkflow's run id, sealed beside it (#451); requires --temporal-workflow-id",
+    )
+    ap.add_argument(
+        "--execution-request-id", default=None,
+        help="The mctl-api execution request (xr_...) this run serves; correlation only",
     )
     ap.add_argument("--surface", default=None, help="Surface this execution runs on (closed vocabulary)")
     ap.add_argument("--actor-kind", default=None, help="Kind of actor driving this execution (closed vocabulary)")
@@ -3122,6 +3195,9 @@ def main() -> None:
             actor_id=args.actor_id,
             requested_by=args.requested_by,
             requested_comment_url=args.requested_comment_url,
+            temporal_workflow_id=args.temporal_workflow_id,
+            temporal_run_id=args.temporal_run_id,
+            execution_request_id=args.execution_request_id,
         )
     except ProposalAmbiguityError as exc:
         # The process boundary is where a clean exit belongs — the library

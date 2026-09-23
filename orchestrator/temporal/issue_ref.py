@@ -37,6 +37,21 @@ def workflow_id_for(issue_url: str) -> str:
     return f"dev-loop-{parts.owner}-{parts.repo}-{parts.number}"
 
 
+def loop_workflow_id(issue_url: str, temporal_workflow_id: str | None = None) -> str:
+    """The DevLoop an agent-container run belongs to: the id its loop passed
+    (`--temporal-workflow-id`, mctlhq/mctl-agents#461), else the issue-keyed
+    id `workflow_id_for` derives.
+
+    The derived id is only right for an issue-keyed loop. A loop started by
+    the execution-request dispatcher is `dev-loop-xr_<id>`, so a run it
+    submitted that re-derived its loop from the issue URL would name a loop
+    that does not exist: in the approve instructions it posts, and in the
+    correlation it seals, which the loop compares against its own id before
+    accepting a clarification request as its own. The one place both read
+    the answer from, so they cannot disagree."""
+    return temporal_workflow_id or workflow_id_for(issue_url)
+
+
 #: Every dispatched DevLoop's workflow id starts with this: `dev-loop-`
 #: followed by mctl-api's `xr_` request-id prefix. An issue-keyed loop is
 #: `dev-loop-<owner>-...` and never matches.

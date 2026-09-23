@@ -46,7 +46,7 @@ from orchestrator.context_snapshot import (
     hash_bytes,
     seal,
 )
-from orchestrator.temporal.issue_ref import workflow_id_for
+from orchestrator.temporal.issue_ref import loop_workflow_id
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
     from orchestrator.run_issue_investigator import IssueData
@@ -575,6 +575,7 @@ def build_execution_correlation(
     legacy_allowed_tools: Sequence[str] = (),
     legacy_budget_usd: float = 0.0,
     environment: str | None = None,
+    temporal_workflow_id: str | None = None,
     temporal_run_id: str | None = None,
     argo_workflow_name: str | None = None,
 ) -> ExecutionCorrelation:
@@ -597,11 +598,16 @@ def build_execution_correlation(
 
     Both hashes use `context_snapshot`'s one canonical-JSON hash rule —
     never a second convention.
+
+    `temporal_workflow_id` / `temporal_run_id` are the loop that submitted
+    this run, when it passed them (mctlhq/mctl-agents#461, #451). Without a
+    passed workflow id the issue-keyed one is derived, which names the wrong
+    loop for a dispatched `dev-loop-xr_*` run (see `loop_workflow_id`).
     """
     resolved_environment: str = (
         environment if environment is not None else os.getenv("AGENT_ENVIRONMENT", "production")
     )
-    workflow_id = workflow_id_for(issue_url)
+    workflow_id = loop_workflow_id(issue_url, temporal_workflow_id)
 
     if resolver_mode == "declarative":
         if plan is None:
@@ -761,6 +767,7 @@ def assemble_investigator_context(
     legacy_model: str = "",
     legacy_allowed_tools: Sequence[str] = (),
     legacy_budget_usd: float = 0.0,
+    temporal_workflow_id: str | None = None,
     temporal_run_id: str | None = None,
     argo_workflow_name: str | None = None,
     config: AssemblyConfig | None = None,
@@ -788,6 +795,7 @@ def assemble_investigator_context(
         legacy_model=legacy_model,
         legacy_allowed_tools=legacy_allowed_tools,
         legacy_budget_usd=legacy_budget_usd,
+        temporal_workflow_id=temporal_workflow_id,
         temporal_run_id=temporal_run_id,
         argo_workflow_name=argo_workflow_name,
     )
