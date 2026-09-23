@@ -3746,11 +3746,28 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
     # run is using still inside its recorded quota window", so do not spend a
     # clone and an SDK call to learn it again. No `.status.yaml` write here —
     # the recorded block is left exactly as it is.
+    #
+    # The skip is still a rate-limited outcome, not a plain skip: the batch
+    # stops on it and `main()` exits EXIT_RATE_LIMITED, so the CWFT's
+    # `implement-fallback` step (the other account) still runs while this
+    # account's window is open. A plain skip would exit 0 and silently keep
+    # the fallback idle until the window closed (agy P2 on #458).
     if (skip_reason := _skip_while_rate_limited(ref)) is not None:
+        block = _load_status(ref.status_path).get("rate_limited") or {}
         return ImplementResult(
             ref=ref,
             pr_url=None,
+            error=f"rate limited: {skip_reason}",
             skipped_reason=skip_reason,
+            rate_limited=True,
+            rate_limit_observation=RateLimitObservation(
+                account=str(block.get("account") or "unknown"),
+                rate_limit_type=block.get("rate_limit_type"),
+                resets_at=block.get("resets_at"),
+                resets_at_epoch=block.get("resets_at_epoch"),
+                overage_disabled_reason=block.get("overage_disabled_reason"),
+                detail=skip_reason,
+            ),
             counts_toward_limit=False,
         )
 
