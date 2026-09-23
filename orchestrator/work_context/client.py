@@ -132,9 +132,11 @@ class WorkItemClient:
 
         mctl-api's view carries only `latest_execution`, so a FOUND item is
         completed from the executions route. That second read is all or
-        nothing: if it fails, or the ledger does not contain the view's own
-        latest execution, the answer is WORK_ITEM_UNKNOWN — never a FOUND
-        item with an understated execution list."""
+        nothing: if it fails, or the ledger does not end on exactly the
+        view's own latest execution, the answer is WORK_ITEM_UNKNOWN — never
+        a FOUND item with an understated or overstated execution list. An
+        execution attached between the two reads is the overstated case, so
+        UNKNOWN here can mean "read again", not only "the store is down"."""
         try:
             res = self._request("GET", ROUTES["get_work_item"].format(id=_q(work_item_id)))
         except WorkItemUnavailable as exc:

@@ -237,13 +237,14 @@ def test_external_key_is_an_issue_url_only_when_it_is_one():
 def test_issue_url_rule_is_the_investigators_own():
     """Pinned against run_issue_investigator's pattern text, which this
     stdlib-only package cannot import."""
-    src = (Path(__file__).resolve().parent.parent / "orchestrator" / "run_issue_investigator.py").read_text()
+    investigator = Path(__file__).resolve().parent.parent / "orchestrator" / "run_issue_investigator.py"
+    src = investigator.read_text(encoding="utf-8")
     urls = ("https://github.com/a/b/issues/1", "http://github.com/a/b/issues/1/", "https://github.com/örg/b/issues/1",
             "https://github.com/a/b/pull/1", "https://github.com/a/b/issues/1#x", "https://gitlab.com/a/b/issues/1")
     import re as _re
 
-    m = _re.search(r"_ISSUE_URL_RE = re\.compile\(\s*r\"(.+?)\"", src, _re.S)
-    assert m, "run_issue_investigator._ISSUE_URL_RE not found"
+    m = _re.search(r"_ISSUE_URL_RE = re\.compile\(\s*r\"(.+?)\"\s*\)", src, _re.S)
+    assert m, "run_issue_investigator._ISSUE_URL_RE not found, or it now takes flags"
     theirs = _re.compile(m.group(1))
     for url in urls:
         assert bool(theirs.match(url)) == bool(wc._ISSUE_URL_RE.match(url)), url
@@ -293,7 +294,6 @@ def test_executions_listing_is_all_or_nothing():
         mutated(attempt=0),
         mutated(attempt="2"),
         mutated(engine="lambda"),
-        mutated(phase="Paused"),
         mutated(attempt=1),
         mutated(attempt=3),
         mutated(id=listing["executions"][0]["id"]),
@@ -302,6 +302,9 @@ def test_executions_listing_is_all_or_nothing():
     ):
         executions, why = wc.executions_from(200, bad, wid)
         assert executions is None and why, bad
+    # A phase this mirror has not seen is not a reason to refuse the ledger.
+    executions, why = wc.executions_from(200, mutated(phase="Paused"), wid)
+    assert executions is not None and len(executions) == 2, why
     executions, why = wc.executions_from(503, {"error": "unavailable"}, wid)
     assert executions is None and "unavailable" in why
 

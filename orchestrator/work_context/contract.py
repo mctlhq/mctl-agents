@@ -49,9 +49,11 @@ WORK_ITEM_STATES = frozenset({"active", "waiting", "completed", "superseded", "a
 #: no transition leaves them (`workitems.IsTerminal`).
 TERMINAL_WORK_ITEM_STATES = frozenset({"completed", "superseded", "archived"})
 
-# mctl-api's execution engines and phases (`workitems.Engine*`/`Phase*`).
+# mctl-api's execution engines (`workitems.Engine*`). The engine decides
+# what `engine_ref` means, so an unknown one refuses the entry. The phase
+# is not checked: nothing here reads it, and a new mctl-api phase must not
+# turn every read of a work item into UNKNOWN.
 EXECUTION_ENGINES = frozenset({"temporal", "argo"})
-EXECUTION_PHASES = frozenset({"Pending", "Running", "Succeeded", "Failed", "Error"})
 
 # The error code mctl-api answers a missing (or invisible) work item with.
 # Only this 404 is ABSENT; any other 404 did not come from the work-items
@@ -219,7 +221,7 @@ class ExecutionRef:
 
         None on anything that does not describe an execution of THIS work
         item: a missing id, a non-positive attempt, another work item's id,
-        or an engine/phase outside mctl-api's closed vocabulary."""
+        or an engine outside mctl-api's closed vocabulary."""
         if not isinstance(data, dict):
             return None
         execution_id = data.get("id")
@@ -231,7 +233,7 @@ class ExecutionRef:
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             return None
         engine = data.get("engine")
-        if engine not in EXECUTION_ENGINES or data.get("phase") not in EXECUTION_PHASES:
+        if engine not in EXECUTION_ENGINES:
             return None
         return ExecutionRef(
             execution_id=execution_id,
