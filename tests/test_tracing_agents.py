@@ -16,7 +16,7 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolResultBlock, ToolUseBlock, UserMessage
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from orchestrator import policy_checkpoint, run_issue_investigator, tracing
+from orchestrator import policy_checkpoint, run_implementer, run_issue_investigator, tracing
 from tests.conftest import fake_mcp_client_factory
 
 MODEL = "claude-opus-5"
@@ -127,6 +127,8 @@ def test_model_spans_carry_model_usage_and_latency_but_no_prompt(exported, tmp_p
     for chat in chats:
         assert chat.attributes["gen_ai.operation.name"] == "chat"
         assert chat.attributes["gen_ai.response.model"] == MODEL
+        # Real clock here; the exact first-turn bounds are pinned with a fake
+        # clock in test_the_first_chat_of_each_scope_measures_from_its_input_not_from_itself.
         assert chat.end_time >= chat.start_time
     first = min(chats, key=lambda s: s.start_time)
     assert first.attributes["gen_ai.usage.input_tokens"] == 100
@@ -165,6 +167,79 @@ def test_a_sub_agent_s_model_turn_nests_under_its_task_tool_span(exported, tmp_p
     ]
     assert len(nested) == 1
     assert nested[0].attributes["gen_ai.usage.input_tokens"] == 50
+
+
+class _Clock:
+    """A settable stand-in for the `time` module inside orchestrator.tracing."""
+
+    def __init__(self) -> None:
+        self.now = 0
+
+    def time_ns(self) -> int:
+        return self.now
+
+
+def test_the_first_chat_of_each_scope_measures_from_its_input_not_from_itself(exported, monkeypatch):
+    """Review P2 on #466: `_last_ns` was never seeded, so the first chat span
+    of the run and of every sub-agent had start_time == end_time."""
+    clock = _Clock()
+    monkeypatch.setattr(tracing, "time", clock)
+
+    clock.now = 1_000
+    with tracing.agent_run("issue-investigator", MODEL) as obs:
+        clock.now = 2_000
+        obs.query_sent()
+        clock.now = 5_000
+        obs.observe(_assistant("m1", [ToolUseBlock(id="t1", name="Task", input={"prompt": PROMPT_MARKER})]))
+        clock.now = 9_000
+        obs.observe(_assistant("c1", [TextBlock(text=ASSISTANT_MARKER)], parent="t1"))
+        clock.now = 12_000
+        obs.observe(UserMessage(content=[ToolResultBlock(tool_use_id="t1", content=TOOL_OUTPUT_MARKER)]))
+        obs.observe(_result())
+
+    task = _spans(exported)["execute_tool Task"]
+    chats = [s for s in exported.get_finished_spans() if s.name == f"chat {MODEL}"]
+    top = next(s for s in chats if s.parent.span_id != task.context.span_id)
+    child = next(s for s in chats if s.parent.span_id == task.context.span_id)
+    # The run's first turn: from the query to its message.
+    assert (top.start_time, top.end_time) == (2_000, 5_000)
+    # A sub-agent's first turn: from its Task tool's start to its message.
+    assert task.start_time == 5_000
+    assert (child.start_time, child.end_time) == (5_000, 9_000)
+
+
+def test_without_query_sent_the_first_chat_still_measures_from_the_run_start(exported, monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(tracing, "time", clock)
+    clock.now = 1_000
+    with tracing.agent_run("issue-investigator", MODEL) as obs:
+        clock.now = 4_000
+        obs.observe(_assistant("m1", [TextBlock(text=ASSISTANT_MARKER)]))
+        obs.observe(_result())
+    (chat,) = [s for s in exported.get_finished_spans() if s.name == f"chat {MODEL}"]
+    assert (chat.start_time, chat.end_time) == (1_000, 4_000)
+
+
+def _run_implementer_agent(tmp_path, monkeypatch, messages) -> None:
+    monkeypatch.setattr(run_implementer, "ClaudeSDKClient", fake_mcp_client_factory(messages=messages))
+    monkeypatch.setattr(run_implementer, "IMPLEMENTER_TIMEOUT_SECONDS", 5)
+    anyio.run(run_implementer._run_implementer_agent, tmp_path, PROMPT_MARKER, tmp_path)
+
+
+@pytest.mark.parametrize("run", [_run_investigator_agent, _run_implementer_agent], ids=["investigator", "implementer"])
+def test_each_driver_marks_the_query_before_the_first_message(exported, tmp_path, monkeypatch, run):
+    calls: list[str] = []
+    original_observe = tracing.AgentRunObserver.observe
+    monkeypatch.setattr(tracing.AgentRunObserver, "query_sent", lambda self: calls.append("query"))
+
+    def observe(self, message):
+        calls.append("message")
+        original_observe(self, message)
+
+    monkeypatch.setattr(tracing.AgentRunObserver, "observe", observe)
+    run(tmp_path, monkeypatch, [_assistant("m1", [TextBlock(text=ASSISTANT_MARKER)]), _result()])
+    assert calls[0] == "query"
+    assert calls.count("query") == 1
 
 
 def test_a_rate_limited_run_is_recorded_as_http_429_and_still_raises(exported, tmp_path, monkeypatch):

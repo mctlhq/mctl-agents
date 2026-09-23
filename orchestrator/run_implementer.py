@@ -2179,6 +2179,7 @@ async def _run_implementer_agent(
                     # Read/Write/Edit/Bash; mctl tools are supplementary.
                     await ensure_mctl_connected(client, fatal=False)
                 await client.query(prompt)
+                trace_run.query_sent()
                 # receive_messages(), NOT receive_response(): the latter returns
                 # at the first ResultMessage, and a ResultMessage ends one TURN,
                 # not the RUN. The prompt asks the agent to delegate to the

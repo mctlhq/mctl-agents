@@ -1646,6 +1646,7 @@ async def _run_agent(repo_dir: Path, prompt: str, proposal_dir: Path) -> None:
             # Read/Glob/Grep; mctl tools are supplementary, not required.
             await ensure_mctl_connected(client, fatal=False)
         await client.query(prompt)
+        trace_run.query_sent()
         ledger = LiveTaskLedger()
 
         def _note(message: Any) -> None:

@@ -218,3 +218,14 @@ async def test_recorded_histories_replay_with_tracing_interceptors(scenario, kin
     path = scenario.path_for(kind)
     history = WorkflowHistory.from_json(f"trace-replay-{scenario.name}-{kind}", path.read_text(encoding="utf-8"))
     await Replayer(workflows=scenario.workflows, interceptors=interceptors).replay_workflow(history)
+
+
+@pytest.mark.parametrize("bad", [None, 42])
+def test_argo_trace_attributes_drop_non_string_params_instead_of_raising(bad):
+    """agy P3 on #466: `params.get("issue_url", "")` returns None for an
+    explicit null, and `re.match(None)` raised out of `submit_and_wait`."""
+    from orchestrator.temporal.activities.argo import SubmitAndWaitInput, _trace_attributes
+
+    params = {key: bad for key in ("issue_url", "service", "execution_id", "work_item_id")}
+    attributes = _trace_attributes(SubmitAndWaitInput(operation="mctl-agents-investigate", params=params))
+    assert attributes == {"mctl.workflow.type": "investigate"}

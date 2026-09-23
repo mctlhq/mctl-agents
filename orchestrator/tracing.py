@@ -812,7 +812,10 @@ class AgentRunObserver:
     A chat span starts when the model's input was complete (the previous
     event in its scope: the query, a tool result, or its own previous
     message) and ends at the last block of its message, so its duration is
-    model latency, not tool time.
+    model latency, not tool time. The top-level scope is seeded when the
+    observer opens and re-seeded by `query_sent()`, which a driver calls once
+    its prompt is sent; a sub-agent's scope is seeded when its Task/Agent tool
+    starts. Without a seed the first chat span of a scope would be zero-length.
     """
 
     def __init__(self, root: SpanHandle, model: str | None) -> None:
@@ -820,12 +823,20 @@ class AgentRunObserver:
         self._model = model
         self._tools: dict[str, SpanHandle] = {}
         self._chats: dict[str | None, tuple[str, SpanHandle, int]] = {}
-        self._last_ns: dict[str | None, int] = {}
+        # Seeded with the observer's own start, so a driver that never calls
+        # query_sent() still gets a non-zero first chat span.
+        self._last_ns: dict[str | None, int] = {None: time.time_ns()}
         self._input_tokens = 0
         self._output_tokens = 0
         self._saw_usage = False
 
     # -- public -----------------------------------------------------------
+
+    def query_sent(self) -> None:
+        """Mark the prompt as sent: the first top-level chat span starts here,
+        not at the client's connect (which can take seconds)."""
+        if self._root.recording:
+            self._last_ns[None] = time.time_ns()
 
     def observe(self, message: Any) -> None:
         if not self._root.recording:
@@ -906,10 +917,10 @@ class AgentRunObserver:
             handle.fail(error)
         for block in getattr(message, "content", None) or ():
             if type(block).__name__ in ("ToolUseBlock", "ServerToolUseBlock"):
-                self._start_tool(block, scope)
+                self._start_tool(block, scope, now)
         self._last_ns[scope] = now
 
-    def _start_tool(self, block: Any, scope: str | None) -> None:
+    def _start_tool(self, block: Any, scope: str | None, now: int) -> None:
         tool_id = getattr(block, "id", None)
         name = _bounded(getattr(block, "name", None), 128) or "unknown"
         if not isinstance(tool_id, str) or tool_id in self._tools:
@@ -921,7 +932,12 @@ class AgentRunObserver:
         }
         if name.startswith("mcp__"):
             attributes["mcp.method.name"] = "tools/call"
-        self._tools[tool_id] = start_span(f"execute_tool {name}", attributes, parent=self._parent_for(scope))
+        self._tools[tool_id] = start_span(
+            f"execute_tool {name}", attributes, parent=self._parent_for(scope), start_time_ns=now
+        )
+        # A sub-agent's first turn (parent_tool_use_id == tool_id) measures
+        # from the moment its Task/Agent tool was invoked.
+        self._last_ns[tool_id] = now
 
     def _user(self, message: Any) -> None:
         now = time.time_ns()
@@ -934,6 +950,8 @@ class AgentRunObserver:
                     continue
                 tool_use_id = getattr(block, "tool_use_id", None)
                 handle = self._tools.pop(tool_use_id, None) if isinstance(tool_use_id, str) else None
+                if isinstance(tool_use_id, str):
+                    self._last_ns.pop(tool_use_id, None)
                 if handle is None:
                     continue
                 if getattr(block, "is_error", None):

@@ -206,21 +206,28 @@ def _trace_attributes(input: SubmitAndWaitInput) -> dict[str, Any]:
     params dict, which is caller-shaped. `execution_id` / `work_item_id` are
     present once the DevLoop passes them (the CWFT declares both); until
     then the attributes are omitted, not written empty."""
+    def param(key: str) -> str:
+        # The dataclass says str, but the payload is JSON from the caller; a
+        # null or a number must drop the attribute, never raise out of the
+        # activity (tracing never fails an execution).
+        value = input.params.get(key)
+        return value if isinstance(value, str) else ""
+
     attributes: dict[str, Any] = {
         tracing.WORKFLOW_TYPE: input.operation.removeprefix(_OPERATION_PREFIX),
     }
-    execution_id = input.params.get("execution_id", "")
+    execution_id = param("execution_id")
     if execution_id:
         attributes[tracing.EXECUTION_ID] = execution_id
-    work_item_id = input.params.get("work_item_id", "")
+    work_item_id = param("work_item_id")
     if work_item_id:
         attributes[tracing.WORK_ITEM_ID] = work_item_id
-    match = _ISSUE_URL_RE.match(input.params.get("issue_url", ""))
+    match = _ISSUE_URL_RE.match(param("issue_url"))
     if match:
         attributes[tracing.REPOSITORY_NAME] = match.group(1)
         attributes[tracing.ISSUE_NUMBER] = int(match.group(2))
-    elif input.params.get("service"):
-        attributes[tracing.REPOSITORY_NAME] = f"mctlhq/{input.params['service']}"
+    elif service := param("service"):
+        attributes[tracing.REPOSITORY_NAME] = f"mctlhq/{service}"
     return attributes
 
 

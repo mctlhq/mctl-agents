@@ -32,7 +32,7 @@ from opentelemetry.sdk.trace.export import (
     SpanExporter,
     SpanExportResult,
 )
-from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.trace import Link, SpanKind, Status, StatusCode
 
 from orchestrator import tracing
 
@@ -179,6 +179,9 @@ def redacted_copy(span: ReadableSpan, *, error_detail: bool = False) -> Readable
         Event(event.name, redact_attributes(event.attributes, error_detail=error_detail), event.timestamp)
         for event in span.events
     ]
+    # Links carry their own attribute dicts: redacted like everything else,
+    # so a library that adds links cannot punch through the guard.
+    links = [Link(link.context, redact_attributes(link.attributes, error_detail=error_detail)) for link in span.links]
     status = span.status
     if not (error_detail and status.description and _scalar_allowed(status.description)):
         status = _redacted_status(status)
@@ -189,7 +192,7 @@ def redacted_copy(span: ReadableSpan, *, error_detail: bool = False) -> Readable
         resource=span.resource,
         attributes=redact_attributes(span.attributes, error_detail=error_detail),
         events=events,
-        links=span.links,
+        links=links,
         kind=span.kind,
         status=status,
         start_time=span.start_time,
@@ -204,20 +207,22 @@ def redacted_copy(span: ReadableSpan, *, error_detail: bool = False) -> Readable
 
 
 class _OnceFilter(logging.Filter):
-    """Pass the first record from a noisy logger, drop the rest.
+    """Pass the first record of each level from a noisy logger, drop the rest.
 
     The OTLP exporter and the batch processor log every failed batch; with a
     dead Collector that is one line every two seconds for the life of the
-    worker. One line says the same thing."""
+    worker. One line says the same thing. The budget is per level, so a
+    retry WARNING or a stray DEBUG record cannot use up the one ERROR line
+    that says the Collector is unreachable."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._seen = False
+        self._seen: set[int] = set()
 
     def filter(self, record: logging.LogRecord) -> bool:
-        if self._seen:
+        if record.levelno in self._seen:
             return False
-        self._seen = True
+        self._seen.add(record.levelno)
         return True
 
 
@@ -328,9 +333,17 @@ def build_provider(
         # Our own bounded exit hook below replaces the SDK's, which would
         # call shutdown() with no bound on the batch thread's join.
         shutdown_on_exit=False,
-        # No max_attribute_length: the SDK would TRUNCATE a long value before
-        # the guard sees it, and a truncated payload passes a length check.
-        span_limits=SpanLimits(max_attributes=64, max_events=128),
+        # Value-length truncation explicitly OFF (UNSET), not merely omitted:
+        # an omitted limit falls back to OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT /
+        # OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT. The SDK would TRUNCATE a long
+        # value before the guard sees it, and a truncated payload passes the
+        # guard's length check instead of being dropped.
+        span_limits=SpanLimits(
+            max_attributes=64,
+            max_events=128,
+            max_attribute_length=SpanLimits.UNSET,
+            max_span_attribute_length=SpanLimits.UNSET,
+        ),
     )
     if synchronous:
         provider.add_span_processor(SimpleSpanProcessor(guarded))

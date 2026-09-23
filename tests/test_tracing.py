@@ -330,6 +330,52 @@ def test_the_export_guard_scrubs_spans_the_producer_did_not_filter(exported):
     assert dict(exception_event.attributes) == {"exception.type": "ValueError", "exception.escaped": "False"}
 
 
+@pytest.mark.parametrize("variable", ["OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT", "OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT"])
+def test_an_env_length_limit_cannot_truncate_a_payload_past_the_guard(monkeypatch, variable):
+    """Review P3 on #466: with an SDK length limit a long value is truncated at
+    record time and the truncated payload then passes the guard's length check."""
+    monkeypatch.setenv(variable, "200")
+    exporter = InMemorySpanExporter()
+    assert tracing.init_tracing("test", exporter=exporter, synchronous=True, set_global=False)
+    span = tracing.tracer().start_span("raw", attributes={"mctl.long": "PAYLOAD" + "x" * 400})
+    span.end()
+    (exported_span,) = exporter.get_finished_spans()
+    assert "mctl.long" not in exported_span.attributes
+    assert "PAYLOAD" not in exported_span.to_json()
+
+
+def test_link_attributes_are_redacted_like_span_attributes():
+    from opentelemetry.sdk.trace import ReadableSpan
+    from opentelemetry.trace import Link, SpanContext, TraceFlags
+
+    ctx = SpanContext(trace_id=1, span_id=2, is_remote=False, trace_flags=TraceFlags(1))
+    raw = ReadableSpan(
+        name="raw",
+        context=ctx,
+        links=[
+            Link(ctx, {"gen_ai.prompt": "PROMPT-TEXT", "mctl.note": "ghp_" + "b" * 36, "mctl.execution.id": "we_1"})
+        ],
+    )
+    (link,) = tracing_sdk.redacted_copy(raw).links
+    assert dict(link.attributes) == {"mctl.execution.id": "we_1"}
+    assert link.context == ctx
+
+
+def test_the_sdk_log_filter_keeps_one_record_per_level():
+    """Review P3 on #466: a first record of any level used to spend the whole
+    budget, hiding the real export-failure line for the life of the worker."""
+    once = tracing_sdk._OnceFilter()
+
+    def record(level):
+        return logging.LogRecord("opentelemetry.sdk._shared_internal", level, __file__, 1, "m", None, None)
+
+    assert once.filter(record(logging.DEBUG))
+    assert once.filter(record(logging.WARNING))
+    assert once.filter(record(logging.ERROR))  # the export failure still gets through
+    assert not once.filter(record(logging.ERROR))
+    assert not once.filter(record(logging.WARNING))
+
+
 def test_every_exported_key_is_on_the_allowlist(exported):
     _raw_span_with_everything_sensitive()
     with tracing.span("helper", {"mctl.workflow.type": "investigate"}) as handle:
