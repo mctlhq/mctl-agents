@@ -314,6 +314,12 @@ RESUME_DEFERRED_ERROR_TYPE = "ResumeDeferred"
 # it is picked up by a later claim, which finds the loop closed and starts a
 # continuation instead.
 DELIVERY_EXIT_GRACE = timedelta(minutes=2)
+# How long a delivery whose terminal advance did not land (every attempt of
+# its retry policy went unanswered: an mctl-api outage) waits before it tries
+# again. It never lets go while the loop runs: its execution would stay
+# non-terminal, which the dispatcher's reconciliation cannot heal while this
+# loop is RUNNING and which blocks every later request for the item.
+DELIVERY_ADVANCE_RETRY_INTERVAL = timedelta(minutes=10)
 
 # Stage 6.1 merge detection (ADR-006, #214): after implement, poll the PR's
 # state until it merges/closes. Two cheap GitHub reads per poll — 15 min is
@@ -775,6 +781,12 @@ class OpenDelivery:
     #: Whether accepting it changed the surface or the actor (and so cleared
     #: the approval). Decided at acceptance, against the provenance then.
     surface_transition: bool = False
+    #: The terminal phase its execution was decided to end in, while that
+    #: advance has not landed yet ("" before the decision). A delivery with
+    #: one only re-attempts the advance, in this run or the next.
+    pending_phase: str = ""
+    #: What `_end_delivery` records once that advance lands.
+    pending_refusal: str = ""
 
 
 @dataclass(frozen=True)
@@ -1815,6 +1827,11 @@ class DevLoopWorkflow:
             self._end_delivery(opened, "unsupported")
             return
         engine_ref = resume_engine_ref(workflow.info().workflow_id, rid)
+        if opened.pending_phase:
+            # Decided by an earlier attempt (maybe an earlier run) whose
+            # advance did not land: land it, nothing else.
+            await self._land_delivery(opened, opened.pending_phase, opened.pending_refusal, engine_ref)
+            return
         bind = BindInput(
             work_item_id=delivery.work_item_id,
             execution_request_id=rid,
@@ -1840,37 +1857,63 @@ class DevLoopWorkflow:
                 # it is non-terminal mctl-api refuses every other request for
                 # the item, and the dispatcher's reconciliation never touches
                 # the execution of a loop that is still RUNNING.
-                await self._advance_dispatched_execution(
-                    "Failed",
-                    retry_policy=FAST_ACTIVITY_RETRY_POLICY if self._exiting else DISPATCHED_ADVANCE_RETRY_POLICY,
-                    work_item_id=delivery.work_item_id,
-                    engine_ref=engine_ref,
-                )
+                await self._land_delivery(opened, "Failed", bound.outcome, engine_ref)
+                return
             # Otherwise rejected by the platform, or fulfilled for another
             # loop (a re-claim that delivered elsewhere): nothing of ours.
             self._end_delivery(opened, bound.outcome)
             return
-        self._seen_execution_ids.add(bound.execution_id)
-        self._executions.append(
-            ExecutionRef(
-                execution_id=bound.execution_id,
-                sequence=bound.sequence,
-                temporal_workflow_id=engine_ref,
-                surface=SurfaceRef(kind=delivery.surface),
-                actor=ActorRef(kind=delivery.actor_kind, actor_id=delivery.actor_id),
-                surface_transition=opened.surface_transition,
+        if bound.execution_id not in self._seen_execution_ids:  # (re-bound after a hop: already recorded)
+            self._seen_execution_ids.add(bound.execution_id)
+            self._executions.append(
+                ExecutionRef(
+                    execution_id=bound.execution_id,
+                    sequence=bound.sequence,
+                    temporal_workflow_id=engine_ref,
+                    surface=SurfaceRef(kind=delivery.surface),
+                    actor=ActorRef(kind=delivery.actor_kind, actor_id=delivery.actor_id),
+                    surface_transition=opened.surface_transition,
+                )
             )
-        )
         await workflow.wait_condition(
-            lambda: self._abandoned or self._approved or self._gates_passed or self._exiting
+            lambda: self._abandoned or self._approved or self._gates_passed or self._exiting or self._hopping
         )
         decided = (self._approved or self._gates_passed) and not self._abandoned
-        phase = "Succeeded" if decided else "Failed"
-        policy = DISPATCHED_ADVANCE_RETRY_POLICY if decided and not self._exiting else FAST_ACTIVITY_RETRY_POLICY
-        await self._advance_dispatched_execution(
-            phase, retry_policy=policy, work_item_id=delivery.work_item_id, engine_ref=engine_ref
-        )
-        self._end_delivery(opened, "")
+        if self._hopping and not decided and not self._abandoned:
+            return  # still open, undecided: carried across the hop, re-bound by the next run
+        await self._land_delivery(opened, "Succeeded" if decided else "Failed", "", engine_ref)
+
+    async def _land_delivery(self, opened: OpenDelivery, phase: str, refusal: str, engine_ref: str) -> None:
+        """Advance a delivery's execution to its terminal `phase`, then close
+        the delivery. An advance that does not land (no answer within its
+        retry policy) keeps the delivery OPEN with the phase pending: it is
+        re-attempted every DELIVERY_ADVANCE_RETRY_INTERVAL while this loop
+        runs, carried across a hop (the next run lands it), and given one
+        last attempt when the loop ends — after which a closed loop's `#xr_`
+        execution is the dispatcher's reconciliation's to end."""
+        delivery = opened.delivery
+        rid = delivery.execution_request_id
+        while True:
+            patient = phase == "Succeeded" or bool(refusal)
+            policy = DISPATCHED_ADVANCE_RETRY_POLICY if patient and not self._exiting else FAST_ACTIVITY_RETRY_POLICY
+            landed = await self._advance_dispatched_execution(
+                phase, retry_policy=policy, work_item_id=delivery.work_item_id, engine_ref=engine_ref
+            )
+            if landed or self._exiting:
+                self._end_delivery(opened, refusal)
+                return
+            opened = dataclasses.replace(opened, pending_phase=phase, pending_refusal=refusal)
+            self._open_deliveries[rid] = opened
+            if self._hopping:
+                return  # carried with its pending phase
+            try:
+                await workflow.wait_condition(
+                    lambda: self._exiting or self._hopping, timeout=DELIVERY_ADVANCE_RETRY_INTERVAL
+                )
+            except TimeoutError:
+                pass
+            if self._hopping:
+                return
 
     async def _poll_delivery_bind(
         self, bind: BindInput, wait: timedelta, *, interruptible: bool
@@ -2270,8 +2313,10 @@ class DevLoopWorkflow:
             if bound.stranded and workflow.patched(EXECUTION_REQUEST_STRANDED_PATCH):
                 # An execution of this loop's own engine ref exists that it
                 # must not run: end it before the loop ends (the reconciliation
-                # only runs once a later request for the item is claimed).
-                await self._advance_dispatched_execution("Failed")
+                # only runs once a later request for the item is claimed, and
+                # mctl-api refuses to create one while it is non-terminal:
+                # hence the patient policy).
+                await self._advance_dispatched_execution("Failed", retry_policy=DISPATCHED_ADVANCE_RETRY_POLICY)
             return None, f"execution request {issue.execution_request_id}: {bound.outcome}: {bound.reason}"
         self._seen_execution_ids.add(bound.execution_id)
         self._executions.append(

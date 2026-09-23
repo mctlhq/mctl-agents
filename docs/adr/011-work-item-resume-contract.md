@@ -302,9 +302,14 @@ takes the part before `#`.
   go). A bind that is refused although the fulfil did mint an execution
   under that ref (the item turned out to be about another issue, or the
   advance to `Running` was refused) ends that execution `Failed` too: L is
-  still running, so no reconciliation would ever reach it. The same holds
-  for a dispatched loop's own bind (under
-  `workflow.patched("execution-request-stranded")`).
+  still running, so no reconciliation would ever reach it. L records the
+  delivery's rejection as `delivery-work-item-mismatch` or, for the refused
+  advance, `delivery-execution-refused`. The same holds for a dispatched
+  loop's own bind (under `workflow.patched("execution-request-stranded")`).
+  A terminal advance that does not land (mctl-api unanswering for a whole
+  retry policy) keeps the delivery open with that phase pending: L
+  re-attempts it every ten minutes while it runs, carries it across
+  continue-as-new, and gives it one last attempt when it ends.
 - **Duplicates** are dropped by Temporal's update id within a run, and by
   L's `accepted_request_ids` across continue-as-new.
 - **Crash windows.** After the Update and before the fulfil: L holds the

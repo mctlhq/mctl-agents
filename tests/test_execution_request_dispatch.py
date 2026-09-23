@@ -651,7 +651,7 @@ async def test_a_loop_whose_advance_to_running_is_refused_ends_its_execution(api
     api.request = refuse_running  # type: ignore[method-assign]
     result = await _run_loop(env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), ref)
 
-    assert "work-item-mismatch" in result.ended and "to Running" in result.ended and seen == []
+    assert "execution-refused" in result.ended and "to Running" in result.ended and seen == []
     assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Failed")]
 
 

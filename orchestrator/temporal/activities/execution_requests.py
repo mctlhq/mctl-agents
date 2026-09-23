@@ -22,7 +22,8 @@ ledger proves one exists under THIS loop's engine ref: the fulfil minted it
 for this loop, and nothing but this loop will ever end it. The item turned
 out to be about another issue, or the advance to `Running` was refused, or
 the engine ref answered with an execution the request does not name: the
-loop must not run it, but it must end it (`Failed`), or it stays
+loop must not run it (`work-item-mismatch`, or `execution-refused` for the
+refused advance), but it must end it (`Failed`), or it stays
 non-terminal and mctl-api refuses every later request for the item. A
 refusal with no execution id proved nothing of this loop's exists (a
 rejected request, another item's request, a fulfil for another engine run).
@@ -57,6 +58,9 @@ BOUND = "bound"
 REQUEST_REJECTED = "rejected"
 #: The store's answer does not describe this loop.
 MISMATCH = "work-item-mismatch"
+#: The execution is this loop's, but mctl-api (or the policy checkpoint)
+#: refused its advance to `Running`: it exists and may not run (stranded).
+EXECUTION_REFUSED_OUTCOME = "execution-refused"
 
 #: Raised while the request is still pending/claimed, so the retry policy
 #: waits for the dispatcher's fulfil.
@@ -173,7 +177,7 @@ async def bind_dispatched_execution(input: BindInput) -> BoundExecution:
         # exists (proven above) but cannot run. Refused, not retried, and
         # stranded: ending an already ended one is a harmless refusal.
         return BoundExecution(
-            MISMATCH,
+            EXECUTION_REFUSED_OUTCOME,
             execution_id=request.execution_id,
             reason=f"advance {request.execution_id} to Running: {attached.reason}",
         )

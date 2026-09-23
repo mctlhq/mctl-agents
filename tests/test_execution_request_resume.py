@@ -401,6 +401,40 @@ async def test_a_delivery_carried_across_continue_as_new_is_bound_once_by_the_ne
     assert [e.execution_id for e in ctx.executions] == [_row(api, f"{loop}#{rid}")["id"]]
 
 
+async def test_a_delivery_carried_with_a_pending_terminal_phase_is_landed_by_the_next_run(api, env):
+    """The previous run decided the resumed execution's phase but its
+    advance never landed, and it hopped: the next run lands the carried
+    phase, binds nothing again, and closes the delivery."""
+    submit, _ = _submit_log()
+    loop = workflow_id_for(URL)
+    _ledger_entry(api, "temporal", loop, "Succeeded")
+    rid = "xr_00000009-0000-4000-8000-000000000461"
+    ref = f"{loop}#{rid}"
+    _ledger_entry(api, "temporal", ref, "Running")
+    carried = MergeWatchResume(
+        service="mctl-telegram",
+        slug="issue-431-dispatch-acceptance",
+        deadline="2099-01-01T00:00:00Z",
+        investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+        implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+        work_item_id=WID,
+        accepted_request_ids=(rid,),
+        open_deliveries=(OpenDelivery(delivery=_delivery(rid), pending_phase="Succeeded"),),
+    )
+    async with _worker(env, submit):
+        await env.client.start_workflow(
+            DevLoopWorkflow.run,
+            IssueRef(issue_url=URL, work_item_id=WID, resume=carried),
+            id=loop,
+            task_queue=TASK_QUEUE,
+        )
+        await _wait_for(lambda: _row(api, ref)["phase"] == "Succeeded")
+        events = await _events(env, loop)
+        await _stop(env, loop)
+
+    assert _binds_for(events, rid) == 0
+
+
 async def test_a_resume_delivered_after_the_implement_step_succeeds_at_once(api, env):
     """No approval gate is left in a merge watch: a fresh resume that
     changes the actor clears the approval, but its execution has no decision
@@ -683,9 +717,36 @@ async def test_a_delivery_whose_advance_to_running_is_refused_ends_its_minted_ex
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED and outcome.engine_ref == ref
 
-        assert await _rejected_delivery(env, loop, rid) == [(rid, "delivery-work-item-mismatch")]
+        assert await _rejected_delivery(env, loop, rid) == [(rid, "delivery-execution-refused")]
         await _wait_for(lambda: _row(api, ref)["phase"] == "Failed")
         await _end(env, loop)
+
+
+async def test_a_terminal_advance_that_outlasts_its_retries_is_kept_open_and_lands_later(api, env):
+    """alice re-approves, but mctl-api does not answer the resumed
+    execution's advance to Succeeded for longer than the whole patient retry
+    policy. The delivery stays open with the phase pending and lands it once
+    the store answers again: never popped with its `we_` still Running."""
+    submit, _ = _submit_log()
+    async with _worker(env, submit):
+        loop = await _park(api, env)
+        rid = api.create_request("resume")
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        ref = f"{loop}#{rid}"
+        await _wait_for(lambda: _row(api, ref)["phase"] == "Running")
+        # One more than DISPATCHED_ADVANCE_RETRY_POLICY's 10 attempts, and then some.
+        api.unavailable_advances["Succeeded"] = 13
+        handle = env.client.get_workflow_handle(loop)
+        await handle.signal(DevLoopWorkflow.approve, {"approver": "alice"})
+        for _ in range(12):
+            if _row(api, ref)["phase"] == "Succeeded":
+                break
+            await env.sleep(timedelta(minutes=30))
+        assert api.unavailable_advances["Succeeded"] == 0
+        assert _row(api, ref)["phase"] == "Succeeded"
+        ctx = await handle.query(DevLoopWorkflow.work_context)
+        assert all(r.execution_request_id != rid for r in ctx.resume_rejections)
+        await _stop(env, loop)
 
 
 # -- refused before any fulfil -------------------------------------------------
