@@ -415,8 +415,10 @@ class Dispatcher:
             actor_id=request.requested_by,
             kind=request.kind,
         )
+        # The same work item id in both halves of the one operation: the
+        # loop's own-start check compares them and fails closed.
         issue = IssueRef(
-            issue_url=issue_url, work_item_id=item.work_item_id, execution_request_id=request.request_id
+            issue_url=issue_url, work_item_id=request.work_item_id, execution_request_id=request.request_id
         )
         answer = await self._temporal.deliver(issue, delivery)
         ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": loop}

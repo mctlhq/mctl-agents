@@ -1480,7 +1480,9 @@ class DevLoopWorkflow:
         loop id is the issue's and shared by every run, so "the loop is
         running" no longer proves the run that holds the execution is. A
         later run that never took the request never ends its execution."""
-        return request_id == self._start_request_id or request_id in self._accepted_request_ids
+        # Never True for "": a loop that was not dispatched has an empty
+        # start request id, and a spurious yes shields a stranded execution.
+        return bool(request_id) and (request_id == self._start_request_id or request_id in self._accepted_request_ids)
 
     @workflow.query
     def implement_execution(self) -> ImplementExecutionState:

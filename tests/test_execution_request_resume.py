@@ -889,6 +889,23 @@ def test_the_validator_takes_the_run_s_own_start_request_before_run_has_its_stat
     assert wf._accepted_request_ids == {"xr_1"} and wf._open_deliveries == {}
 
 
+@pytest.mark.parametrize(
+    ("issue", "request_id", "held"),
+    [
+        (IssueRef(issue_url=URL), "", False),
+        (IssueRef(issue_url=URL, work_item_id=WID, execution_request_id="xr_1"), "", False),
+        (IssueRef(issue_url=URL, work_item_id=WID, execution_request_id="xr_1"), "xr_1", True),
+        (IssueRef(issue_url=URL), "xr_1", False),
+    ],
+    ids=["intake-empty", "dispatched-empty", "own-start", "intake-other"],
+)
+def test_a_run_vouches_only_for_a_request_it_took(issue, request_id, held):
+    """`holds_execution_request` is what stops the reconciliation from
+    failing a stranded execution, so it must never say yes by accident; in
+    particular not for "", which equals an intake loop's empty start id."""
+    assert DevLoopWorkflow(issue).holds_execution_request(request_id) is held
+
+
 def test_the_validator_accepts_mctl_apis_default_surface_api():
     """A resume made straight on mctl-api carries its default surface `api`
     (`defaultWorkItemSurface`); since #481 that is in the closed vocabulary,
