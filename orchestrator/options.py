@@ -959,7 +959,6 @@ def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     return dirs
 
 
-
 def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
     """Every SDK session's options in this module pass through here.
 

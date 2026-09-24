@@ -352,6 +352,24 @@ def test_every_failed_delivery_is_logged_with_the_running_count(caplog):
     assert "3 record(s) undelivered" in lines[1]
 
 
+def test_a_padded_base_url_is_normalised_not_refused():
+    """A trailing newline from a template must not read as "not https" and
+    silently switch recording off everywhere."""
+    rec = usage_ledger.UsageRecorder.from_env(
+        "implementer", {usage_ledger.TOKEN_ENV: TOKEN, usage_ledger.BASE_URL_ENV: "  https://api.mctl.ai/\n"}
+    )
+    assert rec.enabled is True
+    assert rec._url == "https://api.mctl.ai/api/v1/usage/records"
+
+
+def test_a_recorder_that_cannot_be_built_never_fails_the_run(monkeypatch, tmp_path):
+    def broken(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("usage ledger bug")
+
+    monkeypatch.setattr(usage_ledger.UsageRecorder, "from_env", broken)
+    _run_investigator_agent(tmp_path, monkeypatch, [_result("u1", {OPUS: _usage(1, 2)})])  # must not raise
+
+
 @pytest.mark.parametrize("base_url", ["http://api.mctl.ai", "api.mctl.ai", "ftp://api.mctl.ai"])
 def test_the_token_is_never_sent_to_a_non_https_url(monkeypatch, caplog, base_url):
     sent: list[Any] = []

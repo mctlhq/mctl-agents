@@ -345,7 +345,7 @@ Two consequences for delivery:
 - The delta baseline advances only when a batch may have been stored. A
   batch that certainly was not stored (no connection, or an HTTP error: the
   ingest is one transaction) is carried by the next turn's delta rather than
-  lost.
+  lost. "May have been stored" is sticky across the retry attempts.
 - A batch whose answer was lost advances the baseline, because a double count
   is the worse error.
 

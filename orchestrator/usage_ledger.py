@@ -237,7 +237,7 @@ class UsageRecorder:
         return cls(
             agent,
             token=env.get(TOKEN_ENV, ""),
-            base_url=env.get(BASE_URL_ENV, "") or DEFAULT_BASE_URL,
+            base_url=env.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL,
             correlation={**found, **correlation},
         )
 

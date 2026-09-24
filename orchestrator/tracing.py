@@ -1005,14 +1005,19 @@ class agent_run:
     every driver already hands its whole SDK stream to."""
 
     def __init__(self, agent: str, model: str | None) -> None:
-        # Deferred: usage_ledger imports httpx, and this module keeps its
-        # top level to the standard library.
-        from orchestrator import usage_ledger
-
         self._agent = agent
         self._model = model
         self._span_cm: Any = None
-        self._usage = usage_ledger.UsageRecorder.from_env(agent)
+        self._usage: Any = None
+        # Guarded like everything else here: usage recording must not fail
+        # the run it records (rule 2 above). Deferred: usage_ledger imports
+        # httpx, and this module keeps its top level to the standard library.
+        try:
+            from orchestrator import usage_ledger
+
+            self._usage = usage_ledger.UsageRecorder.from_env(agent)
+        except Exception as exc:  # noqa: BLE001
+            _warn_once("usage", "usage recording unavailable for this run (%s)", type(exc).__name__)
         self._observer: AgentRunObserver = _NoopObserver(self._usage)
 
     def __enter__(self) -> AgentRunObserver:
