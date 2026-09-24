@@ -376,6 +376,37 @@ def test_a_policy_decision_is_an_event_with_rule_decision_and_code(exported, cap
     assert "POLICY_DECISION" in capsys.readouterr().out
 
 
+def test_a_granted_approval_decision_carries_approver_and_timestamp_through_export(exported):
+    """mctl-agents#198: `approval_ref`, `approver` and `decided_at` reach the
+    real exported span — proving they survive `tracing_sdk.GuardedExporter`'s
+    redaction, not just the in-process event call."""
+
+    class _GrantedLookup:
+        def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
+            return policy_checkpoint.ApprovalOutcome(
+                policy_checkpoint.APPROVAL_GRANTED, approval_ref="aar_deadbeef",
+                reason="approved by github:root", decided_by="github:root",
+            )
+
+    with tracing.span("pod"):
+        decision = policy_checkpoint.checkpoint(
+            policy_checkpoint.MCP_TOOL_CALL,
+            "mcp__mctl__mctl_deploy_service",
+            "mctl",
+            {"service": "web"},
+            grants=("mcp__mctl__*",),
+            approvals=_GrantedLookup(),
+        )
+    assert decision.permitted and decision.approver == "github:root" and decision.decided_at
+
+    (span,) = exported.get_finished_spans()
+    (event,) = [e for e in span.events if e.name == tracing.POLICY_DECISION_EVENT]
+    attributes = dict(event.attributes)
+    assert attributes["mctl.policy.approval_ref"] == "aar_deadbeef"
+    assert attributes["mctl.approval.approver"] == "github:root"
+    assert attributes["mctl.approval.decided_at"] == decision.decided_at
+
+
 def test_a_published_proposal_records_one_artifact_event_per_file(exported, tmp_path):
     for name in (*run_issue_investigator.TRIPLET, run_issue_investigator.STATUS_FILENAME):
         (tmp_path / name).write_text(PROMPT_MARKER)

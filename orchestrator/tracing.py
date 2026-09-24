@@ -612,6 +612,9 @@ def record_policy_decision(
     policy_version: str,
     action_kind: str,
     operation: str,
+    approval_ref: str = "",
+    approver: str = "",
+    decided_at: str = "",
 ) -> None:
     """A policy checkpoint decision, as an event on the current span.
 
@@ -619,7 +622,14 @@ def record_policy_decision(
     the free-form reason text, which can quote an exception), the policy
     version and the action's kind and operation. Never the target (it can
     be a URL with a path) and never the arguments (only ever a digest in
-    the audit record, and not even that here)."""
+    the audit record, and not even that here).
+
+    `approval_ref`, `approver` and `decided_at` (mctl-agents#198) are the
+    durable-approval fields: `approval_ref` names the receipt whenever one
+    exists (pending, denied, expired or consumed, not only granted);
+    `approver` is `ApprovalRecord.decided_by` when the store names one, and
+    `decided_at` the moment this process observed that decision. All three
+    are empty for a decision that never reached a human."""
     if not _state.enabled:
         return
     current().event(
@@ -631,6 +641,9 @@ def record_policy_decision(
             "mctl.policy.version": policy_version,
             "mctl.policy.action_kind": action_kind,
             "mctl.policy.operation": operation,
+            "mctl.policy.approval_ref": approval_ref,
+            "mctl.approval.approver": approver,
+            "mctl.approval.decided_at": decided_at,
         },
     )
 

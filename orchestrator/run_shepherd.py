@@ -99,7 +99,8 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator import policy_checkpoint
+from orchestrator import approval_ticket, policy_checkpoint, proposal_state
+from orchestrator.action_approvals import ActionApprovalClient
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
@@ -608,6 +609,13 @@ SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
 #   was registered as a DevLoop service; registering it is what makes the
 #   fix-only default load-bearing rather than theoretical.
 NEVER_MERGE_SERVICES = frozenset({"mctl-academy", "mctl-gitops", ".github"})
+
+# A merge parked on a human approval (mctl-agents#198,
+# docs/adr/016-human-approval-checkpoints.md) that keeps getting denied stops
+# being retried after this many denials of the SAME receipt and goes to
+# `needs-triage` instead — mirrors IMPLEMENT_MAX_POLICY_HANDBACKS, so a
+# stuck human decision surfaces to an operator rather than polling forever.
+MERGE_APPROVAL_DENIAL_LIMIT = 3
 
 # Per-service mode: FULL discovers/fixes/merges; FIX_ONLY discovers and fixes
 # but never merges (merge is owned by another PR lifecycle, e.g. pr-steward);
@@ -2571,13 +2579,161 @@ def trigger_review(pr: PRSnapshot) -> None:
 # ---------------------------------------------------------------------------
 # Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
 # ---------------------------------------------------------------------------
-def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
+def _approvals_for_attempt(attempt: int) -> policy_checkpoint.ApprovalLookup | None:
+    """The configured approval store, re-asking with `attempt`
+    (mctl-agents#198): mctl-api answers a replayed idempotency key with the
+    stored request whatever its state, so a same-head expiry needs a
+    bumped attempt to ever get a fresh, human-decidable request rather than
+    the same expired receipt echoed back. `None` (the checkpoint's own
+    default) when the store cannot be built or does not support attempts —
+    never raises."""
+    try:
+        base = policy_checkpoint.configured_approvals()
+    except Exception:  # noqa: BLE001 — fall through to the checkpoint's own default handling
+        return None
+    for_attempt = getattr(base, "for_attempt", None)
+    return for_attempt(attempt) if callable(for_attempt) else base
+
+
+def _park_merge_approval(
+    ref: ProposalRef,
+    pr_ref: str,
+    request: policy_checkpoint.ActionRequest,
+    decision: policy_checkpoint.Decision,
+    denials: int,
+    attempt: int,
+    *,
+    artifact_ref: str,
+) -> None:
+    """Build and persist the `ApprovalTicket` for a decision whose
+    `awaiting_approval` is true, and log `APPROVAL_PARKED`.
+
+    One read-only `ActionApprovalClient.get()` — the read the ticket needs —
+    and never a write: the receipt itself was already created by the
+    checkpoint's own redeem(). Never raises: a ticket that cannot be built
+    this tick is retried next tick exactly like any other `wait`.
+    """
+    try:
+        answer = ActionApprovalClient().get(decision.approval_ref)
+    except Exception as exc:  # noqa: BLE001 — parking a ticket must never crash the tick
+        print(f"warn: could not read approval {decision.approval_ref} to park it: {type(exc).__name__}: {exc}")
+        return
+    if answer.record is None:
+        print(f"warn: could not read approval {decision.approval_ref} to park it: {answer.reason or answer.status}")
+        return
+    ticket = approval_ticket.ticket_from(decision, request, answer.record, artifact_ref=artifact_ref)
+    update_status(ref, ref.status, approval=proposal_state.approval_payload(ticket, denials=denials, attempt=attempt))
+    print(f"APPROVAL_PARKED pr={pr_ref} ref={decision.approval_ref} trace_id={request.trace_id}")
+
+
+def _resolve_parked_merge_refusal(
+    ref: ProposalRef,
+    pr_ref: str,
+    ticket: approval_ticket.ApprovalTicket | None,
+    denials: int,
+    attempt: int,
+    decision: policy_checkpoint.Decision,
+) -> None:
+    """Persisted-state side effects for a parked merge's non-pending,
+    non-granted outcome (design.md §3's outcome table).
+
+    `approval_lookup_error` is deliberately not handled here: it changes
+    nothing on disk, so the receipt's own deadline — not a lookup hiccup —
+    decides the ticket's fate. `approval_consumed` is handled by the caller
+    before this is ever reached (it reconciles instead of touching the
+    ticket state machine at all).
+    """
+    if decision.code == policy_checkpoint.CODE_APPROVAL_DENIED:
+        new_denials = denials + 1
+        if new_denials >= MERGE_APPROVAL_DENIAL_LIMIT:
+            update_status(
+                ref, "needs-triage",
+                approval=proposal_state.approval_payload(None, denials=new_denials, attempt=attempt),
+                failure={
+                    "code": "approval-denied",
+                    "stage": "merge",
+                    "message": (
+                        f"merge approval denied {new_denials} time(s); a human must "
+                        "re-approve or close the PR"
+                    ),
+                },
+            )
+            print(
+                f"APPROVAL_DENIED pr={pr_ref} ref={decision.approval_ref} "
+                f"denials={new_denials} action=needs-triage"
+            )
+        else:
+            update_status(
+                ref, ref.status,
+                approval=proposal_state.approval_payload(ticket, denials=new_denials, attempt=attempt),
+            )
+            print(f"APPROVAL_DENIED pr={pr_ref} ref={decision.approval_ref} denials={new_denials}")
+        return
+    if decision.code == policy_checkpoint.CODE_APPROVAL_EXPIRED:
+        # Same intent, same idempotency key: without a bumped attempt the
+        # next create-or-find call would just get this same expired receipt
+        # back (action_approvals.idempotency_key's documented behaviour).
+        update_status(ref, ref.status, approval=proposal_state.approval_payload(None, attempt=attempt + 1))
+        print(f"APPROVAL_CLEARED pr={pr_ref} ref={decision.approval_ref} code={decision.code}")
+        return
+    if decision.code == policy_checkpoint.CODE_APPROVAL_INTENT_MISMATCH:
+        # The head moved: a fresh head is a fresh intent (a different
+        # idempotency key) regardless of attempt, so there is nothing to bump.
+        update_status(ref, ref.status, approval=proposal_state.approval_payload(None))
+        print(f"APPROVAL_CLEARED pr={pr_ref} ref={decision.approval_ref} code={decision.code}")
+        return
+
+
+def _reconcile_consumed_merge(
+    ref: ProposalRef, pr: PRSnapshot, pr_ref: str, denials: int, attempt: int
+) -> tuple[bool, str | None]:
+    """A spent receipt never authorizes a second effect (ADR 014 §6): a
+    crash between consume and the side effect burns the approval without
+    acting, and this never re-merges to compensate. Instead it asks GitHub
+    what actually happened, exactly once — the same canonical-state re-read
+    `orchestrator/pr_adoption.py` uses (`_fetch_pr_snapshot`) — and always
+    clears the stale ticket so a merge that never landed can request a
+    fresh approval on a later tick.
+
+    `denials` is carried forward unchanged and `attempt` is bumped by one,
+    not reset to 0 — the same idempotency-key reasoning as the expired-decision
+    path above: a same-head retry with a stale attempt would just get this
+    same consumed receipt back, and dropping `denials` would let a proposal
+    that already burned through repeated human denials look freshly parked,
+    re-arming the same livelock this counter exists to prevent.
+    """
+    snap = _fetch_pr_snapshot(pr.repo, pr.number)
+    update_status(
+        ref, ref.status,
+        approval=proposal_state.approval_payload(None, denials=denials, attempt=attempt + 1),
+    )
+    if snap is not None and snap.merged:
+        print(f"APPROVAL_RESUMED pr={pr_ref} ref=consumed reconciled=merged")
+        return (True, snap.merge_commit)
+    print(
+        f"warn: {pr_ref}: approval already consumed but GitHub does not show it merged; "
+        "ticket cleared, a new approval may be requested"
+    )
+    return (False, None)
+
+
+def merge_pr(pr: PRSnapshot, ref: ProposalRef | None = None) -> tuple[bool, str | None]:
     """Invoke `gh pr merge --merge --delete-branch --match-head-commit <SHA>`.
 
     Returns (success, merge_commit_oid). On HEAD-SHA mismatch the gh
     CLI exits non-zero — callers SHALL treat that as transient `wait`
     so the next tick re-evaluates the new head (a push that landed
     between review and merge cannot smuggle unreviewed code through).
+
+    `ref`, when given, is the proposal this PR belongs to (mctl-agents#198,
+    docs/adr/016-human-approval-checkpoints.md): it is what lets a
+    REQUIRE_APPROVAL decision park durably in `.status.yaml` — building an
+    `ApprovalTicket`, logging `APPROVAL_PARKED` — instead of only blocking,
+    and what lets a later tick resume through
+    `checkpoint(..., approval_ref=...)`. Without it (every direct call in
+    this module's own tests, which never park) a decision that would park
+    is refused instead, exactly as it was before this feature existed:
+    `merge_pr`'s `(False, None)` refusal contract is unchanged either way.
     """
     service = pr.repo.split("/")[-1]
     if service in NEVER_MERGE_SERVICES:
@@ -2595,21 +2751,76 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
         "--match-head-commit", pr.head_sha,
         pr_ref,
     ]
-    # The policy checkpoint (#197), immediately before the merge: a refusal
-    # is answered like any other failed merge, as `wait`, and `gh` never
-    # runs. The head SHA is in the arguments, so an approval for one head
-    # never merges another.
-    try:
-        policy_checkpoint.require(policy_checkpoint.checkpoint(
-            policy_checkpoint.GITHUB_PR_MERGE,
-            "merge",
-            pr_ref,
-            {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
-            metadata={"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha},
-        ))
-    except policy_checkpoint.PolicyRefused as e:
-        print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
+    args = {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha}
+    metadata = {"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha}
+
+    status_data = _load_status(ref.status_path) if ref is not None else {}
+    ticket, denials, attempt = proposal_state.read_approval(status_data)
+    approval_ref = ticket.approval_ref if ticket is not None else ""
+    checkpoint_kwargs: dict[str, Any] = {"metadata": metadata, "approval_ref": approval_ref}
+    if ticket is None and attempt > 0:
+        approvals = _approvals_for_attempt(attempt)
+        if approvals is not None:
+            checkpoint_kwargs["approvals"] = approvals
+
+    # The policy checkpoint (#197/#198), immediately before the merge: a
+    # refusal is answered like any other failed merge, as `wait`, and `gh`
+    # never runs. The head SHA is in the arguments, so an approval for one
+    # head never merges another.
+    decision = policy_checkpoint.checkpoint(
+        policy_checkpoint.GITHUB_PR_MERGE, "merge", pr_ref, args, **checkpoint_kwargs,
+    )
+
+    if decision.awaiting_approval:
+        if ref is not None:
+            if ticket is not None and ticket.approval_ref == decision.approval_ref:
+                # Already parked this exact receipt on a prior tick: parking
+                # again would cost a redundant `ActionApprovalClient.get()`,
+                # rewrite `.status.yaml` for no state change, and restamp
+                # `updated_at` as though this were a fresh park. Still
+                # pending is still parked -- nothing to do until the
+                # decision changes.
+                print(f"APPROVAL_STILL_PENDING pr={pr_ref} ref={decision.approval_ref}")
+            else:
+                # `request_for` is pure (it only re-reads the local execution
+                # identity file); calling it again with the same arguments
+                # reproduces the SAME request `checkpoint()` just decided
+                # against, never a new decision.
+                request = policy_checkpoint.request_for(
+                    policy_checkpoint.GITHUB_PR_MERGE, "merge", pr_ref, args, metadata=metadata,
+                )
+                if isinstance(request, policy_checkpoint.ActionRequest):
+                    _park_merge_approval(ref, pr_ref, request, decision, denials, attempt, artifact_ref=pr.head_sha)
+                else:
+                    print(f"warn: not merging {pr.repo}#{pr.number}: could not rebuild the action to park it")
+        else:
+            print(
+                f"warn: not merging {pr.repo}#{pr.number}: awaiting approval "
+                f"{decision.approval_ref}, nothing to park (no proposal ref)"
+            )
         return (False, None)
+
+    if not decision.permitted:
+        if decision.code == policy_checkpoint.CODE_APPROVAL_CONSUMED and ref is not None:
+            return _reconcile_consumed_merge(ref, pr, pr_ref, denials, attempt)
+        if ref is not None:
+            _resolve_parked_merge_refusal(ref, pr_ref, ticket, denials, attempt, decision)
+        print(
+            f"warn: not merging {pr.repo}#{pr.number}: "
+            f"policy {decision.verdict} ({decision.code}): {decision.reason}"
+        )
+        return (False, None)
+
+    if ref is not None and ticket is not None:
+        # The receipt is already consumed in mctl-api by the permitted
+        # decision above, whether or not the `gh` call below succeeds — so
+        # the ticket is cleared here, unconditionally, not after the merge.
+        update_status(
+            ref, ref.status,
+            approval=proposal_state.approval_payload(None, denials=denials, attempt=attempt + 1),
+        )
+        print(f"APPROVAL_RESUMED pr={pr_ref} ref={decision.approval_ref}")
+
     # Bypasses _run() (this is the one gh call this module makes outside
     # that wrapper), so it needs its own refresh: merge_pr() typically fires
     # after a review/fix cycle long enough to have crossed the token's
@@ -3213,9 +3424,19 @@ def process_one(
                 decision="defer-merge",
                 notes=f"merge owned by {owner}",
             )
-        ok, merge_commit = merge_pr(pr)
+        ok, merge_commit = merge_pr(pr, ref)
         if not ok:
-            # Transient: HEAD-SHA mismatch or branch-protection rejection.
+            # merge_pr already wrote `needs-triage` itself (repeated human
+            # denial of the same parked approval, mctl-agents#198) — reflect
+            # that terminal move here rather than reporting a generic wait.
+            if ref.status == "needs-triage":
+                return ShepherdResult(
+                    ref=ref,
+                    decision="needs-triage",
+                    notes="merge approval denied; human triage required",
+                )
+            # Transient: HEAD-SHA mismatch, branch-protection rejection, or a
+            # merge parked awaiting a human approval.
             return ShepherdResult(
                 ref=ref,
                 decision="wait",

@@ -47,6 +47,7 @@ import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from orchestrator.context_snapshot import canonical_json, hash_bytes
@@ -171,6 +172,16 @@ class Decision:
     rule_id: str
     action_digest: str
     approval_ref: str = ""
+    #: The human who decided the receipt named by `approval_ref`
+    #: (`ApprovalRecord.decided_by`), when the store names one. Empty for
+    #: every decision that never reached a human — including a plain
+    #: `REQUIRE_APPROVAL` block with no approval store configured.
+    approver: str = ""
+    #: When this process observed that decision, RFC3339 UTC. Not mctl-api's
+    #: own decision timestamp (the store does not carry one yet) — the
+    #: moment the checkpoint recorded it, which is what "time to decision"
+    #: on the trace (mctl-agents#198) needs.
+    decided_at: str = ""
 
     @property
     def permitted(self) -> bool:
@@ -230,6 +241,11 @@ class ApprovalOutcome:
     status: str
     approval_ref: str = ""
     reason: str = ""
+    #: `ApprovalRecord.decided_by`, when the receipt this outcome is about
+    #: names one. Empty when the store never reached a human (no store, a
+    #: transport failure) or when the receipt found does not describe this
+    #: action (a mismatch never attributes a stranger's approval to it).
+    decided_by: str = ""
 
 
 class ApprovalLookup(Protocol):
@@ -389,28 +405,36 @@ def _verdict_for(code: str) -> str:
 
 def _redeem(
     approvals: ApprovalLookup, request: ActionRequest, rule_id: str, policy_version: str, approval_ref: str,
-) -> tuple[str, str, str]:
-    """(code, reason, approval ref) of the approval step. Fails closed:
-    anything but a well-formed GRANTED with a ref is a refusal."""
+) -> tuple[str, str, str, str, str]:
+    """(code, reason, approval ref, approver, decided_at) of the approval
+    step. Fails closed: anything but a well-formed GRANTED with a ref is a
+    refusal."""
     try:
         outcome = approvals.redeem(request, rule_id=rule_id, policy_version=policy_version,
                                    approval_ref=approval_ref)
     except Exception as exc:  # noqa: BLE001 — an unreadable approval store is no approval
-        return CODE_APPROVAL_LOOKUP_ERROR, f"approval lookup failed: {type(exc).__name__}", ""
+        return CODE_APPROVAL_LOOKUP_ERROR, f"approval lookup failed: {type(exc).__name__}", "", "", ""
     status = getattr(outcome, "status", None)
     ref = str(getattr(outcome, "approval_ref", "") or "")
     detail = str(getattr(outcome, "reason", "") or "")
+    approver = str(getattr(outcome, "decided_by", "") or "")
+    # A wall-clock stamp of when THIS process observed a human decision —
+    # only meaningful once a human has actually decided something.
+    decided_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z") if approver else ""
     code = _APPROVAL_CODES.get(status, CODE_APPROVAL_LOOKUP_ERROR) if isinstance(status, str) else \
         CODE_APPROVAL_LOOKUP_ERROR
     if code == CODE_APPROVED and not ref:
-        return CODE_APPROVAL_LOOKUP_ERROR, "approval lookup granted without naming a receipt", ""
+        return CODE_APPROVAL_LOOKUP_ERROR, "approval lookup granted without naming a receipt", "", "", ""
     if code == CODE_APPROVED:
-        return code, f"rule {rule_id}: approval {ref} consumed for this action", ref
+        return code, f"rule {rule_id}: approval {ref} consumed for this action", ref, approver, decided_at
     if code == CODE_APPROVAL_REQUIRED:
-        return code, f"rule {rule_id}: needs an approval bound to {request.action_digest()}", ref
+        return code, f"rule {rule_id}: needs an approval bound to {request.action_digest()}", ref, approver, decided_at
     if code == CODE_APPROVAL_LOOKUP_ERROR:
-        return code, f"approval lookup failed: {detail or status}", ref
-    return code, f"rule {rule_id}: {code}{f' ({ref})' if ref else ''}{f': {detail}' if detail else ''}", ref
+        return code, f"approval lookup failed: {detail or status}", ref, approver, decided_at
+    return (
+        code, f"rule {rule_id}: {code}{f' ({ref})' if ref else ''}{f': {detail}' if detail else ''}",
+        ref, approver, decided_at,
+    )
 
 
 def decide(
@@ -446,16 +470,18 @@ def decide(
                             policy.version, "", digest)
         emit(request, decision)
         return decision
-    ref = ""
+    ref, approver, decided_at = "", "", ""
     if code == CODE_APPROVAL_REQUIRED:
         try:
             lookup = approvals if approvals is not None else configured_approvals()
         except Exception as exc:  # noqa: BLE001 — a store that cannot be built is no approval
             code, reason = CODE_APPROVAL_LOOKUP_ERROR, f"approval store unavailable: {type(exc).__name__}"
         else:
-            code, reason, ref = _redeem(lookup, request, rule.rule_id if rule else "", policy.version, approval_ref)
+            code, reason, ref, approver, decided_at = _redeem(
+                lookup, request, rule.rule_id if rule else "", policy.version, approval_ref
+            )
     decision = Decision(_verdict_for(code), code, reason, policy.version, rule.rule_id if rule else "",
-                        digest, ref)
+                        digest, ref, approver, decided_at)
     emit(request, decision)
     return decision
 
@@ -500,6 +526,8 @@ def decision_record(request: ActionRequest, decision: Decision) -> dict[str, Any
         "code": decision.code,
         "reason": decision.reason,
         "approval_ref": decision.approval_ref,
+        "approver": decision.approver,
+        "decided_at": decision.decided_at,
     }
 
 
@@ -509,10 +537,12 @@ def emit(request: ActionRequest, decision: Decision) -> None:
     raises.
 
     The span event carries the bounded fields only — rule, verdict, code,
-    policy version, action kind and operation. Not the target, not the free
-    text `reason`, not even the args digest: the log line above is the audit
-    record, the event is how a trace shows where in the run the decision
-    fell. `orchestrator.tracing` is imported here rather than at module scope
+    policy version, action kind, operation, and, for an approval-flow
+    decision (mctl-agents#198), the approval ref, the approver identity and
+    the decision timestamp. Not the target, not the free text `reason`, not
+    even the args digest: the log line above is the audit record, the event
+    is how a trace shows where in the run the decision fell.
+    `orchestrator.tracing` is imported here rather than at module scope
     to keep this module's import stdlib-only by construction, and it is a
     no-op unless tracing is configured."""
     try:
@@ -529,6 +559,9 @@ def emit(request: ActionRequest, decision: Decision) -> None:
             policy_version=decision.policy_version,
             action_kind=request.action_kind,
             operation=request.operation,
+            approval_ref=decision.approval_ref,
+            approver=decision.approver,
+            decided_at=decision.decided_at,
         )
     except Exception:  # noqa: BLE001, S110 — same rule: tracing never fails the action
         pass

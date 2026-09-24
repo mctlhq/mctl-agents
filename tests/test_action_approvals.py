@@ -301,6 +301,48 @@ def test_the_permitted_decision_names_the_spent_receipt(api, clock):
     assert (d.verdict, d.code, d.permitted, d.approval_ref) == (pc.REQUIRE_APPROVAL, pc.CODE_APPROVED, True, ref)
 
 
+def test_a_granted_decision_records_the_approver_and_a_decision_timestamp(api, clock):
+    """mctl-agents#198: the audit trail names who decided a consumed receipt,
+    and when this process observed it."""
+    lookup = _lookup(api, clock)
+    ref = _approved(api, lookup)
+    d = _deploy(lookup, ARGS)
+    assert d.permitted and d.approval_ref == ref
+    assert d.approver == "github:root"
+    assert d.decided_at  # non-empty; exact format is decision_record's business
+
+
+def test_a_denied_decision_still_names_the_approver(api, clock):
+    """A human denial is still a human decision worth attributing, even
+    though it refuses."""
+    lookup = _lookup(api, clock)
+    ref = _deploy(lookup, ARGS).approval_ref
+    api.decide(ref, "deny")
+    d = _deploy(lookup, ARGS)
+    assert d.code == pc.CODE_APPROVAL_DENIED and not d.permitted
+    assert d.approver == "github:root"
+    assert d.decided_at
+
+
+def test_a_pending_decision_names_no_approver(api, clock):
+    lookup = _lookup(api, clock)
+    d = _deploy(lookup, ARGS)
+    assert d.code == pc.CODE_APPROVAL_PENDING
+    assert d.approver == "" and d.decided_at == ""
+
+
+def test_a_mismatch_never_attributes_a_strangers_approval(api, clock):
+    """The receipt found belongs to a DIFFERENT intent; its approver must
+    never be attached to the action being decided now."""
+    lookup = _lookup(api, clock)
+    ref = _approved(api, lookup)
+    other = {**api.records[ref], "intent_hash": "sha256:" + "0" * 64}
+    api.override["create"] = api.override["get"] = lambda req: api._ok(200, other)
+    d = _deploy(lookup, ARGS)
+    assert d.code == pc.CODE_APPROVAL_INTENT_MISMATCH
+    assert d.approver == "" and d.decided_at == ""
+
+
 def test_changed_args_against_the_approved_receipt_is_a_mismatch_and_consumes_nothing(api, clock):
     lookup = _lookup(api, clock)
     ref = _approved(api, lookup)
