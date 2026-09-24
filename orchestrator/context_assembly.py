@@ -32,6 +32,7 @@ never authorization".
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -1152,17 +1153,14 @@ class SnapshotNotPersisted(RuntimeError):
 
 
 def _emit_snapshot_answer(step: str, answer: Any) -> None:
-    import json
-
-    print(
-        "WORK_CONTEXT_SNAPSHOT "
-        + json.dumps(
-            {"step": step, "verdict": answer.verdict, "snapshot_id": answer.snapshot_id,
-             "content_hash": answer.content_hash, "reason": answer.reason},
-            sort_keys=True,
-        ),
-        flush=True,
-    )
+    line = {"step": step, "verdict": answer.verdict, "snapshot_id": answer.snapshot_id,
+            "content_hash": answer.content_hash, "reason": answer.reason}
+    # A replay decided by comparing documents names both sides, so one line
+    # correlates this attempt's snapshot with the stored one (#455 item 9).
+    if answer.local_snapshot_id or answer.local_content_hash:
+        line["local_snapshot_id"] = answer.local_snapshot_id
+        line["local_content_hash"] = answer.local_content_hash
+    print("WORK_CONTEXT_SNAPSHOT " + json.dumps(line, sort_keys=True), flush=True)
 
 
 def _work_context_active(work_context: WorkContextRef | None) -> bool:

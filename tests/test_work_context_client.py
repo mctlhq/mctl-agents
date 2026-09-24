@@ -149,6 +149,66 @@ def test_a_ledger_newer_than_the_view_is_unknown(monkeypatch: pytest.MonkeyPatch
     assert answer.verdict == WORK_ITEM_UNKNOWN
 
 
+def _sequenced(*handlers: Any) -> Any:
+    """One route handler per view+ledger read pair, in order; records every
+    URL it served."""
+    pairs = list(handlers)
+    seen: list[str] = []
+
+    def _handle(req: Any) -> Any:
+        seen.append(req.full_url)
+        return pairs[(len(seen) - 1) // 2](req)
+
+    _handle.seen = seen  # type: ignore[attr-defined]
+    return _handle
+
+
+def test_a_view_ledger_mismatch_is_read_again_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#455 item 3: an execution attached between the two reads is answered
+    by one re-read of both, not by UNKNOWN straight away."""
+    raced = _routes(_fixture("get-waiting.json"), _fixture("executions-two.json"))
+    settled = _routes(VIEW, _fixture("executions-two.json"))
+    handler = _sequenced(raced, settled)
+    paused: list[float] = []
+    monkeypatch.setattr(work_context_client.time, "sleep", paused.append)
+    answer = _client(monkeypatch, handler).get(WID)
+    assert answer.verdict == WORK_ITEM_FOUND, answer.reason
+    assert [e.sequence for e in answer.item.executions] == [1, 2]
+    assert len(handler.seen) == 4
+    # The re-read waits first, so it observes a later moment.
+    assert paused == [work_context_client.WorkItemClient.RE_READ_PAUSE_S] and paused[0] > 0
+
+
+def test_the_re_read_is_bounded_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(work_context_client.time, "sleep", lambda _s: None)
+    raced = _routes(_fixture("get-waiting.json"), _fixture("executions-two.json"))
+    handler = _sequenced(raced, raced, raced)
+    answer = _client(monkeypatch, handler).get(WID)
+    assert answer.verdict == WORK_ITEM_UNKNOWN and "read again" in answer.reason
+    assert len(handler.seen) == 4
+
+
+def test_no_re_read_on_anything_but_the_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    paused: list[float] = []
+    monkeypatch.setattr(work_context_client.time, "sleep", paused.append)
+    handler = _routes(VIEW, _http_error(503, {"error": "store down"}))
+    answer = _client(monkeypatch, handler).get(WID)
+    assert answer.verdict == WORK_ITEM_UNKNOWN and len(handler.seen) == 2 and paused == []
+
+
+def test_an_unreadable_latest_execution_with_an_empty_ledger_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#455 item 2: the view names a latest execution but its id cannot be
+    read; with an empty ledger that must not classify FOUND."""
+    view = _fixture("get-active-no-executions.json")
+    for latest in ({}, {"id": ""}, {"id": 7}, "we_x"):
+        broken = {**view, "latest_execution": latest}
+        answer = _client(monkeypatch, _routes(broken, _fixture("executions-empty.json"))).get(
+            view["work_item"]["id"]
+        )
+        assert answer.verdict == WORK_ITEM_UNKNOWN, latest
+        assert "no readable id" in answer.reason
+
+
 def test_an_answer_about_another_work_item_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = _routes(VIEW, _fixture("executions-two.json"))
     answer = _client(monkeypatch, handler).get("wi_other")

@@ -65,6 +65,12 @@ class SnapshotAnswer:
     snapshot_id: str = ""
     content_hash: str = ""
     reason: str = ""
+    #: On a replay decided by comparing documents (`persist` after a 409):
+    #: this attempt's own snapshot id and content hash, next to the stored
+    #: ones above, so one log line correlates both (#455 item 9). Empty
+    #: otherwise.
+    local_snapshot_id: str = ""
+    local_content_hash: str = ""
     #: On a read: the stored document, decoded, or None when it does not
     #: decode. Compared by `persist` after a 409; never logged.
     stored_document: dict[str, Any] | None = field(default=None, compare=False, repr=False)
@@ -129,14 +135,21 @@ def _is_snapshot_id(value: Any) -> TypeGuard[str]:
     )
 
 
-def answer_from_seal(status: int, payload: dict[str, Any], *, content_hash: str, execution_id: str) -> SnapshotAnswer:
+def answer_from_seal(
+    status: int, payload: dict[str, Any], *, work_item_id: str, content_hash: str, execution_id: str
+) -> SnapshotAnswer:
     """Classify mctl-api's answer to a seal. A 2xx counts only when it
-    describes exactly the bytes and execution that were sent."""
+    describes exactly the bytes, execution and work item that were sent
+    (the work item as in `answer_from_read`, #455 item 6)."""
     code = payload.get("code")
     if status in (200, 201):
         snap = _snapshot_of(payload)
         sid = snap.get("id")
-        describes_ours = snap.get("content_hash") == content_hash and snap.get("execution_id") == execution_id
+        describes_ours = (
+            snap.get("content_hash") == content_hash
+            and snap.get("execution_id") == execution_id
+            and snap.get("work_item_id") == work_item_id
+        )
         if not _is_snapshot_id(sid) or not describes_ours:
             return SnapshotAnswer(
                 SNAPSHOT_UNKNOWN, content_hash=content_hash,
@@ -153,12 +166,20 @@ def answer_from_seal(status: int, payload: dict[str, Any], *, content_hash: str,
     return SnapshotAnswer(SNAPSHOT_UNKNOWN, content_hash=content_hash, reason=reason)
 
 
-def answer_from_read(status: int, payload: dict[str, Any], *, execution_id: str) -> SnapshotAnswer:
-    """Classify a read of one execution's snapshot."""
+def answer_from_read(status: int, payload: dict[str, Any], *, work_item_id: str, execution_id: str) -> SnapshotAnswer:
+    """Classify a read of one execution's snapshot. A 200 counts only when
+    it describes the snapshot that was asked for: that execution's, of that
+    work item (#455 item 6, the same "asked for X, the store answered Y"
+    check as `WorkItemClient.get`)."""
     if status == 200:
         snap = _snapshot_of(payload)
         sid, digest = snap.get("id"), snap.get("content_hash")
-        if not _is_snapshot_id(sid) or not isinstance(digest, str) or snap.get("execution_id") != execution_id:
+        if (
+            not _is_snapshot_id(sid)
+            or not isinstance(digest, str)
+            or snap.get("execution_id") != execution_id
+            or snap.get("work_item_id") != work_item_id
+        ):
             return SnapshotAnswer(SNAPSHOT_UNKNOWN, reason="HTTP 200 does not describe that execution's snapshot")
         return SnapshotAnswer(
             SNAPSHOT_REPLAYED, snapshot_id=sid, content_hash=digest, stored_document=_stored_document(snap)
@@ -206,17 +227,32 @@ def _retry_stable(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def differing_fields(stored: dict[str, Any], ours: dict[str, Any]) -> list[str]:
-    """The top-level fields (and `work_context.<field>`) in which two
-    snapshot documents differ once what a retry may change is removed.
-    Empty means a retry of the same context."""
+    """The fields in which two snapshot documents differ once what a retry
+    may change is removed. Empty means a retry of the same context.
+
+    A top-level field that is a dict on both sides is named one level down
+    (`work_context.<field>`, `execution.<field>`, ...), so a divergence names
+    the field that moved rather than its whole block (#455 item 7). Any
+    other difference names the top-level field."""
     a, b = _retry_stable(stored), _retry_stable(ours)
     out = []
     for key in sorted(set(a) | set(b)):
-        if a.get(key) == b.get(key):
+        # Presence counts at the top level too: `to_dict()` emits
+        # `"step": null`, which an older document may lack entirely.
+        if key in a and key in b and a[key] == b[key]:
             continue
-        if key == "work_context" and isinstance(a.get(key), dict) and isinstance(b.get(key), dict):
-            wa, wb = a[key], b[key]
-            out += [f"work_context.{k}" for k in sorted(set(wa) | set(wb)) if wa.get(k) != wb.get(k)]
+        va, vb = a.get(key), b.get(key)
+        if isinstance(va, dict) and isinstance(vb, dict):
+            # Presence counts, not only value: a key that is null on one
+            # side and absent on the other is a difference (ADR 009's field
+            # growth). With presence counted, two unequal dicts always name
+            # at least one key; `or [key]` is only a defensive floor, since
+            # an empty answer is what `persist` reads as "same context".
+            named = [
+                f"{key}.{k}" for k in sorted(set(va) | set(vb))
+                if k not in va or k not in vb or va[k] != vb[k]
+            ]
+            out += named or [key]
         else:
             out.append(key)
     return out
@@ -251,11 +287,18 @@ def persist(snapshot: ContextSnapshot, client: Any) -> SnapshotAnswer:
     snapshot carries a store execution.
 
     A retry of the same execution (an Argo pod retry) re-assembles the same
-    context with a new `created_at` (and, at a later second, new source
-    observation timestamps), so its bytes differ from the stored ones. That
-    is not a divergence. So a 409 is checked against the stored document,
-    and only a document that differs in more than `_retry_stable` removes
-    is a real divergence. The stored snapshot is never replaced."""
+    context, but its bytes differ from the stored ones. That is not a
+    divergence. So a 409 is checked against the stored document with
+    everything a retry may change removed (`_retry_stable`, ADR 011 §6):
+
+    - `created_at`, and the snapshot's own `snapshot_id` and `content_hash`;
+    - each source's `retrieved_at` and `freshness.observed_at`, stamped with
+      the assembly clock;
+    - `work_context.resumed_from_snapshot_id`, the best-effort pointer to
+      the prior execution's snapshot.
+
+    Only a document that differs in anything else is a real divergence.
+    The stored snapshot is never replaced."""
     work_context = snapshot.work_context
     if work_context is None or not is_store_execution(work_context.execution_id):
         return SnapshotAnswer(SNAPSHOT_SKIPPED, reason="not a store execution")
@@ -279,6 +322,7 @@ def persist(snapshot: ContextSnapshot, client: Any) -> SnapshotAnswer:
         return SnapshotAnswer(
             SNAPSHOT_REPLAYED, snapshot_id=stored.snapshot_id, content_hash=stored.content_hash,
             reason="same context as the stored snapshot, assembled on another attempt",
+            local_snapshot_id=snapshot.snapshot_id, local_content_hash=answer.content_hash,
         )
     # Most often the live inputs changed under a retry (e.g. a new issue
     # comment): the reason names what differs, so this reads as that, not
