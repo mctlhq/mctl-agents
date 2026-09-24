@@ -74,6 +74,7 @@ from typing import Any, Protocol
 
 from orchestrator.temporal.issue_ref import (
     MAX_ENGINE_REF_BYTES,
+    REQUEST_ENGINE_REF_SEPARATOR,
     is_request_engine_ref,
     loop_id_of_engine_ref,
     parse_issue_url,
@@ -227,6 +228,12 @@ class TemporalPort(Protocol):
         cannot answer."""
         ...
 
+    async def holds_request(self, workflow_id: str, request_id: str) -> bool | None:
+        """Does the RUNNING run of `workflow_id` hold `request_id` (the
+        `holds_execution_request` query)? None when it cannot say: the query
+        failed, timed out, or the run predates it."""
+        ...
+
 
 class TemporalClientPort:
     """`TemporalPort` over a live `temporalio` client."""
@@ -294,6 +301,19 @@ class TemporalClientPort:
                 return LOOP_ABSENT
             raise
         return LOOP_RUNNING if desc.status == WorkflowExecutionStatus.RUNNING else LOOP_CLOSED
+
+    async def holds_request(self, workflow_id: str, request_id: str) -> bool | None:
+        from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow
+
+        try:
+            handle = self._client.get_workflow_handle(workflow_id)
+            held = await asyncio.wait_for(
+                handle.query(DevLoopWorkflow.holds_execution_request, request_id), timeout=DELIVERY_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 — "cannot say" is an answer: the reconciliation then leaves it alone
+            logger.warning("holds_execution_request(%s) on %s: %s", request_id, workflow_id, exc)
+            return None
+        return bool(held)
 
 
 @dataclass(frozen=True)
@@ -478,7 +498,9 @@ class Dispatcher:
         (`execution_active`). Narrow on purpose: only a Temporal execution
         whose engine ref is this dispatcher's own `<loop>#xr_...`
         (`is_request_engine_ref`), only while it is non-terminal, and only
-        once Temporal says that loop is not RUNNING: CLOSED, or ABSENT. ABSENT
+        once Temporal says that loop is not RUNNING (CLOSED, or ABSENT), or
+        that its RUNNING run does not hold the request (a later run of the
+        same issue-keyed id, which will never end it). ABSENT
         counts because the `#xr_` suffix proves this dispatcher fulfilled it
         for a loop that took it, and Temporal forgets a workflow only after it
         closed and its namespace retention expired, while a RUNNING workflow
@@ -496,8 +518,15 @@ class Dispatcher:
                 continue
             if not execution.phase or execution.phase in TERMINAL_PHASES:
                 continue
-            if await self._temporal.loop_state(loop_id_of_engine_ref(ref)) == LOOP_RUNNING:
-                continue
+            owner = loop_id_of_engine_ref(ref)
+            if await self._temporal.loop_state(owner) == LOOP_RUNNING:
+                # The id is the issue's, shared by every run: only the run
+                # that took the request will end its execution. A later run
+                # that never took it (the intake's, after an operator
+                # terminated the one that did) would mask it for ever.
+                held = await self._temporal.holds_request(owner, ref.split(REQUEST_ENGINE_REF_SEPARATOR, 1)[1])
+                if held is not False:
+                    continue
             answer = await asyncio.to_thread(
                 self._api.attach_execution, item.work_item_id, EngineRun(engine=ENGINE, engine_ref=ref), "Failed"
             )

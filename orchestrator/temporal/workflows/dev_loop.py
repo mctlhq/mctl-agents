@@ -119,6 +119,7 @@ with workflow.unsafe.imports_passed_through():
         SurfaceRef,
         execution_id_for,
     )
+    from orchestrator.work_context.execution_requests import KIND_RESUME, KIND_START, KINDS
 
 ENVIRONMENT = "production"
 
@@ -310,10 +311,21 @@ ACCEPT_EXECUTION_REQUEST_UPDATE = "accept_execution_request"
 # a history recorded before it bound under its own workflow id, and replays
 # that way. Consulted only on the dispatched path.
 ISSUE_KEYED_DISPATCH_PATCH = "issue-keyed-dispatch"
-#: The kinds of mctl-api execution request a delivery can carry.
-DELIVERY_KIND_START = "start"
-DELIVERY_KIND_RESUME = "resume"
-DELIVERY_KINDS = frozenset({DELIVERY_KIND_START, DELIVERY_KIND_RESUME})
+# Also option A: a dispatched run that ends having run nothing (its request
+# was rejected, refused at fulfil, never fulfilled, or its bind refused) ends
+# the workflow FAILED instead of COMPLETED. Its id is the issue's now, and the
+# intake poller starts it with ALLOW_DUPLICATE_FAILED_ONLY: a COMPLETED run
+# that did nothing would make every later `agents:intake` label a silent
+# "already handled". Before option A that run had its own `dev-loop-xr_*` id
+# and could not shadow the issue's. Recorded where the run ends.
+DISPATCHED_NOT_RUN_FAILS_PATCH = "dispatched-not-run-fails"
+#: The error type of that failure, for whoever reads why the run ended.
+DISPATCHED_NOT_RUN_ERROR_TYPE = "DispatchedRequestNotRun"
+#: The kinds of mctl-api execution request a delivery can carry: the
+#: dispatcher's own vocabulary (`execution_requests.KINDS`), one source.
+DELIVERY_KIND_START = KIND_START
+DELIVERY_KIND_RESUME = KIND_RESUME
+DELIVERY_KINDS = KINDS
 #: The Update's only successful answer. A repeated request id answers it too.
 DELIVERY_ACCEPTED = "accepted"
 #: The validator's permanent refusal: the dispatcher rejects the request with
@@ -1460,6 +1472,17 @@ class DevLoopWorkflow:
         self._hopping = False
 
     @workflow.query
+    def holds_execution_request(self, request_id: str) -> bool:
+        """Did THIS run (or a run it continued from) take `request_id`?
+
+        The dispatcher's reconciliation asks it before failing a stranded
+        `<loop>#<request>` execution of a RUNNING loop (#461 option A): the
+        loop id is the issue's and shared by every run, so "the loop is
+        running" no longer proves the run that holds the execution is. A
+        later run that never took the request never ends its execution."""
+        return request_id == self._start_request_id or request_id in self._accepted_request_ids
+
+    @workflow.query
     def implement_execution(self) -> ImplementExecutionState:
         """The orchestrator's view of the implement step (#389, #395)."""
         return self._implement_state
@@ -2461,8 +2484,14 @@ class DevLoopWorkflow:
         `work_item_id`/`engine_ref` default to this loop's own dispatched
         execution (the ref it was bound under); a delivered resume passes its
         own (`<loop id>#<xr id>`)."""
+        own_ref = self._own_engine_ref
+        if engine_ref is None and not own_ref:
+            # Only a run that bound its own execution has one to advance; its
+            # ref is never re-derived here (a continued run starts without
+            # it, and the bare workflow id is no longer any execution's ref).
+            workflow.logger.error("no dispatched execution of this run to advance to %s", phase)
+            return True
         try:
-            own_ref = self._own_engine_ref or workflow.info().workflow_id
             outcome = await workflow.execute_activity(
                 advance_dispatched_execution,
                 AdvanceInput(
@@ -2545,6 +2574,8 @@ class DevLoopWorkflow:
         if issue.execution_request_id and workflow.patched(EXECUTION_REQUEST_PATCH):
             dispatched, refused = await self._bind_dispatched_execution(issue)
             if dispatched is None:
+                if workflow.patched(DISPATCHED_NOT_RUN_FAILS_PATCH):
+                    raise ApplicationError(refused, type=DISPATCHED_NOT_RUN_ERROR_TYPE, non_retryable=True)
                 return DevLoopResult(
                     investigate=WorkflowResult(workflow_name="", phase="NotStarted"),
                     implement=None,

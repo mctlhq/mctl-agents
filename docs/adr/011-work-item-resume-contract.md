@@ -247,6 +247,12 @@ as the service principal, turns the request into a run:
      executes). A `start` starts the issue's loop, a `resume` a
      continuation of it, under the same id.
 
+   A dispatched run that ends having run nothing (its request rejected,
+   refused at fulfil, never fulfilled, or its bind refused) ends FAILED,
+   `DispatchedRequestNotRun`, under `workflow.patched("dispatched-not-run-
+   fails")`: a COMPLETED run that did nothing would make every later intake
+   label on the issue a silent "already handled".
+
    Reuse policy: the dispatcher starts a new run after ANY closed run
    (`ALLOW_DUPLICATE`), because a `resume` of a finished loop is exactly a
    new run of it and a request is an explicit ask that mctl-api already
@@ -284,9 +290,12 @@ a non-terminal execution makes mctl-api refuse every later request for the
 item (`execution_active`). A terminated loop runs no code, so the dispatcher
 fails a non-terminal execution whose engine ref is a `<loop>#xr_...` ref
 (the `#xr_` suffix proves the dispatcher fulfilled it) once Temporal reports
-that loop not RUNNING (closed, or no longer known), and touches nothing
-else: never an execution of another engine, one the loop seeded itself, or
-one of a running loop. The success-path advance retries patiently (about an hour)
+that loop not RUNNING (closed, or no longer known), or RUNNING in a run
+that never took the request (the `holds_execution_request` query answers
+no: a later run of the shared issue id, say the intake's after an operator
+terminated the one that held it). It touches nothing else: never an
+execution of another engine, one the loop seeded itself, or one a running
+run holds or cannot vouch for. The success-path advance retries patiently (about an hour)
 and, if it still did not land, is re-attempted before every park that
 holds the loop RUNNING (briefly before a clarification wait, whose request
 TTL has no lower bound; patiently before the approval park), because a

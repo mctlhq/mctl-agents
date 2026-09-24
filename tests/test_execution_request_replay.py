@@ -72,6 +72,7 @@ from temporalio.worker import Replayer
 
 from orchestrator.temporal.workflows import dev_loop
 from orchestrator.temporal.workflows.dev_loop import (
+    DISPATCHED_NOT_RUN_FAILS_PATCH,
     EXECUTION_REQUEST_PATCH,
     EXECUTION_REQUEST_RESUME_PATCH,
     EXECUTION_REQUEST_STRANDED_PATCH,
@@ -437,7 +438,12 @@ async def record_stranded(env: WorkflowEnvironment, workflow: type = DevLoopWork
     from orchestrator.temporal.constants import TASK_QUEUE
     from orchestrator.temporal.issue_ref import workflow_id_for
     from orchestrator.work_context.client import WorkItemClient
-    from tests.test_execution_request_dispatch import FakeTemporal, _investigate_log, _loop_activities
+    from tests.test_execution_request_dispatch import (
+        FakeTemporal,
+        _investigate_log,
+        _loop_activities,
+        ended_without_running,
+    )
     from tests.test_work_context_resume_acceptance import URL, WID
 
     api = _CURRENT_API[0]
@@ -452,9 +458,12 @@ async def record_stranded(env: WorkflowEnvironment, workflow: type = DevLoopWork
         handle = await env.client.start_workflow(
             DevLoopWorkflow.run, issue, id=workflow_id_for(issue.issue_url), task_queue=TASK_QUEUE
         )
-        result = await handle.result()
+        if workflow is DevLoopWorkflow:
+            ended = (await ended_without_running(handle)).ended
+        else:
+            ended = (await handle.result()).ended
         history = await handle.fetch_history()
-    assert "work-item-mismatch" in result.ended
+    assert "work-item-mismatch" in ended
     return history.to_json_dict()
 
 
@@ -464,8 +473,9 @@ async def test_a_stranded_dispatched_loop_records_the_marker_ends_its_execution_
     async with await WorkflowEnvironment.start_time_skipping() as env:
         history = await record_stranded(env)
     events = _events(history)
-    assert EXECUTION_REQUEST_STRANDED_PATCH in _patch_ids(events)
+    assert {EXECUTION_REQUEST_STRANDED_PATCH, DISPATCHED_NOT_RUN_FAILS_PATCH} <= _patch_ids(events)
     assert _scheduled(events) == ["bind_dispatched_execution", "advance_dispatched_execution"]
+    assert events[-1]["eventType"] == "EVENT_TYPE_WORKFLOW_EXECUTION_FAILED"
     assert [e["phase"] for e in routed_api.executions] == ["Failed"]
     await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(
         WorkflowHistory.from_json("replay-dev-loop-stranded-fresh", history)
@@ -474,24 +484,24 @@ async def test_a_stranded_dispatched_loop_records_the_marker_ends_its_execution_
 
 @workflow.defn(name="DevLoopWorkflow", sandboxed=False)
 class _ReleasedStrandedLoop(DevLoopWorkflow):
-    """Today's loop with the stranded gate answering False: the shape the
-    released loop recorded (the refused bind ends the loop, no advance)."""
-
-    async def _bind_dispatched_execution(self, issue: IssueRef) -> tuple[Any, str]:
-        real = dev_loop.workflow.patched
-
-        def patched(patch_id: str) -> bool:
-            return False if patch_id == EXECUTION_REQUEST_STRANDED_PATCH else real(patch_id)
-
-        dev_loop.workflow.patched = patched  # type: ignore[assignment]
-        try:
-            return await super()._bind_dispatched_execution(issue)
-        finally:
-            dev_loop.workflow.patched = real  # type: ignore[assignment]
+    """Today's loop with the stranded and not-run gates answering False: the
+    shape the released loop recorded (the refused bind ends the loop
+    COMPLETED, no advance)."""
 
     @workflow.run
     async def run(self, issue: IssueRef) -> Any:
-        return await super().run(issue)
+        real = dev_loop.workflow.patched
+
+        def patched(patch_id: str) -> bool:
+            if patch_id in (EXECUTION_REQUEST_STRANDED_PATCH, DISPATCHED_NOT_RUN_FAILS_PATCH):
+                return False
+            return real(patch_id)
+
+        dev_loop.workflow.patched = patched  # type: ignore[assignment]
+        try:
+            return await super().run(issue)
+        finally:
+            dev_loop.workflow.patched = real  # type: ignore[assignment]
 
 
 async def test_a_stranded_history_recorded_before_the_patch_replays_unchanged(routed_api):
@@ -503,8 +513,9 @@ async def test_a_stranded_history_recorded_before_the_patch_replays_unchanged(ro
     async with await WorkflowEnvironment.start_time_skipping() as env:
         history = await record_stranded(env, _ReleasedStrandedLoop)
     events = _events(history)
-    assert EXECUTION_REQUEST_STRANDED_PATCH not in _patch_ids(events)
+    assert not {EXECUTION_REQUEST_STRANDED_PATCH, DISPATCHED_NOT_RUN_FAILS_PATCH} & _patch_ids(events)
     assert _scheduled(events) == ["bind_dispatched_execution"]
+    assert events[-1]["eventType"] == "EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED"
     await Replayer(workflows=[DevLoopWorkflow]).replay_workflow(
         WorkflowHistory.from_json("replay-dev-loop-stranded-released", history)
     )
@@ -514,3 +525,6 @@ def test_no_committed_history_records_the_stranded_marker():
     for path in sorted(HISTORY_DIR.glob("*.json")):
         events = _events(json.loads(path.read_text(encoding="utf-8")))
         assert EXECUTION_REQUEST_STRANDED_PATCH not in _patch_ids(events), path.name
+        # Every committed history ran something; the not-run end is guarded
+        # by the fresh stranded recordings above.
+        assert DISPATCHED_NOT_RUN_FAILS_PATCH not in _patch_ids(events), path.name
