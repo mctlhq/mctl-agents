@@ -312,11 +312,19 @@ A workflow never holds a pod while it waits.
   the poll alone makes the wait work, at up to `poll_seconds` of latency),
   and the approval surfaces for humans.
 
+This section covers the Temporal-hosted wait only. The shepherd's merge is
+cron-driven, not Temporal (this ADR's own boundary above), so its
+`REQUIRE_APPROVAL` wait needed a second driver rather than an adopter of
+`run_gated_action`: see ADR 016, which also carries the approver identity
+through to the trace and the audit record.
+
 ## Open decisions (not settled here)
 
-1. **The approval wait (#198).** The Temporal wait is built (§7). The
-   signal from mctl-api, the approval surfaces (UI, Telegram, GitHub) and a
-   first step that adopts `run_gated_action` are not. Until gitops sets
+1. **The approval wait (#198).** The Temporal wait is built (§7); the
+   cron-driven wait for the shepherd's merge, and the approver record on the
+   trace, are ADR 016. The signal from mctl-api, the approval surfaces (UI,
+   Telegram, GitHub) and a first Temporal step that adopts
+   `run_gated_action` are still not built. Until gitops sets
    `MCTL_POLICY_APPROVALS=mctl-api`, REQUIRE_APPROVAL keeps blocking. Once
    it is set, an agent's gated MCP call is refused with `approval_pending`
    and the request id, and a later identical call in the same execution
