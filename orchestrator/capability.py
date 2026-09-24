@@ -438,6 +438,18 @@ class CapabilityStrategy:
     ranker_name: str | None = None
     ranker_version: str | None = None
 
+    def __post_init__(self) -> None:
+        # Mirrors what CapabilityStrategy.from_dict enforces via
+        # _require_str (allow_empty defaults to False) for name/version —
+        # checked here too so a directly-constructed CapabilityStrategy
+        # (the way seal() builds one, never through from_dict) can never
+        # round-trip through to_dict/from_dict and be rejected by the same
+        # class that produced it.
+        if not self.name:
+            raise CapabilityError("strategy.name must be a non-empty string")
+        if not self.version:
+            raise CapabilityError("strategy.version must be a non-empty string")
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
