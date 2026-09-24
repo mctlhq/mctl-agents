@@ -276,6 +276,55 @@ def test_validate_rejects_empty_capability_set_id():
         bad.validate()
 
 
+def test_descriptor_rejects_empty_capability_id():
+    with pytest.raises(cap.CapabilityError, match="capability_id"):
+        _descriptor(_provider(), capability_id="")
+
+
+def test_descriptor_rejects_empty_tool_name():
+    with pytest.raises(cap.CapabilityError, match="tool_name"):
+        _descriptor(_provider(), tool_name="")
+
+
+def test_descriptor_rejects_empty_title():
+    with pytest.raises(cap.CapabilityError, match="title"):
+        _descriptor(_provider(), title="")
+
+
+def test_descriptor_rejects_empty_matched_tool_pattern():
+    with pytest.raises(cap.CapabilityError, match="matched_tool_pattern"):
+        _descriptor(_provider(), matched_tool_pattern="")
+
+
+def test_provider_rejects_empty_type():
+    with pytest.raises(cap.CapabilityError, match=r"provider\.type"):
+        _provider(type="")
+
+
+def test_provider_rejects_empty_id():
+    with pytest.raises(cap.CapabilityError, match=r"provider\.id"):
+        _provider(id="")
+
+
+def test_provider_rejects_empty_alias():
+    with pytest.raises(cap.CapabilityError, match=r"provider\.alias"):
+        _provider(alias="")
+
+
+def test_sealed_set_round_trips_through_to_dict_and_from_dict():
+    """The round-trip property seal()/from_dict() must hold end to end: a
+    freshly sealed CapabilitySet, serialized with to_dict() and reloaded
+    with from_dict(), must reconstruct an equal object (not merely a
+    from_dict()-loaded fixture reloaded again, which test_golden_fixture_
+    round_trips already covers) — otherwise a document seal() considers
+    valid could be one its own from_dict() cannot faithfully reproduce."""
+    sealed = _sealed_set()
+    reloaded = cap.CapabilitySet.from_dict(sealed.to_dict())
+    assert reloaded == sealed
+    assert reloaded.to_dict() == sealed.to_dict()
+    assert cap.recompute_content_hash(reloaded) == sealed.content_hash
+
+
 # ---------------------------------------------------------------------------
 # T2 — narrowing invariant: every member's matched_tool_pattern is an
 # element of plan_tools, and its tool_name matches that pattern; a set
@@ -544,31 +593,52 @@ def test_default_consequence_table_path_is_the_checked_in_file():
 
 def test_unknown_tool_name_defaults_to_consequential():
     table = cap.load_consequence_table()
-    assert cap.classify_consequence("mctl_this_tool_does_not_exist", table) == "consequential"
+    assert cap.classify_consequence(
+        "mctl_this_tool_does_not_exist", table, provider_id=cap.MCTL_API_PROVIDER_ID
+    ) == "consequential"
 
 
 def test_sdk_visible_name_is_stripped_to_bare_tool_name_before_lookup():
     table = cap.load_consequence_table()
-    bare = cap.classify_consequence("mctl_deploy_service", table)
-    sdk_visible = cap.classify_consequence("mcp__mctl__mctl_deploy_service", table)
+    bare = cap.classify_consequence("mctl_deploy_service", table, provider_id=cap.MCTL_API_PROVIDER_ID)
+    sdk_visible = cap.classify_consequence(
+        "mcp__mctl__mctl_deploy_service", table, provider_id=cap.MCTL_API_PROVIDER_ID
+    )
     assert bare == sdk_visible == "mutating"
 
 
 def test_known_read_only_tool_classifies_read_only():
     table = cap.load_consequence_table()
-    assert cap.classify_consequence("mctl_whoami", table) == "read-only"
-    assert cap.classify_consequence("mctl_get_service_status", table) == "read-only"
+    assert cap.classify_consequence("mctl_whoami", table, provider_id=cap.MCTL_API_PROVIDER_ID) == "read-only"
+    assert cap.classify_consequence(
+        "mctl_get_service_status", table, provider_id=cap.MCTL_API_PROVIDER_ID
+    ) == "read-only"
 
 
 def test_known_consequential_tool_classifies_consequential():
     table = cap.load_consequence_table()
-    assert cap.classify_consequence("mctl_delete_tenant", table) == "consequential"
-    assert cap.classify_consequence("mctl_trigger_issue", table) == "consequential"
+    assert cap.classify_consequence(
+        "mctl_delete_tenant", table, provider_id=cap.MCTL_API_PROVIDER_ID
+    ) == "consequential"
+    assert cap.classify_consequence(
+        "mctl_trigger_issue", table, provider_id=cap.MCTL_API_PROVIDER_ID
+    ) == "consequential"
+
+
+def test_classify_consequence_requires_an_explicit_provider_id():
+    """`provider_id` has no default (P2 codex finding): a caller that omits
+    it must fail loudly rather than silently fall back to the trusted
+    MCTL_API_PROVIDER_ID table lookup, which would reproduce the exact
+    "unclassified skips the checkpoint by omission" failure mode this
+    function exists to close, just moved from the tool name to the
+    provider id."""
+    table = cap.load_consequence_table()
+    with pytest.raises(TypeError):
+        cap.classify_consequence("mctl_whoami", table)  # type: ignore[call-arg]
 
 
 def test_classify_consequence_defaults_to_the_mctl_api_provider():
     table = cap.load_consequence_table()
-    assert cap.classify_consequence("mctl_whoami", table) == "read-only"
     assert cap.classify_consequence("mctl_whoami", table, provider_id=cap.MCTL_API_PROVIDER_ID) == "read-only"
 
 

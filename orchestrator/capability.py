@@ -231,6 +231,18 @@ class ProviderRef:
     endpoint_ref: str = ""
 
     def __post_init__(self) -> None:
+        # Mirrors what ProviderRef.from_dict enforces via _require_str
+        # (allow_empty defaults to False) for type/id/alias — checked here
+        # too so a directly-constructed ProviderRef (the way seal() builds
+        # one, never through from_dict) can never round-trip through
+        # to_dict/from_dict and be rejected by the same class that produced
+        # it.
+        if not self.type:
+            raise CapabilityError("provider.type must be a non-empty string")
+        if not self.id:
+            raise CapabilityError("provider.id must be a non-empty string")
+        if not self.alias:
+            raise CapabilityError("provider.alias must be a non-empty string")
         if len(self.endpoint_ref) > MAX_ENDPOINT_REF_LENGTH:
             raise CapabilityError(f"provider.endpoint_ref exceeds {MAX_ENDPOINT_REF_LENGTH} characters")
 
@@ -285,6 +297,21 @@ class CapabilityDescriptor:
         # must never change this descriptor's effective content after
         # construction.
         object.__setattr__(self, "annotations", MappingProxyType(dict(self.annotations)))
+        # Mirrors what CapabilityDescriptor.from_dict enforces via
+        # _require_str (allow_empty defaults to False) for capability_id/
+        # tool_name/title/matched_tool_pattern — checked here too so
+        # seal() can never produce a descriptor that its own from_dict
+        # would reject on reload.
+        if not self.capability_id:
+            raise CapabilityError("capability.capability_id must be a non-empty string")
+        if not self.tool_name:
+            raise CapabilityError(f"capability {self.capability_id!r}: tool_name must be a non-empty string")
+        if not self.title:
+            raise CapabilityError(f"capability {self.capability_id!r}: title must be a non-empty string")
+        if not self.matched_tool_pattern:
+            raise CapabilityError(
+                f"capability {self.capability_id!r}: matched_tool_pattern must be a non-empty string"
+            )
         if len(self.title) > MAX_TITLE_LENGTH:
             raise CapabilityError(f"capability {self.capability_id!r}: title exceeds {MAX_TITLE_LENGTH} characters")
         if len(self.summary) > MAX_SUMMARY_LENGTH:
@@ -1007,7 +1034,7 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
     return MappingProxyType(table)
 
 
-def classify_consequence(tool_name: str, table: Mapping[str, str], *, provider_id: str = MCTL_API_PROVIDER_ID) -> str:
+def classify_consequence(tool_name: str, table: Mapping[str, str], *, provider_id: str) -> str:
     """Pure. `tool_name` may be the bare mctl-api tool name
     (`mctl_deploy_service`) or the SDK-visible name
     (`mcp__mctl__mctl_deploy_service`) — a leading `mcp__<alias>__` is
@@ -1018,12 +1045,19 @@ def classify_consequence(tool_name: str, table: Mapping[str, str], *, provider_i
 
     `table` (`config/capability-consequence.yaml`) is mctl-api's own
     advertised tool set (ADR 017 sec. 8) — it says nothing about any other
-    provider. `provider_id` (`ProviderRef.id`, default `MCTL_API_PROVIDER_ID`)
-    scopes the lookup to that one provider: any other provider_id bypasses
-    the table entirely and returns `DEFAULT_CONSEQUENCE`, so a bare-name
-    collision with an unrelated provider's tool (e.g. a second `mcp-remote`
-    server that happens to expose its own `mctl_whoami`) can never borrow
-    mctl-api's classification and widen what skips the checkpoint."""
+    provider. `provider_id` (`ProviderRef.id`) scopes the lookup to that one
+    provider and has no default: a caller that omits it is a bug, not a
+    request for mctl-api's classification, because a default resolving to
+    `MCTL_API_PROVIDER_ID` would let an omitted argument silently opt a
+    capability into the trusted table — the exact "unclassified skips the
+    checkpoint by omission" failure this function exists to close, just
+    moved from the tool name to the provider id. Only an explicit
+    `provider_id == MCTL_API_PROVIDER_ID` consults the table; any other
+    provider_id bypasses it and returns `DEFAULT_CONSEQUENCE`, so a
+    bare-name collision with an unrelated provider's tool (e.g. a second
+    `mcp-remote` server that happens to expose its own `mctl_whoami`) can
+    never borrow mctl-api's classification and widen what skips the
+    checkpoint."""
     if provider_id != MCTL_API_PROVIDER_ID:
         return DEFAULT_CONSEQUENCE
     bare = tool_name
