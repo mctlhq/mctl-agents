@@ -318,10 +318,17 @@ who made it). Only then does the dispatcher fulfil, with `engine_ref =
   `work-item-mismatch`, `resume-already-pending` (another delivery or
   resume signal still open), a `malformed-delivery`, or missing or
   out-of-vocabulary provenance refuses it, and the dispatcher rejects the
-  request `resume_refused:<reason>` before any `we_` is minted. The
-  dispatcher adds `engine-ref-too-long` itself; any reason outside this
-  closed list (`execution_requests.RESUME_REFUSAL_REASONS`) reaches a
-  surface as `unspecified`, never as free text. A loop that
+  request `resume_refused:<reason>` before any `we_` is minted. Any reason
+  outside this closed list (`execution_requests.RESUME_REFUSAL_REASONS`)
+  reaches a surface as `unspecified`, never as free text. A separate,
+  kind-neutral guard applies before the loop is ever involved: an
+  over-long engine ref (mctlhq/mctl-agents#488) is refused with the
+  top-level reason `engine_ref_too_long`, for a `start` exactly as for a
+  `resume`, since #461 option A mints the same `<loop>#<request id>` ref
+  for both. `resume_refused:engine-ref-too-long` remains readable for rows
+  written before #488; the reject call itself falls back to that legacy
+  spelling once, for a version-skewed mctl-api that does not yet know the
+  new reason. A loop that
   cannot decide yet (its state is not rehydrated) or is ending defers the
   request instead. Accepting a resume that changes surface or actor clears
   the approval **at acceptance**: from the moment L says yes to another

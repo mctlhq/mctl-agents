@@ -463,6 +463,117 @@ async def test_nothing_claimable_is_nothing(api):
     assert (await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()).action == dx.NOTHING
 
 
+# -- engine ref too long: kind-neutral, before the loop (mctlhq/mctl-agents#488) --
+
+
+def _over_long_issue_url() -> str:
+    """A repo name long enough that `<loop>#<request id>` (the loop id
+    `dev-loop-mctlhq-<repo>-<n>`, 16 fixed bytes, plus the 40-byte `#<xr_...>`
+    suffix) overflows `MAX_ENGINE_REF_BYTES` (256) well past the ~199-char
+    threshold design.md derives — GitHub's own 100-char repo cap keeps this
+    unreachable in production, but the fake store enforces no such cap."""
+    return f"https://github.com/mctlhq/{'r' * 220}/issues/1"
+
+
+async def test_an_over_long_engine_ref_rejects_a_start_kind_neutrally(api):
+    api.external_key = _over_long_issue_url()
+    rid = api.create_request("start")
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED and outcome.reason == xr.ENGINE_REF_TOO_LONG
+    assert not outcome.reason.startswith(xr.RESUME_REFUSED)
+    assert api.request_state(rid)["reason"] == xr.ENGINE_REF_TOO_LONG
+
+
+async def test_an_over_long_engine_ref_rejects_a_resume_with_the_same_reason(api):
+    """Since #461 option A, this guard runs for `resume` exactly as for
+    `start` — the same top-level, kind-neutral reason proves it."""
+    api.external_key = _over_long_issue_url()
+    rid = api.create_request("resume")
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED and outcome.reason == xr.ENGINE_REF_TOO_LONG
+    assert not outcome.reason.startswith(xr.RESUME_REFUSED)
+    assert api.request_state(rid)["reason"] == xr.ENGINE_REF_TOO_LONG
+
+
+async def test_an_over_long_engine_ref_never_delivers_or_fulfils(api):
+    api.external_key = _over_long_issue_url()
+    api.create_request("start")
+    temporal = FakeTemporal()
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.REJECTED
+    assert temporal.delivered == [] and api.fulfils() == [] and api.executions == []
+
+
+async def test_a_reject_refused_by_an_older_mctl_api_falls_back_to_the_legacy_reason(api, capsys):
+    """A version-skewed mctl-api that does not yet know `engine_ref_too_long`
+    (the #488 companion vocabulary change not yet deployed) refuses the new
+    reason; the dispatcher retries once with the legacy
+    `resume_refused:engine-ref-too-long` spelling instead of leaving the
+    request claimed forever."""
+    api.external_key = _over_long_issue_url()
+    rid = api.create_request("start")
+    serve = api.request
+    reject_path = f"/api/v1/execution-requests/{rid}/reject"
+    calls: list[dict] = []
+
+    def route(method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+        if method == "POST" and path == reject_path:
+            body = payload or {}
+            calls.append(body)
+            if body.get("reason") == xr.ENGINE_REF_TOO_LONG:
+                return _HTTPResult(400, {"code": "invalid_request", "error": "reason not recognised"})
+        return serve(method, path, payload)
+
+    api.request = route  # type: ignore[method-assign]
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    legacy = f"{xr.RESUME_REFUSED}:engine-ref-too-long"
+    assert len(calls) == 2
+    assert calls[0]["reason"] == xr.ENGINE_REF_TOO_LONG and calls[1]["reason"] == legacy
+    assert outcome.action == dx.REJECTED and outcome.reason == legacy
+    assert api.request_state(rid)["reason"] == legacy
+    reject_lines = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reject"]
+    assert len(reject_lines) == 2
+
+
+async def test_a_reject_refused_twice_defers_without_a_third_attempt(api):
+    """Both spellings refused (some other problem, not a version skew): the
+    fallback is one-shot, never a retry loop — the outcome defers, and
+    exactly two reject attempts were made."""
+    api.external_key = _over_long_issue_url()
+    rid = api.create_request("start")
+    serve = api.request
+    reject_path = f"/api/v1/execution-requests/{rid}/reject"
+    calls: list[dict] = []
+
+    def route(method: str, path: str, payload: dict | None = None) -> _HTTPResult:
+        if method == "POST" and path == reject_path:
+            calls.append(payload or {})
+            return _HTTPResult(400, {"code": "invalid_request", "error": "reason not recognised"})
+        return serve(method, path, payload)
+
+    api.request = route  # type: ignore[method-assign]
+
+    outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED
+    assert len(calls) == 2
+
+
+def test_the_legacy_engine_ref_too_long_spelling_stays_retained_vocabulary():
+    """#488: the dispatcher no longer mints `engine-ref-too-long` itself,
+    but old rows written with it must still read back, never normalise to
+    `unspecified`."""
+    assert "engine-ref-too-long" in xr.RESUME_REFUSAL_REASONS
+
+
 async def test_a_start_the_loop_refuses_is_rejected_loop_active(api, capsys):
     """Two investigations of one issue would race for one proposal: the
     loop's `LoopActive` answer rejects the request, before any fulfil."""

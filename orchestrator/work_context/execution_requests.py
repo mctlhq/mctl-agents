@@ -68,11 +68,13 @@ RESUME_REFUSED = "resume_refused"
 #: The closed vocabulary after `resume_refused:`. The loop's own (its
 #: `accept_execution_request` validator, the `resume` signal's rules):
 #: `malformed-delivery`, `work-item-mismatch`, `resume-already-pending`,
-#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`. The
-#: dispatcher's: `engine-ref-too-long` (the engine ref `<loop>#<request id>`
-#: exceeds mctl-api's limit). And `unspecified`: a refusal whose reason is
-#: missing or outside this list (a loop built with a reason this build does
-#: not know), normalised so a surface never sees free text.
+#: `surface-or-actor-missing`, `surface-or-actor-unrecognised`.
+#: `engine-ref-too-long` is retained read-side vocabulary only: rows the
+#: dispatcher rejected this way before mctlhq/mctl-agents#488 still read back
+#: with it, but this build never mints it again (see `ENGINE_REF_TOO_LONG`).
+#: And `unspecified`: a refusal whose reason is missing or outside this list
+#: (a loop built with a reason this build does not know), normalised so a
+#: surface never sees free text.
 RESUME_REFUSAL_UNSPECIFIED = "unspecified"
 RESUME_REFUSAL_REASONS = frozenset(
     {
@@ -91,6 +93,15 @@ RESUME_REFUSAL_REASONS = frozenset(
 #: starts the issue's loop again instead (nothing ran for the request), so
 #: this build never writes it. Kept as mctl-api vocabulary for old rows.
 ENGINE_RUN_ENDED = "engine_run_ended"
+#: The engine ref this dispatcher would mint, `issue_ref.request_engine_ref`'s
+#: `<loop>#<request id>`, exceeds mctl-api's `workitems.MaxEngineRefBytes`.
+#: Top-level and kind-neutral (mctlhq/mctl-agents#488): the ref is minted for
+#: a `start` exactly as for a `resume` since #461 option A folded both onto
+#: the issue-keyed loop, so this is never a resume-specific refusal and never
+#: carries the `resume_refused:` prefix. Supersedes the pre-#488
+#: `resume_refused:engine-ref-too-long` spelling, which stays in
+#: RESUME_REFUSAL_REASONS only so rows written before this build still read.
+ENGINE_REF_TOO_LONG = "engine_ref_too_long"
 #: mctl-api refused the fulfilment (the item moved since the request was
 #: made: a stale version, a terminal item, another active execution). The
 #: request stays claimed for the platform to reject; the store's code is
