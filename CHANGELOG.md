@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.58.0](https://github.com/mctlhq/mctl-agents/compare/1.57.0...1.58.0) (2026-09-24)
+
+
+### Features
+
+* **agents:** issue-488-dispatcher-residual-p3s-after-461-option ([fd7004b](https://github.com/mctlhq/mctl-agents/commit/fd7004bc8b15f383899a150f667d62f14f8b98d1))
+* **usage:** correlate usage records with repo, issue, PR and execution ([#499](https://github.com/mctlhq/mctl-agents/issues/499)) ([0ca4593](https://github.com/mctlhq/mctl-agents/commit/0ca4593bf556e49a99db19b4c93c4e2c2e07f333))
+* **usage:** correlate usage records with repo, issue, PR and execution ([#499](https://github.com/mctlhq/mctl-agents/issues/499)) ([824789f](https://github.com/mctlhq/mctl-agents/commit/824789feecab7208805a0fdd2fb773f29fe1ed5f))
+
+
+### Bug Fixes
+
+* **agents:** kind-neutral engine-ref-too-long reject reason (issue-488) ([d293cb7](https://github.com/mctlhq/mctl-agents/commit/d293cb72777ba851939dd59e8828024b34874660))
+* **usage:** no phantom review-fix execution id; review P3s ([#499](https://github.com/mctlhq/mctl-agents/issues/499)) ([fc39010](https://github.com/mctlhq/mctl-agents/commit/fc390106eee5ac6dc3d734716bd5547304fe9851))
+
 ## [1.57.0](https://github.com/mctlhq/mctl-agents/compare/1.56.0...1.57.0) (2026-09-24)
 
 
