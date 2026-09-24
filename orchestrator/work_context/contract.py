@@ -54,9 +54,12 @@ WORK_ITEM_STATES = frozenset({"active", "waiting", "completed", "superseded", "a
 TERMINAL_WORK_ITEM_STATES = frozenset({"completed", "superseded", "archived"})
 
 # mctl-api's execution engines (`workitems.Engine*`). The engine decides
-# what `engine_ref` means, so an unknown one refuses the entry. The phase
-# is not checked: nothing here reads it, and a new mctl-api phase must not
-# turn every read of a work item into UNKNOWN.
+# what `engine_ref` means, so only a known engine's `engine_ref` is read
+# (#455 item 5): an entry of an unknown engine still counts in the ledger
+# (its id and attempt are the store's and engine-independent), it just
+# carries no `temporal_workflow_id`. Refusing the entry would refuse the
+# whole ledger, and so every read of that work item, for one new engine.
+# The phase is not checked either, for the same reason.
 EXECUTION_ENGINES = frozenset({"temporal", "argo"})
 
 # The error code mctl-api answers a missing (or invisible) work item with.
@@ -231,8 +234,9 @@ class ExecutionRef:
         shape (workflow history and the `resume` signal).
 
         None on anything that does not describe an execution of THIS work
-        item: a missing id, a non-positive attempt, another work item's id,
-        or an engine outside mctl-api's closed vocabulary."""
+        item: a missing id, a non-positive attempt, or another work item's
+        id. An engine outside `EXECUTION_ENGINES` is not one of those: the
+        entry is kept without a `temporal_workflow_id` (#455 item 5)."""
         if not isinstance(data, dict):
             return None
         execution_id = data.get("id")
@@ -244,8 +248,6 @@ class ExecutionRef:
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             return None
         engine = data.get("engine")
-        if engine not in EXECUTION_ENGINES:
-            return None
         return ExecutionRef(
             execution_id=execution_id,
             sequence=attempt,
@@ -309,7 +311,10 @@ class WorkItem:
             revision=str(state_version),
             state=state,
             origin=SurfaceRef(kind=origin_surface),
-            issue_url=external_key if _ISSUE_URL_RE.match(external_key) else "",
+            # fullmatch, not match (#455 item 4): `$` also matches before a
+            # trailing newline, so `match` would read "…/issues/1\n" as an
+            # issue URL.
+            issue_url=external_key if _ISSUE_URL_RE.fullmatch(external_key) else "",
             state_version=state_version,
             schema_version=_str(data.get("schema_version")),
             external_key=external_key,
@@ -416,10 +421,21 @@ def record_of(payload: Any) -> WorkItem | None:
     return envelope_of(payload)[0]
 
 
-def latest_execution_id_of(payload: Any) -> str:
-    """The id of the view's `latest_execution`, or "" when it names none."""
-    latest = payload.get("latest_execution") if isinstance(payload, dict) else None
-    return _str(latest.get("id")) if isinstance(latest, dict) else ""
+def latest_execution_id_of(payload: Any) -> str | None:
+    """The id of the view's `latest_execution`: "" when the view names none
+    (the field is absent or null), None when it names one whose id cannot
+    be read (#455 item 2). The two must not collapse: paired with an empty
+    ledger, "" would classify FOUND, while an unreadable latest execution
+    is UNKNOWN."""
+    if not isinstance(payload, dict):
+        return None
+    latest = payload.get("latest_execution")
+    if latest is None:
+        return ""
+    if not isinstance(latest, dict):
+        return None
+    execution_id = latest.get("id")
+    return execution_id if isinstance(execution_id, str) and execution_id else None
 
 
 def executions_from(status: int, payload: Any, work_item_id: str) -> tuple[tuple[ExecutionRef, ...] | None, str]:

@@ -162,51 +162,81 @@ class WorkItemClient:
         completed from the executions route. That second read is all or
         nothing: if it fails, or the ledger does not end on exactly the
         view's own latest execution, the answer is WORK_ITEM_UNKNOWN — never
-        a FOUND item with an understated or overstated execution list. An
-        execution attached between the two reads is the overstated case, so
-        UNKNOWN here can mean "read again", not only "the store is down"."""
+        a FOUND item with an understated or overstated execution list.
+
+        An execution attached between the two reads is the overstated case:
+        that UNKNOWN means "read again", not "the store is down". So on that
+        mismatch, and only on it, the pair of reads is repeated once
+        (#455 item 3). A second mismatch is answered UNKNOWN: one bounded
+        re-read covers a single attach racing the read, and anything busier
+        is left to the caller's own retry policy."""
+        answer, read_again = self._get_once(work_item_id)
+        if read_again:
+            answer, _ = self._get_once(work_item_id)
+        return answer
+
+    def _get_once(self, work_item_id: str) -> tuple[WorkItemAnswer, bool]:
+        """One view read plus one ledger read: the answer, and whether it is
+        the view/ledger mismatch that a re-read can resolve."""
         try:
             res = self._request("GET", ROUTES["get_work_item"].format(id=_q(work_item_id)))
         except WorkItemUnavailable as exc:
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=str(exc))
+            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=str(exc)), False
         answer = answer_from(res.status, res.payload, path=res.status_path, body_empty=res.body_empty)
         if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
-            return answer
+            return answer, False
         item = answer.item
         if item.work_item_id != work_item_id:
-            return WorkItemAnswer(
-                verdict=WORK_ITEM_UNKNOWN,
-                reason=f"asked for {work_item_id!r}, the store answered {item.work_item_id!r}",
-                accepted=True,
-            )
+            return (
+                WorkItemAnswer(
+                    verdict=WORK_ITEM_UNKNOWN,
+                    reason=f"asked for {work_item_id!r}, the store answered {item.work_item_id!r}",
+                    accepted=True,
+                )
+            ), False
         try:
             ex = self._request("GET", ROUTES["list_executions"].format(id=_q(work_item_id)))
         except WorkItemUnavailable as exc:
-            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=f"executions: {exc}")
+            return WorkItemAnswer(verdict=WORK_ITEM_UNKNOWN, reason=f"executions: {exc}"), False
         executions, why = executions_from(ex.status, ex.payload, work_item_id)
         if executions is None:
             # `accepted` only when the store actually answered the read.
-            return WorkItemAnswer(
-                verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=200 <= ex.status < 300 and not ex.body_empty
-            )
+            return (
+                WorkItemAnswer(
+                    verdict=WORK_ITEM_UNKNOWN, reason=why, accepted=200 <= ex.status < 300 and not ex.body_empty
+                )
+            ), False
         # The two reads must describe the same moment: the ledger ends on
         # exactly the view's latest execution (or both are empty). An
         # execution attached between the reads would otherwise overstate
         # the ledger, and a stale ledger understate it.
         latest = latest_execution_id_of(res.payload)
+        if latest is None:
+            # The view names a latest execution whose id cannot be read
+            # (#455 item 2). With an empty ledger that must not read as
+            # "no executions": the store said there is one.
+            return (
+                WorkItemAnswer(
+                    verdict=WORK_ITEM_UNKNOWN,
+                    reason="the view's latest_execution carries no readable id",
+                    accepted=True,
+                )
+            ), False
         ledger_latest = executions[-1].execution_id if executions else ""
         if ledger_latest != latest:
-            return WorkItemAnswer(
-                verdict=WORK_ITEM_UNKNOWN,
-                reason=(
-                    f"executions: the ledger ends on {ledger_latest!r}, the view's latest "
-                    f"execution is {latest!r}; read again"
-                ),
-                accepted=True,
-            )
+            return (
+                WorkItemAnswer(
+                    verdict=WORK_ITEM_UNKNOWN,
+                    reason=(
+                        f"executions: the ledger ends on {ledger_latest!r}, the view's latest "
+                        f"execution is {latest!r}; read again"
+                    ),
+                    accepted=True,
+                )
+            ), True
         # v1 executions carry no surface/actor kinds, so the verdict the view
         # already earned is unchanged.
-        return WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=with_executions(item, executions), accepted=True)
+        return WorkItemAnswer(verdict=WORK_ITEM_FOUND, item=with_executions(item, executions), accepted=True), False
 
     # -- sealed snapshots (mctlhq/mctl-agents#431) ------------------------
 
@@ -218,7 +248,7 @@ class WorkItemClient:
             res = self._request("GET", path)
         except WorkItemUnavailable as exc:
             return SnapshotAnswer(SNAPSHOT_UNKNOWN, reason=str(exc))
-        return answer_from_read(res.status, res.payload, execution_id=execution_id)
+        return answer_from_read(res.status, res.payload, work_item_id=work_item_id, execution_id=execution_id)
 
     def seal_snapshot(self, work_item_id: str, execution_id: str, body: dict[str, Any]) -> SnapshotAnswer:
         """Seal `body` as `execution_id`'s snapshot. The policy checkpoint

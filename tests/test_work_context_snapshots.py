@@ -75,12 +75,12 @@ class _Store:
 
     def execution_snapshot(self, work_item_id, execution_id):
         if execution_id == E1 and self.prior:
-            return ws.answer_from_read(200, _env({**self.prior, "execution_id": E1}), execution_id=E1)
+            return _read(200, _env({**self.prior, "execution_id": E1}), execution_id=E1)
         if execution_id == E2 and self.stored is not None:
             snap = {"id": "cs_stored", "execution_id": E2, "content_hash": cs.hash_bytes(self.stored),
                     "canonical_b64": base64.b64encode(self.stored).decode()}
-            return ws.answer_from_read(200, _env(snap), execution_id=E2)
-        return ws.answer_from_read(404, {"code": "snapshot_not_found"}, execution_id=execution_id)
+            return _read(200, _env(snap), execution_id=E2)
+        return _read(404, {"code": "snapshot_not_found"}, execution_id=execution_id)
 
     def seal_snapshot(self, work_item_id, execution_id, body):
         self.sealed.append((work_item_id, execution_id, body))
@@ -96,9 +96,16 @@ class _Store:
         )
 
 
+def _read(status: int, payload: dict, *, execution_id: str) -> ws.SnapshotAnswer:
+    """`answer_from_read` for a snapshot of `WID`."""
+    return ws.answer_from_read(status, payload, work_item_id=WID, execution_id=execution_id)
+
+
 def _env(snap: dict) -> dict:
-    """A `workitem/v1` snapshot answer, as mctl-api shapes it."""
-    return {"schema_version": "workitem/v1", "snapshot": {"schema_version": "workitem/v1", **snap}}
+    """A `workitem/v1` snapshot answer, as mctl-api shapes it (of `WID`
+    unless the snapshot says otherwise)."""
+    return {"schema_version": "workitem/v1",
+            "snapshot": {"schema_version": "workitem/v1", "work_item_id": WID, **snap}}
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "workitem"
@@ -151,14 +158,14 @@ def test_seal_answers_are_classified_and_a_2xx_must_describe_what_was_sent():
 
 def test_read_answers_are_classified():
     snap = {"id": "cs_1", "execution_id": E1, "content_hash": "sha256:a"}
-    assert ws.answer_from_read(200, _env(snap), execution_id=E1).snapshot_id == "cs_1"
-    assert ws.answer_from_read(200, _env(snap), execution_id=E2).verdict == ws.SNAPSHOT_UNKNOWN
+    assert _read(200, _env(snap), execution_id=E1).snapshot_id == "cs_1"
+    assert _read(200, _env(snap), execution_id=E2).verdict == ws.SNAPSHOT_UNKNOWN
     # An id the sealed document could not carry is not an answer.
-    assert ws.answer_from_read(200, _env({**snap, "id": "cs_" + "a" * 300}), execution_id=E1).verdict == (
+    assert _read(200, _env({**snap, "id": "cs_" + "a" * 300}), execution_id=E1).verdict == (
         ws.SNAPSHOT_UNKNOWN)
-    assert ws.answer_from_read(404, {"code": "snapshot_not_found"}, execution_id=E1).verdict == ws.SNAPSHOT_ABSENT
+    assert _read(404, {"code": "snapshot_not_found"}, execution_id=E1).verdict == ws.SNAPSHOT_ABSENT
     # Any other 404 (the work item itself, or the execution) is not "none sealed".
-    assert ws.answer_from_read(404, {"code": "work_item_not_found"}, execution_id=E1).verdict == ws.SNAPSHOT_UNKNOWN
+    assert _read(404, {"code": "work_item_not_found"}, execution_id=E1).verdict == ws.SNAPSHOT_UNKNOWN
 
 
 def test_nothing_is_sent_below_observe_or_for_a_local_execution(tmp_path, monkeypatch):
@@ -257,10 +264,10 @@ def test_an_unverifiable_divergence_is_unknown_not_diverged(tmp_path, monkeypatc
     snap = _sealed(tmp_path)
     store = _Store(stored=b'{"other":1}')
     if read == "down":
-        store.execution_snapshot = lambda *a: ws.answer_from_read(503, {"error": "down"}, execution_id=E2)
+        store.execution_snapshot = lambda *a: _read(503, {"error": "down"}, execution_id=E2)
     else:
         bad = {"id": "cs_stored", "execution_id": E2, "content_hash": "sha256:x", "canonical_b64": "not base64!"}
-        store.execution_snapshot = lambda *a: ws.answer_from_read(200, _env(bad), execution_id=E2)
+        store.execution_snapshot = lambda *a: _read(200, _env(bad), execution_id=E2)
     assert ws.persist(snap, store).verdict == ws.SNAPSHOT_UNKNOWN
     # So the break-glass governs it, as for any unreachable store.
     monkeypatch.setenv("WORK_CONTEXT_ROLLOUT_MODE", "enforce")
@@ -278,9 +285,13 @@ def test_real_mctl_api_answers_classify_as_intended():
     assert ws.answer_from_seal(201, created, **kw).verdict == ws.SNAPSHOT_SEALED
     assert ws.answer_from_seal(200, _fixture("snapshot-seal-replayed.json"), **kw).verdict == ws.SNAPSHOT_REPLAYED
     assert ws.answer_from_seal(409, _fixture("snapshot-seal-diverged.json"), **kw).verdict == ws.SNAPSHOT_DIVERGED
-    read = ws.answer_from_read(200, _fixture("snapshot-read.json"), execution_id=snap["execution_id"])
+    read = ws.answer_from_read(
+        200, _fixture("snapshot-read.json"), work_item_id=snap["work_item_id"], execution_id=snap["execution_id"]
+    )
     assert (read.verdict, read.snapshot_id, read.stored_document) == (ws.SNAPSHOT_REPLAYED, snap["id"], json.loads(raw))
-    absent = ws.answer_from_read(404, _fixture("snapshot-read-absent.json"), execution_id=snap["execution_id"])
+    absent = ws.answer_from_read(
+        404, _fixture("snapshot-read-absent.json"), work_item_id=snap["work_item_id"], execution_id=snap["execution_id"]
+    )
     assert absent.verdict == ws.SNAPSHOT_ABSENT
 
 
@@ -297,6 +308,52 @@ def test_a_divergence_names_what_differs(tmp_path):
     other = cs.canonical_json({**snap.to_dict(), "sources": [{"x": 1}]})
     answer = ws.persist(snap, _Store(stored=other))
     assert answer.verdict == ws.SNAPSHOT_DIVERGED and "differs in: sources" in answer.reason
+
+
+def test_a_divergence_inside_any_block_names_the_moved_field(tmp_path):
+    """#455 item 7: every dict block is expanded one level, not only
+    `work_context`."""
+    snap = _sealed(tmp_path)
+    doc = snap.to_dict()
+    assert isinstance(doc["execution"], dict) and doc["execution"]
+    field_name = sorted(doc["execution"])[0]
+    moved = {**doc, "execution": {**doc["execution"], field_name: "moved"}}
+    assert ws.differing_fields(moved, doc) == [f"execution.{field_name}"]
+    answer = ws.persist(snap, _Store(stored=cs.canonical_json(moved)))
+    assert answer.verdict == ws.SNAPSHOT_DIVERGED and f"differs in: execution.{field_name}" in answer.reason
+    # A block that is a dict on one side only is named whole.
+    assert ws.differing_fields({**doc, "execution": None}, doc) == ["execution"]
+
+
+def test_a_replay_by_comparison_logs_both_snapshots(tmp_path, observe, capsys):
+    """#455 item 9: the stored snapshot's id and hash, and this attempt's
+    own, in one log line."""
+    first = _sealed(tmp_path)
+    stored = cs.canonical_json({**first.to_dict(), "created_at": "2020-01-01T00:00:00Z"})
+    answer = ws.persist(first, _Store(stored=stored))
+    assert answer.verdict == ws.SNAPSHOT_REPLAYED
+    assert (answer.snapshot_id, answer.content_hash) == ("cs_stored", cs.hash_bytes(stored))
+    assert answer.local_snapshot_id == first.snapshot_id
+    assert answer.local_content_hash == cs.hash_bytes(cs.canonical_json(first.to_dict()))
+    capsys.readouterr()
+    ca._emit_snapshot_answer("persist", answer)
+    line = json.loads(capsys.readouterr().out.split(" ", 1)[1])
+    assert (line["snapshot_id"], line["local_snapshot_id"]) == ("cs_stored", first.snapshot_id)
+    assert (line["content_hash"], line["local_content_hash"]) == (answer.content_hash, answer.local_content_hash)
+    # Any other answer carries no local pair.
+    ca._emit_snapshot_answer("persist", ws.SnapshotAnswer(ws.SNAPSHOT_SEALED, snapshot_id="cs_1"))
+    assert "local_snapshot_id" not in json.loads(capsys.readouterr().out.split(" ", 1)[1])
+
+
+def test_a_read_about_another_work_item_is_unknown():
+    """#455 item 6: "asked for X, the store answered Y"."""
+    snap = {"id": "cs_1", "execution_id": E1, "content_hash": "sha256:a"}
+    assert _read(200, _env(snap), execution_id=E1).verdict == ws.SNAPSHOT_REPLAYED
+    for other in ({**snap, "work_item_id": "wi_someone-else"}, {**snap, "work_item_id": None}):
+        answer = _read(200, _env(other), execution_id=E1)
+        assert answer.verdict == ws.SNAPSHOT_UNKNOWN, other
+    missing = {"schema_version": "workitem/v1", "snapshot": {"schema_version": "workitem/v1", **snap}}
+    assert _read(200, missing, execution_id=E1).verdict == ws.SNAPSHOT_UNKNOWN
 
 
 def test_an_oversized_prior_id_is_ignored_and_never_breaks_assembly(tmp_path, observe):
@@ -345,3 +402,20 @@ def test_a_retry_at_a_later_second_is_a_replay_and_new_content_still_diverges(tm
     changed["sources"][0]["content_hash"] = "sha256:" + "0" * 64
     answer = ws.persist(retry, _Store(stored=cs.canonical_json(changed)))
     assert answer.verdict == ws.SNAPSHOT_DIVERGED and "differs in: sources" in answer.reason
+
+
+def test_persist_documents_everything_a_retry_may_change():
+    """#455 item 8: the docstring lists what `_retry_stable` drops, so the
+    two cannot drift apart silently."""
+    doc = ws.persist.__doc__ or ""
+    for name in (*ws._RETRY_VOLATILE, "retrieved_at", "observed_at", "resumed_from_snapshot_id"):
+        assert f"`{name}`" in doc or f".{name}`" in doc, name
+
+
+def test_the_snapshot_log_line_imports_nothing_at_call_time():
+    """#455 item 10: `json` is a module-level import of context_assembly."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(ca._emit_snapshot_answer))
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.Import | ast.ImportFrom)]

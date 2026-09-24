@@ -303,7 +303,7 @@ def _parse_issue_url(url: str) -> IssueRef:
     bad input. The library-facing core of `parse_issue_url` — callers that
     filter a mixed list (e.g. the poller) catch IssueURLError rather than
     the process-exit signal `SystemExit`."""
-    m = _ISSUE_URL_RE.match(url.strip())
+    m = _ISSUE_URL_RE.fullmatch(url.strip())
     if not m:
         raise IssueURLError(
             f"Not a GitHub issue URL: {url!r}\n"
@@ -1876,7 +1876,7 @@ def _canonical_issue_key(url: str) -> str:
     (`http://` vs `https://`, a trailing slash, case). An unparseable URL
     falls back to its stripped self: never silently equal to a parseable
     one."""
-    m = _ISSUE_URL_RE.match(url.strip())
+    m = _ISSUE_URL_RE.fullmatch(url.strip())
     if not m:
         return url.strip()
     return f"{m.group(1).lower()}/{m.group(2).lower()}#{m.group(3)}"

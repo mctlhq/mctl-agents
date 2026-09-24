@@ -44,7 +44,14 @@ exactly as served — the `{schema_version, work_item, state_version,
 latest_execution}` view, the states `active | waiting | completed |
 superseded | archived` (terminal: the last three), and the execution ledger
 from `GET /api/v1/work-items/{id}/executions`, read all or nothing. Any other
-`schema_version`, state or vocabulary value is `WORK_ITEM_UNKNOWN`. The test
+`schema_version`, state or vocabulary value is `WORK_ITEM_UNKNOWN`, with one
+exception (#455): an execution whose `engine` this image does not know stays
+in the ledger by its id and attempt, without a `temporal_workflow_id`, rather
+than refusing every read of the item. A view whose `latest_execution` is
+present but has no readable id is `WORK_ITEM_UNKNOWN`, never "no executions".
+When the ledger and the view's latest execution disagree (an attach raced
+the two reads), the pair of reads is repeated once before answering
+`WORK_ITEM_UNKNOWN`. The test
 fixtures under `tests/fixtures/workitem/` are captured from mctl-api's own
 handlers. The ledger read relies on two mctl-api properties: attempts are
 dense `1..n`, and the executions route is unpaginated. If mctl-api changes

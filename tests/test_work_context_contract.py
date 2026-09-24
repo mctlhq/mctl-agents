@@ -242,14 +242,21 @@ def test_issue_url_rule_is_the_investigators_own():
     investigator = Path(__file__).resolve().parent.parent / "orchestrator" / "run_issue_investigator.py"
     src = investigator.read_text(encoding="utf-8")
     urls = ("https://github.com/a/b/issues/1", "http://github.com/a/b/issues/1/", "https://github.com/örg/b/issues/1",
-            "https://github.com/a/b/pull/1", "https://github.com/a/b/issues/1#x", "https://gitlab.com/a/b/issues/1")
+            "https://github.com/a/b/pull/1", "https://github.com/a/b/issues/1#x", "https://gitlab.com/a/b/issues/1",
+            "https://github.com/a/b/issues/1\n")
     import re as _re
 
     m = _re.search(r"_ISSUE_URL_RE = re\.compile\(\s*r\"(.+?)\"\s*\)", src, _re.S)
     assert m, "run_issue_investigator._ISSUE_URL_RE not found, or it now takes flags"
     theirs = _re.compile(m.group(1))
     for url in urls:
-        assert bool(theirs.match(url)) == bool(wc._ISSUE_URL_RE.match(url)), url
+        assert bool(theirs.fullmatch(url)) == bool(wc._ISSUE_URL_RE.fullmatch(url)), url
+    # The matching mode is pinned too (#455 item 4): both modules call
+    # fullmatch, never match, on the rule.
+    contract = Path(wc.__file__).read_text(encoding="utf-8")
+    for source in (src, contract):
+        assert "_ISSUE_URL_RE.match(" not in source
+        assert "_ISSUE_URL_RE.fullmatch(" in source
 
 
 def test_a_null_origin_surface_is_no_origin_not_a_broken_record():
@@ -295,7 +302,6 @@ def test_executions_listing_is_all_or_nothing():
         mutated(work_item_id="wi_someone-else"),
         mutated(attempt=0),
         mutated(attempt="2"),
-        mutated(engine="lambda"),
         mutated(attempt=1),
         mutated(attempt=3),
         mutated(id=listing["executions"][0]["id"]),
@@ -309,6 +315,45 @@ def test_executions_listing_is_all_or_nothing():
     assert executions is not None and len(executions) == 2, why
     executions, why = wc.executions_from(503, {"error": "unavailable"}, wid)
     assert executions is None and "unavailable" in why
+
+
+def test_an_unknown_engine_degrades_its_entry_not_the_ledger():
+    """#455 item 5: an execution of an engine this image does not know is
+    still in the ledger, by its store id and attempt; only its engine_ref
+    is not read as a Temporal workflow id."""
+    listing = _fixture("executions-two.json")
+    wid = listing["executions"][0]["work_item_id"]
+    out = json.loads(json.dumps(listing))
+    out["executions"][1]["engine"] = "lambda"
+    executions, why = wc.executions_from(200, out, wid)
+    assert executions is not None and len(executions) == 2, why
+    assert executions[1].execution_id == listing["executions"][1]["id"]
+    assert executions[1].sequence == 2
+    assert executions[1].temporal_workflow_id == ""
+    # A known non-Temporal engine carries no Temporal id either.
+    out["executions"][1]["engine"] = "argo"
+    executions, _ = wc.executions_from(200, out, wid)
+    assert executions is not None and executions[1].temporal_workflow_id == ""
+
+
+def test_latest_execution_id_tells_none_from_unreadable():
+    """#455 item 2: "" is only "the view names no latest execution"."""
+    assert wc.latest_execution_id_of({"latest_execution": None}) == ""
+    assert wc.latest_execution_id_of({}) == ""
+    assert wc.latest_execution_id_of({"latest_execution": {"id": "we_1"}}) == "we_1"
+    for unreadable in ({"latest_execution": {}}, {"latest_execution": {"id": ""}},
+                       {"latest_execution": {"id": 7}}, {"latest_execution": "we_1"}, None):
+        assert wc.latest_execution_id_of(unreadable) is None, unreadable
+
+
+def test_an_external_key_with_a_trailing_newline_is_not_an_issue_url():
+    """#455 item 4: the rule is matched with fullmatch — `$` alone would
+    also accept a trailing newline."""
+    url = "https://github.com/mctlhq/mctl-agents/issues/488"
+    assert wc.record_of(_view(external_key=url)).issue_url == url
+    for spelled in (url + "\n", url + "/\n"):
+        item = wc.record_of(_view(external_key=spelled))
+        assert item is not None and item.issue_url == "" and item.external_key == spelled
 
 
 def test_a_truncated_ledger_is_refused_even_with_the_latest_entry_present():
