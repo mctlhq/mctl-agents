@@ -15,6 +15,9 @@ from typing import Any
 
 import yaml
 
+from orchestrator.approval_ticket import ApprovalTicket
+from orchestrator.approval_ticket import from_json as _ticket_from_json
+
 
 class _Unset:
     pass
@@ -42,6 +45,45 @@ def load_status(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"{path}: expected a mapping, got {type(data).__name__}")
     return data
+
+
+# The cron-driven action-approval wait (mctl-agents#198,
+# docs/adr/016-human-approval-checkpoints.md). One additive `approval` block,
+# tolerated absent by every reader: `{"ticket": <ApprovalTicket.to_json() |
+# null>, "denials": int, "attempt": int}`.
+#
+# `denials` bounds repeated human denials of the same parked action before
+# the shepherd gives up and hands it to `needs-triage` (mirrors
+# `IMPLEMENT_MAX_POLICY_HANDBACKS`). `attempt` is the redemption attempt the
+# NEXT create-or-find call uses (`action_approvals.idempotency_key`): mctl-api
+# answers a replayed idempotency key with the stored request whatever its
+# state, so a same-head expiry needs a bumped attempt to ever get a fresh,
+# human-decidable request rather than the same expired one back.
+def read_approval(data: dict[str, Any]) -> tuple[ApprovalTicket | None, int, int]:
+    """`(ticket, denials, attempt)` from one `.status.yaml` payload.
+
+    Absent, non-mapping or corrupt is the same as "nothing parked yet":
+    `(None, 0, 0)`, never a raise.
+    """
+    block = data.get("approval")
+    if not isinstance(block, dict):
+        return None, 0, 0
+    ticket = _ticket_from_json(block.get("ticket"))
+
+    def _count(value: Any) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    return ticket, _count(block.get("denials")), _count(block.get("attempt"))
+
+
+def approval_payload(ticket: ApprovalTicket | None, *, denials: int = 0, attempt: int = 0) -> dict[str, Any]:
+    """The `approval` field for `update_status_file` / `update_status`.
+
+    `ticket=None` records "not currently parked" while keeping `denials` and
+    `attempt` -- clearing the ticket after an expiry or a mismatch must not
+    also forget how many attempts or denials came before it.
+    """
+    return {"ticket": ticket.to_json() if ticket is not None else None, "denials": denials, "attempt": attempt}
 
 
 # Approvers that record no identity. "unknown" is the literal default in
