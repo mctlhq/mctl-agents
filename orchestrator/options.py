@@ -24,6 +24,7 @@ from orchestrator.exec_budget import (
 )
 from orchestrator.exec_budget import normalize_shell_command as _normalize_shell_command
 from orchestrator.resolver import ExecutionPlan
+from orchestrator.usage_ledger import agent_env_without_writer_token
 
 # Paths already warned about by _execution_context_headers(): the audit hook
 # re-reads the env on every PreToolUse, so an unreadable context file would
@@ -958,10 +959,25 @@ def _sibling_add_dirs(service_name: str) -> list[str | Path]:
     return dirs
 
 
+def _scrubbed(options: ClaudeAgentOptions) -> ClaudeAgentOptions:
+    """Every SDK session's options in this module pass through here.
+
+    Blanks the usage-writer token (mctlhq/.github#50) in the session's env.
+    The SDK layers `env` over the inherited environment, so a builder that
+    passed none, or copied `os.environ`, would hand the token to the CLI
+    child and to everything the model runs through Bash; the token is for
+    the usage producer in this process only. A builder cannot opt out:
+    tests/test_usage_ledger.py fails on any `ClaudeAgentOptions(...)` here
+    that is not the direct argument of this function.
+    """
+    options.env = agent_env_without_writer_token(options.env or os.environ)
+    return options
+
+
 def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOptions:
     """Options for a service-owner agent."""
     allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(service_dir),                  # CLAUDE.md, .claude/, inbox/, proposals/
         setting_sources=["project"],           # pick up .claude/skills and .claude/agents
         model=model,
@@ -977,7 +993,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         # PATH: claude-agent-sdk bundles its own binary and prefers it over
         # anything on PATH (see Dockerfile).
         env={**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH},
-    )
+    ))
 
 
 def build_implementer_agent_options(
@@ -1034,7 +1050,7 @@ def build_implementer_agent_options(
             ),
         )
     allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=model,
@@ -1045,7 +1061,7 @@ def build_implementer_agent_options(
         add_dirs=[],
         env=env,
         hooks=_compose_hooks(hooks, _policy_hooks(allowed_tools)),
-    )
+    ))
 
 
 def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
@@ -1053,7 +1069,7 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
     # No hooks, so no policy checkpoint either (#197): any hook makes the
     # mentor drainable (mctl-agents#366/#368), which is its own decision.
     # Its MCP calls stay ungoverned until that is taken — ADR 014.
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(mentor_dir.parent),            # .../agents — so the mentor sees every agent
         setting_sources=["project"],
         model=model,
@@ -1062,7 +1078,7 @@ def build_mentor_options(mentor_dir: Path, model: str) -> ClaudeAgentOptions:
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=MENTOR_BUDGET_USD,
-    )
+    ))
 
 
 def build_incident_responder_options(
@@ -1092,7 +1108,7 @@ def build_incident_responder_options(
     if state_dir is not None:
         env["INCIDENT_STATE_DIR"] = str(state_dir)
     allowed_tools = ["Read", "Write", "Glob", *_mctl_tool_globs()]
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(agent_dir),
         setting_sources=["project"],
         model=model,
@@ -1102,7 +1118,7 @@ def build_incident_responder_options(
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
         env=env,
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
-    )
+    ))
 
 
 def build_issue_investigator_options(
@@ -1127,7 +1143,7 @@ def build_issue_investigator_options(
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
     allowed_tools = ["Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", *_mctl_tool_globs()]
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=model,
@@ -1138,7 +1154,7 @@ def build_issue_investigator_options(
         add_dirs=[str(proposal_dir)],
         env=env,
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
-    )
+    ))
 
 
 def build_issue_investigator_options_from_plan(
@@ -1187,7 +1203,7 @@ def build_issue_investigator_options_from_plan(
     ]
     if "mcp__mctl__*" in plan.tools:
         allowed_tools += _mctl_tool_globs()
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=plan.model,
@@ -1198,7 +1214,7 @@ def build_issue_investigator_options_from_plan(
         add_dirs=[str(proposal_dir)],
         env=env,
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
-    )
+    ))
 
 
 def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions:
@@ -1216,7 +1232,7 @@ def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions
 
     No mctl MCP, no sibling repos — the bundle is self-contained text.
     """
-    return ClaudeAgentOptions(
+    return _scrubbed(ClaudeAgentOptions(
         cwd=str(shepherd_dir),
         setting_sources=["project"],
         model=model,
@@ -1225,4 +1241,4 @@ def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions
         permission_mode="acceptEdits",
         max_budget_usd=SHEPHERD_BUDGET_USD,
         env={**os.environ},
-    )
+    ))

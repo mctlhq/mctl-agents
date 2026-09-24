@@ -99,7 +99,7 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator import policy_checkpoint
+from orchestrator import policy_checkpoint, tracing
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
@@ -2122,13 +2122,17 @@ async def _format_bundle_via_sdk(findings: list[CodexFinding]) -> dict:
 
     collected_text: list[str] = []
     try:
-        async for message in query(prompt=prompt, options=options):
-            # Capture any textual content the SDK streams. We do not
-            # depend on a specific Message type here — any object with
-            # a `content` attribute that yields text blocks works.
-            text = _extract_text_from_message(message)
-            if text:
-                collected_text.append(text)
+        # `trace_run.observe` is also what records this call's model usage
+        # (orchestrator/usage_ledger.py, mctlhq/.github#50).
+        with tracing.agent_run("shepherd", SHEPHERD_MODEL) as trace_run:
+            async for message in query(prompt=prompt, options=options):
+                trace_run.observe(message)
+                # Capture any textual content the SDK streams. We do not
+                # depend on a specific Message type here — any object with
+                # a `content` attribute that yields text blocks works.
+                text = _extract_text_from_message(message)
+                if text:
+                    collected_text.append(text)
     except Exception as e:  # noqa: BLE001 — fall back deterministically
         print(f"warn: shepherd SDK call failed ({type(e).__name__}: {e}); using fallback bundle")
         return _fallback_bundle(findings)
