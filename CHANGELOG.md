@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.56.0](https://github.com/mctlhq/mctl-agents/compare/1.55.0...1.56.0) (2026-09-24)
+
+
+### Features
+
+* **dispatcher:** one DevLoop per issue via Update-with-Start ([#461](https://github.com/mctlhq/mctl-agents/issues/461) option A) ([b68291c](https://github.com/mctlhq/mctl-agents/commit/b68291c1afada74899a368407a2840f87950488c))
+* **dispatcher:** one DevLoop per issue via Update-with-Start ([#461](https://github.com/mctlhq/mctl-agents/issues/461) option A) ([5111b7f](https://github.com/mctlhq/mctl-agents/commit/5111b7f6799ba9616f16840dede763c9ca2fc5fa))
+
+
+### Bug Fixes
+
+* **dev-loop:** never vouch for an empty request id; one work item source ([79d5876](https://github.com/mctlhq/mctl-agents/commit/79d5876ff602e3712b3ecdbd5abfb0a2aa627649))
+* **dispatcher:** a new run of the shared id is not the accepting run ([535e92b](https://github.com/mctlhq/mctl-agents/commit/535e92ba668f8c7cf38a27f3247d41e8e129e81f))
+* **dispatcher:** keep the shared issue id safe for intake and reconciliation ([15854c3](https://github.com/mctlhq/mctl-agents/commit/15854c336fe1198026c69804b280d32e460bb851))
+
 ## [1.55.0](https://github.com/mctlhq/mctl-agents/compare/1.54.0...1.55.0) (2026-09-23)
 
 
