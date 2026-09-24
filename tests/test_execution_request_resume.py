@@ -412,8 +412,12 @@ async def test_a_delivery_carried_across_continue_as_new_is_bound_once_by_the_ne
         await _wait_for(lambda: _row(api, f"{loop}#{rid}")["phase"] == "Succeeded")
         events = await _events(env, loop)
         ctx = await handle.query(DevLoopWorkflow.work_context)
+        # The carried request is this run's to vouch for (agy round 2 on #487):
+        # the reconciliation must never take it for a later run's.
+        held = await handle.query(DevLoopWorkflow.holds_execution_request, rid)
         await _stop(env, loop)
 
+    assert held is True
     assert _accepted_updates(events) == [rid]
     assert _binds_for(events, rid) == 1
     assert [e.execution_id for e in ctx.executions] == [_row(api, f"{loop}#{rid}")["id"]]

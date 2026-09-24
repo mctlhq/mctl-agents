@@ -1311,9 +1311,7 @@ async def test_a_later_run_of_the_same_loop_does_not_mask_a_terminated_run_s_exe
 
 
 @pytest.mark.parametrize(("held", "reconciled"), [(True, False), (None, False), (False, True)])
-async def test_the_reconciliation_of_a_running_loop_follows_whether_its_run_holds_the_request(
-    api, held, reconciled
-):
+async def test_the_reconciliation_of_a_running_loop_follows_whether_its_run_holds_the_request(api, held, reconciled):
     """Only a definite "this run never took it" fails the execution of a
     RUNNING loop; a run that holds it, or one that cannot say (the query
     failed, or the run predates it), is left alone."""
@@ -1326,6 +1324,68 @@ async def test_the_reconciliation_of_a_running_loop_follows_whether_its_run_hold
     await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
 
     assert (api.executions[0]["phase"] == "Failed") is reconciled
+
+
+class _HoldsInTurn(FakeTemporal):
+    """A FakeTemporal whose `holds_request` answers from `answers` in turn."""
+
+    def __init__(self, answers: list[bool | None], **kwargs: Any) -> None:
+        super().__init__({workflow_id_for(URL): dx.LOOP_RUNNING}, **kwargs)
+        self.answers = answers
+
+    async def holds_request(self, workflow_id: str, request_id: str) -> bool | None:
+        return self.answers.pop(0)
+
+
+async def test_a_new_run_started_after_the_accepting_run_closed_is_not_taken_for_it(api, capsys):
+    """Review round 2 P2 on #487, before the fulfil: the run that accepted
+    the request closed and another starter began a new run of the shared id.
+    The loop is RUNNING, but its run never took the request: the delivery
+    is stale, nothing is fulfilled, the request stays claimed."""
+    rid = api.create_request("start")
+    temporal = _HoldsInTurn([False])
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED and "closed after accepting" in outcome.reason
+    assert api.fulfils() == [] and api.request_state(rid)["state"] == "claimed"
+    assert "deliver_stale" in [a["event"] for a in _audit(capsys.readouterr().out)]
+
+
+async def test_an_execution_minted_after_the_accepting_run_was_replaced_is_ended_by_the_dispatcher(api, capsys):
+    """Review round 2 P2 on #487, after the fulfil: the accepting run was
+    replaced by a new run of the shared id between the check and the
+    fulfil. The new run will never bind the minted execution, so the
+    dispatcher ends it, as it does for a loop that closed."""
+    rid = api.create_request("start")
+    temporal = _HoldsInTurn([True, False])
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.FULFILLED
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [
+        (request_engine_ref(workflow_id_for(URL), rid), "Failed")
+    ]
+    assert [a["event"] for a in _audit(capsys.readouterr().out)][-1] == "orphan_failed"
+
+
+@pytest.mark.parametrize(
+    ("state", "reconciled"), [(dx.LOOP_RUNNING, False), (dx.LOOP_CLOSED, True), (dx.LOOP_ABSENT, True)]
+)
+async def test_a_pre_option_a_dispatched_loop_s_execution_is_still_reconciled(api, capsys, state, reconciled):
+    """An execution bound under a pre-option-A `dev-loop-xr_<id>` loop's
+    bare id (agy round 2 on #487): no such loop is started any more, but one
+    that closed without ending its execution must not wedge the item."""
+    old = "dev-loop-xr_00000009-0000-4000-8000-000000000461"
+    _ledger_entry(api, "temporal", old, "Running")
+    api.create_request("resume")
+    temporal = FakeTemporal({old: state}, held=False)
+
+    await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert (api.executions[0]["phase"] == "Failed") is reconciled
+    reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert [a["engine_ref"] for a in reconcile] == ([old] if reconciled else [])
 
 
 def _ledger_entry(api: DispatchFakeApi, engine: str, ref: str, phase: str) -> None:

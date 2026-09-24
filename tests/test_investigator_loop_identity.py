@@ -3,12 +3,15 @@ gap 2 and 3, #451).
 
 gitops#1345 declares three optional investigate CWFT parameters and forwards
 each as a flag only when non-empty: `--temporal-workflow-id`,
-`--temporal-run-id`, `--execution-request-id`. A loop started by the
-execution-request dispatcher is `dev-loop-xr_<id>`, which the investigator
-cannot derive from the issue URL, so without the passed id it would name the
-issue-keyed `dev-loop-mctlhq-<repo>-<n>`: in the approve instructions it posts
-(signalling a loop that does not exist) and in the correlation it seals (which
-the loop compares against its own id before accepting a clarification).
+`--temporal-run-id`, `--execution-request-id`. The loop's own id is the
+authority, not the one the investigator could derive from the issue URL:
+since #461 option A every DevLoop is issue-keyed, so the two agree in
+production, but a loop dispatched before it was `dev-loop-xr_<id>` and the
+contract must not depend on the derivation. The tests use such an
+underivable id (`LOOP`) so that a regression to the derived one is visible:
+it would show in the approve instructions the investigator posts and in the
+correlation it seals (which the loop compares against its own id before
+accepting a clarification).
 
 The loop side, end to end, is in tests/test_execution_request_dispatch.py.
 """

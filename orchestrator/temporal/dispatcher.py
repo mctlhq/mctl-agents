@@ -212,6 +212,12 @@ class DeliveryAnswer:
     reason: str = ""
 
 
+#: The workflow id prefix of a loop dispatched before #461 option A: its
+#: execution is bound under that bare id. None is started any more, but one
+#: that closed without ending its execution is still reconciled.
+PRE_ISSUE_KEYED_DISPATCH_PREFIX = "dev-loop-xr_"
+
+
 class TemporalPort(Protocol):
     """The two things the dispatcher needs from Temporal."""
 
@@ -424,8 +430,10 @@ class Dispatcher:
         # Accepted by a run that may have closed since: nothing would bind the
         # execution a fulfil mints now. Leave the request claimed; the next
         # claim re-sends it, and Update-with-Start either finds a running
-        # loop or starts one.
-        if await self._temporal.loop_state(loop) != LOOP_RUNNING:
+        # loop or starts one. "Running" alone proves nothing since the id is
+        # the issue's: another starter (the intake poller) may have started
+        # a new run of it that never took this request.
+        if not await self._accepting_run_alive(loop, request.request_id):
             audit("deliver_stale", **ids)
             return self._defer(request, loop, f"{loop} closed after accepting the request")
         outcome = await self._fulfil(request, token, loop, engine_ref)
@@ -445,7 +453,7 @@ class Dispatcher:
         from orchestrator.work_context.executions import EngineRun
 
         try:
-            if await self._temporal.loop_state(loop) == LOOP_RUNNING:
+            if await self._accepting_run_alive(loop, request.request_id):
                 return
         except Exception as exc:  # noqa: BLE001 — the fulfil already landed; the loop's own exit ends it
             logger.warning("liveness of %s after the fulfil of %s: %s", loop, request.request_id, exc)
@@ -462,6 +470,15 @@ class Dispatcher:
             verdict=answer.verdict,
             reason=answer.reason,
         )
+
+    async def _accepting_run_alive(self, loop: str, request_id: str) -> bool:
+        """Is the run that took `request_id` still running? The loop is
+        RUNNING, and its running run does not say it never took the request
+        (a query that cannot answer counts as alive: fail towards the old
+        `loop_state` check, never towards failing a live execution)."""
+        if await self._temporal.loop_state(loop) != LOOP_RUNNING:
+            return False
+        return await self._temporal.holds_request(loop, request_id) is not False
 
     async def _fulfil(self, request: xr.ExecutionRequest, token: str, loop: str, engine_ref: str) -> DispatchOutcome:
         answer = await asyncio.to_thread(self._api.fulfil_execution_request, request, token, ENGINE, engine_ref)
@@ -497,7 +514,8 @@ class Dispatcher:
         would then block every later request for the item
         (`execution_active`). Narrow on purpose: only a Temporal execution
         whose engine ref is this dispatcher's own `<loop>#xr_...`
-        (`is_request_engine_ref`), only while it is non-terminal, and only
+        (`is_request_engine_ref`) or a pre-option-A `dev-loop-xr_<id>`
+        loop's bare id, only while it is non-terminal, and only
         once Temporal says that loop is not RUNNING (CLOSED, or ABSENT), or
         that its RUNNING run does not hold the request (a later run of the
         same issue-keyed id, which will never end it). ABSENT
@@ -514,12 +532,18 @@ class Dispatcher:
 
         for execution in item.executions:
             ref = execution.temporal_workflow_id
-            if not ref or ref == engine_ref or not is_request_engine_ref(ref):
+            if not ref or ref == engine_ref:
+                continue
+            if not is_request_engine_ref(ref) and not ref.startswith(PRE_ISSUE_KEYED_DISPATCH_PREFIX):
                 continue
             if not execution.phase or execution.phase in TERMINAL_PHASES:
                 continue
             owner = loop_id_of_engine_ref(ref)
             if await self._temporal.loop_state(owner) == LOOP_RUNNING:
+                if not is_request_engine_ref(ref):
+                    # A pre-option-A `dev-loop-xr_<id>` loop is its own
+                    # request: running means it still holds it.
+                    continue
                 # The id is the issue's, shared by every run: only the run
                 # that took the request will end its execution. A later run
                 # that never took it (the intake's, after an operator

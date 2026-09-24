@@ -2490,7 +2490,8 @@ class DevLoopWorkflow:
             # ref is never re-derived here (a continued run starts without
             # it, and the bare workflow id is no longer any execution's ref).
             workflow.logger.error("no dispatched execution of this run to advance to %s", phase)
-            return True
+            # Not "landed": a caller holding a pending advance keeps it.
+            return False
         try:
             outcome = await workflow.execute_activity(
                 advance_dispatched_execution,
