@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.57.0](https://github.com/mctlhq/mctl-agents/compare/1.56.0...1.57.0) (2026-09-24)
+
+
+### Features
+
+* **usage:** record model usage from investigator, implementer and shepherd ([a64da68](https://github.com/mctlhq/mctl-agents/commit/a64da686a2540455d17016128fc420bf30f7a458))
+* **usage:** record model usage from investigator, implementer and shepherd (.github[#50](https://github.com/mctlhq/mctl-agents/issues/50) B) ([0e8a612](https://github.com/mctlhq/mctl-agents/commit/0e8a612d53b36a9e7127a74e5a0142303b3f4e74))
+
+
+### Bug Fixes
+
+* **usage:** deliver off the event loop; sticky landing; https only ([ffd47e4](https://github.com/mctlhq/mctl-agents/commit/ffd47e4e05b7cc3c69b925d5833840f809d584cb))
+* **usage:** strip the base URL; a broken recorder never fails a run ([8e07baf](https://github.com/mctlhq/mctl-agents/commit/8e07baf89047acd8ad7d5bc0afd84b199c6e6cd4))
+* **work-context:** close the [#455](https://github.com/mctlhq/mctl-agents/issues/455) mirror follow-ups before rollout leaves off ([cae440c](https://github.com/mctlhq/mctl-agents/commit/cae440c235beac41a401f81490e2bbfb45ca1fb2))
+* **work-context:** close the [#455](https://github.com/mctlhq/mctl-agents/issues/455) mirror follow-ups before rollout leaves off ([3155135](https://github.com/mctlhq/mctl-agents/commit/31551354b6aa14c7a762666daf3023288c9b3bcb))
+* **work-context:** presence counts at the top level of the snapshot diff ([dbc17ae](https://github.com/mctlhq/mctl-agents/commit/dbc17ae9801b54fad71ad54159ae5efe6772e27e))
+* **work-context:** presence-aware snapshot diff, seal-side work item check ([4049e3b](https://github.com/mctlhq/mctl-agents/commit/4049e3bba84a9badca6d02156f1e1c3e1aa6e690))
+
 ## [1.56.0](https://github.com/mctlhq/mctl-agents/compare/1.55.0...1.56.0) (2026-09-24)
 
 
