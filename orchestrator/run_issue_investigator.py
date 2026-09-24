@@ -1295,8 +1295,8 @@ def post_proposal_comment(
     """Comment on the issue with a link to the freshly written proposal.
 
     `temporal_workflow_id` is the loop that submitted this run, when it said
-    so (mctlhq/mctl-agents#461): a dispatched loop is `dev-loop-xr_*`, and
-    approve instructions naming the issue-keyed id would signal nothing."""
+    so (mctlhq/mctl-agents#461); every loop is issue-keyed (#461 option A),
+    so it agrees with the derived id, and is preferred as the loop's own word."""
     # Render the CONCRETE workflow id (single source: issue_ref.workflow_id_for,
     # a temporalio-free module — this function runs inside the agent container)
     # so the approve commands below are copy-pasteable — placeholder text

@@ -10,58 +10,49 @@ One dispatch, in order:
 
 1. **Claim** the oldest claimable request under a lease (mctl-api's CAS; a
    lapsed lease is claimable again, under a new claim token).
-2. **Decide** what to run, from the store, never guessed:
-   - v1 runs the investigator for an item bound to a mctlhq GitHub issue
-     (`issue_url`). Anything else is rejected `no_runnable_target`.
-   - A DevLoop already live for the item (behind any Temporal execution in
-     its ledger, or the issue's own `dev-loop-<owner>-<repo>-<n>` loop)
-     refuses a `start` (`loop_active`) and takes a `resume` itself (below).
-     No live loop: a `resume` starts a continuation exactly as `start`
-     starts the first run; mctl-api's fulfil applies the `/resume` rule and
-     re-decides the item's state, and the new run's approval is its own,
-     never inherited.
-3. **Start** the DevLoop under `dispatched_workflow_id(request id)` with a
-   reuse policy that refuses a second run (`start_dispatched_dev_loop`). A
-   run that already ended under that id rejects the request
-   (`engine_run_ended`).
-4. **Fulfil** with `(temporal, <that workflow id>)`: mctl-api attaches the
-   `we_` execution. The engine ref is the workflow id, so it is as
-   deterministic as the workflow id.
+2. **Decide** what to run, from the store, never guessed: v1 runs the
+   investigator for an item bound to a mctlhq GitHub issue (`issue_url`).
+   Anything else is rejected `no_runnable_target`.
+3. **Deliver** the request to the issue's one DevLoop,
+   `dev-loop-<owner>-<repo>-<n>` (#461 option A), with Update-with-Start
+   (`start.dispatch_start_operation`): the `accept_execution_request`
+   Update, update id = the request id, together with a start under the
+   intake poller's own id and conflict policy (`USE_EXISTING`; any closed
+   run replaceable). Temporal applies both as one operation,
+   so the intake poller and this dispatcher can never run two loops for one
+   issue, whichever reaches Temporal first; and the loop, not this process,
+   decides what the request means:
+   - No loop runs: a new run starts with the request as its own and
+     accepts it in its first activation, before `run`: a `start` starts the
+     first run, a `resume` a continuation (mctl-api's fulfil applies the
+     `/resume` rule and re-decides the item; the new run's approval is its
+     own, never inherited).
+   - The loop runs: a `start` it was not started for is refused
+     (`loop_active`); a `resume` is taken or refused by the `resume`
+     signal's rules (`resume_refused:<reason>`), or deferred while the loop
+     cannot decide yet.
+   - The issue's loop has ended (any outcome): a new run starts, as when
+     none runs (`start.DISPATCH_ID_REUSE_POLICY`, which also says why that
+     can never run one request twice).
+4. **Fulfil** with `(temporal, <loop id>#<request id>)`
+   (`issue_ref.request_engine_ref`): mctl-api attaches the `we_` execution,
+   and the loop binds it itself, on its dispatched path for its own request
+   or through `_deliver` for a delivered resume.
 
-Start comes BEFORE fulfil on purpose. A crash between the two leaves a
-claimed request whose lease lapses; the next claim (new token) derives the
-same workflow id, attaches to the same run (USE_EXISTING), and fulfils the
-same `(engine, engine_ref)`. A crash after the fulfil leaves nothing to do:
-the loop reads its `we_` from the fulfilled request itself
-(`activities/execution_requests.py`). No order of crashes produces a second
-run or a second execution.
+The Update comes BEFORE the fulfil on purpose: once accepted it is in the
+loop's history, the durable "accepted, not yet bound" record. A crash between
+the two leaves a claimed request whose lease lapses; the next claim sends the
+same update id, which Temporal answers from the run's registry (the loop's
+`accepted_request_ids` covers a continue-as-new), and fulfils the same engine
+ref, which mctl-api answers with the same `we_`. A crash after the fulfil
+leaves nothing to do: the loop reads its `we_` from the store. No order of
+crashes produces a second run or a second execution. The loop's liveness is
+checked again after an accepted Update and before the fulfil, and once more
+after it: a fulfil that landed for a loop that has since closed is failed
+here, since nothing else would end it (mctl-api refuses every new request for
+the item while it is non-terminal, so reconciliation would never run).
 
-**A resume onto a live loop L is delivered to L, before the fulfil**, by
-the same rule: the loop's own history is the durable record, never this
-process. The dispatcher sends L the `accept_execution_request` Update with
-`update_id = the request id`, then fulfils with `engine_ref = "<L>#<request
-id>"` (`issue_ref.resume_engine_ref`), and L binds the `we_` that fulfil
-mints and ends it (`DevLoopWorkflow._deliver`).
-
-- L's validator refuses a resume it would not take (the `resume` signal's
-  rules): the request is rejected `resume_refused:<reason>` and no `we_` is
-  minted. A transient no (L is not ready, or is ending) defers.
-- A crash after the Update and before the fulfil: L holds the request and
-  waits for its fulfilment for as long as it runs; the next claim sends the
-  same update id (Temporal answers it from L's registry, and L's
-  `accepted_request_ids` covers the run after a continue-as-new) and
-  fulfils the same engine ref.
-- A crash after the fulfil: nothing is lost; L reads the `we_` from the
-  store.
-- L gone before it accepts: the Update fails NOT_FOUND and the request
-  starts a continuation as above. L's liveness is checked again after an
-  accepted Update and before the fulfil (Temporal answers a repeated update
-  id from a CLOSED run's registry too), and once more after it: a fulfil
-  that landed for a loop that has since closed is failed here, since
-  nothing else would end it (mctl-api refuses every new request for the
-  item while it is non-terminal, so reconciliation would never run).
-
-Each claim, start, fulfil and reject prints one structured audit line
+Each claim, delivery, fulfil and reject prints one structured audit line
 (`EXECUTION_REQUEST_DISPATCH {...}`) carrying the request, work item,
 workflow and execution ids; mctl-api records its own events and audit rows.
 Every mctl-api mutation goes through the policy checkpoint (#197) inside
@@ -83,12 +74,10 @@ from typing import Any, Protocol
 
 from orchestrator.temporal.issue_ref import (
     MAX_ENGINE_REF_BYTES,
-    dispatched_workflow_id,
-    is_dispatched_workflow_id,
-    is_resume_engine_ref,
+    is_request_engine_ref,
     loop_id_of_engine_ref,
     parse_issue_url,
-    resume_engine_ref,
+    request_engine_ref,
     workflow_id_for,
 )
 from orchestrator.work_context import execution_requests as xr
@@ -116,21 +105,17 @@ LOOP_RUNNING = "running"
 LOOP_CLOSED = "closed"
 LOOP_ABSENT = "absent"
 
-# `TemporalPort.start` answers.
-START_STARTED = "started"
-#: A run under that id already ended; the reuse policy refused a second.
-START_CLOSED = "closed"
-
-# `TemporalPort.deliver_resume` answers.
-#: The loop accepted the request (or had already accepted it).
+# `TemporalPort.deliver` answers.
+#: The loop accepted the request (or had already accepted it): a new run
+#: started for it, or the running loop took it.
 DELIVERED = "delivered"
 #: The loop's validator refused it for good; `reason` is the loop's own.
 DELIVERY_REFUSED = "delivery-refused"
-#: The loop cannot decide now (not ready, ending), or the Update failed in
+#: A `start` for an issue whose loop runs and was not started for it.
+DELIVERY_LOOP_ACTIVE = "delivery-loop-active"
+#: The loop cannot decide now (not ready, ending), or the operation failed in
 #: a way that says nothing permanent about the request.
 DELIVERY_DEFERRED = "delivery-deferred"
-#: The loop is not running any more (or never was).
-DELIVERY_LOOP_GONE = "delivery-loop-gone"
 
 #: A request always comes from a person (mctl-api refuses one from the
 #: service principal), directly or through a surface relaying for its linked
@@ -227,21 +212,19 @@ class DeliveryAnswer:
 
 
 class TemporalPort(Protocol):
-    """The three things the dispatcher needs from Temporal."""
+    """The two things the dispatcher needs from Temporal."""
 
-    async def start(self, issue: Any) -> str:
-        """START_STARTED (new or already running), or START_CLOSED."""
+    async def deliver(self, issue: Any, delivery: Any) -> DeliveryAnswer:
+        """Deliver `delivery` (a `ResumeDelivery`) to the issue's DevLoop
+        with Update-with-Start: the `accept_execution_request` Update, update
+        id = the request id, and a start of `issue` (an `IssueRef` carrying
+        the request) under the issue-keyed id, applied as one operation.
+        Raises when Temporal cannot answer."""
         ...
 
     async def loop_state(self, workflow_id: str) -> str:
         """LOOP_RUNNING, LOOP_CLOSED or LOOP_ABSENT. Raises when Temporal
         cannot answer."""
-        ...
-
-    async def deliver_resume(self, workflow_id: str, delivery: Any) -> DeliveryAnswer:
-        """Send `delivery` (a `ResumeDelivery`) to the running loop through
-        the `accept_execution_request` Update, with the request id as the
-        update id. Raises when Temporal cannot answer."""
         ...
 
 
@@ -251,48 +234,26 @@ class TemporalClientPort:
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    async def start(self, issue: Any) -> str:
-        from temporalio.exceptions import WorkflowAlreadyStartedError
-
-        from orchestrator.temporal.start import start_dispatched_dev_loop
-
-        try:
-            await start_dispatched_dev_loop(self._client, issue)
-        except WorkflowAlreadyStartedError:
-            return START_CLOSED
-        return START_STARTED
-
-    async def loop_state(self, workflow_id: str) -> str:
-        from temporalio.client import WorkflowExecutionStatus
-        from temporalio.service import RPCError, RPCStatusCode
-
-        try:
-            desc = await self._client.get_workflow_handle(workflow_id).describe()
-        except RPCError as exc:
-            if exc.status == RPCStatusCode.NOT_FOUND:
-                return LOOP_ABSENT
-            raise
-        return LOOP_RUNNING if desc.status == WorkflowExecutionStatus.RUNNING else LOOP_CLOSED
-
-    async def deliver_resume(self, workflow_id: str, delivery: Any) -> DeliveryAnswer:
+    async def deliver(self, issue: Any, delivery: Any) -> DeliveryAnswer:
         from temporalio.client import WorkflowUpdateFailedError
         from temporalio.exceptions import ApplicationError
-        from temporalio.service import RPCError, RPCStatusCode
 
+        from orchestrator.temporal.start import dispatch_start_operation
         from orchestrator.temporal.workflows.dev_loop import (
             ACCEPT_EXECUTION_REQUEST_UPDATE,
             DELIVERY_ACCEPTED,
+            LOOP_ACTIVE_ERROR_TYPE,
             RESUME_DEFERRED_ERROR_TYPE,
             RESUME_REFUSED_ERROR_TYPE,
         )
 
-        handle = self._client.get_workflow_handle(workflow_id)
         try:
             answer = await asyncio.wait_for(
-                handle.execute_update(
+                self._client.execute_update_with_start_workflow(
                     ACCEPT_EXECUTION_REQUEST_UPDATE,
                     delivery,
                     id=delivery.execution_request_id,
+                    start_workflow_operation=dispatch_start_operation(issue),
                     result_type=str,
                 ),
                 timeout=DELIVERY_TIMEOUT_SECONDS,
@@ -300,6 +261,8 @@ class TemporalClientPort:
         except WorkflowUpdateFailedError as exc:
             cause = exc.cause
             reason = str(cause.details[0]) if isinstance(cause, ApplicationError) and cause.details else str(cause)
+            if isinstance(cause, ApplicationError) and cause.type == LOOP_ACTIVE_ERROR_TYPE:
+                return DeliveryAnswer(DELIVERY_LOOP_ACTIVE, reason)
             if isinstance(cause, ApplicationError) and cause.type == RESUME_REFUSED_ERROR_TYPE:
                 # Surfaces branch on this reason: only the closed vocabulary,
                 # never the free text of an error without (known) details.
@@ -316,13 +279,21 @@ class TemporalClientPort:
             # (`asyncio.TimeoutError` is `TimeoutError` since 3.11.) Says
             # nothing about the request: defer, and let the next claim re-send.
             return DeliveryAnswer(DELIVERY_DEFERRED, DELIVERY_TIMED_OUT)
-        except RPCError as exc:
-            if exc.status == RPCStatusCode.NOT_FOUND:
-                return DeliveryAnswer(DELIVERY_LOOP_GONE, str(exc))
-            raise
         if answer != DELIVERY_ACCEPTED:
             return DeliveryAnswer(DELIVERY_DEFERRED, f"unexpected answer {answer!r}")
         return DeliveryAnswer(DELIVERED)
+
+    async def loop_state(self, workflow_id: str) -> str:
+        from temporalio.client import WorkflowExecutionStatus
+        from temporalio.service import RPCError, RPCStatusCode
+
+        try:
+            desc = await self._client.get_workflow_handle(workflow_id).describe()
+        except RPCError as exc:
+            if exc.status == RPCStatusCode.NOT_FOUND:
+                return LOOP_ABSENT
+            raise
+        return LOOP_RUNNING if desc.status == WorkflowExecutionStatus.RUNNING else LOOP_CLOSED
 
 
 @dataclass(frozen=True)
@@ -330,11 +301,13 @@ class DispatchOutcome:
     action: str
     execution_request_id: str = ""
     work_item_id: str = ""
+    #: The issue's DevLoop ("" when the request was settled before its item
+    #: was read).
     workflow_id: str = ""
     execution_id: str = ""
     reason: str = ""
-    #: The engine ref the request was fulfilled with, when it differs from
-    #: `workflow_id` (a resume delivered onto a live loop: `<loop>#<xr id>`).
+    #: The engine ref the request was (or would have been) fulfilled with:
+    #: `<workflow_id>#<request id>`.
     engine_ref: str = ""
 
 
@@ -368,103 +341,74 @@ class Dispatcher:
             audit("claim_failed", verdict=claim.verdict, reason=claim.reason)
             return DispatchOutcome(CLAIM_FAILED, reason=claim.reason)
         request, token = claim.request, claim.claim_token
-        own_id = dispatched_workflow_id(request.request_id)
         audit(
             "claim",
             execution_request_id=request.request_id,
             work_item_id=request.work_item_id,
             kind=request.kind,
-            workflow_id=own_id,
             claim_expires_at=request.claim_expires_at,
         )
+        # The loop is known once the item is: until then, "".
+        loop = ""
         try:
-            return await self._dispatch(request, token, own_id)
+            if request.kind not in xr.KINDS:
+                return await self._reject(request, token, loop, xr.UNSUPPORTED_KIND)
+            answer = await asyncio.to_thread(self._api.get, request.work_item_id)
+            if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
+                # Not a reason to reject: the store did not answer. Guessing
+                # either way would be wrong, so the lease decides when to retry.
+                return self._defer(request, loop, f"work item {answer.verdict}: {answer.reason}")
+            item = answer.item
+            issue_url = runnable_issue_url(item.issue_url)
+            if not issue_url:
+                return await self._reject(request, token, loop, xr.NO_RUNNABLE_TARGET)
+            loop = workflow_id_for(issue_url)
+            return await self._dispatch(request, token, item, issue_url, loop)
         except Exception as exc:
             logger.exception("dispatch of %s failed", request.request_id)
-            return self._defer(request, own_id, f"{type(exc).__name__}: {exc}")
+            return self._defer(request, loop, f"{type(exc).__name__}: {exc}")
 
-    async def _dispatch(self, request: xr.ExecutionRequest, token: str, own_id: str) -> DispatchOutcome:
-        if request.kind not in xr.KINDS:
-            return await self._reject(request, token, own_id, xr.UNSUPPORTED_KIND)
+    async def _dispatch(
+        self, request: xr.ExecutionRequest, token: str, item: Any, issue_url: str, loop: str
+    ) -> DispatchOutcome:
+        from orchestrator.temporal.workflows.dev_loop import IssueRef, ResumeDelivery
 
-        answer = await asyncio.to_thread(self._api.get, request.work_item_id)
-        if answer.verdict != WORK_ITEM_FOUND or answer.item is None:
-            # Not a reason to reject: the store did not answer. Guessing
-            # either way would be wrong, so the lease decides when to retry.
-            return self._defer(request, own_id, f"work item {answer.verdict}: {answer.reason}")
-        item = answer.item
-        issue_url = runnable_issue_url(item.issue_url)
-        if not issue_url:
-            return await self._reject(request, token, own_id, xr.NO_RUNNABLE_TARGET)
-
-        await self._reconcile_closed_loops(request, item, own_id)
-
-        for candidate in _live_loop_candidates(item, issue_url, own_id):
-            if await self._temporal.loop_state(candidate) != LOOP_RUNNING:
-                continue
-            if request.kind == xr.KIND_START:
-                return await self._reject(request, token, own_id, xr.LOOP_ACTIVE, live_loop=candidate)
-            delivered = await self._deliver_resume(request, token, own_id, candidate)
-            if delivered is not None:
-                return delivered
-            # The loop ended under us: another live loop takes it, or a
-            # continuation below.
-
-        from orchestrator.temporal.workflows.dev_loop import IssueRef
-
-        started = await self._temporal.start(
-            IssueRef(issue_url=issue_url, work_item_id=item.work_item_id, execution_request_id=request.request_id)
-        )
-        if started == START_CLOSED:
-            return await self._reject(request, token, own_id, xr.ENGINE_RUN_ENDED)
-        audit(
-            "start",
-            execution_request_id=request.request_id,
-            work_item_id=request.work_item_id,
-            kind=request.kind,
-            workflow_id=own_id,
-            issue_url=issue_url,
-        )
-        return await self._fulfil(request, token, own_id)
-
-    async def _deliver_resume(
-        self, request: xr.ExecutionRequest, token: str, own_id: str, loop: str
-    ) -> DispatchOutcome | None:
-        """Deliver a resume onto the running loop `loop`, then fulfil it for
-        that loop. None when the loop turned out not to be running (the
-        caller moves on to another live loop, or a continuation)."""
-        from orchestrator.temporal.workflows.dev_loop import ResumeDelivery
-
-        ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": own_id}
-        engine_ref = resume_engine_ref(loop, request.request_id)
+        engine_ref = request_engine_ref(loop, request.request_id)
         if len(engine_ref.encode("utf-8")) > MAX_ENGINE_REF_BYTES:
             # mctl-api would refuse the fulfil with a 400 that defers for
             # ever: refuse it here, before the loop takes it.
-            return await self._reject(
-                request, token, own_id, f"{xr.RESUME_REFUSED}:engine-ref-too-long", live_loop=loop
-            )
+            return await self._reject(request, token, loop, f"{xr.RESUME_REFUSED}:engine-ref-too-long")
+
+        await self._reconcile_closed_loops(request, item, engine_ref)
+
         delivery = ResumeDelivery(
             execution_request_id=request.request_id,
             work_item_id=request.work_item_id,
             surface=request.surface,
             actor_kind=RESUME_ACTOR_KIND,
             actor_id=request.requested_by,
+            kind=request.kind,
         )
-        answer = await self._temporal.deliver_resume(loop, delivery)
-        audit("deliver", **ids, live_loop=loop, verdict=answer.verdict, reason=answer.reason)
-        if answer.verdict == DELIVERY_LOOP_GONE:
-            return None
+        issue = IssueRef(
+            issue_url=issue_url, work_item_id=item.work_item_id, execution_request_id=request.request_id
+        )
+        answer = await self._temporal.deliver(issue, delivery)
+        ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": loop}
+        audit("deliver", **ids, kind=request.kind, verdict=answer.verdict, reason=answer.reason)
+        if answer.verdict == DELIVERY_LOOP_ACTIVE:
+            return await self._reject(request, token, loop, xr.LOOP_ACTIVE, live_loop=loop)
         if answer.verdict == DELIVERY_REFUSED:
-            return await self._reject(request, token, own_id, f"{xr.RESUME_REFUSED}:{answer.reason}", live_loop=loop)
+            return await self._reject(request, token, loop, f"{xr.RESUME_REFUSED}:{answer.reason}", live_loop=loop)
         if answer.verdict != DELIVERED:
-            return self._defer(request, own_id, f"delivery to {loop}: {answer.reason}")
-        # Accepted — but possibly by a run that has since closed: Temporal
-        # answers a repeated update id from a closed run's registry too. A
-        # closed loop binds nothing, so the request goes to a continuation.
+            return self._defer(request, loop, f"delivery to {loop}: {answer.reason}")
+        # Accepted by a run that may have closed since: nothing would bind the
+        # execution a fulfil mints now. Leave the request claimed; the next
+        # claim re-sends it, and Update-with-Start either finds a running
+        # loop or starts one.
         if await self._temporal.loop_state(loop) != LOOP_RUNNING:
-            audit("deliver_stale", **ids, live_loop=loop)
-            return None
-        outcome = await self._fulfil(request, token, own_id, engine_ref=engine_ref)
+            audit("deliver_stale", **ids)
+            return self._defer(request, loop, f"{loop} closed after accepting the request")
+        outcome = await self._fulfil(request, token, loop, engine_ref)
         if outcome.action == FULFILLED:
             await self._end_if_orphaned(request, loop, engine_ref, outcome.execution_id)
         return outcome
@@ -493,28 +437,23 @@ class Dispatcher:
             "orphan_failed",
             execution_request_id=request.request_id,
             work_item_id=request.work_item_id,
-            live_loop=loop,
+            workflow_id=loop,
             execution_id=execution_id,
             verdict=answer.verdict,
             reason=answer.reason,
         )
 
-    async def _fulfil(
-        self, request: xr.ExecutionRequest, token: str, own_id: str, *, engine_ref: str = ""
-    ) -> DispatchOutcome:
-        ref = engine_ref or own_id
-        answer = await asyncio.to_thread(self._api.fulfil_execution_request, request, token, ENGINE, ref)
+    async def _fulfil(self, request: xr.ExecutionRequest, token: str, loop: str, engine_ref: str) -> DispatchOutcome:
+        answer = await asyncio.to_thread(self._api.fulfil_execution_request, request, token, ENGINE, engine_ref)
         if answer.verdict == xr.UNKNOWN:
             # A lost answer: the store may already have committed. The same
             # holder repeating the same engine run gets the same execution,
             # so one immediate retry is safe; after that the lease decides.
-            answer = await asyncio.to_thread(self._api.fulfil_execution_request, request, token, ENGINE, ref)
-        ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": own_id}
+            answer = await asyncio.to_thread(self._api.fulfil_execution_request, request, token, ENGINE, engine_ref)
+        ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": loop}
         if answer.verdict == xr.FULFILLED:
-            audit("fulfil", **ids, engine=ENGINE, engine_ref=ref, execution_id=answer.execution_id)
-            return DispatchOutcome(
-                FULFILLED, **ids, execution_id=answer.execution_id, engine_ref=ref if ref != own_id else ""
-            )
+            audit("fulfil", **ids, engine=ENGINE, engine_ref=engine_ref, execution_id=answer.execution_id)
+            return DispatchOutcome(FULFILLED, **ids, execution_id=answer.execution_id, engine_ref=engine_ref)
         if answer.verdict == xr.NOT_CLAIMED:
             audit("fenced", **ids, reason=answer.reason)
             return DispatchOutcome(FENCED, **ids, reason=answer.reason)
@@ -524,36 +463,36 @@ class Dispatcher:
         if answer.verdict == xr.REFUSED and answer.code in TERMINAL_FULFIL_CODES:
             # mctl-api re-decided the item and said a permanent no (see
             # TERMINAL_FULFIL_CODES). The request stays claimed for us to
-            # reject; the started loop reads the rejection and ends.
-            return await self._reject(request, token, own_id, f"{xr.FULFIL_REFUSED}:{answer.code}")
-        return self._defer(request, own_id, f"fulfil {answer.verdict}: {answer.reason}")
+            # reject; the loop that accepted it reads the rejection and drops
+            # it (its own request: it ends without running anything).
+            return await self._reject(request, token, loop, f"{xr.FULFIL_REFUSED}:{answer.code}")
+        return self._defer(request, loop, f"fulfil {answer.verdict}: {answer.reason}")
 
-    async def _reconcile_closed_loops(self, request: xr.ExecutionRequest, item: Any, own_id: str) -> None:
-        """Fail every execution that a dispatched loop, or a resume delivered
-        onto a live loop, left non-terminal and can no longer end itself
-        (mctlhq/mctl-agents#461).
+    async def _reconcile_closed_loops(self, request: xr.ExecutionRequest, item: Any, engine_ref: str) -> None:
+        """Fail every execution this dispatcher fulfilled whose loop can no
+        longer end it (mctlhq/mctl-agents#461).
 
-        A dispatched loop ends its own `we_` on every exit it can run code
-        on, but a TERMINATED workflow runs none, and its execution would then
-        block every later request for the item (`execution_active`). Narrow
-        on purpose: only a Temporal execution whose engine ref is a
-        dispatched loop id or a delivered resume's `<loop>#xr_...` (this
-        dispatcher's own writes), only while it is non-terminal, and only
-        once Temporal says that loop is not RUNNING: CLOSED, or ABSENT.
-        ABSENT counts because the `dev-loop-xr_` prefix already proves this
-        dispatcher started the run, and the `#xr_` suffix that this
-        dispatcher delivered to a loop that was running; Temporal forgets a
-        workflow only after it closed and its namespace retention expired,
-        and a RUNNING workflow is always found. An execution of another
-        engine, of an issue-keyed loop, or of a RUNNING run is never
-        touched. The write is the same attach-or-advance the loop itself
-        uses, through the policy checkpoint; its answer is logged and never
-        stops the dispatch (mctl-api's fulfil re-decides regardless)."""
+        A loop ends the execution of a request it took on every exit it can
+        run code on, but a TERMINATED workflow runs none, and its execution
+        would then block every later request for the item
+        (`execution_active`). Narrow on purpose: only a Temporal execution
+        whose engine ref is this dispatcher's own `<loop>#xr_...`
+        (`is_request_engine_ref`), only while it is non-terminal, and only
+        once Temporal says that loop is not RUNNING: CLOSED, or ABSENT. ABSENT
+        counts because the `#xr_` suffix proves this dispatcher fulfilled it
+        for a loop that took it, and Temporal forgets a workflow only after it
+        closed and its namespace retention expired, while a RUNNING workflow
+        is always found. An execution of another engine, one the loop seeded
+        itself, or one of a RUNNING loop is never touched (a running loop may
+        still bind and end it). The write is the same attach-or-advance the
+        loop itself uses, through the policy checkpoint; its answer is logged
+        and never stops the dispatch (mctl-api's fulfil re-decides
+        regardless)."""
         from orchestrator.work_context.executions import EngineRun
 
         for execution in item.executions:
             ref = execution.temporal_workflow_id
-            if not ref or ref == own_id or not (is_dispatched_workflow_id(ref) or is_resume_engine_ref(ref)):
+            if not ref or ref == engine_ref or not is_request_engine_ref(ref):
                 continue
             if not execution.phase or execution.phase in TERMINAL_PHASES:
                 continue
@@ -566,7 +505,8 @@ class Dispatcher:
                 "reconcile",
                 execution_request_id=request.request_id,
                 work_item_id=item.work_item_id,
-                workflow_id=ref,
+                workflow_id=loop_id_of_engine_ref(ref),
+                engine_ref=ref,
                 execution_id=execution.execution_id,
                 phase_was=execution.phase,
                 verdict=answer.verdict,
@@ -574,10 +514,10 @@ class Dispatcher:
             )
 
     async def _reject(
-        self, request: xr.ExecutionRequest, token: str, own_id: str, reason: str, *, live_loop: str = ""
+        self, request: xr.ExecutionRequest, token: str, loop: str, reason: str, *, live_loop: str = ""
     ) -> DispatchOutcome:
         answer = await asyncio.to_thread(self._api.reject_execution_request, request, token, reason)
-        ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": own_id}
+        ids = {"execution_request_id": request.request_id, "work_item_id": request.work_item_id, "workflow_id": loop}
         audit("reject", **ids, reason=reason, verdict=answer.verdict, live_loop=live_loop)
         if answer.verdict == xr.REJECTED:
             return DispatchOutcome(REJECTED, **ids, reason=reason)
@@ -589,37 +529,21 @@ class Dispatcher:
             return DispatchOutcome(CLOSED, **ids, execution_id=answer.execution_id, reason=answer.reason)
         return DispatchOutcome(DEFERRED, **ids, reason=f"reject {answer.verdict}: {answer.reason}")
 
-    def _defer(self, request: xr.ExecutionRequest, own_id: str, reason: str) -> DispatchOutcome:
+    def _defer(self, request: xr.ExecutionRequest, loop: str, reason: str) -> DispatchOutcome:
         audit(
             "defer",
             execution_request_id=request.request_id,
             work_item_id=request.work_item_id,
-            workflow_id=own_id,
+            workflow_id=loop,
             reason=reason,
         )
         return DispatchOutcome(
             DEFERRED,
             execution_request_id=request.request_id,
             work_item_id=request.work_item_id,
-            workflow_id=own_id,
+            workflow_id=loop,
             reason=reason,
         )
-
-
-def _live_loop_candidates(item: Any, issue_url: str, own_id: str) -> list[str]:
-    """DevLoops that may be live for this item, other than this request's
-    own run (which is a convergence, never a conflict): the loop behind
-    EVERY Temporal execution in its ledger, and the issue-keyed loop the
-    `agents:intake` label path starts. A delivered resume's engine ref
-    names its loop before the `#`.
-
-    Every one, not the latest: a dispatched loop ends its execution after
-    the investigator run and then stays RUNNING for days at the approval
-    gate or in the merge watch, so a newer execution from another loop says
-    nothing about whether an older loop is still alive."""
-    candidates = [loop_id_of_engine_ref(e.temporal_workflow_id) for e in item.executions if e.temporal_workflow_id]
-    candidates.append(workflow_id_for(issue_url))
-    return [c for c in dict.fromkeys(candidates) if c != own_id]
 
 
 async def run_dispatcher(dispatcher: Dispatcher, stop: asyncio.Event, *, interval: float | None = None) -> None:

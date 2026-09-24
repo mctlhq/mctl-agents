@@ -574,6 +574,13 @@ def _fake_activities(
     return activities, calls, investigate_ran, ownership_ops
 
 
+def _bare_loop() -> DevLoopWorkflow:
+    """A `DevLoopWorkflow` constructed outside Temporal, for direct unit
+    tests of its methods. `__init__` takes the run's start input since
+    #461 option A (`@workflow.init`); an intake loop's is a bare issue."""
+    return DevLoopWorkflow(IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/1"))
+
+
 class TestDevLoopWorkflow:
     async def test_investigate_then_wait_then_implement_after_approval(self, env):
         activities, calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
@@ -2124,7 +2131,7 @@ class TestDevLoopWorkflow:
         windows is 60+ polls of fixture, and the defect is arithmetic on these
         four fields, which is what this asserts.
         """
-        w = DevLoopWorkflow()
+        w = _bare_loop()
         steward = OwnershipResult(
             verdict="owned-by-other", owner_type="pr-steward", owner_id="steward",
             epoch=77, state="active", healthy=True, accepted=True,
@@ -2156,7 +2163,7 @@ class TestDevLoopWorkflow:
         """Three refusals from three different owners is a busy entity, not a
         settled one. Only one actor holding it across the whole window is the
         case the permanent give-up describes."""
-        w = DevLoopWorkflow()
+        w = _bare_loop()
 
         def refusal(owner_id: str) -> OwnershipResult:
             return OwnershipResult(
@@ -4795,7 +4802,7 @@ class TestTickSettling:
         to return and fails a workflow whose implement and merge both
         succeeded.
         """
-        workflow_obj = DevLoopWorkflow()
+        workflow_obj = _bare_loop()
         running = asyncio.Event()
 
         async def never_finishes() -> None:
@@ -4824,7 +4831,7 @@ class TestTickSettling:
         `cancelled()` guard is the only thing standing between that and the
         same workflow failure the test above covers.
         """
-        workflow_obj = DevLoopWorkflow()
+        workflow_obj = _bare_loop()
 
         async def never_finishes() -> None:
             await asyncio.sleep(3600)
@@ -4850,7 +4857,7 @@ class TestTickSettling:
         trace is asyncio's "exception was never retrieved" warning at GC
         time. The error log is the observable proof that `_drain_tick` ran.
         """
-        workflow_obj = DevLoopWorkflow()
+        workflow_obj = _bare_loop()
 
         async def raises_immediately() -> None:
             raise RuntimeError("tick blew up")
@@ -4879,7 +4886,7 @@ class TestTickSettling:
         """Most watches end without a tick ever starting (the first
         boundary is ~4 h in). `finally` still calls `_settle_tick`, with
         None."""
-        await DevLoopWorkflow()._settle_tick(None, SERVICE, SLUG)
+        await _bare_loop()._settle_tick(None, SERVICE, SLUG)
 
     async def test_shepherd_tick_swallows_an_unexpected_error(
         self,
@@ -4901,7 +4908,7 @@ class TestTickSettling:
         monkeypatch.setattr(dev_loop, "_resolve", resolve_explodes)
 
         with caplog.at_level(logging.ERROR, logger=tick_logger.name):
-            await DevLoopWorkflow()._shepherd_tick(SERVICE, SLUG)
+            await _bare_loop()._shepherd_tick(SERVICE, SLUG)
 
         assert "unexpected RuntimeError" in caplog.text
         assert SERVICE in caplog.text and SLUG in caplog.text
@@ -5803,7 +5810,7 @@ class _FakeContinueAsNewInfo:
 
 
 class TestMergeWatchHopPredicate:
-    """T8: direct unit tests on a bare `DevLoopWorkflow()` with a
+    """T8: direct unit tests on a bare `_bare_loop()` with a
     monkeypatched `dev_loop.workflow`, the `TestTickSettling` pattern --
     exercising `_merge_watch_hop_suggested`'s safety rails without a real
     Temporal worker."""
@@ -5812,14 +5819,14 @@ class TestMergeWatchHopPredicate:
         monkeypatch.setattr(
             dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         assert wf._merge_watch_hop_suggested(polls_this_run=0, tick_task=None, hops=0) is False
 
     async def test_no_hop_with_an_in_flight_tick(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
 
         async def never_finishes() -> None:
             await asyncio.sleep(3600)
@@ -5842,7 +5849,7 @@ class TestMergeWatchHopPredicate:
         monkeypatch.setattr(
             dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         with caplog.at_level(logging.ERROR, logger=tick_logger.name):
             hopped = wf._merge_watch_hop_suggested(
                 polls_this_run=5, tick_task=None, hops=MERGE_WATCH_MAX_HOPS
@@ -5854,7 +5861,7 @@ class TestMergeWatchHopPredicate:
         monkeypatch.setattr(
             dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=999_999)
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         wf._abandoned = True
         assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is False
 
@@ -5865,7 +5872,7 @@ class TestMergeWatchHopPredicate:
         monkeypatch.setattr(
             dev_loop.workflow, "info", lambda: _FakeContinueAsNewInfo(suggested=True, history_length=0)
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is True
 
     def test_hop_when_only_the_local_history_floor_is_crossed(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5876,7 +5883,7 @@ class TestMergeWatchHopPredicate:
                 suggested=False, history_length=dev_loop.MERGE_WATCH_HISTORY_FLOOR
             ),
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is True
 
     def test_no_hop_below_both_signals(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5887,7 +5894,7 @@ class TestMergeWatchHopPredicate:
                 suggested=False, history_length=dev_loop.MERGE_WATCH_HISTORY_FLOOR - 1
             ),
         )
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         assert wf._merge_watch_hop_suggested(polls_this_run=5, tick_task=None, hops=0) is False
 
 
@@ -5979,7 +5986,7 @@ class TestMergeWatchAbandonGuard:
         """The pre-existing (non-resume) path is unchanged: nothing was
         carried, so there is nothing to preserve and the guard still
         answers None exactly as it did before this change."""
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         wf._abandoned = True
         outcome = await wf._watch_pr("mctl-telegram", "issue-1-x")
         assert outcome.last is None
@@ -6390,7 +6397,7 @@ class TestWorkContextGapMerge:
         was accepted against the empty binding (the mismatch guard was
         vacuous); rehydration must reject it with the guard's own reason
         instead of grafting the foreign execution onto the carried item."""
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         wf.resume(
             {
                 "work_item_id": "wi-999", "execution_id": "e7", "surface": "telegram",
@@ -6411,7 +6418,7 @@ class TestWorkContextGapMerge:
         assert wf._current_surface == SurfaceRef(kind="github")
 
     def test_same_item_gap_resume_is_reapplied_against_the_carried_baseline(self) -> None:
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         wf.resume(
             {
                 "work_item_id": "wi-1", "execution_id": "e2", "surface": "telegram",
@@ -6426,7 +6433,7 @@ class TestWorkContextGapMerge:
         assert wf._resume_pending is True
 
     def test_carry_work_context_round_trips_through_rehydration(self) -> None:
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         wf._work_item_id = "wi-1"
         wf._executions = [ExecutionRef(execution_id="e1", sequence=1)]
         wf._seen_execution_ids = {"e1"}
@@ -6437,7 +6444,7 @@ class TestWorkContextGapMerge:
         ]
         wf._resume_pending = True
         carried = wf._carry_work_context(MergeWatchResume())
-        fresh = DevLoopWorkflow()
+        fresh = _bare_loop()
         fresh._rehydrate_work_context(carried)
         assert fresh._work_item_id == "wi-1"
         assert fresh._executions == list(wf._executions)
@@ -6453,7 +6460,7 @@ class TestWorkContextGapMerge:
         only `approve` closes that window) — a gap resume must be rejected
         `resume-already-pending` against that restored value, exactly as the
         identical signal a second earlier or later would have been."""
-        wf = DevLoopWorkflow()
+        wf = _bare_loop()
         wf.resume(
             {
                 "work_item_id": "wi-1", "execution_id": "e3", "surface": "web",

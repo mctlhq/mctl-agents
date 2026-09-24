@@ -85,10 +85,11 @@ RESUME_REFUSAL_REASONS = frozenset(
         RESUME_REFUSAL_UNSPECIFIED,
     }
 )
-#: The run this request's workflow id names already ended without the
-#: request being fulfilled (it waited for fulfilment and gave up). Starting
-#: it again is refused by the reuse policy, and fulfilling the request with
-#: an ended run would bind the execution to nothing.
+#: The run this request's workflow id named already ended without the
+#: request being fulfilled. Written by the per-request `dev-loop-xr_<id>`
+#: dispatcher before mctlhq/mctl-agents#461 option A; since then a later claim
+#: starts the issue's loop again instead (nothing ran for the request), so
+#: this build never writes it. Kept as mctl-api vocabulary for old rows.
 ENGINE_RUN_ENDED = "engine_run_ended"
 #: mctl-api refused the fulfilment (the item moved since the request was
 #: made: a stale version, a terminal item, another active execution). The
