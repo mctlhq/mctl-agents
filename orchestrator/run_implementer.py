@@ -139,10 +139,15 @@ from config.settings import (
     SERVICE_AGENT_MODEL,
     SERVICES,
 )
-from orchestrator import policy_checkpoint, tracing
+from orchestrator import policy_checkpoint, tracing, usage_ledger
 from orchestrator.auth import ensure_auth_for_sdk
 from orchestrator.exec_budget import CommandBudgetLedger
-from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
+from orchestrator.execution_identity import (
+    ExecutionContextRequiredError,
+    ExecutionIdentityError,
+    load_from_environment,
+    mint_local,
+)
 from orchestrator.github_token import refresh_github_token
 from orchestrator.lifecycle import rollout
 from orchestrator.lifecycle.claim import ClaimClient, blocks_mutation
@@ -1287,6 +1292,38 @@ def _check_claim_or_raise(ctx: _ClaimContext, *, entity_version: str | None = No
 
 
 _PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
+
+
+def _usage_correlation(
+    ref: ProposalRef, *, execution_id: str, pr: tuple[str, int] | None = None
+) -> dict[str, Any]:
+    """The usage-ledger correlation of one implementer session
+    (mctlhq/mctl-agents#499), from what this run already holds: the
+    proposal's `source` issue, the PR when there is one, and this run's
+    execution id. The service repository stands in when there is neither.
+    """
+    return usage_ledger.work_correlation(
+        execution_id=execution_id,
+        source=_load_status(ref.status_path).get("source"),
+        pr_repo=pr[0] if pr else None,
+        pr_number=pr[1] if pr else None,
+        repo=f"mctlhq/{ref.service}",
+    )
+
+
+def _review_execution_id() -> str:
+    """This review-fix run's ExecutionContext id for the usage ledger, or "".
+
+    `review_feedback_one` has no identity of its own to reuse, and the one
+    it reads here is bookkeeping only. It must not change whether the run
+    proceeds: every failure, require mode's included, is "".
+    """
+    try:
+        return load_from_environment(
+            executor_type="implementer", workflow_type="review-fix", agent="implementer"
+        ).context_id
+    except (ExecutionIdentityError, ExecutionContextRequiredError):
+        return ""
 
 
 def _parse_pr_url(url: str) -> tuple[str, int] | None:
@@ -2673,13 +2710,16 @@ def review_feedback_one(
             service_skills_block=skill_bundle.to_prompt_block(repo_slug=f"mctlhq/{ref.service}"),
         )
         try:
-            anyio.run(
-                functools.partial(
-                    _run_implementer_agent,
-                    envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
-                ),
-                target, prompt, ref.proposal_dir.resolve(),
-            )
+            with usage_ledger.correlate(
+                _usage_correlation(ref, execution_id=_review_execution_id(), pr=parsed_pr)
+            ):
+                anyio.run(
+                    functools.partial(
+                        _run_implementer_agent,
+                        envelope_s=envelope_s, work_class=work_class, budget_ledger=budget_ledger,
+                    ),
+                    target, prompt, ref.proposal_dir.resolve(),
+                )
         except RateLimitExhaustedError as exc:
             _keep_commits_past_late_rate_limit(exc, target, base=old_head)
 
@@ -4057,10 +4097,14 @@ def implement_one(ref: ProposalRef, dry_run: bool = False) -> ImplementResult:
         )
         budget_ledger = CommandBudgetLedger()
         try:
-            anyio.run(
-                functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
-                target, prompt, ref.proposal_dir.resolve(),
-            )
+            # No PR yet: it is opened after the session, from its commits.
+            with usage_ledger.correlate(
+                _usage_correlation(ref, execution_id=execution_context.context_id)
+            ):
+                anyio.run(
+                    functools.partial(_run_implementer_agent, budget_ledger=budget_ledger),
+                    target, prompt, ref.proposal_dir.resolve(),
+                )
         except RateLimitExhaustedError as exc:
             _keep_commits_past_late_rate_limit(exc, target)
         print(f"info: command budget ledger: {budget_ledger.describe()}")

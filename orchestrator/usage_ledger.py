@@ -45,18 +45,47 @@ deadline the drivers rely on (`fail_after`, the #366 drain). Whatever is
 still queued when the interpreter exits is flushed by an `atexit` hook,
 bounded by FLUSH_TIMEOUT_SECONDS; by then the anyio loop has returned.
 
+Correlation (mctlhq/mctl-agents#499). Each record says which piece of work
+spent it:
+
+- `argo_workflow_name`, `temporal_workflow_id` and `work_item_id` come from
+  the pod's environment.
+- `target_repo`, `issue_number`, `pr_number` and `execution_id` come from the
+  runner, which learns them only after it has read its issue, proposal or PR.
+  It scopes them with `correlate` around the SDK session. The recorder is
+  built inside that scope, and the scope is a `contextvars` variable that
+  `anyio.run` carries into the session's task.
+
+`execution_id` names the runner invocation. It is the work-context store's
+`we_…` when the run has a store execution (today only the investigator,
+once the work-item layer has resolved or attached one). Otherwise it is the
+runner's ExecutionContext `context_id` (`ex-…`, ADR 011). That id is
+control-plane-minted when the CWFT wrote MCTL_EXECUTION_CONTEXT_FILE, and
+locally minted otherwise. Nothing here makes a network call to learn any of
+it.
+
+`issue_number` and `pr_number` are relative to `target_repo`, and a record
+has one repository. `target_repo` is the PR's repository when there is a PR,
+else the issue's. An issue from a different repository is left out rather
+than attributed to the wrong one. A value mctl-api would reject is dropped
+too, with a warning: the ingest is all-or-nothing, so one malformed field
+would otherwise cost the whole batch.
+
 Never fatal. Recording is bookkeeping about a run, not part of it: every
 failure here is logged and swallowed.
 """
 from __future__ import annotations
 
 import atexit
+import contextlib
+import contextvars
 import logging
 import os
 import queue
+import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -112,6 +141,123 @@ _CORRELATION_ENV = (
 )
 
 Post = Callable[[str, dict[str, Any], dict[str, str]], httpx.Response]
+
+# Correlation the runner scopes around an SDK session; see the module
+# docstring. A fresh dict per scope, never mutated.
+_SCOPED: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("usage_ledger_correlation")
+
+# The shapes mctl-api validates at ingest (internal/usage/types.go,
+# validateCorrelation). Kept in step with it: a looser check here lets a
+# record through that costs its whole batch; a stricter one drops a field
+# the server would have taken.
+_TARGET_REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
+_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _positive(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+        return number if number > 0 else None
+    return None
+
+
+def work_correlation(
+    *,
+    execution_id: str | None = None,
+    source: Any = None,
+    issue_repo: str | None = None,
+    issue_number: Any = None,
+    pr_repo: str | None = None,
+    pr_number: Any = None,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """The #499 correlation fields of one piece of work.
+
+    `target_repo` is the PR's repository, else the issue's, else `repo` (the
+    repository the run works in, for work with neither). `issue_number` is
+    kept only when the issue lives in `target_repo`, since the ledger reads
+    both numbers relative to it. Empty and unusable values are left out;
+    `UsageRecorder` checks the shapes again for every source.
+
+    `source` is a proposal's `.status.yaml` `source` block; a `github_issue`
+    one supplies the issue when `issue_repo`/`issue_number` are not given.
+    """
+    if isinstance(source, Mapping) and source.get("type") == "github_issue" and issue_number is None:
+        repo_value = source.get("repo")
+        issue_repo = repo_value if isinstance(repo_value, str) else None
+        issue_number = source.get("issue")
+    pr = _positive(pr_number)
+    issue = _positive(issue_number)
+    pr_repo = (pr_repo or "").strip() if pr else ""
+    issue_repo = (issue_repo or "").strip() if issue else ""
+    target = pr_repo or issue_repo or (repo or "").strip()
+    fields: dict[str, Any] = {}
+    if target:
+        fields["target_repo"] = target
+    if pr and pr_repo:
+        fields["pr_number"] = pr
+    if issue and issue_repo and issue_repo.lower() == target.lower():
+        fields["issue_number"] = issue
+    if execution_id and execution_id.strip():
+        fields["execution_id"] = execution_id.strip()
+    return fields
+
+
+def bind_correlation(fields: Mapping[str, Any]) -> contextvars.Token[dict[str, Any]]:
+    """Add `fields` to the correlation of every recorder built after this in
+    the current context; returns the token that `_SCOPED.reset` takes.
+
+    For a process that is one piece of work end to end (a shepherd tick's
+    execution identity). A scope that ends before the process does uses
+    `correlate`.
+    """
+    merged = {**_SCOPED.get({}), **{k: v for k, v in fields.items() if v not in (None, "")}}
+    return _SCOPED.set(merged)
+
+
+@contextlib.contextmanager
+def correlate(fields: Mapping[str, Any]) -> Iterator[None]:
+    """`bind_correlation` for the duration of a `with` block.
+
+    Wrap the `anyio.run` that drives an SDK session: the recorder
+    `tracing.agent_run` builds inside it picks the fields up, and the next
+    piece of work in the same process starts without them.
+    """
+    token = bind_correlation(fields)
+    try:
+        yield
+    finally:
+        _SCOPED.reset(token)
+
+
+def _checked_correlation(correlation: Mapping[str, Any]) -> dict[str, Any]:
+    """`correlation` without the values mctl-api would reject."""
+    fields = {k: v for k, v in correlation.items() if v not in (None, "")}
+
+    def drop(key: str, why: str) -> None:
+        logger.warning("usage ledger: not sending %s=%r (%s)", key, fields.pop(key), why)
+
+    repo = fields.get("target_repo")
+    if repo is not None and not (isinstance(repo, str) and _TARGET_REPO_RE.match(repo)):
+        drop("target_repo", "not owner/name")
+    for key in ("issue_number", "pr_number"):
+        if key not in fields:
+            continue
+        number = _positive(fields[key])
+        if number is None:
+            drop(key, "not a positive number")
+        elif "target_repo" not in fields:
+            drop(key, "no target_repo to read it against")
+        else:
+            fields[key] = number
+    execution_id = fields.get("execution_id")
+    if execution_id is not None and not (isinstance(execution_id, str) and _EXECUTION_ID_RE.match(execution_id)):
+        drop("execution_id", "not an execution id")
+    return fields
 
 
 def agent_env_without_writer_token(env: Mapping[str, str]) -> dict[str, str]:
@@ -213,7 +359,7 @@ class UsageRecorder:
             self._token = ""
             self._off_reason = f"{BASE_URL_ENV} is not https ({base_url!r})"
         self._url = base_url.rstrip("/") + INGEST_PATH
-        self._correlation = {k: v for k, v in (correlation or {}).items() if v not in (None, "")}
+        self._correlation = _checked_correlation(correlation or {})
         self._post = post or _default_post
         self._sleep = sleep
         self._submit = submit or _WORKER.submit
@@ -238,7 +384,7 @@ class UsageRecorder:
             agent,
             token=env.get(TOKEN_ENV, ""),
             base_url=env.get(BASE_URL_ENV, "").strip() or DEFAULT_BASE_URL,
-            correlation={**found, **correlation},
+            correlation={**found, **_SCOPED.get({}), **correlation},
         )
 
     @property

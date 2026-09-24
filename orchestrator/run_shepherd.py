@@ -99,7 +99,7 @@ from typing import Any, Literal
 import anyio
 
 from config.settings import SERVICES, SHEPHERD_DIR, SHEPHERD_MODEL
-from orchestrator import policy_checkpoint, tracing
+from orchestrator import policy_checkpoint, tracing, usage_ledger
 from orchestrator.ci_checks import CheckBlocker, CIStatus, fetch_failure_logs, read_required_checks
 from orchestrator.execution_identity import ExecutionIdentityError, load_from_environment, mint_local
 from orchestrator.github_token import refresh_github_token
@@ -2665,6 +2665,7 @@ def process_one(
     ref: ProposalRef,
     skip_subprocess: bool = False,
     state_dir: Path | None = None,
+    execution_id: str = "",
 ) -> ShepherdResult:
     """Drive a single proposal one tick further.
 
@@ -2680,6 +2681,9 @@ def process_one(
     (the env-driven default). The CLI always threads ``args.state_dir``
     so a non-default ``--state-dir`` is honoured end-to-end and we do
     not silently re-read from the env path.
+
+    ``execution_id`` is this tick's ExecutionContext id, for the usage
+    records of the summariser session (mctlhq/mctl-agents#499).
     """
     pr = find_pr_for_proposal(
         ref.service, ref.slug, state_dir=state_dir, status_path=ref.status_path,
@@ -2954,13 +2958,22 @@ def process_one(
         # spinning forever. When the cap is hit, flip to review-stuck
         # so a human can intervene.
         try:
-            apply_followup(
-                ref.service, ref.slug, payload,
-                skip_subprocess=skip_subprocess,
-                state_dir=state_dir,
-                adopted_pr=(ref.pr_url if ref.is_adopted else None),
-                repo=pr.repo,
-            )
+            # The summariser's usage records name the PR, the proposal's
+            # source issue and this tick (mctlhq/mctl-agents#499). The
+            # implementer child it forks records its own.
+            with usage_ledger.correlate(usage_ledger.work_correlation(
+                execution_id=execution_id,
+                source=_load_status(ref.status_path).get("source"),
+                pr_repo=pr.repo,
+                pr_number=pr.number,
+            )):
+                apply_followup(
+                    ref.service, ref.slug, payload,
+                    skip_subprocess=skip_subprocess,
+                    state_dir=state_dir,
+                    adopted_pr=(ref.pr_url if ref.is_adopted else None),
+                    repo=pr.repo,
+                )
         except FollowupSubprocessError as e:
             if e.kind == "refused":
                 # Not a failure: the implementer read the findings and decided
@@ -3957,7 +3970,7 @@ def main() -> None:
         # threaded through so a non-default ``--state-dir`` is honoured
         # by every helper (find_pr_for_proposal, apply_followup, ...)
         # rather than silently falling back to the env-driven default.
-        result = process_one(ref, state_dir=state_dir)
+        result = process_one(ref, state_dir=state_dir, execution_id=execution_context.context_id)
         results.append(result)
         if result.decision == "address-review":
             spent_estimate += per_call_estimate

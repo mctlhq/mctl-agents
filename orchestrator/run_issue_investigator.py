@@ -79,7 +79,7 @@ from config.settings import SERVICE_AGENT_MODEL, SERVICES
 # orchestrator.temporal.issue_ref, neither of which pulls in
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
-from orchestrator import context_assembly, policy_checkpoint, tracing
+from orchestrator import context_assembly, policy_checkpoint, tracing, usage_ledger
 from orchestrator.context_snapshot import (
     MAX_PRIOR_EXECUTION_IDS,
     MAX_WORK_CONTEXT_ID_LENGTH,
@@ -2466,7 +2466,19 @@ def _investigate(
         prompt = _build_prompt(
             issue, service, slug, context=context, service_skills_block=service_skills_block
         )
-        anyio.run(_run_agent, clone / "repo", prompt, staging.resolve())
+        # Usage records of this session name the issue and this run
+        # (mctlhq/mctl-agents#499): the store's `we_` once the work-item layer
+        # resolved one, else this run's ExecutionContext id. An unverified
+        # --execution-id is correlation for the log only, never the identity.
+        with usage_ledger.correlate(usage_ledger.work_correlation(
+            execution_id=(
+                work_context_ref.execution_id if work_context_ref is not None
+                else execution_context.context_id
+            ),
+            issue_repo=issue.ref.full_repo,
+            issue_number=issue.ref.number,
+        )):
+            anyio.run(_run_agent, clone / "repo", prompt, staging.resolve())
 
         # 4a. Before looking INSIDE staging, check staging itself is still
         #     the directory we made. Every check below reads through the

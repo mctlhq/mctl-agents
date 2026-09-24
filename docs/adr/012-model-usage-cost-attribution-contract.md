@@ -149,6 +149,7 @@ target_repo
 issue_number                 # nullable
 pr_number                    # nullable
 work_item_id                 # nullable
+execution_id                 # nullable; store we_ when the run has one, else ExecutionContext ex- (#499)
 trace_id / span_id           # nullable
 
 # usage — absent, never zero, when the provider does not report it
