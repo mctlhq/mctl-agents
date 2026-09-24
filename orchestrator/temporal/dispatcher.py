@@ -403,7 +403,15 @@ class Dispatcher:
         if len(engine_ref.encode("utf-8")) > MAX_ENGINE_REF_BYTES:
             # mctl-api would refuse the fulfil with a 400 that defers for
             # ever: refuse it here, before the loop takes it.
-            return await self._reject(request, token, loop, f"{xr.RESUME_REFUSED}:engine-ref-too-long")
+            #
+            # In practice unreachable: the request id is `xr_` plus a 36-char
+            # UUID (39 bytes, 40 with the `#` separator), and the loop id is
+            # `dev-loop-mctlhq-<repo>-<n>` (16 fixed bytes). Against
+            # MAX_ENGINE_REF_BYTES = 256 that leaves the repo name and issue
+            # number together needing roughly 199 characters, and GitHub caps
+            # repo names at 100 — so this guard is defensive contract
+            # hygiene, not a live-incident fix.
+            return await self._reject_engine_ref_too_long(request, token, loop)
 
         await self._reconcile_closed_loops(request, item, engine_ref)
 
@@ -567,6 +575,23 @@ class Dispatcher:
                 verdict=answer.verdict,
                 reason=answer.reason,
             )
+
+    async def _reject_engine_ref_too_long(
+        self, request: xr.ExecutionRequest, token: str, loop: str
+    ) -> DispatchOutcome:
+        """Reject with the kind-neutral `ENGINE_REF_TOO_LONG` (#488), with a
+        one-shot fallback to the legacy `resume_refused:engine-ref-too-long`
+        spelling for a version-skewed mctl-api that does not yet know the
+        new reason: `_reject` maps most 4xx to REFUSED, which falls through
+        to a DEFERRED outcome here, and a request left DEFERRED forever
+        would be re-claimed and re-rejected on every tick without end. Tried
+        at most once: a mctl-api that refuses both spellings has some other
+        problem the lease should surface as a deferral, not paper over with
+        a retry loop."""
+        outcome = await self._reject(request, token, loop, xr.ENGINE_REF_TOO_LONG)
+        if outcome.action != DEFERRED:
+            return outcome
+        return await self._reject(request, token, loop, f"{xr.RESUME_REFUSED}:engine-ref-too-long")
 
     async def _reject(
         self, request: xr.ExecutionRequest, token: str, loop: str, reason: str, *, live_loop: str = ""
