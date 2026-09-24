@@ -1295,16 +1295,23 @@ _PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)/?$")
 
 
 def _usage_correlation(
-    ref: ProposalRef, *, execution_id: str, pr: tuple[str, int] | None = None
+    ref: ProposalRef,
+    *,
+    execution_id: str,
+    pr: tuple[str, int] | None = None,
+    status: dict | None = None,
 ) -> dict[str, Any]:
     """The usage-ledger correlation of one implementer session
     (mctlhq/mctl-agents#499), from what this run already holds: the
     proposal's `source` issue, the PR when there is one, and this run's
     execution id. The service repository stands in when there is neither.
+    `status` is the `.status.yaml` the caller already parsed, if it has one.
     """
+    if status is None:
+        status = _load_status(ref.status_path)
     return usage_ledger.work_correlation(
         execution_id=execution_id,
-        source=_load_status(ref.status_path).get("source"),
+        source=status.get("source"),
         pr_repo=pr[0] if pr else None,
         pr_number=pr[1] if pr else None,
         repo=f"mctlhq/{ref.service}",
@@ -1314,16 +1321,22 @@ def _usage_correlation(
 def _review_execution_id() -> str:
     """This review-fix run's ExecutionContext id for the usage ledger, or "".
 
-    `review_feedback_one` has no identity of its own to reuse, and the one
-    it reads here is bookkeeping only. It must not change whether the run
-    proceeds: every failure, require mode's included, is "".
+    Only a control-plane-minted context counts: it is the sealed file the
+    shepherd tick that forked this run read too, so the id joins the tick's
+    log and the control plane's row. A locally minted one is random, and
+    `review_feedback_one` neither logs nor persists it, so recording it
+    would name an execution that exists nowhere else.
+
+    Bookkeeping only: it must not change whether the run proceeds, so every
+    failure, require mode's included, is "" too.
     """
     try:
-        return load_from_environment(
+        context = load_from_environment(
             executor_type="implementer", workflow_type="review-fix", agent="implementer"
-        ).context_id
+        )
     except (ExecutionIdentityError, ExecutionContextRequiredError):
         return ""
+    return context.context_id if context.assertions.asserted_by == "control-plane" else ""
 
 
 def _parse_pr_url(url: str) -> tuple[str, int] | None:
@@ -2711,7 +2724,7 @@ def review_feedback_one(
         )
         try:
             with usage_ledger.correlate(
-                _usage_correlation(ref, execution_id=_review_execution_id(), pr=parsed_pr)
+                _usage_correlation(ref, execution_id=_review_execution_id(), pr=parsed_pr, status=pre_status)
             ):
                 anyio.run(
                     functools.partial(

@@ -76,12 +76,20 @@ def test_without_a_pr_or_an_issue_the_run_repository_is_the_target():
     assert usage_ledger.work_correlation() == {}
 
 
+def test_a_typeless_source_block_is_the_legacy_github_issue_shape():
+    legacy = {"repo": "mctlhq/mctl-web", "issue": 12}
+    assert usage_ledger.work_correlation(source=legacy) == {"target_repo": "mctlhq/mctl-web", "issue_number": 12}
+    assert usage_ledger.work_correlation(source={**legacy, "type": "incident"}, repo="mctlhq/x") == {
+        "target_repo": "mctlhq/x"
+    }
+
+
 def test_explicit_issue_fields_win_over_the_source_block():
     fields = usage_ledger.work_correlation(source=ISSUE_SOURCE, issue_repo="mctlhq/mctl-web", issue_number="7")
     assert fields == {"target_repo": "mctlhq/mctl-web", "issue_number": 7}
 
 
-@pytest.mark.parametrize("number", [0, -3, "x", "", None, True, 1.5])
+@pytest.mark.parametrize("number", [0, -3, "x", "", None, True, 1.5, "\u00b2", "\u0663"])
 def test_an_unusable_number_is_dropped_with_its_repository(number):
     assert usage_ledger.work_correlation(issue_repo="mctlhq/mctl-web", issue_number=number) == {}
     assert usage_ledger.work_correlation(pr_repo="mctlhq/mctl-web", pr_number=number) == {}
@@ -309,8 +317,7 @@ def test_a_review_fix_names_its_pr(tmp_path, monkeypatch):
     run_implementer.review_feedback_one(ref, {"p1": True, "p2": False, "summaries": []})
 
     (scope,) = seen
-    assert (scope["target_repo"], scope["pr_number"], scope["issue_number"]) == ("mctlhq/mctl-web", 42, 12)
-    assert scope["execution_id"].startswith("ex-")
+    assert scope == {"target_repo": "mctlhq/mctl-web", "pr_number": 42, "issue_number": 12}
 
 
 def test_an_implementer_proposal_without_a_source_issue_names_its_service_repository(tmp_path):
@@ -323,6 +330,28 @@ def test_an_implementer_proposal_without_a_source_issue_names_its_service_reposi
     assert run_implementer._usage_correlation(ref, execution_id="ex-0123456789abcdef") == {
         "target_repo": "mctlhq/mctl-web", "execution_id": "ex-0123456789abcdef",
     }
+
+
+def test_a_review_fix_names_a_control_plane_execution_but_never_a_local_mint(tmp_path, monkeypatch):
+    """A local mint is random and `review_feedback_one` logs it nowhere; the
+    sealed context is the one the shepherd tick that forked it read too."""
+    import json
+
+    from tests.test_execution_identity import _assertions, _context
+
+    monkeypatch.delenv("MCTL_REQUIRE_EXECUTION_CONTEXT", raising=False)
+    sealed_file = tmp_path / "context.json"
+    context = _context()
+    sealed_file.write_text(json.dumps(context.to_dict()), encoding="utf-8")
+    monkeypatch.setenv("MCTL_EXECUTION_CONTEXT_FILE", str(sealed_file))
+    assert run_implementer._review_execution_id() == context.context_id
+
+    local = _context(assertions=_assertions(asserted_by="local"))
+    sealed_file.write_text(json.dumps(local.to_dict()), encoding="utf-8")
+    assert run_implementer._review_execution_id() == ""
+
+    monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE")
+    assert run_implementer._review_execution_id() == ""
 
 
 def test_a_review_fix_without_a_readable_identity_still_runs(tmp_path, monkeypatch):
@@ -383,6 +412,7 @@ def test_the_shepherd_tick_passes_its_execution_context_to_each_proposal(tmp_pat
         return run_shepherd.ShepherdResult(ref=ref, decision="wait")
 
     with patch.object(run_shepherd, "_discover_refs", return_value=[ref]), \
+         patch("orchestrator.auth.ensure_auth_for_sdk"), \
          patch.object(run_shepherd, "process_one", side_effect=fake_process_one):
         try:
             run_shepherd.main()

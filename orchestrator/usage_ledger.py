@@ -67,9 +67,10 @@ it.
 `issue_number` and `pr_number` are relative to `target_repo`, and a record
 has one repository. `target_repo` is the PR's repository when there is a PR,
 else the issue's. An issue from a different repository is left out rather
-than attributed to the wrong one. A value mctl-api would reject is dropped
-too, with a warning: the ingest is all-or-nothing, so one malformed field
-would otherwise cost the whole batch.
+than attributed to the wrong one. These four are the fields mctl-api checks
+the shape of (the environment's three are free text there). A value it would
+reject is dropped here, with a warning: the ingest is all-or-nothing, so one
+malformed field would otherwise cost the whole batch.
 
 Never fatal. Recording is bookkeeping about a run, not part of it: every
 failure here is logged and swallowed.
@@ -159,7 +160,8 @@ def _positive(value: Any) -> int | None:
         return None
     if isinstance(value, int):
         return value if value > 0 else None
-    if isinstance(value, str) and value.strip().isdigit():
+    # isascii first: str.isdigit() also admits superscripts, which int() refuses.
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
         number = int(value.strip())
         return number if number > 0 else None
     return None
@@ -184,9 +186,11 @@ def work_correlation(
     `UsageRecorder` checks the shapes again for every source.
 
     `source` is a proposal's `.status.yaml` `source` block; a `github_issue`
-    one supplies the issue when `issue_repo`/`issue_number` are not given.
+    one supplies the issue when `issue_repo`/`issue_number` are not given. A
+    block with no `type` is the pre-`type` shape of the same thing
+    (orchestrator/source_issue.py).
     """
-    if isinstance(source, Mapping) and source.get("type") == "github_issue" and issue_number is None:
+    if isinstance(source, Mapping) and source.get("type") in (None, "github_issue") and issue_number is None:
         repo_value = source.get("repo")
         issue_repo = repo_value if isinstance(repo_value, str) else None
         issue_number = source.get("issue")
@@ -207,27 +211,16 @@ def work_correlation(
     return fields
 
 
-def bind_correlation(fields: Mapping[str, Any]) -> contextvars.Token[dict[str, Any]]:
-    """Add `fields` to the correlation of every recorder built after this in
-    the current context; returns the token that `_SCOPED.reset` takes.
-
-    For a process that is one piece of work end to end (a shepherd tick's
-    execution identity). A scope that ends before the process does uses
-    `correlate`.
-    """
-    merged = {**_SCOPED.get({}), **{k: v for k, v in fields.items() if v not in (None, "")}}
-    return _SCOPED.set(merged)
-
-
 @contextlib.contextmanager
 def correlate(fields: Mapping[str, Any]) -> Iterator[None]:
-    """`bind_correlation` for the duration of a `with` block.
+    """Add `fields` to the correlation of every recorder built in this
+    context for the duration of a `with` block. Scopes nest.
 
     Wrap the `anyio.run` that drives an SDK session: the recorder
     `tracing.agent_run` builds inside it picks the fields up, and the next
     piece of work in the same process starts without them.
     """
-    token = bind_correlation(fields)
+    token = _SCOPED.set({**_SCOPED.get({}), **{k: v for k, v in fields.items() if v not in (None, "")}})
     try:
         yield
     finally:

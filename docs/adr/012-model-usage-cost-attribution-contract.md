@@ -196,6 +196,15 @@ row, so the usage record carries the key and does not duplicate the
 attributes. Issue/PR/work-item and `trace_id`/`span_id` are carried directly
 because they are per-invocation rather than per-execution.
 
+A record has one repository, and `issue_number` and `pr_number` are both read
+against it (#499). `target_repo` is the PR's repository when there is a PR,
+else the issue's, else the repository the run works in. A source issue in a
+different repository than the PR is omitted rather than recorded, so a missing
+`issue_number` beside a `pr_number` means "no issue in this repository", not
+"no source issue". `execution_id` is the work-context store's `we_…` when the
+run has one, else the runner's ExecutionContext `ex-…`, recorded only where
+that id is logged or control-plane-minted.
+
 The model is recorded **as served** (`model_key`/`canonical_model`), never as
 configured. `model-policy.yaml` v1 names only three tasks
 (`service_agent` → `balanced`, `mentor_digest` → `cheap`,
