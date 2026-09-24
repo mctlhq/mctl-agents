@@ -135,14 +135,21 @@ def _is_snapshot_id(value: Any) -> TypeGuard[str]:
     )
 
 
-def answer_from_seal(status: int, payload: dict[str, Any], *, content_hash: str, execution_id: str) -> SnapshotAnswer:
+def answer_from_seal(
+    status: int, payload: dict[str, Any], *, work_item_id: str, content_hash: str, execution_id: str
+) -> SnapshotAnswer:
     """Classify mctl-api's answer to a seal. A 2xx counts only when it
-    describes exactly the bytes and execution that were sent."""
+    describes exactly the bytes, execution and work item that were sent
+    (the work item as in `answer_from_read`, #455 item 6)."""
     code = payload.get("code")
     if status in (200, 201):
         snap = _snapshot_of(payload)
         sid = snap.get("id")
-        describes_ours = snap.get("content_hash") == content_hash and snap.get("execution_id") == execution_id
+        describes_ours = (
+            snap.get("content_hash") == content_hash
+            and snap.get("execution_id") == execution_id
+            and snap.get("work_item_id") == work_item_id
+        )
         if not _is_snapshot_id(sid) or not describes_ours:
             return SnapshotAnswer(
                 SNAPSHOT_UNKNOWN, content_hash=content_hash,
@@ -234,7 +241,16 @@ def differing_fields(stored: dict[str, Any], ours: dict[str, Any]) -> list[str]:
             continue
         va, vb = a.get(key), b.get(key)
         if isinstance(va, dict) and isinstance(vb, dict):
-            out += [f"{key}.{k}" for k in sorted(set(va) | set(vb)) if va.get(k) != vb.get(k)]
+            # Presence counts, not only value: a key that is null on one
+            # side and absent on the other is a difference (ADR 009's field
+            # growth). With presence counted, two unequal dicts always name
+            # at least one key; `or [key]` is only a defensive floor, since
+            # an empty answer is what `persist` reads as "same context".
+            named = [
+                f"{key}.{k}" for k in sorted(set(va) | set(vb))
+                if k not in va or k not in vb or va[k] != vb[k]
+            ]
+            out += named or [key]
         else:
             out.append(key)
     return out

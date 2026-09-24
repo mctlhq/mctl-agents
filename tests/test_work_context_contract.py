@@ -330,6 +330,12 @@ def test_an_unknown_engine_degrades_its_entry_not_the_ledger():
     assert executions[1].execution_id == listing["executions"][1]["id"]
     assert executions[1].sequence == 2
     assert executions[1].temporal_workflow_id == ""
+    # A missing or non-string engine is a malformed record, not a new one.
+    for malformed in (None, "", 7):
+        out["executions"][1]["engine"] = malformed
+        assert wc.executions_from(200, out, wid)[0] is None, malformed
+    del out["executions"][1]["engine"]
+    assert wc.executions_from(200, out, wid)[0] is None
     # A known non-Temporal engine carries no Temporal id either.
     out["executions"][1]["engine"] = "argo"
     executions, _ = wc.executions_from(200, out, wid)

@@ -169,13 +169,18 @@ def test_a_view_ledger_mismatch_is_read_again_once(monkeypatch: pytest.MonkeyPat
     raced = _routes(_fixture("get-waiting.json"), _fixture("executions-two.json"))
     settled = _routes(VIEW, _fixture("executions-two.json"))
     handler = _sequenced(raced, settled)
+    paused: list[float] = []
+    monkeypatch.setattr(work_context_client.time, "sleep", paused.append)
     answer = _client(monkeypatch, handler).get(WID)
     assert answer.verdict == WORK_ITEM_FOUND, answer.reason
     assert [e.sequence for e in answer.item.executions] == [1, 2]
     assert len(handler.seen) == 4
+    # The re-read waits first, so it observes a later moment.
+    assert paused == [work_context_client.WorkItemClient.RE_READ_PAUSE_S] and paused[0] > 0
 
 
 def test_the_re_read_is_bounded_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(work_context_client.time, "sleep", lambda _s: None)
     raced = _routes(_fixture("get-waiting.json"), _fixture("executions-two.json"))
     handler = _sequenced(raced, raced, raced)
     answer = _client(monkeypatch, handler).get(WID)
@@ -184,9 +189,11 @@ def test_the_re_read_is_bounded_to_one(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_no_re_read_on_anything_but_the_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    paused: list[float] = []
+    monkeypatch.setattr(work_context_client.time, "sleep", paused.append)
     handler = _routes(VIEW, _http_error(503, {"error": "store down"}))
     answer = _client(monkeypatch, handler).get(WID)
-    assert answer.verdict == WORK_ITEM_UNKNOWN and len(handler.seen) == 2
+    assert answer.verdict == WORK_ITEM_UNKNOWN and len(handler.seen) == 2 and paused == []
 
 
 def test_an_unreadable_latest_execution_with_an_empty_ledger_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:

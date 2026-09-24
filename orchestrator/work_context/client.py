@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -112,6 +113,9 @@ class _HTTPResult:
 class WorkItemClient:
     """Synchronous client. Safe in Argo pods and CLI entry points."""
 
+    #: The pause before `get`'s one re-read (#455 item 3).
+    RE_READ_PAUSE_S = 0.5
+
     def __init__(self, base_url: str | None = None, token: str | None = None, timeout: int = DEFAULT_TIMEOUT_S) -> None:
         self._base = (base_url or api_base()).rstrip("/")
         self._token = token if token is not None else os.environ.get("MCTL_TOKEN", "").strip()
@@ -169,9 +173,13 @@ class WorkItemClient:
         mismatch, and only on it, the pair of reads is repeated once
         (#455 item 3). A second mismatch is answered UNKNOWN: one bounded
         re-read covers a single attach racing the read, and anything busier
-        is left to the caller's own retry policy."""
+        is left to the caller's own retry policy. The re-read waits
+        `RE_READ_PAUSE_S` first, so it observes a later moment than an
+        attach still in flight. `get` therefore costs up to four HTTP
+        round trips plus that pause, inside the caller's timeout."""
         answer, read_again = self._get_once(work_item_id)
         if read_again:
+            time.sleep(self.RE_READ_PAUSE_S)
             answer, _ = self._get_once(work_item_id)
         return answer
 
@@ -274,7 +282,8 @@ class WorkItemClient:
         except WorkItemUnavailable as exc:
             return SnapshotAnswer(SNAPSHOT_UNKNOWN, content_hash=str(body.get("content_hash", "")), reason=str(exc))
         return answer_from_seal(
-            res.status, res.payload, content_hash=str(body.get("content_hash", "")), execution_id=execution_id
+            res.status, res.payload, work_item_id=work_item_id,
+            content_hash=str(body.get("content_hash", "")), execution_id=execution_id,
         )
 
     # -- this run's own execution (mctlhq/mctl-agents#455) ---------------

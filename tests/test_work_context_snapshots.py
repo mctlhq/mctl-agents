@@ -85,15 +85,20 @@ class _Store:
     def seal_snapshot(self, work_item_id, execution_id, body):
         self.sealed.append((work_item_id, execution_id, body))
         if self.seal_status is not None:
-            return ws.answer_from_seal(self.seal_status[0], self.seal_status[1],
+            return _seal(self.seal_status[0], self.seal_status[1],
                                        content_hash=body["content_hash"], execution_id=execution_id)
         if self.stored is not None and cs.hash_bytes(self.stored) != body["content_hash"]:
-            return ws.answer_from_seal(409, {"code": "snapshot_divergence", "error": "x"},
+            return _seal(409, {"code": "snapshot_divergence", "error": "x"},
                                        content_hash=body["content_hash"], execution_id=execution_id)
         snap = {"id": "cs_new", "execution_id": execution_id, "content_hash": body["content_hash"]}
-        return ws.answer_from_seal(
+        return _seal(
             201, _env(snap), content_hash=body["content_hash"], execution_id=execution_id
         )
+
+
+def _seal(status: int, payload: dict, *, content_hash: str, execution_id: str) -> ws.SnapshotAnswer:
+    """`answer_from_seal` for a snapshot of `WID`."""
+    return ws.answer_from_seal(status, payload, work_item_id=WID, content_hash=content_hash, execution_id=execution_id)
 
 
 def _read(status: int, payload: dict, *, execution_id: str) -> ws.SnapshotAnswer:
@@ -137,8 +142,8 @@ def test_seal_body_carries_the_exact_canonical_document(tmp_path):
 
 def test_seal_answers_are_classified_and_a_2xx_must_describe_what_was_sent():
     ok = _env({"id": "cs_1", "execution_id": E2, "content_hash": "sha256:a"})
-    assert ws.answer_from_seal(201, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_SEALED
-    assert ws.answer_from_seal(200, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_REPLAYED
+    assert _seal(201, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_SEALED
+    assert _seal(200, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_REPLAYED
     for status, payload, hash_, eid in (
         (201, ok, "sha256:b", E2),                                   # other bytes
         (201, ok, "sha256:a", E1),                                   # other execution
@@ -148,11 +153,11 @@ def test_seal_answers_are_classified_and_a_2xx_must_describe_what_was_sent():
         (201, {}, "sha256:a", E2),
         (500, {"error": "x"}, "sha256:a", E2),
     ):
-        assert ws.answer_from_seal(status, payload, content_hash=hash_, execution_id=eid).verdict == ws.SNAPSHOT_UNKNOWN
-    assert ws.answer_from_seal(409, {"code": "snapshot_divergence"}, content_hash="h", execution_id=E2).verdict == (
+        assert _seal(status, payload, content_hash=hash_, execution_id=eid).verdict == ws.SNAPSHOT_UNKNOWN
+    assert _seal(409, {"code": "snapshot_divergence"}, content_hash="h", execution_id=E2).verdict == (
         ws.SNAPSHOT_DIVERGED)
     for code in ("prior_snapshot_invalid", "snapshot_writer_forbidden", "invalid_request"):
-        answer = ws.answer_from_seal(409, {"code": code}, content_hash="h", execution_id=E2)
+        answer = _seal(409, {"code": code}, content_hash="h", execution_id=E2)
         assert answer.verdict == ws.SNAPSHOT_REFUSED
 
 
@@ -281,7 +286,8 @@ def test_real_mctl_api_answers_classify_as_intended():
     snap = created["snapshot"]
     raw = base64.b64decode(snap["canonical_b64"])
     assert snap["content_hash"] == cs.hash_bytes(raw)  # the store's hash rule is ours
-    kw = {"content_hash": snap["content_hash"], "execution_id": snap["execution_id"]}
+    kw = {"content_hash": snap["content_hash"], "execution_id": snap["execution_id"],
+          "work_item_id": snap["work_item_id"]}
     assert ws.answer_from_seal(201, created, **kw).verdict == ws.SNAPSHOT_SEALED
     assert ws.answer_from_seal(200, _fixture("snapshot-seal-replayed.json"), **kw).verdict == ws.SNAPSHOT_REPLAYED
     assert ws.answer_from_seal(409, _fixture("snapshot-seal-diverged.json"), **kw).verdict == ws.SNAPSHOT_DIVERGED
@@ -325,6 +331,22 @@ def test_a_divergence_inside_any_block_names_the_moved_field(tmp_path):
     assert ws.differing_fields({**doc, "execution": None}, doc) == ["execution"]
 
 
+def test_null_on_one_side_and_absent_on_the_other_is_a_difference(tmp_path):
+    """PR #492 review: presence counts inside a block, so field growth
+    (an older image's document lacks a key this image emits as null) is
+    never read as "same context"."""
+    snap = _sealed(tmp_path)
+    doc = snap.to_dict()
+    grown = {**doc, "execution": {**doc["execution"], "new_field": None}}
+    assert ws.differing_fields(doc, grown) == ["execution.new_field"]
+    assert ws.differing_fields(grown, doc) == ["execution.new_field"]
+    answer = ws.persist(snap, _Store(stored=cs.canonical_json(grown)))
+    assert answer.verdict == ws.SNAPSHOT_DIVERGED and "execution.new_field" in answer.reason
+    # Unequal blocks never yield an empty answer.
+    for a, b in (({"x": {}}, {"x": {"k": None}}), ({"x": {"k": 1}}, {"x": {"k": 1.0, "j": None}})):
+        assert ws.differing_fields(a, b), (a, b)
+
+
 def test_a_replay_by_comparison_logs_both_snapshots(tmp_path, observe, capsys):
     """#455 item 9: the stored snapshot's id and hash, and this attempt's
     own, in one log line."""
@@ -343,6 +365,15 @@ def test_a_replay_by_comparison_logs_both_snapshots(tmp_path, observe, capsys):
     # Any other answer carries no local pair.
     ca._emit_snapshot_answer("persist", ws.SnapshotAnswer(ws.SNAPSHOT_SEALED, snapshot_id="cs_1"))
     assert "local_snapshot_id" not in json.loads(capsys.readouterr().out.split(" ", 1)[1])
+
+
+def test_a_seal_answer_about_another_work_item_is_unknown():
+    """The work item check on the seal side too (PR #492 review)."""
+    ok = _env({"id": "cs_1", "execution_id": E2, "content_hash": "sha256:a"})
+    assert _seal(201, ok, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_SEALED
+    other = _env({"id": "cs_1", "execution_id": E2, "content_hash": "sha256:a", "work_item_id": "wi_else"})
+    for status in (200, 201):
+        assert _seal(status, other, content_hash="sha256:a", execution_id=E2).verdict == ws.SNAPSHOT_UNKNOWN
 
 
 def test_a_read_about_another_work_item_is_unknown():

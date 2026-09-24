@@ -234,9 +234,10 @@ class ExecutionRef:
         shape (workflow history and the `resume` signal).
 
         None on anything that does not describe an execution of THIS work
-        item: a missing id, a non-positive attempt, or another work item's
-        id. An engine outside `EXECUTION_ENGINES` is not one of those: the
-        entry is kept without a `temporal_workflow_id` (#455 item 5)."""
+        item: a missing id, a non-positive attempt, another work item's id,
+        or a missing engine. An engine outside `EXECUTION_ENGINES` is not
+        one of those: the entry is kept without a `temporal_workflow_id`
+        (#455 item 5)."""
         if not isinstance(data, dict):
             return None
         execution_id = data.get("id")
@@ -248,6 +249,10 @@ class ExecutionRef:
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             return None
         engine = data.get("engine")
+        # An engine this image does not know is kept (#455 item 5); a
+        # missing or non-string one is a malformed record, not a new engine.
+        if not isinstance(engine, str) or not engine:
+            return None
         return ExecutionRef(
             execution_id=execution_id,
             sequence=attempt,
@@ -445,7 +450,9 @@ def executions_from(status: int, payload: Any, work_item_id: str) -> tuple[tuple
     All or nothing: one malformed entry, another item's execution, or a
     repeated id or attempt makes the whole ledger untrustworthy — silently
     dropping an entry would understate prior_execution_ids, which resume's
-    idempotency depends on."""
+    idempotency depends on. An entry of an engine this image does not know
+    is not malformed: it is kept, without a `temporal_workflow_id`
+    (#455 item 5, `ExecutionRef.from_v1`)."""
     if not 200 <= status < 300:
         return None, f"executions: {_error_of(status, payload)}"
     if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
