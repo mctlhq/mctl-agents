@@ -2684,16 +2684,29 @@ def _resolve_parked_merge_refusal(
         return
 
 
-def _reconcile_consumed_merge(ref: ProposalRef, pr: PRSnapshot, pr_ref: str) -> tuple[bool, str | None]:
+def _reconcile_consumed_merge(
+    ref: ProposalRef, pr: PRSnapshot, pr_ref: str, denials: int, attempt: int
+) -> tuple[bool, str | None]:
     """A spent receipt never authorizes a second effect (ADR 014 §6): a
     crash between consume and the side effect burns the approval without
     acting, and this never re-merges to compensate. Instead it asks GitHub
     what actually happened, exactly once — the same canonical-state re-read
     `orchestrator/pr_adoption.py` uses (`_fetch_pr_snapshot`) — and always
     clears the stale ticket so a merge that never landed can request a
-    fresh approval on a later tick."""
+    fresh approval on a later tick.
+
+    `denials` is carried forward unchanged and `attempt` is bumped by one,
+    not reset to 0 — the same idempotency-key reasoning as the expired-decision
+    path above: a same-head retry with a stale attempt would just get this
+    same consumed receipt back, and dropping `denials` would let a proposal
+    that already burned through repeated human denials look freshly parked,
+    re-arming the same livelock this counter exists to prevent.
+    """
     snap = _fetch_pr_snapshot(pr.repo, pr.number)
-    update_status(ref, ref.status, approval=proposal_state.approval_payload(None))
+    update_status(
+        ref, ref.status,
+        approval=proposal_state.approval_payload(None, denials=denials, attempt=attempt + 1),
+    )
     if snap is not None and snap.merged:
         print(f"APPROVAL_RESUMED pr={pr_ref} ref=consumed reconciled=merged")
         return (True, snap.merge_commit)
@@ -2789,7 +2802,7 @@ def merge_pr(pr: PRSnapshot, ref: ProposalRef | None = None) -> tuple[bool, str 
 
     if not decision.permitted:
         if decision.code == policy_checkpoint.CODE_APPROVAL_CONSUMED and ref is not None:
-            return _reconcile_consumed_merge(ref, pr, pr_ref)
+            return _reconcile_consumed_merge(ref, pr, pr_ref, denials, attempt)
         if ref is not None:
             _resolve_parked_merge_refusal(ref, pr_ref, ticket, denials, attempt, decision)
         print(
@@ -2802,7 +2815,10 @@ def merge_pr(pr: PRSnapshot, ref: ProposalRef | None = None) -> tuple[bool, str 
         # The receipt is already consumed in mctl-api by the permitted
         # decision above, whether or not the `gh` call below succeeds — so
         # the ticket is cleared here, unconditionally, not after the merge.
-        update_status(ref, ref.status, approval=proposal_state.approval_payload(None, denials=denials, attempt=attempt + 1))
+        update_status(
+            ref, ref.status,
+            approval=proposal_state.approval_payload(None, denials=denials, attempt=attempt + 1),
+        )
         print(f"APPROVAL_RESUMED pr={pr_ref} ref={decision.approval_ref}")
 
     # Bypasses _run() (this is the one gh call this module makes outside

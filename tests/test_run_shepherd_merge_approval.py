@@ -226,13 +226,18 @@ def test_consumed_reconciles_an_already_merged_pr_without_remerging(tmp_path, mo
     calls = _no_op_transport(monkeypatch, merged=True, merge_commit="m" * 40)
     outcome = pc.ApprovalOutcome(pc.APPROVAL_CONSUMED, approval_ref=REF_ID)
     _gate(monkeypatch, _ScriptedLookup(REF_ID, outcome))
-    run_shepherd.update_status(ref, ref.status, approval=proposal_state.approval_payload(_ticket()))
+    payload = proposal_state.approval_payload(_ticket(), denials=1, attempt=2)
+    run_shepherd.update_status(ref, ref.status, approval=payload)
 
     assert run_shepherd.merge_pr(pr, ref) == (True, "m" * 40)
 
     assert calls == []  # never re-ran `gh pr merge`
-    ticket_after, _denials, _attempt = proposal_state.read_approval(read_status(ref))
+    ticket_after, denials, attempt = proposal_state.read_approval(read_status(ref))
     assert ticket_after is None
+    # denials carried forward unchanged; attempt bumped by one (a fresh
+    # idempotency key for a later ask), never reset to 0 -- resetting either
+    # would re-arm the exact livelock this counter exists to prevent.
+    assert denials == 1 and attempt == 3
     assert "reconciled=merged" in capsys.readouterr().out
 
 
@@ -245,13 +250,18 @@ def test_consumed_but_not_merged_clears_the_ticket_and_does_not_merge(tmp_path, 
     calls = _no_op_transport(monkeypatch, merged=False, merge_commit=None)
     outcome = pc.ApprovalOutcome(pc.APPROVAL_CONSUMED, approval_ref=REF_ID)
     _gate(monkeypatch, _ScriptedLookup(REF_ID, outcome))
-    run_shepherd.update_status(ref, ref.status, approval=proposal_state.approval_payload(_ticket()))
+    payload = proposal_state.approval_payload(_ticket(), denials=1, attempt=2)
+    run_shepherd.update_status(ref, ref.status, approval=payload)
 
     assert run_shepherd.merge_pr(pr, ref) == (False, None)
 
     assert calls == []
-    ticket_after, _denials, _attempt = proposal_state.read_approval(read_status(ref))
+    ticket_after, denials, attempt = proposal_state.read_approval(read_status(ref))
     assert ticket_after is None
+    # Same carry-forward as the merged-reconciliation case above: a spent
+    # receipt whose effect never landed must still be retryable without
+    # forgetting how many denials or attempts came before it.
+    assert denials == 1 and attempt == 3
 
 
 def test_lookup_error_leaves_the_ticket_untouched(tmp_path, monkeypatch):
