@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.55.0](https://github.com/mctlhq/mctl-agents/compare/1.54.0...1.55.0) (2026-09-23)
+
+
+### Features
+
+* **approvals:** durable Temporal wait for REQUIRE_APPROVAL ([#198](https://github.com/mctlhq/mctl-agents/issues/198)) ([97cbbc3](https://github.com/mctlhq/mctl-agents/commit/97cbbc334b4df3887f179f926af194c169ea99a9))
+* **context:** rank, age and flag conflicting investigator context ([#471](https://github.com/mctlhq/mctl-agents/issues/471)) ([1bcf62c](https://github.com/mctlhq/mctl-agents/commit/1bcf62c4eabed878a6ccc1a093230693b672b05a))
+* **context:** trust/freshness ranking and recorded conflicting evidence ([ef3f8c2](https://github.com/mctlhq/mctl-agents/commit/ef3f8c2801c29e6e7c9a13d976c7b2c7f68fb9ff))
+* **devloop:** deliver a resume request onto a live DevLoop ([#461](https://github.com/mctlhq/mctl-agents/issues/461)) ([53939f1](https://github.com/mctlhq/mctl-agents/commit/53939f106e8afe790d2ae6e88a7272e6ca86d9df))
+* **devloop:** deliver a resume request onto a live DevLoop via a Temporal Update ([4eceb3a](https://github.com/mctlhq/mctl-agents/commit/4eceb3a61c87d70e06fc698a6d87fca888b363f7))
+* **devloop:** name the submitting loop to its investigator ([#461](https://github.com/mctlhq/mctl-agents/issues/461), [#451](https://github.com/mctlhq/mctl-agents/issues/451)) ([6eed4bc](https://github.com/mctlhq/mctl-agents/commit/6eed4bc9d067587e3594d29e0bbfa9ede7391638))
+* **governance:** durable Temporal wait for action approvals ([3512cd5](https://github.com/mctlhq/mctl-agents/commit/3512cd58a789b0000e08733afd1e442297264ff6))
+* **investigator:** take the DevLoop and execution-request ids from the CWFT ([7015207](https://github.com/mctlhq/mctl-agents/commit/70152077946cc91b793025d8f6f41017bdfdf2d4))
+* **policy:** route platform GitHub mutations through the policy checkpoint ([c5ea4be](https://github.com/mctlhq/mctl-agents/commit/c5ea4bed83c8571c89ed4b4cd7cda81ba19c7ca9))
+
+
+### Bug Fixes
+
+* **approval:** keep the side effect's error on a first-call effect_failed ([#479](https://github.com/mctlhq/mctl-agents/issues/479) review) ([80edc05](https://github.com/mctlhq/mctl-agents/commit/80edc05b5ff81b91ea003d32f398e896a2f2227f))
+* **approvals:** leave a consume margin before expiry and report every final-read decision ([#198](https://github.com/mctlhq/mctl-agents/issues/198)) ([11709cc](https://github.com/mctlhq/mctl-agents/commit/11709ccd143bc09b54f2050633f4ddbf69f66766))
+* **context:** keep the conflict notice truthful and the conflict bounded ([#478](https://github.com/mctlhq/mctl-agents/issues/478) review) ([17a5821](https://github.com/mctlhq/mctl-agents/commit/17a5821ed65feed9d6eba530ab94dc10f2e3d6cd))
+* **context:** rank undatable sources last and reject a cut .status.yaml ([#478](https://github.com/mctlhq/mctl-agents/issues/478) review 2) ([e8745f8](https://github.com/mctlhq/mctl-agents/commit/e8745f803a4ef0b5a92eb2950bf68908c330ea16))
+* **devloop:** carry the issue alias memo across the merge-watch continue_as_new ([1be7ef0](https://github.com/mctlhq/mctl-agents/commit/1be7ef0223aa358537b52f4125ec7d9606ad1a76))
+* **devloop:** end a minted execution whose bind is refused ([#461](https://github.com/mctlhq/mctl-agents/issues/461)) ([1421ce4](https://github.com/mctlhq/mctl-agents/commit/1421ce4c2bfbcf83754f78128548944d30c122f1))
+* **devloop:** keep a delivery open until its terminal advance lands ([#461](https://github.com/mctlhq/mctl-agents/issues/461)) ([88e9bfd](https://github.com/mctlhq/mctl-agents/commit/88e9bfdfc90aab88885c13249915b312a74a09af))
+* **devloop:** keep the active-loop listing old-worker-compatible; fail the sweep closed on unreadable entries ([46fcbae](https://github.com/mctlhq/mctl-agents/commit/46fcbae728782abaf0a9266d9e562f80d5134b60))
+* **devloop:** match dispatched dev-loop-xr_* loops to their proposals by an issue alias ([396af83](https://github.com/mctlhq/mctl-agents/commit/396af83fee56ec3fcd0f8efcf029eaddf31e6070))
+* **devloop:** match dispatched dev-loop-xr_* loops to their proposals by an issue alias ([7088eef](https://github.com/mctlhq/mctl-agents/commit/7088eef401dd9e6b8f475f4e0ded24dc0f261ce0))
+* **devloop:** treat an unattributed dispatched loop as unknown ownership; name every owner of an issue ([2dd0b41](https://github.com/mctlhq/mctl-agents/commit/2dd0b416094d62fe1ec9167d78dd710e37d8016f))
+* **policy:** bound an undecided follow-up push as harness, skip the hand-back ([#197](https://github.com/mctlhq/mctl-agents/issues/197)) ([6ee7189](https://github.com/mctlhq/mctl-agents/commit/6ee71890786782da2679b7cc1d84295c0f830cdb))
+* **policy:** bound the implement-side undecided hand-back ([#197](https://github.com/mctlhq/mctl-agents/issues/197)) ([f17b98b](https://github.com/mctlhq/mctl-agents/commit/f17b98bde7a5ec3e59f90e43211b2c49f26422b7))
+* **policy:** retry an undecided checkpoint instead of charging the proposal ([#197](https://github.com/mctlhq/mctl-agents/issues/197)) ([dabc440](https://github.com/mctlhq/mctl-agents/commit/dabc440332899b7b64a4b7caef5ad27faf5d1356))
+* **work-context:** accept mctl-api's default surface `api` ([31806d3](https://github.com/mctlhq/mctl-agents/commit/31806d37c04e9f399f412c524e5e263a4e325be0))
+* **work-context:** accept mctl-api's default surface `api` in both vocabularies ([c62a4c0](https://github.com/mctlhq/mctl-agents/commit/c62a4c0799be4859e1ce5b8b483df4207d337575))
+
 ## [1.54.0](https://github.com/mctlhq/mctl-agents/compare/1.53.1...1.54.0) (2026-09-23)
 
 
