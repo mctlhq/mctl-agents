@@ -262,6 +262,92 @@ def test_default_off_with_a_ref_still_makes_no_http_call_and_parks_nothing(tmp_p
     assert ticket is None and denials == 0 and attempt == 0
 
 
+def test_approvals_for_attempt_returns_none_when_the_store_cannot_be_built(monkeypatch):
+    """`_approvals_for_attempt` never raises: an unbuildable store falls
+    through to `None`, which leaves `checkpoint()` to fall back to its own
+    default handling."""
+    def _boom():
+        raise RuntimeError("misconfigured")
+
+    monkeypatch.setattr(pc, "configured_approvals", _boom)
+
+    assert run_shepherd._approvals_for_attempt(3) is None
+
+
+def test_approvals_for_attempt_passes_through_a_store_without_the_hook(monkeypatch):
+    """A store with no `for_attempt` method (e.g. `NO_APPROVALS`) is
+    returned unchanged -- attempt-scoping is opt-in per store, not assumed."""
+    monkeypatch.setattr(pc, "configured_approvals", lambda: pc.NO_APPROVALS)
+
+    assert run_shepherd._approvals_for_attempt(5) is pc.NO_APPROVALS
+
+
+def test_approvals_for_attempt_isolates_a_denied_prior_attempt_from_the_next(monkeypatch):
+    """mctl-agents#198: the whole point of the attempt bump. mctl-api answers
+    a replayed idempotency key with whatever is stored under it
+    (`action_approvals.idempotency_key`'s documented behaviour), so attempt
+    0's denied receipt must never be echoed back to attempt 1 -- attempt 1
+    needs, and gets, its own fresh, pending request bound to a new key.
+    Replaying the SAME attempt then finds that SAME fresh receipt rather
+    than opening a second one."""
+    from orchestrator import action_approvals
+
+    class _KeyedClient:
+        """One receipt per idempotency key -- exactly mctl-api's replay rule
+        that make the attempt bump necessary in the first place."""
+
+        def __init__(self) -> None:
+            self._by_key: dict[str, ApprovalRecord] = {}
+
+        def create(self, intent, *, key, expires_at):
+            rec = self._by_key.get(key)
+            if rec is None:
+                rec = ApprovalRecord(
+                    id=f"aar_{key.rsplit('/', 1)[-1]}",
+                    state="pending",
+                    intent_hash=action_approvals.intent_hash(intent),
+                    expires_at="2099-01-01T00:00:00Z",
+                )
+                self._by_key[key] = rec
+            return ApprovalAnswer(rec.state, record=rec)
+
+    client = _KeyedClient()
+    monkeypatch.setenv(pc.APPROVALS_ENV, pc.APPROVALS_MCTL_API)
+    monkeypatch.setattr(action_approvals, "ActionApprovalClient", lambda *a, **kw: client)
+
+    request = pc.ActionRequest(
+        pc.GITHUB_PR_MERGE, "merge", PR_URL, "sha256:" + "1" * 64,
+        execution_id="exec1", trace_id="trace1", actor="human:x",
+    )
+    intent = action_approvals.intent_for(request, rule_id="github-pr-merge", policy_version="v1")
+    denied_key = action_approvals.idempotency_key(intent, 0)
+    client._by_key[denied_key] = ApprovalRecord(
+        id="aar_denied0", state="denied", intent_hash=action_approvals.intent_hash(intent),
+        expires_at="2099-01-01T00:00:00Z", decided_by="github:root",
+    )
+
+    # Attempt 0 finds the prior (denied) receipt stored under its key.
+    outcome0 = run_shepherd._approvals_for_attempt(0).redeem(
+        request, rule_id="github-pr-merge", policy_version="v1",
+    )
+    assert outcome0.status == pc.APPROVAL_DENIED and outcome0.approval_ref == "aar_denied0"
+
+    # Attempt 1 must NOT see attempt 0's denial -- it gets a fresh, pending
+    # receipt under a different key.
+    outcome1 = run_shepherd._approvals_for_attempt(1).redeem(
+        request, rule_id="github-pr-merge", policy_version="v1",
+    )
+    assert outcome1.status == pc.APPROVAL_PENDING
+    assert outcome1.approval_ref != "aar_denied0"
+
+    # A second ask at the SAME attempt finds the SAME fresh receipt it just
+    # opened, never a third one.
+    outcome1_again = run_shepherd._approvals_for_attempt(1).redeem(
+        request, rule_id="github-pr-merge", policy_version="v1",
+    )
+    assert outcome1_again.approval_ref == outcome1.approval_ref
+
+
 def test_no_raw_arguments_leak_into_the_persisted_ticket(tmp_path, monkeypatch):
     """T11: nothing in the persisted ticket is a raw action argument."""
     ref = make_ref(tmp_path)
