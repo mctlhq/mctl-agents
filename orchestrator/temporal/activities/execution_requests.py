@@ -29,10 +29,12 @@ refusal with no execution id proved nothing of this loop's exists (a
 rejected request, another item's request, a fulfil for another engine run).
 
 The same two activities serve a `resume` delivered onto a LIVE loop
-(`DevLoopWorkflow.accept_execution_request`): there the engine ref the loop
-binds and advances is `<loop id>#<request id>`
-(`issue_ref.resume_engine_ref`), not the loop's own id, and the rules are
-unchanged — the store's execution must be exactly that engine run.
+(`DevLoopWorkflow.accept_execution_request`). Every execution the dispatcher
+fulfils has the engine ref `<loop id>#<request id>`
+(`issue_ref.request_engine_ref`): a loop's own dispatched request (since #461
+option A; a history recorded before bound under the bare `dev-loop-xr_<id>`)
+and a delivered resume alike, and the rules are the same — the store's
+execution must be exactly that engine run.
 
 Workflow code never performs this I/O itself (ADR-010 §9, as
 `activities/lifecycle.py`): these activities are the only place it happens.

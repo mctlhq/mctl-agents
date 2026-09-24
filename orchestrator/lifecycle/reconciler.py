@@ -128,9 +128,6 @@ class Observation:
     entity_terminal_reason: str = ""
     #: A DevLoopWorkflow for this entity is running right now, per the same
     #: Temporal visibility query the orphan sweep uses. Empty means none.
-    #: May hold several comma-joined ids when more than one loop runs for the
-    #: entity (mctlhq/mctl-agents#474), so read it only for evidence prose and
-    #: a `!=` against the record's id, never as one loop to act on.
     live_workflow_id: str = ""
     #: Whether the entity still has work to do — an open PR on an actionable
     #: proposal. False for anything the sweep should not adopt an owner for.

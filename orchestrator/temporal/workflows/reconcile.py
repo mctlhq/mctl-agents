@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -112,9 +111,7 @@ class ReconcileWorkflow:
 
         if workflow.patched("orphan-active-ids"):
             try:
-                # A bare id per running loop, or a `{workflow_id,
-                # issue_workflow_id}` dict for one carrying the #474 alias.
-                active_ids: list[Any] = await workflow.execute_activity(
+                active_ids: list[str] = await workflow.execute_activity(
                     "list_active_dev_loop_ids",
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=ACTIVITY_RETRY_POLICY,

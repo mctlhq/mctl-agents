@@ -216,15 +216,6 @@ def _dev_loop_owns_answer(service: str, slug: str) -> str:
     The workflow id is derived exactly the way start.py derives it
     (dev-loop-mctlhq-{service}-{issue-number}).
 
-    KNOWN GAP (mctlhq/mctl-agents#474): a loop the execution-request
-    dispatcher started is `dev-loop-xr_<id>` and is not found here. The
-    Temporal-side sweeps match it through the `issue_workflow_id` memo
-    (`temporal/active_loops.py`), but this probe has no Temporal client and
-    mctl-api's describe route takes one exact id, with no exact route from
-    an issue to its work item. Until mctl-api resolves the alias server-side,
-    a dispatched loop's PR is swept here too: the pre-#213 behaviour, not a
-    second implementer run.
-
     The distinction this adds is between a real "no owner" and "I could not
     find out". _dev_loop_owns collapses both into False — deliberately, since
     for the SWEEP the safe default is to drive everything — but the shadow

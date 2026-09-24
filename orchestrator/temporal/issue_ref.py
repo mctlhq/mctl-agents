@@ -42,68 +42,45 @@ def loop_workflow_id(issue_url: str, temporal_workflow_id: str | None = None) ->
     (`--temporal-workflow-id`, mctlhq/mctl-agents#461), else the issue-keyed
     id `workflow_id_for` derives.
 
-    The derived id is only right for an issue-keyed loop. A loop started by
-    the execution-request dispatcher is `dev-loop-xr_<id>`, so a run it
-    submitted that re-derived its loop from the issue URL would name a loop
-    that does not exist: in the approve instructions it posts, and in the
-    correlation it seals, which the loop compares against its own id before
-    accepting a clarification request as its own. The one place both read
-    the answer from, so they cannot disagree."""
+    Every DevLoop is issue-keyed (#461 option A: the execution-request
+    dispatcher starts or joins `dev-loop-<owner>-<repo>-<n>` too), so the
+    two agree; the passed id is still preferred because it is what the loop
+    itself reported, and the one place both the approve instructions and the
+    sealed correlation read it from, so they cannot disagree."""
     return temporal_workflow_id or workflow_id_for(issue_url)
 
 
-#: Every dispatched DevLoop's workflow id starts with this: `dev-loop-`
-#: followed by mctl-api's `xr_` request-id prefix. An issue-keyed loop is
-#: `dev-loop-<owner>-...` and never matches.
-DISPATCHED_WORKFLOW_PREFIX = "dev-loop-xr_"
-
-
-def is_dispatched_workflow_id(workflow_id: str) -> bool:
-    """Was `workflow_id` started by the execution-request dispatcher?"""
-    return workflow_id.startswith(DISPATCHED_WORKFLOW_PREFIX)
-
-
-def dispatched_workflow_id(execution_request_id: str) -> str:
-    """The DevLoop workflow id for one mctl-api execution request
-    (mctlhq/mctl-agents#461): a pure function of the request id, so every
-    claim of the same request — the first, or a re-claim after a crash and
-    a lapsed lease, under a new claim token — names the same run. It is
-    also the `engine_ref` the dispatcher fulfils the request with, so the
-    same run is the same `we_` execution by mctl-api's
-    `(engine, engine_ref)` idempotency."""
-    return f"dev-loop-{execution_request_id}"
-
-
-#: Separates the live loop's workflow id from the request id in the engine
-#: ref of a resume delivered onto that loop. Never part of a workflow id:
-#: Temporal ids here are `dev-loop-<owner>-<repo>-<n>` or `dev-loop-xr_<id>`.
-RESUME_ENGINE_REF_SEPARATOR = "#"
+#: Separates the loop's workflow id from the request id in the engine ref of
+#: every execution the dispatcher fulfils. Never part of a workflow id:
+#: Temporal ids here are `dev-loop-<owner>-<repo>-<n>`.
+REQUEST_ENGINE_REF_SEPARATOR = "#"
 #: mctl-api's `workitems.MaxEngineRefBytes`: a longer ref is refused (400).
 MAX_ENGINE_REF_BYTES = 256
 
 
-def resume_engine_ref(loop_workflow_id: str, execution_request_id: str) -> str:
-    """The `engine_ref` of a resume delivered onto the live DevLoop
-    `loop_workflow_id` (mctlhq/mctl-agents#461): `<loop id>#<request id>`.
+def request_engine_ref(loop_workflow_id: str, execution_request_id: str) -> str:
+    """The `engine_ref` of the execution an mctl-api execution request runs
+    as on the DevLoop `loop_workflow_id` (mctlhq/mctl-agents#461):
+    `<loop id>#<request id>`, whether the request started that loop, started
+    a continuation of it, or was delivered onto it while it ran.
 
     A pure function of (loop, request), so a re-claim of the same request
     fulfils with the same ref and gets the same `we_` back by mctl-api's
     `(engine, engine_ref)` idempotency. Unique per item, because a request
-    id is (mctl-api refuses a resume under a ref the item already has). No
-    run id in it, so it survives the loop's continue-as-new.
+    id is. No run id in it, so it survives the loop's continue-as-new.
 
     NOT a workflow id: anything that turns a ledger entry into a Temporal
     handle must go through `loop_id_of_engine_ref`."""
-    return f"{loop_workflow_id}{RESUME_ENGINE_REF_SEPARATOR}{execution_request_id}"
+    return f"{loop_workflow_id}{REQUEST_ENGINE_REF_SEPARATOR}{execution_request_id}"
 
 
-def is_resume_engine_ref(engine_ref: str) -> bool:
-    """Was `engine_ref` written by the dispatcher for a resume delivered
-    onto a live loop? The `#xr_` suffix is the proof: no workflow id has it."""
-    return f"{RESUME_ENGINE_REF_SEPARATOR}xr_" in engine_ref
+def is_request_engine_ref(engine_ref: str) -> bool:
+    """Was `engine_ref` written by the dispatcher for an execution request?
+    The `#xr_` suffix is the proof: no workflow id has it."""
+    return f"{REQUEST_ENGINE_REF_SEPARATOR}xr_" in engine_ref
 
 
 def loop_id_of_engine_ref(engine_ref: str) -> str:
     """The DevLoop workflow id behind a Temporal execution's `engine_ref`:
-    the ref itself, or its loop half for a delivered resume."""
-    return engine_ref.split(RESUME_ENGINE_REF_SEPARATOR, 1)[0]
+    the ref itself, or its loop half for a dispatched request."""
+    return engine_ref.split(REQUEST_ENGINE_REF_SEPARATOR, 1)[0]

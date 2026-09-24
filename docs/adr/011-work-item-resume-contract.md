@@ -230,18 +230,52 @@ as the service principal, turns the request into a run:
    again under a new token, and fulfil/reject are fenced by the token).
 2. **Decide from the store.** v1 runs the investigator for an item bound to
    a mctlhq GitHub issue; any other item is rejected `no_runnable_target`.
-   A live DevLoop for the item (behind any Temporal execution in its ledger,
-   or the issue-keyed loop) refuses a `start` (`loop_active`) and takes a
-   `resume` itself (delivered, below). With no live loop, a `resume` starts
-   a continuation exactly as `start` starts a first run.
-3. **Start** `DevLoopWorkflow` under `dev-loop-<request id>`: `USE_EXISTING`
-   on conflict, `REJECT_DUPLICATE` on reuse. A request is run once.
-4. **Fulfil** with `(temporal, <that workflow id>)`. mctl-api attaches the
+   The loop is the issue's one DevLoop, `dev-loop-<owner>-<repo>-<n>`
+   (`workflow_id_for`), the same id the intake poller starts: one workflow
+   id per issue, whoever starts it (#461 option A).
+3. **Deliver with Update-with-Start**: the `accept_execution_request` Update
+   (update id = request id) together with a start of that loop whose input
+   carries the request (`dispatch_start_operation`), `USE_EXISTING` on
+   conflict. Temporal applies both as one operation, so the intake poller
+   and the dispatcher can never make two loops for one issue:
+   - a RUNNING loop (the intake's, or one a request started) ignores the
+     start input and validates the Update: a `start` it was not started
+     for is refused `loop_active`, a `resume` follows the rules below;
+   - with no running loop a new run starts with the request as its own,
+     and takes the Update in its first activation (`@workflow.init` reads
+     the start input, because the Update is validated before `run`
+     executes). A `start` starts the issue's loop, a `resume` a
+     continuation of it, under the same id.
+
+   A dispatched run that ends having run nothing (its request rejected,
+   refused at fulfil, never fulfilled, or its bind refused) ends FAILED,
+   `DispatchedRequestNotRun`, under `workflow.patched("dispatched-not-run-
+   fails")`: a COMPLETED run that did nothing would make every later intake
+   label on the issue a silent "already handled".
+
+   Reuse policy: the dispatcher starts a new run after ANY closed run
+   (`ALLOW_DUPLICATE`), because a `resume` of a finished loop is exactly a
+   new run of it and a request is an explicit ask that mctl-api already
+   re-decided; `ALLOW_DUPLICATE_FAILED_ONLY` would refuse a resume of every
+   completed loop. The intake poller keeps `ALLOW_DUPLICATE_FAILED_ONLY`: a
+   label re-added on a completed issue is "already handled". A request runs
+   once regardless: it is fulfilled once, and a repeated update id is
+   answered from Temporal's registry, or by the run's own accepted set.
+4. **Fulfil** with `(temporal, <loop>#<request id>)`. mctl-api attaches the
    `we_` (`start`: Running; `resume`: Pending under the `/resume` rule,
    which re-decides the item and its approval is the new run's own).
 
-Start precedes fulfil so that every crash converges: before the fulfil, the
-next claim derives the same workflow id and engine ref; after it, the loop
+The engine ref `<loop>#<request id>` is deterministic from (loop, request),
+unique per item and free of any run id, so it survives continue-as-new and a
+new run of the same loop; it is not a workflow id, and everything that turns
+a ledger entry into a Temporal handle takes the part before `#`
+(`loop_id_of_engine_ref`). A loop recorded before option A (a
+`dev-loop-xr_<request id>` started with a plain start) bound its execution
+under its bare id; `workflow.patched("issue-keyed-dispatch")` keeps that
+shape on replay.
+
+Delivery precedes fulfil so that every crash converges: before the fulfil,
+the next claim derives the same loop, update id and engine ref; after it, the loop
 reads its `we_` from the fulfilled request itself (the
 `bind_dispatched_execution` activity), which also refuses a request of
 another item, an item about another issue, or an execution that is not the
@@ -254,10 +288,14 @@ when that run ends, and to `Failed` on every exit before that (a missing
 release, an exhausted or timed-out submit, a cancellation, shielded), since
 a non-terminal execution makes mctl-api refuse every later request for the
 item (`execution_active`). A terminated loop runs no code, so the dispatcher
-fails a non-terminal execution whose engine ref is a dispatched loop id
-once Temporal reports that loop closed or no longer knows it (the
-`dev-loop-xr_` prefix proves the dispatcher started it), and touches
-nothing else. The success-path advance retries patiently (about an hour)
+fails a non-terminal execution whose engine ref is a `<loop>#xr_...` ref
+(the `#xr_` suffix proves the dispatcher fulfilled it) once Temporal reports
+that loop not RUNNING (closed, or no longer known), or RUNNING in a run
+that never took the request (the `holds_execution_request` query answers
+no: a later run of the shared issue id, say the intake's after an operator
+terminated the one that held it). It touches nothing else: never an
+execution of another engine, one the loop seeded itself, or one a running
+run holds or cannot vouch for. The success-path advance retries patiently (about an hour)
 and, if it still did not land, is re-attempted before every park that
 holds the loop RUNNING (briefly before a clarification wait, whose request
 TTL has no lower bound; patiently before the approval park), because a
@@ -267,17 +305,16 @@ a request at fulfil; anything else defers to a later claim. Human-input continua
 and one execution seals one snapshot).
 
 **A resume onto a live loop is delivered to that loop, before the
-fulfil**, by the same rule as the start: the durable record is the loop's own
-history, never the dispatcher process. The dispatcher sends the live loop L
-the `accept_execution_request` Workflow Update with `update_id` = the request
-id, carrying the request id, the item and the request's provenance (its
-surface; the human who made it). Only then does it fulfil, with `engine_ref
-= "<L>#<request id>"`: deterministic from (L, request), unique per item, and
-free of any run id, so it survives L's continue-as-new. That ref is not a
-workflow id; everything that turns a ledger entry into a Temporal handle
-takes the part before `#`.
+fulfil**, by the same Update-with-Start: the durable record is the loop's
+own history, never the dispatcher process. The Update carries the request
+id, its kind, the item and the request's provenance (its surface; the human
+who made it). Only then does the dispatcher fulfil, with `engine_ref =
+"<L>#<request id>"`.
 
-- **L's validator** applies the `resume` signal's rules (§5): a
+- **L's validator** first takes the request L was started for (whatever
+  its kind, and before `run` has its state; one naming another item is a
+  `work-item-mismatch`), refuses any other `start` (`LoopActive`,
+  `loop_active`), and applies the `resume` signal's rules (§5): a
   `work-item-mismatch`, `resume-already-pending` (another delivery or
   resume signal still open), a `malformed-delivery`, or missing or
   out-of-vocabulary provenance refuses it, and the dispatcher rejects the
@@ -313,17 +350,17 @@ takes the part before `#`.
 - **Duplicates** are dropped by Temporal's update id within a run, and by
   L's `accepted_request_ids` across continue-as-new.
 - **Crash windows.** After the Update and before the fulfil: L holds the
-  request, and the next claim re-sends the same Update and fulfils the same
-  ref. After the fulfil: nothing is lost, L reads the `we_` from the store.
-  L gone before accepting: the Update fails NOT_FOUND and the request
-  starts a continuation. L accepted, then closed before the fulfil: the
-  dispatcher re-checks L after the Update (Temporal answers a repeated
-  update id from a closed run's registry too) and starts a continuation
-  instead. L closed between that re-check and the fulfil: the dispatcher
-  checks once more after the fulfil and fails the execution itself,
-  because mctl-api refuses every new request for the item while that
-  execution is non-terminal, so no reconciliation would ever run for it.
-  The reconciliation also matches `#xr_` refs, by the loop before the `#`.
+  request, and the next claim re-sends the same Update-with-Start and
+  fulfils the same ref. After the fulfil: nothing is lost, L reads the `we_`
+  from the store. L gone before the Update: Update-with-Start starts a new
+  run of L that takes the request as its own. L accepted, then closed before
+  the fulfil: the dispatcher re-checks L after the Update and leaves the
+  request claimed (`deliver_stale`); the next claim's Update-with-Start
+  starts a new run that takes it. L closed between that re-check and the
+  fulfil: the dispatcher checks once more after the fulfil and fails the
+  execution itself, because mctl-api refuses every new request for the item
+  while that execution is non-terminal, so no reconciliation would ever run
+  for it.
 - **Residual.** A dispatcher that dies between its fulfil and that last
   check, while L is closing in the same seconds, leaves the execution
   `Pending`; a TERMINATED L leaves a bound one `Running`. The
@@ -340,14 +377,18 @@ and execution ids. The dispatched path in `DevLoopWorkflow` is guarded by
 `workflow.patched("execution-request-dispatch")` and replayed from
 `tests/fixtures/histories/dev_loop_dispatched.json`; a delivery records
 `workflow.patched("execution-request-resume")` where it starts, and is
-replayed from `tests/fixtures/histories/dev_loop_resumed.json`.
+replayed from `tests/fixtures/histories/dev_loop_resumed.json`. Both were
+recorded before option A and are kept as the in-flight shape;
+`workflow.patched("issue-keyed-dispatch")` guards the `<loop>#<request>`
+engine ref, and `tests/fixtures/histories/dev_loop_issue_keyed.json`
+replays today's shape (Update-with-Start, the intake joining, a refused
+second `start`, a delivered and re-sent resume).
 
-**Known gap.** Everything else that names a DevLoop derives the
-issue-keyed id (`workflow_id_for`): the investigator's approve instructions
-on the issue, the shepherd's legacy liveness check and the orphan sweep. A
-dispatched loop is `dev-loop-<request id>`, so it is approved through the
-mctl-api approve route with its own id (it is in the item's ledger as the
-execution's `engine_ref`), and the legacy checks do not see it.
+Because every DevLoop is issue-keyed, everything that names one by
+`workflow_id_for` (the investigator's approve instructions on the issue,
+the shepherd's liveness check, the orphan sweep) sees the dispatched loop
+too; the `dev-loop-xr_*` alias those callers used to consult (#477, the
+#474 memo) is gone.
 
 ## Alternatives
 
@@ -431,7 +472,7 @@ two cross-repo prerequisites.
 | Execution-request contract mirror, typed reject reasons (#461) | `orchestrator/work_context/execution_requests.py` |
 | `WorkItemClient.claim_execution_request` / `fulfil_execution_request` / `reject_execution_request` / `execution_request` (#461) | `orchestrator/work_context/client.py` |
 | Dispatcher, `EXECUTION_REQUEST_DISPATCHER` (#461) | `orchestrator/temporal/dispatcher.py`, `worker.py`, `cli.py dispatch-once` |
-| `dispatched_workflow_id`, `start_dispatched_dev_loop` (#461) | `orchestrator/temporal/start.py` |
+| `dispatch_start_operation`, `DISPATCH_ID_REUSE_POLICY` (#461 option A) | `orchestrator/temporal/start.py` |
 | `bind_dispatched_execution`, `advance_dispatched_execution` (#461) | `orchestrator/temporal/activities/execution_requests.py` |
 | `accept_execution_request` Update, `ResumeDelivery`, `_deliver` (#461) | `orchestrator/temporal/workflows/dev_loop.py` |
-| `resume_engine_ref`, `loop_id_of_engine_ref` (#461) | `orchestrator/temporal/issue_ref.py` |
+| `request_engine_ref`, `loop_id_of_engine_ref` (#461) | `orchestrator/temporal/issue_ref.py` |

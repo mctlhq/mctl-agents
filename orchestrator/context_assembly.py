@@ -901,8 +901,8 @@ def build_execution_correlation(
 
     `temporal_workflow_id` / `temporal_run_id` are the loop that submitted
     this run, when it passed them (mctlhq/mctl-agents#461, #451). Without a
-    passed workflow id the issue-keyed one is derived, which names the wrong
-    loop for a dispatched `dev-loop-xr_*` run (see `loop_workflow_id`).
+    passed workflow id the issue-keyed one is derived, which is the same
+    loop: every DevLoop is issue-keyed (#461 option A, `loop_workflow_id`).
     """
     resolved_environment: str = (
         environment if environment is not None else os.getenv("AGENT_ENVIRONMENT", "production")

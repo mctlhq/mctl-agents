@@ -25,6 +25,7 @@ inside that fake submit, so the snapshot it seals is the real one.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import uuid
@@ -46,8 +47,7 @@ from orchestrator.temporal.activities.execution_requests import (
     bind_dispatched_execution,
 )
 from orchestrator.temporal.constants import TASK_QUEUE
-from orchestrator.temporal.issue_ref import workflow_id_for
-from orchestrator.temporal.start import dispatched_workflow_id
+from orchestrator.temporal.issue_ref import request_engine_ref, workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
 from orchestrator.work_context import execution_requests as xr
 from orchestrator.work_context.client import WorkItemClient, WorkItemUnavailable, _HTTPResult
@@ -253,23 +253,38 @@ async def env():
 class FakeTemporal:
     """`TemporalPort` for tests that must never reach Temporal."""
 
-    def __init__(self, states: dict[str, str] | None = None, *, delivery: dx.DeliveryAnswer | None = None) -> None:
+    def __init__(
+        self,
+        states: dict[str, str] | None = None,
+        *,
+        delivery: dx.DeliveryAnswer | None = None,
+        closes_after_delivery: bool = False,
+        held: bool | None = True,
+    ) -> None:
         self.states = states or {}
-        self.started: list[IssueRef] = []
-        #: What every `deliver_resume` answers (default: accepted).
+        #: What `holds_request` answers for every running loop.
+        self.held = held
+        #: The run that accepted the request closes before the fulfil.
+        self.closes_after_delivery = closes_after_delivery
+        #: What every `deliver` answers (default: accepted).
         self.delivery = delivery or dx.DeliveryAnswer(dx.DELIVERED)
-        self.delivered: list[tuple[str, Any]] = []
+        #: Every (IssueRef, ResumeDelivery) handed to Update-with-Start.
+        self.delivered: list[tuple[IssueRef, Any]] = []
 
-    async def start(self, issue: Any) -> str:
-        self.started.append(issue)
-        return dx.START_STARTED
+    async def deliver(self, issue: Any, delivery: Any) -> dx.DeliveryAnswer:
+        self.delivered.append((issue, delivery))
+        if self.delivery.verdict == dx.DELIVERED:
+            # Update-with-Start reaches a running loop or starts one: a loop
+            # that accepted a request runs, unless the test says it closed.
+            closed = dx.LOOP_CLOSED if self.closes_after_delivery else dx.LOOP_RUNNING
+            self.states[workflow_id_for(issue.issue_url)] = closed
+        return self.delivery
 
     async def loop_state(self, workflow_id: str) -> str:
         return self.states.get(workflow_id, dx.LOOP_ABSENT)
 
-    async def deliver_resume(self, workflow_id: str, delivery: Any) -> dx.DeliveryAnswer:
-        self.delivered.append((workflow_id, delivery))
-        return self.delivery
+    async def holds_request(self, workflow_id: str, request_id: str) -> bool | None:
+        return self.held
 
 
 class Crash(BaseException):
@@ -338,6 +353,19 @@ async def _end(env: WorkflowEnvironment, workflow_id: str) -> None:
     await handle.result()
 
 
+def _delivery(rid: str, kind: str, work_item_id: str = WID) -> Any:
+    from orchestrator.temporal.workflows.dev_loop import ResumeDelivery
+
+    return ResumeDelivery(
+        execution_request_id=rid,
+        work_item_id=work_item_id,
+        surface="telegram",
+        actor_kind=dx.RESUME_ACTOR_KIND,
+        actor_id="alice",
+        kind=kind,
+    )
+
+
 def _audit(out: str) -> list[dict]:
     return [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith(dx.AUDIT_PREFIX + " ")]
 
@@ -381,10 +409,14 @@ async def test_the_operator_cli_refuses_while_the_dispatcher_is_off(monkeypatch,
 # -- deterministic identity --------------------------------------------------
 
 
-def test_workflow_id_and_engine_ref_are_pure_functions_of_the_request_id():
+def test_the_loop_is_the_issue_s_and_the_engine_ref_a_pure_function_of_loop_and_request():
+    """#461 option A: one DevLoop per issue, whatever started it; the engine
+    ref names the request on that loop, so a re-claim fulfils the same one."""
     rid = "xr_00000001-0000-4000-8000-000000000461"
-    assert dispatched_workflow_id(rid) == dispatched_workflow_id(rid) == f"dev-loop-{rid}"
-    assert dispatched_workflow_id(rid) != dispatched_workflow_id(rid.replace("1-", "2-", 1))
+    loop = workflow_id_for(URL)
+    assert loop.startswith("dev-loop-mctlhq-mctl-telegram-") and "xr_" not in loop
+    assert request_engine_ref(loop, rid) == request_engine_ref(loop, rid) == f"{loop}#{rid}"
+    assert request_engine_ref(loop, rid) != request_engine_ref(loop, rid.replace("1-", "2-", 1))
 
 
 # -- no runnable target ------------------------------------------------------
@@ -405,7 +437,7 @@ async def test_an_item_without_a_runnable_issue_is_rejected_never_guessed(api, c
     assert outcome.action == dx.REJECTED and outcome.reason == xr.NO_RUNNABLE_TARGET
     assert api.request_state(rid)["state"] == "rejected"
     assert api.request_state(rid)["reason"] == xr.NO_RUNNABLE_TARGET
-    assert temporal.started == [] and api.fulfils() == [] and api.executions == []
+    assert temporal.delivered == [] and api.fulfils() == [] and api.executions == []
     events = [(a["event"], a.get("reason")) for a in _audit(capsys.readouterr().out)]
     assert events == [("claim", None), ("reject", xr.NO_RUNNABLE_TARGET)]
 
@@ -424,22 +456,160 @@ async def test_an_unreadable_item_leaves_the_request_claimed_for_a_later_claim(a
     outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
 
     assert outcome.action == dx.DEFERRED
-    assert api.request_state(rid)["state"] == "claimed" and temporal.started == []
+    assert api.request_state(rid)["state"] == "claimed" and temporal.delivered == []
 
 
 async def test_nothing_claimable_is_nothing(api):
     assert (await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()).action == dx.NOTHING
 
 
-async def test_a_start_is_refused_while_the_issue_loop_is_live(api):
-    """Two investigations of one issue would race for one proposal."""
+async def test_a_start_the_loop_refuses_is_rejected_loop_active(api, capsys):
+    """Two investigations of one issue would race for one proposal: the
+    loop's `LoopActive` answer rejects the request, before any fulfil."""
     rid = api.create_request("start")
-    temporal = FakeTemporal({workflow_id_for(URL): dx.LOOP_RUNNING})
+    temporal = FakeTemporal(delivery=dx.DeliveryAnswer(dx.DELIVERY_LOOP_ACTIVE, "loop-active"))
 
     outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
 
     assert outcome.action == dx.REJECTED and api.request_state(rid)["reason"] == xr.LOOP_ACTIVE
-    assert temporal.started == []
+    assert api.fulfils() == [] and api.executions == []
+    [(issue, delivery)] = temporal.delivered
+    assert issue.execution_request_id == rid and delivery.kind == "start"
+    reject = _audit(capsys.readouterr().out)[-1]
+    assert reject["event"] == "reject" and reject["live_loop"] == workflow_id_for(URL)
+
+
+async def test_intake_first_a_start_request_joins_its_loop_and_is_refused_loop_active(api, env):
+    """Acceptance 3 (#461 option A): the intake poller started the issue's
+    loop; the request's Update-with-Start reaches THAT run (no second one)
+    and its validator refuses a start it was not started for."""
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, seen = _investigate_log()
+    rid = api.create_request("start")
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        handle = await start_dev_loop_workflow(URL, client=env.client)
+        run_id = (await handle.describe()).run_id
+        await _wait_for(lambda: len(seen) == 1)
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.REJECTED and outcome.reason == xr.LOOP_ACTIVE
+        assert (await env.client.get_workflow_handle(wid).describe()).run_id == run_id
+        await _end(env, wid)
+
+    assert len(seen) == 1 and "execution_id" not in seen[0]
+    assert api.fulfils() == [] and api.executions == []
+    assert api.request_state(rid)["reason"] == xr.LOOP_ACTIVE
+
+
+async def test_dispatcher_first_the_intake_start_attaches_to_the_same_run(api, env):
+    """Acceptance 2 (#461 option A): the dispatcher started the issue's loop;
+    the intake poller's start of the same issue is a no-op that hands back
+    that run (USE_EXISTING), so the issue still has one loop, one run, one
+    investigation."""
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, seen = _investigate_log()
+    rid = api.create_request("start")
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED and outcome.workflow_id == wid
+        run_id = (await env.client.get_workflow_handle(wid).describe()).run_id
+        joined = await start_dev_loop_workflow(URL, client=env.client)
+        assert joined.id == wid and (await joined.describe()).run_id == run_id
+        await _wait_for(lambda: len(seen) == 1)
+        await anyio.sleep(0.5)
+        await _end(env, wid)
+
+    assert len(seen) == 1 and seen[0]["execution_request_id"] == rid
+    assert [e["engine_ref"] for e in api.executions] == [request_engine_ref(wid, rid)]
+
+
+async def test_intake_and_dispatcher_starting_one_issue_at_once_make_exactly_one_loop(api, env):
+    """Acceptance 1 (#461 option A): the intake poller and the dispatcher
+    start the same issue concurrently. Whichever reaches Temporal first owns
+    the run; the other joins it: the dispatcher's `start` is then refused
+    `loop_active` (never a second loop), or the intake's start is a no-op.
+    Exactly one run, one investigation, and a request that is either
+    fulfilled by that run or rejected, never left dangling."""
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, seen = _investigate_log()
+    rid = api.create_request("start")
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        outcome, handle = await asyncio.gather(
+            _dispatcher(env).dispatch_once(), start_dev_loop_workflow(URL, client=env.client)
+        )
+        run_id = (await env.client.get_workflow_handle(wid).describe()).run_id
+        assert (await handle.describe()).run_id == run_id
+        await _wait_for(lambda: len(seen) == 1)
+        await anyio.sleep(0.5)
+        await _end(env, wid)
+
+    assert len(seen) == 1
+    if outcome.action == dx.FULFILLED:
+        assert seen[0]["execution_request_id"] == rid
+        assert [e["engine_ref"] for e in api.executions] == [request_engine_ref(wid, rid)]
+    else:
+        assert outcome.action == dx.REJECTED and api.request_state(rid)["reason"] == xr.LOOP_ACTIVE
+        assert "execution_request_id" not in seen[0] and api.executions == []
+
+
+async def test_intake_first_a_resume_request_is_delivered_to_that_same_run(api, env):
+    """Acceptance 3, `resume` half: the loop the intake poller started takes
+    a resume request through Update-with-Start (USE_EXISTING: the start
+    input is ignored), binds its execution under `<loop>#<request>`, and no
+    second run exists."""
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, seen = _investigate_log()
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        handle = await start_dev_loop_workflow(URL, client=env.client)
+        run_id = (await handle.describe()).run_id
+        await _wait_for(lambda: len(seen) == 1)
+        rid = api.create_request("resume")
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED and outcome.engine_ref == request_engine_ref(wid, rid), outcome
+        await _wait_for(lambda: bool(api.executions) and api.executions[0]["phase"] == "Running")
+        assert (await env.client.get_workflow_handle(wid).describe()).run_id == run_id
+        await _end(env, wid)
+
+    assert len(seen) == 1
+    assert [e["engine_ref"] for e in api.executions] == [request_engine_ref(wid, rid)]
+
+
+async def test_after_a_completed_loop_the_dispatcher_starts_a_new_run_and_the_intake_does_not(api, env):
+    """Acceptance 8, the agreed reuse policy. A request after the issue's
+    loop COMPLETED starts a new run of the same id (ALLOW_DUPLICATE: a
+    resume of a finished loop is its continuation, and the request is an
+    explicit ask); the intake poller keeps ALLOW_DUPLICATE_FAILED_ONLY, so a
+    re-added label on a completed issue is still "already handled"."""
+    from temporalio.exceptions import WorkflowAlreadyStartedError
+
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, seen = _investigate_log()
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        first = await start_dev_loop_workflow(URL, client=env.client)
+        await _wait_for(lambda: len(seen) == 1)
+        await _end(env, wid)
+        assert (await first.describe()).status == WorkflowExecutionStatus.COMPLETED
+        with pytest.raises(WorkflowAlreadyStartedError):
+            await start_dev_loop_workflow(URL, client=env.client)
+
+        rid = api.create_request("resume")
+        outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED and outcome.workflow_id == wid, outcome
+        await _wait_for(lambda: len(seen) == 2)
+        second = (await env.client.get_workflow_handle(wid).describe()).run_id
+        await _end(env, wid)
+
+    assert second != first.result_run_id
+    assert seen[1]["execution_request_id"] == rid
 
 
 def test_the_claim_token_never_reaches_a_repr_or_the_policy_checkpoint(api, capsys):
@@ -458,43 +628,47 @@ def test_the_claim_token_never_reaches_a_repr_or_the_policy_checkpoint(api, caps
 async def test_a_duplicate_claim_or_start_never_makes_a_second_run(api, env, capsys):
     submit, seen = _investigate_log()
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
+    ref = request_engine_ref(wid, rid)
     async with _worker(env, submit):
         first = await _dispatcher(env).dispatch_once()
-        assert first.action == dx.FULFILLED and first.workflow_id == wid
+        assert first.action == dx.FULFILLED and first.workflow_id == wid and first.engine_ref == ref
         # A second claim finds nothing: the request is closed, not re-run.
         assert (await _dispatcher(env).dispatch_once()).action == dx.NOTHING
-        # A duplicate start of the same request attaches to the same run.
+        # A duplicate Update-with-Start of the same request joins the same
+        # run: the update id is the request id.
         run_id = (await env.client.get_workflow_handle(wid).describe()).run_id
         issue = IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid)
-        assert await dx.TemporalClientPort(env.client).start(issue) == dx.START_STARTED
+        again = await dx.TemporalClientPort(env.client).deliver(issue, _delivery(rid, "start"))
+        assert again.verdict == dx.DELIVERED
         assert (await env.client.get_workflow_handle(wid).describe()).run_id == run_id
         await _wait_for(lambda: len(seen) == 1)
         await _end(env, wid)
-        # Once the run has ended, the reuse policy refuses to start it again.
-        assert await dx.TemporalClientPort(env.client).start(issue) == dx.START_CLOSED
+        # The request is fulfilled, so closed for good: never claimed again.
+        assert (await _dispatcher(env).dispatch_once()).action == dx.NOTHING
 
     assert len(seen) == 1
-    assert [(e["engine"], e["engine_ref"]) for e in api.executions] == [("temporal", wid)]
+    assert [(e["engine"], e["engine_ref"]) for e in api.executions] == [("temporal", ref)]
     assert seen[0]["execution_id"] == first.execution_id == api.executions[0]["id"]
     audit = _audit(capsys.readouterr().out)
-    assert [a["event"] for a in audit] == ["claim", "start", "fulfil"]
+    assert [a["event"] for a in audit] == ["claim", "deliver", "fulfil"]
     # Every line carries the ids; the fulfil line carries the execution.
-    assert all(a["execution_request_id"] == rid and a["work_item_id"] == WID and a["workflow_id"] == wid for a in audit)
-    assert audit[-1]["execution_id"] == first.execution_id and audit[-1]["engine_ref"] == wid
+    assert all(a["execution_request_id"] == rid and a["work_item_id"] == WID for a in audit)
+    assert all(a["workflow_id"] == wid for a in audit[1:])
+    assert audit[-1]["execution_id"] == first.execution_id and audit[-1]["engine_ref"] == ref
 
 
 async def test_a_lost_fulfil_answer_is_retried_onto_the_same_execution(api, env):
     """The store committed, the answer was lost: the same holder repeating
     the same engine run must get the same `we_`, never a second one."""
     submit, seen = _investigate_log()
-    rid = api.create_request("start")
+    api.create_request("start")
     api.lose_next_fulfil_answer = True
     async with _worker(env, submit):
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED
         await _wait_for(lambda: len(seen) == 1)
-        await _end(env, dispatched_workflow_id(rid))
+        await _end(env, workflow_id_for(URL))
 
     fulfils = api.fulfils()
     assert len(fulfils) == 2 and fulfils[0] == fulfils[1]
@@ -504,7 +678,7 @@ async def test_a_lost_fulfil_answer_is_retried_onto_the_same_execution(api, env)
 async def test_a_crash_between_start_and_fulfil_converges_on_the_same_run(api, env, capsys):
     submit, seen = _investigate_log()
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
     async with _worker(env, submit):
         with pytest.raises(Crash):
             await _dispatcher(env, CrashBeforeFulfil(WorkItemClient())).dispatch_once()
@@ -523,8 +697,8 @@ async def test_a_crash_between_start_and_fulfil_converges_on_the_same_run(api, e
         await _end(env, wid)
 
     assert len(seen) == 1 and seen[0]["execution_id"] == outcome.execution_id
-    assert [(e["engine"], e["engine_ref"]) for e in api.executions] == [("temporal", wid)]
-    assert [a["event"] for a in _audit(capsys.readouterr().out)] == ["claim", "start", "claim", "start", "fulfil"]
+    assert [(e["engine"], e["engine_ref"]) for e in api.executions] == [("temporal", request_engine_ref(wid, rid))]
+    assert [a["event"] for a in _audit(capsys.readouterr().out)] == ["claim", "deliver", "claim", "deliver", "fulfil"]
 
 
 async def test_an_expired_lease_is_fenced_and_the_next_claim_converges(api, env):
@@ -543,33 +717,86 @@ async def test_an_expired_lease_is_fenced_and_the_next_claim_converges(api, env)
         converged = await _dispatcher(env).dispatch_once()
         assert converged.action == dx.FULFILLED
         await _wait_for(lambda: len(seen) == 1)
-        await _end(env, dispatched_workflow_id(rid))
+        await _end(env, workflow_id_for(URL))
 
     assert len(api.executions) == 1 and seen[0]["execution_id"] == converged.execution_id
 
 
-async def test_a_request_whose_run_already_ended_is_rejected_not_rerun(api, env):
-    """The loop gave up waiting for its fulfilment and ended; a later claim
-    must not bind the request to that dead run, nor start another."""
+async def test_a_request_whose_first_run_gave_up_runs_once_on_a_new_run(api, env, capsys):
+    """The loop gave up waiting for its fulfilment and ended having run
+    nothing. A later claim of the (still unfulfilled) request starts the
+    issue's loop again and runs it there: exactly one investigator and one
+    execution for the request, never bound to the dead run."""
     submit, seen = _investigate_log()
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
     async with _worker(env, submit):
         with pytest.raises(Crash):
             await _dispatcher(env, CrashBeforeFulfil(WorkItemClient())).dispatch_once()
+        first_run = (await env.client.get_workflow_handle(wid).describe()).run_id
         # Nobody fulfils for longer than FULFILMENT_WAIT: the loop ends.
         await env.sleep(timedelta(minutes=31))
-        result = await env.client.get_workflow_handle_for(DevLoopWorkflow.run, wid).result()
-        assert "not fulfilled" in result.ended and result.investigate.phase == "NotStarted"
+        result = await ended_without_running(env.client.get_workflow_handle(wid, run_id=first_run))
+        assert "not fulfilled" in result.ended
+        assert seen == [] and api.executions == []
         api.now += 3600
         outcome = await _dispatcher(env).dispatch_once()
+        assert outcome.action == dx.FULFILLED and outcome.engine_ref == request_engine_ref(wid, rid)
+        assert (await env.client.get_workflow_handle(wid).describe()).run_id != first_run
+        await _wait_for(lambda: len(seen) == 1)
+        await _end(env, wid)
 
-    assert outcome.action == dx.REJECTED and outcome.reason == xr.ENGINE_RUN_ENDED
-    assert api.request_state(rid)["reason"] == xr.ENGINE_RUN_ENDED
-    assert seen == [] and api.executions == []
+    assert len(seen) == 1 and seen[0]["execution_id"] == outcome.execution_id
+    assert [e["engine_ref"] for e in api.executions] == [request_engine_ref(wid, rid)]
+    assert api.request_state(rid)["state"] == "fulfilled"
+
+
+async def test_a_dispatched_run_that_ran_nothing_leaves_the_issue_startable_by_the_intake_label(api, env):
+    """Review P2 on #487: the dispatched run shares the issue's id, and the
+    intake poller starts it with ALLOW_DUPLICATE_FAILED_ONLY. A run that
+    ended having run nothing must therefore not end COMPLETED, or every
+    later `agents:intake` label on the issue is a silent "already handled".
+    It ends FAILED, and the label starts the issue's loop again."""
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, seen = _investigate_log()
+    rid = "xr_77777777-0000-4000-8000-000000000461"  # never fulfilled: the read is refused
+    wid = workflow_id_for(URL)
+    async with _worker(env, submit):
+        handle = await env.client.start_workflow(
+            DevLoopWorkflow.run,
+            IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid),
+            id=wid,
+            task_queue=TASK_QUEUE,
+        )
+        await ended_without_running(handle)
+        assert (await handle.describe()).status == WorkflowExecutionStatus.FAILED
+        relabelled = await start_dev_loop_workflow(URL, client=env.client)
+        await _wait_for(lambda: len(seen) == 1)
+        assert (await relabelled.describe()).run_id != handle.result_run_id
+        await _end(env, wid)
+
+    assert "execution_request_id" not in seen[0]
 
 
 # -- the loop binds to exactly its own request and item ----------------------
+
+
+async def ended_without_running(handle: Any) -> Any:
+    """The end of a dispatched run that ran nothing: FAILED with
+    `DispatchedRequestNotRun` (#461 option A), so the issue's id stays
+    startable by the intake label. Its message is the reason, as `ended`."""
+    from types import SimpleNamespace
+
+    from temporalio.client import WorkflowFailureError
+
+    from orchestrator.temporal.workflows.dev_loop import DISPATCHED_NOT_RUN_ERROR_TYPE
+
+    with pytest.raises(WorkflowFailureError) as failed:
+        await handle.result()
+    cause = failed.value.cause
+    assert isinstance(cause, ApplicationError) and cause.type == DISPATCHED_NOT_RUN_ERROR_TYPE, cause
+    return SimpleNamespace(ended=cause.message)
 
 
 async def _run_loop(env: WorkflowEnvironment, submit: Any, issue: IssueRef, workflow_id: str) -> Any:
@@ -580,7 +807,7 @@ async def _run_loop(env: WorkflowEnvironment, submit: Any, issue: IssueRef, work
             id=workflow_id,
             task_queue=TASK_QUEUE,
         )
-        return await handle.result()
+        return await ended_without_running(handle)
 
 
 async def test_a_loop_refuses_an_execution_that_is_not_its_own_engine_run(api, env):
@@ -593,7 +820,7 @@ async def test_a_loop_refuses_an_execution_that_is_not_its_own_engine_run(api, e
     WorkItemClient().fulfil_execution_request(claim.request, claim.claim_token, "temporal", "somebody-else")
 
     result = await _run_loop(
-        env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), dispatched_workflow_id(rid)
+        env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), workflow_id_for(URL)
     )
 
     assert "work-item-mismatch" in result.ended and seen == []
@@ -605,7 +832,7 @@ async def test_a_loop_refuses_a_request_of_another_work_item(api, env):
     rid = api.create_request("start", work_item_id=OTHER_WID)
 
     result = await _run_loop(
-        env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), dispatched_workflow_id(rid)
+        env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), workflow_id_for(URL)
     )
 
     assert "work-item-mismatch" in result.ended and OTHER_WID in result.ended
@@ -623,13 +850,15 @@ async def test_a_loop_refuses_an_item_that_is_about_another_issue(api, env):
         env,
         submit,
         IssueRef(issue_url=other_issue, work_item_id=WID, execution_request_id=rid),
-        dispatched_workflow_id(rid),
+        workflow_id_for(URL),
     )
 
     assert "work-item-mismatch" in result.ended and seen == []
     # The fulfil minted it under this loop's own ref, so the loop ends it
     # rather than leave the item wedged behind a Running execution.
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(dispatched_workflow_id(rid), "Failed")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [
+        (request_engine_ref(workflow_id_for(URL), rid), "Failed")
+    ]
 
 
 async def test_a_loop_whose_advance_to_running_is_refused_ends_its_execution(api, env):
@@ -637,7 +866,8 @@ async def test_a_loop_whose_advance_to_running_is_refused_ends_its_execution(api
     definite no: the loop runs nothing, and ends the execution `Failed`."""
     submit, seen = _investigate_log()
     rid = api.create_request("start")
-    ref = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
+    ref = request_engine_ref(wid, rid)
     outcome = await dx.Dispatcher(WorkItemClient(), FakeTemporal(), lease=60).dispatch_once()
     assert outcome.action == dx.FULFILLED
     serve = api.request
@@ -649,7 +879,7 @@ async def test_a_loop_whose_advance_to_running_is_refused_ends_its_execution(api
         return serve(method, path, payload)
 
     api.request = refuse_running  # type: ignore[method-assign]
-    result = await _run_loop(env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), ref)
+    result = await _run_loop(env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), wid)
 
     assert "execution-refused" in result.ended and "to Running" in result.ended and seen == []
     assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Failed")]
@@ -663,7 +893,7 @@ async def test_a_rejected_request_ends_its_loop_without_running_anything(api, en
     WorkItemClient().reject_execution_request(claim.request, claim.claim_token, xr.LOOP_ACTIVE)
 
     result = await _run_loop(
-        env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), dispatched_workflow_id(rid)
+        env, submit, IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=rid), workflow_id_for(URL)
     )
 
     assert xr.LOOP_ACTIVE in result.ended and seen == [] and api.executions == []
@@ -675,10 +905,11 @@ async def test_a_rejected_request_ends_its_loop_without_running_anything(api, en
 async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_continues(api, env):
     submit, seen = _investigate_log()
     first = api.create_request("start")
-    first_loop = dispatched_workflow_id(first)
+    first_loop = workflow_id_for(URL)
     async with _worker(env, submit):
         started = await _dispatcher(env).dispatch_once()
         assert started.action == dx.FULFILLED
+        first_run = (await env.client.get_workflow_handle(first_loop).describe()).run_id
         await _wait_for(lambda: len(seen) == 1)
         # The dispatched execution ended with its investigator run...
         await _wait_for(lambda: api.executions[0]["phase"] == "Succeeded")
@@ -701,7 +932,9 @@ async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_con
         finished = api.create_request("resume")
         continued = await _dispatcher(env).dispatch_once()
         assert continued.action == dx.FULFILLED
-        assert continued.workflow_id == dispatched_workflow_id(finished) != first_loop
+        # A continuation is a new run of the SAME issue-keyed loop.
+        assert continued.workflow_id == first_loop
+        assert (await env.client.get_workflow_handle(first_loop).describe()).run_id != first_run
         await _wait_for(lambda: len(seen) == 2)
         await _wait_for(lambda: api.executions[2]["phase"] == "Succeeded")
         await _end(env, continued.workflow_id)
@@ -709,9 +942,9 @@ async def test_resume_onto_a_live_loop_is_delivered_and_onto_a_finished_loop_con
     first_we, _resumed_we, continued_we = (e["id"] for e in api.executions)
     assert [p["execution_id"] for p in seen] == [first_we, continued_we]
     assert [(e["engine_ref"], e["attempt"]) for e in api.executions] == [
-        (first_loop, 1),
+        (f"{first_loop}#{first}", 1),
         (f"{first_loop}#{live}", 2),
-        (continued.workflow_id, 3),
+        (f"{first_loop}#{finished}", 3),
     ]
     # Both resumes passed through Pending (the /resume rule) and moved the item.
     assert api.state_version == 3
@@ -805,7 +1038,7 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
         return WorkflowResult(workflow_name="mctl-agents-investigate-e2e", phase="Succeeded" if ok else "Failed")
 
     rid = api.create_request("start")
-    loop_id = dispatched_workflow_id(rid)
+    loop_id = workflow_id_for(URL)
     async with _worker(env, submit):
         outcome = await _dispatcher(env).dispatch_once()
         assert outcome.action == dx.FULFILLED
@@ -826,25 +1059,23 @@ async def test_offline_end_to_end_request_to_a_snapshot_sealed_for_the_dispatche
     # Exactly one execution: the dispatcher's, attached at fulfilment and
     # ended by the loop; the investigator attached none of its own.
     assert [(e["id"], e["engine"], e["engine_ref"], e["phase"]) for e in api.executions] == [
-        (we, "temporal", loop_id, "Succeeded"),
+        (we, "temporal", request_engine_ref(loop_id, rid), "Succeeded"),
     ]
     # A snapshot sealed for exactly that execution, naming it.
     assert list(api.snapshots) == [we]
     wc = api.document(we)["work_context"]
     assert wc["work_item_id"] == WID and wc["execution_id"] == we and wc["execution_sequence"] == 1
-    # ...correlated to the loop that really ran it (#461 gap 2, #451), not
-    # to the issue-keyed loop the investigator would otherwise derive.
+    # ...correlated to the loop that really ran it (#461 gap 2, #451).
     sealed = api.document(we)["execution"]
     assert sealed["temporal_workflow_id"] == loop_id and sealed["temporal_run_id"] == run_id
     # The approve instructions name that same loop.
     assert len(comments) == 1
     assert f"/dev-loop/{loop_id}/approve" in comments[0]["body"]
     assert f"cli approve {loop_id} " in comments[0]["body"]
-    assert workflow_id_for(URL) not in comments[0]["body"]
     # The loop carries the same identity.
     assert state.work_item_id == WID and state.execution_id == we and state.execution_sequence == 1
     audit = _audit(capsys.readouterr().out)
-    assert [a["event"] for a in audit] == ["claim", "start", "fulfil"]
+    assert [a["event"] for a in audit] == ["claim", "deliver", "fulfil"]
     assert audit[-1]["execution_id"] == we
 
 
@@ -853,13 +1084,13 @@ async def test_a_dispatched_loop_recognises_the_clarification_its_own_investigat
 ):
     """#461 gap 2 / #451, end to end: the real investigator, run with the
     flags the CWFT builds from the dispatched loop's params, seals the
-    correlation a clarification request carries; the `dev-loop-xr_*` loop
-    must take that request as its own and park on it.
+    correlation a clarification request carries; the dispatched loop must
+    take that request as its own and park on it.
 
-    Before the loop passed its ids, the investigator stamped the issue-keyed
-    `dev-loop-mctlhq-<repo>-<n>`, and `_await_human_input` retired the
-    request as a foreign execution's: the clarification was silently lost
-    and the loop went on to the approval park."""
+    Before the loop passed its ids, the investigator derived them itself,
+    and `_await_human_input` retired a request whose correlation named
+    another run as a foreign execution's: the clarification was silently
+    lost and the loop went on to the approval park."""
     from datetime import UTC, datetime
 
     from orchestrator import human_input as hi
@@ -895,8 +1126,8 @@ async def test_a_dispatched_loop_recognises_the_clarification_its_own_investigat
             requests[0] = json.dumps(request.to_dict())
         return WorkflowResult(workflow_name="mctl-agents-investigate-e2e", phase="Succeeded")
 
-    rid = api.create_request("start")
-    loop_id = dispatched_workflow_id(rid)
+    api.create_request("start")
+    loop_id = workflow_id_for(URL)
     async with _worker(env, submit, human_input_requests=requests):
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         await _wait_for(lambda: len(runs) == 1, limit=60)
@@ -913,9 +1144,9 @@ async def test_a_dispatched_loop_recognises_the_clarification_its_own_investigat
     # The loop took the request as its own and parked on it...
     assert state is not None and state.state == "WAITING_FOR_INPUT", state
     assert state.request_id == json.loads(requests[0])["request_id"]
-    # ...because it carries this loop's id, not the issue-keyed one.
+    # ...because it carries this loop's own ids.
     sealed = json.loads(requests[0])["execution"]
-    assert sealed["temporal_workflow_id"] == loop_id != workflow_id_for(URL)
+    assert sealed["temporal_workflow_id"] == loop_id
 
 
 async def test_an_issue_keyed_loop_passes_its_own_ids_and_no_request_id(api, env):
@@ -969,24 +1200,25 @@ def _failing_submit(error: BaseException | None = None, *, block: bool = False) 
 
 
 async def _dispatch_and_fail(api, env, submit, *, expect_failure=True, **fakes) -> tuple[str, Any]:
-    """Dispatch one start request into a loop that fails; the loop's history."""
+    """Dispatch one start request into a loop that fails: the request's
+    engine ref, and the loop's history."""
     from temporalio.client import WorkflowFailureError
 
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
     async with _worker(env, submit, **fakes):
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         with pytest.raises(WorkflowFailureError):
             await env.client.get_workflow_handle(wid).result()
         history = await env.client.get_workflow_handle(wid).fetch_history()
-    return wid, history
+    return request_engine_ref(wid, rid), history
 
 
 async def test_a_dispatched_loop_whose_investigate_submit_fails_still_ends_its_execution(api, env):
     submit, _ = _failing_submit()
-    wid, history = await _dispatch_and_fail(api, env, submit)
+    ref, history = await _dispatch_and_fail(api, env, submit)
 
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Failed")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Failed")]
     # The failure path replays: its extra command is on the dispatched path only.
     from temporalio.worker import Replayer
 
@@ -995,10 +1227,10 @@ async def test_a_dispatched_loop_whose_investigate_submit_fails_still_ends_its_e
 
 async def test_a_dispatched_loop_without_a_pinned_investigator_still_ends_its_execution(api, env):
     submit, entered = _failing_submit()
-    wid, _ = await _dispatch_and_fail(api, env, submit, unpinned={"issue-investigator"})
+    ref, _ = await _dispatch_and_fail(api, env, submit, unpinned={"issue-investigator"})
 
     assert not entered.is_set()  # `_require_release` raised before any submit
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Failed")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Failed")]
 
 
 async def test_a_cancelled_dispatched_loop_still_ends_its_execution(api, env):
@@ -1006,7 +1238,7 @@ async def test_a_cancelled_dispatched_loop_still_ends_its_execution(api, env):
 
     submit, entered = _failing_submit(block=True)
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
     async with _worker(env, submit):
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         await _wait_for(entered.is_set)
@@ -1018,31 +1250,142 @@ async def test_a_cancelled_dispatched_loop_still_ends_its_execution(api, env):
         desc = await handle.describe()
 
     assert desc.status == WorkflowExecutionStatus.CANCELED
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Failed")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(request_engine_ref(wid, rid), "Failed")]
 
 
 async def test_the_dispatcher_fails_the_execution_of_a_terminated_dispatched_loop(api, env, capsys):
     """A terminated loop runs no code, so its `we_` stays Running and every
     later request would meet `execution_active`. The next dispatch fails it,
-    and only it, once Temporal reports that loop closed."""
+    and only it, once Temporal reports that loop closed; the resume then
+    starts a new run of the same issue loop."""
     submit, entered = _failing_submit(block=True)
     first = api.create_request("start")
-    first_loop = dispatched_workflow_id(first)
+    loop = workflow_id_for(URL)
     async with _worker(env, submit):
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         await _wait_for(entered.is_set)
-        await env.client.get_workflow_handle(first_loop).terminate("operator")
+        await env.client.get_workflow_handle(loop).terminate("operator")
         assert api.executions[0]["phase"] == "Running"
 
         second = api.create_request("resume")
         outcome = await _dispatcher(env).dispatch_once()
-        assert outcome.action == dx.FULFILLED, outcome
-        await env.client.get_workflow_handle(outcome.workflow_id).terminate("test over")
+        assert outcome.action == dx.FULFILLED and outcome.workflow_id == loop, outcome
+        await env.client.get_workflow_handle(loop).terminate("test over")
 
-    assert (api.executions[0]["engine_ref"], api.executions[0]["phase"]) == (first_loop, "Failed")
-    assert api.executions[1]["engine_ref"] == dispatched_workflow_id(second)
+    first_ref = request_engine_ref(loop, first)
+    assert (api.executions[0]["engine_ref"], api.executions[0]["phase"]) == (first_ref, "Failed")
+    assert api.executions[1]["engine_ref"] == request_engine_ref(loop, second)
     reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
-    assert [(a["workflow_id"], a["phase_was"]) for a in reconcile] == [(first_loop, "Running")]
+    assert [(a["engine_ref"], a["phase_was"]) for a in reconcile] == [(first_ref, "Running")]
+
+
+async def test_a_later_run_of_the_same_loop_does_not_mask_a_terminated_run_s_execution(api, env, capsys):
+    """Review P2 on #487: the loop id is the issue's, shared by every run. An
+    operator terminates the run that holds `xr_A`'s execution; the intake
+    label starts a NEW run of the same id, which never took `xr_A` and will
+    never end it. "The loop is running" must not shield that execution: the
+    reconciliation asks the running run whether it holds the request, and
+    fails the execution when it does not."""
+    from orchestrator.temporal.start import start_dev_loop_workflow
+
+    submit, entered = _failing_submit(block=True)
+    first = api.create_request("start")
+    loop = workflow_id_for(URL)
+    first_ref = request_engine_ref(loop, first)
+    async with _worker(env, submit):
+        assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
+        await _wait_for(entered.is_set)
+        await env.client.get_workflow_handle(loop).terminate("operator")
+        relabelled = await start_dev_loop_workflow(URL, client=env.client)
+        assert (await relabelled.describe()).status == WorkflowExecutionStatus.RUNNING
+        assert await dx.TemporalClientPort(env.client).holds_request(loop, first) is False
+        assert api.executions[0]["phase"] == "Running"
+
+        api.create_request("resume")
+        await _dispatcher(env).dispatch_once()
+        await env.client.get_workflow_handle(loop).terminate("test over")
+
+    assert (api.executions[0]["engine_ref"], api.executions[0]["phase"]) == (first_ref, "Failed")
+    reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert [(a["engine_ref"], a["phase_was"]) for a in reconcile] == [(first_ref, "Running")]
+
+
+@pytest.mark.parametrize(("held", "reconciled"), [(True, False), (None, False), (False, True)])
+async def test_the_reconciliation_of_a_running_loop_follows_whether_its_run_holds_the_request(api, held, reconciled):
+    """Only a definite "this run never took it" fails the execution of a
+    RUNNING loop; a run that holds it, or one that cannot say (the query
+    failed, or the run predates it), is left alone."""
+    loop = workflow_id_for(URL)
+    ref = request_engine_ref(loop, "xr_99999999-0000-4000-8000-000000000461")
+    _ledger_entry(api, "temporal", ref, "Running")
+    api.create_request("resume")
+    temporal = FakeTemporal({loop: dx.LOOP_RUNNING}, held=held)
+
+    await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert (api.executions[0]["phase"] == "Failed") is reconciled
+
+
+class _HoldsInTurn(FakeTemporal):
+    """A FakeTemporal whose `holds_request` answers from `answers` in turn."""
+
+    def __init__(self, answers: list[bool | None], **kwargs: Any) -> None:
+        super().__init__({workflow_id_for(URL): dx.LOOP_RUNNING}, **kwargs)
+        self.answers = answers
+
+    async def holds_request(self, workflow_id: str, request_id: str) -> bool | None:
+        return self.answers.pop(0)
+
+
+async def test_a_new_run_started_after_the_accepting_run_closed_is_not_taken_for_it(api, capsys):
+    """Review round 2 P2 on #487, before the fulfil: the run that accepted
+    the request closed and another starter began a new run of the shared id.
+    The loop is RUNNING, but its run never took the request: the delivery
+    is stale, nothing is fulfilled, the request stays claimed."""
+    rid = api.create_request("start")
+    temporal = _HoldsInTurn([False])
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.DEFERRED and "closed after accepting" in outcome.reason
+    assert api.fulfils() == [] and api.request_state(rid)["state"] == "claimed"
+    assert "deliver_stale" in [a["event"] for a in _audit(capsys.readouterr().out)]
+
+
+async def test_an_execution_minted_after_the_accepting_run_was_replaced_is_ended_by_the_dispatcher(api, capsys):
+    """Review round 2 P2 on #487, after the fulfil: the accepting run was
+    replaced by a new run of the shared id between the check and the
+    fulfil. The new run will never bind the minted execution, so the
+    dispatcher ends it, as it does for a loop that closed."""
+    rid = api.create_request("start")
+    temporal = _HoldsInTurn([True, False])
+
+    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert outcome.action == dx.FULFILLED
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [
+        (request_engine_ref(workflow_id_for(URL), rid), "Failed")
+    ]
+    assert [a["event"] for a in _audit(capsys.readouterr().out)][-1] == "orphan_failed"
+
+
+@pytest.mark.parametrize(
+    ("state", "reconciled"), [(dx.LOOP_RUNNING, False), (dx.LOOP_CLOSED, True), (dx.LOOP_ABSENT, True)]
+)
+async def test_a_pre_option_a_dispatched_loop_s_execution_is_still_reconciled(api, capsys, state, reconciled):
+    """An execution bound under a pre-option-A `dev-loop-xr_<id>` loop's
+    bare id (agy round 2 on #487): no such loop is started any more, but one
+    that closed without ending its execution must not wedge the item."""
+    old = "dev-loop-xr_00000009-0000-4000-8000-000000000461"
+    _ledger_entry(api, "temporal", old, "Running")
+    api.create_request("resume")
+    temporal = FakeTemporal({old: state}, held=False)
+
+    await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
+
+    assert (api.executions[0]["phase"] == "Failed") is reconciled
+    reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
+    assert [a["engine_ref"] for a in reconcile] == ([old] if reconciled else [])
 
 
 def _ledger_entry(api: DispatchFakeApi, engine: str, ref: str, phase: str) -> None:
@@ -1080,8 +1423,8 @@ async def test_the_reconciliation_never_touches_another_engine_or_a_non_dispatch
 
 
 async def test_the_reconciliation_leaves_a_running_dispatched_loop_alone(api):
-    live = dispatched_workflow_id("xr_99999999-0000-4000-8000-000000000461")
-    _ledger_entry(api, "temporal", live, "Running")
+    live = workflow_id_for(URL)
+    _ledger_entry(api, "temporal", request_engine_ref(live, "xr_99999999-0000-4000-8000-000000000461"), "Running")
     api.create_request("resume")
     temporal = FakeTemporal({live: dx.LOOP_RUNNING})
 
@@ -1089,28 +1432,9 @@ async def test_the_reconciliation_leaves_a_running_dispatched_loop_alone(api):
 
     # Delivered to the live loop, whose execution is untouched; mctl-api's
     # fulfil then refuses while that execution runs, which defers.
-    assert [loop for loop, _ in temporal.delivered] == [live]
+    assert [workflow_id_for(issue.issue_url) for issue, _ in temporal.delivered] == [live]
     assert outcome.action == dx.DEFERRED and "execution_active" in outcome.reason
     assert api.executions[0]["phase"] == "Running"
-
-
-# P2-2: every loop in the ledger is checked, not only the latest.
-
-
-async def test_an_older_live_loop_is_found_behind_a_newer_closed_one(api):
-    older = dispatched_workflow_id("xr_00000009-0000-4000-8000-000000000461")
-    _ledger_entry(api, "temporal", older, "Succeeded")  # ended its run, still parked at approval
-    _ledger_entry(api, "temporal", workflow_id_for(URL), "Succeeded")  # the label loop, finished
-    rid = api.create_request("resume")
-    temporal = FakeTemporal({older: dx.LOOP_RUNNING, workflow_id_for(URL): dx.LOOP_CLOSED})
-
-    outcome = await dx.Dispatcher(WorkItemClient(), temporal, lease=60).dispatch_once()
-
-    # The resume goes to the older loop that is still live, not to a
-    # continuation, and not to the closed label loop.
-    assert [loop for loop, _ in temporal.delivered] == [older]
-    assert outcome.action == dx.FULFILLED and outcome.engine_ref == f"{older}#{rid}"
-    assert temporal.started == [] and api.request_state(rid)["state"] == "fulfilled"
 
 
 # P2-3: only mctl-api's typed re-decisions reject; everything else defers.
@@ -1177,7 +1501,7 @@ async def test_a_refused_request_read_is_a_mismatch_not_a_thirty_minute_retry(ap
         env,
         submit,
         IssueRef(issue_url=URL, work_item_id=WID, execution_request_id=missing),
-        dispatched_workflow_id(missing),
+        workflow_id_for(URL),
     )
 
     assert "work-item-mismatch" in result.ended and "not fulfilled" not in result.ended
@@ -1235,7 +1559,7 @@ async def _run_to_the_park(api, env, unavailable: int) -> tuple[str, Any]:
     submit, seen = _investigate_log()
     api.unavailable_advances["Succeeded"] = unavailable
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
     async with _worker(env, submit):
         assert (await _dispatcher(env).dispatch_once()).action == dx.FULFILLED
         # Skip past every retry backoff; the loop then sits at approval.
@@ -1245,15 +1569,15 @@ async def _run_to_the_park(api, env, unavailable: int) -> tuple[str, Any]:
         history = await handle.fetch_history()
         await _end(env, wid)
     assert len(seen) == 1
-    return wid, history
+    return request_engine_ref(wid, rid), history
 
 
 async def test_a_transient_advance_failure_on_the_success_path_ends_succeeded_before_the_park(api, env):
     """mctl-api unavailable for longer than FAST's five attempts: the patient
     policy still lands the advance, in ONE activity, before the park."""
-    wid, history = await _run_to_the_park(api, env, unavailable=7)
+    ref, history = await _run_to_the_park(api, env, unavailable=7)
 
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Succeeded")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Succeeded")]
     assert _advance_attempts(api, "Succeeded") == 8
     assert _scheduled_advances(history) == 1
 
@@ -1261,9 +1585,9 @@ async def test_a_transient_advance_failure_on_the_success_path_ends_succeeded_be
 async def test_an_advance_that_outlasts_its_retries_is_re_attempted_before_the_park(api, env):
     """Unavailable past the whole patient policy: the loop goes on (best
     effort), re-attempts once before the approval park, and that lands."""
-    wid, history = await _run_to_the_park(api, env, unavailable=12)
+    ref, history = await _run_to_the_park(api, env, unavailable=12)
 
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Succeeded")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(ref, "Succeeded")]
     assert _scheduled_advances(history) == 2
     from temporalio.worker import Replayer
 
@@ -1274,7 +1598,7 @@ async def test_an_advance_that_outlasts_its_retries_is_re_attempted_before_the_p
 
 
 async def test_the_reconciliation_fails_the_execution_of_a_loop_temporal_no_longer_knows(api, capsys):
-    gone = dispatched_workflow_id("xr_99999999-0000-4000-8000-000000000461")
+    gone = request_engine_ref(workflow_id_for(URL), "xr_99999999-0000-4000-8000-000000000461")
     _ledger_entry(api, "temporal", gone, "Running")
     api.create_request("resume")
     temporal = FakeTemporal()  # every loop ABSENT: retention expired
@@ -1284,7 +1608,7 @@ async def test_the_reconciliation_fails_the_execution_of_a_loop_temporal_no_long
     assert api.executions[0]["phase"] == "Failed"
     assert outcome.action == dx.FULFILLED
     reconcile = [a for a in _audit(capsys.readouterr().out) if a["event"] == "reconcile"]
-    assert [a["workflow_id"] for a in reconcile] == [gone]
+    assert [a["engine_ref"] for a in reconcile] == [gone]
 
 
 # P3: a reject answered `execution_request_closed` is CLOSED, not DEFERRED.
@@ -1318,7 +1642,7 @@ async def test_an_advance_that_outlasts_its_retries_lands_before_a_human_input_p
     # pre-park attempt (4): only that attempt can land it.
     api.unavailable_advances["Succeeded"] = 12
     rid = api.create_request("start")
-    wid = dispatched_workflow_id(rid)
+    wid = workflow_id_for(URL)
     # The clarification this run's investigator sealed, for THIS loop.
     request = _sealed_request(workflow_id=wid, created=datetime.now(UTC), ttl_seconds=7 * 24 * 3600)
     async with _worker(env, submit, human_input_requests=[_request_json(request), None]):
@@ -1331,7 +1655,7 @@ async def test_an_advance_that_outlasts_its_retries_lands_before_a_human_input_p
 
     # Parked on the clarification, and the execution already ended.
     assert state.state == "WAITING_FOR_INPUT" and state.request_id == request.request_id
-    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(wid, "Succeeded")]
+    assert [(e["engine_ref"], e["phase"]) for e in api.executions] == [(request_engine_ref(wid, rid), "Succeeded")]
     assert len(seen) == 1 and _scheduled_advances(history) == 2
     from temporalio.worker import Replayer
 

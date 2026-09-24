@@ -427,15 +427,11 @@ class TestListActiveDevLoopIds:
     async def test_it_returns_the_ids_and_pins_the_query(self, env):
         wf_a, wf_b = MagicMock(), MagicMock()
         wf_a.id, wf_b.id = "dev-loop-mctlhq-mctl-web-10", "dev-loop-mctlhq-mctl-api-20"
-        for wf in (wf_a, wf_b):
-            # Issue-keyed loops carry no alias memo (#474).
-            wf.memo_value = AsyncMock(side_effect=lambda key, default: default)
         client = _client([wf_a, wf_b])
         acts = VisibilityActivities(client)
 
         ids = await env.run(acts.list_active_dev_loop_ids)
 
-        # Bare ids, exactly the pre-#474 `list[str]`, for loops with no alias.
         assert ids == [wf_a.id, wf_b.id]
         assert client.queries == [ACTIVE_DEV_LOOPS_QUERY]
 

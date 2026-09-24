@@ -9,22 +9,37 @@ from __future__ import annotations
 
 import os
 
-from temporalio.client import Client, WorkflowHandle
+from temporalio.client import Client, WithStartWorkflowOperation, WorkflowHandle
 from temporalio.common import WorkflowIDConflictPolicy, WorkflowIDReusePolicy
 
-from orchestrator.temporal.active_loops import ISSUE_WORKFLOW_ID_MEMO
 from orchestrator.temporal.constants import TASK_QUEUE
 
 # workflow_id_for moved to issue_ref (temporalio-free) so agent-container
 # callers can import it without the SDK; re-exported here because this
 # module is where every Temporal-side caller historically found it.
-from orchestrator.temporal.issue_ref import (  # noqa: F401 — re-exported for Temporal-side callers
-    DISPATCHED_WORKFLOW_PREFIX,
-    dispatched_workflow_id,
-    is_dispatched_workflow_id,
-    workflow_id_for,
-)
+from orchestrator.temporal.issue_ref import workflow_id_for
 from orchestrator.temporal.workflows.dev_loop import DevLoopWorkflow, IssueRef
+
+#: The one DevLoop per issue (mctlhq/mctl-agents#461 option A): every start,
+#: the intake poller's and the execution-request dispatcher's alike, names
+#: `workflow_id_for(issue_url)` with `USE_EXISTING` on conflict, so a start
+#: against an issue whose loop is RUNNING attaches to it instead of starting
+#: a second. That shared conflict policy is what makes the two starters
+#: converge on one workflow, whichever reaches Temporal first.
+DEV_LOOP_ID_CONFLICT_POLICY = WorkflowIDConflictPolicy.USE_EXISTING
+#: The intake poller's reuse policy: a FAILED run stays restartable (see
+#: `start_dev_loop_workflow`); a run that COMPLETED is "already handled" and
+#: a re-added label starts nothing (`WorkflowAlreadyStartedError`).
+DEV_LOOP_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY
+#: The dispatcher's reuse policy: any closed run may be followed by a new one.
+#: A request is an explicit ask to run: a `resume` for an issue whose loop has
+#: ended starts a continuation (ADR 011, #267), and mctl-api's fulfil
+#: re-decides whether the item may run at all. It cannot run one request
+#: twice: a request can only be claimed again while it is unfulfilled, and a
+#: run executes nothing for a request before its fulfilment binds the `we_`
+#: (`_bind_dispatched_execution`, `_deliver`), so a closed run that took it
+#: never ran it; a fulfilled request is closed for good.
+DISPATCH_ID_REUSE_POLICY = WorkflowIDReusePolicy.ALLOW_DUPLICATE
 
 
 async def connect() -> Client:
@@ -73,42 +88,37 @@ async def start_dev_loop_workflow(issue_url: str, client: Client | None = None) 
         IssueRef(issue_url=issue_url),
         id=workflow_id_for(issue_url),
         task_queue=TASK_QUEUE,
-        id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY,
-        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        id_reuse_policy=DEV_LOOP_ID_REUSE_POLICY,
+        id_conflict_policy=DEV_LOOP_ID_CONFLICT_POLICY,
     )
 
 
-async def start_dispatched_dev_loop(client: Client, issue: IssueRef) -> WorkflowHandle:
-    """Start (or attach to) the DevLoop for `issue.execution_request_id`.
+def dispatch_start_operation(issue: IssueRef) -> WithStartWorkflowOperation:
+    """The start half of the execution-request dispatcher's Update-with-Start
+    (mctlhq/mctl-agents#461 option A): the issue's own DevLoop, under
+    `start_dev_loop_workflow`'s id and conflict policy, and the dispatcher's
+    reuse policy (`DISPATCH_ID_REUSE_POLICY`).
 
-    The policies are the "never a second run" half of the dispatcher's
-    idempotency, and are deliberately stricter than
-    `start_dev_loop_workflow`'s:
+    Temporal applies the start and the `accept_execution_request` Update as
+    one operation. When the issue's loop is RUNNING the start input is
+    ignored and the Update is delivered to that loop, whose validator
+    decides (a `start` it was not started for is `loop_active`; a `resume`
+    follows the `resume` signal's rules). When no loop runs, a new run starts
+    with `issue.execution_request_id` as its own request and the Update
+    accepts it before `run` executes: a `start` starts the issue's loop, a
+    `resume` a continuation of it.
 
-    - `USE_EXISTING` on conflict: a RUNNING loop for the same request is
-      returned as-is — the re-claim after a crash between start and fulfil
-      converges on it instead of starting another.
-    - `REJECT_DUPLICATE` on reuse: a CLOSED loop for the same request raises
-      `WorkflowAlreadyStartedError`, whatever its outcome. A request is run
-      once. Unlike an issue-keyed loop, a failed dispatched run is not
-      restartable under the same id: the surface asks again (a new request,
-      a new id), which is what keeps one request from ever owning two runs.
-
-    The memo names the issue-keyed id this loop stands in for
-    (mctlhq/mctl-agents#474), so the sweeps that look a proposal's loop up by
-    that id can find this one too (`active_loops`). It is part of the start
-    request, not a workflow command: it lands on the started event and in
-    visibility, the workflow code never reads it, and adding it changes no
-    replay.
-    """
+    Per-request exactly-once no longer rides a per-request workflow id: the
+    Update id is the request id (Temporal answers a repeat from the run's
+    registry) and the loop's `accepted_request_ids` covers a repeat after a
+    continue-as-new."""
     if not issue.execution_request_id:
-        raise ValueError("start_dispatched_dev_loop needs an IssueRef with an execution_request_id")
-    return await client.start_workflow(
+        raise ValueError("dispatch_start_operation needs an IssueRef with an execution_request_id")
+    return WithStartWorkflowOperation(
         DevLoopWorkflow.run,
         issue,
-        id=dispatched_workflow_id(issue.execution_request_id),
+        id=workflow_id_for(issue.issue_url),
         task_queue=TASK_QUEUE,
-        memo={ISSUE_WORKFLOW_ID_MEMO: workflow_id_for(issue.issue_url)},
-        id_reuse_policy=WorkflowIDReusePolicy.REJECT_DUPLICATE,
-        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+        id_reuse_policy=DISPATCH_ID_REUSE_POLICY,
+        id_conflict_policy=DEV_LOOP_ID_CONFLICT_POLICY,
     )

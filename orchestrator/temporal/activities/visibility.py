@@ -14,9 +14,7 @@ from temporalio import activity
 from temporalio.client import Client, WorkflowFailureError
 from temporalio.exceptions import ApplicationError
 
-from orchestrator.temporal.active_loops import ISSUE_WORKFLOW_ID_MEMO, ActiveLoopEntry
 from orchestrator.temporal.implement_outcome import PRE_START_ERROR_TYPE
-from orchestrator.temporal.issue_ref import is_dispatched_workflow_id
 
 # Visibility query for the active DevLoop set. WorkflowType is the
 # @workflow.defn class name; ExecutionStatus 'Running' deliberately excludes
@@ -109,77 +107,18 @@ class VisibilityActivities:
         self._client = client
 
     @activity.defn
-    async def list_active_dev_loop_ids(self) -> list[ActiveLoopEntry]:
-        """Return every running DevLoopWorkflow: its bare workflow id, or a
-        `{workflow_id, issue_workflow_id}` dict when it carries an alias.
-
-        The alias is the issue-keyed id a dispatched `dev-loop-xr_*` loop
-        stands in for, read from the memo `start_dispatched_dev_loop` writes
-        (mctlhq/mctl-agents#474). The consumers match a proposal on it and
-        report the real id (`active_loops`); see that module for why the alias
-        is not simply added to the set as another id.
-
-        ROLLING DEPLOYS, both directions. Same activity name as before, so the
-        reconcile and sweep workflows' schedule command replays unchanged.
-        The shape is the old `list[str]` for every loop WITHOUT the memo, and a
-        dict only for a loop WITH it, which only the dispatcher starts:
-
-        - old result, new consumer: the consumers declare
-          `list[ActiveLoopEntry]` and `active_loops.index` reads both shapes;
-        - new result, old consumer: the old consumers declare `list[str]`,
-          which temporalio refuses to decode a dict into. While no dispatched
-          loop runs the payload is exactly `list[str]`, so an old worker is
-          unaffected. The one window left is a dispatched loop running while
-          old and new workers share the queue; it cannot open by accident,
-          because the dispatcher is off until `EXECUTION_REQUEST_DISPATCHER`
-          is set, which happens after this release has rolled out. Even then
-          it costs one failed reconcile/sweep run, not a wrong decision.
+    async def list_active_dev_loop_ids(self) -> list[str]:
+        """Return the workflow IDs of all running DevLoopWorkflow executions.
 
         Raises on visibility errors — the caller (ReconcileWorkflow) treats a
         failure as "active set unknown" and skips orphan detection for the
         tick rather than reporting every proposal as an orphan.
         """
-        loops: list[ActiveLoopEntry] = []
-        missing_alias: list[str] = []
+        ids: list[str] = []
         async for wf in self._client.list_workflows(ACTIVE_DEV_LOOPS_QUERY):
-            try:
-                alias = await wf.memo_value(ISSUE_WORKFLOW_ID_MEMO, "")
-            except Exception as exc:  # noqa: BLE001 — an unreadable memo is a missing one, not a failed tick
-                # Named with its reason: a codec or converter failure and a
-                # loop that predates the memo call for different fixes.
-                activity.logger.warning(
-                    "visibility: could not read the %r memo of %s: %s: %s",
-                    ISSUE_WORKFLOW_ID_MEMO,
-                    wf.id,
-                    type(exc).__name__,
-                    exc,
-                )
-                alias = ""
-            if not isinstance(alias, str):
-                alias = ""
-            if not alias and is_dispatched_workflow_id(wf.id):
-                missing_alias.append(wf.id)
-            if alias and alias != wf.id:
-                loops.append({"workflow_id": wf.id, "issue_workflow_id": alias})
-            else:
-                loops.append(wf.id)
-        if missing_alias:
-            # A dispatched loop started before the memo existed, or one whose
-            # memo could not be read (logged above with its reason). It is
-            # emitted as a bare id, which `active_loops.index` counts as
-            # unattributable: the orphan and lifecycle sweeps cannot match it
-            # to its proposal, and the implement sweep holds back every
-            # unowned proposal while it runs rather than risk a second
-            # implementer run on the one it owns.
-            activity.logger.warning(
-                "visibility: %d running dispatched DevLoop(s) carry no %r memo "
-                "and cannot be matched to their proposal: %s",
-                len(missing_alias),
-                ISSUE_WORKFLOW_ID_MEMO,
-                missing_alias,
-            )
-        activity.logger.info("visibility: %d active DevLoopWorkflow run(s)", len(loops))
-        return loops
+            ids.append(wf.id)
+        activity.logger.info("visibility: %d active DevLoopWorkflow run(s)", len(ids))
+        return ids
 
     @activity.defn
     async def count_swept_prestart_failures(self, workflow_ids: list[str]) -> dict[str, int]:

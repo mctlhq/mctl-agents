@@ -110,7 +110,7 @@ with workflow.unsafe.imports_passed_through():
     from orchestrator.temporal.implement_outcome import (
         pre_start_reason as render_pre_start_reason,
     )
-    from orchestrator.temporal.issue_ref import parse_issue_url, resume_engine_ref
+    from orchestrator.temporal.issue_ref import parse_issue_url, request_engine_ref
     from orchestrator.work_context.contract import (
         ACTOR_KINDS,
         SURFACE_KINDS,
@@ -119,6 +119,7 @@ with workflow.unsafe.imports_passed_through():
         SurfaceRef,
         execution_id_for,
     )
+    from orchestrator.work_context.execution_requests import KIND_RESUME, KIND_START, KINDS
 
 ENVIRONMENT = "production"
 
@@ -239,8 +240,9 @@ APPROVAL_WAIT_DEADLINE = timedelta(days=14)
 # bounded by FULFILMENT_WAIT. Longer than mctl-api's longest claim lease
 # (15 min), so a dispatcher that crashed between the start and the fulfil
 # has one full lease to lapse and the next claim to converge on this loop
-# before it gives up. A loop that gives up ends; the next claim of its
-# request then finds the run ended and rejects the request (`engine_run_ended`).
+# before it gives up. A loop that gives up ends having run nothing; a later
+# claim of its still-unfulfilled request starts the issue's loop again for it
+# (#461 option A, `start.DISPATCH_ID_REUSE_POLICY`).
 FULFILMENT_WAIT = timedelta(minutes=30)
 FULFILMENT_POLL_RETRY_POLICY = RetryPolicy(
     initial_interval=timedelta(seconds=2),
@@ -295,10 +297,35 @@ EXECUTION_REQUEST_STRANDED_PATCH = "execution-request-stranded"
 # the `accept_execution_request` Update BEFORE it fulfils the request, so the
 # loop's own history is the durable "accepted, not yet bound" record; the
 # loop then binds the `we_` the fulfil mints (engine ref `<loop id>#<request
-# id>`, `issue_ref.resume_engine_ref`) and ends it. The patch id is recorded
+# id>`, `issue_ref.request_engine_ref`) and ends it. The patch id is recorded
 # where a delivery starts, so no history without a delivery records it.
 EXECUTION_REQUEST_RESUME_PATCH = "execution-request-resume"
 ACCEPT_EXECUTION_REQUEST_UPDATE = "accept_execution_request"
+# Option A of mctlhq/mctl-agents#461: every DevLoop is issue-keyed. The
+# dispatcher no longer starts `dev-loop-xr_<request id>`: it starts or joins
+# `dev-loop-<owner>-<repo>-<n>` through Update-with-Start, with the request
+# delivered by `accept_execution_request` in the same call, so the intake
+# poller and the dispatcher converge on one workflow atomically. A loop
+# started that way binds its execution under `<loop id>#<request id>`
+# (`issue_ref.request_engine_ref`), the ref every dispatched execution has;
+# a history recorded before it bound under its own workflow id, and replays
+# that way. Consulted only on the dispatched path.
+ISSUE_KEYED_DISPATCH_PATCH = "issue-keyed-dispatch"
+# Also option A: a dispatched run that ends having run nothing (its request
+# was rejected, refused at fulfil, never fulfilled, or its bind refused) ends
+# the workflow FAILED instead of COMPLETED. Its id is the issue's now, and the
+# intake poller starts it with ALLOW_DUPLICATE_FAILED_ONLY: a COMPLETED run
+# that did nothing would make every later `agents:intake` label a silent
+# "already handled". Before option A that run had its own `dev-loop-xr_*` id
+# and could not shadow the issue's. Recorded where the run ends.
+DISPATCHED_NOT_RUN_FAILS_PATCH = "dispatched-not-run-fails"
+#: The error type of that failure, for whoever reads why the run ended.
+DISPATCHED_NOT_RUN_ERROR_TYPE = "DispatchedRequestNotRun"
+#: The kinds of mctl-api execution request a delivery can carry: the
+#: dispatcher's own vocabulary (`execution_requests.KINDS`), one source.
+DELIVERY_KIND_START = KIND_START
+DELIVERY_KIND_RESUME = KIND_RESUME
+DELIVERY_KINDS = KINDS
 #: The Update's only successful answer. A repeated request id answers it too.
 DELIVERY_ACCEPTED = "accepted"
 #: The validator's permanent refusal: the dispatcher rejects the request with
@@ -307,6 +334,10 @@ RESUME_REFUSED_ERROR_TYPE = "ResumeRefused"
 #: The validator's transient refusal (the loop is not ready, or is ending):
 #: the dispatcher defers, and a later claim delivers or starts a continuation.
 RESUME_DEFERRED_ERROR_TYPE = "ResumeDeferred"
+#: The validator's answer to a `start` request delivered onto a loop that was
+#: not started for it: the issue already has a DevLoop, so the dispatcher
+#: rejects the request `loop_active`, as it always has.
+LOOP_ACTIVE_ERROR_TYPE = "LoopActive"
 # How long an exiting loop still waits for an accepted delivery's fulfilment.
 # The dispatcher fulfils within seconds of the Update, and re-checks the loop
 # after the fulfil (failing the execution itself when the loop has closed),
@@ -769,6 +800,10 @@ class ResumeDelivery:
     surface: str = ""
     actor_kind: str = ""
     actor_id: str = ""
+    #: The request's kind, `start` or `resume` (DELIVERY_KINDS). Defaulted to
+    #: `resume`, the only kind delivered before #461 option A, so a payload
+    #: recorded then still decodes to what it was.
+    kind: str = DELIVERY_KIND_RESUME
 
 
 @dataclass(frozen=True)
@@ -1333,7 +1368,22 @@ class _WatchOutcome:
 
 @workflow.defn
 class DevLoopWorkflow:
-    def __init__(self) -> None:
+    @workflow.init
+    def __init__(self, issue: IssueRef) -> None:
+        # The start input, read here rather than in `run` (mctlhq/mctl-
+        # agents#461 option A): the dispatcher starts this loop with
+        # Update-with-Start, and the `accept_execution_request` Update that
+        # comes with the start is validated and handled in the first
+        # activation, before `run` has executed a line. The request this run
+        # was started for is its own and needs none of `run`'s state; a
+        # continued run's accepted requests come with its resume record.
+        # Nothing here schedules a command, so no history changes shape.
+        self._start_request_id = issue.execution_request_id or ""
+        self._start_work_item_id = issue.work_item_id or ""
+        # The engine ref this loop's own dispatched execution was bound under
+        # (`_bind_dispatched_execution`); "" until then, and for every loop
+        # that was not dispatched.
+        self._own_engine_ref = ""
         self._implement_state = ImplementExecutionState()
         # Which cadence this execution runs at. Bound for real in _watch_pr,
         # once, off the `fast-shepherd-cadence` marker; CADENCE here so every
@@ -1410,7 +1460,7 @@ class DevLoopWorkflow:
         # from one still in the activation that starts it.
         self._issue_url = ""
         self._initialized = False
-        self._accepted_request_ids: set[str] = set()
+        self._accepted_request_ids: set[str] = set(issue.resume.accepted_request_ids) if issue.resume else set()
         self._open_deliveries: dict[str, OpenDelivery] = {}
         self._delivery_tasks: dict[str, asyncio.Task[None]] = {}
         # Set once the implement step is submitted: no approval gate is left
@@ -1420,6 +1470,19 @@ class DevLoopWorkflow:
         # or continues as new (`_hopping`).
         self._exiting = False
         self._hopping = False
+
+    @workflow.query
+    def holds_execution_request(self, request_id: str) -> bool:
+        """Did THIS run (or a run it continued from) take `request_id`?
+
+        The dispatcher's reconciliation asks it before failing a stranded
+        `<loop>#<request>` execution of a RUNNING loop (#461 option A): the
+        loop id is the issue's and shared by every run, so "the loop is
+        running" no longer proves the run that holds the execution is. A
+        later run that never took the request never ends its execution."""
+        # Never True for "": a loop that was not dispatched has an empty
+        # start request id, and a spurious yes shields a stranded execution.
+        return bool(request_id) and (request_id == self._start_request_id or request_id in self._accepted_request_ids)
 
     @workflow.query
     def implement_execution(self) -> ImplementExecutionState:
@@ -1750,6 +1813,11 @@ class DevLoopWorkflow:
         rid = delivery.execution_request_id
         if rid in self._accepted_request_ids:
             return DELIVERY_ACCEPTED
+        if rid == self._start_request_id:
+            # The request this run was started for (Update-with-Start): `run`
+            # binds and runs it on the dispatched path; nothing to deliver.
+            self._accepted_request_ids.add(rid)
+            return DELIVERY_ACCEPTED
         surface, actor, _ = self._resume_provenance(delivery.surface, delivery.actor_kind, delivery.actor_id)
         self._accepted_request_ids.add(rid)
         self._work_item_id = self._work_item_id or delivery.work_item_id
@@ -1778,8 +1846,24 @@ class DevLoopWorkflow:
 
         if not isinstance(rid, str) or not rid.startswith("xr_") or not isinstance(wid, str) or not wid:
             raise refuse(RESUME_REFUSED_ERROR_TYPE, "malformed-delivery")
+        if delivery.kind not in DELIVERY_KINDS:
+            raise refuse(RESUME_REFUSED_ERROR_TYPE, "malformed-delivery")
         if rid in self._accepted_request_ids:
             return
+        if rid == self._start_request_id:
+            # This run was started for this request (#461 option A), so it is
+            # this run's to take whatever its kind, and before `run` has its
+            # state: that is exactly when Update-with-Start delivers it. Its
+            # work item was part of the same start input; a delivery naming
+            # another fails closed.
+            if wid != self._start_work_item_id:
+                raise refuse(RESUME_REFUSED_ERROR_TYPE, "work-item-mismatch")
+            return
+        if delivery.kind == DELIVERY_KIND_START:
+            # A `start` for an issue whose DevLoop already runs (the intake
+            # poller's, or another request's): the loop is the one arbiter,
+            # so a start is never "delivered" to a loop it did not start.
+            raise refuse(LOOP_ACTIVE_ERROR_TYPE, "loop-active")
         # Before `run` has its state (the activation that starts this run, or
         # the continue-as-new gap before the rehydration), every guard below
         # would be vacuous: an empty binding accepts a foreign item, an empty
@@ -1826,7 +1910,7 @@ class DevLoopWorkflow:
             # could answer False, and none can: the Update is new with it.
             self._end_delivery(opened, "unsupported")
             return
-        engine_ref = resume_engine_ref(workflow.info().workflow_id, rid)
+        engine_ref = request_engine_ref(workflow.info().workflow_id, rid)
         if opened.pending_phase:
             # Decided by an earlier attempt (maybe an earlier run) whose
             # advance did not land: land it, nothing else.
@@ -2283,6 +2367,16 @@ class DevLoopWorkflow:
                 resume_count=self._human_input_resume_count,
             )
 
+    def _dispatched_engine_ref(self, issue: IssueRef) -> str:
+        """The engine ref this dispatched loop's own execution runs under:
+        `<loop id>#<request id>` since #461 option A (the loop is issue-keyed,
+        so its bare id no longer names one request), the bare workflow id in
+        a history recorded before (`dev-loop-xr_<id>` was the request)."""
+        workflow_id = workflow.info().workflow_id
+        if workflow.patched(ISSUE_KEYED_DISPATCH_PATCH):
+            return request_engine_ref(workflow_id, str(issue.execution_request_id))
+        return workflow_id
+
     async def _bind_dispatched_execution(self, issue: IssueRef) -> tuple[BoundExecution | None, str]:
         """Wait for this loop's execution request to be fulfilled with this
         workflow's own engine run, and adopt the `we_` it was given.
@@ -2294,13 +2388,15 @@ class DevLoopWorkflow:
         if not issue.work_item_id:
             return None, "execution request without a work item: refused"
         self._work_item_id = issue.work_item_id
+        engine_ref = self._dispatched_engine_ref(issue)
+        self._own_engine_ref = engine_ref
         try:
             bound = await workflow.execute_activity(
                 bind_dispatched_execution,
                 BindInput(
                     work_item_id=issue.work_item_id,
                     execution_request_id=str(issue.execution_request_id),
-                    engine_ref=workflow.info().workflow_id,
+                    engine_ref=engine_ref,
                     issue_url=issue.issue_url,
                 ),
                 start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
@@ -2323,7 +2419,7 @@ class DevLoopWorkflow:
             ExecutionRef(
                 execution_id=bound.execution_id,
                 sequence=bound.sequence,
-                temporal_workflow_id=workflow.info().workflow_id,
+                temporal_workflow_id=engine_ref,
             )
         )
         return bound, ""
@@ -2388,13 +2484,22 @@ class DevLoopWorkflow:
         without an answer, so the caller can try again later.
 
         `work_item_id`/`engine_ref` default to this loop's own dispatched
-        execution; a delivered resume passes its own (`<loop id>#<xr id>`)."""
+        execution (the ref it was bound under); a delivered resume passes its
+        own (`<loop id>#<xr id>`)."""
+        own_ref = self._own_engine_ref
+        if engine_ref is None and not own_ref:
+            # Only a run that bound its own execution has one to advance; its
+            # ref is never re-derived here (a continued run starts without
+            # it, and the bare workflow id is no longer any execution's ref).
+            workflow.logger.error("no dispatched execution of this run to advance to %s", phase)
+            # Not "landed": a caller holding a pending advance keeps it.
+            return False
         try:
             outcome = await workflow.execute_activity(
                 advance_dispatched_execution,
                 AdvanceInput(
                     work_item_id=self._work_item_id if work_item_id is None else work_item_id,
-                    engine_ref=workflow.info().workflow_id if engine_ref is None else engine_ref,
+                    engine_ref=own_ref if engine_ref is None else engine_ref,
                     phase=phase,
                 ),
                 start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
@@ -2472,6 +2577,8 @@ class DevLoopWorkflow:
         if issue.execution_request_id and workflow.patched(EXECUTION_REQUEST_PATCH):
             dispatched, refused = await self._bind_dispatched_execution(issue)
             if dispatched is None:
+                if workflow.patched(DISPATCHED_NOT_RUN_FAILS_PATCH):
+                    raise ApplicationError(refused, type=DISPATCHED_NOT_RUN_ERROR_TYPE, non_retryable=True)
                 return DevLoopResult(
                     investigate=WorkflowResult(workflow_name="", phase="NotStarted"),
                     implement=None,
@@ -2514,9 +2621,10 @@ class DevLoopWorkflow:
             # --temporal-workflow-id / --temporal-run-id. The investigator
             # names this loop in its approve instructions and stamps both on
             # what it seals, so `_await_human_input` recognises the request as
-            # its own: a dispatched loop is `dev-loop-xr_*`, which the
-            # investigator cannot derive from the issue URL, and the run id
-            # retires a same-id leftover that the `created_at` check misses.
+            # its own. Every loop is issue-keyed since #461 option A, so the
+            # investigator could derive the workflow id itself, but not the run
+            # id, which retires a same-id leftover that the `created_at` check
+            # misses.
             # Inert until mctl-api declares them (mctl-api#372 strips
             # undeclared params). Replay-safe without a marker: activity
             # input is not compared on replay (tests/test_workflow_replay.py,
@@ -2947,9 +3055,6 @@ class DevLoopWorkflow:
                 )
                 workflow.continue_as_new(
                     IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=resume),
-                    # The dispatched loop's `issue_workflow_id` alias (#474),
-                    # carried explicitly; None (unchanged command) without one.
-                    memo=dict(workflow.memo()) or None,
                 )
 
         return await self._finish_after_watch(
@@ -3144,9 +3249,6 @@ class DevLoopWorkflow:
             )
             workflow.continue_as_new(
                 IssueRef(issue_url=issue.issue_url, work_item_id=issue.work_item_id, resume=next_resume),
-                # The dispatched loop's `issue_workflow_id` alias (#474),
-                # carried explicitly; None (unchanged command) without one.
-                memo=dict(workflow.memo()) or None,
             )
 
         investigate_result = resume.investigate
