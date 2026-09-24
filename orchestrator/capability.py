@@ -93,6 +93,13 @@ CONSEQUENCE_VALUES = frozenset({"read-only", "mutating", "consequential"})
 #: mutating, always the tier that requires a checkpoint.
 DEFAULT_CONSEQUENCE = "consequential"
 RETENTION_CLASSES = frozenset({"telemetry", "execution-record", "gitops"})
+#: `ProviderRef.id` for the one provider `config/capability-consequence.yaml`
+#: classifies (ADR 017 sec. 8): mctl-api's own advertised tool set.
+#: `classify_consequence` only consults the table for this provider id; any
+#: other provider_id falls straight through to `DEFAULT_CONSEQUENCE`, so the
+#: table can only narrow which tools skip the checkpoint, never widen it by
+#: a bare-name collision with an unrelated provider.
+MCTL_API_PROVIDER_ID = "mctl-api"
 #: The closed reason-code vocabulary discovery and invocation share.
 #: `collision` is a sealing-time failure (two providers resolving to one
 #: SDK-visible name); the rest are per-call outcomes.
@@ -139,7 +146,7 @@ def _canonical_json(payload: Any) -> bytes:
     # so callers of this module only ever see one exception type.
     try:
         return canonical_json(payload)
-    except Exception as exc:
+    except ContextSnapshotError as exc:
         raise CapabilityError(f"payload is not JSON-serializable: {exc}") from exc
 
 
@@ -282,6 +289,11 @@ class CapabilityDescriptor:
             raise CapabilityError(f"capability {self.capability_id!r}: title exceeds {MAX_TITLE_LENGTH} characters")
         if len(self.summary) > MAX_SUMMARY_LENGTH:
             raise CapabilityError(f"capability {self.capability_id!r}: summary exceeds {MAX_SUMMARY_LENGTH} characters")
+        # Mirrors what CapabilityDescriptor.from_dict enforces via
+        # _require_sha256 — checked here too so seal() (which constructs
+        # this class directly, never through from_dict) can never produce a
+        # descriptor that from_dict itself would reject on reload.
+        _require_sha256(self.input_schema_hash, where=f"capability {self.capability_id!r}: input_schema_hash")
         if len(self.keywords) > MAX_KEYWORDS:
             raise CapabilityError(f"capability {self.capability_id!r}: more than {MAX_KEYWORDS} keywords")
         for kw in self.keywords:
@@ -572,6 +584,13 @@ class CapabilitySet:
             raise CapabilityError(f"api_version must be {API_VERSION!r}, got {self.api_version!r}")
         if self.kind != KIND:
             raise CapabilityError(f"kind must be {KIND!r}, got {self.kind!r}")
+        # Mirrors what CapabilitySet.from_dict enforces via _require_str
+        # (allow_empty defaults to False) — checked here too so seal() can
+        # never produce a document that its own from_dict rejects on reload.
+        if not self.capability_set_id:
+            raise CapabilityError("capability_set_id must be a non-empty string")
+        if not self.created_at:
+            raise CapabilityError("created_at must be a non-empty string")
         if not self.content_hash.startswith("sha256:"):
             raise CapabilityError(f"content_hash must carry the 'sha256:' prefix, got {self.content_hash!r}")
         if self.retention.class_ not in RETENTION_CLASSES:
@@ -822,6 +841,13 @@ class InvocationRecord:
             )
         if self.duration_ms < 0:
             raise CapabilityError("invocation_record.duration_ms must be >= 0")
+        # Mirrors what InvocationRecord.from_dict enforces via
+        # _require_sha256 — checked here too so a directly-constructed
+        # record can never round-trip through to_dict/from_dict and be
+        # rejected by the same class that produced it.
+        _require_sha256(self.arguments_hash, where="invocation_record.arguments_hash")
+        if self.result_hash is not None:
+            _require_sha256(self.result_hash, where="invocation_record.result_hash")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -981,14 +1007,25 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
     return MappingProxyType(table)
 
 
-def classify_consequence(tool_name: str, table: Mapping[str, str]) -> str:
+def classify_consequence(tool_name: str, table: Mapping[str, str], *, provider_id: str = MCTL_API_PROVIDER_ID) -> str:
     """Pure. `tool_name` may be the bare mctl-api tool name
     (`mctl_deploy_service`) or the SDK-visible name
     (`mcp__mctl__mctl_deploy_service`) — a leading `mcp__<alias>__` is
     stripped before lookup, so both forms classify identically. Any name
     absent from `table` defaults to `DEFAULT_CONSEQUENCE` (`consequential`)
     — the fail-safe rule design.md names explicitly: an unclassified
-    capability is never allowed to skip the policy checkpoint by omission."""
+    capability is never allowed to skip the policy checkpoint by omission.
+
+    `table` (`config/capability-consequence.yaml`) is mctl-api's own
+    advertised tool set (ADR 017 sec. 8) — it says nothing about any other
+    provider. `provider_id` (`ProviderRef.id`, default `MCTL_API_PROVIDER_ID`)
+    scopes the lookup to that one provider: any other provider_id bypasses
+    the table entirely and returns `DEFAULT_CONSEQUENCE`, so a bare-name
+    collision with an unrelated provider's tool (e.g. a second `mcp-remote`
+    server that happens to expose its own `mctl_whoami`) can never borrow
+    mctl-api's classification and widen what skips the checkpoint."""
+    if provider_id != MCTL_API_PROVIDER_ID:
+        return DEFAULT_CONSEQUENCE
     bare = tool_name
     if bare.startswith("mcp__"):
         parts = bare.split("__", 2)

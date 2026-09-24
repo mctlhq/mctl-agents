@@ -223,6 +223,59 @@ def test_single_keyword_too_long_raises():
         _descriptor(_provider(), keywords=("x" * (cap.MAX_KEYWORD_LENGTH + 1),))
 
 
+def test_descriptor_rejects_input_schema_hash_missing_sha256_prefix():
+    """A CapabilityDescriptor built directly (the way seal() builds one,
+    never through from_dict) must reject the same malformed hash from_dict
+    would — otherwise seal() could produce a document that its own
+    from_dict rejects on reload."""
+    with pytest.raises(cap.CapabilityError, match="input_schema_hash"):
+        _descriptor(_provider(), input_schema_hash="not-a-hash")
+
+
+def test_invocation_record_rejects_arguments_hash_missing_sha256_prefix():
+    with pytest.raises(cap.CapabilityError, match="arguments_hash"):
+        cap.InvocationRecord(
+            capability_id="mctl://mcp-remote/mctl-api/mctl_get_service_status",
+            capability_set_id="cap-0000000000000000",
+            outcome="ok",
+            reason_code="ok",
+            duration_ms=5,
+            policy_checkpoint="absent",
+            arguments_hash="not-a-hash",
+        )
+
+
+def test_invocation_record_rejects_result_hash_missing_sha256_prefix():
+    with pytest.raises(cap.CapabilityError, match="result_hash"):
+        cap.InvocationRecord(
+            capability_id="mctl://mcp-remote/mctl-api/mctl_get_service_status",
+            capability_set_id="cap-0000000000000000",
+            outcome="ok",
+            reason_code="ok",
+            duration_ms=5,
+            policy_checkpoint="absent",
+            arguments_hash="sha256:" + "0" * 64,
+            result_hash="not-a-hash",
+        )
+
+
+def test_validate_rejects_empty_created_at():
+    """Same property as the two tests above, at the CapabilitySet level:
+    validate() must catch what from_dict's _require_str(created_at) would,
+    so seal() can never accept what from_dict later rejects."""
+    sealed = _sealed_set()
+    bad = dc_replace(sealed, created_at="")
+    with pytest.raises(cap.CapabilityError, match="created_at"):
+        bad.validate()
+
+
+def test_validate_rejects_empty_capability_set_id():
+    sealed = _sealed_set()
+    bad = dc_replace(sealed, capability_set_id="")
+    with pytest.raises(cap.CapabilityError, match="capability_set_id"):
+        bad.validate()
+
+
 # ---------------------------------------------------------------------------
 # T2 — narrowing invariant: every member's matched_tool_pattern is an
 # element of plan_tools, and its tool_name matches that pattern; a set
@@ -511,6 +564,23 @@ def test_known_consequential_tool_classifies_consequential():
     table = cap.load_consequence_table()
     assert cap.classify_consequence("mctl_delete_tenant", table) == "consequential"
     assert cap.classify_consequence("mctl_trigger_issue", table) == "consequential"
+
+
+def test_classify_consequence_defaults_to_the_mctl_api_provider():
+    table = cap.load_consequence_table()
+    assert cap.classify_consequence("mctl_whoami", table) == "read-only"
+    assert cap.classify_consequence("mctl_whoami", table, provider_id=cap.MCTL_API_PROVIDER_ID) == "read-only"
+
+
+def test_classify_consequence_ignores_the_table_for_a_different_provider():
+    """A bare-name collision with an unrelated provider's tool must never
+    borrow mctl-api's classification — config/capability-consequence.yaml
+    documents mctl-api's own tool set only, so any other provider_id falls
+    through to DEFAULT_CONSEQUENCE regardless of what the table says about
+    that name."""
+    table = cap.load_consequence_table()
+    assert cap.classify_consequence("mcp__other__mctl_whoami", table, provider_id="other-provider") == "consequential"
+    assert cap.classify_consequence("mctl_whoami", table, provider_id="other-provider") == "consequential"
 
 
 def test_loader_rejects_an_invalid_consequence_value(tmp_path):
