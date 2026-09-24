@@ -237,7 +237,9 @@ def differing_fields(stored: dict[str, Any], ours: dict[str, Any]) -> list[str]:
     a, b = _retry_stable(stored), _retry_stable(ours)
     out = []
     for key in sorted(set(a) | set(b)):
-        if a.get(key) == b.get(key):
+        # Presence counts at the top level too: `to_dict()` emits
+        # `"step": null`, which an older document may lack entirely.
+        if key in a and key in b and a[key] == b[key]:
             continue
         va, vb = a.get(key), b.get(key)
         if isinstance(va, dict) and isinstance(vb, dict):

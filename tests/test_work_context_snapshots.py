@@ -342,6 +342,11 @@ def test_null_on_one_side_and_absent_on_the_other_is_a_difference(tmp_path):
     assert ws.differing_fields(grown, doc) == ["execution.new_field"]
     answer = ws.persist(snap, _Store(stored=cs.canonical_json(grown)))
     assert answer.verdict == ws.SNAPSHOT_DIVERGED and "execution.new_field" in answer.reason
+    # The same rule at the top level: an explicit null against a missing key.
+    assert doc["step"] is None
+    without_step = {k: v for k, v in doc.items() if k != "step"}
+    assert ws.differing_fields(without_step, doc) == ["step"]
+    assert ws.differing_fields(doc, without_step) == ["step"]
     # Unequal blocks never yield an empty answer.
     for a, b in (({"x": {}}, {"x": {"k": None}}), ({"x": {"k": 1}}, {"x": {"k": 1.0, "j": None}})):
         assert ws.differing_fields(a, b), (a, b)
