@@ -145,22 +145,26 @@ def test_still_pending_tick_does_not_repark(tmp_path, monkeypatch, capsys):
 
 
 def test_resume_after_approval_merges_once_and_clears_ticket(tmp_path, monkeypatch, capsys):
-    """T4 tick 2: a granted decision merges exactly once and clears the ticket."""
+    """T4 tick 2: a granted decision merges exactly once and clears the
+    ticket, carrying denials/attempt forward (never resetting either) --
+    the receipt is already consumed in mctl-api at this point, so a fresh
+    idempotency key (attempt + 1) is what lets a later ask ever happen."""
     ref = make_ref(tmp_path)
     pr = make_pr()
     calls = _no_op_transport(monkeypatch)
     outcome = pc.ApprovalOutcome(pc.APPROVAL_GRANTED, approval_ref=REF_ID, decided_by="github:root")
     lookup = _ScriptedLookup(REF_ID, outcome)
     _gate(monkeypatch, lookup)
-    run_shepherd.update_status(ref, ref.status, approval=proposal_state.approval_payload(_ticket()))
+    payload = proposal_state.approval_payload(_ticket(), denials=1, attempt=1)
+    run_shepherd.update_status(ref, ref.status, approval=payload)
 
     assert run_shepherd.merge_pr(pr, ref) == (True, "m" * 40)
 
     assert len(calls) == 1 and calls[0][:3] == ["gh", "pr", "merge"]
     assert lookup.calls == [REF_ID]  # revalidated the SAME receipt, never a fresh ask
     assert "APPROVAL_RESUMED" in capsys.readouterr().out
-    ticket_after, _denials, _attempt = proposal_state.read_approval(read_status(ref))
-    assert ticket_after is None
+    ticket_after, denials, attempt = proposal_state.read_approval(read_status(ref))
+    assert ticket_after is None and denials == 1 and attempt == 2
 
 
 @pytest.mark.parametrize("cap_hit", [False, True])
