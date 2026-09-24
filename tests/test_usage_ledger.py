@@ -8,7 +8,13 @@ cumulative `model_usage`, 53 output tokens after turn one and 100 after two.
 """
 from __future__ import annotations
 
+import ast
 import json
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -89,9 +95,11 @@ class FakeApi:
 
 
 def _recorder(api: FakeApi, agent: str = "implementer", **correlation: Any) -> usage_ledger.UsageRecorder:
+    # Jobs run inline here so each test reads its outcome at once; the real
+    # delivery thread has its own tests below.
     return usage_ledger.UsageRecorder(
         agent, token=TOKEN, base_url="https://api.example.test/", correlation=correlation,
-        post=api, sleep=lambda _s: None,
+        post=api, sleep=lambda _s: None, submit=lambda job: job(),
     )
 
 
@@ -280,7 +288,7 @@ def test_a_client_error_is_not_retried(caplog):
     api = FakeApi(400)
     _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}))
     assert len(api.calls) == 1
-    assert any("refused 1 usage record" in r.getMessage() for r in caplog.records)
+    assert any("not delivered (HTTP 400" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -288,6 +296,11 @@ def test_a_client_error_is_not_retried(caplog):
     [
         pytest.param([500, 500], id="http-error"),
         pytest.param([httpx.ConnectError("down"), httpx.ConnectError("down")], id="no-connection"),
+        pytest.param([httpx.PoolTimeout("pool"), httpx.PoolTimeout("pool")], id="pool-timeout"),
+        pytest.param([httpx.ProxyError("proxy"), httpx.ProxyError("proxy")], id="proxy"),
+        pytest.param([httpx.UnsupportedProtocol("ftp"), httpx.UnsupportedProtocol("ftp")], id="protocol"),
+        pytest.param([httpx.WriteError("half"), httpx.WriteError("half")], id="write-error"),
+        pytest.param([httpx.ConnectError("down"), 503], id="no-connection-then-http-error"),
     ],
 )
 def test_a_batch_that_certainly_did_not_land_is_carried_by_the_next_turn(failure):
@@ -309,12 +322,101 @@ def test_a_batch_that_may_have_landed_is_not_counted_again():
     assert api.calls[-1][1]["records"][0]["output_tokens"] == 15
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param([httpx.ReadTimeout("slow"), httpx.ConnectError("down")], id="lost-answer-then-no-connection"),
+        pytest.param([httpx.ReadTimeout("slow"), 503], id="lost-answer-then-http-error"),
+        pytest.param([httpx.RemoteProtocolError("cut"), httpx.PoolTimeout("pool")], id="cut-then-pool"),
+    ],
+)
+def test_once_an_attempt_may_have_landed_a_later_plain_failure_does_not_undo_it(failure):
+    """The first attempt may have stored the batch. The next turn is sent
+    under another result_uuid, so no server dedupe would catch a carried
+    copy of these tokens: the verdict must stick."""
+    api = FakeApi(*failure)
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 10)}))
+    rec.observe(_result("u2", {OPUS: _usage(160, 25)}))
+    assert api.calls[-1][1]["records"][0]["output_tokens"] == 15
+
+
+def test_every_failed_delivery_is_logged_with_the_running_count(caplog):
+    api = FakeApi(500, 500, 500, 500)
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 10), HAIKU: _usage(1, 1)}))
+    rec.observe(_result("u2", {OPUS: _usage(160, 25)}))
+    lines = [r.getMessage() for r in caplog.records if "not delivered" in r.getMessage()]
+    assert len(lines) == 2
+    assert "2 record(s) undelivered" in lines[0]
+    assert "3 record(s) undelivered" in lines[1]
+
+
+@pytest.mark.parametrize("base_url", ["http://api.mctl.ai", "api.mctl.ai", "ftp://api.mctl.ai"])
+def test_the_token_is_never_sent_to_a_non_https_url(monkeypatch, caplog, base_url):
+    sent: list[Any] = []
+    monkeypatch.setattr(usage_ledger, "_default_post", lambda *a: sent.append(a))
+    rec = usage_ledger.UsageRecorder.from_env(
+        "implementer", {usage_ledger.TOKEN_ENV: TOKEN, usage_ledger.BASE_URL_ENV: base_url}
+    )
+    rec.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert usage_ledger.flush(5)
+    assert sent == []
+    assert rec.enabled is False
+    assert any("is not https" in r.getMessage() for r in caplog.records)
+
+
+def test_observe_returns_at_once_while_delivery_is_slow():
+    """observe runs inside the drivers' async loops: a slow POST must stall
+    the delivery thread, never the caller."""
+    release = threading.Event()
+    api = FakeApi()
+
+    def slow_post(url: str, body: dict, headers: dict) -> httpx.Response:
+        release.wait(10)
+        return api(url, body, headers)
+
+    rec = usage_ledger.UsageRecorder("implementer", token=TOKEN, post=slow_post, sleep=lambda _s: None)
+    started = time.monotonic()
+    rec.observe(_result("u1", {OPUS: _usage(100, 10)}))
+    rec.observe(_result("u2", {OPUS: _usage(160, 25)}))
+    assert time.monotonic() - started < 0.5
+    assert api.calls == []
+    release.set()
+    assert usage_ledger.flush(5)
+    # In order, on one thread: the second delta is still right.
+    assert [r["output_tokens"] for r in api.records] == [10, 15]
+
+
+def test_a_runner_that_exits_right_after_its_last_turn_still_delivers_it(tmp_path):
+    """The atexit flush: a process that observes and exits at once."""
+    out = tmp_path / "delivered.json"
+    script = f"""
+import json, time, httpx
+from claude_agent_sdk import ResultMessage
+from orchestrator import usage_ledger
+
+def post(url, body, headers):
+    time.sleep(0.5)
+    open({str(out)!r}, "w").write(json.dumps(body))
+    return httpx.Response(200, json={{}}, request=httpx.Request("POST", url))
+
+rec = usage_ledger.UsageRecorder("implementer", token="t" * 40, post=post)
+rec.observe(ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+    num_turns=1, session_id="s", uuid="u1",
+    model_usage={{"m": {{"inputTokens": 3, "outputTokens": 4}}}}))
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, cwd=Path(options.__file__).parents[1], timeout=60)
+    assert json.loads(out.read_text())["records"][0]["output_tokens"] == 4
+
+
 def test_recording_never_raises_into_the_run():
     def boom(*_a: Any) -> httpx.Response:
         raise RuntimeError("bug in delivery")
 
     rec = usage_ledger.UsageRecorder("implementer", token=TOKEN, post=boom)
     rec.observe(_result("u1", {OPUS: _usage(1, 2)}))  # must not raise
+    assert usage_ledger.flush(5)
 
 
 # ---------------------------------------------------------------------------
@@ -322,9 +424,30 @@ def test_recording_never_raises_into_the_run():
 # ---------------------------------------------------------------------------
 
 
-def test_every_sdk_session_env_blanks_the_writer_token(monkeypatch, tmp_path):
-    monkeypatch.setenv(usage_ledger.TOKEN_ENV, TOKEN)
+def test_every_options_builder_goes_through_the_scrubbing_constructor():
+    """Structural, so a future builder cannot opt out: every
+    `ClaudeAgentOptions(...)` in orchestrator/options.py must be the direct
+    argument of `_scrubbed(...)`."""
+    tree = ast.parse(Path(options.__file__).read_text())
+    wrapped: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "_scrubbed":
+            wrapped.update(id(arg) for arg in node.args)
     built = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ClaudeAgentOptions"
+    ]
+    assert len(built) >= 7
+    assert [node.lineno for node in built if id(node) not in wrapped] == []
+
+
+def test_a_session_env_blanks_the_writer_token_even_where_a_builder_set_none(monkeypatch, tmp_path):
+    """The mentor passed no env at all, so its CLI child inherited the whole
+    parent environment, token included."""
+    monkeypatch.setenv(usage_ledger.TOKEN_ENV, TOKEN)
+    monkeypatch.setenv("SOME_OTHER_VAR", "kept")
+    built = [
+        options.build_mentor_options(tmp_path / "digest", OPUS),
         options.build_implementer_agent_options(tmp_path, OPUS, tmp_path),
         options.build_issue_investigator_options(tmp_path, OPUS, tmp_path),
         options.build_shepherd_options(tmp_path, OPUS),
@@ -332,6 +455,7 @@ def test_every_sdk_session_env_blanks_the_writer_token(monkeypatch, tmp_path):
     ]
     for opts in built:
         assert opts.env[usage_ledger.TOKEN_ENV] == ""
+        assert opts.env["SOME_OTHER_VAR"] == "kept"
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +482,7 @@ def ledger(monkeypatch) -> FakeApi:
 def test_each_sdk_driver_records_its_usage_with_tracing_off(ledger, tmp_path, monkeypatch, run, agent):
     assert tracing.enabled() is False
     run(tmp_path, monkeypatch, [_result("u1", {OPUS: _usage(1500, 420)})])
+    assert usage_ledger.flush(5)
     (record,) = ledger.records
     assert (record["agent"], record["model_key"], record["output_tokens"]) == (agent, OPUS, 420)
     assert ledger.calls[0][2]["Authorization"] == f"Bearer {TOKEN}"
@@ -373,5 +498,6 @@ def test_the_shepherd_records_the_usage_of_its_normalising_call(ledger, monkeypa
         body="**P1** a real bug", path="a.py", line=1, commit_id="abc", created_at=None, severity="P1"
     )
     anyio.run(run_shepherd._format_bundle_via_sdk, [finding])
+    assert usage_ledger.flush(5)
     (record,) = ledger.records
     assert (record["agent"], record["model_key"], record["output_tokens"]) == ("shepherd", HAIKU, 60)

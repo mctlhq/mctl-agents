@@ -319,7 +319,8 @@ of `service:mctl-agents-usage` (mctl-api#385): a principal whose only
 permission is `usage:write` and which mctl-api confines to
 `POST /api/v1/usage/records`. The admin `MCTL_TOKEN` is never used for
 ingestion (variant B of #50). The token is blanked in every SDK session's
-environment, so the model cannot read it through Bash. Every row records the
+environment (every `ClaudeAgentOptions` in `options.py` goes through
+`_scrubbed`), so the model cannot read it through Bash. Every row records the
 writer (`ingested_by`, `ingested_by_principal_id`), server-side.
 
 **`model_usage` is cumulative per session.** This corrects an assumption the
@@ -347,6 +348,10 @@ Two consequences for delivery:
   lost.
 - A batch whose answer was lost advances the baseline, because a double count
   is the worse error.
+
+**Off the event loop.** `observe` only queues. One daemon thread per process plans, delivers and commits, in order, so a slow mctl-api never stalls the drivers' anyio deadlines. An `atexit` hook flushes what is still queued, so the last turn of a run is delivered too.
+
+**Transport.** The token is sent only to an https `MCTL_API_BASE_URL`. Any other scheme disables recording.
 
 **Cost.** The producer sends no cost. mctl-api prices the token counts from
 its versioned catalog at ingest (`calculated_cost` + `pricing_version`), and

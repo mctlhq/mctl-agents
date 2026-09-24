@@ -37,13 +37,24 @@ where it was, and the next turn's delta carries that usage instead of losing
 it. A batch that may have been stored (the answer was lost) advances it:
 counting a turn twice is the worse error for a ledger.
 
+Off the event loop. `observe` is called from inside the drivers' async
+message loops, so it only queues: one daemon thread per process plans,
+delivers and commits, in order, and is the only writer of a recorder's
+state. A blocking POST there would stall the loop and push back every anyio
+deadline the drivers rely on (`fail_after`, the #366 drain). Whatever is
+still queued when the interpreter exits is flushed by an `atexit` hook,
+bounded by FLUSH_TIMEOUT_SECONDS; by then the anyio loop has returned.
+
 Never fatal. Recording is bookkeeping about a run, not part of it: every
 failure here is logged and swallowed.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
+import queue
+import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -59,12 +70,26 @@ DEFAULT_BASE_URL = "https://api.mctl.ai"
 INGEST_PATH = "/api/v1/usage/records"
 SCHEMA_VERSION = 1
 
-# Short on purpose: delivery runs inline in the SDK message loop, once per
-# turn. Two attempts at 5 s bound the stall at about 11 s; the ingest is
-# idempotent, so a retry after a lost answer is safe.
+# Two attempts at 5 s on the delivery thread; the ingest is idempotent, so a
+# retry after a lost answer is safe. The exit flush allows about two full
+# batches of that.
 REQUEST_TIMEOUT_SECONDS = 5.0
 ATTEMPTS = 2
 RETRY_DELAY_SECONDS = 1.0
+FLUSH_TIMEOUT_SECONDS = 25.0
+
+# Failures that mean the request never reached mctl-api, so nothing of it
+# can have been stored. Any other failure may have been (the answer was
+# lost), and is treated as such.
+_UNSENT = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ProxyError,
+    httpx.UnsupportedProtocol,
+    httpx.WriteError,
+    httpx.WriteTimeout,
+)
 
 # The ADR-012 agent vocabulary. `tracing.agent_run` names are kept as they
 # are for spans; the ledger speaks the shorter names.
@@ -110,6 +135,60 @@ def _default_post(url: str, body: dict[str, Any], headers: dict[str, str]) -> ht
     return httpx.post(url, json=body, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
 
 
+class _Worker:
+    """The one delivery thread of this process: jobs run in order."""
+
+    def __init__(self) -> None:
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def submit(self, job: Callable[[], None]) -> None:
+        with self._lock:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name="usage-ledger", daemon=True)
+                self._thread.start()
+        self._queue.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            try:
+                job()
+            except Exception:  # a job must not kill the thread that runs the next one
+                logger.exception("usage ledger job failed")
+            finally:
+                self._queue.task_done()
+
+    def flush(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._queue.all_tasks_done:
+            while self._queue.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._queue.all_tasks_done.wait(remaining)
+        return True
+
+
+_WORKER = _Worker()
+
+
+def flush(timeout: float = FLUSH_TIMEOUT_SECONDS) -> bool:
+    """Wait for the queued usage records to be delivered; False on timeout.
+
+    Registered with `atexit`, so a runner that exits right after its last
+    turn still delivers that turn.
+    """
+    done = _WORKER.flush(timeout)
+    if not done:
+        logger.warning("usage ledger: stopped waiting after %.0fs; queued usage records were not delivered", timeout)
+    return done
+
+
+atexit.register(flush)
+
+
 class UsageRecorder:
     """Builds and delivers the usage records of one agent's SDK sessions."""
 
@@ -122,13 +201,23 @@ class UsageRecorder:
         correlation: Mapping[str, Any] | None = None,
         post: Post | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        submit: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         self.agent = _AGENT_NAMES.get(agent, agent)
         self._token = token.strip()
+        self._off_reason = "" if self._token else f"{TOKEN_ENV} is not set"
+        if self._token and not base_url.startswith("https://"):
+            # Operator-supplied, like everywhere else this variable is read
+            # (run_shepherd, publish_agent_release): never send the bearer
+            # over anything but https.
+            self._token = ""
+            self._off_reason = f"{BASE_URL_ENV} is not https ({base_url!r})"
         self._url = base_url.rstrip("/") + INGEST_PATH
         self._correlation = {k: v for k, v in (correlation or {}).items() if v not in (None, "")}
         self._post = post or _default_post
         self._sleep = sleep
+        self._submit = submit or _WORKER.submit
+        self._undelivered = 0
         # (session_id, result_uuid or turn marker): results already handled.
         # A result is committed whole, so the model is not part of it.
         self._seen: set[tuple[str, str]] = set()
@@ -162,14 +251,24 @@ class UsageRecorder:
             logger.warning(message, *args)
 
     def observe(self, message: Any) -> None:
-        """Record `message` if it is a ResultMessage. Never raises."""
+        """Queue `message` for recording if it is a ResultMessage.
+
+        Returns at once and never raises: the work happens on the delivery
+        thread.
+        """
         if type(message).__name__ != "ResultMessage":
             return
         if not self.enabled:
             self._warn_once(
-                "disabled", "usage recording is off: %s is not set, so this run records no model usage", TOKEN_ENV
+                "disabled", "usage recording is off (%s): this run records no model usage", self._off_reason
             )
             return
+        try:
+            self._submit(lambda: self._record(message))
+        except Exception as exc:  # noqa: BLE001 — recording must never break the run it records
+            self._warn_once("submit", "could not queue model usage (%s: %s)", type(exc).__name__, exc)
+
+    def _record(self, message: Any) -> None:
         try:
             planned = self._plan(message)
             if planned and self._deliver([record for _, _, _, record in planned]):
@@ -259,31 +358,43 @@ class UsageRecorder:
         return planned
 
     def _deliver(self, records: list[dict[str, Any]]) -> bool:
-        """POST `records`; True when they may have been stored."""
+        """POST `records`; True when they may have been stored.
+
+        "May have been stored" is sticky across attempts: once one attempt
+        lost its answer, a later attempt that plainly failed does not make
+        the batch certainly-unstored, and carrying its tokens into the next
+        turn (under another result_uuid, which no server dedupe catches)
+        would count them twice.
+        """
         headers = {"Authorization": f"Bearer {self._token}"}
         body = {"records": records}
+        may_have_landed = False
+        failure = ""
         for attempt in range(1, ATTEMPTS + 1):
             try:
                 resp = self._post(self._url, body, headers)
             except httpx.HTTPError as exc:
-                # Refused before the request went out: certainly not stored.
-                unsent = isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout)
-                if attempt == ATTEMPTS:
-                    self._warn_once("deliver", "usage records not delivered (%s)", type(exc).__name__)
-                    return not unsent
-                self._sleep(RETRY_DELAY_SECONDS)
-                continue
-            if resp.status_code < 300:
-                return True
-            if resp.status_code >= 500 or resp.status_code == 429:
+                if not isinstance(exc, _UNSENT):
+                    may_have_landed = True
+                failure = type(exc).__name__
                 if attempt < ATTEMPTS:
                     self._sleep(RETRY_DELAY_SECONDS)
                     continue
-            # A 4xx other than 429 will not change on retry: the records or
-            # the token are wrong, and the message says which.
-            logger.error(
-                "mctl-api refused %d usage record(s): HTTP %d %s",
-                len(records), resp.status_code, resp.text[:300],
-            )
-            return False
-        return False
+                break
+            if resp.status_code < 300:
+                return True
+            # An HTTP error answer: the ingest is one transaction, so this
+            # attempt stored nothing.
+            failure = f"HTTP {resp.status_code} {resp.text[:300]}"
+            if (resp.status_code >= 500 or resp.status_code == 429) and attempt < ATTEMPTS:
+                self._sleep(RETRY_DELAY_SECONDS)
+                continue
+            break
+        # Every failure is logged, with the running total: a run whose
+        # deliveries keep failing must not go quiet after the first one.
+        self._undelivered += len(records)
+        logger.warning(
+            "usage records not delivered (%s); %d record(s) undelivered so far in this process",
+            failure, self._undelivered,
+        )
+        return may_have_landed
