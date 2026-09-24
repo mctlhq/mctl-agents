@@ -113,6 +113,37 @@ def test_park_persists_ticket_logs_and_does_not_merge(tmp_path, monkeypatch, cap
     assert ticket.target == PR_URL
 
 
+def test_still_pending_tick_does_not_repark(tmp_path, monkeypatch, capsys):
+    """A tick that finds the SAME decision still awaiting approval (the
+    ticket already parked on a prior tick) must not re-fetch the receipt,
+    rewrite .status.yaml, or log a second APPROVAL_PARKED -- P2 review
+    finding on mctl-agents#198: an extra GET, a gitops commit, and a
+    restamped updated_at on every still-pending firing."""
+    ref = make_ref(tmp_path)
+    pr = make_pr()
+    calls = _no_op_transport(monkeypatch)
+    outcome = pc.ApprovalOutcome(pc.APPROVAL_PENDING, approval_ref=REF_ID)
+    _gate(monkeypatch, _ScriptedLookup(REF_ID, outcome))
+    get_calls: list[str] = []
+
+    class _Client:
+        def get(self, approval_id):
+            get_calls.append(approval_id)
+            return ApprovalAnswer("pending", record=None)
+
+    monkeypatch.setattr(run_shepherd, "ActionApprovalClient", lambda *a, **kw: _Client())
+    run_shepherd.update_status(ref, ref.status, approval=proposal_state.approval_payload(_ticket()))
+    before = read_status(ref)
+
+    assert run_shepherd.merge_pr(pr, ref) == (False, None)
+
+    assert calls == []
+    assert get_calls == []  # already parked -- no redundant read of the receipt
+    out = capsys.readouterr().out
+    assert "APPROVAL_PARKED" not in out
+    assert read_status(ref) == before  # no redundant .status.yaml rewrite
+
+
 def test_resume_after_approval_merges_once_and_clears_ticket(tmp_path, monkeypatch, capsys):
     """T4 tick 2: a granted decision merges exactly once and clears the ticket."""
     ref = make_ref(tmp_path)

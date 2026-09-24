@@ -2760,17 +2760,26 @@ def merge_pr(pr: PRSnapshot, ref: ProposalRef | None = None) -> tuple[bool, str 
 
     if decision.awaiting_approval:
         if ref is not None:
-            # `request_for` is pure (it only re-reads the local execution
-            # identity file); calling it again with the same arguments
-            # reproduces the SAME request `checkpoint()` just decided
-            # against, never a new decision.
-            request = policy_checkpoint.request_for(
-                policy_checkpoint.GITHUB_PR_MERGE, "merge", pr_ref, args, metadata=metadata,
-            )
-            if isinstance(request, policy_checkpoint.ActionRequest):
-                _park_merge_approval(ref, pr_ref, request, decision, denials, attempt, artifact_ref=pr.head_sha)
+            if ticket is not None and ticket.approval_ref == decision.approval_ref:
+                # Already parked this exact receipt on a prior tick: parking
+                # again would cost a redundant `ActionApprovalClient.get()`,
+                # rewrite `.status.yaml` for no state change, and restamp
+                # `updated_at` as though this were a fresh park. Still
+                # pending is still parked -- nothing to do until the
+                # decision changes.
+                print(f"APPROVAL_STILL_PENDING pr={pr_ref} ref={decision.approval_ref}")
             else:
-                print(f"warn: not merging {pr.repo}#{pr.number}: could not rebuild the action to park it")
+                # `request_for` is pure (it only re-reads the local execution
+                # identity file); calling it again with the same arguments
+                # reproduces the SAME request `checkpoint()` just decided
+                # against, never a new decision.
+                request = policy_checkpoint.request_for(
+                    policy_checkpoint.GITHUB_PR_MERGE, "merge", pr_ref, args, metadata=metadata,
+                )
+                if isinstance(request, policy_checkpoint.ActionRequest):
+                    _park_merge_approval(ref, pr_ref, request, decision, denials, attempt, artifact_ref=pr.head_sha)
+                else:
+                    print(f"warn: not merging {pr.repo}#{pr.number}: could not rebuild the action to park it")
         else:
             print(
                 f"warn: not merging {pr.repo}#{pr.number}: awaiting approval "
