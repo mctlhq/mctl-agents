@@ -818,9 +818,13 @@ class AgentRunObserver:
     starts. Without a seed the first chat span of a scope would be zero-length.
     """
 
-    def __init__(self, root: SpanHandle, model: str | None) -> None:
+    def __init__(self, root: SpanHandle, model: str | None, usage: Any = None) -> None:
         self._root = root
         self._model = model
+        # The usage producer (orchestrator/usage_ledger.UsageRecorder) or
+        # None. It sees every message whether this span records or not:
+        # tracing is optional, the usage ledger is not.
+        self._usage = usage
         self._tools: dict[str, SpanHandle] = {}
         self._chats: dict[str | None, tuple[str, SpanHandle, int]] = {}
         # Seeded with the observer's own start, so a driver that never calls
@@ -839,6 +843,8 @@ class AgentRunObserver:
             self._last_ns[None] = time.time_ns()
 
     def observe(self, message: Any) -> None:
+        if self._usage is not None:
+            self._usage.observe(message)  # never raises
         if not self._root.recording:
             return
         try:
@@ -979,8 +985,8 @@ class AgentRunObserver:
 
 
 class _NoopObserver(AgentRunObserver):
-    def __init__(self) -> None:
-        super().__init__(NOOP, None)
+    def __init__(self, usage: Any = None) -> None:
+        super().__init__(NOOP, None, usage)
 
     def close(self, error: BaseException | None = None) -> None:
         return None
@@ -992,13 +998,22 @@ class agent_run:
     Usable as `with` or `async with`, so a driver can open it in the same
     statement as its client — `async with tracing.agent_run(...) as obs,
     ClaudeSDKClient(...) as client:` — and feed `obs.observe` every message.
-    Tracing off -> a no-op observer and no span."""
+    Tracing off -> a no-op observer and no span.
+
+    Either way the observer also feeds the model-usage producer
+    (orchestrator/usage_ledger.py, mctlhq/.github#50): this is the one place
+    every driver already hands its whole SDK stream to."""
 
     def __init__(self, agent: str, model: str | None) -> None:
+        # Deferred: usage_ledger imports httpx, and this module keeps its
+        # top level to the standard library.
+        from orchestrator import usage_ledger
+
         self._agent = agent
         self._model = model
         self._span_cm: Any = None
-        self._observer: AgentRunObserver = _NoopObserver()
+        self._usage = usage_ledger.UsageRecorder.from_env(agent)
+        self._observer: AgentRunObserver = _NoopObserver(self._usage)
 
     def __enter__(self) -> AgentRunObserver:
         if not _state.enabled:
@@ -1013,7 +1028,7 @@ class agent_run:
             attributes["gen_ai.request.model"] = self._model
         self._span_cm = span(f"invoke_agent {self._agent}", attributes, kind="client")
         handle = self._span_cm.__enter__()
-        self._observer = AgentRunObserver(handle, self._model)
+        self._observer = AgentRunObserver(handle, self._model, self._usage)
         return self._observer
 
     def __exit__(self, exc_type: Any, exc: BaseException | None, tb: Any) -> None:

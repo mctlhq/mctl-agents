@@ -1,0 +1,377 @@
+"""The model-usage producer (orchestrator/usage_ledger.py, mctlhq/.github#50).
+
+Messages are the REAL `claude_agent_sdk.ResultMessage`: the recorder is
+duck-typed on its class name and field names, so a fake class would prove
+nothing about the real one. The per-turn numbers in the multi-turn cases are
+the ones measured on claude-agent-sdk 0.2.136 (see the module docstring):
+cumulative `model_usage`, 53 output tokens after turn one and 100 after two.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import anyio
+import httpx
+import pytest
+from claude_agent_sdk import ResultMessage
+
+from orchestrator import options, run_shepherd, tracing, usage_ledger
+from tests.test_tracing_agents import (
+    PROMPT_MARKER,
+    _run_implementer_agent,
+    _run_investigator_agent,
+)
+
+TOKEN = "usage-writer-token-for-tests-0123456789"
+ADMIN_TOKEN = "admin-mctl-token-must-never-be-used"
+HAIKU = "claude-haiku-4-5-20251001"
+OPUS = "claude-opus-5"
+
+
+def _usage(input_tokens: int, output_tokens: int, cache_read: int = 0, cache_write: int = 0, **extra: Any) -> dict:
+    return {
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "cacheReadInputTokens": cache_read,
+        "cacheCreationInputTokens": cache_write,
+        "webSearchRequests": 0,
+        "costUSD": 0.05,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        **extra,
+    }
+
+
+def _result(
+    uuid: str | None,
+    model_usage: dict | None,
+    *,
+    session: str = "session-1",
+    is_error: bool = False,
+    api_error_status: int | None = None,
+    num_turns: int = 1,
+) -> ResultMessage:
+    return ResultMessage(
+        subtype="success",
+        duration_ms=1000,
+        duration_api_ms=800,
+        is_error=is_error,
+        num_turns=num_turns,
+        session_id=session,
+        total_cost_usd=0.05,
+        usage={"input_tokens": 10, "output_tokens": 41},
+        result=f"final answer quoting {PROMPT_MARKER}",
+        model_usage=model_usage,
+        api_error_status=api_error_status,
+        uuid=uuid,
+        stop_reason="end_turn",
+    )
+
+
+class FakeApi:
+    """Records every POST; answers with the queued statuses, then 200."""
+
+    def __init__(self, *answers: int | Exception) -> None:
+        self.answers = list(answers)
+        self.calls: list[tuple[str, dict, dict]] = []
+
+    def __call__(self, url: str, body: dict, headers: dict) -> httpx.Response:
+        self.calls.append((url, body, headers))
+        answer = self.answers.pop(0) if self.answers else 200
+        if isinstance(answer, Exception):
+            raise answer
+        return httpx.Response(answer, json={}, request=httpx.Request("POST", url))
+
+    @property
+    def records(self) -> list[dict]:
+        return [r for _, body, _ in self.calls for r in body["records"]]
+
+
+def _recorder(api: FakeApi, agent: str = "implementer", **correlation: Any) -> usage_ledger.UsageRecorder:
+    return usage_ledger.UsageRecorder(
+        agent, token=TOKEN, base_url="https://api.example.test/", correlation=correlation,
+        post=api, sleep=lambda _s: None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Record shape and credential
+# ---------------------------------------------------------------------------
+
+
+def test_one_record_per_model_posted_with_the_usage_writer_token_only():
+    api = FakeApi()
+    rec = _recorder(api)
+    opus_usage = _usage(900, 400, provider="firstParty", canonicalModel=OPUS)
+    rec.observe(_result("u1", {OPUS: opus_usage, HAIKU: _usage(50, 5)}))
+
+    assert len(api.calls) == 1
+    url, _, headers = api.calls[0]
+    assert url == "https://api.example.test/api/v1/usage/records"
+    assert headers == {"Authorization": f"Bearer {TOKEN}"}
+    by_model = {r["model_key"]: r for r in api.records}
+    assert set(by_model) == {OPUS, HAIKU}
+    opus = by_model[OPUS]
+    assert opus["session_id"] == "session-1"
+    assert opus["result_uuid"] == "u1"
+    assert opus["schema_version"] == 1
+    assert opus["agent"] == "implementer"
+    assert opus["provider"] == "firstParty"
+    assert opus["canonical_model"] == OPUS
+    assert (opus["input_tokens"], opus["output_tokens"]) == (900, 400)
+    assert opus["outcome"] == "success"
+    assert opus["recorded_at"].endswith("Z")
+
+
+def test_a_record_carries_no_cost_no_id_and_no_text():
+    """The server derives the id and prices the tokens; the producer must not
+    pre-empt either (a client id is refused, and the SDK's costUSD is an
+    estimate). And no field may carry prompt or completion text (ADR-012
+    invariant 8)."""
+    api = FakeApi()
+    _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    (record,) = api.records
+    for field in ("id", "calculated_cost", "provider_reported_cost", "pricing_version", "ingested_by"):
+        assert field not in record
+    assert PROMPT_MARKER not in json.dumps(api.calls[0][1])
+
+
+def test_an_error_result_is_recorded_as_an_error_with_its_status():
+    api = FakeApi()
+    _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}, is_error=True, api_error_status=429))
+    (record,) = api.records
+    assert record["outcome"] == "error"
+    assert record["api_error_status"] == "429"
+
+
+def test_correlation_comes_from_the_runner_pod_environment():
+    env = {
+        usage_ledger.TOKEN_ENV: TOKEN,
+        "MCTL_TOKEN": ADMIN_TOKEN,
+        "WORKFLOW_TEMPORAL_WORKFLOW_ID": "dev-loop-mctlhq-mctl-api-7",
+        "WORKFLOW_NAME": "mctl-agents-investigate-abcde",
+        "WORKFLOW_WORK_ITEM_ID": "wi_123",
+    }
+    rec = usage_ledger.UsageRecorder.from_env("issue-investigator", env)
+    (record,) = rec.records_for(_result("u1", {OPUS: _usage(1, 2)}))
+    assert record["agent"] == "investigator"
+    assert record["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-api-7"
+    assert record["argo_workflow_name"] == "mctl-agents-investigate-abcde"
+    assert record["work_item_id"] == "wi_123"
+    assert rec._token == TOKEN
+
+
+def test_without_the_writer_token_nothing_is_sent_even_with_an_admin_token(monkeypatch, caplog):
+    """No fallback to the admin MCTL_TOKEN: variant B keeps ingestion off the
+    admin principal, so no writer token means no records."""
+    monkeypatch.delenv(usage_ledger.TOKEN_ENV, raising=False)
+    monkeypatch.setenv("MCTL_TOKEN", ADMIN_TOKEN)
+    sent: list[Any] = []
+    monkeypatch.setattr(usage_ledger, "_default_post", lambda *a: sent.append(a))
+    rec = usage_ledger.UsageRecorder.from_env("implementer")
+    rec.observe(_result("u1", {OPUS: _usage(1, 2)}))
+    rec.observe(_result("u2", {OPUS: _usage(2, 3)}))
+    assert sent == []
+    assert rec.enabled is False
+    assert sum("usage recording is off" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_messages_other_than_results_are_ignored():
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(object())
+    rec.observe(_result("u1", None))  # no per-model usage: nothing attributable
+    rec.observe(_result("u2", {OPUS: _usage(1, 2)}, session=""))
+    assert api.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Deltas and dedupe
+# ---------------------------------------------------------------------------
+
+
+def test_cumulative_session_counters_are_recorded_as_per_turn_deltas():
+    """Measured shape: turn two of one session reports the running total.
+    Recording it as-is would count turn one twice."""
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("u1", {HAIKU: _usage(533, 53, 0, 26199)}))
+    rec.observe(_result("u2", {HAIKU: _usage(543, 100, 26199, 34487)}))
+
+    first, second = api.records
+    assert (second["input_tokens"], second["output_tokens"]) == (10, 47)
+    assert (second["cache_read_tokens"], second["cache_write_tokens"]) == (26199, 8288)
+    # The rows of a session sum to what the SDK reported for it.
+    assert first["output_tokens"] + second["output_tokens"] == 100
+    assert first["cache_write_tokens"] + second["cache_write_tokens"] == 34487
+
+
+def test_deltas_are_kept_per_session_and_per_model():
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("a1", {OPUS: _usage(100, 10)}, session="A"))
+    rec.observe(_result("b1", {OPUS: _usage(7, 1)}, session="B"))
+    rec.observe(_result("a2", {OPUS: _usage(150, 30), HAIKU: _usage(5, 5)}, session="A"))
+    got = [(r["session_id"], r["model_key"], r["output_tokens"]) for r in api.records]
+    assert got == [("A", OPUS, 10), ("B", OPUS, 1), ("A", OPUS, 20), ("A", HAIKU, 5)]
+
+
+def test_each_turn_keeps_its_own_idempotency_identity():
+    """The server keys a row on (session_id, result_uuid, model_key). Two turns
+    of one session must reach it as two identities, or the second is dropped
+    as a duplicate of the first."""
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(10, 1)}))
+    rec.observe(_result("u2", {OPUS: _usage(20, 2)}))
+    identities = [(r["session_id"], r.get("result_uuid"), r["model_key"]) for r in api.records]
+    assert identities == [("session-1", "u1", OPUS), ("session-1", "u2", OPUS)]
+
+
+def test_results_without_a_uuid_are_told_apart_by_session():
+    """An older CLI sends no uuid; the key then falls back to the turn count,
+    which every session starts at 1. Only the session keeps two runs apart."""
+    api = FakeApi()
+    rec = _recorder(api)
+    rec.observe(_result(None, {OPUS: _usage(100, 10)}, session="A"))
+    rec.observe(_result(None, {OPUS: _usage(200, 20)}, session="B"))
+    assert [(r["session_id"], r["output_tokens"]) for r in api.records] == [("A", 10), ("B", 20)]
+    assert all("result_uuid" not in r and r["num_turns"] == 1 for r in api.records)
+
+
+def test_the_same_result_observed_twice_is_sent_once_and_does_not_move_the_baseline():
+    """The stream reaches the observer from the turn loop and again from the
+    drain; a replayed ResultMessage must be a no-op, not a zero delta that
+    advances nothing, and above all not a second copy of its tokens."""
+    api = FakeApi()
+    rec = _recorder(api)
+    turn_one = _result("u1", {OPUS: _usage(100, 10)})
+    rec.observe(turn_one)
+    rec.observe(turn_one)
+    rec.observe(_result("u2", {OPUS: _usage(160, 25)}))
+    assert [r["result_uuid"] for r in api.records] == ["u1", "u2"]
+    assert api.records[1]["output_tokens"] == 15
+
+
+def test_a_redelivered_batch_is_byte_for_byte_the_same_identity():
+    """What makes a retry safe server-side: the retry carries the same
+    session/result/model, so it lands on the same row id."""
+    api = FakeApi(500)
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 10)}))
+    first, retry = (body["records"][0] for _, body, _ in api.calls)
+    key = ("session_id", "result_uuid", "model_key", "input_tokens", "output_tokens")
+    assert [first[k] for k in key] == [retry[k] for k in key]
+
+
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+
+
+def test_a_server_error_is_retried_once():
+    api = FakeApi(503)
+    _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert len(api.calls) == 2
+
+
+def test_a_client_error_is_not_retried(caplog):
+    api = FakeApi(400)
+    _recorder(api).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    assert len(api.calls) == 1
+    assert any("refused 1 usage record" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param([500, 500], id="http-error"),
+        pytest.param([httpx.ConnectError("down"), httpx.ConnectError("down")], id="no-connection"),
+    ],
+)
+def test_a_batch_that_certainly_did_not_land_is_carried_by_the_next_turn(failure):
+    api = FakeApi(*failure)
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 10)}))
+    rec.observe(_result("u2", {OPUS: _usage(160, 25)}))
+    delivered = api.calls[-1][1]["records"]
+    assert [(r["result_uuid"], r["output_tokens"]) for r in delivered] == [("u2", 25)]
+
+
+def test_a_batch_that_may_have_landed_is_not_counted_again():
+    """A lost answer may mean a stored row: carrying its tokens into the next
+    turn would count them twice, the worse error for a ledger."""
+    api = FakeApi(httpx.ReadTimeout("slow"), httpx.ReadTimeout("slow"))
+    rec = _recorder(api)
+    rec.observe(_result("u1", {OPUS: _usage(100, 10)}))
+    rec.observe(_result("u2", {OPUS: _usage(160, 25)}))
+    assert api.calls[-1][1]["records"][0]["output_tokens"] == 15
+
+
+def test_recording_never_raises_into_the_run():
+    def boom(*_a: Any) -> httpx.Response:
+        raise RuntimeError("bug in delivery")
+
+    rec = usage_ledger.UsageRecorder("implementer", token=TOKEN, post=boom)
+    rec.observe(_result("u1", {OPUS: _usage(1, 2)}))  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# The token stays out of the agent's own environment
+# ---------------------------------------------------------------------------
+
+
+def test_every_sdk_session_env_blanks_the_writer_token(monkeypatch, tmp_path):
+    monkeypatch.setenv(usage_ledger.TOKEN_ENV, TOKEN)
+    built = [
+        options.build_implementer_agent_options(tmp_path, OPUS, tmp_path),
+        options.build_issue_investigator_options(tmp_path, OPUS, tmp_path),
+        options.build_shepherd_options(tmp_path, OPUS),
+        options.build_service_agent_options(tmp_path, OPUS),
+    ]
+    for opts in built:
+        assert opts.env[usage_ledger.TOKEN_ENV] == ""
+
+
+# ---------------------------------------------------------------------------
+# Through the real drivers: investigator, implementer, shepherd
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ledger(monkeypatch) -> FakeApi:
+    monkeypatch.setenv(usage_ledger.TOKEN_ENV, TOKEN)
+    monkeypatch.setenv("MCTL_TOKEN", ADMIN_TOKEN)
+    api = FakeApi()
+    monkeypatch.setattr(usage_ledger, "_default_post", api)
+    tracing._reset_for_tests()
+    yield api
+    tracing._reset_for_tests()
+
+
+@pytest.mark.parametrize(
+    ("run", "agent"),
+    [(_run_investigator_agent, "investigator"), (_run_implementer_agent, "implementer")],
+    ids=["investigator", "implementer"],
+)
+def test_each_sdk_driver_records_its_usage_with_tracing_off(ledger, tmp_path, monkeypatch, run, agent):
+    assert tracing.enabled() is False
+    run(tmp_path, monkeypatch, [_result("u1", {OPUS: _usage(1500, 420)})])
+    (record,) = ledger.records
+    assert (record["agent"], record["model_key"], record["output_tokens"]) == (agent, OPUS, 420)
+    assert ledger.calls[0][2]["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_the_shepherd_records_the_usage_of_its_normalising_call(ledger, monkeypatch, tmp_path):
+    async def fake_query(*, prompt: str, options: Any):
+        yield _result("s1", {HAIKU: _usage(300, 60)})
+
+    monkeypatch.setattr("claude_agent_sdk.query", fake_query)
+    monkeypatch.setattr(options, "build_shepherd_options", lambda *_a: None)
+    finding = run_shepherd.CodexFinding(
+        body="**P1** a real bug", path="a.py", line=1, commit_id="abc", created_at=None, severity="P1"
+    )
+    anyio.run(run_shepherd._format_bundle_via_sdk, [finding])
+    (record,) = ledger.records
+    assert (record["agent"], record["model_key"], record["output_tokens"]) == ("shepherd", HAIKU, 60)

@@ -24,6 +24,7 @@ from orchestrator.exec_budget import (
 )
 from orchestrator.exec_budget import normalize_shell_command as _normalize_shell_command
 from orchestrator.resolver import ExecutionPlan
+from orchestrator.usage_ledger import agent_env_without_writer_token
 
 # Paths already warned about by _execution_context_headers(): the audit hook
 # re-reads the env on every PreToolUse, so an unreadable context file would
@@ -976,7 +977,7 @@ def build_service_agent_options(service_dir: Path, model: str) -> ClaudeAgentOpt
         # Bash tool shells out to. The Claude Code CLI itself doesn't need
         # PATH: claude-agent-sdk bundles its own binary and prefers it over
         # anything on PATH (see Dockerfile).
-        env={**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH},
+        env=agent_env_without_writer_token({**os.environ, "SIBLING_REPOS_PATH": SIBLING_REPOS_PATH}),
     )
 
 
@@ -1043,7 +1044,7 @@ def build_implementer_agent_options(
         permission_mode="acceptEdits",
         max_budget_usd=IMPLEMENTER_BUDGET_USD,
         add_dirs=[],
-        env=env,
+        env=agent_env_without_writer_token(env),
         hooks=_compose_hooks(hooks, _policy_hooks(allowed_tools)),
     )
 
@@ -1100,7 +1101,7 @@ def build_incident_responder_options(
         mcp_servers=mctl_mcp_config(always_load=True),
         permission_mode="acceptEdits",
         max_budget_usd=INCIDENT_RESPONDER_BUDGET_USD,
-        env=env,
+        env=agent_env_without_writer_token(env),
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
     )
 
@@ -1136,7 +1137,7 @@ def build_issue_investigator_options(
         permission_mode="acceptEdits",
         max_budget_usd=ISSUE_INVESTIGATOR_BUDGET_USD,
         add_dirs=[str(proposal_dir)],
-        env=env,
+        env=agent_env_without_writer_token(env),
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
     )
 
@@ -1196,7 +1197,7 @@ def build_issue_investigator_options_from_plan(
         permission_mode="acceptEdits",
         max_budget_usd=plan.budget_usd,
         add_dirs=[str(proposal_dir)],
-        env=env,
+        env=agent_env_without_writer_token(env),
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
     )
 
@@ -1224,5 +1225,5 @@ def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions
         mcp_servers={},
         permission_mode="acceptEdits",
         max_budget_usd=SHEPHERD_BUDGET_USD,
-        env={**os.environ},
+        env=agent_env_without_writer_token(os.environ),
     )

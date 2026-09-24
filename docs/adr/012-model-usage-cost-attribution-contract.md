@@ -38,7 +38,7 @@ field read, not new plumbing.
 | `run_implementer.py` | `ClaudeSDKClient` (streaming, multi-turn) | yes (4 sites) | not in `model-policy.yaml` |
 | `run_issue_investigator.py` | `ClaudeSDKClient` | yes (7 sites) | not in `model-policy.yaml` |
 | `run_service_agent.py` | `ClaudeSDKClient` | yes (4 sites) | `service_agent` → `balanced` |
-| `run_shepherd.py` | `query()` one-shot (`orchestrator/run_shepherd.py:2108`) | **no** | `review_findings_normalize` → `cheap` |
+| `run_shepherd.py` | `query()` one-shot (`orchestrator/run_shepherd.py:2108`) | **no** (yes since the 2026-09-24 amendment) | `review_findings_normalize` → `cheap` |
 | `run_incident_responder.py` | `ClaudeSDKClient` | **no** | not in `model-policy.yaml` |
 | `run_mentor.py` | `ClaudeSDKClient` | **no** | `mentor_digest` → `cheap` |
 
@@ -305,6 +305,52 @@ the endpoint shape belongs to `usage-ledger`.
    has no field of that shape.
 9. `cache_read_tokens` absent and `cache_read_tokens = 0` are distinguishable
    after a round-trip.
+
+## Amendment 2026-09-24 — the producer (mctlhq/.github#50)
+
+**Where it records.** `orchestrator/usage_ledger.UsageRecorder` is fed by
+`tracing.agent_run`'s observer, the one place the investigator, the
+implementer and (now) the shepherd already hand their whole SDK stream to. It
+records whether tracing is on or off. `subagent_wait` and `mcp_guard` feed the
+same observer and never record on their own, as required above.
+
+**Who writes.** Records are appended with `MCTL_USAGE_WRITER_TOKEN`, the bearer
+of `service:mctl-agents-usage` (mctl-api#385): a principal whose only
+permission is `usage:write` and which mctl-api confines to
+`POST /api/v1/usage/records`. The admin `MCTL_TOKEN` is never used for
+ingestion (variant B of #50). The token is blanked in every SDK session's
+environment, so the model cannot read it through Bash. Every row records the
+writer (`ingested_by`, `ingested_by_principal_id`), server-side.
+
+**`model_usage` is cumulative per session.** This corrects an assumption the
+record section above leaves implicit. Measured on claude-agent-sdk 0.2.136,
+two turns of one `ClaudeSDKClient` session with Haiku reported:
+
+| Turn | `model_usage` outputTokens | cacheCreationInputTokens | `total_cost_usd` |
+|---|---|---|---|
+| 1 | 53 | 26199 | 0.0532 |
+| 2 | 100 (= 53 + 47) | 34487 (= 26199 + 8288) | 0.0726 |
+
+So a ResultMessage is not an independent invocation within its session. The
+implementer and the investigator drain past the first result (#366), and
+recording each ResultMessage as-is would count every earlier turn again. The
+producer therefore sends, per (session, model), the difference between this
+result's counters and the ones last recorded. The identity is unchanged,
+`(session_id, result_uuid, model_key)`, and the rows of a session sum to its
+reported total. Invariant 3 holds per result. Invariant 2 still holds, since
+model is part of both the key and the delta.
+
+Two consequences for delivery:
+- The delta baseline advances only when a batch may have been stored. A
+  batch that certainly was not stored (no connection, or an HTTP error: the
+  ingest is one transaction) is carried by the next turn's delta rather than
+  lost.
+- A batch whose answer was lost advances the baseline, because a double count
+  is the worse error.
+
+**Cost.** The producer sends no cost. mctl-api prices the token counts from
+its versioned catalog at ingest (`calculated_cost` + `pricing_version`), and
+`provider_reported_cost` stays null as decided above.
 
 ## Non-goals
 
