@@ -2629,7 +2629,7 @@ def _park_merge_approval(
 def _resolve_parked_merge_refusal(
     ref: ProposalRef,
     pr_ref: str,
-    ticket: approval_ticket.ApprovalTicket,
+    ticket: approval_ticket.ApprovalTicket | None,
     denials: int,
     attempt: int,
     decision: policy_checkpoint.Decision,
@@ -2790,7 +2790,7 @@ def merge_pr(pr: PRSnapshot, ref: ProposalRef | None = None) -> tuple[bool, str 
     if not decision.permitted:
         if decision.code == policy_checkpoint.CODE_APPROVAL_CONSUMED and ref is not None:
             return _reconcile_consumed_merge(ref, pr, pr_ref)
-        if ref is not None and ticket is not None:
+        if ref is not None:
             _resolve_parked_merge_refusal(ref, pr_ref, ticket, denials, attempt, decision)
         print(
             f"warn: not merging {pr.repo}#{pr.number}: "
@@ -2802,7 +2802,7 @@ def merge_pr(pr: PRSnapshot, ref: ProposalRef | None = None) -> tuple[bool, str 
         # The receipt is already consumed in mctl-api by the permitted
         # decision above, whether or not the `gh` call below succeeds — so
         # the ticket is cleared here, unconditionally, not after the merge.
-        update_status(ref, ref.status, approval=proposal_state.approval_payload(None))
+        update_status(ref, ref.status, approval=proposal_state.approval_payload(None, denials=denials, attempt=attempt + 1))
         print(f"APPROVAL_RESUMED pr={pr_ref} ref={decision.approval_ref}")
 
     # Bypasses _run() (this is the one gh call this module makes outside
