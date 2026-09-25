@@ -439,16 +439,17 @@ class CapabilityStrategy:
     ranker_version: str | None = None
 
     def __post_init__(self) -> None:
-        # Mirrors what CapabilityStrategy.from_dict enforces via
-        # _require_str (allow_empty defaults to False) for name/version —
-        # checked here too so a directly-constructed CapabilityStrategy
-        # (the way seal() builds one, never through from_dict) can never
-        # round-trip through to_dict/from_dict and be rejected by the same
-        # class that produced it.
-        if not self.name:
-            raise CapabilityError("strategy.name must be a non-empty string")
-        if not self.version:
-            raise CapabilityError("strategy.version must be a non-empty string")
+        # The one place these four fields are validated: from_dict passes
+        # the raw values straight through, so a directly-constructed
+        # CapabilityStrategy (the way seal() receives one) and a reloaded
+        # one obey the same rule, and nothing sealable can be rejected by
+        # from_dict later. name/version are non-empty strings; each ranker
+        # field is None or a non-empty string, never "" (a missing config
+        # value must be passed as None).
+        _require_str(self.name, where="strategy.name")
+        _require_str(self.version, where="strategy.version")
+        _optional_str(self.ranker_name, where="strategy.ranker_name")
+        _optional_str(self.ranker_version, where="strategy.ranker_version")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -464,11 +465,12 @@ class CapabilityStrategy:
         _reject_unknown_keys(
             mapping, frozenset({"name", "version", "ranker_name", "ranker_version"}), where="strategy"
         )
+        # Validated by __post_init__, the same path seal()'s callers use.
         return cls(
-            name=_require_str(mapping.get("name"), where="strategy.name"),
-            version=_require_str(mapping.get("version"), where="strategy.version"),
-            ranker_name=_optional_str(mapping.get("ranker_name"), where="strategy.ranker_name"),
-            ranker_version=_optional_str(mapping.get("ranker_version"), where="strategy.ranker_version"),
+            name=mapping.get("name", ""),
+            version=mapping.get("version", ""),
+            ranker_name=mapping.get("ranker_name"),
+            ranker_version=mapping.get("ranker_version"),
         )
 
 
@@ -636,8 +638,13 @@ class CapabilitySet:
             raise CapabilityError(
                 f"retention.class {self.retention.class_!r} is not one of {sorted(RETENTION_CLASSES)!r}"
             )
-        if self.excluded_count < 0:
+        # Same helpers from_dict uses, so seal() cannot accept a value its
+        # own from_dict rejects on reload (a bool count, a non-str tool).
+        if _require_int(self.excluded_count, where="excluded_count") < 0:
             raise CapabilityError(f"excluded_count must be >= 0, got {self.excluded_count}")
+        _require_int(self.retention.expires_after_days, where="retention.expires_after_days")
+        for tool in self.plan_tools:
+            _require_str(tool, where="plan_tools[]")
 
         for provider in self.providers:
             if provider.type not in PROVIDER_TYPES:
@@ -1026,9 +1033,25 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
     module's docstring) — only calling this function pulls in PyYAML."""
     import yaml
 
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        """safe_load, except a repeated mapping key is an error instead of
+        silently last-wins: a duplicate tool would change its tier without
+        dropping a name, which the coverage test cannot see."""
+
+    def _construct_unique_mapping(loader: yaml.SafeLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+        seen: set[Any] = set()
+        for key_node, _ in node.value:
+            key = loader.construct_object(key_node)
+            if key in seen:
+                raise CapabilityError(f"{target}: duplicate key {key!r}")
+            seen.add(key)
+        return loader.construct_mapping(node)
+
+    _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
+
     target = Path(path) if path is not None else DEFAULT_CONSEQUENCE_TABLE_PATH
     raw = target.read_text(encoding="utf-8")
-    data = yaml.safe_load(raw) or {}
+    data = yaml.load(raw, Loader=_UniqueKeyLoader) or {}  # noqa: S506 - a SafeLoader subclass
     if not isinstance(data, Mapping):
         raise CapabilityError(f"{target}: expected a top-level mapping, got {type(data).__name__}")
     tools_raw = data.get("tools", {})

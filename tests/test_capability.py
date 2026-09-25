@@ -325,6 +325,53 @@ def test_sealed_set_round_trips_through_to_dict_and_from_dict():
     assert cap.recompute_content_hash(reloaded) == sealed.content_hash
 
 
+_STRATEGY_SHAPES = {
+    "with-ranker": ({"ranker_name": "bm25", "ranker_version": "0.1.0"}, None),
+    "ranker-none": ({"ranker_name": None, "ranker_version": None}, None),
+    "ranker-name-only": ({"ranker_name": "bm25"}, None),
+    "empty-name": ({"name": ""}, r"strategy\.name"),
+    "empty-version": ({"version": ""}, r"strategy\.version"),
+    "empty-ranker-name": ({"ranker_name": ""}, r"strategy\.ranker_name"),
+    "empty-ranker-version": ({"ranker_version": ""}, r"strategy\.ranker_version"),
+    "non-str-ranker-name": ({"ranker_name": 1}, r"strategy\.ranker_name"),
+}
+
+
+@pytest.mark.parametrize("overrides,rejected", _STRATEGY_SHAPES.values(), ids=_STRATEGY_SHAPES.keys())
+def test_strategy_is_sealable_exactly_when_it_round_trips(overrides, rejected):
+    """The round-trip property, per strategy shape: an accepted strategy
+    survives strategy -> seal -> to_dict -> JSON -> from_dict unchanged, and
+    a rejected one fails at construction, before anything is sealed, with
+    the same error from_dict gives for that document."""
+    if rejected is None:
+        sealed = _sealed_set(strategy=_strategy(**overrides))
+        reloaded = cap.CapabilitySet.from_dict(json.loads(json.dumps(sealed.to_dict())))
+        assert reloaded == sealed
+        assert reloaded.strategy == sealed.strategy
+        assert cap.recompute_content_hash(reloaded) == sealed.content_hash
+        return
+    with pytest.raises(cap.CapabilityError, match=rejected):
+        _strategy(**overrides)
+    document = _sealed_set().to_dict()
+    document["strategy"].update(overrides)
+    with pytest.raises(cap.CapabilityError, match=rejected):
+        cap.CapabilitySet.from_dict(document)
+
+
+@pytest.mark.parametrize(
+    "overrides,rejected",
+    [
+        ({"excluded_count": True}, "excluded_count"),
+        ({"plan_tools": ("Read", 1, "mcp__mctl__*")}, r"plan_tools"),
+        ({"retention": cap.RetentionPolicy(class_="execution-record", expires_after_days=True)}, "expires_after_days"),
+    ],
+    ids=["bool-excluded-count", "non-str-plan-tool", "bool-expiry"],
+)
+def test_seal_refuses_what_from_dict_would_refuse(overrides, rejected):
+    with pytest.raises(cap.CapabilityError, match=rejected):
+        _sealed_set(**overrides)
+
+
 # ---------------------------------------------------------------------------
 # T2 — narrowing invariant: every member's matched_tool_pattern is an
 # element of plan_tools, and its tool_name matches that pattern; a set
@@ -637,7 +684,7 @@ def test_classify_consequence_requires_an_explicit_provider_id():
         cap.classify_consequence("mctl_whoami", table)  # type: ignore[call-arg]
 
 
-def test_classify_consequence_defaults_to_the_mctl_api_provider():
+def test_classify_consequence_uses_the_table_for_the_mctl_api_provider():
     table = cap.load_consequence_table()
     assert cap.classify_consequence("mctl_whoami", table, provider_id=cap.MCTL_API_PROVIDER_ID) == "read-only"
 
@@ -696,3 +743,60 @@ def test_every_tool_documented_in_the_repo_owned_mcp_tool_inventory_is_classifie
     table = cap.load_consequence_table()
     missing = sorted(name for name in mcp_tools if name not in table)
     assert not missing, f"tool(s) advertised in facts.yaml but not classified: {missing}"
+
+
+def test_loader_rejects_a_duplicated_tool(tmp_path):
+    bad_path = tmp_path / "dup.yaml"
+    bad_path.write_text("tools:\n  mctl_whoami: read-only\n  mctl_whoami: consequential\n", encoding="utf-8")
+    with pytest.raises(cap.CapabilityError, match="duplicate key 'mctl_whoami'"):
+        cap.load_consequence_table(bad_path)
+
+
+def test_discovery_decision_round_trips_and_normalizes_score():
+    for score, expected in [(None, None), (3, 3.0), (0.25, 0.25)]:
+        decision = cap.DiscoveryDecision(
+            capability_id="cap-1", rank=1, reason_code="ok", included=True, score=score
+        )
+        assert decision.score == expected
+        assert type(decision.score) is (float if expected is not None else type(None))
+        assert cap.DiscoveryDecision.from_dict(json.loads(json.dumps(decision.to_dict()))) == decision
+
+
+@pytest.mark.parametrize(
+    "overrides,rejected",
+    [
+        ({"score": True}, "score"),
+        ({"score": "0.5"}, "score"),
+        ({"reason_code": "because"}, "reason_code"),
+        ({"rank": "1"}, "rank"),
+        ({"included": 1}, "included"),
+        ({"surplus": 1}, "surplus"),
+    ],
+    ids=["bool-score", "str-score", "unknown-reason", "str-rank", "int-included", "unknown-key"],
+)
+def test_discovery_decision_from_dict_rejects(overrides, rejected):
+    document = {"capability_id": "cap-1", "rank": 1, "score": None, "reason_code": "ok", "included": True}
+    document.update(overrides)
+    with pytest.raises(cap.CapabilityError, match=rejected):
+        cap.DiscoveryDecision.from_dict(document)
+
+
+def test_to_log_dict_carries_ids_hashes_and_counts_only():
+    sealed = _sealed_set(strategy=_strategy(ranker_name="bm25", ranker_version="0.1.0"))
+    log = sealed.to_log_dict()
+    assert log == {
+        "capability_set_id": sealed.capability_set_id,
+        "content_hash": sealed.content_hash,
+        "strategy_name": "lexical-fixed-order",
+        "strategy_version": "1.0.0",
+        "ranker_name": "bm25",
+        "ranker_version": "0.1.0",
+        "provider_count": 1,
+        "capability_count": 1,
+        "excluded_count": 70,
+    }
+    rendered = json.dumps(log)
+    for capability in sealed.capabilities:
+        for leaked in (capability.tool_name, capability.title, capability.summary, capability.provider.alias):
+            if leaked:
+                assert leaked not in rendered
