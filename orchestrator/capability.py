@@ -1101,5 +1101,3 @@ def classify_consequence(tool_name: str, table: Mapping[str, str], *, provider_i
         if len(parts) == 3:
             bare = parts[2]
     return table.get(bare, DEFAULT_CONSEQUENCE)
-
-
