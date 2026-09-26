@@ -46,7 +46,7 @@ ADR 017 for the full boundary table.
 from __future__ import annotations
 
 import fnmatch
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -237,12 +237,10 @@ class ProviderRef:
         # one, never through from_dict) can never round-trip through
         # to_dict/from_dict and be rejected by the same class that produced
         # it.
-        if not self.type:
-            raise CapabilityError("provider.type must be a non-empty string")
-        if not self.id:
-            raise CapabilityError("provider.id must be a non-empty string")
-        if not self.alias:
-            raise CapabilityError("provider.alias must be a non-empty string")
+        _require_str(self.type, where="provider.type")
+        _require_str(self.id, where="provider.id")
+        _require_str(self.alias, where="provider.alias")
+        _require_str(self.endpoint_ref, where="provider.endpoint_ref", allow_empty=True)
         if len(self.endpoint_ref) > MAX_ENDPOINT_REF_LENGTH:
             raise CapabilityError(f"provider.endpoint_ref exceeds {MAX_ENDPOINT_REF_LENGTH} characters")
 
@@ -302,16 +300,13 @@ class CapabilityDescriptor:
         # tool_name/title/matched_tool_pattern — checked here too so
         # seal() can never produce a descriptor that its own from_dict
         # would reject on reload.
-        if not self.capability_id:
-            raise CapabilityError("capability.capability_id must be a non-empty string")
-        if not self.tool_name:
-            raise CapabilityError(f"capability {self.capability_id!r}: tool_name must be a non-empty string")
-        if not self.title:
-            raise CapabilityError(f"capability {self.capability_id!r}: title must be a non-empty string")
-        if not self.matched_tool_pattern:
-            raise CapabilityError(
-                f"capability {self.capability_id!r}: matched_tool_pattern must be a non-empty string"
-            )
+        _require_str(self.capability_id, where="capability.capability_id")
+        where = f"capability {self.capability_id!r}"
+        _require_str(self.tool_name, where=f"{where}: tool_name")
+        _require_str(self.title, where=f"{where}: title")
+        _require_str(self.matched_tool_pattern, where=f"{where}: matched_tool_pattern")
+        _require_str(self.summary, where=f"{where}: summary", allow_empty=True)
+        _require_int(self.input_schema_bytes, where=f"{where}: input_schema_bytes")
         if len(self.title) > MAX_TITLE_LENGTH:
             raise CapabilityError(f"capability {self.capability_id!r}: title exceeds {MAX_TITLE_LENGTH} characters")
         if len(self.summary) > MAX_SUMMARY_LENGTH:
@@ -628,10 +623,8 @@ class CapabilitySet:
         # Mirrors what CapabilitySet.from_dict enforces via _require_str
         # (allow_empty defaults to False) — checked here too so seal() can
         # never produce a document that its own from_dict rejects on reload.
-        if not self.capability_set_id:
-            raise CapabilityError("capability_set_id must be a non-empty string")
-        if not self.created_at:
-            raise CapabilityError("created_at must be a non-empty string")
+        _require_str(self.capability_set_id, where="capability_set_id")
+        _require_str(self.created_at, where="created_at")
         if not self.content_hash.startswith("sha256:"):
             raise CapabilityError(f"content_hash must carry the 'sha256:' prefix, got {self.content_hash!r}")
         if self.retention.class_ not in RETENTION_CLASSES:
@@ -885,7 +878,7 @@ class InvocationRecord:
                 f"invocation_record.policy_checkpoint {self.policy_checkpoint!r} is not one of "
                 f"{sorted(POLICY_CHECKPOINT_STATUSES)!r}"
             )
-        if self.duration_ms < 0:
+        if _require_int(self.duration_ms, where="invocation_record.duration_ms") < 0:
             raise CapabilityError("invocation_record.duration_ms must be >= 0")
         # Mirrors what InvocationRecord.from_dict enforces via
         # _require_sha256 — checked here too so a directly-constructed
@@ -1033,6 +1026,8 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
     module's docstring) — only calling this function pulls in PyYAML."""
     import yaml
 
+    target = Path(path) if path is not None else DEFAULT_CONSEQUENCE_TABLE_PATH
+
     class _UniqueKeyLoader(yaml.SafeLoader):
         """safe_load, except a repeated mapping key is an error instead of
         silently last-wins: a duplicate tool would change its tier without
@@ -1042,6 +1037,8 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
         seen: set[Any] = set()
         for key_node, _ in node.value:
             key = loader.construct_object(key_node)
+            if not isinstance(key, Hashable):
+                raise CapabilityError(f"{target}: unhashable key {key!r}")
             if key in seen:
                 raise CapabilityError(f"{target}: duplicate key {key!r}")
             seen.add(key)
@@ -1049,7 +1046,6 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
 
     _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
 
-    target = Path(path) if path is not None else DEFAULT_CONSEQUENCE_TABLE_PATH
     raw = target.read_text(encoding="utf-8")
     data = yaml.load(raw, Loader=_UniqueKeyLoader) or {}  # noqa: S506 - a SafeLoader subclass
     if not isinstance(data, Mapping):

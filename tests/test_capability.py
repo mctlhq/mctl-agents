@@ -364,12 +364,29 @@ def test_strategy_is_sealable_exactly_when_it_round_trips(overrides, rejected):
         ({"excluded_count": True}, "excluded_count"),
         ({"plan_tools": ("Read", 1, "mcp__mctl__*")}, r"plan_tools"),
         ({"retention": cap.RetentionPolicy(class_="execution-record", expires_after_days=True)}, "expires_after_days"),
+        ({"capabilities": "bool-schema-bytes"}, "input_schema_bytes"),
+        ({"capabilities": "non-str-summary"}, "summary"),
+        ({"providers": "non-str-endpoint-ref"}, "endpoint_ref"),
+        ({"providers": "non-str-id"}, r"provider\.id"),
+        ({"created_at": 1}, "created_at"),
     ],
-    ids=["bool-excluded-count", "non-str-plan-tool", "bool-expiry"],
+    ids=[
+        "bool-excluded-count", "non-str-plan-tool", "bool-expiry", "bool-schema-bytes", "non-str-summary",
+        "non-str-endpoint-ref", "non-str-provider-id", "non-str-created-at",
+    ],
 )
 def test_seal_refuses_what_from_dict_would_refuse(overrides, rejected):
+    """Construction or seal() refuses it, always as CapabilityError (never a
+    bare TypeError), so no sealed document can fail its own from_dict."""
+    bad_parts = {
+        "bool-schema-bytes": lambda: [_descriptor(_provider(), input_schema_bytes=True)],
+        "non-str-summary": lambda: [_descriptor(_provider(), summary=1)],
+        "non-str-endpoint-ref": lambda: [_provider(endpoint_ref=1)],
+        "non-str-id": lambda: [_provider(id=1)],
+    }
     with pytest.raises(cap.CapabilityError, match=rejected):
-        _sealed_set(**overrides)
+        resolved = {k: bad_parts[v]() if isinstance(v, str) and v in bad_parts else v for k, v in overrides.items()}
+        _sealed_set(**resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +760,21 @@ def test_every_tool_documented_in_the_repo_owned_mcp_tool_inventory_is_classifie
     table = cap.load_consequence_table()
     missing = sorted(name for name in mcp_tools if name not in table)
     assert not missing, f"tool(s) advertised in facts.yaml but not classified: {missing}"
+
+
+def test_loader_rejects_an_unhashable_key(tmp_path):
+    bad_path = tmp_path / "complex.yaml"
+    bad_path.write_text("tools:\n  ? [a, b]\n  : read-only\n", encoding="utf-8")
+    with pytest.raises(cap.CapabilityError, match="unhashable key"):
+        cap.load_consequence_table(bad_path)
+
+
+def test_invocation_record_refuses_a_bool_duration():
+    with pytest.raises(cap.CapabilityError, match="duration_ms"):
+        cap.InvocationRecord(
+            capability_id="cap-1", capability_set_id="cap-2", outcome="ok", reason_code="ok",
+            duration_ms=True, policy_checkpoint="absent", arguments_hash="sha256:" + "0" * 64,
+        )
 
 
 def test_loader_rejects_a_duplicated_tool(tmp_path):

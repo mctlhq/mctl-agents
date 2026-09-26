@@ -270,29 +270,36 @@ restated for discovery mode.
 
 ### 8. Consequence classification
 
-MCP `ToolAnnotations` (`readOnlyHint`/`destructiveHint`) are advisory and not
-guaranteed present on mctl-api's tools (requirements.md open question
+MCP `ToolAnnotations` (`readOnlyHint`/`destructiveHint`) are advisory and
+not guaranteed present on mctl-api's tools (requirements.md open question
 "Consequence classification source"). The authoritative source is a
-checked-in table, `config/capability-consequence.yaml`, mapping every
-tool name in `docs/diagrams/archify/facts.yaml`'s `mcp_tools` snapshot (the
-same mctl-api `server.go`-derived inventory `tools/diagram_facts.py`
-generates) to `read-only | mutating | consequential`. Loaded and applied by
+checked-in table, `config/capability-consequence.yaml`, mapping every tool
+name in `docs/diagrams/archify/facts.yaml`'s `mcp_tools` snapshot (the same
+mctl-api `server.go`-derived inventory `tools/diagram_facts.py` generates)
+to `read-only | mutating | consequential`. Loaded and applied by
 `orchestrator.capability.load_consequence_table()` /
-`classify_consequence(tool_name, table, *, provider_id)`, which accepts either
-the bare mctl-api tool name or the SDK-visible `mcp__<alias>__<tool>`
+`classify_consequence(tool_name, table, *, provider_id)`, which accepts
+either the bare mctl-api tool name or the SDK-visible `mcp__<alias>__<tool>`
 spelling. The table describes mctl-api's own tools only, so `provider_id` is
 required and has no default: only `provider_id == MCTL_API_PROVIDER_ID`
-consults the table, and every other provider classifies `consequential`
-even when a bare name collides with an mctl-api tool. Omitting it is a
+consults the table, and every other provider classifies `consequential` even
+when a bare name collides with an mctl-api tool. Omitting it is a
 `TypeError`, not a silent opt-in to the table. The loader also refuses a
 duplicated key, which would otherwise change a tier silently (last wins).
-**Any tool absent from the table classifies `consequential`** — the fail-safe default, hard-coded in
-the loader rather than configurable from the file itself, so the table can
-only narrow which tools skip the checkpoint, never widen it by omission. A
-`read-only` capability may still go through `capability_search`/`describe`
-freely; `mutating` and `consequential` capabilities are the ones
-`capability_invoke` (slice 2) submits to the `PolicyCheckpoint` before
-dispatch.
+**Any tool absent from the table classifies `consequential`** — the
+fail-safe default, hard-coded in the loader rather than configurable from
+the file itself, so the table can only narrow which tools skip the
+checkpoint, never widen it by omission. A `read-only` capability may still
+go through `capability_search`/`describe` freely; `mutating` and
+`consequential` capabilities are the ones `capability_invoke` (slice 2)
+submits to the `PolicyCheckpoint` before dispatch.
+
+The tiers rank side effect only. A `read-only` tool that discloses
+sensitive data (`mctl_get_service_config`, `mctl_get_service_logs`,
+`mctl_read_openclaw_identity`) therefore never reaches the checkpoint under
+this vocabulary. Whether such reads need one is an open question for the
+slice that wires the checkpoint (`#197`); until then `ExecutionPlan.tools`
+remains the gate for them.
 
 ### 9. Boundary rules — normative and testable (mirrors ADR 009 sec. 5)
 
