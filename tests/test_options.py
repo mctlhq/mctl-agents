@@ -1585,10 +1585,23 @@ def test_gateway_with_absent_checkpoint_and_a_consequential_capability_is_refuse
         _gateway_options(tmp_path, monkeypatch, gateway)
 
 
-def test_gateway_with_absent_checkpoint_over_read_only_capabilities_is_allowed(tmp_path, monkeypatch):
+def test_gateway_with_absent_checkpoint_over_read_only_capabilities_is_also_refused(tmp_path, monkeypatch):
+    """ADR 017 sec. 8, option B (dated owner decision, 2026-09-26):
+    `capability_invoke` sends every capability through the checkpoint,
+    whatever its tier, so `AbsentPolicyCheckpoint` is refused even over a
+    set holding only `read-only` capabilities — not only a mutating/
+    consequential one."""
     from orchestrator.capability import AbsentPolicyCheckpoint
 
     gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=("read-only",))
+    with pytest.raises(ValueError, match="AbsentPolicyCheckpoint"):
+        _gateway_options(tmp_path, monkeypatch, gateway)
+
+
+def test_gateway_with_absent_checkpoint_over_an_empty_set_is_allowed(tmp_path, monkeypatch):
+    from orchestrator.capability import AbsentPolicyCheckpoint
+
+    gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=())
     built = _gateway_options(tmp_path, monkeypatch, gateway)
     assert built.mcp_servers == {"capability": {"fake": "server-config"}}
 

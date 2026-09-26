@@ -8,12 +8,14 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import pathlib
 import shutil
 import stat
 import subprocess
+import sys
 import types
 from pathlib import Path
 
@@ -595,7 +597,19 @@ def _investigate_harness(tmp_path, monkeypatch, *, agent, number=7, title="Some 
     monkeypatch.setattr(run_issue_investigator, "gh_issue_view", lambda url: issue)
     monkeypatch.setattr(run_issue_investigator, "_clone_repo", lambda repo, slug: clone_dir)
     monkeypatch.setattr(run_issue_investigator, "_run_agent", agent)
-    monkeypatch.setattr(run_issue_investigator.anyio, "run", lambda fn, *a: fn(*a))
+
+    def _fake_anyio_run(fn, *args):
+        # _investigate() now calls anyio.run(functools.partial(_run_agent,
+        # issue_url=..., ...), repo_dir, prompt, proposal_dir) (mctlhq/
+        # mctl-agents#242 slice 3) — the correlation kwargs are for the real
+        # _run_agent's discovery branch, not for these harness doubles
+        # (whichever fake is CURRENTLY installed as _run_agent, including one
+        # a test re-monkeypatches after this harness runs), so unwrap the
+        # partial and drop its bound kwargs before dispatching.
+        target = fn.func if isinstance(fn, functools.partial) else fn
+        return target(*args)
+
+    monkeypatch.setattr(run_issue_investigator.anyio, "run", _fake_anyio_run)
     monkeypatch.setattr(run_issue_investigator, "post_proposal_comment", lambda *a, **k: None)
     return issue
 
@@ -726,8 +740,14 @@ def test_investigate_sets_rate_limited_on_429(tmp_path, monkeypatch):
             RateLimitExhaustedError("SDK reported api_error_status=429: boom")
         ),
     )
-    monkeypatch.setattr(run_issue_investigator.anyio, "run",
-                        lambda fn, *a: fn(*a))
+    # _investigate() calls anyio.run(functools.partial(_run_agent,
+    # issue_url=..., ...), ...) (mctlhq/mctl-agents#242 slice 3) — unwrap the
+    # partial so this 3-arg double is not handed correlation kwargs it does
+    # not accept.
+    monkeypatch.setattr(
+        run_issue_investigator.anyio, "run",
+        lambda fn, *a: (fn.func if isinstance(fn, functools.partial) else fn)(*a),
+    )
 
     result = investigate(issue.ref.url, state_dir=tmp_path)
     assert result.rate_limited is True
@@ -3257,8 +3277,9 @@ def test_run_agent_declarative_mode_resolves_a_plan_and_uses_plan_builder(tmp_pa
 
     captured_plan_calls = []
 
-    def _fake_build_from_plan(plan, repo_dir, proposal_dir):
+    def _fake_build_from_plan(plan, repo_dir, proposal_dir, *, gateway=None):
         captured_plan_calls.append(plan)
+        assert gateway is None  # capability_mode defaults to eager here
         return types.SimpleNamespace(mcp_servers={})
 
     monkeypatch.setattr(
@@ -3286,6 +3307,228 @@ def test_run_agent_invalid_resolver_mode_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "bogus")
     with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_RESOLVER_MODE"):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# _capability_mode / discovery-mode wiring (mctlhq/mctl-agents#242 slice 3,
+# ADR 017: docs/adr/017-capability-discovery-and-gateway-contract.md).
+# T13.
+# ---------------------------------------------------------------------------
+def test_capability_mode_defaults_to_eager(monkeypatch):
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", raising=False)
+    assert run_issue_investigator._capability_mode() == "eager"
+
+
+def test_capability_mode_rejects_an_invalid_value(monkeypatch):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "bogus")
+    with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_CAPABILITY_MODE"):
+        run_issue_investigator._capability_mode()
+
+
+@pytest.mark.parametrize("mode", ["eager", "discovery"])
+def test_capability_mode_accepts_every_documented_value(monkeypatch, mode):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", mode)
+    assert run_issue_investigator._capability_mode() == mode
+
+
+def test_capability_mode_prints_the_capability_line(monkeypatch, capsys):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "eager")
+    run_issue_investigator._capability_mode()
+    assert "[capability] capability_mode='eager'" in capsys.readouterr().out
+
+
+def test_run_agent_unset_capability_mode_is_eager_and_never_imports_the_gateway(
+    tmp_path, monkeypatch, capsys
+):
+    """DoD: unset env runs the unchanged path and never imports
+    orchestrator.capability_gateway — the RUNTIME half that pulls in
+    claude_agent_sdk/mcp and must never reach the worker (tests/
+    test_worker_isolation.py)."""
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", raising=False)
+    monkeypatch.delitem(sys.modules, "orchestrator.capability_gateway", raising=False)
+    _stub_client_no_messages(monkeypatch)
+    _stub_build_options(monkeypatch, mcp_servers={})
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    assert "orchestrator.capability_gateway" not in sys.modules
+    assert "[capability] capability_mode='eager'" in capsys.readouterr().out
+
+
+def test_run_agent_explicit_eager_capability_mode_is_unchanged(tmp_path, monkeypatch, capsys):
+    """Explicit eager on top of declarative resolver mode: the plan builder
+    is called with gateway=None (its default), exactly as it is when the
+    capability mode env var is absent entirely."""
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "eager")
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    _stub_client_no_messages(monkeypatch)
+
+    captured_gateways = []
+
+    def _fake_build_from_plan(plan, repo_dir, proposal_dir, *, gateway=None):
+        captured_gateways.append(gateway)
+        return types.SimpleNamespace(mcp_servers={})
+
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options_from_plan", _fake_build_from_plan,
+    )
+
+    anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+    assert captured_gateways == [None]
+    assert "[capability] capability_mode='eager'" in capsys.readouterr().out
+
+
+def test_run_agent_invalid_capability_mode_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "bogus")
+    with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_CAPABILITY_MODE"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_run_agent_legacy_resolver_with_discovery_capability_mode_raises_first(tmp_path, monkeypatch):
+    """`legacy + discovery` is rejected before any options are built —
+    never half-applied."""
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", raising=False)  # legacy, the default
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not build any options before the mode check")
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# T17 — the discovery construction site.
+# ---------------------------------------------------------------------------
+def _fake_capability_provider_connector(tools=()):
+    """A `capability_gateway.ProviderConnector` with no network, patched
+    onto `orchestrator.capability_gateway._default_remote_connector` — the
+    one `CapabilityGateway.build()` resolves to when `_run_agent` calls it
+    without a `connector=` override, exactly as production does."""
+    from contextlib import asynccontextmanager
+
+    class _FakeSession:
+        async def list_tools(self):
+            return list(tools)
+
+        async def call_tool(self, tool, arguments):
+            raise AssertionError("discovery must not invoke a capability in this test")
+
+    @asynccontextmanager
+    async def _connect(provider, headers):
+        yield _FakeSession()
+
+    return _connect
+
+
+def test_run_agent_discovery_mode_builds_the_gateway_and_skips_the_mctl_guard(
+    tmp_path, monkeypatch, capsys
+):
+    from orchestrator import capability_gateway as gw
+    from orchestrator import context_assembly as ctx_asm
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    monkeypatch.setattr(gw, "_default_remote_connector", _fake_capability_provider_connector())
+    _stub_client_no_messages(monkeypatch)
+
+    ensure_calls: list[bool] = []
+
+    async def _spy_ensure_mctl_connected(client, *, fatal):
+        ensure_calls.append(fatal)
+
+    monkeypatch.setattr("orchestrator.mcp_guard.ensure_mctl_connected", _spy_ensure_mctl_connected)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build_from_plan(plan, repo_dir, proposal_dir, *, gateway=None):
+        captured["plan"] = plan
+        captured["gateway"] = gateway
+        return types.SimpleNamespace(mcp_servers={"capability": {"fake": True}})
+
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options_from_plan", _fake_build_from_plan,
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("legacy builder must not run in discovery mode")
+        ),
+    )
+
+    anyio.run(functools.partial(
+        run_issue_investigator._run_agent,
+        issue_url="https://github.com/mctlhq/mctl-telegram/issues/7",
+        temporal_workflow_id="wf-1",
+        temporal_run_id="run-1",
+        argo_workflow_name="argo-1",
+    ), tmp_path, "prompt", tmp_path)
+
+    gateway = captured["gateway"]
+    assert gateway is not None
+    assert isinstance(gateway.checkpoint, gw.PolicyDecidePolicyCheckpoint)
+    assert "mcp__mctl__*" in gateway.checkpoint.grants  # MCTL_TOKEN is set above
+
+    expected_correlation = ctx_asm.build_execution_correlation(
+        resolver_mode="declarative",
+        issue_url="https://github.com/mctlhq/mctl-telegram/issues/7",
+        target_repository_sha="f" * 40,
+        plan=captured["plan"],
+        temporal_workflow_id="wf-1",
+        temporal_run_id="run-1",
+        argo_workflow_name="argo-1",
+    )
+    assert gateway.capability_set.execution == expected_correlation
+
+    assert ensure_calls == []  # the guard is skipped; build() is the connection proof
+    assert "[capability] capability_mode='discovery'" in capsys.readouterr().out
+
+
+def test_run_agent_discovery_mode_provider_failure_fails_the_run_and_never_falls_back(
+    tmp_path, monkeypatch
+):
+    """A GatewayError from CapabilityGateway.build() propagates — the run
+    never falls back to eager options."""
+    from contextlib import asynccontextmanager
+
+    from orchestrator import capability_gateway as gw
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+
+    @asynccontextmanager
+    async def _failing_connect(provider, headers):
+        raise gw.ProviderUnavailableError(f"provider {provider.id!r}: connection failed")
+        yield  # pragma: no cover — unreachable, only shapes the generator
+
+    monkeypatch.setattr(gw, "_default_remote_connector", _failing_connect)
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must never fall back to the eager/legacy builder")
+        ),
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options_from_plan",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must never build options after a failed discovery")
+        ),
+    )
+
+    with pytest.raises(gw.ProviderUnavailableError):
+        anyio.run(functools.partial(
+            run_issue_investigator._run_agent,
+            issue_url="https://github.com/mctlhq/mctl-telegram/issues/7",
+        ), tmp_path, "prompt", tmp_path)
 
 
 def test_target_repository_sha_reads_git_head(tmp_path):
@@ -3601,6 +3844,53 @@ def test_build_prompt_with_context_none_matches_the_no_kwarg_call():
         issue, "mctl-agents", "issue-265-x", context=None
     )
     assert with_default == with_explicit_none
+
+
+# ---------------------------------------------------------------------------
+# T19 — the discovery-mode prompt block is additive-only.
+# ---------------------------------------------------------------------------
+def test_capability_discovery_block_is_empty_by_default():
+    """An omitted `capability_discovery_block` changes the rendered prompt
+    by zero bytes — same shape as `service_skills_block`'s own guarantee."""
+    issue = _issue(number=242, title="Capability discovery")
+    with_default = run_issue_investigator._build_prompt(issue, "mctl-agents", "issue-242-x")
+    with_explicit_empty = run_issue_investigator._build_prompt(
+        issue, "mctl-agents", "issue-242-x", capability_discovery_block=""
+    )
+    assert with_default == with_explicit_empty
+    assert "capability_search" not in with_default
+    assert "capability_describe" not in with_default
+    assert "capability_invoke" not in with_default
+
+
+def test_capability_discovery_block_appears_only_when_supplied():
+    issue = _issue(number=242, title="Capability discovery")
+    without_block = run_issue_investigator._build_prompt(issue, "mctl-agents", "issue-242-x")
+    with_block = run_issue_investigator._build_prompt(
+        issue, "mctl-agents", "issue-242-x",
+        capability_discovery_block=run_issue_investigator._CAPABILITY_DISCOVERY_PROMPT_BLOCK,
+    )
+    assert with_block != without_block
+    assert "capability_search" in with_block
+    assert "capability_describe" in with_block
+    assert "capability_invoke" in with_block
+    # Everything from "## What to produce" onward is byte-identical: the
+    # block is a pure addition above it, never a rewrite of anything else.
+    assert (
+        without_block.split("## What to produce", 1)[1]
+        == with_block.split("## What to produce", 1)[1]
+    )
+
+
+def test_capability_discovery_prompt_block_is_only_rendered_in_discovery_mode(monkeypatch):
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", raising=False)
+    assert run_issue_investigator._capability_discovery_prompt_block() == ""
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    assert (
+        run_issue_investigator._capability_discovery_prompt_block()
+        == run_issue_investigator._CAPABILITY_DISCOVERY_PROMPT_BLOCK
+    )
 
 
 def test_legacy_allowed_tools_matches_options_builder(tmp_path, monkeypatch):

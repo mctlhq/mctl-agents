@@ -233,6 +233,16 @@ class _McpProviderSession:
 
     provider: ProviderRef
     session: Any
+    #: Count of tools whose `annotations` was present but could not be
+    #: coerced by `_annotations_to_dict` (returned `{}` despite non-`None`
+    #: input), set fresh by the most recent `list_tools()` call. `_discover`
+    #: folds this into the `CAPABILITY_PROVIDER_DEGRADED` line's
+    #: `annotations_dropped` count via `getattr(session,
+    #: "annotation_serialization_drops", 0)` — a drop made HERE, inside the
+    #: conversion, would otherwise never be counted: by the time `_discover`
+    #: sees `ProviderTool.annotations` it is already `{}`, indistinguishable
+    #: from "no annotations at all".
+    annotation_serialization_drops: int = field(default=0, compare=False)
 
     async def list_tools(self) -> list[ProviderTool]:
         try:
@@ -241,15 +251,20 @@ class _McpProviderSession:
             raise ProviderTimeoutError(f"provider {self.provider.id!r}: list_tools timed out: {exc}") from exc
         except Exception as exc:
             raise GatewayError(f"provider {self.provider.id!r}: list_tools failed: {exc}") from exc
-        return [
-            ProviderTool(
+        self.annotation_serialization_drops = 0
+        tools: list[ProviderTool] = []
+        for t in result.tools:
+            raw_annotations = getattr(t, "annotations", None)
+            converted = _annotations_to_dict(raw_annotations)
+            if raw_annotations is not None and not converted:
+                self.annotation_serialization_drops += 1
+            tools.append(ProviderTool(
                 name=t.name,
                 description=t.description or "",
                 input_schema=t.inputSchema or {},
-                annotations=_annotations_to_dict(getattr(t, "annotations", None)),
-            )
-            for t in result.tools
-        ]
+                annotations=converted,
+            ))
+        return tools
 
     async def call_tool(self, tool: str, arguments: Mapping[str, Any]) -> ToolCallResult:
         try:
@@ -403,6 +418,20 @@ def _usable_tool_name(name: Any) -> bool:
     return isinstance(name, str) and bool(name) and "/" not in name
 
 
+def _reject_unusable_provider_id(provider: ProviderRef) -> None:
+    """A `provider.id` carrying `/` would corrupt every capability_id this
+    provider mints (`mctl://<type>/<id>/<tool>` — `_parse_capability_id`
+    splits on exactly three `/`-delimited segments). Unlike a single bad
+    tool name (`_usable_tool_name`, per-tool and merely excluded), a bad
+    `provider.id` poisons the whole provider, so it fails closed at
+    discovery time rather than being silently skipped."""
+    if "/" in provider.id:
+        raise GatewayError(
+            f"provider.id {provider.id!r} must not contain '/' — it appears verbatim in every "
+            "capability_id this provider mints (mctl://<provider_type>/<provider_id>/<tool>)"
+        )
+
+
 def _utcnow_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -445,6 +474,7 @@ async def _discover(
     excluded_count = 0
 
     for provider in providers:
+        _reject_unusable_provider_id(provider)
         if provider.type == "mcp-remote":
             session_cm = resolved_connector(provider, discovery_headers)
         elif provider.id in local_sessions:
@@ -459,7 +489,13 @@ async def _discover(
             tools = await session.list_tools()
 
         unusable_names = 0
-        annotations_dropped = 0
+        # Seeded with any drop `_McpProviderSession.list_tools()` already
+        # made inside `_annotations_to_dict` (a raw ToolAnnotations that
+        # failed to coerce): those never reach `_bounded_annotations` below
+        # with a truthy `info.annotations`, so they would otherwise vanish
+        # from this count. `getattr` defaults to 0 for every other session
+        # shape (a fake in tests, an execution-local registry).
+        annotations_dropped = getattr(session, "annotation_serialization_drops", 0)
         for info in tools:
             if not _usable_tool_name(info.name):
                 unusable_names += 1
@@ -627,14 +663,6 @@ class PolicyDecidePolicyCheckpoint:
 # sealed CapabilitySet.
 # ---------------------------------------------------------------------------
 
-#: Consequence tiers that must clear the PolicyCheckpoint before dispatch
-#: (ADR 017 sec. 8): "'mutating' and 'consequential' capabilities are the
-#: ones capability_invoke submits to the PolicyCheckpoint before dispatch."
-#: `read-only` never reaches it, even one that discloses sensitive data —
-#: an open product question ADR 017 sec. 8 leaves for a later slice, not
-#: reopened here.
-_CHECKPOINT_CONSEQUENCES = frozenset({"mutating", "consequential"})
-
 #: Bound on a model-invented id carried into a `not-eligible` trace line.
 #: Eligible ids come from the sealed set and are never truncated.
 _MAX_TRACED_ID_LENGTH = 256
@@ -801,11 +829,12 @@ class CapabilityGateway:
 
     async def invoke(self, capability_id: Any, arguments: Any) -> dict[str, Any]:
         """Membership check against the sealed set, then the
-        `PolicyCheckpoint` (for `mutating`/`consequential` capabilities
-        only), then dispatch — remote via the provider connector, local in
-        process, with zero network hop (ADR 017 sec. 5). Returns exactly one
-        reason code from `orchestrator.capability.REASON_CODES` on every
-        path, and emits one invocation trace line regardless of outcome."""
+        `PolicyCheckpoint` (every capability, whatever its consequence tier
+        — ADR 017 sec. 8, option B), then dispatch — remote via the provider
+        connector, local in process, with zero network hop (ADR 017 sec. 5).
+        Returns exactly one reason code from
+        `orchestrator.capability.REASON_CODES` on every path, and emits one
+        invocation trace line regardless of outcome."""
         start = time.monotonic()
 
         if not isinstance(capability_id, str):
@@ -817,7 +846,10 @@ class CapabilityGateway:
             return {"reason_code": "invalid-arguments", "error": "capability_id must be a string"}
 
         if not isinstance(arguments, Mapping):
-            record = self._record(capability_id, "refused", "invalid-arguments", start, {}, policy_checkpoint="absent")
+            record = self._record(
+                capability_id[:_MAX_TRACED_ID_LENGTH], "refused", "invalid-arguments", start, {},
+                policy_checkpoint="absent",
+            )
             self._trace(record)
             return {"reason_code": "invalid-arguments", "error": "arguments must be a JSON object"}
 
@@ -830,16 +862,22 @@ class CapabilityGateway:
             self._trace(record)
             return {"reason_code": "not-eligible", "error": f"{capability_id!r} is not eligible for this execution"}
 
-        policy_status = "absent"
-        if descriptor.consequence in _CHECKPOINT_CONSEQUENCES:
-            verdict = self.checkpoint.check(descriptor, self.capability_set.execution)
-            policy_status = policy_checkpoint_status(self.checkpoint, verdict)
-            if verdict.decision != "allowed":
-                record = self._record(
-                    capability_id, "refused", "policy-denied", start, arguments, policy_checkpoint=policy_status,
-                )
-                self._trace(record)
-                return {"reason_code": "policy-denied", "error": verdict.reason}
+        # ADR 017 sec. 8, option B (dated owner decision, 2026-09-26): every
+        # capability goes through the PolicyCheckpoint before dispatch,
+        # whatever its consequence tier. BUILTIN_POLICY still allows reads,
+        # so behaviour is unchanged for read-only tools; what changes is that
+        # the decision — ALLOW included — is now recorded, matching the
+        # direct mcp__mctl__* path's audit trail (_PolicyCheckpointHook
+        # sends every call through the checkpoint, not only mutating/
+        # consequential ones).
+        verdict = self.checkpoint.check(descriptor, self.capability_set.execution)
+        policy_status = policy_checkpoint_status(self.checkpoint, verdict)
+        if verdict.decision != "allowed":
+            record = self._record(
+                capability_id, "refused", "policy-denied", start, arguments, policy_checkpoint=policy_status,
+            )
+            self._trace(record)
+            return {"reason_code": "policy-denied", "error": verdict.reason}
 
         dispatch = self.dispatch_by_id.get(capability_id)
         if dispatch is None:

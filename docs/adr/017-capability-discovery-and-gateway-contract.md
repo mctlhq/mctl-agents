@@ -290,16 +290,51 @@ duplicated key, which would otherwise change a tier silently (last wins).
 fail-safe default, hard-coded in the loader rather than configurable from
 the file itself, so the table can only narrow which tools skip the
 checkpoint, never widen it by omission. A `read-only` capability may still
-go through `capability_search`/`describe` freely; `mutating` and
-`consequential` capabilities are the ones `capability_invoke` (slice 2)
-submits to the `PolicyCheckpoint` before dispatch.
+go through `capability_search`/`describe` freely; `capability_invoke`
+(slice 2) submits every capability to the `PolicyCheckpoint` before
+dispatch, whatever its consequence tier (option B below).
 
-The tiers rank side effect only. A `read-only` tool that discloses
-sensitive data (`mctl_get_service_config`, `mctl_get_service_logs`,
-`mctl_read_openclaw_identity`) therefore never reaches the checkpoint under
-this vocabulary. Whether such reads need one is an open question for the
-slice that wires the checkpoint (`#197`); until then `ExecutionPlan.tools`
-remains the gate for them.
+> **Amended 2026-09-26 (slice 3, dated owner decision).** The two
+> paragraphs above originally read: "`mutating` and `consequential`
+> capabilities are the ones `capability_invoke` (slice 2) submits to the
+> `PolicyCheckpoint` before dispatch," and the tiers-rank-side-effect-only
+> paragraph below closed with "Whether such reads need one is an open
+> question for the slice that wires the checkpoint (`#197`); until then
+> `ExecutionPlan.tools` remains the gate for them." Slice 3 closes that
+> question.
+>
+> Facts on `main` at the time of the decision: on the direct `mcp__mctl__*`
+> path, `_PolicyCheckpointHook` sends **every** call through
+> `policy_checkpoint.checkpoint` and every decision — ALLOW included — emits
+> a `POLICY_DECISION` audit line. On the gateway path as slice 2 shipped it,
+> `capability_invoke` consulted the checkpoint only for `mutating`/
+> `consequential`; a `read-only` call dispatched with no policy decision and
+> no audit line at all — an audit regression against the direct path, and
+> the mechanism behind the `mctl_verify_domain` P1 on #508 (closed there
+> only by a table test, not by the invocation path itself).
+>
+> **Decision (option B): `capability_invoke` sends every capability through
+> the `PolicyCheckpoint`, whatever its tier.** Behaviour is unchanged in
+> practice, because `BUILTIN_POLICY` still allows reads; what changes is
+> that the decision is now recorded, matching the direct path's audit
+> trail, and a misclassified `read-only` entry can no longer bypass policy
+> silently. The consequence tier stays in the descriptor and in
+> `capability_search` rows as information for the model; it no longer
+> decides whether the checkpoint runs. `options._require_enforcing_checkpoint`
+> correspondingly refuses `AbsentPolicyCheckpoint` over any non-empty sealed
+> set, not only one holding a mutating/consequential member.
+>
+> Rejected: **A** (keep the tier gate) loses the audit line for reads.
+> **C** (a "sensitive-read" tier gated behind human approval) stays
+> explicitly out of scope — the investigator reads logs on almost every
+> run, so every run would stall on an approval; C would need its own issue
+> if ever wanted.
+
+The tiers rank side effect only. Every capability now reaches the
+`PolicyCheckpoint` regardless of tier (option B above), so a `read-only`
+tool that discloses sensitive data (`mctl_get_service_config`,
+`mctl_get_service_logs`, `mctl_read_openclaw_identity`) is audited exactly
+like every other capability the gateway dispatches.
 
 ### 9. Boundary rules — normative and testable (mirrors ADR 009 sec. 5)
 
