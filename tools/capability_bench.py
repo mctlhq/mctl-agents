@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Benchmark harness for mctlhq/mctl-agents#242 slice 4 (task 13, design.md
 sec. 4): measures the eager-vs-discovery capability-loading tradeoff this
-proposal claims but this implementer pass does not itself measure (that is
-part C — an operator step, run after part A/this repo and part B/mctl-gitops
-both land; see `docs/benchmarks/capability-discovery.md`).
+proposal claims. The measurement itself is an operator step (part C); its
+results are in `docs/benchmarks/capability-discovery.md`.
 
 Two independent commands:
 
@@ -25,10 +24,11 @@ Two independent commands:
   — and renders the markdown table this proposal's benchmark doc expects:
   input, output, cache-read and cache-creation tokens, turns and wall
   clock, with the sample size (1 run per mode, for this pilot) stated
-  explicitly. Token math reuses `orchestrator.usage_ledger.UsageRecorder.
-  records_for` (pure: no delivery, no network — the recorder is
-  unconditionally constructed with no token, which disables delivery by
-  construction). USD cost is NOT computed here: the price catalog is
+  explicitly. Token math reuses `orchestrator.usage_ledger.UsageRecorder`'s
+  own per-message planning, committing its baseline between messages so
+  cumulative `model_usage` becomes per-message deltas (no delivery, no
+  network — the recorder is unconditionally constructed with no token,
+  which disables delivery by construction). USD cost is NOT computed here: the price catalog is
   server-side (mctl-api), not duplicated in this repository.
 
 Every function performing I/O (`_live_mctl_tools`, the two `_cmd_*`
