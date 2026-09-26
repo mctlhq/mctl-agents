@@ -3386,9 +3386,28 @@ def test_run_agent_legacy_resolver_with_discovery_capability_mode_raises_first(t
     never half-applied."""
     monkeypatch.delenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", raising=False)  # legacy, the default
     monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
-    # Set, so the MCTL_TOKEN preflight (which runs first) cannot be the
-    # branch that exits: this test is about legacy + discovery.
+    # Set, so the MCTL_TOKEN preflight cannot be the branch that exits: this
+    # test is about legacy + discovery.
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("must not build any options before the mode check")
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="requires ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_run_agent_resolver_mode_preflight_wins_over_the_token_preflight(tmp_path, monkeypatch):
+    """T22 (#509 review follow-up, task 6): the resolver-mode check now runs
+    BEFORE the MCTL_TOKEN check, so `legacy + discovery` with no MCTL_TOKEN at
+    all still names the resolver-mode mismatch, never `requires MCTL_TOKEN`
+    — the more fundamental problem must win."""
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", raising=False)  # legacy, the default
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
     monkeypatch.setattr(
         "orchestrator.options.build_issue_investigator_options",
         lambda *a, **k: (_ for _ in ()).throw(
@@ -3430,10 +3449,11 @@ def test_run_agent_discovery_mode_builds_the_gateway_and_skips_the_mctl_guard(
     from orchestrator import capability_gateway as gw
     from orchestrator import context_assembly as ctx_asm
 
-    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
-    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
-    monkeypatch.setenv("MCTL_TOKEN", "test-token")
-    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    # mctlhq/mctl-agents#242 slice 4: the real committed catalog does not
+    # permit discovery yet (that is the mctl-gitops half, part B), so this
+    # patches resolver.execute to return a plan that does — see
+    # _discovery_env's docstring.
+    _discovery_env(monkeypatch)
     monkeypatch.setattr(gw, "_default_remote_connector", _fake_capability_provider_connector())
     _stub_client_no_messages(monkeypatch)
 
@@ -3473,6 +3493,9 @@ def test_run_agent_discovery_mode_builds_the_gateway_and_skips_the_mctl_guard(
     assert gateway is not None
     assert isinstance(gateway.checkpoint, gw.PolicyDecidePolicyCheckpoint)
     assert "mcp__mctl__*" in gateway.checkpoint.grants  # MCTL_TOKEN is set above
+    # T21 (task 3): the gateway is built from the PLAN's providers, not a
+    # module-level constant — see _discovery_env's _permitting_provider().
+    assert gateway.capability_set.providers == captured["plan"].capability_providers
 
     expected_correlation = ctx_asm.build_execution_correlation(
         resolver_mode="declarative",
@@ -3489,6 +3512,36 @@ def test_run_agent_discovery_mode_builds_the_gateway_and_skips_the_mctl_guard(
     assert "[capability] capability_mode='discovery'" in capsys.readouterr().out
 
 
+def test_run_agent_discovery_refused_when_the_profile_does_not_permit_it(tmp_path, monkeypatch):
+    """T21 (task 3, design.md sec. 1): "the catalog permits, the env var
+    activates" — the env var alone is no longer sufficient. Real catalog,
+    unmodified (the mctl-gitops half, part B, is not part of this run): its
+    `issue-investigator-default` profile declares no `capabilityDiscovery`
+    at all, so `plan.capability_discovery_enabled` is `False` and the run
+    must refuse before any gateway or options are built."""
+    from orchestrator import capability_gateway as gw
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    monkeypatch.setattr(gw, "_default_remote_connector", _raising_connector_for_tests())
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options_from_plan",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not build options")),
+    )
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not build options")),
+    )
+
+    with pytest.raises(SystemExit, match="requires the resolved profile to permit discovery"):
+        anyio.run(functools.partial(
+            run_issue_investigator._run_agent,
+            issue_url="https://github.com/mctlhq/mctl-telegram/issues/7",
+        ), tmp_path, "prompt", tmp_path)
+
+
 def test_run_agent_discovery_mode_provider_failure_fails_the_run_and_never_falls_back(
     tmp_path, monkeypatch
 ):
@@ -3498,10 +3551,8 @@ def test_run_agent_discovery_mode_provider_failure_fails_the_run_and_never_falls
 
     from orchestrator import capability_gateway as gw
 
-    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
-    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
-    monkeypatch.setenv("MCTL_TOKEN", "test-token")
-    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    # mctlhq/mctl-agents#242 slice 4: see _discovery_env's docstring.
+    _discovery_env(monkeypatch)
 
     @asynccontextmanager
     async def _failing_connect(provider, headers):
@@ -4753,7 +4804,21 @@ def test_investigate_passes_the_correlation_inputs_to_run_agent(tmp_path, monkey
     assert seen["assemble_kwargs"]["argo_workflow_name"] == run_kwargs["argo_workflow_name"]
 
 
+def _permitting_provider():
+    from orchestrator import capability as cap
+
+    return cap.ProviderRef(type="mcp-remote", id="mctl-api", alias="mctl", endpoint_ref="https://api.mctl.ai/mcp")
+
+
 def _discovery_env(monkeypatch, *, with_token: bool = True):
+    """mctlhq/mctl-agents#242 slice 4 (design.md sec. 1): "the catalog
+    permits, the env var activates". The real committed catalog does not
+    declare `capabilityDiscovery` yet (that is the mctl-gitops half, part B),
+    so every discovery test here overrides `resolver.execute` to return a
+    plan that permits it — otherwise every one of them would fail on the new
+    profile-permission preflight before reaching what it actually tests."""
+    from orchestrator import resolver
+
     monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
     monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
     if with_token:
@@ -4761,6 +4826,15 @@ def _discovery_env(monkeypatch, *, with_token: bool = True):
     else:
         monkeypatch.delenv("MCTL_TOKEN", raising=False)
     monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    real_execute = resolver.execute
+
+    def _permitting_execute(*args, **kwargs):
+        plan = real_execute(*args, **kwargs)
+        return dataclasses.replace(
+            plan, capability_discovery_enabled=True, capability_providers=(_permitting_provider(),),
+        )
+
+    monkeypatch.setattr(resolver, "execute", _permitting_execute)
     for name in ("build_issue_investigator_options", "build_issue_investigator_options_from_plan"):
         monkeypatch.setattr(
             f"orchestrator.options.{name}",

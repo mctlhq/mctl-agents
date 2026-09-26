@@ -440,6 +440,32 @@ def test_a_denied_read_only_invocation_performs_no_provider_call():
     assert session.calls == []
 
 
+class _RaisingCheckpoint:
+    """A `PolicyCheckpoint` implementation that raises instead of deciding —
+    task 8 (#509 review follow-up, design.md "5."): this must fail closed,
+    never fall through to dispatch."""
+
+    def check(self, descriptor, correlation):
+        raise RuntimeError("checkpoint backend unavailable")
+
+
+def test_a_raising_checkpoint_yields_policy_denied_and_no_provider_call():
+    session = FakeSession(tools=[_tool("mctl_whoami")])
+    connector = _fake_connector({REMOTE_PROVIDER.id: session})
+
+    gateway = anyio.run(partial(
+        _build, ("mcp__mctl__*",), providers=[REMOTE_PROVIDER], connector=connector,
+        checkpoint=_RaisingCheckpoint(),
+    ))
+    capability_id = "mctl://mcp-remote/mctl-api/mctl_whoami"
+    session.calls.clear()
+
+    result = anyio.run(partial(gateway.invoke, capability_id, {}))
+
+    assert result["reason_code"] == "policy-denied"
+    assert session.calls == []
+
+
 # ---------------------------------------------------------------------------
 # Task 6b — PolicyDecidePolicyCheckpoint, the #197 adapter.
 # ---------------------------------------------------------------------------
@@ -936,10 +962,11 @@ def test_annotation_serialization_drop_is_counted_through_mcp_provider_session(c
     `_annotations_to_dict` (not `None`, not `Mapping`-like, no
     `model_dump`) already reads as `{}` by the time `_discover` inspects
     `ProviderTool.annotations` — indistinguishable there from "no
-    annotations at all". The drop must be counted through
-    `_McpProviderSession.annotation_serialization_drops` instead, and only
-    through the real session path (`_McpProviderSession`), not `FakeSession`
-    (design.md "5. Carried from #508's last review round")."""
+    annotations at all". The drop must be counted through the per-tool
+    `ProviderTool.annotations_unparseable` flag `_McpProviderSession.
+    list_tools()` sets instead, and only through the real session path
+    (`_McpProviderSession`), not `FakeSession` (design.md "5. Carried from
+    #508's last review round")."""
     unusable_annotations = object()  # not None, not a Mapping, no model_dump
     real_session = _FakeRealMcpSession([_FakeMcpToolInfo("mctl_whoami", annotations=unusable_annotations)])
     mcp_session = gw._McpProviderSession(REMOTE_PROVIDER, real_session)
@@ -957,6 +984,37 @@ def test_annotation_serialization_drop_is_counted_through_mcp_provider_session(c
     line = next(line for line in out.splitlines() if line.startswith("CAPABILITY_PROVIDER_DEGRADED "))
     payload = json.loads(line.split(" ", 1)[1])
     assert payload["annotations_dropped"] == 1
+
+
+def test_an_ineligible_tools_annotation_drop_is_not_counted(capsys):
+    """T22 (#509 review follow-up, design.md "5. Carried from #509's last
+    review round"): a tool excluded by `plan.tools` was never eligible, so
+    its annotation drop must not inflate `annotations_dropped` — that count
+    and `excluded_count` would otherwise disagree about how many tools the
+    sealed set actually considered. `mctl_whoami` matches `mcp__mctl__*` and
+    counts; `mctl_not_granted` matches nothing in `plan.tools` and must not,
+    even though both tools' annotations are equally uncoercible."""
+    unusable_annotations = object()  # not None, not a Mapping, no model_dump
+    real_session = _FakeRealMcpSession([
+        _FakeMcpToolInfo("mctl_whoami", annotations=unusable_annotations),
+        _FakeMcpToolInfo("mctl_not_granted", annotations=unusable_annotations),
+    ])
+    mcp_session = gw._McpProviderSession(REMOTE_PROVIDER, real_session)
+
+    @asynccontextmanager
+    async def _connect(provider, headers):
+        yield mcp_session
+
+    capability_set = anyio.run(partial(
+        gw.resolve_eligible, _plan(("mcp__mctl__mctl_whoami",)), _execution(), [REMOTE_PROVIDER],
+        connector=_connect, headers={},
+    ))
+    assert capability_set.excluded_count == 1  # mctl_not_granted
+
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if line.startswith("CAPABILITY_PROVIDER_DEGRADED "))
+    payload = json.loads(line.split(" ", 1)[1])
+    assert payload["annotations_dropped"] == 1  # mctl_whoami only, not both
 
 
 def test_a_provider_id_containing_a_slash_is_rejected_at_discovery():
@@ -996,7 +1054,6 @@ def test_empty_annotations_are_not_counted_as_a_drop(capsys):
         gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
         connector=_connect, headers={},
     ))
-    assert mcp_session.annotation_serialization_drops == 0
     assert "CAPABILITY_PROVIDER_DEGRADED" not in capsys.readouterr().out
 
 

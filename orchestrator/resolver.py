@@ -81,6 +81,8 @@ from typing import Any, cast
 import yaml
 
 from config.model_policy import DEFAULT_POLICY_PATH, resolve_model
+from config.settings import MCTL_MCP_URL
+from orchestrator.capability import MCTL_API_PROVIDER_ID, PROVIDER_TYPES, ProviderRef
 from orchestrator.manifest import ManifestError as _ManifestError
 from orchestrator.manifest import PromptSource
 from orchestrator.service_skills import ServiceSkillBundle, ServiceSkillPolicy
@@ -123,6 +125,20 @@ _COMPAT_RE = re.compile(r"(>=|<=|==|>|<)\s*([0-9]+(?:\.[0-9]+)*)")
 # under these, checked by _bounded() below.
 MAX_BUDGET_USD = 100.0
 MAX_TIMEOUT_SECONDS = 86400.0  # 24h
+
+# mctlhq/mctl-agents#242 slice 4 (design.md sec. 1/2): the closed map of
+# `spec.capabilityDiscovery.providers[].endpoint` symbolic names to the real
+# URL/host they resolve to. `endpoint` is deliberately a NAME, never a URL, in
+# the catalog: a profile edit must never be able to point the gateway, and the
+# bearer token it sends, at an arbitrary host. An unknown name is a resolver
+# error, never a pass-through.
+_CAPABILITY_ENDPOINTS: Mapping[str, str] = {"mctl-api-mcp": MCTL_MCP_URL}
+
+# The one alias the `mctl-api` provider must declare, so the SDK-visible
+# names the gateway builds stay `mcp__mctl__<tool>` and continue to match
+# `spec.tools`' `mcp__mctl__*` entry (design.md sec. 1). The resolver
+# validates this rather than relying on convention.
+_MCTL_API_REQUIRED_ALIAS = "mctl"
 
 
 class ResolverError(ValueError):
@@ -203,6 +219,12 @@ class ExecutionProfile:
     service_skills: ServiceSkillPolicy = field(
         default_factory=lambda: ServiceSkillPolicy(enabled=False), compare=False
     )
+    # mctlhq/mctl-agents#242 slice 4 (design.md sec. 1/2): optional
+    # spec.capabilityDiscovery block. Absent -> disabled with no providers --
+    # see _parse_capability_discovery -- so every profile that predates this
+    # field resolves to a plan identical to today's.
+    capability_discovery_enabled: bool = False
+    capability_providers: tuple[ProviderRef, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -278,6 +300,13 @@ class ExecutionPlan:
     service_skills: tuple[Mapping[str, Any], ...] = ()
     service_skill_manifest_hash: str | None = None
     service_skills_resolved_from_sha: str = ""
+    # mctlhq/mctl-agents#242 slice 4 (design.md sec. 1/2): "the catalog
+    # permits, the env var activates" — mirrors ExecutionProfile's own two
+    # fields (see load_profile/_parse_capability_discovery). Defaulted so
+    # every plan resolved from a profile that predates this field is
+    # identical to today's.
+    capability_discovery_enabled: bool = False
+    capability_providers: tuple[ProviderRef, ...] = ()
 
     def to_log_dict(self) -> dict[str, Any]:
         """JSON-serializable snapshot for structured logging (mctlhq/mctl-agents#227
@@ -310,6 +339,8 @@ class ExecutionPlan:
             "service_skills": [dict(s) for s in self.service_skills],
             "service_skill_manifest_hash": self.service_skill_manifest_hash,
             "service_skills_resolved_from_sha": self.service_skills_resolved_from_sha,
+            "capability_discovery_enabled": self.capability_discovery_enabled,
+            "capability_providers": [p.to_dict() for p in self.capability_providers],
         }
 
     def log(self) -> None:
@@ -456,6 +487,84 @@ def _parse_service_skills_policy(raw: Any, *, path: Path) -> ServiceSkillPolicy:
         return ServiceSkillPolicy.from_spec(raw)
     except ServiceSkillError as exc:
         raise ResolverError(f"{path}: spec.serviceSkills: {exc}") from exc
+
+
+def _parse_capability_discovery(
+    spec: Mapping[str, Any], *, path: Path
+) -> tuple[bool, tuple[ProviderRef, ...]]:
+    """mctlhq/mctl-agents#242 slice 4 (design.md sec. 1/2): parse the
+    profile's optional `spec.capabilityDiscovery` block. Absent field ==
+    `(False, ())` -- disabled, no providers -- so a profile that predates
+    this field resolves to a plan identical to today's (task 1's DoD). Every
+    violation raises `ResolverError` naming the field: a malformed or
+    unapproved provider declaration must not resolve silently.
+
+    `providers` is ORDERED -- alias assignment follows declaration order
+    (design.md's "ordered; alias assignment follows this order") -- so this
+    returns a tuple, not a set, and never reorders what it read.
+    """
+    raw = spec.get("capabilityDiscovery")
+    if raw is None:
+        return False, ()
+    block = _require_mapping(raw, path=path, field_path="spec.capabilityDiscovery")
+    enabled = block.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ResolverError(
+            f"{path}: spec.capabilityDiscovery.enabled must be a bool, got {enabled!r}"
+        )
+    providers_raw = block.get("providers", [])
+    if not isinstance(providers_raw, list):
+        raise ResolverError(f"{path}: spec.capabilityDiscovery.providers must be a list")
+
+    providers: list[ProviderRef] = []
+    seen_aliases: set[str] = set()
+    for index, entry in enumerate(providers_raw):
+        field_path = f"spec.capabilityDiscovery.providers[{index}]"
+        entry_map = _require_mapping(entry, path=path, field_path=field_path)
+        provider_type = entry_map.get("type")
+        if provider_type not in PROVIDER_TYPES:
+            raise ResolverError(
+                f"{path}: {field_path}.type {provider_type!r} is not one of "
+                f"{sorted(PROVIDER_TYPES)!r}"
+            )
+        provider_id_raw = entry_map.get("id")
+        if not isinstance(provider_id_raw, str) or not provider_id_raw or "/" in provider_id_raw:
+            raise ResolverError(
+                f"{path}: {field_path}.id must be a non-empty string without '/', got {provider_id_raw!r}"
+            )
+        alias_raw = entry_map.get("alias")
+        if not isinstance(alias_raw, str) or not alias_raw or "/" in alias_raw:
+            raise ResolverError(
+                f"{path}: {field_path}.alias must be a non-empty string without '/', got {alias_raw!r}"
+            )
+        # Reassigned to typed locals so mypy carries the narrowing from the
+        # isinstance checks above into ProviderRef's str-typed fields below.
+        provider_id: str = provider_id_raw
+        alias: str = alias_raw
+        if alias in seen_aliases:
+            raise ResolverError(f"{path}: {field_path}: duplicate alias {alias!r}")
+        seen_aliases.add(alias)
+        endpoint = entry_map.get("endpoint")
+        if not isinstance(endpoint, str) or endpoint not in _CAPABILITY_ENDPOINTS:
+            raise ResolverError(
+                f"{path}: {field_path}.endpoint {endpoint!r} is not one of "
+                f"{sorted(_CAPABILITY_ENDPOINTS)!r} — endpoint is a symbolic name resolved in "
+                "code, never a URL in the catalog"
+            )
+        if provider_id == MCTL_API_PROVIDER_ID and alias != _MCTL_API_REQUIRED_ALIAS:
+            raise ResolverError(
+                f"{path}: {field_path}: provider {MCTL_API_PROVIDER_ID!r} must use alias "
+                f"{_MCTL_API_REQUIRED_ALIAS!r}, got {alias!r}"
+            )
+        providers.append(
+            ProviderRef(
+                type=provider_type,
+                id=provider_id,
+                alias=alias,
+                endpoint_ref=_CAPABILITY_ENDPOINTS[endpoint],
+            )
+        )
+    return enabled, tuple(providers)
 
 
 def load_definition(agent: str) -> AgentDefinition:
@@ -611,6 +720,8 @@ def load_profile(name: str) -> ExecutionProfile:
     if not isinstance(evidence, list) or not evidence:
         raise ResolverError(f"{path}: spec.evidence.required must be a non-empty list")
 
+    capability_discovery_enabled, capability_providers = _parse_capability_discovery(spec, path=path)
+
     return ExecutionProfile(
         name=profile_name,
         version=profile_version,
@@ -631,6 +742,8 @@ def load_profile(name: str) -> ExecutionProfile:
         path=path,
         content_hash=content_hash,
         service_skills=_parse_service_skills_policy(spec.get("serviceSkills"), path=path),
+        capability_discovery_enabled=capability_discovery_enabled,
+        capability_providers=capability_providers,
     )
 
 
@@ -958,6 +1071,8 @@ def execute(agent: str, task: Task) -> ExecutionPlan:
         service_skills=skill_bundle.identifiers(),
         service_skill_manifest_hash=skill_bundle.manifest_hash,
         service_skills_resolved_from_sha=skill_bundle.resolved_from_sha,
+        capability_discovery_enabled=profile.capability_discovery_enabled,
+        capability_providers=profile.capability_providers,
     )
 
 

@@ -211,6 +211,11 @@ def test_execute_resolves_a_valid_fixture_set(tmp_path, monkeypatch):
     assert plan.target_repository_sha == "a" * 40
     assert plan.release_revision == 1
     assert plan.binding_source == "compatibility-fixture"
+    # mctlhq/mctl-agents#242 slice 4, T20: absent spec.capabilityDiscovery ==
+    # disabled with no providers — a profile that predates this field
+    # resolves to a plan identical to today's.
+    assert plan.capability_discovery_enabled is False
+    assert plan.capability_providers == ()
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +528,117 @@ def test_load_profile_fails_closed_on_non_mapping_model_policy_ref(tmp_path, mon
     doc["spec"]["modelPolicyRef"] = "oops"
     _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
     with pytest.raises(resolver.ResolverError, match="modelPolicyRef must be a mapping"):
+        resolver.load_profile(_PROFILE)
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#242 slice 4, T20 — spec.capabilityDiscovery parsing
+# (design.md sec. 1/2, task 1). Absent field -> disabled with no providers;
+# every malformed shape -> ResolverError naming the field.
+# ---------------------------------------------------------------------------
+def _write_profile_with_capability_discovery(tmp_path, monkeypatch, capability_discovery):
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", tmp_path / "profiles")
+    doc = _base_profile_doc()
+    doc["spec"]["capabilityDiscovery"] = capability_discovery
+    _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
+
+
+def test_capability_discovery_absent_is_disabled_with_no_providers(tmp_path, monkeypatch):
+    monkeypatch.setattr(resolver, "CATALOG_PROFILES_DIR", tmp_path / "profiles")
+    doc = _base_profile_doc()
+    assert "capabilityDiscovery" not in doc["spec"]
+    _write(tmp_path / "profiles" / _PROFILE / "profile.yaml", doc)
+
+    profile = resolver.load_profile(_PROFILE)
+
+    assert profile.capability_discovery_enabled is False
+    assert profile.capability_providers == ()
+
+
+def test_capability_discovery_parses_an_ordered_provider_list(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True,
+        "providers": [
+            {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"},
+        ],
+    })
+
+    profile = resolver.load_profile(_PROFILE)
+
+    assert profile.capability_discovery_enabled is True
+    assert len(profile.capability_providers) == 1
+    provider = profile.capability_providers[0]
+    assert provider.type == "mcp-remote"
+    assert provider.id == "mctl-api"
+    assert provider.alias == "mctl"
+    # `endpoint` is a symbolic name resolved in code, never a URL in the
+    # catalog (design.md sec. 1) — `endpoint_ref` is the real URL it maps to.
+    assert provider.endpoint_ref == resolver.MCTL_MCP_URL
+
+
+def test_capability_discovery_enabled_must_be_a_bool(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {"enabled": "true"})
+    with pytest.raises(resolver.ResolverError, match=r"capabilityDiscovery\.enabled must be a bool"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_providers_must_be_a_list(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True, "providers": "mctl-api",
+    })
+    with pytest.raises(resolver.ResolverError, match=r"capabilityDiscovery\.providers must be a list"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_rejects_an_unknown_provider_type(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True,
+        "providers": [{"type": "http", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"}],
+    })
+    with pytest.raises(resolver.ResolverError, match=r"providers\[0\]\.type"):
+        resolver.load_profile(_PROFILE)
+
+
+@pytest.mark.parametrize("field_name", ["id", "alias"])
+def test_capability_discovery_rejects_a_slash_in_id_or_alias(tmp_path, monkeypatch, field_name):
+    entry = {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"}
+    entry[field_name] = "bad/name"
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {"enabled": True, "providers": [entry]})
+    with pytest.raises(resolver.ResolverError, match=rf"providers\[0\]\.{field_name}"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_rejects_duplicate_aliases(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True,
+        "providers": [
+            {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"},
+            {"type": "mcp-remote", "id": "other", "alias": "mctl", "endpoint": "mctl-api-mcp"},
+        ],
+    })
+    with pytest.raises(resolver.ResolverError, match="duplicate alias"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_rejects_an_unknown_endpoint_name(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True,
+        "providers": [
+            {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "https://api.mctl.ai/mcp"},
+        ],
+    })
+    with pytest.raises(resolver.ResolverError, match=r"providers\[0\]\.endpoint"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_requires_mctl_api_to_use_the_mctl_alias(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True,
+        "providers": [
+            {"type": "mcp-remote", "id": "mctl-api", "alias": "not-mctl", "endpoint": "mctl-api-mcp"},
+        ],
+    })
+    with pytest.raises(resolver.ResolverError, match="must use alias 'mctl'"):
         resolver.load_profile(_PROFILE)
 
 
