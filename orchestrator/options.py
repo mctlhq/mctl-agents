@@ -1279,7 +1279,7 @@ CAPABILITY_GATEWAY_TOOL_PREFIX = "mcp__capability__"
 
 
 def _require_enforcing_checkpoint(gateway: Any) -> None:
-    """Refuse a gateway that would let a consequential call through unchecked.
+    """Refuse a gateway that would let a call through unchecked.
 
     On the gateway path `_PolicyCheckpointHook` delegates every
     `mcp__capability__*` call, so the gateway's own `checkpoint` is the only
@@ -1287,20 +1287,24 @@ def _require_enforcing_checkpoint(gateway: Any) -> None:
     `AbsentPolicyCheckpoint` answers `allowed` for everything, which is
     strictly weaker than the direct `mcp__mctl__*` path. Fail loudly at
     construction rather than silently at invocation.
+
+    ADR 017 sec. 8, option B (dated owner decision, 2026-09-26):
+    `CapabilityGateway.invoke()` sends every capability through the
+    `PolicyCheckpoint`, not only `mutating`/`consequential` ones, so this
+    refuses `AbsentPolicyCheckpoint` over ANY non-empty sealed set — a
+    `read-only`-only set included — rather than only one holding a
+    mutating/consequential member.
     """
     from orchestrator.capability import AbsentPolicyCheckpoint
 
     if not isinstance(gateway.checkpoint, AbsentPolicyCheckpoint):
         return
-    gated = sorted(
-        c.capability_id for c in gateway.capability_set.capabilities
-        if c.consequence in ("mutating", "consequential")
-    )
+    gated = sorted(c.capability_id for c in gateway.capability_set.capabilities)
     if gated:
         raise ValueError(
             "capability gateway uses AbsentPolicyCheckpoint but its sealed set holds "
-            f"{len(gated)} mutating/consequential capabilities (first: {gated[0]!r}); "
-            "pass a real PolicyCheckpoint such as PolicyDecidePolicyCheckpoint"
+            f"{len(gated)} capabilities (first: {gated[0]!r}); pass a real PolicyCheckpoint "
+            "such as PolicyDecidePolicyCheckpoint"
         )
 
 
