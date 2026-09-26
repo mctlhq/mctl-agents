@@ -599,3 +599,102 @@ def test_assemble_threads_work_context_into_the_sealed_snapshot(tmp_path):
     assert with_wc.snapshot.work_context == wc
     assert without.snapshot.work_context is None
     assert with_wc.snapshot.snapshot_id != without.snapshot.snapshot_id
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#266 T1 — `run_pipeline` extraction. tasks.md task 3:
+# `assemble()` becomes a caller of `run_pipeline`, a pure function covering
+# both strategy branches plus the shared dedupe/truncate/budget tail. The
+# golden-fixture and pinned-id tests above already prove `assemble()`'s
+# output is unchanged end to end; these exercise the extracted function
+# directly, which is what lets an evaluator run a candidate list through the
+# real pipeline with no collector and no clone.
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_candidate(
+    source_id: str,
+    *,
+    kind: str = "github-issue-comment",
+    raw: bytes = b"x",
+    trust_tier: str = "untrusted",
+    max_age_seconds: int | None = 3600,
+    observed_at: str = "2026-09-19T00:00:00Z",
+    content_time: str | None = None,
+) -> ca.CandidateSource:
+    return ca.CandidateSource(
+        source_id=source_id,
+        kind=kind,
+        locator=f"locator/{source_id}",
+        selector={},
+        raw=raw,
+        observed_at=observed_at,
+        max_age_seconds=max_age_seconds,
+        trust_tier=trust_tier,
+        trust_rationale="test",
+        reason_code="test-candidate",
+        content_time=content_time,
+    )
+
+
+_NOW = datetime(2026, 9, 19, 0, 0, 0, tzinfo=UTC)
+
+
+def test_run_pipeline_default_strategy_drops_stale_and_dedupes():
+    candidates = [
+        _pipeline_candidate("fresh", raw=b"a"),
+        _pipeline_candidate("stale", raw=b"b", observed_at="2026-01-01T00:00:00Z"),
+        _pipeline_candidate("dup-1", raw=b"same"),
+        _pipeline_candidate("dup-2", raw=b"same"),
+    ]
+    outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(), _NOW)
+    by_id = {c.source_id: c for c in outcome.candidates}
+    assert outcome.strategy.name == ca.STRATEGY_NAME
+    assert by_id["fresh"].included
+    assert not by_id["stale"].included and by_id["stale"].reason_code == "stale"
+    assert by_id["dup-1"].included and not by_id["dup-2"].included
+    assert by_id["dup-2"].reason_code == "duplicate-content"
+    assert outcome.counters.dropped_stale == 1
+    assert outcome.counters.dropped_duplicate == 1
+    assert outcome.conflicts == []
+    assert [c.source_id for c in outcome.candidates] == sorted(by_id, key=lambda i: by_id[i].rank)
+
+
+def test_run_pipeline_ranked_strategy_detects_conflicts_and_demotes_stale():
+    candidates = [
+        _pipeline_candidate("issue", kind="github-issue", raw=b"issue"),
+        _pipeline_candidate(
+            "proposal-dir-requirements.md",
+            kind="proposal-dir",
+            raw=b"req",
+            trust_tier="corroborated",
+            max_age_seconds=86400,
+            observed_at="2026-09-19T00:00:00Z",
+            content_time="2026-09-10T00:00:00Z",
+        ),
+        _pipeline_candidate(
+            "issue-comment-1",
+            raw=b"a later comment",
+            observed_at="2026-09-19T00:00:00Z",
+            content_time="2026-09-15T00:00:00Z",
+        ),
+        _pipeline_candidate(
+            "old", raw=b"old-source", observed_at="2026-01-01T00:00:00Z", content_time="2026-01-01T00:00:00Z"
+        ),
+    ]
+    config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    outcome = ca.run_pipeline(candidates, config, _NOW)
+    assert outcome.strategy.name == ca.RANKED_STRATEGY_NAME
+    assert len(outcome.conflicts) == 1
+    assert outcome.conflicts[0].subject == ca.CONFLICT_PRIOR_PROPOSAL_SUPERSEDED
+    by_id = {c.source_id: c for c in outcome.candidates}
+    assert by_id["old"].included and by_id["old"].reason_code == "stale-demoted"
+    assert outcome.counters.stale_demoted == 1
+    assert outcome.counters.dropped_stale == 0
+
+
+def test_run_pipeline_mutates_and_returns_the_same_objects_given():
+    candidates = [_pipeline_candidate("only", raw=b"payload")]
+    outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(), _NOW)
+    assert outcome.candidates[0] is candidates[0]
+    assert outcome.candidates[0].content_hash == cs.hash_bytes(b"payload")

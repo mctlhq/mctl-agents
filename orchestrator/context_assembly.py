@@ -961,36 +961,50 @@ def _count_by_kind(candidates: Sequence[CandidateSource]) -> dict[str, int]:
     return counts
 
 
-def assemble(
-    assembly_input: AssemblyInput,
-    *,
-    mode: str,
-    execution: ExecutionCorrelation,
-    work_context: WorkContextRef | None = None,
-) -> AssemblyResult:
-    """Runs every collector, the deterministic pipeline, and `seal()`.
-    Sealing the same inputs twice at two different `created_at` values
-    yields one `snapshot_id` — `created_at` is excluded from the hash by
-    `context_snapshot.seal` (ADR 009 sec. 2)."""
-    start = time.monotonic()
-    config = assembly_input.config
+@dataclass(frozen=True)
+class PipelineCounters:
+    """The drop/dup/budget/stale counts `run_pipeline` produces, read into
+    `AssemblyMetrics` by its caller. `conflict_count` is deliberately not
+    one of these fields: it is `len(PipelineOutcome.conflicts)`, so it can
+    never disagree with the conflicts a caller actually receives."""
 
-    candidates: list[CandidateSource] = []
-    collector_calls = 0
-    for collector in _COLLECTOR_ORDER:
-        candidates.extend(collector(assembly_input))
-        collector_calls += 1
+    dropped_stale: int
+    dropped_duplicate: int
+    excluded_budget: int
+    truncated_sources: int
+    stale_demoted: int
+    conflict_sources_capped: int
 
-    candidates_before_ceiling = _count_by_kind(candidates)
-    candidates_total = len(candidates)
 
-    candidates_dropped_pre_budget = max(0, len(assembly_input.issue.comments) - config.max_comments)
-    if len(candidates) > config.max_candidates:
-        candidates_dropped_pre_budget += len(candidates) - config.max_candidates
-        candidates = candidates[: config.max_candidates]
+@dataclass(frozen=True)
+class PipelineOutcome:
+    """The result of running the deterministic selection pipeline — ranking
+    or dropping, deduplication, per-source truncation and the budget — over
+    one strategy's candidate list, before `seal()`. `candidates` holds every
+    candidate considered, included and excluded alike, ordered by final
+    rank: the same list `assemble()` seals into `ContextSource`s."""
 
+    candidates: list[CandidateSource]
+    strategy: ContextStrategy
+    budget: ContextBudget
+    conflicts: list[ContextConflict]
+    counters: PipelineCounters
+
+
+def run_pipeline(candidates: list[CandidateSource], config: AssemblyConfig, now: datetime) -> PipelineOutcome:
+    """The deterministic selection pipeline (mctlhq/mctl-agents#266), moved
+    out of `assemble()` unchanged: for `config.strategy`, either the default
+    drop-stale branch or the ranked rank/`detect_conflicts`/`flag_stale`
+    branch, then the shared `deduplicate` / `truncate_to_per_source_limit` /
+    `apply_budget` tail every strategy applies.
+
+    A pure function of its arguments — no collector, no I/O, no clock beyond
+    `now` — though it mutates the `CandidateSource` objects it is given in
+    place, exactly as this logic did inline inside `assemble()` before this
+    extraction. This is what lets an evaluator run a fixture's candidate list
+    through the real pipeline under either strategy with no network, no
+    collector and no clone, rather than re-implementing ranking in test code."""
     dropped_stale = 0
-    stale_demoted = 0
     conflicts: list[ContextConflict] = []
     conflict_sources_capped = 0
     if config.ranked:
@@ -998,7 +1012,7 @@ def assemble(
         # then rank, then record conflicts and flag — never drop — stale.
         for candidate in candidates:
             normalize(candidate)
-            classify_freshness(candidate, assembly_input.now)
+            classify_freshness(candidate, now)
         candidates = rank_candidates(candidates)
         conflicts, conflict_sources_capped = detect_conflicts(candidates)
         flag_stale(candidates)
@@ -1013,7 +1027,7 @@ def assemble(
         for candidate in candidates:
             normalize(candidate)
         for candidate in candidates:
-            classify_freshness(candidate, assembly_input.now)
+            classify_freshness(candidate, now)
 
         for candidate in candidates:
             if candidate.included and candidate.freshness_staleness == "stale":
@@ -1035,23 +1049,69 @@ def assemble(
     # `stale-demoted` reason: the metric reports what the snapshot shows.
     stale_demoted = sum(1 for c in candidates if c.reason_code == "stale-demoted")
 
-    sources = tuple(_to_context_source(c) for c in sorted(candidates, key=lambda c: c.rank))
+    ordered = sorted(candidates, key=lambda c: c.rank)
+    counters = PipelineCounters(
+        dropped_stale=dropped_stale,
+        dropped_duplicate=dropped_duplicate,
+        excluded_budget=excluded_budget,
+        truncated_sources=truncated_sources,
+        stale_demoted=stale_demoted,
+        conflict_sources_capped=conflict_sources_capped,
+    )
+    return PipelineOutcome(
+        candidates=ordered, strategy=strategy, budget=budget, conflicts=conflicts, counters=counters
+    )
+
+
+def assemble(
+    assembly_input: AssemblyInput,
+    *,
+    mode: str,
+    execution: ExecutionCorrelation,
+    work_context: WorkContextRef | None = None,
+) -> AssemblyResult:
+    """Runs every collector, the deterministic pipeline (`run_pipeline`), and
+    `seal()`. Sealing the same inputs twice at two different `created_at`
+    values yields one `snapshot_id` — `created_at` is excluded from the hash
+    by `context_snapshot.seal` (ADR 009 sec. 2)."""
+    start = time.monotonic()
+    config = assembly_input.config
+
+    candidates: list[CandidateSource] = []
+    collector_calls = 0
+    for collector in _COLLECTOR_ORDER:
+        candidates.extend(collector(assembly_input))
+        collector_calls += 1
+
+    candidates_before_ceiling = _count_by_kind(candidates)
+    candidates_total = len(candidates)
+
+    candidates_dropped_pre_budget = max(0, len(assembly_input.issue.comments) - config.max_comments)
+    if len(candidates) > config.max_candidates:
+        candidates_dropped_pre_budget += len(candidates) - config.max_candidates
+        candidates = candidates[: config.max_candidates]
+
+    outcome = run_pipeline(candidates, config, assembly_input.now)
+
+    sources = tuple(_to_context_source(c) for c in outcome.candidates)
     retention = RetentionPolicy(class_="execution-record", expires_after_days=180)
     snapshot = seal(
         execution=execution,
-        strategy=strategy,
-        budget=budget,
+        strategy=outcome.strategy,
+        budget=outcome.budget,
         retention=retention,
         created_at=_iso(assembly_input.now),
         work_context=work_context,
         sources=sources,
         evidence_refs=(),
-        conflicts=conflicts,
+        conflicts=outcome.conflicts,
     )
 
     latency_ms = (time.monotonic() - start) * 1000
-    included_by_kind = _count_by_kind([c for c in candidates if c.included])
-    rendered = {c.source_id: c.render_text for c in candidates if c.included and c.render_text is not None}
+    included_by_kind = _count_by_kind([c for c in outcome.candidates if c.included])
+    rendered = {
+        c.source_id: c.render_text for c in outcome.candidates if c.included and c.render_text is not None
+    }
 
     metrics = AssemblyMetrics(
         mode=mode,
@@ -1059,20 +1119,20 @@ def assemble(
         included_by_kind=included_by_kind,
         candidates_total=candidates_total,
         candidates_dropped_pre_budget=candidates_dropped_pre_budget,
-        dropped_stale=dropped_stale,
-        dropped_duplicate=dropped_duplicate,
-        excluded_budget=excluded_budget,
-        truncated_sources=truncated_sources,
-        used_sources=budget.used_sources,
-        used_bytes=budget.used_bytes,
+        dropped_stale=outcome.counters.dropped_stale,
+        dropped_duplicate=outcome.counters.dropped_duplicate,
+        excluded_budget=outcome.counters.excluded_budget,
+        truncated_sources=outcome.counters.truncated_sources,
+        used_sources=outcome.budget.used_sources,
+        used_bytes=outcome.budget.used_bytes,
         assembly_latency_ms=latency_ms,
         collector_calls=collector_calls,
-        strategy_name=strategy.name,
-        strategy_version=strategy.version,
+        strategy_name=outcome.strategy.name,
+        strategy_version=outcome.strategy.version,
         snapshot=snapshot,
-        stale_demoted=stale_demoted,
-        conflict_count=len(conflicts),
-        conflict_sources_capped=conflict_sources_capped,
+        stale_demoted=outcome.counters.stale_demoted,
+        conflict_count=len(outcome.conflicts),
+        conflict_sources_capped=outcome.counters.conflict_sources_capped,
     )
     return AssemblyResult(mode=mode, snapshot=snapshot, rendered=rendered, metrics=metrics)
 
