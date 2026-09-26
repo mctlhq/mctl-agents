@@ -317,7 +317,19 @@ def test_a_review_fix_names_its_pr(tmp_path, monkeypatch):
     run_implementer.review_feedback_one(ref, {"p1": True, "p2": False, "summaries": []})
 
     (scope,) = seen
-    assert scope == {"target_repo": "mctlhq/mctl-web", "pr_number": 42, "issue_number": 12}
+    assert scope == {
+        "target_repo": "mctlhq/mctl-web", "pr_number": 42, "issue_number": 12, "devloop_stage": "shepherd",
+    }
+
+
+def test_a_review_fix_names_the_shepherd_as_the_spending_stage():
+    """The scope a review-feedback run opens (above) is what a real recorder
+    built inside it would carry: `agent` still names the binary that spent
+    the tokens, `devloop_stage` the phase that ordered the spend."""
+    api = FakeApi()
+    _recorder(api, "implementer", devloop_stage="shepherd").observe(_result("u1", {OPUS: _usage(1, 2)}))
+    (record,) = api.records
+    assert (record["agent"], record["devloop_stage"]) == ("implementer", "shepherd")
 
 
 def test_an_implementer_proposal_without_a_source_issue_names_its_service_repository(tmp_path):
