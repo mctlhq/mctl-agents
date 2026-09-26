@@ -153,6 +153,27 @@ for the full design, including the four `@workflow.query` handlers'
 rehydration contract and why `resume` is a dataclass field rather than a
 second `run` parameter.
 
+**Addendum (mctl-agents#516, 2026-09).** The watch's exits above are all
+PR-shaped: MERGED/CLOSED, a non-transient `get_pr_state` failure, the
+`pr_lookup_grace_polls` give-up when no PR link ever resolves, or the
+14-day `MERGE_WATCH_DEADLINE`. None of them read the proposal's own
+`status:`, so a proposal parked in a terminal status with NO pull request
+(e.g. `no-commits` → `needs-triage`) kept the watch running, heartbeating a
+healthy-looking lifecycle-ownership claim, for up to 14 days with nothing
+left to observe. `_watch_pr` now ends the watch, under the
+`proposal-terminal-end` patch, when the same `get_pr_state` poll finds no PR
+AND the proposal's status is a `LOOP_TERMINAL_PROPOSAL_STATUSES` member
+(`needs-triage`, `review-stuck`, `rejected`, `error`) AND no OPEN pull
+request was resolved earlier in this watch (`saw_open_pr`). `merged` is not
+in that set: the existing MERGED/CLOSED arm already ends the watch on it and
+drives 6.2-6.4. And the check never fires while a linked pull request is
+OPEN, whatever the status: reconcile's own repair
+(`run_shepherd.RECONCILE_INPUT_STATUSES`) moves an open-PR `needs-triage`/
+`review-stuck`/`rejected`/`error` proposal back to `implemented` on its own,
+so ending the loop there would drop a still-recoverable PR. See
+`agents-state/mctl-agents/proposals/issue-516-fix-devloop-end-devloopworkflow-when-its/`
+for the full design.
+
 ### 6.2 Release observation (#215)
 
 After merge: watch the release land, using only existing read surfaces —

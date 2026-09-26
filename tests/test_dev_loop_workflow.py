@@ -50,6 +50,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_REFUSAL_GIVE_UP,
     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
+    LOOP_TERMINAL_PROPOSAL_STATUSES,
     MERGE_WATCH_MAX_HOPS,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
@@ -58,6 +59,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     IssueRef,
     MergeWatchResume,
     ResumeRejection,
+    _loop_terminal_status,
 )
 from orchestrator.work_context.contract import ActorRef, ExecutionRef, SurfaceRef
 from tests.temporal_harness import Worker  # polls the execution queue too — see #251
@@ -109,6 +111,24 @@ def test_the_shepherd_tick_got_faster_without_shrinking_its_window() -> None:
     assert tick == timedelta(minutes=15)
     assert tick < legacy.shepherd_tick_every_polls * legacy.poll_interval
     assert fast.shepherd_ticks_max * tick >= timedelta(hours=24)
+
+def test_loop_terminal_status_strips_and_case_folds() -> None:
+    """mctl-agents#516, T11: pure and importable with no workflow context.
+    Whitespace and mixed case are the normalisation `ProposalCandidate.
+    ignorable` already applies; None, empty and unknown statuses answer "";
+    `merged` is explicitly NOT terminal for the loop; every member of the
+    set is recognized regardless of how it is spelled."""
+    assert _loop_terminal_status(None) == ""
+    assert _loop_terminal_status("") == ""
+    assert _loop_terminal_status("   ") == ""
+    assert _loop_terminal_status("accepted") == ""
+    assert _loop_terminal_status("implemented") == ""
+    assert _loop_terminal_status("merged") == ""
+    assert _loop_terminal_status("  Merged  ") == ""
+    for status in LOOP_TERMINAL_PROPOSAL_STATUSES:
+        assert _loop_terminal_status(status) == status
+        assert _loop_terminal_status(f"  {status.upper()}  ") == status
+
 
 _SENTINEL_TARGET = DeployTarget(team="admins", app="mctl-telegram")
 _DEFAULT_RELEASE = ReleaseInfo(tag="9.9.9", published_at="2026-08-30T00:00:00Z")
@@ -4303,6 +4323,325 @@ class TestDevLoopWorkflow:
 
         assert result.pr is not None and result.pr.state == "MERGED"
         assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
+
+
+class TestProposalTerminalEnd:
+    """mctlhq/mctl-agents#516: DevLoopWorkflow ends its merge watch when the
+    proposal's own `.status.yaml` `status:` reaches a loop-terminal value
+    (`LOOP_TERMINAL_PROPOSAL_STATUSES`) AND the same poll found no pull
+    request AND no OPEN pull request was resolved earlier in this watch.
+    While a linked pull request stays OPEN, these statuses are a human-wait
+    state (reconcile's own repair resolves them) and must NOT end the watch."""
+
+    async def test_review_stuck_on_an_open_pr_keeps_watching_and_ticking(self, env):
+        """T2: a review-stuck proposal on a still-OPEN PR must not end the
+        watch, and its in-loop shepherd ticks must keep running -- reconcile
+        is the actor that repairs it, and it needs the tick to run."""
+        open_pr_review_stuck = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            proposal_status="review-stuck",
+        )
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            pr_states=[open_pr_review_stuck] * FIRST_SHEPHERD_TICK_POLL + [MERGED_PR],
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5160"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        # The watch kept going through the reconcile repair (status flips
+        # back to implemented, the shepherd merges) and reached the ordinary
+        # MERGED path -- not the new terminal-status exit.
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert result.ended == ""
+        assert "mctl-agents-shepherd" in calls
+
+    async def test_needs_triage_merge_conflict_on_an_open_pr_keeps_watching(self, env):
+        """T2b: the mctl-agents#511 shape -- needs-triage/merge-conflict on
+        a still-OPEN PR. Same guarantee as the review-stuck case above: no
+        early end, ticks continue, and the loop completes via the ordinary
+        MERGED path once reconcile repairs it."""
+        open_pr_needs_triage = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            proposal_status="needs-triage",
+        )
+        activities, calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            pr_states=[open_pr_needs_triage] * FIRST_SHEPHERD_TICK_POLL + [MERGED_PR],
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5161"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert result.ended == ""
+        assert "mctl-agents-shepherd" in calls
+
+    async def test_terminal_status_with_no_pr_ends_the_watch_on_the_first_poll(self, env):
+        """T2c/T3: a terminal-set status with NO pull request ends the watch
+        at the very first poll -- not after cadence.pr_lookup_grace_polls.
+        `DevLoopResult.ended` names the status, and `DevLoopResult.pr`
+        carries the last observed (found=False) PRState. No shepherd tick or
+        ownership row is ever touched: no PR was ever found to tick on or
+        to own (T4/T7)."""
+        base_activities, _calls, investigate_ran, ownership_ops = _fake_activities(released=True)
+        poll_count = {"n": 0}
+        # A PR link IS recorded (repo/number set) but has never resolved --
+        # the "vanished/unresolvable" shape `PRState`'s own docstring
+        # describes -- so `last` gets preserved (mirrors
+        # test_merge_detection_preserves_unresolvable_recorded_pr) and this
+        # test can assert `DevLoopResult.pr` carries it, proposal_status and
+        # all.
+        vanished_terminal = PRState(
+            found=False,
+            pr_url="https://github.com/mctlhq/mctl-telegram/pull/516",
+            repo="mctlhq/mctl-telegram",
+            number=516,
+            proposal_status="needs-triage",
+        )
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_terminal_no_pr(service: str, slug: str) -> PRState:
+            poll_count["n"] += 1
+            return vanished_terminal
+
+        activities = [
+            a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"
+        ]
+        activities.append(fake_get_pr_state_terminal_no_pr)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5162"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert poll_count["n"] == 1, (
+            f"watch polled get_pr_state {poll_count['n']} times; a terminal "
+            "status with no PR must end on the FIRST poll"
+        )
+        assert result.ended == "proposal needs-triage"
+        assert result.pr is not None
+        assert result.pr.found is False
+        assert result.pr.proposal_status == "needs-triage"
+        assert not ownership_ops, "no PR was ever resolved, so no row could exist to relinquish"
+
+    async def test_saw_open_pr_guards_a_later_transient_404_with_a_terminal_status(self, env):
+        """T2d: once an OPEN PR has resolved, a LATER poll that returns
+        found=False with a terminal status must NOT end the watch on the
+        spot -- it rides the existing pr_lookup_grace_polls rule exactly as
+        an ordinary transient 404 would, so a momentary read blip on a
+        recoverable PR never gets treated as "no PR ever existed"."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+            head_sha="a" * 40,
+        )
+        vanished_terminal = PRState(found=False, proposal_status="needs-triage")
+        activities, _calls, investigate_ran, ownership_ops = _fake_activities(
+            released=True,
+            pr_states=[open_pr] + [vanished_terminal] * 8,
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5163"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        # Ended via the pre-existing grace-polls give-up, not the new exit --
+        # `last` is the OPEN PR resolved on the first poll (a subsequent
+        # found=False with no `number` never overwrites an already-resolved
+        # `last`, same rule test_merge_detection_keeps_resolved_state_over_
+        # later_404 pins).
+        assert result.ended == ""
+        assert result.pr is not None
+        assert result.pr.found is True
+        assert result.pr.state == "OPEN"
+        # The row WAS claimed (the OPEN poll resolved it) and is released,
+        # not left dangling -- same invariant the pre-existing
+        # test_ownership_released_when_the_watch_ends_without_a_terminal_pr
+        # pins for an ordinary (non-terminal-status) give-up.
+        assert ownership_ops and ownership_ops[-1].op == "release"
+
+    async def test_merged_proposal_status_with_no_pr_is_not_the_new_exit(self, env):
+        """`merged` is deliberately excluded from LOOP_TERMINAL_PROPOSAL_
+        STATUSES: it must not be read as this new terminal-status exit even
+        when the PR link is unresolvable -- it falls through to the
+        ordinary grace-polls give-up, exactly as before this change."""
+        vanished_merged = PRState(found=False, proposal_status="merged")
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, pr_states=[vanished_merged],
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5164"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+
+        # No `pr:` link ever appeared (no `number` recorded), so this rides
+        # the ordinary give-up to `result.pr is None` -- the same outcome
+        # test_merge_detection_gives_up_when_pr_link_never_appears pins for
+        # an unrelated found=False shape; what matters here is `ended == ""`.
+        assert result.ended == ""
+        assert result.pr is None
+
+    async def test_unreadable_or_unknown_status_with_no_pr_keeps_polling(self, env):
+        """T6: fail-open. A status this activity could not read (None) and a
+        status outside the loop-terminal set are both treated as "keep
+        watching" -- missing or unrecognized evidence is never terminal."""
+        for issue, status in ((5165, None), (5166, "accepted"), (5167, "implemented")):
+            vanished = PRState(found=False, proposal_status=status)
+            activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+                released=True, pr_states=[vanished],
+            )
+            async with Worker(
+                env.client,
+                task_queue=TASK_QUEUE,
+                workflows=[DevLoopWorkflow],
+                activities=activities,
+            ):
+                handle = await env.client.start_workflow(
+                    DevLoopWorkflow.run,
+                    IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+                    id=f"dev-loop-test-{uuid.uuid4()}",
+                    task_queue=TASK_QUEUE,
+                )
+                with anyio.fail_after(10):
+                    await investigate_ran.wait()
+                await handle.signal(DevLoopWorkflow.approve)
+                result = await handle.result()
+
+            assert result.ended == "", (status, result.ended)
+            assert result.pr is None, (status, result.pr)
+
+    async def test_a_resumed_run_carrying_proposal_terminal_end_false_keeps_polling(
+        self, env
+    ) -> None:
+        """T8: an execution whose history predates PROPOSAL_TERMINAL_PATCH
+        resumes with `proposal_terminal_end=False` carried -- the field's
+        default for an old serialized MergeWatchResume that never had it --
+        so the new exit must stay off for the rest of that watch's life
+        (migration by attrition, the same rule every other marker here
+        follows). Counting polls directly is what tells this apart from a
+        vacuous pass: if the guard were broken, the watch would end after
+        exactly ONE poll instead of riding the grace-polls rule."""
+        poll_count = {"n": 0}
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_terminal_no_pr(service: str, slug: str) -> PRState:
+            poll_count["n"] += 1
+            return PRState(found=False, proposal_status="needs-triage")
+
+        base_activities, _calls, _investigate_ran, _ownership_ops = _fake_activities(released=True)
+        activities = [
+            a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"
+        ]
+        activities.append(fake_get_pr_state_terminal_no_pr)
+
+        resume = MergeWatchResume(
+            service="mctl-telegram",
+            slug="issue-518-x",
+            deadline="2027-01-01T00:00:00Z",
+            proposal_terminal_end=False,
+            saw_open_pr=False,
+            investigate=WorkflowResult(workflow_name="mctl-agents-investigate-fake", phase="Succeeded"),
+            implement=WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded"),
+            approve=WorkflowResult(workflow_name="mctl-agents-approve-fake", phase="Succeeded"),
+        )
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/518", resume=resume
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(30):
+                result = await handle.result()
+
+        assert poll_count["n"] >= dev_loop.CADENCE.pr_lookup_grace_polls, (
+            f"only polled {poll_count['n']} times; a carried "
+            "proposal_terminal_end=False must not end the watch on the "
+            "first poll"
+        )
+        assert result.ended == ""
 
 
 class TestLaunchCorrelation:
