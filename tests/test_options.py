@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from types import SimpleNamespace
 
+import anyio
 import pytest
 
 from orchestrator import options, resolver
@@ -269,11 +271,18 @@ def test_a_profile_that_grants_the_mctl_tools_still_gets_them(tmp_path, monkeypa
 
 
 class _FakeGateway:
-    """A stand-in for `capability_gateway.CapabilityGateway`: this module
-    only ever calls `.sdk_server()`, so that is all the fake needs."""
+    """A stand-in for `capability_gateway.CapabilityGateway`: the builder
+    calls `.sdk_server()` and reads `.checkpoint` / `.capability_set` for
+    its enforcing-checkpoint guard, so that is all the fake needs. By
+    default the checkpoint is a real (non-absent) one and the set is empty."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, checkpoint=None, consequences=()) -> None:
         self.sdk_server_calls = 0
+        self.checkpoint = checkpoint if checkpoint is not None else object()
+        self.capability_set = SimpleNamespace(capabilities=tuple(
+            SimpleNamespace(capability_id=f"mctl://mcp-remote/mctl-api/t{i}", consequence=c)
+            for i, c in enumerate(consequences)
+        ))
 
     def sdk_server(self):
         self.sdk_server_calls += 1
@@ -1516,3 +1525,69 @@ def test_audit_hook_omits_execution_context_when_absent(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "AUDIT tool=Bash cmd='ls'" in out
     assert "execution_context" not in out
+
+
+def _policy_hook(built):
+    """The `_PolicyCheckpointHook` a builder installed on PreToolUse."""
+    for matcher in built.hooks["PreToolUse"]:
+        for hook in matcher.hooks:
+            if isinstance(hook, options._PolicyCheckpointHook):
+                return hook
+    raise AssertionError("no _PolicyCheckpointHook installed")
+
+
+def _gateway_options(tmp_path, monkeypatch, gateway):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir(exist_ok=True)
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    return options.build_issue_investigator_options_from_plan(
+        plan, repo_dir, tmp_path / "proposals" / "issue-123", gateway=gateway,
+    )
+
+
+def test_gateway_tools_are_not_denied_by_the_policy_hook(tmp_path, monkeypatch):
+    """No BUILTIN_POLICY rule matches a `mcp__capability__*` operation, so
+    without delegation the hook denies every gateway call as
+    `no_matching_rule` and the gateway path is dead (claude P1 on #508).
+    The gateway enforces #197 per capability instead."""
+    hook = _policy_hook(_gateway_options(tmp_path, monkeypatch, _FakeGateway()))
+    for tool in ("capability_search", "capability_describe", "capability_invoke"):
+        decision = anyio.run(hook, {"tool_name": f"mcp__capability__{tool}", "tool_input": {}}, None, None)
+        assert decision == {}, tool
+
+
+def test_only_the_gateway_builder_delegates_capability_tools(tmp_path, monkeypatch):
+    """Delegation is scoped to the gateway path: the eager builder's hook
+    still sends a `mcp__capability__*` name to the checkpoint, which has no
+    rule for it and denies."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    eager = options.build_issue_investigator_options_from_plan(plan, repo_dir, tmp_path / "p")
+
+    hook = _policy_hook(eager)
+    assert hook.delegated_prefix == ""
+    decision = anyio.run(hook, {"tool_name": "mcp__capability__capability_invoke", "tool_input": {}}, None, None)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_gateway_with_absent_checkpoint_and_a_consequential_capability_is_refused(tmp_path, monkeypatch):
+    """With the hook delegating, the gateway's checkpoint is the only #197
+    enforcement for what `capability_invoke` reaches, so an
+    `AbsentPolicyCheckpoint` over a mutating/consequential set fails at
+    construction (claude P2 on #508)."""
+    from orchestrator.capability import AbsentPolicyCheckpoint
+
+    gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=("read-only", "mutating"))
+    with pytest.raises(ValueError, match="AbsentPolicyCheckpoint"):
+        _gateway_options(tmp_path, monkeypatch, gateway)
+
+
+def test_gateway_with_absent_checkpoint_over_read_only_capabilities_is_allowed(tmp_path, monkeypatch):
+    from orchestrator.capability import AbsentPolicyCheckpoint
+
+    gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=("read-only",))
+    built = _gateway_options(tmp_path, monkeypatch, gateway)
+    assert built.mcp_servers == {"capability": {"fake": "server-config"}}

@@ -125,7 +125,7 @@ async def _build(
         providers,
         local_sessions=local_sessions or {},
         connector=connector,
-        checkpoint=checkpoint,
+        checkpoint=checkpoint if checkpoint is not None else cap.AbsentPolicyCheckpoint(),
         headers={},
     )
 
@@ -534,3 +534,237 @@ def test_set_sealing_trace_line_carries_no_capability_name(capsys):
     rendered = json.dumps(lines[-1])
     assert "mctl_whoami" not in rendered
     assert "tool_name" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups on #508.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_capability_id_rejects_extra_path_segments():
+    """`split("/", 2)` folded "provider/tool" into the tool part (agy P3)."""
+    with pytest.raises(cap.CapabilityError, match="must have the shape"):
+        cap._parse_capability_id("mctl://mcp-remote/ns/provider/tool", where="test")
+    assert cap._parse_capability_id("mctl://mcp-remote/provider/tool", where="test") == (
+        "mcp-remote", "provider", "tool",
+    )
+
+
+def test_two_providers_sharing_type_and_id_under_different_aliases_raise_collision():
+    """Distinct aliases give distinct tool_names but ONE capability_id per
+    shared tool; dispatch is keyed by capability_id, so the last provider
+    would silently win (claude P2 on #508)."""
+    provider_a = cap.ProviderRef(type="mcp-remote", id="same", alias="a", endpoint_ref="https://a")
+    provider_b = cap.ProviderRef(type="mcp-remote", id="same", alias="b", endpoint_ref="https://b")
+    session = FakeSession(tools=[_tool("T")])
+    connector = _fake_connector({"same": session})
+
+    with pytest.raises(cap.CapabilityCollisionError, match="share type"):
+        anyio.run(partial(
+            gw.resolve_eligible, _plan(("mcp__a__*", "mcp__b__*")), _execution(), [provider_a, provider_b],
+            connector=connector, headers={},
+        ))
+
+
+def test_oversized_or_unserializable_annotations_degrade_only_their_own_descriptor():
+    """Annotations are advisory (ADR 017 sec. 8): one chatty or odd blob
+    must not abort discovery for every provider (claude P2 on #508)."""
+    from datetime import UTC, datetime
+
+    big = gw.ProviderTool(name="mctl_whoami", input_schema={"type": "object"},
+                          annotations={"blob": "x" * (cap.MAX_ANNOTATIONS_JSON_LENGTH + 1)})
+    small = gw.ProviderTool(name="mctl_list_services", input_schema={"type": "object"},
+                            annotations={"readOnlyHint": True})
+    session = FakeSession(tools=[big, small])
+
+    capability_set = anyio.run(partial(
+        gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
+        connector=_fake_connector({REMOTE_PROVIDER.id: session}), headers={},
+    ))
+    by_name = {c.tool_name: c for c in capability_set.capabilities}
+    assert by_name["mcp__mctl__mctl_whoami"].annotations == {}
+    assert by_name["mcp__mctl__mctl_list_services"].annotations == {"readOnlyHint": True}
+
+    coerced = gw._annotations_to_dict({"at": datetime(2026, 9, 26, tzinfo=UTC)})
+    assert coerced == {"at": "2026-09-26 00:00:00+00:00"}
+
+
+def test_discovery_carries_correlation_headers_without_a_set_id():
+    """`list_tools` reaches the provider with the same #196 fields an
+    invocation sends, except the set id that does not exist yet (claude P3
+    on #508)."""
+    execution = _execution()
+    header_calls: list[dict] = []
+    connector = _fake_connector({REMOTE_PROVIDER.id: FakeSession(tools=[_tool("mctl_whoami")])},
+                                header_sink=header_calls)
+
+    anyio.run(partial(_build, ("mcp__mctl__*",), providers=[REMOTE_PROVIDER], connector=connector,
+                      correlation=execution))
+
+    assert len(header_calls) == 1
+    assert header_calls[0]["X-Mctl-Agent"] == execution.agent
+    assert header_calls[0]["X-Mctl-Temporal-Workflow-Id"] == execution.temporal_workflow_id
+    assert "X-Mctl-Capability-Set-Id" not in header_calls[0]
+
+
+def _whoami_gateway(**session_kwargs):
+    session = FakeSession(tools=[_tool("mctl_whoami")], **session_kwargs)
+    gateway = anyio.run(partial(_build, ("mcp__mctl__*",), providers=[REMOTE_PROVIDER],
+                                connector=_fake_connector({REMOTE_PROVIDER.id: session})))
+    return gateway, session
+
+
+@pytest.mark.parametrize("limit", ["abc", 0, -1, True, 2.5])
+def test_search_rejects_a_bad_limit_as_invalid_arguments(limit):
+    gateway, _ = _whoami_gateway()
+    result = gateway.search("whoami", limit)
+    assert result["reason_code"] == "invalid-arguments"
+    assert result["results"] == []
+
+
+def test_search_rejects_a_non_string_query_and_marks_success_ok():
+    gateway, _ = _whoami_gateway()
+    assert gateway.search(["whoami"])["reason_code"] == "invalid-arguments"
+    ok = gateway.search("whoami")
+    assert ok["reason_code"] == "ok"
+    assert [row["capability_id"] for row in ok["results"]] == ["mctl://mcp-remote/mctl-api/mctl_whoami"]
+
+
+@pytest.mark.parametrize("capability_ids", [[{"a": 1}], [["nested"]], "mctl://x/y/z", None, 5])
+def test_describe_rejects_anything_but_a_list_of_strings(capability_ids):
+    """An unhashable element used to raise TypeError out of the tool
+    handler (claude P2 on #508)."""
+    gateway, _ = _whoami_gateway()
+    result = gateway.describe(capability_ids)
+    assert result["reason_code"] == "invalid-arguments"
+
+
+def test_invoke_rejects_a_non_string_capability_id():
+    gateway, session = _whoami_gateway()
+    result = anyio.run(partial(gateway.invoke, {"a": 1}, {}))
+    assert result["reason_code"] == "invalid-arguments"
+    assert session.calls == []
+
+
+def test_provider_exception_text_never_reaches_the_model():
+    """A transport error can carry URLs or upstream bodies; the model gets
+    the reason code and a fixed message (claude P3 on #508)."""
+    gateway, _ = _whoami_gateway(raise_on_call=RuntimeError("GET https://internal.example/secret failed: body"))
+    result = anyio.run(partial(gateway.invoke, "mctl://mcp-remote/mctl-api/mctl_whoami", {}))
+    assert result["reason_code"] == "provider-error"
+    assert "secret" not in result["error"] and "internal.example" not in result["error"]
+
+
+def test_build_requires_an_explicit_checkpoint():
+    """No silent AbsentPolicyCheckpoint default (claude P2 on #508)."""
+    connector = _fake_connector({REMOTE_PROVIDER.id: FakeSession(tools=[_tool("mctl_whoami")])})
+    with pytest.raises(TypeError, match="checkpoint"):
+        anyio.run(partial(
+            gw.CapabilityGateway.build, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
+            connector=connector, headers={},
+        ))
+
+
+# -- the default remote connector -------------------------------------------
+
+
+class _FakeClientSession:
+    def __init__(self, *_streams, fail_initialize: Exception | None = None):
+        self.fail_initialize = fail_initialize
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+    async def initialize(self):
+        if self.fail_initialize is not None:
+            raise self.fail_initialize
+
+
+def _patch_mcp_transport(monkeypatch, *, fail_initialize: Exception | None = None):
+    import mcp
+    import mcp.client.streamable_http as streamable_http
+
+    @asynccontextmanager
+    async def _client(_url, headers=None):
+        yield (object(), object(), lambda: None)
+
+    monkeypatch.setattr(streamable_http, "streamablehttp_client", _client)
+    monkeypatch.setattr(mcp, "ClientSession",
+                        lambda *streams: _FakeClientSession(*streams, fail_initialize=fail_initialize))
+
+
+def test_default_connector_lets_errors_inside_the_session_propagate_unchanged(monkeypatch):
+    """An exception raised in the caller's `async with` body is thrown into
+    the generator at `yield`; relabelling it provider-unavailable made every
+    call_tool timeout and error look like a connection failure (agy P2 on
+    #508)."""
+    _patch_mcp_transport(monkeypatch)
+
+    async def _use(exc):
+        async with gw._default_remote_connector(REMOTE_PROVIDER, {}):
+            raise exc
+
+    with pytest.raises(gw.ProviderTimeoutError):
+        anyio.run(_use, gw.ProviderTimeoutError("call timed out"))
+    with pytest.raises(gw.GatewayError) as caught:
+        anyio.run(_use, gw.GatewayError("call failed"))
+    assert type(caught.value) is gw.GatewayError
+
+
+def test_default_connector_still_classifies_connection_failures(monkeypatch):
+    _patch_mcp_transport(monkeypatch, fail_initialize=RuntimeError("refused"))
+
+    async def _connect():
+        async with gw._default_remote_connector(REMOTE_PROVIDER, {}):
+            pass
+
+    with pytest.raises(gw.ProviderUnavailableError):
+        anyio.run(_connect)
+
+
+# -- the SDK tool layer ------------------------------------------------------
+
+
+def _sdk_tools_by_name(gateway):
+    return {t.name: t for t in gateway.sdk_tools()}
+
+
+def test_sdk_tool_schemas_require_only_what_each_handler_needs():
+    """The `{"key": type}` shorthand marks every key required, which made
+    capability_search uncallable without a limit (claude P2 on #508)."""
+    tools = _sdk_tools_by_name(_whoami_gateway()[0])
+    assert set(tools) == {"capability_search", "capability_describe", "capability_invoke"}
+    assert "required" not in tools["capability_search"].input_schema
+    assert tools["capability_describe"].input_schema["required"] == ["capability_ids"]
+    assert tools["capability_invoke"].input_schema["required"] == ["capability_id"]
+
+
+def _call_sdk_tool(tool, args):
+    result = anyio.run(tool.handler, args)
+    return json.loads(result["content"][0]["text"])
+
+
+def test_sdk_tool_handlers_serve_the_gateway_and_report_bad_input_as_reason_codes():
+    gateway, session = _whoami_gateway()
+    tools = _sdk_tools_by_name(gateway)
+    capability_id = "mctl://mcp-remote/mctl-api/mctl_whoami"
+
+    assert _call_sdk_tool(tools["capability_search"], {"query": "whoami"})["reason_code"] == "ok"
+    assert _call_sdk_tool(tools["capability_search"], {"limit": "abc"})["reason_code"] == "invalid-arguments"
+    assert _call_sdk_tool(tools["capability_describe"], {"capability_ids": [{"a": 1}]})["reason_code"] == (
+        "invalid-arguments"
+    )
+    described = _call_sdk_tool(tools["capability_describe"], {"capability_ids": [capability_id]})
+    assert described["results"][capability_id]["reason_code"] == "ok"
+    invoked = _call_sdk_tool(tools["capability_invoke"], {"capability_id": capability_id})
+    assert invoked == {"reason_code": "ok", "text": "ok"}
+    assert session.calls == [("mctl_whoami", {})]
+
+
+def test_sdk_server_wraps_the_three_tools():
+    server = _whoami_gateway()[0].sdk_server()
+    assert server["type"] == "sdk"
+    assert server["name"] == "capability"

@@ -242,7 +242,9 @@ def _parse_capability_id(capability_id: str, *, where: str) -> tuple[str, str, s
     prefix = "mctl://"
     if not capability_id.startswith(prefix):
         raise CapabilityError(f"{where}: capability_id must start with {prefix!r}, got {capability_id!r}")
-    parts = capability_id[len(prefix):].split("/", 2)
+    # No maxsplit: an id with extra segments ("mctl://t/ns/provider/tool")
+    # must fail here rather than fold "provider/tool" into the tool part.
+    parts = capability_id[len(prefix):].split("/")
     if len(parts) != 3 or not all(parts):
         raise CapabilityError(
             f"{where}: capability_id {capability_id!r} must have the shape "
@@ -719,7 +721,14 @@ class CapabilitySet:
         # follow-up from #485): two providers claiming one execution-scoped
         # alias is a fail-closed sealing-time error, never a silent rename,
         # shadow or drop.
+        # A duplicate `(type, id)` under two aliases is the same collision
+        # from the other side: their tool_names differ, but both derive one
+        # `capability_id` per shared tool, and that id is the canonical
+        # identity capability_invoke dispatches on (last writer would win).
+        # With this check, equal ids imply one provider and so one
+        # tool_name, which the capabilities half below already rejects.
         seen_aliases: set[str] = set()
+        seen_provider_ids: set[tuple[str, str]] = set()
         for provider in self.providers:
             if provider.type not in PROVIDER_TYPES:
                 raise CapabilityError(
@@ -728,6 +737,11 @@ class CapabilitySet:
             if provider.alias in seen_aliases:
                 raise CapabilityCollisionError(f"two providers claim alias {provider.alias!r}")
             seen_aliases.add(provider.alias)
+            if (provider.type, provider.id) in seen_provider_ids:
+                raise CapabilityCollisionError(
+                    f"two providers share type {provider.type!r} and id {provider.id!r}"
+                )
+            seen_provider_ids.add((provider.type, provider.id))
 
         plan_tools_set = set(self.plan_tools)
         seen_tool_names: set[str] = set()

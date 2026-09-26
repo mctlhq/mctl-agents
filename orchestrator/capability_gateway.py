@@ -20,6 +20,12 @@ import it lazily inside the function that actually runs an agent, exactly as
 `orchestrator/capability.py` stays stdlib-only and worker-importable —
 nothing in this module changes that.
 
+Provider types in this slice: `mcp-remote` providers are connected through
+the connector; `mcp-local` and `sdk-builtin` providers must be registered in
+`local_sessions` by `provider.id`. There is no built-in listing of the SDK's
+own tools yet, so an `sdk-builtin` provider without a registered session is
+a `GatewayError`, not an empty provider.
+
 No production code constructs a `CapabilityGateway` in this slice
 (design.md "The #197 adapter"): slice 3 chooses between
 `orchestrator.capability.AbsentPolicyCheckpoint` and
@@ -46,11 +52,11 @@ from types import MappingProxyType
 from typing import Any, Protocol
 
 from orchestrator.capability import (
+    MAX_ANNOTATIONS_JSON_LENGTH,
     MAX_KEYWORD_LENGTH,
     MAX_KEYWORDS,
     MAX_SUMMARY_LENGTH,
     MAX_TITLE_LENGTH,
-    AbsentPolicyCheckpoint,
     CapabilityDescriptor,
     CapabilitySet,
     CapabilityStrategy,
@@ -65,7 +71,7 @@ from orchestrator.capability import (
     policy_checkpoint_status,
     seal,
 )
-from orchestrator.context_snapshot import canonical_json, hash_bytes
+from orchestrator.context_snapshot import ContextSnapshotError, canonical_json, hash_bytes
 from orchestrator.resolver import ExecutionPlan
 
 # ---------------------------------------------------------------------------
@@ -194,16 +200,27 @@ async def _default_remote_connector(
     import mcp
     from mcp.client.streamable_http import streamablehttp_client
 
+    # Only a failure BEFORE the session is handed out is a connection
+    # failure. An exception raised inside the caller's `async with` body is
+    # thrown into this generator at `yield`; it must propagate unchanged,
+    # or every call_tool timeout/error would be relabelled
+    # provider-unavailable.
+    connected = False
     try:
         async with streamablehttp_client(provider.endpoint_ref, headers=dict(headers)) as (
             read_stream, write_stream, _get_session_id,
         ):
             async with mcp.ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
+                connected = True
                 yield _McpProviderSession(provider, session)
     except TimeoutError as exc:
+        if connected:
+            raise
         raise ProviderTimeoutError(f"provider {provider.id!r}: timed out connecting: {exc}") from exc
     except Exception as exc:
+        if connected:
+            raise
         raise ProviderUnavailableError(f"provider {provider.id!r}: connection failed: {exc}") from exc
 
 
@@ -247,14 +264,37 @@ class _McpProviderSession:
 
 def _annotations_to_dict(annotations: Any) -> dict[str, Any]:
     """MCP `ToolAnnotations` -> a plain dict, advisory-only (ADR 017
-    sec. 8), tolerant of every shape a provider might actually hand back."""
+    sec. 8), tolerant of every shape a provider might actually hand back.
+    Leaf values are coerced to JSON (`default=str`) so a `datetime`/`Enum`/
+    URL from `model_dump()` cannot fail sealing."""
+    import json
+
     if annotations is None:
         return {}
     if hasattr(annotations, "model_dump"):
-        return dict(annotations.model_dump(exclude_none=True))
-    if isinstance(annotations, Mapping):
-        return dict(annotations)
-    return {}
+        raw: Any = annotations.model_dump(exclude_none=True)
+    elif isinstance(annotations, Mapping):
+        raw = dict(annotations)
+    else:
+        return {}
+    try:
+        coerced = json.loads(json.dumps(raw, default=str))
+    except (TypeError, ValueError):
+        return {}
+    return coerced if isinstance(coerced, dict) else {}
+
+
+def _bounded_annotations(annotations: Mapping[str, Any]) -> dict[str, Any]:
+    """Annotations are advisory-only (ADR 017 sec. 8), so an oversized or
+    unserializable blob degrades ITS OWN descriptor to no annotations
+    instead of failing `CapabilityDescriptor` validation and with it the
+    whole discovery for every provider."""
+    candidate = dict(annotations)
+    try:
+        size = len(canonical_json(candidate))
+    except ContextSnapshotError:
+        return {}
+    return candidate if size <= MAX_ANNOTATIONS_JSON_LENGTH else {}
 
 
 @asynccontextmanager
@@ -361,6 +401,7 @@ def _utcnow_iso() -> str:
 
 async def _discover(
     plan: ExecutionPlan,
+    correlation: ExecutionCorrelation,
     providers: Sequence[ProviderRef],
     *,
     local_sessions: Mapping[str, ProviderSession],
@@ -384,6 +425,10 @@ async def _discover(
     """
     resolved_connector = connector if connector is not None else _default_remote_connector
     resolved_headers = dict(headers) if headers is not None else _default_remote_headers()
+    # The listing round trip carries the same #196 correlation fields an
+    # invocation does, minus the capability_set_id that cannot exist before
+    # the set is sealed (`_correlation_headers` drops empty values).
+    discovery_headers = {**resolved_headers, **_correlation_headers(correlation, "")}
     table = consequence_table if consequence_table is not None else load_consequence_table()
 
     descriptors: list[CapabilityDescriptor] = []
@@ -393,7 +438,7 @@ async def _discover(
 
     for provider in providers:
         if provider.type == "mcp-remote":
-            session_cm = resolved_connector(provider, resolved_headers)
+            session_cm = resolved_connector(provider, discovery_headers)
         elif provider.id in local_sessions:
             session_cm = _static_session(local_sessions[provider.id])
         else:
@@ -424,7 +469,7 @@ async def _discover(
                 input_schema_bytes=len(schema_bytes),
                 consequence=classify_consequence(info.name, table, provider_id=provider.id),
                 matched_tool_pattern=matched_pattern,
-                annotations=dict(info.annotations),
+                annotations=_bounded_annotations(info.annotations),
             )
             descriptors.append(descriptor)
             schemas_by_id[capability_id] = info.input_schema
@@ -467,7 +512,7 @@ async def resolve_eligible(
     resolve to one SDK-visible name or claim one alias (ADR 017 sec. 4).
     """
     descriptors, excluded_count, _schemas, _dispatch = await _discover(
-        plan, providers,
+        plan, correlation, providers,
         local_sessions=local_sessions, connector=connector, headers=headers, consequence_table=consequence_table,
     )
     return seal(
@@ -565,6 +610,15 @@ class PolicyDecidePolicyCheckpoint:
 #: reopened here.
 _CHECKPOINT_CONSEQUENCES = frozenset({"mutating", "consequential"})
 
+#: What the model is told when a dispatch fails. Provider/transport exception
+#: text can carry URLs or upstream response fragments, so it never reaches the
+#: model; the reason code is the whole answer, and the trace line records it.
+_FIXED_ERRORS = MappingProxyType({
+    "timeout": "the provider did not answer in time",
+    "provider-unavailable": "the provider could not be reached",
+    "provider-error": "the provider failed to execute this capability",
+})
+
 
 @dataclass
 class CapabilityGateway:
@@ -581,7 +635,10 @@ class CapabilityGateway:
     itself (a descriptor is not a payload carrier)."""
 
     capability_set: CapabilitySet
-    checkpoint: PolicyCheckpoint = field(default_factory=AbsentPolicyCheckpoint)
+    # Required, never defaulted: on the gateway path this is the only #197
+    # enforcement for the capabilities behind capability_invoke, so a caller
+    # must choose it explicitly (AbsentPolicyCheckpoint included).
+    checkpoint: PolicyCheckpoint
     descriptors_by_id: Mapping[str, CapabilityDescriptor] = field(default_factory=dict)
     schemas_by_id: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     dispatch_by_id: Mapping[str, tuple[ProviderRef, str]] = field(default_factory=dict)
@@ -596,11 +653,11 @@ class CapabilityGateway:
         correlation: ExecutionCorrelation,
         providers: Sequence[ProviderRef],
         *,
+        checkpoint: PolicyCheckpoint,
         local_sessions: Mapping[str, ProviderSession] = MappingProxyType({}),
         connector: ProviderConnector | None = None,
         headers: Mapping[str, str] | None = None,
         consequence_table: Mapping[str, str] | None = None,
-        checkpoint: PolicyCheckpoint | None = None,
         strategy: CapabilityStrategy | None = None,
         retention: RetentionPolicy | None = None,
         created_at: str | None = None,
@@ -611,7 +668,7 @@ class CapabilityGateway:
         from."""
         resolved_headers = dict(headers) if headers is not None else _default_remote_headers()
         descriptors, excluded_count, schemas_by_id, dispatch_by_id = await _discover(
-            plan, providers,
+            plan, correlation, providers,
             local_sessions=local_sessions, connector=connector, headers=resolved_headers,
             consequence_table=consequence_table,
         )
@@ -632,7 +689,7 @@ class CapabilityGateway:
         _emit_trace(capability_set.to_log_dict(), event="set_sealed")
         return cls(
             capability_set=capability_set,
-            checkpoint=checkpoint if checkpoint is not None else AbsentPolicyCheckpoint(),
+            checkpoint=checkpoint,
             descriptors_by_id={d.capability_id: d for d in capability_set.capabilities},
             schemas_by_id=schemas_by_id,
             dispatch_by_id=dispatch_by_id,
@@ -643,12 +700,23 @@ class CapabilityGateway:
 
     # -- capability_search --------------------------------------------------
 
-    def search(self, query: str = "", limit: int | None = None) -> dict[str, Any]:
+    def search(self, query: Any = "", limit: Any = None) -> dict[str, Any]:
         """Compact rows only — `capability_id`, `title`, one-line `summary`,
         `consequence` — drawn only from the sealed set. Never a schema
-        (ADR 017 sec. 5)."""
-        row_limit = DEFAULT_SEARCH_LIMIT if limit is None else max(0, min(int(limit), MAX_SEARCH_LIMIT))
-        needle = (query or "").strip().lower()
+        (ADR 017 sec. 5). Arguments come from the model, so they are
+        validated here and a bad one is `invalid-arguments`, never an
+        exception."""
+        if query is None:
+            query = ""
+        if not isinstance(query, str):
+            return {"results": [], "reason_code": "invalid-arguments", "error": "query must be a string"}
+        if limit is None:
+            row_limit = DEFAULT_SEARCH_LIMIT
+        elif isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            return {"results": [], "reason_code": "invalid-arguments", "error": "limit must be a positive integer"}
+        else:
+            row_limit = min(limit, MAX_SEARCH_LIMIT)
+        needle = query.strip().lower()
         rows: list[dict[str, Any]] = []
         for descriptor in self.capability_set.capabilities:
             haystack = " ".join((descriptor.title, descriptor.summary, *descriptor.keywords)).lower()
@@ -660,15 +728,24 @@ class CapabilityGateway:
                 "summary": descriptor.summary,
                 "consequence": descriptor.consequence,
             })
-        return {"results": rows[:row_limit]}
+        return {"results": rows[:row_limit], "reason_code": "ok"}
 
     # -- capability_describe -------------------------------------------------
 
-    def describe(self, capability_ids: Sequence[str]) -> dict[str, Any]:
+    def describe(self, capability_ids: Any) -> dict[str, Any]:
         """Full input schemas for at most `MAX_DESCRIBE_IDS` eligible ids.
         An id outside the sealed set answers `not-found` — indistinguishable
         from a genuinely nonexistent id, so this leaks nothing about what
-        was withheld (ADR 017 sec. 5)."""
+        was withheld (ADR 017 sec. 5). Model-supplied input: anything but a
+        list of strings is `invalid-arguments`, never an exception."""
+        if not isinstance(capability_ids, (list, tuple)) or not all(
+            isinstance(capability_id, str) for capability_id in capability_ids
+        ):
+            return {
+                "results": {},
+                "reason_code": "invalid-arguments",
+                "error": "capability_ids must be a list of strings",
+            }
         if len(capability_ids) > MAX_DESCRIBE_IDS:
             return {
                 "results": {},
@@ -689,11 +766,11 @@ class CapabilityGateway:
                 "consequence": descriptor.consequence,
                 "input_schema": dict(self.schemas_by_id.get(capability_id, {})),
             }
-        return {"results": results}
+        return {"results": results, "reason_code": "ok"}
 
     # -- capability_invoke ---------------------------------------------------
 
-    async def invoke(self, capability_id: str, arguments: Any) -> dict[str, Any]:
+    async def invoke(self, capability_id: Any, arguments: Any) -> dict[str, Any]:
         """Membership check against the sealed set, then the
         `PolicyCheckpoint` (for `mutating`/`consequential` capabilities
         only), then dispatch — remote via the provider connector, local in
@@ -701,6 +778,12 @@ class CapabilityGateway:
         reason code from `orchestrator.capability.REASON_CODES` on every
         path, and emits one invocation trace line regardless of outcome."""
         start = time.monotonic()
+
+        if not isinstance(capability_id, str):
+            record = self._record(str(capability_id), "refused", "invalid-arguments", start, {},
+                                  policy_checkpoint="absent")
+            self._trace(record)
+            return {"reason_code": "invalid-arguments", "error": "capability_id must be a string"}
 
         if not isinstance(arguments, Mapping):
             record = self._record(capability_id, "refused", "invalid-arguments", start, {}, policy_checkpoint="absent")
@@ -752,24 +835,24 @@ class CapabilityGateway:
                 if local is None:
                     raise GatewayError(f"provider {provider.id!r}: no local session registered")
                 call_result = await local.call_tool(bare_tool_name, arguments)
-        except ProviderTimeoutError as exc:
+        except ProviderTimeoutError:
             record = self._record(
                 capability_id, "error", "timeout", start, arguments, policy_checkpoint=policy_status,
             )
             self._trace(record)
-            return {"reason_code": "timeout", "error": str(exc)}
-        except ProviderUnavailableError as exc:
+            return {"reason_code": "timeout", "error": _FIXED_ERRORS["timeout"]}
+        except ProviderUnavailableError:
             record = self._record(
                 capability_id, "error", "provider-unavailable", start, arguments, policy_checkpoint=policy_status,
             )
             self._trace(record)
-            return {"reason_code": "provider-unavailable", "error": str(exc)}
-        except Exception as exc:  # noqa: BLE001 — any other dispatch failure is provider-error
+            return {"reason_code": "provider-unavailable", "error": _FIXED_ERRORS["provider-unavailable"]}
+        except Exception:  # noqa: BLE001 — any other dispatch failure is provider-error
             record = self._record(
                 capability_id, "error", "provider-error", start, arguments, policy_checkpoint=policy_status,
             )
             self._trace(record)
-            return {"reason_code": "provider-error", "error": str(exc)}
+            return {"reason_code": "provider-error", "error": _FIXED_ERRORS["provider-error"]}
 
         result_hash = hash_bytes(canonical_json({"text": call_result.text}))
         outcome = "error" if call_result.is_error else "ok"
@@ -810,6 +893,67 @@ class CapabilityGateway:
 
     # -- SDK tool registration -----------------------------------------------
 
+    def sdk_tools(self) -> list[Any]:
+        """The three gateway tools as `claude_agent_sdk.SdkMcpTool`s, each
+        with a full JSON schema. The SDK's `{"key": type}` shorthand marks
+        every key required, which would make `capability_search` uncallable
+        without a `limit`; the explicit schemas below require only what the
+        handler actually needs. Handlers pass model input to `search`/
+        `describe`/`invoke` unchanged, and those three validate it."""
+        import json
+
+        from claude_agent_sdk import tool as sdk_tool
+
+        def _as_tool_result(payload: Mapping[str, Any]) -> dict[str, Any]:
+            return {"content": [{"type": "text", "text": json.dumps(payload, sort_keys=True)}]}
+
+        async def _search(args: dict[str, Any]) -> dict[str, Any]:
+            return _as_tool_result(self.search(args.get("query", ""), args.get("limit")))
+
+        async def _describe(args: dict[str, Any]) -> dict[str, Any]:
+            return _as_tool_result(self.describe(args.get("capability_ids")))
+
+        async def _invoke(args: dict[str, Any]) -> dict[str, Any]:
+            arguments = args.get("arguments")
+            result = await self.invoke(args.get("capability_id"), arguments if arguments is not None else {})
+            return _as_tool_result(result)
+
+        return [
+            sdk_tool(
+                "capability_search", "Search the capabilities eligible for this execution.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SEARCH_LIMIT},
+                    },
+                },
+            )(_search),
+            sdk_tool(
+                "capability_describe", "Return full input schemas for eligible capability ids.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "capability_ids": {
+                            "type": "array", "items": {"type": "string"}, "maxItems": MAX_DESCRIBE_IDS,
+                        },
+                    },
+                    "required": ["capability_ids"],
+                },
+            )(_describe),
+            sdk_tool(
+                "capability_invoke", "Invoke one eligible capability.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "capability_id": {"type": "string"},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["capability_id"],
+                },
+            )(_invoke),
+        ]
+
     def sdk_server(self) -> Any:
         """The `create_sdk_mcp_server` config exposing exactly the three
         gateway tools (ADR 017 sec. 5) — the only MCP server
@@ -818,39 +962,6 @@ class CapabilityGateway:
         `claude_agent_sdk` lazily, inside this method, so constructing or
         testing a `CapabilityGateway` never requires the SDK to be
         importable — only actually serving it as an MCP server does."""
-        import json
-
         from claude_agent_sdk import create_sdk_mcp_server
-        from claude_agent_sdk import tool as sdk_tool
 
-        def _as_tool_result(payload: Mapping[str, Any]) -> dict[str, Any]:
-            return {"content": [{"type": "text", "text": json.dumps(payload, sort_keys=True)}]}
-
-        async def _search(args: dict[str, Any]) -> dict[str, Any]:
-            return _as_tool_result(self.search(str(args.get("query") or ""), args.get("limit")))
-
-        async def _describe(args: dict[str, Any]) -> dict[str, Any]:
-            ids = args.get("capability_ids")
-            return _as_tool_result(self.describe(ids if isinstance(ids, list) else []))
-
-        async def _invoke(args: dict[str, Any]) -> dict[str, Any]:
-            capability_id = str(args.get("capability_id") or "")
-            arguments = args.get("arguments")
-            result = await self.invoke(capability_id, arguments if arguments is not None else {})
-            return _as_tool_result(result)
-
-        tools = [
-            sdk_tool(
-                "capability_search", "Search the capabilities eligible for this execution.",
-                {"query": str, "limit": int},
-            )(_search),
-            sdk_tool(
-                "capability_describe", "Return full input schemas for eligible capability ids.",
-                {"capability_ids": list},
-            )(_describe),
-            sdk_tool(
-                "capability_invoke", "Invoke one eligible capability.",
-                {"capability_id": str, "arguments": dict},
-            )(_invoke),
-        ]
-        return create_sdk_mcp_server(name="capability", tools=tools)
+        return create_sdk_mcp_server(name="capability", tools=self.sdk_tools())
