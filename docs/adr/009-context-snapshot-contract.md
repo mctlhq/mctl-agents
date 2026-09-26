@@ -525,6 +525,13 @@ dependency stays one-way, exactly as this ADR requires: `ExecutionContext`
 projects into `ExecutionCorrelation`, this module is never imported by
 `orchestrator/execution_identity.py` at module scope.
 
+`ExecutionCorrelation` also now has a second consumer: ADR 017
+(`docs/adr/017-capability-discovery-and-gateway-contract.md`,
+`orchestrator/capability.py`) imports the type directly rather than
+re-deriving it, so a `ContextSnapshot` and a `CapabilitySet` sealed for one
+execution join on byte-identical fields. That dependency is one-way too:
+`orchestrator/capability.py` imports from this module, never the reverse.
+
 ## Implementation map
 
 This PR changes only:

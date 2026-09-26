@@ -1,0 +1,114 @@
+{
+  "api_version": "capability.mctl.ai/v1alpha1",
+  "capabilities": [
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "capability_id": "mctl://mcp-remote/mctl-api/mctl_get_service_status",
+      "consequence": "read-only",
+      "input_schema_bytes": 512,
+      "input_schema_hash": "sha256:3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+      "keywords": [
+        "status",
+        "service"
+      ],
+      "matched_tool_pattern": "mcp__mctl__*",
+      "provider": {
+        "alias": "mctl",
+        "endpoint_ref": "https://api.mctl.ai/mcp",
+        "id": "mctl-api",
+        "type": "mcp-remote"
+      },
+      "summary": "Return the current deployment status for one service.",
+      "title": "Get service status",
+      "tool_name": "mcp__mctl__mctl_get_service_status"
+    },
+    {
+      "annotations": {
+        "readOnlyHint": true
+      },
+      "capability_id": "mctl://mcp-remote/mctl-api/mctl_list_services",
+      "consequence": "read-only",
+      "input_schema_bytes": 256,
+      "input_schema_hash": "sha256:4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d",
+      "keywords": [
+        "list",
+        "service"
+      ],
+      "matched_tool_pattern": "mcp__mctl__*",
+      "provider": {
+        "alias": "mctl",
+        "endpoint_ref": "https://api.mctl.ai/mcp",
+        "id": "mctl-api",
+        "type": "mcp-remote"
+      },
+      "summary": "List every service in the caller's scope.",
+      "title": "List services",
+      "tool_name": "mcp__mctl__mctl_list_services"
+    },
+    {
+      "annotations": {},
+      "capability_id": "mctl://mcp-remote/mctl-api/mctl_deploy_service",
+      "consequence": "mutating",
+      "input_schema_bytes": 1024,
+      "input_schema_hash": "sha256:5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+      "keywords": [
+        "deploy",
+        "service"
+      ],
+      "matched_tool_pattern": "mcp__mctl__*",
+      "provider": {
+        "alias": "mctl",
+        "endpoint_ref": "https://api.mctl.ai/mcp",
+        "id": "mctl-api",
+        "type": "mcp-remote"
+      },
+      "summary": "Deploy the given service to its target environment.",
+      "title": "Deploy service",
+      "tool_name": "mcp__mctl__mctl_deploy_service"
+    }
+  ],
+  "capability_set_id": "cap-c39787011bde25c0",
+  "content_hash": "sha256:c39787011bde25c0ff4d5e3302ed09365e66384c6f2691bed17d244ef15d2860",
+  "created_at": "2026-09-23T00:00:00Z",
+  "excluded_count": 70,
+  "execution": {
+    "agent": "issue-investigator",
+    "argo_workflow_name": null,
+    "definition_content_hash": "sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+    "definition_version": "3",
+    "environment": "production",
+    "profile_content_hash": "sha256:2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+    "profile_version": "5",
+    "release_revision": 12,
+    "target_repository_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "temporal_run_id": null,
+    "temporal_workflow_id": "dev-loop-mctlhq-mctl-agents-242"
+  },
+  "kind": "CapabilitySet",
+  "plan_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "mcp__mctl__*"
+  ],
+  "providers": [
+    {
+      "alias": "mctl",
+      "endpoint_ref": "https://api.mctl.ai/mcp",
+      "id": "mctl-api",
+      "type": "mcp-remote"
+    }
+  ],
+  "retention": {
+    "class": "execution-record",
+    "expires_after_days": 90
+  },
+  "strategy": {
+    "name": "lexical-fixed-order",
+    "ranker_name": null,
+    "ranker_version": null,
+    "version": "1.0.0"
+  }
+}

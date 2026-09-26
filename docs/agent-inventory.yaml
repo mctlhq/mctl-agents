@@ -74,6 +74,13 @@ version: 1
 # (docs/adr/011-execution-identity-contract.md) and
 # orchestrator/execution_identity.py define the versioned ExecutionContext
 # every agent execution loads via load_from_environment().
+#
+# What it could see and call (as opposed to what it was allowed to, per
+# `tools` above) is a third contract: ADR 017
+# (docs/adr/017-capability-discovery-and-gateway-contract.md) and
+# orchestrator/capability.py define the sealed, narrowed CapabilitySet a
+# resolved ExecutionPlan may expose. Slice 1 only; unwired until the
+# capability_gateway follow-up lands (see that ADR's Implementation map).
 
 agents:
   - name: issue-investigator
