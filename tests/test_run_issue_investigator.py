@@ -3386,6 +3386,9 @@ def test_run_agent_legacy_resolver_with_discovery_capability_mode_raises_first(t
     never half-applied."""
     monkeypatch.delenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", raising=False)  # legacy, the default
     monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    # Set, so the MCTL_TOKEN preflight (which runs first) cannot be the
+    # branch that exits: this test is about legacy + discovery.
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
     monkeypatch.setattr(
         "orchestrator.options.build_issue_investigator_options",
         lambda *a, **k: (_ for _ in ()).throw(
@@ -3393,7 +3396,7 @@ def test_run_agent_legacy_resolver_with_discovery_capability_mode_raises_first(t
         ),
     )
 
-    with pytest.raises(SystemExit, match="ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery"):
+    with pytest.raises(SystemExit, match="requires ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative"):
         anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
 
 

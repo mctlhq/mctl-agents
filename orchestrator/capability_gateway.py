@@ -424,14 +424,13 @@ def _usable_tool_name(name: Any) -> bool:
     return isinstance(name, str) and bool(name) and "/" not in name
 
 
-def _reject_unusable_provider_id(provider: ProviderRef) -> None:
+def _reject_unusable_provider_ref(provider: ProviderRef) -> None:
     """A `provider.type` or `provider.id` carrying `/` would corrupt every
-    capability_id this
-    provider mints (`mctl://<type>/<id>/<tool>` — `_parse_capability_id`
-    splits on exactly three `/`-delimited segments). Unlike a single bad
-    tool name (`_usable_tool_name`, per-tool and merely excluded), a bad
-    `provider.id` poisons the whole provider, so it fails closed at
-    discovery time rather than being silently skipped."""
+    capability_id this provider mints (`mctl://<type>/<id>/<tool>`;
+    `_parse_capability_id` splits on exactly three `/`-delimited segments).
+    Unlike a single bad tool name (`_usable_tool_name`, per-tool and merely
+    excluded), a bad provider identity poisons the whole provider, so it
+    fails closed at discovery time rather than being silently skipped."""
     if "/" in provider.type:
         raise GatewayError(
             f"provider.type {provider.type!r} must not contain '/' — it appears verbatim in every "
@@ -486,7 +485,7 @@ async def _discover(
     excluded_count = 0
 
     for provider in providers:
-        _reject_unusable_provider_id(provider)
+        _reject_unusable_provider_ref(provider)
         if provider.type == "mcp-remote":
             session_cm = resolved_connector(provider, discovery_headers)
         elif provider.id in local_sessions:

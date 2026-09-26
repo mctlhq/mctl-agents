@@ -1805,13 +1805,11 @@ async def _run_agent(
                 temporal_run_id=temporal_run_id,
                 argo_workflow_name=argo_workflow_name,
             )
-            # The same two-fact conjunction the plan builder itself applies
-            # to mcp__mctl__* (options.py:
-            # build_issue_investigator_options_from_plan's docstring): the
-            # profile granting it is not enough on its own, MCP must also be
-            # configured in THIS environment, or the checkpoint would grant
-            # an entry the eager path withholds.
-            grants = tuple(t for t in plan.tools if t != "mcp__mctl__*" or _mctl_tool_globs())
+            # The plan's tools, unfiltered: both halves of the two-fact
+            # conjunction the builder applies to mcp__mctl__* (profile grants
+            # it, MCP configured here) were already enforced by the discovery
+            # preflights above, so there is nothing left to drop.
+            grants = tuple(plan.tools)
             # A GatewayError here (provider unreachable, timed out, or any
             # other discovery failure) fails the run with its reason code —
             # never caught to fall back to eager, which would silently
