@@ -76,6 +76,19 @@ def test_schema_version_2_is_dropped_with_a_warning(capsys):
     assert "schema_version" in capsys.readouterr().out
 
 
+def test_schema_version_true_is_dropped_despite_equalling_1():
+    # bool is an int subclass in Python, so `True == 1` — schema_version
+    # must be rejected on type, not just on the `!=` check.
+    raw = {**_fixture_records()[0], "schema_version": True}
+    assert sanitise(raw) is None
+
+
+def test_schema_version_1_0_is_dropped_despite_equalling_1():
+    # `1.0 == 1` in Python — a float must not slip past the equality check.
+    raw = {**_fixture_records()[0], "schema_version": 1.0}
+    assert sanitise(raw) is None
+
+
 def test_blank_session_id_is_dropped():
     raw = {**_fixture_records()[0], "session_id": "   "}
     assert sanitise(raw) is None

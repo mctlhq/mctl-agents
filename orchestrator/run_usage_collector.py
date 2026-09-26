@@ -364,7 +364,11 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
         print(f"WARN: dropping record {session_id!r} with no non-empty model_key")
         return None
     schema_version = raw.get("schema_version")
-    if schema_version is not None and schema_version != SCHEMA_VERSION:
+    if schema_version is not None and (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != SCHEMA_VERSION
+    ):
         print(
             f"WARN: dropping record {session_id!r}/{model_key!r} with "
             f"schema_version={schema_version!r} (expected {SCHEMA_VERSION})"
