@@ -140,6 +140,52 @@ def test_blank_string_field_is_dropped():
     assert "outcome" not in sanitised
 
 
+def test_devloop_stage_outside_the_vocabulary_is_dropped():
+    raw = {**_fixture_records()[0], "devloop_stage": "not-a-real-stage"}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "devloop_stage" not in sanitised
+
+
+def test_devloop_stage_in_the_vocabulary_is_kept():
+    raw = {**_fixture_records()[0], "devloop_stage": "shepherd"}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert sanitised["devloop_stage"] == "shepherd"
+
+
+def test_target_repo_that_is_not_owner_slash_name_is_dropped():
+    raw = {**_fixture_records()[0], "target_repo": "not-owner-slash-name"}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "target_repo" not in sanitised
+
+
+def test_pr_number_without_a_valid_target_repo_is_dropped():
+    raw = dict(_fixture_records()[0])
+    raw.pop("target_repo", None)
+    raw["pr_number"] = 139
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "pr_number" not in sanitised
+    assert "target_repo" not in sanitised
+
+
+def test_issue_number_dropped_when_its_target_repo_is_itself_dropped():
+    raw = {**_fixture_records()[0], "target_repo": "not-owner-slash-name", "issue_number": 42}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "target_repo" not in sanitised
+    assert "issue_number" not in sanitised
+
+
+def test_non_positive_pr_number_is_dropped():
+    raw = {**_fixture_records()[0], "pr_number": 0}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "pr_number" not in sanitised
+
+
 def test_no_correlation_added_from_this_processs_own_environment(monkeypatch):
     monkeypatch.setenv("WORKFLOW_NAME", "usage-collector-run-abc")
     monkeypatch.setenv("WORKFLOW_TEMPORAL_WORKFLOW_ID", "collector-wf-1")

@@ -13,7 +13,7 @@ model-free periodic sweep, runnable on the existing image, that
         list its in-window model-usage-records artifacts
         download each one (bounded, binary-safe)
         sanitise its candidate records onto the ADR-012 allowlist
-    POST the sanitised records to mctl-api, chunked
+        POST that repository's sanitised records to mctl-api, chunked
 
 It mints no record id — mctl-api derives `(session_id, result_uuid,
 model_key)` itself and rejects a supplied id that disagrees
@@ -76,8 +76,10 @@ from orchestrator.proc import CommandFailed, run_capturing
 from orchestrator.usage_ledger import (
     BASE_URL_ENV,
     DEFAULT_BASE_URL,
+    DEVLOOP_STAGES,
     INGEST_PATH,
     SCHEMA_VERSION,
+    TARGET_REPO_RE,
     TOKEN_ENV,
 )
 
@@ -338,9 +340,17 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
     every allowed field exactly as given (an absent counter stays absent,
     never becomes 0, and nothing here adds `argo_workflow_name`,
     `temporal_workflow_id`, `work_item_id` or `execution_id` from this
-    process's own environment) EXCEPT when its Python type does not match
-    what mctl-api expects (`_STRING_FIELDS`/`_INT_FIELDS`): that single field
-    is dropped, with a warning, rather than forwarded — the artifact is
+    process's own environment) EXCEPT when a field fails a check mctl-api
+    itself applies at ingest: a Python type mismatch
+    (`_STRING_FIELDS`/`_INT_FIELDS`), a `devloop_stage` outside the closed
+    v1 vocabulary (`DEVLOOP_STAGES`, ADR-012 invariant 10 and its
+    2026-09-24 amendment — "free text, wrong case, a non-string, empty"),
+    a `target_repo` that is not `owner/name` (`TARGET_REPO_RE`, the same
+    pattern `orchestrator.usage_ledger._checked_correlation` enforces for
+    the other producer), or an `issue_number`/`pr_number` that is not a
+    positive number or has no accompanying `target_repo` to be read
+    against. In every one of those cases the single offending field is
+    dropped, with a warning, rather than forwarded — the artifact is
     untrusted input, and the ingest is one transaction, so one malformed
     field would otherwise fail every record chunked into the same batch,
     not just the record it came from.
@@ -377,6 +387,44 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
             )
             continue
         sanitised[key] = value
+
+    # Beyond a plain Python-type check: the shapes mctl-api's own
+    # validateCorrelation rejects at ingest (see orchestrator.usage_ledger
+    # TARGET_REPO_RE / DEVLOOP_STAGES / _checked_correlation, which this
+    # mirrors so the producer and the collector cannot drift apart).
+    stage = sanitised.get("devloop_stage")
+    if stage is not None and stage not in DEVLOOP_STAGES:
+        print(
+            f"WARN: dropping field 'devloop_stage'={stage!r} of record "
+            f"{session_id!r}/{model_key!r} — not in the devloop_stage vocabulary"
+        )
+        del sanitised["devloop_stage"]
+
+    repo = sanitised.get("target_repo")
+    if repo is not None and not TARGET_REPO_RE.match(repo):
+        print(
+            f"WARN: dropping field 'target_repo'={repo!r} of record "
+            f"{session_id!r}/{model_key!r} — not owner/name"
+        )
+        del sanitised["target_repo"]
+
+    for number_key in ("issue_number", "pr_number"):
+        if number_key not in sanitised:
+            continue
+        number = sanitised[number_key]
+        if number <= 0:
+            print(
+                f"WARN: dropping field {number_key!r}={number!r} of record "
+                f"{session_id!r}/{model_key!r} — not a positive number"
+            )
+            del sanitised[number_key]
+        elif "target_repo" not in sanitised:
+            print(
+                f"WARN: dropping field {number_key!r}={number!r} of record "
+                f"{session_id!r}/{model_key!r} — no target_repo to read it against"
+            )
+            del sanitised[number_key]
+
     return sanitised
 
 
@@ -493,7 +541,8 @@ def collect(
     list_fn: Callable[[str, datetime, int], list[Artifact]] = list_artifacts,
     download_fn: Callable[[str, int, int], list[dict[str, Any]] | None] = download_records,
 ) -> CollectResult:
-    """One sweep over `repos`: list, download, sanitise, deliver.
+    """One sweep over `repos`: list, download, sanitise, deliver — delivered
+    per repository, not once at the end of the whole sweep.
 
     A repository whose listing raises, or an artifact whose download raises,
     is logged with its repository/artifact id, counted in `failures`, and
@@ -501,12 +550,22 @@ def collect(
     `dry_run`, everything up to delivery still runs; the POST is skipped
     entirely and the count of records that would have been posted is
     reported instead.
+
+    Delivery happens as soon as one repository's artifacts are all read,
+    rather than being buffered for a single POST after every repository in
+    `repos` has been swept. A wide backfill (`--lookback-days 90` across the
+    whole `SERVICES` list) can then make partial, durable progress: if the
+    process is interrupted or fails partway through the repository list —
+    a rate limit, a timeout, a crash — every repository already swept has
+    already been delivered and mctl-api's dedupe makes re-sweeping it on the
+    next attempt free, so the sweep converges instead of restarting from
+    zero every time.
     """
     result = CollectResult(repositories=len(repos))
     cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
-    buffer: list[dict[str, Any]] = []
 
     for repo in repos:
+        buffer: list[dict[str, Any]] = []
         try:
             artifacts = list_fn(repo, cutoff, max_pages)
         except Exception as exc:  # noqa: BLE001 — one bad repository must not abort the sweep
@@ -531,14 +590,14 @@ def collect(
                 if sanitised is not None:
                     buffer.append(sanitised)
 
-    if dry_run:
-        result.records_posted = len(buffer)
-        print(f"[dry-run] would post {len(buffer)} record(s); posting nothing")
-    elif buffer:
-        delivered = deliver(buffer, token=token, base_url=base_url, post=post)
-        result.records_posted = delivered.accepted
-        result.records_deduped = delivered.deduped
-        result.failures += delivered.failed_chunks
+        if dry_run:
+            result.records_posted += len(buffer)
+            print(f"[dry-run] would post {len(buffer)} record(s) for {repo}; posting nothing")
+        elif buffer:
+            delivered = deliver(buffer, token=token, base_url=base_url, post=post)
+            result.records_posted += delivered.accepted
+            result.records_deduped += delivered.deduped
+            result.failures += delivered.failed_chunks
 
     return result
 

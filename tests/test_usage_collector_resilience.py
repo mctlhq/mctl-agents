@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import httpx
 import pytest
 
 from orchestrator import run_usage_collector as collector
@@ -88,6 +89,43 @@ def test_dry_run_posts_nothing_with_no_writer_token_present(monkeypatch):
     )
     assert result.records_posted == 1
     assert result.failures == 0
+
+
+def test_a_repositorys_records_are_delivered_before_a_later_repository_is_swept():
+    """A wide backfill must make partial progress: delivery happens per
+    repository, not once after the whole repos list has been swept, so a
+    repository already processed is already posted even if a later one in
+    the same tick fails or the process never gets to it."""
+    def list_fn(repo, cutoff, max_pages):
+        if repo == "mctlhq/broken":
+            raise RuntimeError("401 Bad credentials")
+        return [Artifact(id=1, created_at=_now_utc().isoformat())]
+
+    def download_fn(repo, artifact_id, max_bytes):
+        return [{"session_id": f"s-{repo}", "model_key": "haiku"}]
+
+    posted_bodies: list[dict] = []
+
+    def post(url, body, headers):
+        posted_bodies.append(body)
+        return httpx.Response(
+            200, json={"accepted_count": len(body["records"]), "deduped_count": 0},
+            request=httpx.Request("POST", url),
+        )
+
+    result = collect(
+        repos=["mctlhq/first", "mctlhq/broken", "mctlhq/second"],
+        token=TOKEN, base_url=BASE_URL, post=post,
+        list_fn=list_fn, download_fn=download_fn,
+    )
+    # Delivered once per successful repository, each carrying only that
+    # repository's own record — never buffered across the whole sweep.
+    assert len(posted_bodies) == 2
+    assert [body["records"][0]["session_id"] for body in posted_bodies] == [
+        "s-mctlhq/first", "s-mctlhq/second",
+    ]
+    assert result.records_posted == 2
+    assert result.failures == 1
 
 
 def test_gh_authentication_failure_exits_non_zero(monkeypatch):

@@ -168,8 +168,10 @@ _SCOPED: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("usage_
 # The shapes mctl-api validates at ingest (internal/usage/types.go,
 # validateCorrelation). Kept in step with it: a looser check here lets a
 # record through that costs its whole batch; a stricter one drops a field
-# the server would have taken.
-_TARGET_REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
+# the server would have taken. TARGET_REPO_RE is public (no leading
+# underscore) because orchestrator.run_usage_collector.sanitise applies the
+# same check to a second producer's records and must not drift from it.
+TARGET_REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 _EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 
 
@@ -261,7 +263,7 @@ def _checked_correlation(correlation: Mapping[str, Any]) -> dict[str, Any]:
         logger.warning("usage ledger: not sending %s=%r (%s)", key, fields.pop(key), why)
 
     repo = fields.get("target_repo")
-    if repo is not None and not (isinstance(repo, str) and _TARGET_REPO_RE.match(repo)):
+    if repo is not None and not (isinstance(repo, str) and TARGET_REPO_RE.match(repo)):
         drop("target_repo", "not owner/name")
     for key in ("issue_number", "pr_number"):
         if key not in fields:
