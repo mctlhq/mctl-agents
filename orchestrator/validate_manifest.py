@@ -743,6 +743,15 @@ def _check_capability_discovery_matches_gateway_allowlist(
     """
     from orchestrator.options import build_issue_investigator_options_from_plan
 
+    if "mcp__mctl__*" not in declared_tools:
+        # The builder adds the gateway only in place of mcp__mctl__*, so the
+        # comparison below would fail on a missing mcp__capability__* and
+        # hide the real problem.
+        return [
+            f"{profile_name}: capabilityDiscovery.enabled=true but spec.tools does not "
+            "declare 'mcp__mctl__*', so discovery has no mctl tools to serve"
+        ]
+
     previous_token = os.environ.get("MCTL_TOKEN")
     os.environ["MCTL_TOKEN"] = _DUMMY_MCTL_TOKEN
     try:
@@ -919,6 +928,16 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
         # the two above and orthogonal to which optionsBuilder the profile
         # names — only fires for a profile that opts into discovery.
         capability_discovery = spec.get("capabilityDiscovery")
+        if capability_discovery is not None:
+            # The providers block is checked here with the resolver's own
+            # rules, so a bad endpoint/alias fails CI rather than a live run.
+            from orchestrator import resolver as catalog_resolver
+
+            try:
+                catalog_resolver._parse_capability_discovery(spec, path=profile_path)
+            except catalog_resolver.ResolverError as exc:
+                errors.append(f"{profile_name}: {exc}")
+                continue
         if isinstance(capability_discovery, dict) and capability_discovery.get("enabled") is True:
             errors += _check_capability_discovery_matches_gateway_allowlist(profile_name, declared_tools)
     return errors

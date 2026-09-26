@@ -296,6 +296,65 @@ def test_catalog_profile_with_unrelated_extra_tool_still_fails(tmp_path, monkeyp
 # checkable against the catalog. Does not switch the profile's optionsBuilder
 # (that stays `build_issue_investigator_options`, checked above unchanged).
 # ---------------------------------------------------------------------------
+_MCTL_API_PROVIDER = {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"}
+
+
+def _write_discovery_profile(tmp_path, monkeypatch, tools, capability_discovery) -> None:
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump({
+            "spec": {
+                "tools": tools,
+                "modelPolicyRef": {"task": "service_agent"},
+                "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
+                "capabilityDiscovery": capability_discovery,
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
+
+
+def _real_investigator_tools(tmp_path, monkeypatch) -> list[str]:
+    from orchestrator.options import build_issue_investigator_options
+
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    return list(build_issue_investigator_options(tmp_path, "dummy-model", tmp_path / "proposal").allowed_tools)
+
+
+def test_a_capability_discovery_profile_with_a_bad_provider_block_fails(tmp_path, monkeypatch) -> None:
+    """claude P3 on #513: the providers block is checked with the resolver's
+    rules in CI, not first at load_profile inside a live run."""
+    tools = [*_real_investigator_tools(tmp_path, monkeypatch), "human.request_input"]
+    _write_discovery_profile(tmp_path, monkeypatch, tools, {
+        "enabled": True,
+        "providers": [{**_MCTL_API_PROVIDER, "endpoint": "mctl-api-mcp2"}],
+    })
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert any("providers[0].endpoint" in e for e in errors), errors
+
+
+def test_a_capability_discovery_profile_without_mctl_tools_names_the_real_problem(
+    tmp_path, monkeypatch
+) -> None:
+    """claude P3 on #513: without mcp__mctl__* the gateway is never added,
+    and the error must say so rather than report a set difference."""
+    tools = [t for t in _real_investigator_tools(tmp_path, monkeypatch) if t != "mcp__mctl__*"]
+    _write_discovery_profile(tmp_path, monkeypatch, [*tools, "human.request_input"], {
+        "enabled": True, "providers": [_MCTL_API_PROVIDER],
+    })
+    monkeypatch.delenv("MCTL_TOKEN")
+
+    errors = validate_manifest_module._check_capability_discovery_matches_gateway_allowlist(
+        "issue-investigator-default", set(tools),
+    )
+
+    assert errors and "does not declare 'mcp__mctl__*'" in errors[0], errors
+
+
 def test_current_catalog_has_no_capability_discovery_field_and_validates_unchanged() -> None:
     """The real committed catalog predates this field (part B, mctl-gitops,
     lands separately) — the third check must not fire for it at all."""
@@ -327,7 +386,7 @@ def test_a_capability_discovery_enabled_profile_matching_the_gateway_allowlist_p
                 "tools": [*real_tools, "human.request_input"],
                 "modelPolicyRef": {"task": "service_agent"},
                 "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
-                "capabilityDiscovery": {"enabled": True},
+                "capabilityDiscovery": {"enabled": True, "providers": [_MCTL_API_PROVIDER]},
             }
         }),
         encoding="utf-8",
@@ -361,7 +420,7 @@ def test_a_capability_discovery_enabled_profile_with_a_widening_builder_fails(
                 "tools": [*real_tools, "human.request_input"],
                 "modelPolicyRef": {"task": "service_agent"},
                 "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
-                "capabilityDiscovery": {"enabled": True},
+                "capabilityDiscovery": {"enabled": True, "providers": [_MCTL_API_PROVIDER]},
             }
         }),
         encoding="utf-8",

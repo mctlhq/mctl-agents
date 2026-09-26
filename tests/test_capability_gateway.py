@@ -466,6 +466,56 @@ def test_a_raising_checkpoint_yields_policy_denied_and_no_provider_call():
     assert session.calls == []
 
 
+def test_a_raising_checkpoint_traces_its_cause_apart_from_a_real_deny(capsys):
+    """claude P2 on #513: the refusal record alone is identical to a real
+    deny verdict, so the exception type and message go out on a separate
+    trace line."""
+    session = FakeSession(tools=[_tool("mctl_whoami")])
+    connector = _fake_connector({REMOTE_PROVIDER.id: session})
+    gateway = anyio.run(partial(
+        _build, ("mcp__mctl__*",), providers=[REMOTE_PROVIDER], connector=connector,
+        checkpoint=_RaisingCheckpoint(),
+    ))
+    capsys.readouterr()
+
+    anyio.run(partial(gateway.invoke, "mctl://mcp-remote/mctl-api/mctl_whoami", {}))
+
+    out = capsys.readouterr().out
+    [failure] = _trace_lines(out, "policy_checkpoint_failed")
+    assert failure["error_type"] == "RuntimeError"
+    assert failure["error"] == "checkpoint backend unavailable"
+    assert failure["checkpoint"] == "_RaisingCheckpoint"
+    [record] = _trace_lines(out, "invocation")
+    assert record["reason_code"] == "policy-denied"
+    assert record["policy_checkpoint"] == "denied"
+
+
+class _RaisingAbsentCheckpoint(cap.AbsentPolicyCheckpoint):
+    def check(self, descriptor, correlation):
+        raise RuntimeError("absent checkpoint broke")
+
+
+def test_a_raising_absent_checkpoint_never_claims_a_policy_decision(capsys):
+    """claude P2 on #513: the fail-closed branch goes through
+    policy_checkpoint_status, so AbsentPolicyCheckpoint still reports
+    `absent` rather than a decision it never made."""
+    session = FakeSession(tools=[_tool("mctl_whoami")])
+    connector = _fake_connector({REMOTE_PROVIDER.id: session})
+    gateway = anyio.run(partial(
+        _build, ("mcp__mctl__*",), providers=[REMOTE_PROVIDER], connector=connector,
+        checkpoint=_RaisingAbsentCheckpoint(),
+    ))
+    session.calls.clear()
+    capsys.readouterr()
+
+    result = anyio.run(partial(gateway.invoke, "mctl://mcp-remote/mctl-api/mctl_whoami", {}))
+
+    assert result["reason_code"] == "policy-denied"
+    assert session.calls == []
+    [record] = _trace_lines(capsys.readouterr().out, "invocation")
+    assert record["policy_checkpoint"] == "absent"
+
+
 # ---------------------------------------------------------------------------
 # Task 6b — PolicyDecidePolicyCheckpoint, the #197 adapter.
 # ---------------------------------------------------------------------------

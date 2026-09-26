@@ -642,6 +642,45 @@ def test_capability_discovery_requires_mctl_api_to_use_the_mctl_alias(tmp_path, 
         resolver.load_profile(_PROFILE)
 
 
+def test_capability_discovery_enabled_requires_at_least_one_provider(tmp_path, monkeypatch):
+    """claude P2 on #513: `enabled: true` with no providers would run
+    discovery over an empty CapabilitySet."""
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {"enabled": True, "providers": []})
+    with pytest.raises(resolver.ResolverError, match="enabled is true but providers is empty"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_disabled_may_declare_no_providers(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {"enabled": False})
+
+    profile = resolver.load_profile(_PROFILE)
+
+    assert profile.capability_discovery_enabled is False
+    assert profile.capability_providers == ()
+
+
+def test_capability_discovery_rejects_unknown_keys(tmp_path, monkeypatch):
+    """A misspelled `provider:` must not read as "no providers"."""
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": False,
+        "provider": [{"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"}],
+    })
+    with pytest.raises(resolver.ResolverError, match="unknown keys"):
+        resolver.load_profile(_PROFILE)
+
+
+def test_capability_discovery_rejects_a_duplicate_provider_id(tmp_path, monkeypatch):
+    _write_profile_with_capability_discovery(tmp_path, monkeypatch, {
+        "enabled": True,
+        "providers": [
+            {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"},
+            {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl2", "endpoint": "mctl-api-mcp"},
+        ],
+    })
+    with pytest.raises(resolver.ResolverError, match=r"providers\[1\]: duplicate provider mcp-remote/mctl-api"):
+        resolver.load_profile(_PROFILE)
+
+
 def test_load_release_binding_requires_compatibility_fixture_source(tmp_path, monkeypatch):
     monkeypatch.setattr(resolver, "CATALOG_RELEASES_DIR", tmp_path / "releases")
     doc = _base_binding_doc(

@@ -678,6 +678,10 @@ class PolicyDecidePolicyCheckpoint:
 #: Eligible ids come from the sealed set and are never truncated.
 _MAX_TRACED_ID_LENGTH = 256
 
+#: Bound on a raising PolicyCheckpoint's message in its
+#: `CAPABILITY_POLICY_CHECKPOINT_FAILED` trace line.
+_MAX_CHECKPOINT_ERROR_LENGTH = 300
+
 #: What the model is told when a dispatch fails. Provider/transport exception
 #: text can carry URLs or upstream response fragments, so it never reaches the
 #: model; the reason code is the whole answer, and the trace line records it.
@@ -889,9 +893,23 @@ class CapabilityGateway:
         try:
             verdict = self.checkpoint.check(descriptor, self.capability_set.execution)
             policy_status = policy_checkpoint_status(self.checkpoint, verdict)
-        except Exception:  # noqa: BLE001 - any checkpoint failure is a fail-closed deny
+        except Exception as exc:  # noqa: BLE001 - any checkpoint failure is a fail-closed deny
+            # The record alone would read exactly like a real deny verdict, so
+            # the cause goes out on its own trace line: a checkpoint backend
+            # outage must not look like policy working as intended. The status
+            # still goes through policy_checkpoint_status, so an
+            # AbsentPolicyCheckpoint that raised never claims a decision.
+            _emit_trace({
+                "capability_id": capability_id,
+                "checkpoint": type(self.checkpoint).__name__,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:_MAX_CHECKPOINT_ERROR_LENGTH],
+            }, event="policy_checkpoint_failed")
+            failed_status = policy_checkpoint_status(
+                self.checkpoint, CheckpointVerdict(decision="denied", reason="the policy checkpoint failed"),
+            )
             record = self._record(
-                capability_id, "refused", "policy-denied", start, arguments, policy_checkpoint="denied",
+                capability_id, "refused", "policy-denied", start, arguments, policy_checkpoint=failed_status,
             )
             self._trace(record)
             return {"reason_code": "policy-denied", "error": "the policy checkpoint failed"}

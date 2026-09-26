@@ -507,6 +507,10 @@ def _parse_capability_discovery(
     if raw is None:
         return False, ()
     block = _require_mapping(raw, path=path, field_path="spec.capabilityDiscovery")
+    unknown = sorted(set(block) - {"enabled", "providers"})
+    if unknown:
+        # A misspelled `provider:` would otherwise read as "no providers".
+        raise ResolverError(f"{path}: spec.capabilityDiscovery has unknown keys {unknown!r}")
     enabled = block.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ResolverError(
@@ -518,6 +522,7 @@ def _parse_capability_discovery(
 
     providers: list[ProviderRef] = []
     seen_aliases: set[str] = set()
+    seen_ids: set[tuple[str, str]] = set()
     for index, entry in enumerate(providers_raw):
         field_path = f"spec.capabilityDiscovery.providers[{index}]"
         entry_map = _require_mapping(entry, path=path, field_path=field_path)
@@ -544,6 +549,13 @@ def _parse_capability_discovery(
         if alias in seen_aliases:
             raise ResolverError(f"{path}: {field_path}: duplicate alias {alias!r}")
         seen_aliases.add(alias)
+        # capability.seal() rejects a duplicate (type, id) too, but only at
+        # gateway build time inside a live run; catch it at profile load.
+        if (provider_type, provider_id) in seen_ids:
+            raise ResolverError(
+                f"{path}: {field_path}: duplicate provider {provider_type}/{provider_id}"
+            )
+        seen_ids.add((provider_type, provider_id))
         endpoint = entry_map.get("endpoint")
         if not isinstance(endpoint, str) or endpoint not in _CAPABILITY_ENDPOINTS:
             raise ResolverError(
@@ -563,6 +575,12 @@ def _parse_capability_discovery(
                 alias=alias,
                 endpoint_ref=_CAPABILITY_ENDPOINTS[endpoint],
             )
+        )
+    if enabled and not providers:
+        # Discovery over an empty CapabilitySet would run with no mctl tools
+        # at all while the trace reports discovery mode.
+        raise ResolverError(
+            f"{path}: spec.capabilityDiscovery.enabled is true but providers is empty"
         )
     return enabled, tuple(providers)
 

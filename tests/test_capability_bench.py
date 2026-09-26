@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 
 import capability_bench as cb
@@ -86,20 +88,45 @@ def _result(
     }
 
 
-def test_totals_for_transcript_sums_tokens_and_counts_turns_once_per_message():
+def test_totals_for_transcript_takes_deltas_of_cumulative_usage_within_a_session():
+    """claude P2 on #513: model_usage, num_turns and duration_api_ms are
+    cumulative per session, so a second ResultMessage reporting 120 input
+    tokens after 100 means 120 in total, not 220."""
     messages = [
         _result(session_id="s1", uuid="r1", input_tokens=100, output_tokens=50, num_turns=2, duration_api_ms=500),
-        _result(session_id="s1", uuid="r2", input_tokens=20, output_tokens=10, num_turns=3, duration_api_ms=300),
+        _result(session_id="s1", uuid="r2", input_tokens=120, output_tokens=60, num_turns=3, duration_api_ms=800),
     ]
 
     totals = cb._totals_for_transcript(messages)
 
     assert totals["input_tokens"] == 120
     assert totals["output_tokens"] == 60
-    # num_turns/duration_api_ms are per-message, not per-model — summed once
-    # per message, not once per (message, model_key) pair.
+    assert totals["num_turns"] == 3
+    assert totals["duration_api_ms"] == 800
+
+
+def test_totals_for_transcript_sums_across_sessions():
+    messages = [
+        _result(session_id="s1", uuid="r1", input_tokens=100, output_tokens=50, num_turns=2, duration_api_ms=500),
+        _result(session_id="s2", uuid="r1", input_tokens=20, output_tokens=10, num_turns=3, duration_api_ms=300),
+    ]
+
+    totals = cb._totals_for_transcript(messages)
+
+    assert totals["input_tokens"] == 120
+    assert totals["output_tokens"] == 60
     assert totals["num_turns"] == 5
     assert totals["duration_api_ms"] == 800
+
+
+def test_compare_rejects_a_transcript_that_is_not_an_array_of_objects(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text("[]", encoding="utf-8")
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"session_id": "s1"}', encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="expected a JSON array"):
+        cb.main(["compare", str(good), str(bad)])
 
 
 def test_compare_report_states_the_sample_size():

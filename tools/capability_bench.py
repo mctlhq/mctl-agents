@@ -150,7 +150,7 @@ def _gateway_tools() -> list[Any]:
 #: (usage_ledger field, markdown column label). Order is the table's row
 #: order. `num_turns`/`duration_api_ms` come straight off the ResultMessage
 #: (`usage_ledger.py`'s `common` dict), not the per-model usage breakdown, so
-#: this module sums them once per message rather than once per model_key —
+#: this module takes them once per session rather than once per model_key —
 #: `_totals_for_transcript` below folds that distinction in.
 _TOKEN_FIELDS = (
     ("input_tokens", "Input tokens"),
@@ -166,32 +166,43 @@ _ALL_FIELDS = _TOKEN_FIELDS + _PER_MESSAGE_FIELDS
 
 
 def _totals_for_transcript(messages: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    """Sum every usage field `UsageRecorder.records_for` extracts from one
-    captured run's `ResultMessage`s. Pure: the recorder is constructed with
-    `token=""`, which `UsageRecorder.enabled` reports `False` for and
-    `records_for` never consults — `records_for` neither delivers nor marks
-    anything as handled (its own docstring), so no network call happens
-    here regardless.
+    """Total every usage field `UsageRecorder` extracts from one captured
+    run's `ResultMessage`s. Pure: the recorder is constructed with
+    `token=""`, which `UsageRecorder.enabled` reports `False` for, and it is
+    never asked to deliver, so no network call happens here.
 
-    Per-model token fields are summed once per model_key (a run may report
-    more than one); `num_turns`/`duration_api_ms` are per-message and would
-    be double-counted the same way, so they are summed once per message
-    from the first record `records_for` returns for it instead.
+    `model_usage` is cumulative per `(session_id, model_key)`. The recorder
+    turns it into per-message deltas only against a committed baseline, and
+    `records_for` never commits one, so each message is planned and then
+    committed here exactly as `UsageRecorder._record` does minus delivery;
+    summing the resulting deltas gives the session's real totals.
+
+    `num_turns`/`duration_api_ms` sit on the ResultMessage itself and are
+    cumulative per session too, so each session contributes its largest
+    reported value once, and sessions are summed.
     """
     recorder = UsageRecorder("issue-investigator", token="")
     totals: dict[str, int] = {field: 0 for field, _ in _ALL_FIELDS}
+    per_session: dict[str, dict[str, int]] = {}
     for raw in messages:
         message = SimpleNamespace(**raw)
-        records = recorder.records_for(message)
-        for field, _ in _PER_MESSAGE_FIELDS:
-            value = records[0].get(field) if records else None
-            if isinstance(value, int):
-                totals[field] += value
+        planned = recorder._plan(message)
+        recorder._commit(planned)
+        records = [record for _, _, _, record in planned]
+        if records:
+            session = per_session.setdefault(str(records[0].get("session_id", "")), {})
+            for field, _ in _PER_MESSAGE_FIELDS:
+                value = records[0].get(field)
+                if isinstance(value, int):
+                    session[field] = max(session.get(field, 0), value)
         for record in records:
             for field, _ in _TOKEN_FIELDS:
                 value = record.get(field)
                 if isinstance(value, int):
                     totals[field] += value
+    for session in per_session.values():
+        for field, value in session.items():
+            totals[field] += value
     return totals
 
 
@@ -230,9 +241,16 @@ def _cmd_schema_bytes(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_transcript(path: str) -> list[dict[str, Any]]:
+    loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(loaded, list) or not all(isinstance(item, dict) for item in loaded):
+        raise SystemExit(f"{path}: expected a JSON array of ResultMessage objects")
+    return loaded
+
+
 def _cmd_compare(args: argparse.Namespace) -> int:
-    eager_messages = json.loads(Path(args.eager).read_text(encoding="utf-8"))
-    discovery_messages = json.loads(Path(args.discovery).read_text(encoding="utf-8"))
+    eager_messages = _load_transcript(args.eager)
+    discovery_messages = _load_transcript(args.discovery)
     report = compare_report(eager_messages, discovery_messages)
     print(render_markdown_table(report))
     return 0
