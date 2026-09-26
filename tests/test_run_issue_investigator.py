@@ -3514,13 +3514,23 @@ def test_run_agent_discovery_mode_builds_the_gateway_and_skips_the_mctl_guard(
 
 def test_run_agent_discovery_refused_when_the_profile_does_not_permit_it(tmp_path, monkeypatch):
     """T21 (task 3, design.md sec. 1): "the catalog permits, the env var
-    activates" — the env var alone is no longer sufficient. Real catalog,
-    unmodified (the mctl-gitops half, part B, is not part of this run): its
-    `issue-investigator-default` profile declares no `capabilityDiscovery`
-    at all, so `plan.capability_discovery_enabled` is `False` and the run
-    must refuse before any gateway or options are built."""
-    from orchestrator import capability_gateway as gw
+    activates" — the env var alone is no longer sufficient. A resolved plan
+    whose profile does not permit discovery must refuse before any gateway
+    or options are built.
 
+    The plan is forced to `capability_discovery_enabled=False` rather than
+    read from the real catalog: mctl-gitops#1425 set `enabled: true` on
+    `issue-investigator-default`, so relying on the catalog made this test
+    fail on every mctl-agents PR the moment gitops main changed."""
+    from orchestrator import capability_gateway as gw
+    from orchestrator import resolver
+
+    real_execute = resolver.execute
+
+    def _forbidding_execute(*args, **kwargs):
+        return dataclasses.replace(real_execute(*args, **kwargs), capability_discovery_enabled=False)
+
+    monkeypatch.setattr(resolver, "execute", _forbidding_execute)
     monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
     monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
     monkeypatch.setenv("MCTL_TOKEN", "test-token")
@@ -4812,11 +4822,11 @@ def _permitting_provider():
 
 def _discovery_env(monkeypatch, *, with_token: bool = True):
     """mctlhq/mctl-agents#242 slice 4 (design.md sec. 1): "the catalog
-    permits, the env var activates". The real committed catalog does not
-    declare `capabilityDiscovery` yet (that is the mctl-gitops half, part B),
-    so every discovery test here overrides `resolver.execute` to return a
-    plan that permits it — otherwise every one of them would fail on the new
-    profile-permission preflight before reaching what it actually tests."""
+    permits, the env var activates". Every discovery test here overrides
+    `resolver.execute` to return a plan that permits it, so none of them
+    depends on what the real catalog currently says — otherwise they would
+    fail on the profile-permission preflight before reaching what they
+    actually test."""
     from orchestrator import resolver
 
     monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
