@@ -110,6 +110,24 @@ _ALLOWED_FIELDS = frozenset({
     "num_turns", "duration_api_ms", "retry_attempt", "recorded_at",
 })
 
+# The two shapes `_ALLOWED_FIELDS` (minus session_id/model_key/schema_version,
+# checked separately above) can take. mctl-api's ingest is one transaction, so
+# a field of the wrong Python type is dropped on its own, with a warning,
+# rather than forwarded — otherwise it would fail every record chunked into
+# the same batch as the malformed one (see `_chunk_records`), not just the
+# record it came from.
+_STRING_FIELDS = frozenset({
+    "result_uuid", "canonical_model", "provider", "agent", "devloop_stage",
+    "target_repo", "work_item_id", "trace_id", "span_id",
+    "outcome", "api_error_status", "stop_reason", "terminal_reason", "recorded_at",
+})
+_INT_FIELDS = frozenset({
+    "issue_number", "pr_number",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "reasoning_tokens", "web_search_requests",
+    "num_turns", "duration_api_ms", "retry_attempt",
+})
+
 Post = Callable[[str, dict[str, Any], dict[str, str]], httpx.Response]
 
 
@@ -206,11 +224,16 @@ def list_artifacts(repo: str, cutoff: datetime, max_pages: int = DEFAULT_MAX_PAG
     """
     found: list[Artifact] = []
     for page in range(1, max_pages + 1):
+        # Query parameters go in the URL, not as `-f` fields: `gh api`
+        # defaults to GET only when it has no fields to send — any `-f`/`-F`
+        # turns an unmethoded call into a POST (its body carrying the
+        # "fields"), which silently 404s/misbehaves against a listing
+        # endpoint. Kept as a literal query string, not `-f`, precisely so
+        # this call stays GET without ever writing `--method`/`-X` in this
+        # read-only module (see tests/test_usage_collector_readonly.py).
         proc = _run_gh([
-            "api", f"repos/{repo}/actions/artifacts",
-            "-f", f"name={ARTIFACT_NAME}",
-            "-f", f"per_page={ARTIFACTS_PER_PAGE}",
-            "-f", f"page={page}",
+            "api",
+            f"repos/{repo}/actions/artifacts?name={ARTIFACT_NAME}&per_page={ARTIFACTS_PER_PAGE}&page={page}",
         ])
         try:
             payload = json.loads(proc.stdout or "{}")
@@ -312,10 +335,15 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
 
     Drops `id` and every key not in `_ALLOWED_FIELDS` — an unrecognised key,
     including a future one, is dropped rather than forwarded. Preserves
-    every allowed field exactly as given: an absent counter stays absent
-    (never becomes 0), and nothing here adds `argo_workflow_name`,
+    every allowed field exactly as given (an absent counter stays absent,
+    never becomes 0, and nothing here adds `argo_workflow_name`,
     `temporal_workflow_id`, `work_item_id` or `execution_id` from this
-    process's own environment.
+    process's own environment) EXCEPT when its Python type does not match
+    what mctl-api expects (`_STRING_FIELDS`/`_INT_FIELDS`): that single field
+    is dropped, with a warning, rather than forwarded — the artifact is
+    untrusted input, and the ingest is one transaction, so one malformed
+    field would otherwise fail every record chunked into the same batch,
+    not just the record it came from.
     """
     session_id = raw.get("session_id")
     if not (isinstance(session_id, str) and session_id.strip()):
@@ -332,7 +360,24 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any] | None:
             f"schema_version={schema_version!r} (expected {SCHEMA_VERSION})"
         )
         return None
-    return {key: value for key, value in raw.items() if key in _ALLOWED_FIELDS}
+    sanitised: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in _ALLOWED_FIELDS:
+            continue
+        if key in _STRING_FIELDS and not (isinstance(value, str) and value.strip()):
+            print(
+                f"WARN: dropping field {key!r}={value!r} of record "
+                f"{session_id!r}/{model_key!r} — not a non-empty string"
+            )
+            continue
+        if key in _INT_FIELDS and (isinstance(value, bool) or not isinstance(value, int)):
+            print(
+                f"WARN: dropping field {key!r}={value!r} of record "
+                f"{session_id!r}/{model_key!r} — not an int"
+            )
+            continue
+        sanitised[key] = value
+    return sanitised
 
 
 def _chunk_records(records: list[dict[str, Any]], max_batch: int, max_body_bytes: int) -> list[list[dict[str, Any]]]:

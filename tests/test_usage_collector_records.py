@@ -106,6 +106,40 @@ def test_absent_counter_stays_absent_rather_than_becoming_zero():
     assert "cache_read_tokens" not in sanitised
 
 
+def test_wrong_typed_int_field_is_dropped_without_dropping_the_record(capsys):
+    """A malformed field must not fail the whole record — mctl-api's ingest
+    is one transaction, so a bad field forwarded as-is would cost every
+    record chunked into the same batch, not just this one."""
+    raw = {**_fixture_records()[0], "pr_number": "139"}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "pr_number" not in sanitised
+    assert sanitised["session_id"] == raw["session_id"]
+    assert "pr_number" in capsys.readouterr().out
+
+
+def test_bool_is_not_accepted_as_an_int_field():
+    """`bool` is an `int` subclass in Python; mctl-api's counters are not."""
+    raw = {**_fixture_records()[0], "retry_attempt": True}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "retry_attempt" not in sanitised
+
+
+def test_wrong_typed_string_field_is_dropped():
+    raw = {**_fixture_records()[0], "target_repo": 12345}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "target_repo" not in sanitised
+
+
+def test_blank_string_field_is_dropped():
+    raw = {**_fixture_records()[0], "outcome": "   "}
+    sanitised = sanitise(raw)
+    assert sanitised is not None
+    assert "outcome" not in sanitised
+
+
 def test_no_correlation_added_from_this_processs_own_environment(monkeypatch):
     monkeypatch.setenv("WORKFLOW_NAME", "usage-collector-run-abc")
     monkeypatch.setenv("WORKFLOW_TEMPORAL_WORKFLOW_ID", "collector-wf-1")

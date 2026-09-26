@@ -36,6 +36,24 @@ def test_single_page_in_window(monkeypatch):
     assert [a.id for a in found] == [1]
 
 
+def test_listing_call_carries_no_field_flag_so_gh_defaults_to_get(monkeypatch):
+    """`gh api` defaults to GET only when it has no `-f`/`-F` fields to send
+    — any field flag on an unmethoded call makes `gh` issue a POST instead,
+    which silently fails artifact discovery. The listing call must pass its
+    parameters via the endpoint's own query string, never via `-f`/`-F`."""
+    captured: list[list[str]] = []
+
+    def _fake(args):
+        captured.append(args)
+        return _proc(json.dumps({"artifacts": []}))
+
+    monkeypatch.setattr(collector, "_run_gh", _fake)
+    collector.list_artifacts("mctlhq/.github", CUTOFF, max_pages=1)
+    assert len(captured) == 1
+    assert not any(token in ("-f", "-F") for token in captured[0])
+    assert any("name=" in token and "per_page=" in token and "page=" in token for token in captured[0])
+
+
 def test_pagination_across_full_pages(monkeypatch):
     """A full first page (100 rows) is followed by a second, short page —
     both must be read."""
@@ -44,7 +62,7 @@ def test_pagination_across_full_pages(monkeypatch):
     calls: list[int] = []
 
     def _fake(args):
-        page = int(next(a.split("=", 1)[1] for a in args if a.startswith("page=")))
+        page = int(next(part.split("=", 1)[1] for a in args for part in a.split("&") if part.startswith("page=")))
         calls.append(page)
         rows = page1 if page == 1 else page2
         return _proc(json.dumps({"artifacts": rows}))
@@ -59,7 +77,7 @@ def test_max_pages_caps_reading_even_with_full_pages(monkeypatch):
     calls: list[int] = []
 
     def _fake(args):
-        page = int(next(a.split("=", 1)[1] for a in args if a.startswith("page=")))
+        page = int(next(part.split("=", 1)[1] for a in args for part in a.split("&") if part.startswith("page=")))
         calls.append(page)
         rows = [_row(page * 1000 + i, "2026-09-25T10:00:00Z") for i in range(100)]
         return _proc(json.dumps({"artifacts": rows}))
