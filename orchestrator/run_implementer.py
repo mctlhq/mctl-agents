@@ -1300,12 +1300,17 @@ def _usage_correlation(
     execution_id: str,
     pr: tuple[str, int] | None = None,
     status: dict | None = None,
+    devloop_stage: str | None = None,
 ) -> dict[str, Any]:
     """The usage-ledger correlation of one implementer session
     (mctlhq/mctl-agents#499), from what this run already holds: the
     proposal's `source` issue, the PR when there is one, and this run's
     execution id. The service repository stands in when there is neither.
     `status` is the `.status.yaml` the caller already parsed, if it has one.
+
+    `devloop_stage` (mctlhq/.github#50) overrides the per-agent default a
+    bare `implementer` run gets — the review-feedback path is the one caller
+    that passes it, since only it knows it is the shepherd's own follow-up.
     """
     if status is None:
         status = _load_status(ref.status_path)
@@ -1315,6 +1320,7 @@ def _usage_correlation(
         pr_repo=pr[0] if pr else None,
         pr_number=pr[1] if pr else None,
         repo=f"mctlhq/{ref.service}",
+        devloop_stage=devloop_stage,
     )
 
 
@@ -2724,7 +2730,13 @@ def review_feedback_one(
         )
         try:
             with usage_ledger.correlate(
-                _usage_correlation(ref, execution_id=_review_execution_id(), pr=parsed_pr, status=pre_status)
+                # The remediation cost belongs to the stage that ordered it
+                # (the shepherd, which forked this run); `agent` stays
+                # `implementer`, naming the binary that spent it.
+                _usage_correlation(
+                    ref, execution_id=_review_execution_id(), pr=parsed_pr, status=pre_status,
+                    devloop_stage=usage_ledger.STAGE_SHEPHERD,
+                )
             ):
                 anyio.run(
                     functools.partial(

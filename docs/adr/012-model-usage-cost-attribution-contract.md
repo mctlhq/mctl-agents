@@ -315,6 +315,9 @@ the endpoint shape belongs to `usage-ledger`.
    has no field of that shape.
 9. `cache_read_tokens` absent and `cache_read_tokens = 0` are distinguishable
    after a round-trip.
+10. Every producer record carries a `devloop_stage` vocabulary value or none.
+11. A review-feedback run's records carry `agent=implementer` and
+    `devloop_stage=shepherd`.
 
 ## Amendment 2026-09-24 — the producer (mctlhq/.github#50)
 
@@ -366,6 +369,36 @@ Two consequences for delivery:
 **Cost.** The producer sends no cost. mctl-api prices the token counts from
 its versioned catalog at ingest (`calculated_cost` + `pricing_version`), and
 `provider_reported_cost` stays null as decided above.
+
+**`devloop_stage` is a closed v1 vocabulary (owner decision 2).** Four values,
+and no others: `investigator`, `implementer`, `reviewer`, `shepherd`. Every
+ledger agent name defaults to a stage:
+
+| Ledger `agent` | Default `devloop_stage` |
+|---|---|
+| `investigator` | `investigator` |
+| `implementer` | `implementer` |
+| `shepherd` | `shepherd` |
+
+The one exception is the shepherd's review-feedback follow-up: it forks
+`python -m orchestrator.run_implementer --review-feedback`, whose SDK session
+still opens as `tracing.agent_run("implementer", ...)`, so `agent` stays
+`implementer`. But the remediation cost belongs to the stage that ordered it,
+not the stage that spent it, so that run's records carry
+`agent=implementer` and `devloop_stage=shepherd`. `agent` is never renamed;
+`devloop_stage` is an additional field on the same record.
+
+A `devloop_stage` outside the vocabulary — free text, wrong case, a
+non-string, empty — is omitted from the record with one warning, exactly as
+`target_repo` and `execution_id` are today: the ingest is one transaction, so
+a malformed field would otherwise cost the whole batch. A ledger agent absent
+from the default table (a future `service-agent`, `mentor` or
+`incident-responder` path) records no `devloop_stage` at all rather than
+guessing one.
+
+`reviewer` is part of the vocabulary constant so the producer and the
+collector cannot drift, but no path in this repo emits it: it is written by
+the review collector (mctlhq/.github#126), not by `UsageRecorder`.
 
 ## Amendment 2026-09-26 — the collector (mctlhq/mctl-agents#506)
 

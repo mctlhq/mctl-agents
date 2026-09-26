@@ -125,6 +125,24 @@ _UNSENT = (
 # are for spans; the ledger speaks the shorter names.
 _AGENT_NAMES = {"issue-investigator": "investigator"}
 
+# The closed v1 devloop_stage vocabulary (mctlhq/.github#50, owner decision 2).
+# `reviewer` is produced by the review collector (mctlhq/.github#126), not here;
+# it is part of the constant so the producer and the collector cannot drift.
+STAGE_INVESTIGATOR = "investigator"
+STAGE_IMPLEMENTER = "implementer"
+STAGE_REVIEWER = "reviewer"
+STAGE_SHEPHERD = "shepherd"
+DEVLOOP_STAGES = frozenset({STAGE_INVESTIGATOR, STAGE_IMPLEMENTER, STAGE_REVIEWER, STAGE_SHEPHERD})
+
+# Ledger agent name -> the stage its own runs belong to. Keyed on the name
+# AFTER _AGENT_NAMES. An agent that is absent here records no stage: a path
+# that starts recording later must name its stage deliberately.
+_AGENT_STAGES = {
+    "investigator": STAGE_INVESTIGATOR,
+    "implementer": STAGE_IMPLEMENTER,
+    "shepherd": STAGE_SHEPHERD,
+}
+
 # ModelUsage counter -> record field. All cumulative within a session.
 _COUNTERS = (
     ("inputTokens", "input_tokens"),
@@ -176,6 +194,7 @@ def work_correlation(
     pr_repo: str | None = None,
     pr_number: Any = None,
     repo: str | None = None,
+    devloop_stage: str | None = None,
 ) -> dict[str, Any]:
     """The #499 correlation fields of one piece of work.
 
@@ -189,6 +208,11 @@ def work_correlation(
     one supplies the issue when `issue_repo`/`issue_number` are not given. A
     block with no `type` is the pre-`type` shape of the same thing
     (orchestrator/source_issue.py).
+
+    `devloop_stage` is included only when truthy. It is not validated here —
+    `_checked_correlation` is the single gate that clamps it to
+    `DEVLOOP_STAGES`, and duplicating that check here is how a looser and a
+    stricter copy drift apart.
     """
     if isinstance(source, Mapping) and source.get("type") in (None, "github_issue") and issue_number is None:
         repo_value = source.get("repo")
@@ -208,6 +232,8 @@ def work_correlation(
         fields["issue_number"] = issue
     if execution_id and execution_id.strip():
         fields["execution_id"] = execution_id.strip()
+    if devloop_stage:
+        fields["devloop_stage"] = devloop_stage
     return fields
 
 
@@ -250,6 +276,9 @@ def _checked_correlation(correlation: Mapping[str, Any]) -> dict[str, Any]:
     execution_id = fields.get("execution_id")
     if execution_id is not None and not (isinstance(execution_id, str) and _EXECUTION_ID_RE.match(execution_id)):
         drop("execution_id", "not an execution id")
+    stage = fields.get("devloop_stage")
+    if stage is not None and stage not in DEVLOOP_STAGES:
+        drop("devloop_stage", "not one of the devloop_stage vocabulary")
     return fields
 
 
@@ -353,6 +382,12 @@ class UsageRecorder:
             self._off_reason = f"{BASE_URL_ENV} is not https ({base_url!r})"
         self._url = base_url.rstrip("/") + INGEST_PATH
         self._correlation = _checked_correlation(correlation or {})
+        # The stage of this agent's own runs, unless the runner scoped one (the
+        # shepherd's review-feedback implementer child does; see run_implementer).
+        if "devloop_stage" not in self._correlation:
+            stage = _AGENT_STAGES.get(self.agent)
+            if stage:
+                self._correlation["devloop_stage"] = stage
         self._post = post or _default_post
         self._sleep = sleep
         self._submit = submit or _WORKER.submit
