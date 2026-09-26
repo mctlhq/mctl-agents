@@ -51,8 +51,7 @@ today's unchanged path.
 must both hold, and the env var alone is no longer sufficient:
 
 - The resolved profile's `spec.capabilityDiscovery.enabled` must be `true`.
-  Absent the field entirely (every profile today, until part B lands) means
-  `false` — a profile that predates this field permits nothing. The
+  Absent the field entirely means `false` — a profile that predates this field permits nothing. The
   profile's `providers` list, in declaration order, is what
   `CapabilityGateway.build()` is given; there is no longer a module-level
   provider constant.
@@ -89,24 +88,21 @@ fails the run with the failure's reason code. It never falls back to eager
 options: a silent mode change would invalidate whatever the pilot run was
 measuring.
 
-## What is blocked
+## Catalog and measurement (parts B and C)
 
-Not part of this proposal — the mctl-gitops half and the live measurement:
+- **Part B — done (mctl-gitops#1423).** `spec.capabilityDiscovery` is an
+  optional `ExecutionProfile` schema property, checked by
+  `validate-agent-platform.py`, and `issue-investigator-default` declares it
+  with the `mctl-api` provider.
+- **Part C — done.** mctl-gitops#1425 set `enabled: true` (profile 1.5.0,
+  shadow binding revision 12). That only *permits* discovery:
+  `cwft-mctl-agents-investigate.yaml` sets neither
+  `ISSUE_INVESTIGATOR_RESOLVER_MODE` nor `ISSUE_INVESTIGATOR_CAPABILITY_MODE`,
+  so production runs stay `legacy`/`eager`. The measured pair (one run per
+  mode) is in `docs/benchmarks/capability-discovery.md`.
 
-- **Part B (mctl-gitops, human-authored PR, after this merges).**
-  `spec.capabilityDiscovery` as an optional `ExecutionProfile` schema
-  property, the `issue-investigator-default` profile actually declaring it
-  (starting `enabled: false`, so nothing changes on merge), and the matching
-  profile-version/release-binding bump. Until it lands, every profile
-  resolves `capability_discovery_enabled=False` — discovery cannot run in
-  production regardless of the env var.
-- **Part C (operator, after A and B).** The measured comparison of initial
-  tool-schema bytes and end-to-end token usage between `eager` and
-  `discovery` mode, for one fixed issue and target SHA, with the sample size
-  stated (requirements.md's benchmark acceptance criterion). The harness is
-  implemented (`tools/capability_bench.py`); running it against a live,
-  paid pair of runs is not something an implementer pass can do — see
-  `docs/benchmarks/capability-discovery.md`.
+Turning discovery on in production is a separate owner decision that this
+pilot does not make. It needs the CWFT to set both env vars.
 
 ## Rollback
 
