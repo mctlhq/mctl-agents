@@ -48,8 +48,8 @@ bounded by FLUSH_TIMEOUT_SECONDS; by then the anyio loop has returned.
 Correlation (mctlhq/mctl-agents#499). Each record says which piece of work
 spent it:
 
-- `argo_workflow_name`, `temporal_workflow_id` and `work_item_id` come from
-  the pod's environment.
+- `argo_workflow_name`, `temporal_workflow_id`, `temporal_run_id` and
+  `work_item_id` come from the pod's environment.
 - `target_repo`, `issue_number`, `pr_number` and `execution_id` come from the
   runner, which learns them only after it has read its issue, proposal or PR.
   It scopes them with `correlate` around the SDK session. The recorder is
@@ -155,6 +155,7 @@ _COUNTERS = (
 # Correlation read from the runner pod's environment (the CWFTs set these).
 _CORRELATION_ENV = (
     ("WORKFLOW_TEMPORAL_WORKFLOW_ID", "temporal_workflow_id"),
+    ("WORKFLOW_TEMPORAL_RUN_ID", "temporal_run_id"),
     ("WORKFLOW_NAME", "argo_workflow_name"),
     ("WORKFLOW_WORK_ITEM_ID", "work_item_id"),
 )

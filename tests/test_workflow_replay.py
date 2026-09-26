@@ -329,6 +329,90 @@ def test_patched_histories_show_submit_and_wait_on_the_execution_queue(
     assert not strays, f"{scenario.patched_path.name} also routed {strays}"
 
 
+def _submit_params(events: list[dict], name: str) -> list[dict]:
+    """Decoded `SubmitAndWaitInput` for every scheduled `submit_and_wait`
+    whose `operation` equals `name`. Same b64-then-json shape as
+    `_patch_ids`, applied to the activity's own input payload rather than a
+    marker's."""
+    out = []
+    for attrs in _activity_scheduled_attrs(events, "submit_and_wait"):
+        for payload in attrs["input"]["payloads"]:
+            decoded = json.loads(base64.b64decode(payload["data"]))
+            if decoded.get("operation") == name:
+                out.append(decoded.get("params", {}))
+    return out
+
+
+def test_dev_loop_full_prepatch_history_predates_the_launch_correlation_marker() -> None:
+    """mctlhq/mctl-agents#505: `dev_loop_full.prepatch.json` must not carry
+    the `launch-correlation` marker, or it no longer exercises the unpatched
+    branch `_launch_correlation` falls back to. Restore it from git rather
+    than re-recording (see the module and `replay_scenarios.py` docstrings)."""
+    scenario = scenario_by_name("dev_loop_full")
+    events = _events(scenario)
+    assert "launch-correlation" not in _patch_ids(events), (
+        f"{scenario.path.name} records the launch-correlation patch, so it "
+        "was recorded AFTER #505 landed and no longer exercises the "
+        "unpatched branch. Restore it from git rather than re-recording."
+    )
+    for name in ("mctl-agents-implement", "mctl-agents-shepherd"):
+        for params in _submit_params(events, name):
+            assert "temporal_workflow_id" not in params, (
+                f"{scenario.path.name}'s {name} submit carries "
+                "temporal_workflow_id; a pre-patch history cannot."
+            )
+            assert "temporal_run_id" not in params
+
+
+async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> None:
+    """mctlhq/mctl-agents#505, ties the assertion to the CODE rather than to
+    `dev_loop_full.patched.json`.
+
+    That shared fixture is NOT regenerated for this change (unlike the
+    #251 exec-queue flip's own `test_patched_histories_show_submit_and_wait_
+    on_the_execution_queue`): it is reused by several unrelated markers'
+    predates-tests (`test_prepatch_history_predates_the_approval_watch` is
+    one), each asserting the fixture does NOT yet carry ITS marker.
+    Re-recording it with today's code would take every patch's guarded
+    branch at once, including markers this proposal has nothing to do with,
+    and break those assertions out from under them -- the same collateral
+    damage `replay_scenarios.py`'s docstring warns re-recording a
+    `*.prepatch.json` causes, one file over. `test_todays_code_still_routes_
+    and_still_guards` chose the same live-recording shape for exactly this
+    reason.
+
+    Both halves are asserted, because either alone would pass on a broken
+    change: the marker without the params if `patched()`'s result were
+    ignored, or the params without the marker on an unguarded addition.
+    """
+    scenario = scenario_by_name("dev_loop_full")
+    async with await WorkflowEnvironment.start_time_skipping() as env:
+        handle = await record(env.client, scenario)
+        history = await handle.fetch_history()
+
+    events = history.to_json_dict()["events"]
+    assert "launch-correlation" in _patch_ids(events), (
+        "the implement/shepherd correlation params are unguarded, so a "
+        "rollback could not be replayed."
+    )
+    implement_submits = _submit_params(events, "mctl-agents-implement")
+    assert implement_submits, "no mctl-agents-implement submit was recorded"
+    for params in implement_submits:
+        assert params.get("temporal_workflow_id") == handle.id
+        assert params.get("temporal_run_id") == handle.first_execution_run_id
+        # This scenario starts with no work item (`_dev_loop_start` passes
+        # only `issue_url`), so `work_item_id` must be omitted entirely
+        # rather than sent empty (requirements.md's EARS clause).
+        assert "work_item_id" not in params
+        assert "execution_id" not in params
+    # The approve submit keeps its own shape: the helper touches only the
+    # implement and shepherd sites.
+    approve_submits = _submit_params(events, "mctl-agents-approve")
+    assert approve_submits and all(
+        set(p) == {"service", "slug", "approver"} for p in approve_submits
+    ), approve_submits
+
+
 async def test_todays_code_still_routes_and_still_guards() -> None:
     """Ties the routing assertions to the CODE, not to a committed snapshot.
 
