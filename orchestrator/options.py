@@ -1176,6 +1176,7 @@ def build_issue_investigator_options_from_plan(
     plan: ExecutionPlan,
     repo_dir: Path,
     proposal_dir: Path,
+    *,
     gateway: Any = None,
 ) -> ClaudeAgentOptions:
     """Options for issue-investigator's `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`

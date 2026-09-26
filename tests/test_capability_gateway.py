@@ -768,3 +768,92 @@ def test_sdk_server_wraps_the_three_tools():
     server = _whoami_gateway()[0].sdk_server()
     assert server["type"] == "sdk"
     assert server["name"] == "capability"
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups on #508, second round (7763ccf).
+# ---------------------------------------------------------------------------
+
+
+def test_every_read_only_tool_in_the_table_is_allowed_by_the_builtin_policy():
+    """The gateway dispatches `read-only` capabilities without a checkpoint,
+    and the policy hook delegates every gateway call. That is only safe while
+    each read-only key is ALLOW on the direct `mcp__mctl__*` path too.
+    `mctl_verify_domain` was not (claude P1 on #508)."""
+    from orchestrator import policy_checkpoint as pc
+
+    table = cap.load_consequence_table()
+    read_only = sorted(name for name, tier in table.items() if tier == "read-only")
+    assert read_only, "the table must still classify some tools read-only"
+    gated = []
+    for name in read_only:
+        request = pc.request_for(pc.MCP_TOOL_CALL, f"mcp__mctl__{name}", "mctl", {}, grants=("mcp__mctl__*",))
+        rule, _code, _reason = pc.evaluate(pc.BUILTIN_POLICY, request)
+        if rule is None or rule.verdict != pc.ALLOW:
+            gated.append((name, rule.rule_id if rule else None))
+    assert gated == []
+
+
+def test_verify_domain_is_not_read_only():
+    table = cap.load_consequence_table()
+    assert cap.classify_consequence("mctl_verify_domain", table, provider_id=cap.MCTL_API_PROVIDER_ID) != "read-only"
+
+
+def test_an_unusable_tool_name_is_skipped_and_reported_not_fatal(capsys):
+    """A namespaced (`/`) or empty name cannot become a capability_id; it is
+    skipped for its own provider instead of failing discovery (claude P3)."""
+    session = FakeSession(tools=[_tool("github/create_issue"), _tool(""), _tool("mctl_whoami")])
+    capability_set = anyio.run(partial(
+        gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
+        connector=_fake_connector({REMOTE_PROVIDER.id: session}), headers={},
+    ))
+    assert [c.tool_name for c in capability_set.capabilities] == ["mcp__mctl__mctl_whoami"]
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("CAPABILITY_PROVIDER_DEGRADED ")]
+    assert len(lines) == 1
+    payload = json.loads(lines[0].split(" ", 1)[1])
+    assert payload == {"provider_id": "mctl-api", "unusable_tool_names": 2, "annotations_dropped": 0}
+    assert "github" not in lines[0]
+
+
+def test_dropped_annotations_are_counted_in_the_trace(capsys):
+    big = gw.ProviderTool(name="mctl_whoami", input_schema={"type": "object"},
+                          annotations={"blob": "x" * (cap.MAX_ANNOTATIONS_JSON_LENGTH + 1)})
+    anyio.run(partial(
+        gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
+        connector=_fake_connector({REMOTE_PROVIDER.id: FakeSession(tools=[big])}), headers={},
+    ))
+    out = capsys.readouterr().out
+    line = next(line for line in out.splitlines() if line.startswith("CAPABILITY_PROVIDER_DEGRADED "))
+    assert json.loads(line.split(" ", 1)[1])["annotations_dropped"] == 1
+    assert "xxxx" not in out
+
+
+def test_a_clean_discovery_emits_no_degradation_line(capsys):
+    anyio.run(partial(
+        gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
+        connector=_fake_connector({REMOTE_PROVIDER.id: FakeSession(tools=[_tool("mctl_whoami")])}), headers={},
+    ))
+    assert "CAPABILITY_PROVIDER_DEGRADED" not in capsys.readouterr().out
+
+
+def _invocation_trace(out: str) -> dict:
+    line = next(line for line in out.splitlines() if line.startswith("CAPABILITY_INVOCATION "))
+    return json.loads(line.split(" ", 1)[1])
+
+
+def test_a_non_string_capability_id_never_reaches_the_trace(capsys):
+    gateway, _ = _whoami_gateway()
+    capsys.readouterr()
+    anyio.run(partial(gateway.invoke, {"secret": "do-not-log"}, {}))
+    out = capsys.readouterr().out
+    assert "do-not-log" not in out
+    assert _invocation_trace(out)["capability_id"] == "<non-string>"
+
+
+def test_an_invented_capability_id_is_bounded_in_the_trace(capsys):
+    gateway, _ = _whoami_gateway()
+    capsys.readouterr()
+    result = anyio.run(partial(gateway.invoke, "mctl://x/y/" + "z" * 5000, {}))
+    assert result["reason_code"] == "not-eligible"
+    assert len(_invocation_trace(capsys.readouterr().out)["capability_id"]) == gw._MAX_TRACED_ID_LENGTH

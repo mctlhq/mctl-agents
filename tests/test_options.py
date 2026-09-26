@@ -1591,3 +1591,14 @@ def test_gateway_with_absent_checkpoint_over_read_only_capabilities_is_allowed(t
     gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=("read-only",))
     built = _gateway_options(tmp_path, monkeypatch, gateway)
     assert built.mcp_servers == {"capability": {"fake": "server-config"}}
+
+
+def test_gateway_is_keyword_only(tmp_path, monkeypatch):
+    """A fourth positional argument must not silently switch the builder
+    into the gateway branch (claude P3 on #508)."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    with pytest.raises(TypeError):
+        options.build_issue_investigator_options_from_plan(plan, repo_dir, tmp_path / "p", _FakeGateway())

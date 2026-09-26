@@ -395,6 +395,14 @@ def _derive_keywords(bare_tool_name: str) -> tuple[str, ...]:
     return tuple(parts[:MAX_KEYWORDS])
 
 
+def _usable_tool_name(name: Any) -> bool:
+    """A bare tool name `capability_id` can carry: non-empty, no `/`.
+    MCP does not forbid namespaced names like `github/create_issue`, but
+    ADR 017 sec. 4's `mctl://<type>/<id>/<tool>` cannot hold one, and one
+    such name must not fail discovery for every provider."""
+    return isinstance(name, str) and bool(name) and "/" not in name
+
+
 def _utcnow_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -450,7 +458,12 @@ async def _discover(
         async with session_cm as session:
             tools = await session.list_tools()
 
+        unusable_names = 0
+        annotations_dropped = 0
         for info in tools:
+            if not _usable_tool_name(info.name):
+                unusable_names += 1
+                continue
             sdk_name = _sdk_visible_name(provider, info.name)
             matched_pattern = _first_matching_pattern(sdk_name, plan.tools)
             if matched_pattern is None:
@@ -458,6 +471,9 @@ async def _discover(
                 continue
             capability_id = f"mctl://{provider.type}/{provider.id}/{info.name}"
             schema_bytes = canonical_json(dict(info.input_schema))
+            annotations = _bounded_annotations(info.annotations)
+            if info.annotations and not annotations:
+                annotations_dropped += 1
             descriptor = CapabilityDescriptor(
                 capability_id=capability_id,
                 tool_name=sdk_name,
@@ -469,11 +485,20 @@ async def _discover(
                 input_schema_bytes=len(schema_bytes),
                 consequence=classify_consequence(info.name, table, provider_id=provider.id),
                 matched_tool_pattern=matched_pattern,
-                annotations=_bounded_annotations(info.annotations),
+                annotations=annotations,
             )
             descriptors.append(descriptor)
             schemas_by_id[capability_id] = info.input_schema
             dispatch_by_id[capability_id] = (provider, info.name)
+
+        # Degradation is visible, never silent: counts and the provider id
+        # only, no tool names and no annotation content.
+        if unusable_names or annotations_dropped:
+            _emit_trace({
+                "provider_id": provider.id,
+                "unusable_tool_names": unusable_names,
+                "annotations_dropped": annotations_dropped,
+            }, event="provider_degraded")
 
     return descriptors, excluded_count, schemas_by_id, dispatch_by_id
 
@@ -609,6 +634,10 @@ class PolicyDecidePolicyCheckpoint:
 #: an open product question ADR 017 sec. 8 leaves for a later slice, not
 #: reopened here.
 _CHECKPOINT_CONSEQUENCES = frozenset({"mutating", "consequential"})
+
+#: Bound on a model-invented id carried into a `not-eligible` trace line.
+#: Eligible ids come from the sealed set and are never truncated.
+_MAX_TRACED_ID_LENGTH = 256
 
 #: What the model is told when a dispatch fails. Provider/transport exception
 #: text can carry URLs or upstream response fragments, so it never reaches the
@@ -780,7 +809,9 @@ class CapabilityGateway:
         start = time.monotonic()
 
         if not isinstance(capability_id, str):
-            record = self._record(str(capability_id), "refused", "invalid-arguments", start, {},
+            # A fixed placeholder: the trace never carries model-supplied
+            # content (the no-payload rule above).
+            record = self._record("<non-string>", "refused", "invalid-arguments", start, {},
                                   policy_checkpoint="absent")
             self._trace(record)
             return {"reason_code": "invalid-arguments", "error": "capability_id must be a string"}
@@ -793,7 +824,8 @@ class CapabilityGateway:
         descriptor = self.descriptors_by_id.get(capability_id)
         if descriptor is None:
             record = self._record(
-                capability_id, "refused", "not-eligible", start, arguments, policy_checkpoint="absent",
+                capability_id[:_MAX_TRACED_ID_LENGTH], "refused", "not-eligible", start, arguments,
+                policy_checkpoint="absent",
             )
             self._trace(record)
             return {"reason_code": "not-eligible", "error": f"{capability_id!r} is not eligible for this execution"}
