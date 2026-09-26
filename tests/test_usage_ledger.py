@@ -503,6 +503,8 @@ def test_each_sdk_driver_records_its_usage_with_tracing_off(ledger, tmp_path, mo
     assert usage_ledger.flush(5)
     (record,) = ledger.records
     assert (record["agent"], record["model_key"], record["output_tokens"]) == (agent, OPUS, 420)
+    # Each ledger agent name is its own devloop_stage default (mctlhq/.github#50).
+    assert record["devloop_stage"] == agent
     assert ledger.calls[0][2]["Authorization"] == f"Bearer {TOKEN}"
 
 
@@ -519,3 +521,61 @@ def test_the_shepherd_records_the_usage_of_its_normalising_call(ledger, monkeypa
     assert usage_ledger.flush(5)
     (record,) = ledger.records
     assert (record["agent"], record["model_key"], record["output_tokens"]) == ("shepherd", HAIKU, 60)
+    assert record["devloop_stage"] == "shepherd"
+
+
+# ---------------------------------------------------------------------------
+# devloop_stage (mctlhq/.github#50)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("stage", ["reviewing", "Shepherd", "", 42, None])
+def test_an_out_of_vocabulary_stage_is_dropped_with_a_warning(stage, caplog):
+    """Free text, wrong case, a non-string, empty and None all fail the
+    `DEVLOOP_STAGES` membership check the same way `target_repo` and
+    `execution_id` are clamped today. `mentor` has no per-agent default, so
+    a dropped value leaves the key truly absent rather than defaulted."""
+    api = FakeApi()
+    _recorder(api, "mentor", devloop_stage=stage).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    (record,) = api.records
+    assert "devloop_stage" not in record
+    if stage not in (None, ""):
+        assert "usage ledger: not sending devloop_stage" in caplog.text
+
+
+@pytest.mark.parametrize("stage", usage_ledger.DEVLOOP_STAGES)
+def test_a_vocabulary_stage_passes_through(stage):
+    api = FakeApi()
+    _recorder(api, devloop_stage=stage).observe(_result("u1", {OPUS: _usage(1, 2)}))
+    (record,) = api.records
+    assert record["devloop_stage"] == stage
+
+
+def test_an_agent_absent_from_the_default_table_records_no_stage():
+    """A future `mentor`/`service-agent`/`incident-responder` path must not
+    inherit a guessed stage."""
+    api = FakeApi()
+    _recorder(api, "mentor").observe(_result("u1", {OPUS: _usage(1, 2)}))
+    (record,) = api.records
+    assert "devloop_stage" not in record
+
+
+def test_devloop_stage_precedence_explicit_over_scope_over_default():
+    """Mirrors `test_explicit_correlation_wins_over_the_scope_and_the_scope_over_the_environment`:
+    an explicit argument beats a `correlate` scope, which beats the
+    per-agent default."""
+    with usage_ledger.correlate({"devloop_stage": "shepherd"}):
+        scoped = usage_ledger.UsageRecorder.from_env("implementer", {usage_ledger.TOKEN_ENV: TOKEN})
+        explicit = usage_ledger.UsageRecorder.from_env(
+            "implementer", {usage_ledger.TOKEN_ENV: TOKEN}, devloop_stage="reviewer",
+        )
+    assert scoped._correlation["devloop_stage"] == "shepherd"
+    assert explicit._correlation["devloop_stage"] == "reviewer"
+    # No scope, no explicit argument: the per-agent default fills in.
+    defaulted = usage_ledger.UsageRecorder.from_env("implementer", {usage_ledger.TOKEN_ENV: TOKEN})
+    assert defaulted._correlation["devloop_stage"] == "implementer"
+
+
+def test_the_devloop_stage_vocabulary_is_closed_and_covers_every_default():
+    assert usage_ledger.DEVLOOP_STAGES == frozenset({"investigator", "implementer", "reviewer", "shepherd"})
+    assert set(usage_ledger._AGENT_STAGES.values()) <= usage_ledger.DEVLOOP_STAGES
