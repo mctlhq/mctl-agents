@@ -34,6 +34,13 @@ requires-python = ">=3.12,<3.13"
 # and grpcio would be the heaviest wheel in the image. Everything is imported
 # lazily by orchestrator/tracing.py, so an unconfigured process never loads
 # the SDK at all.
+#
+# mcp: promoted from a transitive dep (pulled in by claude-agent-sdk) to a
+# direct, deliberately-pinned one, following the httpx precedent above --
+# orchestrator/capability_gateway.py (mctlhq/mctl-agents#242 slice 2) now
+# imports mcp.client.streamable_http and mcp.ClientSession directly to
+# connect a remote MCP capability provider. Pinned at the version already
+# resolved in uv.lock so this promotion changes no resolved version.
 dependencies = [
     "claude-agent-sdk==0.2.136",
     "anyio==4.14.2",
@@ -41,6 +48,7 @@ dependencies = [
     "PyYAML==6.0.3",
     "temporalio==1.31.0",
     "httpx==0.28.1",
+    "mcp==1.29.0",
     "opentelemetry-api==1.44.0",
     "opentelemetry-sdk==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.44.0",

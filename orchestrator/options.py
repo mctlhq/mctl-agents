@@ -1161,6 +1161,7 @@ def build_issue_investigator_options_from_plan(
     plan: ExecutionPlan,
     repo_dir: Path,
     proposal_dir: Path,
+    gateway: Any = None,
 ) -> ClaudeAgentOptions:
     """Options for issue-investigator's `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`
     path (orchestrator/run_issue_investigator.py): built from a resolved
@@ -1192,6 +1193,21 @@ def build_issue_investigator_options_from_plan(
     dormant today only because the single checked-in fixture always lists
     `mcp__mctl__*` — an accident of the fixture, not a property of the
     design (claude P2 on #234, third round; earlier rounds fixed (2) alone).
+
+    ``gateway`` (mctlhq/mctl-agents#242 slice 2, ADR 017): a
+    ``orchestrator.capability_gateway.CapabilityGateway``, or ``None``
+    (the default). ``None`` produces byte-identical options to before this
+    parameter existed — nothing below this docstring's original behaviour
+    changes on that path. With a gateway supplied: the remote ``mctl``
+    server is NOT connected into the model's tool set at all (``mcp_servers
+    = {"capability": gateway.sdk_server()}`` instead of
+    ``mctl_mcp_config(...)``); the same two-fact conjunction above still
+    gates the grant, only the tool glob changes, from ``mcp__mctl__*`` to
+    ``mcp__capability__*``; and ``strict_mcp_config=True``, so the CLI can
+    only ever reach the gateway's three tools plus whatever the profile
+    otherwise grants — never a remote MCP server this function did not
+    itself configure. Nothing in slice 2 passes a gateway from a real run;
+    that construction site is slice 3's job.
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
     # HUMAN_INPUT_CAPABILITY is filtered out alongside "mcp__mctl__*": both
@@ -1201,19 +1217,39 @@ def build_issue_investigator_options_from_plan(
     allowed_tools = [
         t for t in plan.tools if t not in ("mcp__mctl__*", HUMAN_INPUT_CAPABILITY)
     ]
-    if "mcp__mctl__*" in plan.tools:
-        allowed_tools += _mctl_tool_globs()
+    if gateway is None:
+        if "mcp__mctl__*" in plan.tools:
+            allowed_tools += _mctl_tool_globs()
+        return _scrubbed(ClaudeAgentOptions(
+            cwd=str(repo_dir),
+            setting_sources=["project"],
+            model=plan.model,
+            allowed_tools=allowed_tools,
+            mcp_servers=mctl_mcp_config(always_load=True),
+            permission_mode="acceptEdits",
+            max_budget_usd=plan.budget_usd,
+            add_dirs=[str(proposal_dir)],
+            env=env,
+            hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+        ))
+    # gateway is not None: the capability gateway's own SDK server replaces
+    # the remote mctl connection entirely — the model never sees
+    # mcp__mctl__* directly, only mcp__capability__* (capability_search/
+    # describe/invoke), which the gateway itself narrows to the sealed set.
+    if "mcp__mctl__*" in plan.tools and mctl_mcp_config():
+        allowed_tools += ["mcp__capability__*"]
     return _scrubbed(ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=plan.model,
         allowed_tools=allowed_tools,
-        mcp_servers=mctl_mcp_config(always_load=True),
+        mcp_servers={"capability": gateway.sdk_server()},
         permission_mode="acceptEdits",
         max_budget_usd=plan.budget_usd,
         add_dirs=[str(proposal_dir)],
         env=env,
         hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+        strict_mcp_config=True,
     ))
 
 

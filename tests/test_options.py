@@ -259,6 +259,113 @@ def test_a_profile_that_grants_the_mctl_tools_still_gets_them(tmp_path, monkeypa
     assert "mcp__mctl__*" in built.allowed_tools
 
 
+# ---------------------------------------------------------------------------
+# build_issue_investigator_options_from_plan(..., gateway=...) — T10
+# (mctlhq/mctl-agents#242 slice 2, ADR 017). gateway=None (the default) must
+# stay byte-identical to every equivalence test above; a gateway replaces
+# the remote mctl connection with the gateway's own SDK server and narrows
+# the model's tool surface to mcp__capability__* under strict_mcp_config.
+# ---------------------------------------------------------------------------
+
+
+class _FakeGateway:
+    """A stand-in for `capability_gateway.CapabilityGateway`: this module
+    only ever calls `.sdk_server()`, so that is all the fake needs."""
+
+    def __init__(self) -> None:
+        self.sdk_server_calls = 0
+
+    def sdk_server(self):
+        self.sdk_server_calls += 1
+        return {"fake": "server-config"}
+
+
+def test_build_issue_investigator_options_from_plan_gateway_default_is_none(tmp_path, monkeypatch):
+    """`gateway` defaults to `None`, and passing `None` explicitly resolves
+    identical options to omitting it — the parameter is a pure no-op at its
+    default, exactly as design.md requires."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+
+    omitted = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+    explicit_none = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=None)
+
+    assert omitted.mcp_servers == explicit_none.mcp_servers
+    assert sorted(omitted.allowed_tools) == sorted(explicit_none.allowed_tools)
+    assert omitted.strict_mcp_config == explicit_none.strict_mcp_config == False  # noqa: E712 - exact-value assertion
+
+
+def test_build_issue_investigator_options_from_plan_with_gateway_uses_the_capability_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gateway = _FakeGateway()
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    assert "mcp__mctl__*" in plan.tools  # guards the premise below
+
+    built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=gateway)
+
+    assert gateway.sdk_server_calls == 1
+    assert built.mcp_servers == {"capability": {"fake": "server-config"}}
+    assert built.strict_mcp_config is True
+    # The remote mctl server is never connected into the model's tool set:
+    # neither the raw wildcard nor a dead mctl__* entry survives.
+    assert "mcp__mctl__*" not in built.allowed_tools
+    assert not [t for t in built.allowed_tools if t.startswith("mcp__mctl__")]
+    assert "mcp__capability__*" in built.allowed_tools
+
+
+def test_build_issue_investigator_options_from_plan_with_gateway_omits_capability_tools_without_token(
+    tmp_path, monkeypatch,
+):
+    """The same "profile grants it AND MCP is configured" conjunction the
+    eager path enforces holds on the gateway path too: no MCTL_TOKEN means
+    no mcp__capability__* grant either, even though the profile lists
+    mcp__mctl__*."""
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gateway = _FakeGateway()
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="f" * 40))
+    assert "mcp__mctl__*" in plan.tools
+
+    built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=gateway)
+
+    assert "mcp__capability__*" not in built.allowed_tools
+    assert built.mcp_servers == {"capability": {"fake": "server-config"}}  # the gateway server is still wired
+    assert built.strict_mcp_config is True
+
+
+def test_build_issue_investigator_options_from_plan_with_gateway_respects_a_profile_that_withholds_mctl(
+    tmp_path, monkeypatch,
+):
+    """The narrowing half of the conjunction, on the gateway path: a profile
+    that never granted mcp__mctl__* must not get mcp__capability__* back
+    just because a gateway happens to be supplied."""
+    monkeypatch.setenv("MCTL_TOKEN", "set-and-therefore-tempting")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gateway = _FakeGateway()
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    import dataclasses
+
+    restricted = dataclasses.replace(plan, tools=tuple(t for t in plan.tools if t != "mcp__mctl__*"))
+
+    built = options.build_issue_investigator_options_from_plan(restricted, repo_dir, proposal_dir, gateway=gateway)
+
+    assert "mcp__capability__*" not in built.allowed_tools
+
+
 def test_implementer_drain_timeout_defaults_to_five_minutes():
     """Sub-deadline for awaiting an async-launched sub-agent (mctl-agents#366).
 
