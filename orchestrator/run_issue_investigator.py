@@ -73,7 +73,7 @@ import yaml
 # ACTIVITY inside the long-lived worker. A module-level import would drag
 # the whole agent stack into that process, which is exactly what #149
 # forbids — the agent itself only ever runs in an Argo sandbox.
-from config.settings import MCTL_MCP_URL, SERVICE_AGENT_MODEL, SERVICES
+from config.settings import SERVICE_AGENT_MODEL, SERVICES
 
 # context_assembly is stdlib-only (mctlhq/mctl-agents#265, ADR 009 follow-up
 # row (a)) — imports only orchestrator.context_snapshot and
@@ -81,14 +81,6 @@ from config.settings import MCTL_MCP_URL, SERVICE_AGENT_MODEL, SERVICES
 # claude_agent_sdk — so, unlike options/mcp_guard/resolver above, it is safe
 # to import at module scope here.
 from orchestrator import context_assembly, policy_checkpoint, tracing, usage_ledger
-
-# orchestrator.capability (mctlhq/mctl-agents#242, ADR 017) is the CONTRACT
-# module — stdlib-only, worker-importable, exactly like context_snapshot
-# above (tests/test_worker_isolation.py's
-# test_capability_module_is_importable_by_the_worker). Its sibling,
-# orchestrator.capability_gateway (the RUNTIME — imports claude_agent_sdk and
-# mcp), stays deferred inside _run_agent's discovery branch, never here.
-from orchestrator.capability import MCTL_API_PROVIDER_ID, ProviderRef
 from orchestrator.context_snapshot import (
     MAX_PRIOR_EXECUTION_IDS,
     MAX_WORK_CONTEXT_ID_LENGTH,
@@ -125,15 +117,6 @@ DEFAULT_STATE_DIR = Path(
     )
 )
 INVESTIGATOR_MODEL = os.getenv("ISSUE_INVESTIGATOR_MODEL", SERVICE_AGENT_MODEL)
-
-# mctlhq/mctl-agents#242 slice 3: the one capability provider declared for
-# discovery mode — mctl-api itself, alias "mctl" so the SDK-visible name
-# stays mcp__mctl__<tool>, matching the resolved plan's mcp__mctl__* entry
-# (design.md "2. The construction site"). Moving the provider list into the
-# profile (spec.capabilityDiscovery.providers) is slice 4's job.
-MCTL_API_PROVIDER = ProviderRef(
-    type="mcp-remote", id=MCTL_API_PROVIDER_ID, alias="mctl", endpoint_ref=MCTL_MCP_URL,
-)
 
 
 # mctlhq/mctl-agents#227 declarative resolver pilot. "legacy" (the default)
@@ -1740,6 +1723,17 @@ async def _run_agent(
     mode = _resolver_mode()
     capability_mode = _capability_mode()
     print(f"[capability] capability_mode={capability_mode!r}")
+    if capability_mode == "discovery" and mode != "declarative":
+        # Before any options are built, never half-applied (design.md "2.
+        # The construction site"): discovery mode only exists on top of a
+        # resolved ExecutionPlan. Checked before the MCTL_TOKEN preflight
+        # below (#509 review follow-up) so this message wins even when
+        # MCTL_TOKEN happens to be unset too — the resolver-mode mismatch is
+        # the more fundamental problem.
+        raise SystemExit(
+            "ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery requires "
+            f"ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative, got resolver_mode={mode!r}"
+        )
     if capability_mode == "discovery" and not _mctl_tool_globs():
         # The second half of the two-fact conjunction (MCP configured in
         # THIS environment). Without MCTL_TOKEN the gateway would dial the
@@ -1749,14 +1743,6 @@ async def _run_agent(
         raise SystemExit(
             "ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery requires MCTL_TOKEN "
             "(mctl MCP must be configured); unset the capability mode to run eager"
-        )
-    if capability_mode == "discovery" and mode != "declarative":
-        # Before any options are built, never half-applied (design.md "2.
-        # The construction site"): discovery mode only exists on top of a
-        # resolved ExecutionPlan.
-        raise SystemExit(
-            "ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery requires "
-            f"ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative, got resolver_mode={mode!r}"
         )
     # Observable regardless of mode — including the explicit legacy rollback
     # this line exists to make provable (see orchestrator/resolver.py's
@@ -1785,6 +1771,18 @@ async def _run_agent(
                 PolicyDecidePolicyCheckpoint,
             )
 
+            if not plan.capability_discovery_enabled:
+                # mctlhq/mctl-agents#242 slice 4 (design.md sec. 1): "the
+                # catalog permits, the env var activates" — the env var alone
+                # is no longer sufficient. An env var asking for discovery
+                # while the reviewed profile does not permit it is the same
+                # fail-closed posture as every other preflight here, never a
+                # silent fallback to eager.
+                raise SystemExit(
+                    "ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery requires the resolved "
+                    "profile to permit discovery (spec.capabilityDiscovery.enabled: true); "
+                    "it does not"
+                )
             if "mcp__mctl__*" not in plan.tools:
                 # The first half of the conjunction: a profile that withholds
                 # the mctl tools leaves the gateway nothing to serve.
@@ -1815,7 +1813,7 @@ async def _run_agent(
             # never caught to fall back to eager, which would silently
             # invalidate whatever the pilot is measuring.
             gateway = await CapabilityGateway.build(
-                plan, correlation, [MCTL_API_PROVIDER],
+                plan, correlation, list(plan.capability_providers),
                 checkpoint=PolicyDecidePolicyCheckpoint(grants=grants),
             )
             options = build_issue_investigator_options_from_plan(

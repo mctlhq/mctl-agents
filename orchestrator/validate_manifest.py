@@ -22,8 +22,8 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from types import ModuleType
-from typing import Any
+from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 
 import yaml
 
@@ -704,6 +704,83 @@ def check_manifests_match_inventory(manifests: dict[str, AgentManifest]) -> list
     return errors
 
 
+def _capability_discovery_stub_gateway() -> Any:
+    """A lightweight stand-in for `orchestrator.capability_gateway.
+    CapabilityGateway` (mctlhq/mctl-agents#242 slice 4, task 11) used only to
+    exercise `build_issue_investigator_options_from_plan`'s gateway branch
+    for `_check_capability_discovery_matches_gateway_allowlist` below — it
+    never connects a provider and never seals a real `CapabilitySet`.
+
+    `PolicyDecidePolicyCheckpoint` (not `AbsentPolicyCheckpoint`) satisfies
+    `orchestrator.options._require_enforcing_checkpoint` without needing a
+    populated `capability_set` — that guard returns immediately for any
+    checkpoint that is not `AbsentPolicyCheckpoint`.
+    """
+    from orchestrator.capability_gateway import CapabilityGateway, PolicyDecidePolicyCheckpoint
+
+    return CapabilityGateway(
+        capability_set=cast("Any", SimpleNamespace(capabilities=())),
+        checkpoint=PolicyDecidePolicyCheckpoint(),
+    )
+
+
+def _check_capability_discovery_matches_gateway_allowlist(
+    profile_name: str, declared_tools: set[str],
+) -> list[str]:
+    """Task 11 (mctlhq/mctl-agents#242 slice 4, design.md sec. 3): a catalog
+    profile declaring `capabilityDiscovery.enabled: true` must not let
+    `build_issue_investigator_options_from_plan`'s gateway branch widen the
+    tool surface relative to what the profile itself declares — the "no
+    permission expansion" claim made checkable against the catalog.
+
+    This does NOT switch any profile's `runtime.optionsBuilder` (that stays
+    the legacy `build_issue_investigator_options`, checked by the caller's
+    two existing comparisons) and does not touch `_builder_call_args`: it
+    calls the plan builder directly, on a minimal stand-in plan carrying
+    only the three fields that builder actually reads from a plan (`tools`,
+    `model`, `budget_usd` — see that function's own docstring), mirroring
+    `tests/test_capability_gateway.py`'s `_plan()` helper.
+    """
+    from orchestrator.options import build_issue_investigator_options_from_plan
+
+    if "mcp__mctl__*" not in declared_tools:
+        # The builder adds the gateway only in place of mcp__mctl__*, so the
+        # comparison below would fail on a missing mcp__capability__* and
+        # hide the real problem.
+        return [
+            f"{profile_name}: capabilityDiscovery.enabled=true but spec.tools does not "
+            "declare 'mcp__mctl__*', so discovery has no mctl tools to serve"
+        ]
+
+    previous_token = os.environ.get("MCTL_TOKEN")
+    os.environ["MCTL_TOKEN"] = _DUMMY_MCTL_TOKEN
+    try:
+        plan = cast("Any", SimpleNamespace(tools=tuple(declared_tools), model="dummy-model", budget_usd=1.0))
+        try:
+            options = build_issue_investigator_options_from_plan(
+                plan, _DUMMY_PATH, _DUMMY_PATH / "proposal",
+                gateway=_capability_discovery_stub_gateway(),
+            )
+        except Exception as exc:  # noqa: BLE001 - report as a validation failure
+            return [f"{profile_name}: capabilityDiscovery gateway options raised: {exc}"]
+    finally:
+        if previous_token is None:
+            os.environ.pop("MCTL_TOKEN", None)
+        else:
+            os.environ["MCTL_TOKEN"] = previous_token
+
+    actual = set(options.allowed_tools or []) - _CAPABILITY_TOOLS
+    expected = (declared_tools - _CAPABILITY_TOOLS - {"mcp__mctl__*"}) | {"mcp__capability__*"}
+    if actual != expected:
+        return [
+            f"{profile_name}: capabilityDiscovery.enabled=true but "
+            f"build_issue_investigator_options_from_plan's gateway allowed_tools {sorted(actual)} "
+            f"does not equal (spec.tools - {{'mcp__mctl__*'}}) | {{'mcp__capability__*'}} = "
+            f"{sorted(expected)}"
+        ]
+    return []
+
+
 def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -> list[str]:
     """The mctl-gitops ExecutionProfile catalog must state the tools that
     `orchestrator/options.py` actually grants.
@@ -846,6 +923,23 @@ def check_catalog_profiles_match_builders(manifests: dict[str, AgentManifest]) -
                 f"{profile_name}: spec.tools {sorted(declared_tools)} does not match "
                 f"{manifest.options_builder}'s actual allowed_tools {sorted(actual)}"
             )
+
+        # Task 11 (mctlhq/mctl-agents#242 slice 4): a THIRD check, additive to
+        # the two above and orthogonal to which optionsBuilder the profile
+        # names — only fires for a profile that opts into discovery.
+        capability_discovery = spec.get("capabilityDiscovery")
+        if capability_discovery is not None:
+            # The providers block is checked here with the resolver's own
+            # rules, so a bad endpoint/alias fails CI rather than a live run.
+            from orchestrator import resolver as catalog_resolver
+
+            try:
+                catalog_resolver._parse_capability_discovery(spec, path=profile_path)
+            except catalog_resolver.ResolverError as exc:
+                errors.append(f"{profile_name}: {exc}")
+                continue
+        if isinstance(capability_discovery, dict) and capability_discovery.get("enabled") is True:
+            errors += _check_capability_discovery_matches_gateway_allowlist(profile_name, declared_tools)
     return errors
 
 

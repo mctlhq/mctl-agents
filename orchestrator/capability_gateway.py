@@ -146,6 +146,14 @@ class ProviderTool:
     description: str = ""
     input_schema: Mapping[str, Any] = field(default_factory=dict)
     annotations: Mapping[str, Any] = field(default_factory=dict)
+    #: Set by `_McpProviderSession.list_tools()` when this tool's raw
+    #: `ToolAnnotations` was present but could not be coerced to a dict
+    #: (`_annotations_to_dict` returned `None`) — a per-TOOL flag, not a
+    #: per-session count (#509 review follow-up), so `_discover` can fold it
+    #: into `annotations_dropped` AFTER the eligibility `continue`s, sharing
+    #: one denominator with the oversized-annotations half of that count
+    #: instead of counting excluded tools' drops that half never sees.
+    annotations_unparseable: bool = False
 
 
 @dataclass(frozen=True)
@@ -233,16 +241,6 @@ class _McpProviderSession:
 
     provider: ProviderRef
     session: Any
-    #: Count of tools whose `annotations` was present but could not be
-    #: coerced by `_annotations_to_dict` (returned `{}` despite non-`None`
-    #: input), set fresh by the most recent `list_tools()` call. `_discover`
-    #: folds this into the `CAPABILITY_PROVIDER_DEGRADED` line's
-    #: `annotations_dropped` count via `getattr(session,
-    #: "annotation_serialization_drops", 0)` — a drop made HERE, inside the
-    #: conversion, would otherwise never be counted: by the time `_discover`
-    #: sees `ProviderTool.annotations` it is already `{}`, indistinguishable
-    #: from "no annotations at all".
-    annotation_serialization_drops: int = field(default=0, compare=False)
 
     async def list_tools(self) -> list[ProviderTool]:
         try:
@@ -251,20 +249,18 @@ class _McpProviderSession:
             raise ProviderTimeoutError(f"provider {self.provider.id!r}: list_tools timed out: {exc}") from exc
         except Exception as exc:
             raise GatewayError(f"provider {self.provider.id!r}: list_tools failed: {exc}") from exc
-        self.annotation_serialization_drops = 0
         tools: list[ProviderTool] = []
         for t in result.tools:
             converted = _annotations_to_dict(getattr(t, "annotations", None))
-            if converted is None:
-                # Only a genuine coercion failure counts. An empty
-                # `annotations: {}` (or every hint unset) converts to {}
-                # and is not a drop.
-                self.annotation_serialization_drops += 1
             tools.append(ProviderTool(
                 name=t.name,
                 description=t.description or "",
                 input_schema=t.inputSchema or {},
                 annotations=converted or {},
+                # Only a genuine coercion failure counts here. An empty
+                # `annotations: {}` (or every hint unset) converts to {} and
+                # is not a drop — see ProviderTool.annotations_unparseable.
+                annotations_unparseable=converted is None,
             ))
         return tools
 
@@ -500,13 +496,13 @@ async def _discover(
             tools = await session.list_tools()
 
         unusable_names = 0
-        # Seeded with any drop `_McpProviderSession.list_tools()` already
-        # made inside `_annotations_to_dict` (a raw ToolAnnotations that
-        # failed to coerce): those never reach `_bounded_annotations` below
-        # with a truthy `info.annotations`, so they would otherwise vanish
-        # from this count. `getattr` defaults to 0 for every other session
-        # shape (a fake in tests, an execution-local registry).
-        annotations_dropped = getattr(session, "annotation_serialization_drops", 0)
+        # Both halves of this count are folded in AFTER the eligibility
+        # `continue`s below (#509 review follow-up), so they share one
+        # denominator: a tool excluded by `plan.tools` was never eligible to
+        # begin with, and counting its annotation drop here would inflate
+        # `annotations_dropped` relative to what the sealed set actually
+        # holds.
+        annotations_dropped = 0
         for info in tools:
             if not _usable_tool_name(info.name):
                 unusable_names += 1
@@ -519,7 +515,11 @@ async def _discover(
             capability_id = f"mctl://{provider.type}/{provider.id}/{info.name}"
             schema_bytes = canonical_json(dict(info.input_schema))
             annotations = _bounded_annotations(info.annotations)
-            if info.annotations and not annotations:
+            # Either a coercion failure at the session (ProviderTool.
+            # annotations_unparseable, set per-tool by
+            # `_McpProviderSession.list_tools()`) or an oversized/
+            # unserializable blob dropped here by `_bounded_annotations`.
+            if info.annotations_unparseable or (info.annotations and not annotations):
                 annotations_dropped += 1
             descriptor = CapabilityDescriptor(
                 capability_id=capability_id,
@@ -677,6 +677,10 @@ class PolicyDecidePolicyCheckpoint:
 #: Bound on a model-invented id carried into a `not-eligible` trace line.
 #: Eligible ids come from the sealed set and are never truncated.
 _MAX_TRACED_ID_LENGTH = 256
+
+#: Bound on a raising PolicyCheckpoint's message in its
+#: `CAPABILITY_POLICY_CHECKPOINT_FAILED` trace line.
+_MAX_CHECKPOINT_ERROR_LENGTH = 300
 
 #: What the model is told when a dispatch fails. Provider/transport exception
 #: text can carry URLs or upstream response fragments, so it never reaches the
@@ -881,8 +885,35 @@ class CapabilityGateway:
         # direct mcp__mctl__* path's audit trail (_PolicyCheckpointHook
         # sends every call through the checkpoint, not only mutating/
         # consequential ones).
-        verdict = self.checkpoint.check(descriptor, self.capability_set.execution)
-        policy_status = policy_checkpoint_status(self.checkpoint, verdict)
+        # #509 review follow-up (design.md "5."): a `PolicyCheckpoint`
+        # implementation that raises must fail closed, exactly like every
+        # other refusal path here — never let an exception fall through to
+        # dispatch, which would turn a broken checkpoint into an unchecked
+        # capability_invoke.
+        try:
+            verdict = self.checkpoint.check(descriptor, self.capability_set.execution)
+            policy_status = policy_checkpoint_status(self.checkpoint, verdict)
+        except Exception as exc:  # noqa: BLE001 - any checkpoint failure is a fail-closed deny
+            # The record alone would read exactly like a real deny verdict, so
+            # the cause goes out on its own trace line: a checkpoint backend
+            # outage must not look like policy working as intended. The status
+            # still goes through policy_checkpoint_status, so an
+            # AbsentPolicyCheckpoint that raised never claims a decision.
+            _emit_trace({
+                "capability_id": capability_id,
+                "checkpoint": type(self.checkpoint).__name__,
+                "error_type": type(exc).__name__,
+                "error": str(exc)[:_MAX_CHECKPOINT_ERROR_LENGTH],
+            }, event="policy_checkpoint_failed")
+            failed_status = policy_checkpoint_status(
+                self.checkpoint, CheckpointVerdict(decision="denied", reason="the policy checkpoint failed"),
+            )
+            record = self._record(
+                capability_id, "refused", "policy-denied", start, arguments, policy_checkpoint=failed_status,
+            )
+            self._trace(record)
+            return {"reason_code": "policy-denied", "error": "the policy checkpoint failed"}
+
         if verdict.decision != "allowed":
             record = self._record(
                 capability_id, "refused", "policy-denied", start, arguments, policy_checkpoint=policy_status,

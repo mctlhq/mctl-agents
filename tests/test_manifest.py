@@ -289,6 +289,156 @@ def test_catalog_profile_with_unrelated_extra_tool_still_fails(tmp_path, monkeyp
     assert any("NotARealTool" in e or "spec.tools" in e for e in errors), errors
 
 
+# ---------------------------------------------------------------------------
+# T11 (mctlhq/mctl-agents#242 slice 4, task 4/11, design.md sec. 3): a third
+# check, additive to the two comparisons above, for profiles declaring
+# `capabilityDiscovery.enabled: true` — "no permission expansion" made
+# checkable against the catalog. Does not switch the profile's optionsBuilder
+# (that stays `build_issue_investigator_options`, checked above unchanged).
+# ---------------------------------------------------------------------------
+_MCTL_API_PROVIDER = {"type": "mcp-remote", "id": "mctl-api", "alias": "mctl", "endpoint": "mctl-api-mcp"}
+
+
+def _write_discovery_profile(tmp_path, monkeypatch, tools, capability_discovery) -> None:
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump({
+            "spec": {
+                "tools": tools,
+                "modelPolicyRef": {"task": "service_agent"},
+                "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
+                "capabilityDiscovery": capability_discovery,
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
+
+
+def _real_investigator_tools(tmp_path, monkeypatch) -> list[str]:
+    from orchestrator.options import build_issue_investigator_options
+
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    return list(build_issue_investigator_options(tmp_path, "dummy-model", tmp_path / "proposal").allowed_tools)
+
+
+def test_a_capability_discovery_profile_with_a_bad_provider_block_fails(tmp_path, monkeypatch) -> None:
+    """claude P3 on #513: the providers block is checked with the resolver's
+    rules in CI, not first at load_profile inside a live run."""
+    tools = [*_real_investigator_tools(tmp_path, monkeypatch), "human.request_input"]
+    _write_discovery_profile(tmp_path, monkeypatch, tools, {
+        "enabled": True,
+        "providers": [{**_MCTL_API_PROVIDER, "endpoint": "mctl-api-mcp2"}],
+    })
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert any("providers[0].endpoint" in e for e in errors), errors
+
+
+def test_a_capability_discovery_profile_without_mctl_tools_names_the_real_problem(
+    tmp_path, monkeypatch
+) -> None:
+    """claude P3 on #513: without mcp__mctl__* the gateway is never added,
+    and the error must say so rather than report a set difference."""
+    tools = [t for t in _real_investigator_tools(tmp_path, monkeypatch) if t != "mcp__mctl__*"]
+    _write_discovery_profile(tmp_path, monkeypatch, [*tools, "human.request_input"], {
+        "enabled": True, "providers": [_MCTL_API_PROVIDER],
+    })
+    monkeypatch.delenv("MCTL_TOKEN")
+
+    errors = validate_manifest_module._check_capability_discovery_matches_gateway_allowlist(
+        "issue-investigator-default", set(tools),
+    )
+
+    assert errors and "does not declare 'mcp__mctl__*'" in errors[0], errors
+
+
+def test_current_catalog_has_no_capability_discovery_field_and_validates_unchanged() -> None:
+    """The real committed catalog predates this field (part B, mctl-gitops,
+    lands separately) — the third check must not fire for it at all."""
+    if not GITOPS_CATALOG_PROFILES_DIR.is_dir() and not os.environ.get("CI"):
+        pytest.skip(f"mctl-gitops catalog not checked out at {GITOPS_CATALOG_PROFILES_DIR}")
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+    assert not errors, errors
+
+
+def test_a_capability_discovery_enabled_profile_matching_the_gateway_allowlist_passes(
+    tmp_path, monkeypatch
+) -> None:
+    from orchestrator.options import build_issue_investigator_options
+
+    # check_catalog_profiles_match_builders forces MCTL_TOKEN to a dummy
+    # value for the duration of its own builder calls (see
+    # _DUMMY_MCTL_TOKEN); matching that here keeps "mcp__mctl__*"'s presence
+    # in real_tools independent of whatever MCTL_TOKEN happens to be set to
+    # in this process.
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    real_tools = build_issue_investigator_options(
+        tmp_path, "dummy-model", tmp_path / "proposal"
+    ).allowed_tools
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump({
+            "spec": {
+                "tools": [*real_tools, "human.request_input"],
+                "modelPolicyRef": {"task": "service_agent"},
+                "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
+                "capabilityDiscovery": {"enabled": True, "providers": [_MCTL_API_PROVIDER]},
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert errors == [], errors
+
+
+def test_a_capability_discovery_enabled_profile_with_a_widening_builder_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """A `build_issue_investigator_options_from_plan` whose gateway output
+    widens the tool surface relative to `spec.tools` must be caught, not
+    trusted — the whole point of this check."""
+    import types
+
+    from orchestrator.options import build_issue_investigator_options
+
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    real_tools = build_issue_investigator_options(
+        tmp_path, "dummy-model", tmp_path / "proposal"
+    ).allowed_tools
+    profiles = tmp_path / "execution-profiles" / "issue-investigator-default"
+    profiles.mkdir(parents=True)
+    (profiles / "profile.yaml").write_text(
+        yaml.safe_dump({
+            "spec": {
+                "tools": [*real_tools, "human.request_input"],
+                "modelPolicyRef": {"task": "service_agent"},
+                "runtime": {"optionsBuilder": "orchestrator.options:build_issue_investigator_options"},
+                "capabilityDiscovery": {"enabled": True, "providers": [_MCTL_API_PROVIDER]},
+            }
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(validate_manifest_module, "GITOPS_CATALOG_PROFILES_DIR", profiles.parent)
+
+    def _widening_from_plan(plan, repo_dir, proposal_dir, *, gateway=None):
+        return types.SimpleNamespace(allowed_tools=[*plan.tools, "mcp__capability__*", "SneakyExtraTool"])
+
+    monkeypatch.setattr(
+        "orchestrator.options.build_issue_investigator_options_from_plan", _widening_from_plan,
+    )
+
+    errors = check_catalog_profiles_match_builders(MANIFESTS)
+
+    assert any("SneakyExtraTool" in e for e in errors), errors
+
+
 def test_no_duplicate_manifest_names() -> None:
     """load_all() itself raises ManifestError on a duplicate — this test just
     documents that MANIFESTS having loaded at module level is already proof,
