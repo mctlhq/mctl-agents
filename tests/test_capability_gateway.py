@@ -798,10 +798,11 @@ def test_sdk_server_wraps_the_three_tools():
 
 
 def test_every_read_only_tool_in_the_table_is_allowed_by_the_builtin_policy(monkeypatch):
-    """The gateway dispatches `read-only` capabilities without a checkpoint,
-    and the policy hook delegates every gateway call. That is only safe while
-    each read-only key is ALLOW on the direct `mcp__mctl__*` path too.
-    `mctl_verify_domain` was not (claude P1 on #508).
+    """Since option B (ADR 017 sec. 8) every gateway invocation, read-only
+    included, goes through the `PolicyCheckpoint`. A read-only key must still
+    be ALLOW on the direct `mcp__mctl__*` path: otherwise a tool labelled
+    "no side effect" would land on `mctl-mcp-default-approval` and stall on
+    an approval. `mctl_verify_domain` was that case (claude P1 on #508).
 
     Grants come from `options._mctl_tool_globs()` (with `MCTL_TOKEN` set),
     not a hardcoded `("mcp__mctl__*",)` literal, so this test cannot drift
@@ -969,4 +970,48 @@ def test_a_provider_id_containing_a_slash_is_rejected_at_discovery():
         anyio.run(partial(
             gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [bad_provider],
             connector=_fake_connector({}), headers={},
+        ))
+
+
+def test_empty_annotations_are_not_counted_as_a_drop(capsys):
+    """`annotations: {}` (or a ToolAnnotations with every hint unset) is
+    "nothing there", not a failed coercion; it must not emit a
+    CAPABILITY_PROVIDER_DEGRADED line (claude P3 on #509)."""
+
+    class _AllUnset:
+        def model_dump(self, exclude_none=False):
+            return {}
+
+    real_session = _FakeRealMcpSession([
+        _FakeMcpToolInfo("mctl_whoami", annotations={}),
+        _FakeMcpToolInfo("mctl_list_services", annotations=_AllUnset()),
+    ])
+    mcp_session = gw._McpProviderSession(REMOTE_PROVIDER, real_session)
+
+    @asynccontextmanager
+    async def _connect(provider, headers):
+        yield mcp_session
+
+    anyio.run(partial(
+        gw.resolve_eligible, _plan(("mcp__mctl__*",)), _execution(), [REMOTE_PROVIDER],
+        connector=_connect, headers={},
+    ))
+    assert mcp_session.annotation_serialization_drops == 0
+    assert "CAPABILITY_PROVIDER_DEGRADED" not in capsys.readouterr().out
+
+
+def test_annotations_to_dict_separates_empty_from_uncoercible():
+    assert gw._annotations_to_dict(None) == {}
+    assert gw._annotations_to_dict({}) == {}
+    assert gw._annotations_to_dict(object()) is None
+
+
+def test_a_provider_type_containing_a_slash_is_rejected_at_discovery():
+    """`provider.type` is interpolated into the same capability_id template
+    as `provider.id` (claude P3 on #509)."""
+    bad_provider = cap.ProviderRef(type="mcp/remote", id="local-x", alias="x")
+    with pytest.raises(gw.GatewayError, match="mcp/remote"):
+        anyio.run(partial(
+            gw.resolve_eligible, _plan(("mcp__x__*",)), _execution(), [bad_provider],
+            local_sessions={"local-x": FakeSession(tools=[_tool("t")])}, headers={},
         ))

@@ -40,8 +40,10 @@ today's unchanged path.
 
 Two environment variables, both read fresh per run (like
 `ISSUE_INVESTIGATOR_RESOLVER_MODE` itself — see
-`docs/resolver-pilot-status.md`), so an operator can roll back by unsetting
-either one without a code change or a redeploy:
+`docs/resolver-pilot-status.md`). Rolling back means unsetting
+`ISSUE_INVESTIGATOR_CAPABILITY_MODE` only (see "Rollback" below); unsetting
+the resolver mode alone while discovery is still set is a hard failure, not
+a rollback:
 
 - `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative` — required first. Discovery
   mode only exists on top of a resolved `ExecutionPlan`; it is production-
@@ -58,7 +60,10 @@ either one without a code change or a redeploy:
 
 `legacy` + `discovery` (declarative resolver mode off but discovery mode on)
 is rejected with `SystemExit` at the start of `_run_agent`, before any
-options are built — never half-applied.
+options are built — never half-applied. So is `discovery` without
+`MCTL_TOKEN` (mctl MCP not configured in this environment), and `discovery`
+under a profile that does not grant `mcp__mctl__*`: the gateway would have
+nothing it is allowed to serve.
 
 A provider failure (unreachable, times out, or any other discovery error)
 fails the run with the failure's reason code. It never falls back to eager
@@ -99,10 +104,14 @@ Slice 4 is not part of this proposal and needs its own slug:
 
 Unset `ISSUE_INVESTIGATOR_CAPABILITY_MODE` (or set it to `eager`, the
 default either way): `_run_agent` builds options exactly as it does today,
-and `orchestrator.capability_gateway` is never imported. Because discovery
-mode also requires `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`, unsetting
-*that* variable (already the default — see
-`docs/resolver-pilot-status.md`'s own rollback note) has the same effect.
+and `orchestrator.capability_gateway` is never imported. This is the only
+rollback.
+
+Do **not** roll back by unsetting `ISSUE_INVESTIGATOR_RESOLVER_MODE` alone.
+With `ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery` still set, that is the
+`legacy + discovery` combination above, which fails every run with
+`SystemExit`. To leave the resolver pilot as well, unset the capability mode
+first (or both together).
 
 Reverting this proposal's PR removes the mode switch, the discovery
 construction site, the discovery prompt block, and ADR 017 sec. 8's option-B

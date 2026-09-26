@@ -8,6 +8,7 @@ in ``investigate`` via a mocked ``gh_issue_view``.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import functools
 import json
 import os
@@ -3331,12 +3332,6 @@ def test_capability_mode_accepts_every_documented_value(monkeypatch, mode):
     assert run_issue_investigator._capability_mode() == mode
 
 
-def test_capability_mode_prints_the_capability_line(monkeypatch, capsys):
-    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "eager")
-    run_issue_investigator._capability_mode()
-    assert "[capability] capability_mode='eager'" in capsys.readouterr().out
-
-
 def test_run_agent_unset_capability_mode_is_eager_and_never_imports_the_gateway(
     tmp_path, monkeypatch, capsys
 ):
@@ -4712,3 +4707,124 @@ def test_store_supplied_revision_is_clamped_not_a_seal_trap():
         actor_id=None,
     )
     assert len(ref.work_item_revision) == MAX_WORK_CONTEXT_ID_LENGTH
+
+
+# ---------------------------------------------------------------------------
+# #509 review follow-ups.
+# ---------------------------------------------------------------------------
+
+
+def _write_triplet_agent(repo_dir, prompt, proposal_dir):
+    for name in ("requirements.md", "design.md", "tasks.md"):
+        (proposal_dir / name).write_text(f"{name} body")
+
+
+def test_investigate_passes_the_correlation_inputs_to_run_agent(tmp_path, monkeypatch):
+    """The shared harness drops the partial's keywords, so this asserts them
+    directly: without `issue_url` the discovery branch cannot build its
+    correlation (claude P2 on #509). The ContextSnapshot gets the same
+    `argo_workflow_name` the CapabilitySet does (claude P3 on #509)."""
+    issue = _investigate_harness(tmp_path, monkeypatch, agent=_write_triplet_agent)
+    seen: dict[str, object] = {}
+
+    def _capturing_anyio_run(fn, *args):
+        assert isinstance(fn, functools.partial)
+        seen["run_agent_kwargs"] = dict(fn.keywords)
+        return fn.func(*args)
+
+    real_assemble = run_issue_investigator._assemble_context
+
+    def _capturing_assemble(**kwargs):
+        seen["assemble_kwargs"] = kwargs
+        return real_assemble(**kwargs)
+
+    monkeypatch.setattr(run_issue_investigator.anyio, "run", _capturing_anyio_run)
+    monkeypatch.setattr(run_issue_investigator, "_assemble_context", _capturing_assemble)
+
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+
+    run_kwargs = seen["run_agent_kwargs"]
+    assert run_kwargs["issue_url"] == issue.ref.url
+    assert set(run_kwargs) == {"issue_url", "temporal_workflow_id", "temporal_run_id", "argo_workflow_name"}
+    assert seen["assemble_kwargs"]["argo_workflow_name"] == run_kwargs["argo_workflow_name"]
+
+
+def _discovery_env(monkeypatch, *, with_token: bool = True):
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_RESOLVER_MODE", "declarative")
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    if with_token:
+        monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    else:
+        monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    monkeypatch.setattr(run_issue_investigator, "_target_repository_sha", lambda repo_dir: "f" * 40)
+    for name in ("build_issue_investigator_options", "build_issue_investigator_options_from_plan"):
+        monkeypatch.setattr(
+            f"orchestrator.options.{name}",
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("no options may be built")),
+        )
+
+
+def test_discovery_without_mctl_token_is_refused_before_anything_is_built(tmp_path, monkeypatch):
+    """Eager degrades without MCTL_TOKEN; discovery would dial the provider
+    unauthenticated or tell the model to use tools it cannot call. Refused
+    up front instead (claude P2 on #509)."""
+    from orchestrator import capability_gateway as gw
+
+    _discovery_env(monkeypatch, with_token=False)
+    monkeypatch.setattr(gw, "_default_remote_connector", _raising_connector_for_tests())
+
+    with pytest.raises(SystemExit, match="requires MCTL_TOKEN"):
+        anyio.run(functools.partial(
+            run_issue_investigator._run_agent, issue_url="https://github.com/mctlhq/mctl-telegram/issues/7",
+        ), tmp_path, "prompt", tmp_path)
+
+
+def test_discovery_under_a_profile_without_mctl_tools_is_refused(tmp_path, monkeypatch):
+    from orchestrator import capability_gateway as gw
+    from orchestrator import resolver
+
+    _discovery_env(monkeypatch)
+    monkeypatch.setattr(gw, "_default_remote_connector", _raising_connector_for_tests())
+    real_execute = resolver.execute
+
+    def _execute_without_mctl(*args, **kwargs):
+        plan = real_execute(*args, **kwargs)
+        return dataclasses.replace(plan, tools=tuple(t for t in plan.tools if t != "mcp__mctl__*"))
+
+    monkeypatch.setattr(resolver, "execute", _execute_without_mctl)
+
+    with pytest.raises(SystemExit, match="grant mcp__mctl__"):
+        anyio.run(functools.partial(
+            run_issue_investigator._run_agent, issue_url="https://github.com/mctlhq/mctl-telegram/issues/7",
+        ), tmp_path, "prompt", tmp_path)
+
+
+def test_discovery_without_issue_url_names_the_parameter(tmp_path, monkeypatch):
+    from orchestrator import capability_gateway as gw
+
+    _discovery_env(monkeypatch)
+    monkeypatch.setattr(gw, "_default_remote_connector", _raising_connector_for_tests())
+
+    with pytest.raises(SystemExit, match="issue_url"):
+        anyio.run(run_issue_investigator._run_agent, tmp_path, "prompt", tmp_path)
+
+
+def test_capability_mode_helper_is_silent(monkeypatch, capsys):
+    """The mode is read more than once per run; only _run_agent prints it
+    (claude P3 on #509)."""
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CAPABILITY_MODE", "discovery")
+    assert run_issue_investigator._capability_mode() == "discovery"
+    assert run_issue_investigator._capability_discovery_prompt_block() != ""
+    assert "[capability]" not in capsys.readouterr().out
+
+
+def _raising_connector_for_tests():
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _connect(provider, headers):
+        raise AssertionError("the provider must not be contacted")
+        yield  # pragma: no cover — unreachable, only shapes the generator
+
+    return _connect

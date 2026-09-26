@@ -254,15 +254,17 @@ class _McpProviderSession:
         self.annotation_serialization_drops = 0
         tools: list[ProviderTool] = []
         for t in result.tools:
-            raw_annotations = getattr(t, "annotations", None)
-            converted = _annotations_to_dict(raw_annotations)
-            if raw_annotations is not None and not converted:
+            converted = _annotations_to_dict(getattr(t, "annotations", None))
+            if converted is None:
+                # Only a genuine coercion failure counts. An empty
+                # `annotations: {}` (or every hint unset) converts to {}
+                # and is not a drop.
                 self.annotation_serialization_drops += 1
             tools.append(ProviderTool(
                 name=t.name,
                 description=t.description or "",
                 input_schema=t.inputSchema or {},
-                annotations=converted,
+                annotations=converted or {},
             ))
         return tools
 
@@ -277,11 +279,15 @@ class _McpProviderSession:
         return ToolCallResult(is_error=bool(result.isError), text=text)
 
 
-def _annotations_to_dict(annotations: Any) -> dict[str, Any]:
+def _annotations_to_dict(annotations: Any) -> dict[str, Any] | None:
     """MCP `ToolAnnotations` -> a plain dict, advisory-only (ADR 017
     sec. 8), tolerant of every shape a provider might actually hand back.
     Leaf values are coerced to JSON (`default=str`) so a `datetime`/`Enum`/
-    URL from `model_dump()` cannot fail sealing."""
+    URL from `model_dump()` cannot fail sealing.
+
+    `{}` means "nothing there" (absent, or present with every hint unset);
+    `None` means "present but could not be coerced", which is the only case
+    counted as a drop."""
     import json
 
     if annotations is None:
@@ -291,12 +297,12 @@ def _annotations_to_dict(annotations: Any) -> dict[str, Any]:
     elif isinstance(annotations, Mapping):
         raw = dict(annotations)
     else:
-        return {}
+        return None
     try:
         coerced = json.loads(json.dumps(raw, default=str))
     except (TypeError, ValueError):
-        return {}
-    return coerced if isinstance(coerced, dict) else {}
+        return None
+    return coerced if isinstance(coerced, dict) else None
 
 
 def _bounded_annotations(annotations: Mapping[str, Any]) -> dict[str, Any]:
@@ -419,12 +425,18 @@ def _usable_tool_name(name: Any) -> bool:
 
 
 def _reject_unusable_provider_id(provider: ProviderRef) -> None:
-    """A `provider.id` carrying `/` would corrupt every capability_id this
+    """A `provider.type` or `provider.id` carrying `/` would corrupt every
+    capability_id this
     provider mints (`mctl://<type>/<id>/<tool>` — `_parse_capability_id`
     splits on exactly three `/`-delimited segments). Unlike a single bad
     tool name (`_usable_tool_name`, per-tool and merely excluded), a bad
     `provider.id` poisons the whole provider, so it fails closed at
     discovery time rather than being silently skipped."""
+    if "/" in provider.type:
+        raise GatewayError(
+            f"provider.type {provider.type!r} must not contain '/' — it appears verbatim in every "
+            "capability_id this provider mints (mctl://<provider_type>/<provider_id>/<tool>)"
+        )
     if "/" in provider.id:
         raise GatewayError(
             f"provider.id {provider.id!r} must not contain '/' — it appears verbatim in every "

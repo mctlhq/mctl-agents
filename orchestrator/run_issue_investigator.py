@@ -199,7 +199,8 @@ def _capability_mode() -> str:
         raise SystemExit(
             f"ISSUE_INVESTIGATOR_CAPABILITY_MODE must be one of {_CAPABILITY_MODES}, got {mode!r}"
         )
-    print(f"[capability] capability_mode={mode!r}")
+    # Silent, like _resolver_mode: the mode is read more than once per run
+    # (prompt block and _run_agent), and _run_agent prints the one line.
     return mode
 
 
@@ -1738,6 +1739,17 @@ async def _run_agent(
 
     mode = _resolver_mode()
     capability_mode = _capability_mode()
+    print(f"[capability] capability_mode={capability_mode!r}")
+    if capability_mode == "discovery" and not _mctl_tool_globs():
+        # The second half of the two-fact conjunction (MCP configured in
+        # THIS environment). Without MCTL_TOKEN the gateway would dial the
+        # provider unauthenticated and fail mid-run, or, if it connected,
+        # the builder would withhold mcp__capability__* while the prompt
+        # already tells the model to use it. Refuse up front instead.
+        raise SystemExit(
+            "ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery requires MCTL_TOKEN "
+            "(mctl MCP must be configured); unset the capability mode to run eager"
+        )
     if capability_mode == "discovery" and mode != "declarative":
         # Before any options are built, never half-applied (design.md "2.
         # The construction site"): discovery mode only exists on top of a
@@ -1773,9 +1785,20 @@ async def _run_agent(
                 PolicyDecidePolicyCheckpoint,
             )
 
+            if "mcp__mctl__*" not in plan.tools:
+                # The first half of the conjunction: a profile that withholds
+                # the mctl tools leaves the gateway nothing to serve.
+                raise SystemExit(
+                    "ISSUE_INVESTIGATOR_CAPABILITY_MODE=discovery requires the resolved "
+                    "profile to grant mcp__mctl__*; it does not"
+                )
+            if not issue_url:
+                # Named here rather than surfacing as a URL-regex ValueError
+                # from deep inside correlation building.
+                raise SystemExit("discovery mode requires _run_agent(issue_url=...); none was passed")
             correlation = context_assembly.build_execution_correlation(
                 resolver_mode="declarative",
-                issue_url=issue_url or "",
+                issue_url=issue_url,
                 target_repository_sha=target_repository_sha,
                 plan=plan,
                 temporal_workflow_id=temporal_workflow_id,
@@ -1932,6 +1955,7 @@ def _assemble_context(
     work_context: WorkContextRef | None = None,
     temporal_workflow_id: str | None = None,
     temporal_run_id: str | None = None,
+    argo_workflow_name: str | None = None,
 ) -> context_assembly.AssemblyResult | None:
     """Assembles and seals this investigation's `ContextSnapshot`
     (mctlhq/mctl-agents#265). Returns `None` in `off` mode without doing any
@@ -1984,6 +2008,7 @@ def _assemble_context(
             work_context=work_context,
             temporal_workflow_id=temporal_workflow_id,
             temporal_run_id=temporal_run_id,
+            argo_workflow_name=argo_workflow_name,
         )
     except Exception as exc:
         if mode == "on":
@@ -2612,6 +2637,10 @@ def _investigate(
             work_context=work_context_ref,
             temporal_workflow_id=temporal_workflow_id,
             temporal_run_id=temporal_run_id,
+            # The same source _run_agent's correlation uses below, so the
+            # ContextSnapshot and the CapabilitySet sealed for one execution
+            # agree on it.
+            argo_workflow_name=execution_context.correlation.argo_workflow_name,
         )
 
         # 2c. Resolve this investigation's ServiceSkillBundle
