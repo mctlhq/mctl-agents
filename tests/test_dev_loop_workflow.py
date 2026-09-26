@@ -219,6 +219,9 @@ def _fake_activities(
     # request the first time, none after the model stops asking").
     human_input_requests: list[str | None] | None = None,
     investigate_params_log: list[dict] | None = None,
+    implement_params_log: list[dict] | None = None,
+    shepherd_params_log: list[dict] | None = None,
+    approve_params_log: list[dict] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -285,11 +288,17 @@ def _fake_activities(
             if released:
                 assert input.params.get("agent_image") == "ghcr.io/x@sha256:ccc"
                 assert input.params.get("agent_version") == "shepherd@3.0.0"
+            if shepherd_params_log is not None:
+                shepherd_params_log.append(dict(input.params))
             if shepherd_fails:
                 from temporalio.exceptions import ApplicationError
 
                 raise ApplicationError("tick exploded", non_retryable=True)
             return WorkflowResult(workflow_name="mctl-agents-shepherd-fake", phase="Succeeded")
+        if input.operation == "mctl-agents-implement" and implement_params_log is not None:
+            implement_params_log.append(dict(input.params))
+        if input.operation == "mctl-agents-approve" and approve_params_log is not None:
+            approve_params_log.append(dict(input.params))
         return WorkflowResult(workflow_name="mctl-agents-implement-fake", phase="Succeeded")
 
     @activity.defn(name="record_execution")
@@ -4294,6 +4303,205 @@ class TestDevLoopWorkflow:
 
         assert result.pr is not None and result.pr.state == "MERGED"
         assert calls.count("mctl-agents-shepherd") == SHEPHERD_TICKS_MAX
+
+
+class TestLaunchCorrelation:
+    """mctlhq/mctl-agents#505, owner decision 4 on mctlhq/.github#50.
+
+    The implement and shepherd submits must carry this loop's own
+    `temporal_workflow_id`/`temporal_run_id`, and `work_item_id` when the
+    loop has one -- while the investigate and approve submits stay exactly
+    as they were. See `DevLoopWorkflow._launch_correlation`.
+    """
+
+    async def test_implement_submit_carries_this_loops_temporal_ids(self, env):
+        """T1: the implement submit's params equal the handle's own workflow
+        id and run id -- asserted on the recorded activity input, not a log
+        line."""
+        params_log: list[dict] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, implement_params_log=params_log
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/505"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert len(params_log) == 1
+        assert params_log[0]["temporal_workflow_id"] == handle.id
+        assert params_log[0]["temporal_run_id"] == handle.first_execution_run_id
+
+    async def test_shepherd_tick_carries_the_same_temporal_ids_as_implement(self, env):
+        """T2: the in-loop shepherd tick's submit carries the same two
+        values as the implement submit in the same execution."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        implement_log: list[dict] = []
+        shepherd_log: list[dict] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * FIRST_SHEPHERD_TICK_POLL + [MERGED_PR],
+            implement_params_log=implement_log,
+            shepherd_params_log=shepherd_log,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/506"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert len(implement_log) == 1
+        assert len(shepherd_log) == 1
+        for params in (implement_log[0], shepherd_log[0]):
+            assert params["temporal_workflow_id"] == handle.id
+            assert params["temporal_run_id"] == handle.first_execution_run_id
+
+    async def test_dispatched_loop_puts_work_item_id_on_both_submits(self, env):
+        """T3 (dispatched half): a loop that starts with a work item id puts
+        `work_item_id` on both the implement submit and the shepherd tick."""
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        implement_log: list[dict] = []
+        shepherd_log: list[dict] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * FIRST_SHEPHERD_TICK_POLL + [MERGED_PR],
+            implement_params_log=implement_log,
+            shepherd_params_log=shepherd_log,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/507",
+                    work_item_id="wi-505",
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert implement_log[0]["work_item_id"] == "wi-505"
+        assert shepherd_log[0]["work_item_id"] == "wi-505"
+
+    async def test_undispatched_loop_omits_work_item_id_entirely(self, env):
+        """T3 (undispatched half): an issue-url-only loop, where
+        `self._work_item_id` is `""`, omits the key entirely rather than
+        sending an empty string."""
+        params_log: list[dict] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, implement_params_log=params_log
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/508"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert "work_item_id" not in params_log[0]
+
+    async def test_neither_submit_carries_an_execution_id(self, env):
+        """T4: pins the deliberate omission argued in design.md -- an
+        implementer or shepherd invocation is not the investigator's `we_`,
+        and reusing it would misattribute spend across three invocations."""
+        implement_log: list[dict] = []
+        shepherd_log: list[dict] = []
+        open_pr = PRState(
+            found=True,
+            pr_url=MERGED_PR.pr_url,
+            repo=MERGED_PR.repo,
+            number=MERGED_PR.number,
+            state="OPEN",
+        )
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True,
+            pr_states=[open_pr] * FIRST_SHEPHERD_TICK_POLL + [MERGED_PR],
+            implement_params_log=implement_log,
+            shepherd_params_log=shepherd_log,
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(
+                    issue_url="https://github.com/mctlhq/mctl-telegram/issues/509",
+                    work_item_id="wi-509",
+                ),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert "execution_id" not in implement_log[0]
+        assert "execution_id" not in shepherd_log[0]
+
+    async def test_approve_submit_is_unaffected(self, env):
+        """T5 (approve half): the approve CWFT runs no agent and produces no
+        usage record, so it must carry no correlation parameters."""
+        approve_log: list[dict] = []
+        activities, _calls, investigate_ran, _ownership_ops = _fake_activities(
+            released=True, approve_params_log=approve_log
+        )
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow], activities=activities
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/510"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            await handle.result()
+
+        assert approve_log, "approve was never submitted"
+        assert set(approve_log[0]) == {"service", "slug", "approver"}
 
 
 class TestWorkContextResume:

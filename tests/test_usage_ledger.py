@@ -158,6 +158,7 @@ def test_correlation_comes_from_the_runner_pod_environment():
         usage_ledger.TOKEN_ENV: TOKEN,
         "MCTL_TOKEN": ADMIN_TOKEN,
         "WORKFLOW_TEMPORAL_WORKFLOW_ID": "dev-loop-mctlhq-mctl-api-7",
+        "WORKFLOW_TEMPORAL_RUN_ID": "run-abc-123",
         "WORKFLOW_NAME": "mctl-agents-investigate-abcde",
         "WORKFLOW_WORK_ITEM_ID": "wi_123",
     }
@@ -165,8 +166,28 @@ def test_correlation_comes_from_the_runner_pod_environment():
     (record,) = rec.records_for(_result("u1", {OPUS: _usage(1, 2)}))
     assert record["agent"] == "investigator"
     assert record["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-api-7"
+    assert record["temporal_run_id"] == "run-abc-123"
     assert record["argo_workflow_name"] == "mctl-agents-investigate-abcde"
     assert record["work_item_id"] == "wi_123"
+    assert rec._token == TOKEN
+
+
+def test_correlation_omits_temporal_run_id_when_the_env_var_is_absent():
+    """mctlhq/mctl-agents#505: a pod without WORKFLOW_TEMPORAL_RUN_ID (every
+    runner outside a DevLoop, and every DevLoop pod before mctl-gitops#1408
+    deploys) must keep recording usage exactly as before -- no warning, no
+    dropped record, just an absent field."""
+    env = {
+        usage_ledger.TOKEN_ENV: TOKEN,
+        "MCTL_TOKEN": ADMIN_TOKEN,
+        "WORKFLOW_TEMPORAL_WORKFLOW_ID": "dev-loop-mctlhq-mctl-api-7",
+        "WORKFLOW_NAME": "mctl-agents-implement-abcde",
+        "WORKFLOW_WORK_ITEM_ID": "wi_123",
+    }
+    rec = usage_ledger.UsageRecorder.from_env("implementer", env)
+    (record,) = rec.records_for(_result("u1", {OPUS: _usage(1, 2)}))
+    assert record["temporal_workflow_id"] == "dev-loop-mctlhq-mctl-api-7"
+    assert "temporal_run_id" not in record
     assert rec._token == TOKEN
 
 

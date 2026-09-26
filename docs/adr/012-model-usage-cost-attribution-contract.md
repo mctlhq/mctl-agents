@@ -142,6 +142,7 @@ provider                     # ModelUsage.provider (firstParty | bedrock | …)
 
 # correlation — see Correlation contract
 temporal_workflow_id
+temporal_run_id              # nullable; disambiguates a same-id retry of the DevLoopWorkflow (#505)
 argo_workflow_name
 agent                        # investigator | implementer | shepherd | …
 devloop_stage
@@ -195,6 +196,15 @@ execution, workflow/run, repository, agent, stage — already exists on that
 row, so the usage record carries the key and does not duplicate the
 attributes. Issue/PR/work-item and `trace_id`/`span_id` are carried directly
 because they are per-invocation rather than per-execution.
+
+`temporal_run_id` (#505) is an amendment to this spine, not a second join
+key: it is the run id of the `DevLoopWorkflow` execution that launched the
+implementer or shepherd, read from `WORKFLOW_TEMPORAL_RUN_ID` beside
+`temporal_workflow_id`. `argo_workflow_name` already disambiguates the Argo
+run; `temporal_run_id` disambiguates the Temporal workflow *execution*
+underneath it, which matters because a workflow id can be reused by a
+retried or continued-as-new run. Absent for every runner outside a DevLoop
+and for every submit predating mctlhq/mctl-agents#505's patch gate.
 
 A record has one repository, and `issue_number` and `pr_number` are both read
 against it (#499). `target_repo` is the PR's repository when there is a PR,

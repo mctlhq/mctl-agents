@@ -321,6 +321,17 @@ ISSUE_KEYED_DISPATCH_PATCH = "issue-keyed-dispatch"
 DISPATCHED_NOT_RUN_FAILS_PATCH = "dispatched-not-run-fails"
 #: The error type of that failure, for whoever reads why the run ended.
 DISPATCHED_NOT_RUN_ERROR_TYPE = "DispatchedRequestNotRun"
+#: Guards the correlation params added to the implement and shepherd submits
+#: (mctlhq/mctl-agents#505, owner decision 4 on mctlhq/.github#50). Depends on
+#: mctl-gitops#1408 declaring `temporal_workflow_id` / `temporal_run_id` /
+#: `work_item_id` on `cwft-mctl-agents-implement.yaml` and
+#: `cwft-mctl-agents-shepherd.yaml` and mapping them to the pod env vars
+#: `WORKFLOW_TEMPORAL_WORKFLOW_ID` / `WORKFLOW_TEMPORAL_RUN_ID` /
+#: `WORKFLOW_WORK_ITEM_ID` that `orchestrator/usage_ledger.py`'s
+#: `_CORRELATION_ENV` reads. mctl-agents CI cannot check that sibling repo
+#: out to assert it; if those templates are ever changed to drop or rename
+#: the parameters, this silently reverts to sending unread values.
+LAUNCH_CORRELATION_PATCH = "launch-correlation"
 #: The kinds of mctl-api execution request a delivery can carry: the
 #: dispatcher's own vocabulary (`execution_requests.KINDS`), one source.
 DELIVERY_KIND_START = KIND_START
@@ -2994,6 +3005,12 @@ class DevLoopWorkflow:
         if implementer_release and implementer_release.image_ref:
             implement_params["agent_image"] = implementer_release.image_ref
             implement_params["agent_version"] = f"implementer@{implementer_release.version}"
+        # This loop's ids (mctlhq/mctl-agents#505, owner decision 4 on
+        # mctlhq/.github#50), added before `_implement`'s pre-start requeue
+        # loop so every requeued attempt carries the same values. See
+        # `_launch_correlation` for the patch gate and why `work_item_id` is
+        # omitted rather than sent empty.
+        implement_params.update(self._launch_correlation())
 
         # Re-check approval immediately before implementing (mctlhq/mctl-
         # agents#267, ADR 011) — the twin of the gate before the approve
@@ -3330,6 +3347,29 @@ class DevLoopWorkflow:
             # reached (mctl-agents#404 v2).
             ended=f"abandoned: {self._abandon_reason}" if self._abandoned else "",
         )
+
+    def _launch_correlation(self) -> dict[str, str]:
+        """This loop's ids, for a CWFT that declares them (#505).
+
+        Empty for an execution whose history predates the marker:
+        `workflow.patched` memoises per id (tests/test_patch_memoization.py),
+        so such a loop keeps submitting exactly the params it recorded for
+        the rest of its life, including a merge watch that outlives the
+        deploy by up to MERGE_WATCH_DEADLINE.
+
+        `workflow.info()` schedules no command, so this adds nothing to
+        history beyond the marker itself.
+        """
+        if not workflow.patched(LAUNCH_CORRELATION_PATCH):
+            return {}
+        info = workflow.info()
+        correlation = {
+            "temporal_workflow_id": info.workflow_id,
+            "temporal_run_id": info.run_id,
+        }
+        if self._work_item_id:
+            correlation["work_item_id"] = self._work_item_id
+        return correlation
 
     async def _implement(
         self,
@@ -3691,6 +3731,9 @@ class DevLoopWorkflow:
             if shepherd_release and shepherd_release.image_ref:
                 tick_params["agent_image"] = shepherd_release.image_ref
                 tick_params["agent_version"] = f"shepherd@{shepherd_release.version}"
+            # This loop's ids (mctlhq/mctl-agents#505); see
+            # `_launch_correlation` for the patch gate.
+            tick_params.update(self._launch_correlation())
             tick_result = await _run_cwft("mctl-agents-shepherd", tick_params)
             await _record("shepherd", shepherd_release, tick_result, service)
         except ActivityError as exc:
