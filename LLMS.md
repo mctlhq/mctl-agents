@@ -8,6 +8,7 @@
 - **Tier 2 (Implementer)**: `orchestrator/run_implementer.py` picks up accepted proposals, runs the Claude Agent SDK inside Python sub-agents, writes code, creates branches (`feat/agents-<slug>`), and opens pull requests.
 - **Tier 3 (Shepherd)**: `orchestrator/run_shepherd.py` reviews open agent PRs, validates test suites, handles merge conflicts via rebase, and performs safe merges into target `main` branches.
 - **Mentor Agent**: `orchestrator/run_mentor.py` periodically analyzes agent performance, common errors, and updates knowledge bases.
+- **Usage-collector**: `orchestrator/run_usage_collector.py` is a model-free periodic sweep (not part of the tiered pipeline) that pulls the reviewer stage's `model-usage-records` GitHub Actions artifacts into the mctl-api usage ledger, mints no record id, and issues only read (`gh api GET`) calls — see ADR-012 and `docs/operations/usage-collector.md`.
 
 ## Temporal Workflows & Activities
 

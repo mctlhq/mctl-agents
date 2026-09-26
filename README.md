@@ -583,3 +583,40 @@ and is discarded at the end of each tick — `review_attempts`,
 `harness_failures` and `refusals` reset to zero every run. The shepherd
 prints a startup warning naming both facts whenever adoption is enabled.
 Do not enable `SHEPHERD_ADOPT_PRS` in production until both PRs are merged.
+
+### Usage-collector
+
+`orchestrator/run_usage_collector.py` is a model-free periodic sweep — not
+part of the three-tier pipeline above — that pulls the reviewer stage's
+model-usage records into the ledger from inside the cluster
+(mctlhq/mctl-agents#506, ADR-012). The reviewer (`claude-review.yml` in
+GitHub Actions, mctlhq/.github#126) does not run inside mctl-agents and
+cannot post its usage directly: the ingest endpoint's writer credential must
+not become a secret in every caller repository. Instead the reviewer
+publishes a `model-usage-records` workflow artifact, and this collector:
+
+```bash
+# One sweep over every mctlhq/<svc> in config.settings.SERVICES.
+python -m orchestrator.run_usage_collector
+
+# Preview only — discovers and downloads, posts nothing, no writer token needed.
+python -m orchestrator.run_usage_collector --dry-run
+
+# A one-shot backfill covering the full 90-day artifact retention window.
+python -m orchestrator.run_usage_collector --lookback-days 90
+```
+
+lists each repository's in-window `model-usage-records` artifacts, downloads
+them (bounded, binary-safe), projects each candidate record onto the
+ADR-012 field allowlist — dropping any `id`, cost field or unrecognised
+key — and POSTs the survivors to mctl-api, chunked to its ingest limits. It
+mints no record id (mctl-api derives one from `(session_id, result_uuid,
+model_key)` and rejects a supplied one that disagrees) and keeps no cursor:
+re-collecting the same artifact is a no-op because the ledger's
+insert-or-ignore dedupes on that derived id, which is what makes a widened
+`--lookback-days` backfill safe rather than a double count. It issues only
+`gh api` `GET` calls — no GitHub write of any kind.
+
+Not yet scheduled: this proposal ships the code and
+`docs/operations/usage-collector.md`'s CronWorkflow manifest, but applying
+that manifest to `mctl-gitops` is an owner step, not performed here.
