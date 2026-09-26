@@ -1,0 +1,52 @@
+{
+  "records": [
+    {
+      "schema_version": 1,
+      "session_id": "bcdd4386-40ae-471d-b8d1-9e2bb8757c81",
+      "result_uuid": "9d93d631-a52c-41be-833a-aa6515d87aba",
+      "model_key": "claude-haiku-4-5-20251001",
+      "canonical_model": "claude-haiku-4-5-20251001",
+      "provider": "firstParty",
+      "agent": "claude-review",
+      "devloop_stage": "reviewer",
+      "target_repo": "mctlhq/.github",
+      "pr_number": 139,
+      "input_tokens": 1421,
+      "output_tokens": 612,
+      "cache_read_tokens": 18420,
+      "cache_write_tokens": 4096,
+      "web_search_requests": 0,
+      "outcome": "success",
+      "stop_reason": "end_turn",
+      "terminal_reason": "end_turn",
+      "num_turns": 1,
+      "duration_api_ms": 8421,
+      "retry_attempt": 0,
+      "recorded_at": "2026-09-26T14:07:22Z"
+    },
+    {
+      "schema_version": 1,
+      "session_id": "bcdd4386-40ae-471d-b8d1-9e2bb8757c81",
+      "result_uuid": "9d93d631-a52c-41be-833a-aa6515d87aba",
+      "model_key": "claude-opus-4-1-20250805",
+      "canonical_model": "claude-opus-4-1-20250805",
+      "provider": "firstParty",
+      "agent": "claude-review",
+      "devloop_stage": "reviewer",
+      "target_repo": "mctlhq/.github",
+      "pr_number": 139,
+      "input_tokens": 8931,
+      "output_tokens": 22381,
+      "cache_read_tokens": 3123860,
+      "cache_write_tokens": 51204,
+      "web_search_requests": 0,
+      "outcome": "success",
+      "stop_reason": "end_turn",
+      "terminal_reason": "end_turn",
+      "num_turns": 1,
+      "duration_api_ms": 41028,
+      "retry_attempt": 0,
+      "recorded_at": "2026-09-26T14:07:22Z"
+    }
+  ]
+}

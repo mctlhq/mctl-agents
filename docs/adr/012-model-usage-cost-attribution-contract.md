@@ -367,6 +367,46 @@ Two consequences for delivery:
 its versioned catalog at ingest (`calculated_cost` + `pricing_version`), and
 `provider_reported_cost` stays null as decided above.
 
+## Amendment 2026-09-26 — the collector (mctlhq/mctl-agents#506)
+
+**The reviewer stage reaches the ledger through a puller, not a pusher.**
+`claude-review.yml` runs in GitHub Actions (mctlhq/.github#126), outside
+mctl-agents, and already builds ADR-012 records at the model-call boundary —
+but it does not POST them. Doing so would need the confined usage-writer
+bearer as a GitHub secret in every caller repository, which is the
+standing 2026-09-24 constraint this amendment respects: no new long-lived
+secret in GitHub. Instead the workflow publishes those records verbatim as
+the `model-usage-records` artifact (`retention-days: 90`), and
+`orchestrator/run_usage_collector.py` — a model-free periodic sweep on the
+existing image, triggered by its own Argo CronWorkflow (an owner step, see
+`docs/operations/usage-collector.md`) — pulls it from inside the cluster,
+where both credentials it needs already live (the GitHub App installation
+token and the usage-writer bearer).
+
+**The collector mints no id.** `Record.EnsureID` (`internal/usage/types.go`)
+derives `id` server-side from `(session_id, result_uuid, model_key)` and
+rejects a supplied id that disagrees, failing the whole (single-transaction)
+batch. The collector therefore drops any `id` field a candidate record
+carries and forwards the artifact's own identity fields unchanged — the same
+rule every other producer already follows, stated here because the
+collector is the first producer whose distance from the model made "just
+mint one" look tempting.
+
+**`(session_id, result_uuid, model_key)` is the reviewer's dedupe key — not
+`(run id, run attempt, model)`.** The issue that motivated this collector
+asked for the latter; it is not what mctl-api derives, and it is strictly
+worse: the ADR-012 key already collapses a reviewer's primary/fallback
+attempts that re-record one result, while still counting a fallback that
+genuinely re-ran the model (a new `session_id`) as the second real charge it
+is.
+
+**Statelessness is the idempotency design.** The collector keeps no cursor
+and no seen-set. Re-collecting the same artifact is a no-op because
+mctl-api's insert-or-ignore on the derived id makes a second delivery add no
+row — so "re-read one artifact" and "re-run the whole sweep" are the same
+operation, and a wider `--lookback-days` backfill (up to the 90-day artifact
+retention) is a safe redundant read, never a double count.
+
 ## Non-goals
 
 Dashboards. Hard budget enforcement. Replacing provider invoices. Selecting
