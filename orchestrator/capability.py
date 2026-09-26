@@ -46,6 +46,7 @@ ADR 017 for the full boundary table.
 from __future__ import annotations
 
 import fnmatch
+import math
 from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,6 +63,7 @@ __all__ = [
     "API_VERSION",
     "KIND",
     "AbsentPolicyCheckpoint",
+    "CapabilityCollisionError",
     "CapabilityDescriptor",
     "CapabilityError",
     "CapabilitySet",
@@ -137,6 +139,20 @@ class CapabilityError(ValueError):
     document, never catch this to fall back to a default shape."""
 
 
+class CapabilityCollisionError(CapabilityError):
+    """Raised by `CapabilitySet.validate()` (and therefore `seal()`) when two
+    members would resolve to the same SDK-visible `tool_name`, or two
+    providers claim the same `alias` (ADR 017 sec. 4: "Two providers
+    resolving to the same SDK-visible tool_name, or two providers claiming
+    one alias, is a `collision` error raised at set-sealing time ... fail
+    closed, never a silent rename, shadow or drop"). Carries a fixed
+    `reason_code` so a caller (the gateway, slice 2) can report the closed
+    `REASON_CODES` value `"collision"` without parsing this exception's
+    message."""
+
+    reason_code = "collision"
+
+
 def _hash_bytes(raw: bytes) -> str:
     return hash_bytes(raw)
 
@@ -164,7 +180,8 @@ def _require_mapping(value: Any, *, where: str) -> Mapping[str, Any]:
 
 def _require_str(value: Any, *, where: str, allow_empty: bool = False) -> str:
     if not isinstance(value, str) or (not allow_empty and not value):
-        raise CapabilityError(f"{where} must be a non-empty string")
+        expected = "a string" if allow_empty else "a non-empty string"
+        raise CapabilityError(f"{where} must be {expected}")
     return value
 
 
@@ -191,7 +208,10 @@ def _optional_float(value: Any, *, where: str) -> float | None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CapabilityError(f"{where} must be a number or null")
-    return float(value)
+    result = float(value)
+    if math.isnan(result) or math.isinf(result):
+        raise CapabilityError(f"{where} must be finite, got {value!r}")
+    return result
 
 
 def _execution_from_dict(data: Any) -> ExecutionCorrelation:
@@ -211,6 +231,27 @@ def _require_sha256(value: Any, *, where: str) -> str:
     if not text.startswith("sha256:"):
         raise CapabilityError(f"{where} must carry the 'sha256:' prefix, got {text!r}")
     return text
+
+
+def _parse_capability_id(capability_id: str, *, where: str) -> tuple[str, str, str]:
+    """Split a canonical `mctl://<provider_type>/<provider_id>/<tool>` id
+    into its three parts (ADR 017 sec. 4). Pure and total: raises
+    `CapabilityError` rather than returning a partially-parsed id, so
+    `CapabilitySet.validate()`'s derivation check below never has to guard
+    against a malformed split."""
+    prefix = "mctl://"
+    if not capability_id.startswith(prefix):
+        raise CapabilityError(f"{where}: capability_id must start with {prefix!r}, got {capability_id!r}")
+    # No maxsplit: an id with extra segments ("mctl://t/ns/provider/tool")
+    # must fail here rather than fold "provider/tool" into the tool part.
+    parts = capability_id[len(prefix):].split("/")
+    if len(parts) != 3 or not all(parts):
+        raise CapabilityError(
+            f"{where}: capability_id {capability_id!r} must have the shape "
+            "'mctl://<provider_type>/<provider_id>/<tool>'"
+        )
+    provider_type, provider_id, tool = parts
+    return provider_type, provider_id, tool
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +330,19 @@ class CapabilityDescriptor:
     annotations: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        # Type-checked BEFORE any conversion touches them, so a wrong-typed
+        # keywords/annotations value raises CapabilityError (fail-closed)
+        # rather than a bare TypeError from tuple()/dict() (R3, review
+        # follow-up from #485).
+        if not isinstance(self.keywords, (tuple, list)):
+            raise CapabilityError(
+                f"capability.keywords must be a list/tuple of strings, got {type(self.keywords).__name__}"
+            )
         object.__setattr__(self, "keywords", tuple(self.keywords))
+        if not isinstance(self.annotations, Mapping):
+            raise CapabilityError(
+                f"capability.annotations must be a mapping, got {type(self.annotations).__name__}"
+            )
         # Defensive copy + read-only wrap, mirroring ContextSource.selector
         # in context_snapshot.py: a caller mutating the dict it passed in
         # must never change this descriptor's effective content after
@@ -307,6 +360,10 @@ class CapabilityDescriptor:
         _require_str(self.matched_tool_pattern, where=f"{where}: matched_tool_pattern")
         _require_str(self.summary, where=f"{where}: summary", allow_empty=True)
         _require_int(self.input_schema_bytes, where=f"{where}: input_schema_bytes")
+        if self.input_schema_bytes < 0:
+            raise CapabilityError(
+                f"capability {self.capability_id!r}: input_schema_bytes must be >= 0, got {self.input_schema_bytes}"
+            )
         if len(self.title) > MAX_TITLE_LENGTH:
             raise CapabilityError(f"capability {self.capability_id!r}: title exceeds {MAX_TITLE_LENGTH} characters")
         if len(self.summary) > MAX_SUMMARY_LENGTH:
@@ -481,6 +538,22 @@ class RetentionPolicy:
     class_: str
     expires_after_days: int
 
+    def __post_init__(self) -> None:
+        # Checked here too (not only in from_dict), so a directly-constructed
+        # RetentionPolicy (the way seal()'s caller builds one, never through
+        # from_dict) can never carry a value its own from_dict would reject
+        # on reload (R3, review follow-up from #485). The closed
+        # `RETENTION_CLASSES` vocabulary is deliberately NOT enforced here —
+        # that stays CapabilitySet.validate()'s job, mirroring
+        # orchestrator/context_snapshot.py's identically-shaped
+        # RetentionPolicy, which leaves the same check to ContextSnapshot.
+        _require_str(self.class_, where="retention.class")
+        _require_int(self.expires_after_days, where="retention.expires_after_days")
+        if self.expires_after_days < 0:
+            raise CapabilityError(
+                f"retention.expires_after_days must be >= 0, got {self.expires_after_days}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return {"class": self.class_, "expires_after_days": self.expires_after_days}
 
@@ -488,6 +561,11 @@ class RetentionPolicy:
     def from_dict(cls, data: Any) -> RetentionPolicy:
         mapping = _require_mapping(data, where="retention")
         _reject_unknown_keys(mapping, frozenset({"class", "expires_after_days"}), where="retention")
+        # __post_init__ re-validates these too (so a directly-constructed
+        # RetentionPolicy obeys the same rule), but from_dict validates
+        # explicitly rather than relying on a default value for a missing
+        # key, which would silently turn an absent field into 0/"" instead
+        # of raising.
         return cls(
             class_=_require_str(mapping.get("class"), where="retention.class"),
             expires_after_days=_require_int(mapping.get("expires_after_days"), where="retention.expires_after_days"),
@@ -639,13 +717,34 @@ class CapabilitySet:
         for tool in self.plan_tools:
             _require_str(tool, where="plan_tools[]")
 
+        # Collision check, providers half (ADR 017 sec. 4, R1 review
+        # follow-up from #485): two providers claiming one execution-scoped
+        # alias is a fail-closed sealing-time error, never a silent rename,
+        # shadow or drop.
+        # A duplicate `(type, id)` under two aliases is the same collision
+        # from the other side: their tool_names differ, but both derive one
+        # `capability_id` per shared tool, and that id is the canonical
+        # identity capability_invoke dispatches on (last writer would win).
+        # With this check, equal ids imply one provider and so one
+        # tool_name, which the capabilities half below already rejects.
+        seen_aliases: set[str] = set()
+        seen_provider_ids: set[tuple[str, str]] = set()
         for provider in self.providers:
             if provider.type not in PROVIDER_TYPES:
                 raise CapabilityError(
                     f"provider {provider.id!r}: type {provider.type!r} is not one of {sorted(PROVIDER_TYPES)!r}"
                 )
+            if provider.alias in seen_aliases:
+                raise CapabilityCollisionError(f"two providers claim alias {provider.alias!r}")
+            seen_aliases.add(provider.alias)
+            if (provider.type, provider.id) in seen_provider_ids:
+                raise CapabilityCollisionError(
+                    f"two providers share type {provider.type!r} and id {provider.id!r}"
+                )
+            seen_provider_ids.add((provider.type, provider.id))
 
         plan_tools_set = set(self.plan_tools)
+        seen_tool_names: set[str] = set()
         for capability in self.capabilities:
             if capability.consequence not in CONSEQUENCE_VALUES:
                 raise CapabilityError(
@@ -670,6 +769,42 @@ class CapabilitySet:
                     f"capability {capability.capability_id!r}: tool_name {capability.tool_name!r} does not "
                     f"match matched_tool_pattern {capability.matched_tool_pattern!r}"
                 )
+            # Structural consistency (ADR 017 sec. 4, R1 review follow-up
+            # from #485): capability_id and tool_name must each be
+            # re-derivable from the other via the provider that advertised
+            # this capability — a sealed document must prove the
+            # SDK-visible name and the canonical id agree, not merely
+            # assert it.
+            provider_type, provider_id, tool = _parse_capability_id(
+                capability.capability_id, where=f"capability {capability.capability_id!r}"
+            )
+            if provider_type != capability.provider.type or provider_id != capability.provider.id:
+                raise CapabilityError(
+                    f"capability {capability.capability_id!r}: capability_id does not match its provider "
+                    f"(type={capability.provider.type!r}, id={capability.provider.id!r})"
+                )
+            expected_tool_name = (
+                tool if capability.provider.type == "sdk-builtin" else f"mcp__{capability.provider.alias}__{tool}"
+            )
+            if capability.tool_name != expected_tool_name:
+                raise CapabilityError(
+                    f"capability {capability.capability_id!r}: tool_name {capability.tool_name!r} does not "
+                    f"match the name derived from capability_id and provider.alias ({expected_tool_name!r})"
+                )
+            # Every member's provider must be a declared provider of this
+            # set — a capability cannot come from a provider the set itself
+            # never lists.
+            if capability.provider not in self.providers:
+                raise CapabilityError(
+                    f"capability {capability.capability_id!r}: provider {capability.provider.id!r} "
+                    f"(alias {capability.provider.alias!r}) is not a member of this set's providers"
+                )
+            # Collision check, capabilities half: two members resolving to
+            # one SDK-visible tool_name is the other fail-closed sealing-time
+            # error ADR 017 sec. 4 names.
+            if capability.tool_name in seen_tool_names:
+                raise CapabilityCollisionError(f"two capabilities resolve to tool_name {capability.tool_name!r}")
+            seen_tool_names.add(capability.tool_name)
 
     def to_log_dict(self) -> dict[str, Any]:
         """Trace/telemetry-export shape (`#195` owns traces): ids, hashes,
@@ -804,6 +939,14 @@ class DiscoveryDecision:
     score: float | None = None
 
     def __post_init__(self) -> None:
+        # Checked here too (not only in from_dict's _require_int), so a
+        # directly-constructed DiscoveryDecision (the way a ranker builds
+        # one) can never carry a negative or wrong-typed rank that its own
+        # from_dict would reject on reload (R2, review follow-up from #485).
+        if isinstance(self.rank, bool) or not isinstance(self.rank, int):
+            raise CapabilityError(f"discovery_decision.rank must be an int, got {type(self.rank).__name__}")
+        if self.rank < 0:
+            raise CapabilityError(f"discovery_decision.rank must be >= 0, got {self.rank}")
         # Same normalization Selection.score uses in context_snapshot.py:
         # an int score coerces to float on every construction path, and a
         # bool (an int subclass) is rejected rather than silently becoming
@@ -1047,7 +1190,16 @@ def load_consequence_table(path: Path | str | None = None) -> Mapping[str, str]:
     _UniqueKeyLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_unique_mapping)
 
     raw = target.read_text(encoding="utf-8")
-    data = yaml.load(raw, Loader=_UniqueKeyLoader) or {}  # noqa: S506 - a SafeLoader subclass
+    try:
+        data = yaml.load(raw, Loader=_UniqueKeyLoader) or {}  # noqa: S506 - a SafeLoader subclass
+    except yaml.YAMLError as exc:
+        # A syntax error (or anything else PyYAML itself raises) becomes a
+        # CapabilityError like every other failure in this module, so a
+        # caller only ever needs to catch one exception type (R3, review
+        # follow-up from #485). CapabilityError raised by
+        # `_construct_unique_mapping` above (unhashable/duplicate key) is
+        # not a yaml.YAMLError, so it passes through this clause unchanged.
+        raise CapabilityError(f"{target}: invalid YAML: {exc}") from exc
     if not isinstance(data, Mapping):
         raise CapabilityError(f"{target}: expected a top-level mapping, got {type(data).__name__}")
     tools_raw = data.get("tools", {})

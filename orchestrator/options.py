@@ -893,6 +893,15 @@ class _PolicyCheckpointHook:
     """
 
     grants: tuple[str, ...]
+    # Tool-name prefix whose calls are checked downstream instead of here.
+    # Only the capability-gateway builder sets it (`mcp__capability__`): the
+    # gateway's three tools are not mctl operations, so no BUILTIN_POLICY
+    # rule matches them and this hook would deny every call as
+    # `no_matching_rule`. The gateway puts each underlying capability
+    # through its own `PolicyCheckpoint` before dispatch (ADR 017 sec. 6),
+    # and the builder refuses a gateway without a real one when the sealed
+    # set holds anything consequential. Empty for every other builder.
+    delegated_prefix: str = ""
 
     async def __call__(self, input_data: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
         from orchestrator import policy_checkpoint
@@ -901,6 +910,8 @@ class _PolicyCheckpointHook:
             if not isinstance(input_data, dict):
                 return _deny("policy checkpoint: unreadable tool call")
             tool_name = str(input_data.get("tool_name") or "")
+            if self.delegated_prefix and tool_name.startswith(self.delegated_prefix):
+                return {}
             tool_input = input_data.get("tool_input")
             decision = await anyio.to_thread.run_sync(functools.partial(
                 policy_checkpoint.checkpoint,
@@ -920,12 +931,16 @@ class _PolicyCheckpointHook:
         )
 
 
-def _policy_hooks(allowed_tools: list[str]) -> dict[HookEventName, list[HookMatcher]]:
+def _policy_hooks(
+    allowed_tools: list[str], *, delegated_prefix: str = "",
+) -> dict[HookEventName, list[HookMatcher]]:
     """Every MCP tool call, whatever the server, meets the checkpoint; the
-    builder's own allow-list is the grant set it evaluates against."""
+    builder's own allow-list is the grant set it evaluates against.
+    `delegated_prefix` is the one exception, see `_PolicyCheckpointHook`."""
+    hook = _PolicyCheckpointHook(tuple(allowed_tools), delegated_prefix=delegated_prefix)
     return {
         "PreToolUse": [
-            HookMatcher(matcher="mcp__.*", hooks=[cast(Any, _PolicyCheckpointHook(tuple(allowed_tools)))]),
+            HookMatcher(matcher="mcp__.*", hooks=[cast(Any, hook)]),
         ],
     }
 
@@ -1161,6 +1176,8 @@ def build_issue_investigator_options_from_plan(
     plan: ExecutionPlan,
     repo_dir: Path,
     proposal_dir: Path,
+    *,
+    gateway: Any = None,
 ) -> ClaudeAgentOptions:
     """Options for issue-investigator's `ISSUE_INVESTIGATOR_RESOLVER_MODE=declarative`
     path (orchestrator/run_issue_investigator.py): built from a resolved
@@ -1192,6 +1209,21 @@ def build_issue_investigator_options_from_plan(
     dormant today only because the single checked-in fixture always lists
     `mcp__mctl__*` — an accident of the fixture, not a property of the
     design (claude P2 on #234, third round; earlier rounds fixed (2) alone).
+
+    ``gateway`` (mctlhq/mctl-agents#242 slice 2, ADR 017): a
+    ``orchestrator.capability_gateway.CapabilityGateway``, or ``None``
+    (the default). ``None`` produces byte-identical options to before this
+    parameter existed — nothing below this docstring's original behaviour
+    changes on that path. With a gateway supplied: the remote ``mctl``
+    server is NOT connected into the model's tool set at all (``mcp_servers
+    = {"capability": gateway.sdk_server()}`` instead of
+    ``mctl_mcp_config(...)``); the same two-fact conjunction above still
+    gates the grant, only the tool glob changes, from ``mcp__mctl__*`` to
+    ``mcp__capability__*``; and ``strict_mcp_config=True``, so the CLI can
+    only ever reach the gateway's three tools plus whatever the profile
+    otherwise grants — never a remote MCP server this function did not
+    itself configure. Nothing in slice 2 passes a gateway from a real run;
+    that construction site is slice 3's job.
     """
     env = {**os.environ, "PROPOSAL_DIR": str(proposal_dir)}
     # HUMAN_INPUT_CAPABILITY is filtered out alongside "mcp__mctl__*": both
@@ -1201,20 +1233,75 @@ def build_issue_investigator_options_from_plan(
     allowed_tools = [
         t for t in plan.tools if t not in ("mcp__mctl__*", HUMAN_INPUT_CAPABILITY)
     ]
-    if "mcp__mctl__*" in plan.tools:
-        allowed_tools += _mctl_tool_globs()
+    if gateway is None:
+        if "mcp__mctl__*" in plan.tools:
+            allowed_tools += _mctl_tool_globs()
+        return _scrubbed(ClaudeAgentOptions(
+            cwd=str(repo_dir),
+            setting_sources=["project"],
+            model=plan.model,
+            allowed_tools=allowed_tools,
+            mcp_servers=mctl_mcp_config(always_load=True),
+            permission_mode="acceptEdits",
+            max_budget_usd=plan.budget_usd,
+            add_dirs=[str(proposal_dir)],
+            env=env,
+            hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+        ))
+    # gateway is not None: the capability gateway's own SDK server replaces
+    # the remote mctl connection entirely — the model never sees
+    # mcp__mctl__* directly, only mcp__capability__* (capability_search/
+    # describe/invoke), which the gateway itself narrows to the sealed set.
+    _require_enforcing_checkpoint(gateway)
+    if "mcp__mctl__*" in plan.tools and mctl_mcp_config():
+        allowed_tools += ["mcp__capability__*"]
     return _scrubbed(ClaudeAgentOptions(
         cwd=str(repo_dir),
         setting_sources=["project"],
         model=plan.model,
         allowed_tools=allowed_tools,
-        mcp_servers=mctl_mcp_config(always_load=True),
+        mcp_servers={"capability": gateway.sdk_server()},
         permission_mode="acceptEdits",
         max_budget_usd=plan.budget_usd,
         add_dirs=[str(proposal_dir)],
         env=env,
-        hooks=_compose_hooks(_command_audit_hooks(), _policy_hooks(allowed_tools)),
+        hooks=_compose_hooks(
+            _command_audit_hooks(),
+            _policy_hooks(allowed_tools, delegated_prefix=CAPABILITY_GATEWAY_TOOL_PREFIX),
+        ),
+        strict_mcp_config=True,
     ))
+
+
+#: SDK-visible prefix of the capability gateway's own tools
+#: (`create_sdk_mcp_server(name="capability")`).
+CAPABILITY_GATEWAY_TOOL_PREFIX = "mcp__capability__"
+
+
+def _require_enforcing_checkpoint(gateway: Any) -> None:
+    """Refuse a gateway that would let a consequential call through unchecked.
+
+    On the gateway path `_PolicyCheckpointHook` delegates every
+    `mcp__capability__*` call, so the gateway's own `checkpoint` is the only
+    #197 enforcement left for the capabilities behind `capability_invoke`.
+    `AbsentPolicyCheckpoint` answers `allowed` for everything, which is
+    strictly weaker than the direct `mcp__mctl__*` path. Fail loudly at
+    construction rather than silently at invocation.
+    """
+    from orchestrator.capability import AbsentPolicyCheckpoint
+
+    if not isinstance(gateway.checkpoint, AbsentPolicyCheckpoint):
+        return
+    gated = sorted(
+        c.capability_id for c in gateway.capability_set.capabilities
+        if c.consequence in ("mutating", "consequential")
+    )
+    if gated:
+        raise ValueError(
+            "capability gateway uses AbsentPolicyCheckpoint but its sealed set holds "
+            f"{len(gated)} mutating/consequential capabilities (first: {gated[0]!r}); "
+            "pass a real PolicyCheckpoint such as PolicyDecidePolicyCheckpoint"
+        )
 
 
 def build_shepherd_options(shepherd_dir: Path, model: str) -> ClaudeAgentOptions:

@@ -90,6 +90,47 @@ def test_the_guard_can_actually_see_the_sdk():
     assert "orchestrator.auth" in loaded
 
 
+def test_capability_module_is_importable_by_the_worker():
+    """`orchestrator/capability.py` (mctlhq/mctl-agents#242, ADR 017) is
+    stdlib-only by design — the contract module, not the gateway — so the
+    worker must be able to import it exactly like `orchestrator/
+    context_snapshot.py`, its closest sibling. Regression coverage for T12
+    (tasks.md, slice 2): once a caller wires this module in, it must not
+    silently pull in claude_agent_sdk/mcp along the way."""
+    loaded = _modules_imported_by("orchestrator.capability")
+
+    assert "claude_agent_sdk" not in loaded
+    assert "mcp" not in loaded
+    assert "yaml" not in loaded  # load_consequence_table() defers its own import
+
+
+def test_capability_gateway_is_never_imported_by_the_worker():
+    """`orchestrator/capability_gateway.py` (mctlhq/mctl-agents#242 slice 2)
+    imports `claude_agent_sdk` and `mcp` lazily inside its own functions, so
+    merely importing IT stays free of both — but the module itself must
+    never be reachable from the worker's import graph at module scope
+    (T12, tasks.md). No caller wires it in this slice; this guards the day
+    one does."""
+    loaded = _modules_imported_by("orchestrator.temporal.worker")
+
+    assert "orchestrator.capability_gateway" not in loaded
+
+
+def test_the_guard_can_actually_see_capability_gateway():
+    """Control for the assertion above: the probe must be able to detect
+    `orchestrator.capability_gateway` when it IS present, and confirm that
+    module alone (not `orchestrator.capability`) is what pulls in the SDK
+    and `mcp`."""
+    loaded = _modules_imported_by("orchestrator.capability_gateway")
+
+    assert "orchestrator.capability_gateway" in loaded
+    # capability_gateway's own top-level imports are stdlib + orchestrator.*
+    # only (claude_agent_sdk/mcp are deferred inside its functions) — this
+    # mirrors capability.py's own stdlib-only import graph one level up.
+    assert "claude_agent_sdk" not in loaded
+    assert "mcp" not in loaded
+
+
 def test_subagent_wait_is_importable_by_the_worker():
     """The sub-agent-await helper must not drag the SDK in at import time.
 

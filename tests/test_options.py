@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from types import SimpleNamespace
 
+import anyio
 import pytest
 
 from orchestrator import options, resolver
@@ -257,6 +259,120 @@ def test_a_profile_that_grants_the_mctl_tools_still_gets_them(tmp_path, monkeypa
     built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
 
     assert "mcp__mctl__*" in built.allowed_tools
+
+
+# ---------------------------------------------------------------------------
+# build_issue_investigator_options_from_plan(..., gateway=...) — T10
+# (mctlhq/mctl-agents#242 slice 2, ADR 017). gateway=None (the default) must
+# stay byte-identical to every equivalence test above; a gateway replaces
+# the remote mctl connection with the gateway's own SDK server and narrows
+# the model's tool surface to mcp__capability__* under strict_mcp_config.
+# ---------------------------------------------------------------------------
+
+
+class _FakeGateway:
+    """A stand-in for `capability_gateway.CapabilityGateway`: the builder
+    calls `.sdk_server()` and reads `.checkpoint` / `.capability_set` for
+    its enforcing-checkpoint guard, so that is all the fake needs. By
+    default the checkpoint is a real (non-absent) one and the set is empty."""
+
+    def __init__(self, *, checkpoint=None, consequences=()) -> None:
+        self.sdk_server_calls = 0
+        self.checkpoint = checkpoint if checkpoint is not None else object()
+        self.capability_set = SimpleNamespace(capabilities=tuple(
+            SimpleNamespace(capability_id=f"mctl://mcp-remote/mctl-api/t{i}", consequence=c)
+            for i, c in enumerate(consequences)
+        ))
+
+    def sdk_server(self):
+        self.sdk_server_calls += 1
+        return {"fake": "server-config"}
+
+
+def test_build_issue_investigator_options_from_plan_gateway_default_is_none(tmp_path, monkeypatch):
+    """`gateway` defaults to `None`, and passing `None` explicitly resolves
+    identical options to omitting it — the parameter is a pure no-op at its
+    default, exactly as design.md requires."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+
+    omitted = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir)
+    explicit_none = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=None)
+
+    assert omitted.mcp_servers == explicit_none.mcp_servers
+    assert sorted(omitted.allowed_tools) == sorted(explicit_none.allowed_tools)
+    assert omitted.strict_mcp_config == explicit_none.strict_mcp_config == False  # noqa: E712 - exact-value assertion
+
+
+def test_build_issue_investigator_options_from_plan_with_gateway_uses_the_capability_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gateway = _FakeGateway()
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    assert "mcp__mctl__*" in plan.tools  # guards the premise below
+
+    built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=gateway)
+
+    assert gateway.sdk_server_calls == 1
+    assert built.mcp_servers == {"capability": {"fake": "server-config"}}
+    assert built.strict_mcp_config is True
+    # The remote mctl server is never connected into the model's tool set:
+    # neither the raw wildcard nor a dead mctl__* entry survives.
+    assert "mcp__mctl__*" not in built.allowed_tools
+    assert not [t for t in built.allowed_tools if t.startswith("mcp__mctl__")]
+    assert "mcp__capability__*" in built.allowed_tools
+
+
+def test_build_issue_investigator_options_from_plan_with_gateway_omits_capability_tools_without_token(
+    tmp_path, monkeypatch,
+):
+    """The same "profile grants it AND MCP is configured" conjunction the
+    eager path enforces holds on the gateway path too: no MCTL_TOKEN means
+    no mcp__capability__* grant either, even though the profile lists
+    mcp__mctl__*."""
+    monkeypatch.delenv("MCTL_TOKEN", raising=False)
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gateway = _FakeGateway()
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="f" * 40))
+    assert "mcp__mctl__*" in plan.tools
+
+    built = options.build_issue_investigator_options_from_plan(plan, repo_dir, proposal_dir, gateway=gateway)
+
+    assert "mcp__capability__*" not in built.allowed_tools
+    assert built.mcp_servers == {"capability": {"fake": "server-config"}}  # the gateway server is still wired
+    assert built.strict_mcp_config is True
+
+
+def test_build_issue_investigator_options_from_plan_with_gateway_respects_a_profile_that_withholds_mctl(
+    tmp_path, monkeypatch,
+):
+    """The narrowing half of the conjunction, on the gateway path: a profile
+    that never granted mcp__mctl__* must not get mcp__capability__* back
+    just because a gateway happens to be supplied."""
+    monkeypatch.setenv("MCTL_TOKEN", "set-and-therefore-tempting")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    proposal_dir = tmp_path / "proposals" / "issue-123"
+    gateway = _FakeGateway()
+
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    import dataclasses
+
+    restricted = dataclasses.replace(plan, tools=tuple(t for t in plan.tools if t != "mcp__mctl__*"))
+
+    built = options.build_issue_investigator_options_from_plan(restricted, repo_dir, proposal_dir, gateway=gateway)
+
+    assert "mcp__capability__*" not in built.allowed_tools
 
 
 def test_implementer_drain_timeout_defaults_to_five_minutes():
@@ -1409,3 +1525,80 @@ def test_audit_hook_omits_execution_context_when_absent(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "AUDIT tool=Bash cmd='ls'" in out
     assert "execution_context" not in out
+
+
+def _policy_hook(built):
+    """The `_PolicyCheckpointHook` a builder installed on PreToolUse."""
+    for matcher in built.hooks["PreToolUse"]:
+        for hook in matcher.hooks:
+            if isinstance(hook, options._PolicyCheckpointHook):
+                return hook
+    raise AssertionError("no _PolicyCheckpointHook installed")
+
+
+def _gateway_options(tmp_path, monkeypatch, gateway):
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir(exist_ok=True)
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    return options.build_issue_investigator_options_from_plan(
+        plan, repo_dir, tmp_path / "proposals" / "issue-123", gateway=gateway,
+    )
+
+
+def test_gateway_tools_are_not_denied_by_the_policy_hook(tmp_path, monkeypatch):
+    """No BUILTIN_POLICY rule matches a `mcp__capability__*` operation, so
+    without delegation the hook denies every gateway call as
+    `no_matching_rule` and the gateway path is dead (claude P1 on #508).
+    The gateway enforces #197 per capability instead."""
+    hook = _policy_hook(_gateway_options(tmp_path, monkeypatch, _FakeGateway()))
+    for tool in ("capability_search", "capability_describe", "capability_invoke"):
+        decision = anyio.run(hook, {"tool_name": f"mcp__capability__{tool}", "tool_input": {}}, None, None)
+        assert decision == {}, tool
+
+
+def test_only_the_gateway_builder_delegates_capability_tools(tmp_path, monkeypatch):
+    """Delegation is scoped to the gateway path: the eager builder's hook
+    still sends a `mcp__capability__*` name to the checkpoint, which has no
+    rule for it and denies."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    eager = options.build_issue_investigator_options_from_plan(plan, repo_dir, tmp_path / "p")
+
+    hook = _policy_hook(eager)
+    assert hook.delegated_prefix == ""
+    decision = anyio.run(hook, {"tool_name": "mcp__capability__capability_invoke", "tool_input": {}}, None, None)
+    assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_gateway_with_absent_checkpoint_and_a_consequential_capability_is_refused(tmp_path, monkeypatch):
+    """With the hook delegating, the gateway's checkpoint is the only #197
+    enforcement for what `capability_invoke` reaches, so an
+    `AbsentPolicyCheckpoint` over a mutating/consequential set fails at
+    construction (claude P2 on #508)."""
+    from orchestrator.capability import AbsentPolicyCheckpoint
+
+    gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=("read-only", "mutating"))
+    with pytest.raises(ValueError, match="AbsentPolicyCheckpoint"):
+        _gateway_options(tmp_path, monkeypatch, gateway)
+
+
+def test_gateway_with_absent_checkpoint_over_read_only_capabilities_is_allowed(tmp_path, monkeypatch):
+    from orchestrator.capability import AbsentPolicyCheckpoint
+
+    gateway = _FakeGateway(checkpoint=AbsentPolicyCheckpoint(), consequences=("read-only",))
+    built = _gateway_options(tmp_path, monkeypatch, gateway)
+    assert built.mcp_servers == {"capability": {"fake": "server-config"}}
+
+
+def test_gateway_is_keyword_only(tmp_path, monkeypatch):
+    """A fourth positional argument must not silently switch the builder
+    into the gateway branch (claude P3 on #508)."""
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    repo_dir = tmp_path / "mctl-telegram"
+    repo_dir.mkdir()
+    plan = resolver.execute("issue-investigator", resolver.Task(target_repository_sha="e" * 40))
+    with pytest.raises(TypeError):
+        options.build_issue_investigator_options_from_plan(plan, repo_dir, tmp_path / "p", _FakeGateway())

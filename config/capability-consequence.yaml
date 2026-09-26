@@ -19,8 +19,11 @@
 # lookup.
 #
 # Classification rule (design.md, conservative and reviewed):
-#   read-only     — get/list/read/resolve/whoami/status/summary/verify
-#                    operations; no side effect.
+#   read-only     — get/list/read/resolve/whoami/status/summary
+#                    operations; no side effect. Every read-only key must
+#                    also be ALLOW under policy_checkpoint.BUILTIN_POLICY
+#                    (tests/test_capability_gateway.py asserts it): the
+#                    gateway dispatches read-only tools without a checkpoint.
 #   mutating      — deploy/scale/save/create/provision/publish/enable/
 #                    disable/sync/resume operations whose effect is
 #                    reversible or narrowly scoped.
@@ -100,5 +103,8 @@ tools:
   mctl_trigger_reconcile: consequential
   mctl_trigger_shepherd: consequential
   mctl_trigger_single_service: consequential
-  mctl_verify_domain: read-only
+  # Starts a domain verification (a state change), and BUILTIN_POLICY gates
+  # it under mctl-mcp-default-approval; read-only here would let the gateway
+  # dispatch it unchecked (claude P1 on #508).
+  mctl_verify_domain: mutating
   mctl_whoami: read-only

@@ -363,11 +363,14 @@ def test_strategy_is_sealable_exactly_when_it_round_trips(overrides, rejected):
     [
         ({"excluded_count": True}, "excluded_count"),
         ({"plan_tools": ("Read", 1, "mcp__mctl__*")}, r"plan_tools"),
-        ({"retention": cap.RetentionPolicy(class_="execution-record", expires_after_days=True)}, "expires_after_days"),
-        ({"capabilities": "bool-schema-bytes"}, "input_schema_bytes"),
-        ({"capabilities": "non-str-summary"}, "summary"),
-        ({"providers": "non-str-endpoint-ref"}, "endpoint_ref"),
-        ({"providers": "non-str-id"}, r"provider\.id"),
+        (
+            {"retention": lambda: cap.RetentionPolicy(class_="execution-record", expires_after_days=True)},
+            "expires_after_days",
+        ),
+        ({"capabilities": lambda: [_descriptor(_provider(), input_schema_bytes=True)]}, "input_schema_bytes"),
+        ({"capabilities": lambda: [_descriptor(_provider(), summary=1)]}, "summary"),
+        ({"providers": lambda: [_provider(endpoint_ref=1)]}, "endpoint_ref"),
+        ({"providers": lambda: [_provider(id=1)]}, r"provider\.id"),
         ({"created_at": 1}, "created_at"),
     ],
     ids=[
@@ -377,16 +380,182 @@ def test_strategy_is_sealable_exactly_when_it_round_trips(overrides, rejected):
 )
 def test_seal_refuses_what_from_dict_would_refuse(overrides, rejected):
     """Construction or seal() refuses it, always as CapabilityError (never a
-    bare TypeError), so no sealed document can fail its own from_dict."""
-    bad_parts = {
-        "bool-schema-bytes": lambda: [_descriptor(_provider(), input_schema_bytes=True)],
-        "non-str-summary": lambda: [_descriptor(_provider(), summary=1)],
-        "non-str-endpoint-ref": lambda: [_provider(endpoint_ref=1)],
-        "non-str-id": lambda: [_provider(id=1)],
-    }
+    bare TypeError), so no sealed document can fail its own from_dict.
+
+    Every override that needs a bad OBJECT (rather than a bad primitive) is
+    a zero-argument callable, invoked only inside `pytest.raises` below —
+    never as a bare parametrize literal. `CapabilityDescriptor`/
+    `ProviderRef`/`RetentionPolicy` now raise `CapabilityError` straight
+    from their own `__post_init__` for exactly these bad shapes (R1-R3,
+    review follow-ups from mctl-agents#485's slice-1 review); constructing
+    one eagerly, as a parametrize literal evaluated at collection time,
+    would fail test COLLECTION instead of the test itself — the sentinel-
+    indirection workaround this replaces.
+    """
     with pytest.raises(cap.CapabilityError, match=rejected):
-        resolved = {k: bad_parts[v]() if isinstance(v, str) and v in bad_parts else v for k, v in overrides.items()}
+        resolved = {k: (v() if callable(v) else v) for k, v in overrides.items()}
         _sealed_set(**resolved)
+
+
+# ---------------------------------------------------------------------------
+# R1 — CapabilitySet.validate() internal consistency (review follow-ups from
+# #485, mctl-agents#242 design.md "Contract hardening"): tool_name derives
+# from capability_id + provider.alias, every capability's provider is a
+# member of the set's providers, and the collision check (two capabilities
+# resolving to one tool_name, or two providers claiming one alias).
+# ---------------------------------------------------------------------------
+def test_validate_rejects_tool_name_inconsistent_with_capability_id_and_alias():
+    provider = _provider()
+    bad = _descriptor(provider, tool_name="mcp__mctl__mctl_wrong_tool")
+    with pytest.raises(cap.CapabilityError, match="does not match the name derived"):
+        cap.seal(
+            execution=_execution(), plan_tools=("Read", "mcp__mctl__*"), providers=[provider],
+            capabilities=[bad], excluded_count=0, strategy=_strategy(), retention=_retention(),
+            created_at="2026-09-23T00:00:00Z",
+        )
+
+
+def test_validate_rejects_capability_id_mismatched_with_its_provider():
+    provider = _provider()
+    bad = _descriptor(provider, capability_id="mctl://mcp-remote/some-other-provider/mctl_get_service_status")
+    with pytest.raises(cap.CapabilityError, match="does not match its provider"):
+        cap.seal(
+            execution=_execution(), plan_tools=("Read", "mcp__mctl__*"), providers=[provider],
+            capabilities=[bad], excluded_count=0, strategy=_strategy(), retention=_retention(),
+            created_at="2026-09-23T00:00:00Z",
+        )
+
+
+def test_validate_rejects_a_malformed_capability_id():
+    provider = _provider()
+    bad = _descriptor(provider, capability_id="mctl://mcp-remote/mctl-api")  # missing the <tool> segment
+    with pytest.raises(cap.CapabilityError, match="must have the shape"):
+        cap.seal(
+            execution=_execution(), plan_tools=("Read", "mcp__mctl__*"), providers=[provider],
+            capabilities=[bad], excluded_count=0, strategy=_strategy(), retention=_retention(),
+            created_at="2026-09-23T00:00:00Z",
+        )
+
+
+def test_validate_rejects_a_capability_whose_provider_is_not_a_set_member():
+    member = _provider()
+    stray = _provider(id="stray-provider", alias="stray")
+    bad = _descriptor(
+        stray,
+        capability_id="mctl://mcp-remote/stray-provider/mctl_get_service_status",
+        tool_name="mcp__stray__mctl_get_service_status",
+        matched_tool_pattern="mcp__stray__*",
+    )
+    with pytest.raises(cap.CapabilityError, match="is not a member of this set's providers"):
+        cap.seal(
+            execution=_execution(), plan_tools=("Read", "mcp__stray__*"), providers=[member],
+            capabilities=[bad], excluded_count=0, strategy=_strategy(), retention=_retention(),
+            created_at="2026-09-23T00:00:00Z",
+        )
+
+
+def test_validate_rejects_two_capabilities_resolving_to_the_same_tool_name():
+    provider_a = cap.ProviderRef(type="sdk-builtin", id="sdk-a", alias="sdk-a")
+    provider_b = cap.ProviderRef(type="sdk-builtin", id="sdk-b", alias="sdk-b")
+    capability_a = _descriptor(
+        provider_a, capability_id="mctl://sdk-builtin/sdk-a/toolX", tool_name="toolX", matched_tool_pattern="toolX",
+    )
+    capability_b = _descriptor(
+        provider_b, capability_id="mctl://sdk-builtin/sdk-b/toolX", tool_name="toolX", matched_tool_pattern="toolX",
+    )
+    with pytest.raises(cap.CapabilityCollisionError, match="resolve to tool_name"):
+        cap.seal(
+            execution=_execution(), plan_tools=("toolX",), providers=[provider_a, provider_b],
+            capabilities=[capability_a, capability_b], excluded_count=0, strategy=_strategy(),
+            retention=_retention(), created_at="2026-09-23T00:00:00Z",
+        )
+
+
+def test_validate_rejects_two_providers_claiming_the_same_alias():
+    provider_a = cap.ProviderRef(type="mcp-remote", id="provider-a", alias="dup")
+    provider_b = cap.ProviderRef(type="mcp-remote", id="provider-b", alias="dup")
+    with pytest.raises(cap.CapabilityCollisionError, match="claim alias"):
+        cap.seal(
+            execution=_execution(), plan_tools=("Read",), providers=[provider_a, provider_b],
+            capabilities=[], excluded_count=0, strategy=_strategy(), retention=_retention(),
+            created_at="2026-09-23T00:00:00Z",
+        )
+
+
+def test_capability_collision_error_is_a_capability_error_with_a_fixed_reason_code():
+    assert issubclass(cap.CapabilityCollisionError, cap.CapabilityError)
+    assert cap.CapabilityCollisionError("boom").reason_code == "collision"
+    assert "collision" in cap.REASON_CODES
+
+
+# ---------------------------------------------------------------------------
+# R2 — numeric bounds: negative rank/input_schema_bytes/expires_after_days
+# are rejected; _optional_float rejects nan/inf.
+# ---------------------------------------------------------------------------
+def test_discovery_decision_rejects_negative_rank():
+    with pytest.raises(cap.CapabilityError, match="rank"):
+        cap.DiscoveryDecision(capability_id="cap-1", rank=-1, reason_code="ok", included=True)
+
+
+def test_descriptor_rejects_negative_input_schema_bytes():
+    with pytest.raises(cap.CapabilityError, match="input_schema_bytes"):
+        _descriptor(_provider(), input_schema_bytes=-1)
+
+
+def test_retention_policy_rejects_negative_expires_after_days():
+    with pytest.raises(cap.CapabilityError, match="expires_after_days"):
+        cap.RetentionPolicy(class_="execution-record", expires_after_days=-1)
+
+
+def test_discovery_decision_score_rejects_nan():
+    with pytest.raises(cap.CapabilityError, match="score"):
+        cap.DiscoveryDecision(capability_id="cap-1", rank=0, reason_code="ok", included=True, score=float("nan"))
+
+
+def test_discovery_decision_score_rejects_infinity():
+    with pytest.raises(cap.CapabilityError, match="score"):
+        cap.DiscoveryDecision(capability_id="cap-1", rank=0, reason_code="ok", included=True, score=float("inf"))
+
+
+# ---------------------------------------------------------------------------
+# R3 — error-type consistency: wrong-typed keywords/annotations raise
+# CapabilityError (never TypeError); _require_str(allow_empty=True) no
+# longer says "non-empty"; RetentionPolicy.__post_init__ enforces what
+# from_dict enforces; a YAML syntax error is wrapped in CapabilityError.
+# ---------------------------------------------------------------------------
+def test_descriptor_rejects_a_non_iterable_keywords_value():
+    with pytest.raises(cap.CapabilityError, match="keywords"):
+        _descriptor(_provider(), keywords=42)
+
+
+def test_descriptor_rejects_a_non_mapping_annotations_value():
+    with pytest.raises(cap.CapabilityError, match="annotations"):
+        _descriptor(_provider(), annotations=["not", "a", "mapping"])
+
+
+def test_require_str_allow_empty_message_omits_non_empty_wording():
+    with pytest.raises(cap.CapabilityError) as exc_info:
+        cap.ProviderRef(type="mcp-remote", id="p", alias="a", endpoint_ref=123)
+    message = str(exc_info.value)
+    assert "must be a string" in message
+    assert "non-empty" not in message
+
+
+def test_retention_policy_direct_construction_rejects_what_from_dict_would():
+    """RetentionPolicy.__post_init__ enforces the same rules from_dict does,
+    so a direct construction (the way seal()'s caller builds one) can never
+    produce a value its own from_dict would reject on reload."""
+    with pytest.raises(cap.CapabilityError, match=r"retention\.class"):
+        cap.RetentionPolicy(class_="", expires_after_days=1)
+    with pytest.raises(cap.CapabilityError, match="expires_after_days"):
+        cap.RetentionPolicy(class_="execution-record", expires_after_days="90")  # type: ignore[arg-type]
+
+
+def test_loader_wraps_a_yaml_syntax_error_in_capability_error(tmp_path):
+    bad_path = tmp_path / "syntax-error.yaml"
+    bad_path.write_text("tools:\n  mctl_whoami: [unterminated\n", encoding="utf-8")
+    with pytest.raises(cap.CapabilityError, match="invalid YAML"):
+        cap.load_consequence_table(bad_path)
 
 
 # ---------------------------------------------------------------------------
