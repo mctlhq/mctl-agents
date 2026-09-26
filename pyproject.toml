@@ -42,7 +42,7 @@ requires-python = ">=3.12,<3.13"
 # connect a remote MCP capability provider. Pinned at the version already
 # resolved in uv.lock so this promotion changes no resolved version.
 dependencies = [
-    "claude-agent-sdk==0.2.136",
+    "claude-agent-sdk==0.2.148",
     "anyio==4.14.2",
     "python-dotenv==1.2.2",
     "PyYAML==6.0.3",
