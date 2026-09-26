@@ -1,5 +1,40 @@
 # Changelog
 
+## [1.59.0](https://github.com/mctlhq/mctl-agents/compare/1.58.0...1.59.0) (2026-09-26)
+
+
+### Features
+
+* **agents:** add gateway parameter to the issue-investigator builder ([c1bd800](https://github.com/mctlhq/mctl-agents/commit/c1bd800350b972e06f353404349ca29c47ad0de3))
+* **agents:** add the capability discovery/invocation gateway runtime ([3878cd3](https://github.com/mctlhq/mctl-agents/commit/3878cd30bb835638066995c150d7d1dabf3add1e))
+* **agents:** issue-242-capability-discovery-catalog-and-bench-slice-4 ([aeba0f9](https://github.com/mctlhq/mctl-agents/commit/aeba0f9f61baadf5a474e4cd2386cb5348bbfdfb))
+* **agents:** issue-242-capability-discovery-catalog-and-bench-slice-4 ([101d3ec](https://github.com/mctlhq/mctl-agents/commit/101d3eccadad6ff6748e0a38f49e150472d6ce74))
+* **agents:** issue-242-capability-discovery-investigator-mode-slice-3 ([2848fbe](https://github.com/mctlhq/mctl-agents/commit/2848fbe0ccb1202be730e4d1ce632e485f2c462f))
+* **agents:** issue-242-capability-gateway-and-builder-slice-2 ([146133d](https://github.com/mctlhq/mctl-agents/commit/146133d6ce8f8c901ecc510f1f0ceaf34d9927e7))
+* **agents:** issue-242-feat-agent-platform-role-aware-capabilit ([cf5adda](https://github.com/mctlhq/mctl-agents/commit/cf5adda9e4c870add44f76c971356d291d8a269f))
+* **agents:** issue-504-feat-usage-populate-devloop-stage-with-t ([fed243e](https://github.com/mctlhq/mctl-agents/commit/fed243e71f7776e8956444e4001eb662c3ab7486))
+* **agents:** issue-504-feat-usage-populate-devloop-stage-with-t ([ebfe66f](https://github.com/mctlhq/mctl-agents/commit/ebfe66fa863d3ba25efa8726775469ee0ca2670c))
+* **agents:** issue-505-feat-usage-devloopworkflow-passes-tempor ([b37c5a3](https://github.com/mctlhq/mctl-agents/commit/b37c5a357c19b5f96a077ee47de270b99d0d73f3))
+* **agents:** issue-505-feat-usage-devloopworkflow-passes-tempor ([89690d2](https://github.com/mctlhq/mctl-agents/commit/89690d2635aef93615cbb28eafa1b839cc84e21d))
+* **agents:** issue-506-feat-usage-in-cluster-collector-moves-cl ([94f4684](https://github.com/mctlhq/mctl-agents/commit/94f4684c94f0d9afa32e07678edf2944c7cad76b))
+* **agents:** pull reviewer model-usage into the ledger via a collector ([5014e25](https://github.com/mctlhq/mctl-agents/commit/5014e25d9b4cd17ad5ec3f721c02828268951128))
+* **agents:** wire capability discovery mode into issue-investigator ([68a4f85](https://github.com/mctlhq/mctl-agents/commit/68a4f855d398e37941f7678cebe8f4e258543869))
+
+
+### Bug Fixes
+
+* **agents:** address [#508](https://github.com/mctlhq/mctl-agents/issues/508) review findings on the capability gateway ([7763ccf](https://github.com/mctlhq/mctl-agents/commit/7763ccfec37e92776d3488352e3441016a3e1e14))
+* **agents:** address [#509](https://github.com/mctlhq/mctl-agents/issues/509) review findings on the discovery mode ([b225980](https://github.com/mctlhq/mctl-agents/commit/b2259804d9ffb8f752bf1a92d070d119b7012e7f))
+* **agents:** address claude review on the [#242](https://github.com/mctlhq/mctl-agents/issues/242) slice 4 PR ([e298ac0](https://github.com/mctlhq/mctl-agents/commit/e298ac0726296921b33b18365eb535c3a79dcb30))
+* **agents:** address P1/P2 codex findings on issue-506-feat-usage-in-cluster-collector-moves-cl ([3bb7a36](https://github.com/mctlhq/mctl-agents/commit/3bb7a3611ffe9f2c8452810c2d09b6428de7da36))
+* **agents:** address P1/P2 codex findings on issue-506-feat-usage-in-cluster-collector-moves-cl ([44a365f](https://github.com/mctlhq/mctl-agents/commit/44a365f1173dd704c095757e42fd5b8387add227))
+* **agents:** address P1/P2 codex findings on issue-506-feat-usage-in-cluster-collector-moves-cl ([b6f5b18](https://github.com/mctlhq/mctl-agents/commit/b6f5b18ea1d5181a232f14a49c6ca19e72782d68))
+* **agents:** close the read-only authorization gap on the gateway path ([80344e0](https://github.com/mctlhq/mctl-agents/commit/80344e0aca7a51610ba1d6b12396b6c7d79d59a7))
+* **agents:** harden CapabilitySet validation ahead of the gateway ([dff4a12](https://github.com/mctlhq/mctl-agents/commit/dff4a12b9cebffd24223709f2cde157722def6a8))
+* **agents:** restore deterministic coverage of the legacy+discovery guard ([e2a48d1](https://github.com/mctlhq/mctl-agents/commit/e2a48d18f4c404135759524014fa8884d80ed4b7))
+* **agents:** route every sealed field through the from_dict helpers ([b3051b6](https://github.com/mctlhq/mctl-agents/commit/b3051b6380e8cd79e7f92bfb505f12ca154ab555)), closes [#242](https://github.com/mctlhq/mctl-agents/issues/242)
+* **agents:** validate CapabilityStrategy in one place so a sealed set always reloads ([6841b00](https://github.com/mctlhq/mctl-agents/commit/6841b00815a8f94c3b973689a3734939be0eb659)), closes [#242](https://github.com/mctlhq/mctl-agents/issues/242)
+
 ## [1.58.0](https://github.com/mctlhq/mctl-agents/compare/1.57.0...1.58.0) (2026-09-24)
 
 
