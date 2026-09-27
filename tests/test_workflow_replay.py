@@ -364,6 +364,22 @@ def test_dev_loop_full_prepatch_history_predates_the_launch_correlation_marker()
             assert "temporal_run_id" not in params
 
 
+def test_dev_loop_full_prepatch_history_predates_the_proposal_terminal_end_marker() -> None:
+    """mctlhq/mctl-agents#516: `dev_loop_full.prepatch.json` must not carry
+    the `proposal-terminal-end` marker, or it no longer exercises the
+    unpatched branch `_watch_pr` falls back to (poll to the deadline exactly
+    as before this change). Restore it from git rather than re-recording
+    (see the module and `replay_scenarios.py` docstrings)."""
+    scenario = scenario_by_name("dev_loop_full")
+    events = _events(scenario)
+    assert "proposal-terminal-end" not in _patch_ids(events), (
+        f"{scenario.path.name} records the proposal-terminal-end patch, so "
+        "it was recorded AFTER mctl-agents#516 landed and no longer "
+        "exercises the unpatched branch. Restore it from git rather than "
+        "re-recording."
+    )
+
+
 async def test_todays_dev_loop_full_carries_the_launch_correlation_marker() -> None:
     """mctlhq/mctl-agents#505, ties the assertion to the CODE rather than to
     `dev_loop_full.patched.json`.

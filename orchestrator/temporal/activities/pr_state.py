@@ -36,6 +36,10 @@ _PR_API_URL_RE = re.compile(r"https://api\.github\.com/repos/([\w.-]+/[\w.-]+)/p
 # .status.yaml is flat investigator-written YAML; the pr field is a bare URL
 # on its own line (see run_shepherd's reader, which does data.get("pr")).
 _PR_FIELD_RE = re.compile(r"^pr:\s*['\"]?(\S+?)['\"]?\s*$", re.MULTILINE)
+# The proposal's own `status:` field, same flat-YAML shape as `_PR_FIELD_RE`
+# (mctl-agents#516). Read from the SAME decoded `.status.yaml` content the PR
+# field already came from — no extra HTTP request.
+_STATUS_FIELD_RE = re.compile(r"^status:\s*['\"]?(\S+?)['\"]?\s*$", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,16 @@ class PRState:
     # Defaulted so results recorded before this field existed still
     # deserialize, same as merged_at above.
     head_sha: str | None = None
+    # The proposal's own `status:` field from the same `.status.yaml` read
+    # (mctl-agents#516) — DevLoopWorkflow's merge watch reads this to tell a
+    # proposal parked in a terminal status (no machine will advance it
+    # further) from one still progressing. `None` means "could not be read"
+    # (the file itself 404'd or was undecodable), NEVER "live" — set on every
+    # OTHER return path below, including the found=False ones, because the
+    # file was decoded even when no usable `pr:` field came out of it.
+    # Defaulted so results recorded before this field existed still
+    # deserialize, same as merged_at/head_sha above.
+    proposal_status: str | None = None
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -122,13 +136,19 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         except (ValueError, TypeError) as exc:
             raise ProposalListingError(f"undecodable contents payload from {status_url}") from exc
 
+        # The file is decoded from here on, so every return below can carry
+        # the proposal's own status alongside its PR-lookup verdict — no
+        # extra HTTP request (mctl-agents#516).
+        status_field = _STATUS_FIELD_RE.search(content)
+        proposal_status = status_field.group(1) if status_field else None
+
         field = _PR_FIELD_RE.search(content)
         if not field:
-            return PRState(found=False)
+            return PRState(found=False, proposal_status=proposal_status)
         recorded_pr_url = field.group(1)
         pr_match = _PR_URL_RE.search(recorded_pr_url) or _PR_API_URL_RE.search(recorded_pr_url)
         if not pr_match:
-            return PRState(found=False)
+            return PRState(found=False, proposal_status=proposal_status)
         repo, number = pr_match.group(1), int(pr_match.group(2))
 
         # The recorded PR must live in this proposal's own repository: a
@@ -144,7 +164,9 @@ async def get_pr_state(service: str, slug: str) -> PRState:
                 recorded_pr_url,
                 service,
             )
-            return PRState(found=False, pr_url=recorded_pr_url, repo=repo, number=number)
+            return PRState(
+                found=False, pr_url=recorded_pr_url, repo=repo, number=number, proposal_status=proposal_status
+            )
 
         pr_api = f"https://api.github.com/repos/{repo}/pulls/{number}"
         try:
@@ -153,7 +175,9 @@ async def get_pr_state(service: str, slug: str) -> PRState:
             raise ProposalListingError(f"reading {pr_api} failed: {exc}") from exc
         if pr_response.status_code == 404:
             # Recorded PR vanished (repo/PR deleted, token lost access).
-            return PRState(found=False, pr_url=recorded_pr_url, repo=repo, number=number)
+            return PRState(
+                found=False, pr_url=recorded_pr_url, repo=repo, number=number, proposal_status=proposal_status
+            )
         if pr_response.status_code != 200:
             raise ProposalListingError(
                 f"reading {pr_api} returned HTTP {pr_response.status_code}: {pr_response.text[:200]}"
@@ -186,6 +210,7 @@ async def get_pr_state(service: str, slug: str) -> PRState:
         merge_commit=data.get("merge_commit_sha") if merged else None,
         merged_at=data.get("merged_at") if merged else None,
         head_sha=(data.get("head") or {}).get("sha") if isinstance(data.get("head"), dict) else None,
+        proposal_status=proposal_status,
     )
     activity.logger.info(
         "pr_state service=%s slug=%s pr=%s#%s state=%s", service, slug, repo, number, state

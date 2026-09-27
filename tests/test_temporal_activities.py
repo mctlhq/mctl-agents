@@ -1312,6 +1312,83 @@ class TestGetPRState:
         assert state.found is True
         assert state.state == "OPEN"
 
+    async def test_proposal_status_is_parsed_alongside_a_found_pr(self, env, monkeypatch):
+        """mctl-agents#516: the proposal's own `status:` field comes back on
+        the SAME read that resolves the PR — no extra HTTP request."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="status: review-fixing\npr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_json={"state": "open", "merged": False},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is True
+        assert state.proposal_status == "review-fixing"
+
+    async def test_proposal_status_is_parsed_when_no_pr_field_exists(self, env, monkeypatch):
+        """The `found=False` no-commits shape: no `pr:` field at all, but the
+        status IS readable — this is what lets a needs-triage proposal with
+        no PR link end the merge watch after PROPOSAL_TERMINAL_CONFIRM_POLLS
+        consecutive polls instead of after the grace polls."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(monkeypatch, status_yaml="status: needs-triage\n")
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+        assert state.proposal_status == "needs-triage"
+
+    async def test_proposal_status_is_parsed_on_a_vanished_pr(self, env, monkeypatch):
+        """found=False from a 404'd PR still carries the proposal's status —
+        it was decoded from the same file read as the (now dead) pr: link."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="status: review-stuck\npr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_status=404,
+            pr_json={"message": "Not Found"},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+        assert state.proposal_status == "review-stuck"
+
+    async def test_proposal_status_is_parsed_on_a_wrong_repo_refusal(self, env, monkeypatch):
+        """The wrong-repo refusal also decoded the file — the status must
+        not be dropped just because the PR link was refused."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="status: error\npr: https://github.com/mctlhq/mctl-api/pull/99\n",
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+        assert state.proposal_status == "error"
+
+    async def test_proposal_status_is_none_when_the_status_file_is_missing(self, env, monkeypatch):
+        """None means "could not be read" — a 404'd file, never "live"."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(monkeypatch, status_yaml=None)
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is False
+        assert state.proposal_status is None
+
+    async def test_proposal_status_is_none_when_the_status_field_is_absent(self, env, monkeypatch):
+        """A decoded file with no `status:` line at all — still None, not a
+        crash, and distinct from "the file itself could not be read"."""
+        from orchestrator.temporal.activities.pr_state import get_pr_state
+
+        self._handler(
+            monkeypatch,
+            status_yaml="pr: https://github.com/mctlhq/mctl-web/pull/99\n",
+            pr_json={"state": "open", "merged": False},
+        )
+        state = await env.run(get_pr_state, "mctl-web", "issue-10-test")
+        assert state.found is True
+        assert state.proposal_status is None
+
     async def test_directory_contents_payload_raises_listing_error(self, env, monkeypatch):
         """The contents API returns a JSON list for a directory — that must
         surface as a retryable ProposalListingError, not an AttributeError."""

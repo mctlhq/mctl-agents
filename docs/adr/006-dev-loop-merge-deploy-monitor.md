@@ -153,6 +153,34 @@ for the full design, including the four `@workflow.query` handlers'
 rehydration contract and why `resume` is a dataclass field rather than a
 second `run` parameter.
 
+**Addendum (mctl-agents#516, 2026-09).** The watch's exits above are all
+PR-shaped: MERGED/CLOSED, a non-transient `get_pr_state` failure, the
+`pr_lookup_grace_polls` give-up when no PR link ever resolves, or the
+14-day `MERGE_WATCH_DEADLINE`. None of them read the proposal's own
+`status:`. A proposal parked in a terminal status with NO pull request
+(e.g. `no-commits` → `needs-triage`) was already bounded, by the
+`pr_lookup_grace_polls` give-up (8 polls, ~2 h), but the watch spent those
+polls on a proposal nothing would advance and ended with no recorded reason.
+`_watch_pr` now ends the watch, under the `proposal-terminal-end` patch, once
+`PROPOSAL_TERMINAL_CONFIRM_POLLS` (2) CONSECUTIVE `get_pr_state` polls find no
+PR AND read a `LOOP_TERMINAL_PROPOSAL_STATUSES` status (`needs-triage`,
+`review-stuck`, `rejected`, `error`), AND no OPEN pull request was resolved
+earlier in this watch (`saw_open_pr`). The two-poll confirmation absorbs a
+stale `.status.yaml` read from gitops `main`. The effect is an earlier end
+(about 15 minutes instead of ~2 h) and a `DevLoopResult.ended` reason naming
+the status. No lifecycle row is involved: a claim is only taken on a poll that
+resolves a PR, and that sets `saw_open_pr`, which rules this exit out. The only watch that runs to
+the 14-day deadline is one with an OPEN PR, and that case is deliberately
+unchanged. `merged` is not
+in that set: the existing MERGED/CLOSED arm already ends the watch on it and
+drives 6.2-6.4. And the check never fires while a linked pull request is
+OPEN, whatever the status: reconcile's own repair
+(`run_shepherd.RECONCILE_INPUT_STATUSES`) moves an open-PR `needs-triage`/
+`review-stuck`/`rejected`/`error` proposal back to `implemented` on its own,
+so ending the loop there would drop a still-recoverable PR. See
+`agents-state/mctl-agents/proposals/issue-516-fix-devloop-end-devloopworkflow-when-its/`
+for the full design.
+
 ### 6.2 Release observation (#215)
 
 After merge: watch the release land, using only existing read surfaces —
