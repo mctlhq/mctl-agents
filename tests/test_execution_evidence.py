@@ -346,6 +346,19 @@ def test_seal_succeeds_when_the_same_absence_carries_a_gap():
     assert ev.completeness == ee.INCOMPLETE
 
 
+def test_seal_raises_when_the_same_absence_carries_only_a_non_required_gap():
+    # A Gap naming the block is not enough on its own: the Gap must itself
+    # be required=True, or a caller could seal a COMPLETE envelope that is
+    # silently missing a block Requirements marks required.
+    with pytest.raises(ee.ExecutionEvidenceError, match="policy_decisions"):
+        ee.seal(
+            execution=_execution(),
+            outcome=_outcome(),
+            created_at="2026-01-01T00:00:00Z",
+            gaps=[ee.Gap(block="policy_decisions", code="not_produced", required=False)],
+        )
+
+
 def test_seal_raises_for_a_caller_declared_required_block():
     requirements = ee.Requirements(usage=True)
     with pytest.raises(ee.ExecutionEvidenceError, match="usage"):

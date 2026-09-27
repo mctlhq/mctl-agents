@@ -965,11 +965,20 @@ def _check_required_blocks(
     artifacts: tuple[ArtifactRef, ...],
     gaps: tuple[Gap, ...],
 ) -> None:
-    gapped_blocks = {g.block for g in gaps}
+    gaps_by_block: dict[str, list[Gap]] = {}
+    for g in gaps:
+        gaps_by_block.setdefault(g.block, []).append(g)
 
     def _check(block: str, required: bool, absent: bool) -> None:
-        if required and absent and block not in gapped_blocks:
+        if not (required and absent):
+            return
+        block_gaps = gaps_by_block.get(block, [])
+        if not block_gaps:
             raise ExecutionEvidenceError(f"block {block!r} is required but absent and carries no Gap")
+        if not any(g.required for g in block_gaps):
+            raise ExecutionEvidenceError(
+                f"block {block!r} is required but absent and its Gap is not marked required"
+            )
 
     _check("execution", True, not execution.execution_id)
     _check("outcome", True, not outcome.code)
