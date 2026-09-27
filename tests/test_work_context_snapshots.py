@@ -502,31 +502,31 @@ def test_store_ref_from_populated_for_sealed_and_replayed(tmp_path):
         )
 
 
-def test_store_ref_from_uses_the_local_hash_for_a_cross_attempt_replay(tmp_path):
+def test_store_ref_from_always_uses_the_store_minted_hash_for_a_cross_attempt_replay(tmp_path):
     """On a cross-attempt replay (`persist`'s document-comparison branch
-    after a 409), `answer.content_hash` is the ORIGINAL attempt's stored
-    hash while `answer.local_content_hash` is this attempt's own — and
-    `snapshot` here is this attempt's document. Using `content_hash` would
-    make `hash_bytes(canonical_bytes(snapshot)) == store_ref.store_content_hash`
-    fail for every legitimate replay; `store_ref_from` must prefer
-    `local_content_hash` when it is populated."""
+    after a 409), `answer.content_hash` is the hash mctl-api itself reported
+    for the stored document; `answer.local_content_hash` is this attempt's
+    own, locally computed hash. ADR 015 sec. 1 defines `store_content_hash`
+    as minted by mctl-api and never recomputed locally, so `store_ref_from`
+    must carry `answer.content_hash` regardless of whether
+    `local_content_hash` is populated — using the local hash would make
+    `context_eval.verify_identity`'s store check compare a value against
+    itself instead of against what the store actually holds."""
     snap = _sealed(tmp_path, _work_context())
-    original_hash = "sha256:" + "9" * 64  # a prior attempt's stored hash: different volatile fields
-    this_attempt_hash = ws.hash_bytes(ws.canonical_bytes(snap))  # this attempt's own, real, hash
+    stored_hash = "sha256:" + "9" * 64  # mctl-api's own hash for the stored document
+    this_attempt_hash = ws.hash_bytes(ws.canonical_bytes(snap))  # this attempt's own, local, hash
     answer = ws.SnapshotAnswer(
-        ws.SNAPSHOT_REPLAYED, snapshot_id="cs_original", content_hash=original_hash,
+        ws.SNAPSHOT_REPLAYED, snapshot_id="cs_original", content_hash=stored_hash,
         reason="same context as the stored snapshot, assembled on another attempt",
         local_snapshot_id=snap.snapshot_id, local_content_hash=this_attempt_hash,
     )
     ref = ws.store_ref_from(snap, answer)
     assert ref == ws.StoreRef(
-        work_item_id=WID, execution_id=E2, store_snapshot_id="cs_original", store_content_hash=this_attempt_hash,
+        work_item_id=WID, execution_id=E2, store_snapshot_id="cs_original", store_content_hash=stored_hash,
     )
-    # The identity check evaluate()/verify_identity() will run against this
-    # attempt's own snapshot bytes must hold, not fail with a spurious
-    # hash-mismatch against the other attempt's stored hash.
-    assert ref.store_content_hash == ws.hash_bytes(ws.canonical_bytes(snap))
-    assert ref.store_content_hash != original_hash
+    # `store_content_hash` is the store's own hash, not a recomputation of
+    # this attempt's own snapshot bytes.
+    assert ref.store_content_hash != ws.hash_bytes(ws.canonical_bytes(snap))
 
 
 def test_persist_to_work_item_store_still_raises_under_pre_change_conditions_and_returns_the_answer(

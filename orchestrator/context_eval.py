@@ -832,14 +832,27 @@ def assess_evidence(
     # `min_consecutive_observations = N` on their own
     # (mctlhq/mctl-agents#526). Two observations of the same snapshot at
     # genuinely different moments (e.g. two replay-CLI runs) still count
-    # separately, so the key includes `observed_at`, not `context_snapshot_id`
-    # alone.
+    # separately, so the key includes `observed_at` too.
+    #
+    # The "same snapshot" the store itself agrees on is `store_ref
+    # .store_snapshot_id` (ADR 015 sec. 1) when a record carries one — never
+    # `context_snapshot_id`/`content_hash`, which is this record's own LOCAL
+    # document identity and can legitimately differ across records that are
+    # all evidence of the one snapshot the store persisted (e.g. retries of
+    # the same execution). Keying on the local identity would let the store's
+    # single snapshot be counted as several distinct observations. Only when
+    # no `store_ref` exists (no store execution backs the record) is the
+    # local document identity the best available notion of "same document".
     consecutive = 0
-    seen_observations: set[tuple[str, str, str]] = set()
+    seen_observations: set[tuple[str, str]] = set()
     for record in ordered:
         if not (_declared_identity_matches(record, expected) and _catalog_identity_matches(record, expected)):
             break
-        observation_key = (record.context_snapshot_id, record.content_hash, record.observed_at)
+        snapshot_identity = (
+            record.store_ref.store_snapshot_id if record.store_ref is not None
+            else f"{record.context_snapshot_id}:{record.content_hash}"
+        )
+        observation_key = (snapshot_identity, record.observed_at)
         if observation_key in seen_observations:
             continue
         seen_observations.add(observation_key)

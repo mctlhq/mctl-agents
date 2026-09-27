@@ -587,6 +587,52 @@ def test_assess_evidence_duplicate_observations_do_not_each_count():
     assert result.status == "fresh"
 
 
+def test_assess_evidence_dedups_on_store_snapshot_identity_not_local_document_identity():
+    """mctlhq/mctl-agents#526, ADR 015 sec. 1: the store considers a single
+    execution's snapshot one document (`store_ref.store_snapshot_id`), but
+    each record's own `context_snapshot_id`/`content_hash` is this record's
+    LOCAL document identity, which can legitimately differ across records
+    that are all evidence of that one stored snapshot (e.g. records from
+    different retries of the same execution). Keying the dedup on the local
+    identity would let the store's one snapshot be counted as several
+    distinct observations; it must dedup on `store_snapshot_id` instead."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+
+    same_store_ref = wc_snapshots.StoreRef(
+        work_item_id="wi_1", execution_id="we_1", store_snapshot_id="cs_shared",
+        store_content_hash="sha256:" + "a" * 64,
+    )
+    # Three records the store calls the SAME snapshot (same store_ref), each
+    # with a different local document identity (as different retry attempts
+    # would carry) and the same observed_at (one evaluation instant): this
+    # must count as ONE observation, not three.
+    one_real_observation = _record(expected, observed_at="2026-09-26T00:00:00Z")
+    retries_of_one_store_snapshot = [
+        replace(one_real_observation, context_snapshot_id=f"cs-{i}",
+                content_hash="sha256:" + str(i) * 64, store_ref=same_store_ref)
+        for i in (1, 2, 3)
+    ]
+    result = ce.assess_evidence(retries_of_one_store_snapshot, expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations"
+
+    # Three records against genuinely DIFFERENT store snapshots, one per
+    # moment, are three real observations and still count separately.
+    distinct_store_refs = [
+        replace(
+            one_real_observation, observed_at=iso,
+            store_ref=wc_snapshots.StoreRef(
+                work_item_id="wi_1", execution_id="we_1", store_snapshot_id=f"cs_{i}",
+                store_content_hash="sha256:" + str(i) * 64,
+            ),
+        )
+        for i, iso in enumerate(("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z"))
+    ]
+    result = ce.assess_evidence(distinct_store_refs, expected=expected, now=now, policy=policy)
+    assert result.status == "fresh"
+
+
 def test_assess_evidence_malformed_observed_at_is_stale_not_a_crash():
     """A malformed `observed_at` string (not ISO-8601 at all) cannot be
     parsed for a freshness comparison; `assess_evidence` must fail closed
