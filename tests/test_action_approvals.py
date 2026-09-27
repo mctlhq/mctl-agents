@@ -299,6 +299,8 @@ def test_the_permitted_decision_names_the_spent_receipt(api, clock):
     ref = _approved(api, lookup)
     d = _deploy(lookup, ARGS)
     assert (d.verdict, d.code, d.permitted, d.approval_ref) == (pc.REQUIRE_APPROVAL, pc.CODE_APPROVED, True, ref)
+    # mctl-agents#519: the approver identity travels with the decision.
+    assert d.approver == "github:root"
 
 
 def test_changed_args_against_the_approved_receipt_is_a_mismatch_and_consumes_nothing(api, clock):
@@ -344,6 +346,8 @@ def test_denied_fails_closed(api, clock):
     d = _deploy(lookup, ARGS)
     assert (d.code, d.permitted, d.approval_ref) == (pc.CODE_APPROVAL_DENIED, False, ref)
     assert api.consume_calls() == 0
+    # mctl-agents#519: a denial still names who decided.
+    assert d.approver == "github:root"
 
 
 def test_expired_fails_closed(api, clock):
@@ -353,6 +357,7 @@ def test_expired_fails_closed(api, clock):
     d = _deploy(lookup, ARGS)
     assert (d.code, d.permitted, d.approval_ref) == (pc.CODE_APPROVAL_EXPIRED, False, ref)
     assert api.consume_calls() == 0
+    assert d.approver == "github:root"
 
 
 def test_an_approved_answer_past_its_expiry_is_expired_locally(api, clock):

@@ -28,8 +28,10 @@ from temporalio.worker import UnsandboxedWorkflowRunner
 import orchestrator.human_input as hi
 from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
 from orchestrator.lifecycle.contract import Owner, answer_from
+from orchestrator.temporal.activities.action_approval import GatedActionInput, GatedActionResult
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
+from orchestrator.temporal.activities.identity import MintedContext, MintRequest
 from orchestrator.temporal.activities.incidents import Incident, IncidentQueryResult
 from orchestrator.temporal.activities.issue_state import IssueState
 from orchestrator.temporal.activities.lifecycle import _PATHS, OwnershipRequest, OwnershipResult
@@ -595,6 +597,26 @@ def _fake_activities(
             accepted=True,
         )
 
+    # mctlhq/mctl-agents#519: `gate_enabled = workflow.patched("gated-merge")`
+    # is True for every FRESH execution (there is no history yet to disagree
+    # with), so every existing test that drives a real merge watch now reaches
+    # the merge gate's identity mint and its gated-activity poll, whether or
+    # not it cares about governance at all. These two fakes mirror the real
+    # default (unconfigured) behaviour cheaply: a locally-minted identity, and
+    # `merge_gate_disabled` — the same code the real activity's own first
+    # check answers when MCTL_POLICY_MERGE_APPROVAL/SHEPHERD_MERGE_APPROVAL_
+    # SERVICES are unset, which they are in every test in this module.
+    @activity.defn(name="mint_execution_context")
+    async def fake_mint_execution_context(req: MintRequest) -> MintedContext:
+        return MintedContext(
+            context_id="ex-test-merge-gate", trace_id=req.trace_id or "0" * 32,
+            content_hash="sha256:" + "0" * 64, stored=False,
+        )
+
+    @activity.defn(name="merge_pull_request_gated")
+    async def fake_merge_pull_request_gated(inp: GatedActionInput) -> GatedActionResult:
+        return GatedActionResult(code="merge_gate_disabled")
+
     activities = [
         fake_resolve_agent_release,
         fake_submit_and_wait,
@@ -608,6 +630,8 @@ def _fake_activities(
         fake_get_deploy_status,
         fake_list_service_incidents,
         fake_lifecycle_ownership,
+        fake_mint_execution_context,
+        fake_merge_pull_request_gated,
     ]
     return activities, calls, investigate_ran, ownership_ops
 

@@ -117,6 +117,19 @@ def test_the_approval_wait_registers_on_the_control_queue_only(visibility):
             assert "read_action_approval" not in plan.activity_names
 
 
+def test_the_gated_merge_activity_registers_on_the_control_queue_only(visibility):
+    """The gated merge (#519) is scheduled by STRING name from
+    DevLoopWorkflow's `run_gated_action` call, so a dropped registration is
+    not a type error anywhere — the merge watch's gate would sit
+    `undecided` forever."""
+    control = next(p for p in worker_plans("all", visibility) if p.task_queue == TASK_QUEUE)
+    assert "merge_pull_request_gated" in control.activity_names
+
+    for role in ("execution", "implementation"):
+        for plan in worker_plans(role, visibility):
+            assert "merge_pull_request_gated" not in plan.activity_names
+
+
 def test_implement_sweep_tunables_are_read_from_the_environment(monkeypatch):
     """Same `_int_env` rule IMPLEMENTATION_MAX_CONCURRENT_ACTIVITIES follows
     (mctl-agents#412): env override, default, refusal on a bad value."""

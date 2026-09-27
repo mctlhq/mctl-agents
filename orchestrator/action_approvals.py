@@ -341,7 +341,8 @@ _OUTCOMES = {
 
 def _outcome(answer: ApprovalAnswer, ref: str = "") -> pc.ApprovalOutcome:
     status = _OUTCOMES.get(answer.status, pc.APPROVAL_UNKNOWN)
-    return pc.ApprovalOutcome(status, approval_ref=ref, reason=answer.reason or answer.code)
+    decided_by = answer.record.decided_by if answer.record is not None else ""
+    return pc.ApprovalOutcome(status, approval_ref=ref, reason=answer.reason or answer.code, decided_by=decided_by)
 
 
 def _ttl_s() -> int:
@@ -431,9 +432,10 @@ class MctlApiApprovals:
         if expires is None:
             return pc.ApprovalOutcome(pc.APPROVAL_UNKNOWN, approval_ref=rec.id, reason="unreadable expires_at")
         if expires <= self._now():
-            return pc.ApprovalOutcome(pc.APPROVAL_EXPIRED, approval_ref=rec.id, reason=f"expired at {rec.expires_at}")
+            return pc.ApprovalOutcome(pc.APPROVAL_EXPIRED, approval_ref=rec.id, reason=f"expired at {rec.expires_at}",
+                                      decided_by=rec.decided_by)
         spent = self._client.consume(rec.id, fresh)
         if spent.status != SPENT:
             return _outcome(spent, rec.id)
         return pc.ApprovalOutcome(pc.APPROVAL_GRANTED, approval_ref=rec.id,
-                                  reason=f"approved by {rec.decided_by or 'a human'}")
+                                  reason=f"approved by {rec.decided_by or 'a human'}", decided_by=rec.decided_by)

@@ -78,6 +78,10 @@ class GatedActionResult:
     #: Set when the decision permitted and `side_effect()` raised: the
     #: exception type and message. `ran` stays false.
     effect_error: str = ""
+    #: `Decision.approver` / `Decision.decided_at`, forwarded unchanged:
+    #: empty unless this decision reached a human.
+    approver: str = ""
+    decided_at: str = ""
 
     @property
     def awaiting_approval(self) -> bool:
@@ -115,6 +119,7 @@ def _result(decision: pc.Decision, *, ran: bool = False, result: dict[str, Any] 
     return GatedActionResult(
         code=decision.code, verdict=decision.verdict, approval_ref=decision.approval_ref,
         ran=ran, result=result, reason=decision.reason,
+        approver=decision.approver, decided_at=decision.decided_at,
     )
 
 
@@ -192,6 +197,7 @@ def run_gated(
         return GatedActionResult(
             code=failed.code, verdict=failed.verdict, approval_ref=failed.approval_ref, ran=False,
             reason=failed.reason, effect_error=f"{type(exc).__name__}: {exc}",
+            approver=failed.approver, decided_at=failed.decided_at,
         )
     return _result(decision, ran=True, result=result)
 

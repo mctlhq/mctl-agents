@@ -566,6 +566,21 @@ def _skip_services_from_env() -> frozenset[str]:
 SHEPHERD_SKIP_SERVICES = _service_set_from_env("SHEPHERD_SKIP_SERVICES")
 SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
 
+# Services whose merge has moved out of the shepherd pod entirely, into a
+# gated Temporal activity owned by DevLoopWorkflow (mctlhq/mctl-agents#519,
+# docs/adr/017-shepherd-merge-approval.md). Unset = empty = today's
+# behaviour: the shepherd merges in-pod as it always has. A gated service's
+# tick still discovers, reviews and pushes follow-up commits exactly like a
+# fix-only one; only the merge step is delegated.
+SHEPHERD_MERGE_APPROVAL_SERVICES = _service_set_from_env("SHEPHERD_MERGE_APPROVAL_SERVICES")
+
+
+def _merge_gate_delegated(service: str) -> bool:
+    """True when `service`'s merge is owned by DevLoopWorkflow's gated
+    activity, not this pod. Independent of `_service_mode`: a gated service
+    still reviews and fixes in FULL mode, it just never merges here."""
+    return service in SHEPHERD_MERGE_APPROVAL_SERVICES
+
 # Merge for these repos is gated on a human CODEOWNER by design. No
 # environment value may grant an agent the merge decision for a service listed
 # here, regardless of SHEPHERD_SKIP_SERVICES, SHEPHERD_FIX_ONLY_SERVICES, or
@@ -620,11 +635,20 @@ def _merge_owner_for(service: str) -> str:
     only), so recording ``pr-steward`` named an actor that was never going to
     merge it. ``human-codeowner`` is what actually happens.
 
+    A service in SHEPHERD_MERGE_APPROVAL_SERVICES (and not NEVER_MERGE_SERVICES,
+    which always wins) is recorded as ``devloop-workflow``: its merge is a
+    gated Temporal activity owned by `DevLoopWorkflow`
+    (mctlhq/mctl-agents#519), not the pr-steward PR lifecycle.
+
     This is descriptive routing metadata, NOT an authorization or readiness
     signal — see mctlhq/mctl-agents#344, where a reviewer read the field as a
     merge authorization. Nothing in this repository reads it.
     """
-    return "human-codeowner" if service in NEVER_MERGE_SERVICES else "pr-steward"
+    if service in NEVER_MERGE_SERVICES:
+        return "human-codeowner"
+    if _merge_gate_delegated(service):
+        return "devloop-workflow"
+    return "pr-steward"
 
 
 def _service_mode(service: str, *, force_fix_only: bool = False) -> str:
@@ -2566,8 +2590,17 @@ def trigger_review(pr: PRSnapshot) -> None:
 # ---------------------------------------------------------------------------
 # Merge — gh pr merge with --match-head-commit per requirements.md L50-60.
 # ---------------------------------------------------------------------------
-def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
-    """Invoke `gh pr merge --merge --delete-branch --match-head-commit <SHA>`.
+def merge_pr_unchecked(pr: PRSnapshot) -> tuple[bool, str | None]:
+    """The merge side effect itself, without a policy checkpoint of its
+    own: `gh pr merge --merge --delete-branch --match-head-commit <SHA>`,
+    plus the re-read for the merge commit oid.
+
+    Refuses NEVER_MERGE_SERVICES independently of any caller — this is also
+    the gated Temporal activity's side effect
+    (`orchestrator/temporal/activities/pr_merge.py::merge_pull_request_gated`,
+    mctlhq/mctl-agents#519), reached only after ITS OWN checkpoint permits,
+    and this refusal is the same belt-and-braces guarantee `merge_pr` below
+    gives the in-pod path.
 
     Returns (success, merge_commit_oid). On HEAD-SHA mismatch the gh
     CLI exits non-zero — callers SHALL treat that as transient `wait`
@@ -2590,23 +2623,8 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
         "--match-head-commit", pr.head_sha,
         pr_ref,
     ]
-    # The policy checkpoint (#197), immediately before the merge: a refusal
-    # is answered like any other failed merge, as `wait`, and `gh` never
-    # runs. The head SHA is in the arguments, so an approval for one head
-    # never merges another.
-    try:
-        policy_checkpoint.require(policy_checkpoint.checkpoint(
-            policy_checkpoint.GITHUB_PR_MERGE,
-            "merge",
-            pr_ref,
-            {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
-            metadata={"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha},
-        ))
-    except policy_checkpoint.PolicyRefused as e:
-        print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
-        return (False, None)
     # Bypasses _run() (this is the one gh call this module makes outside
-    # that wrapper), so it needs its own refresh: merge_pr() typically fires
+    # that wrapper), so it needs its own refresh: the merge typically fires
     # after a review/fix cycle long enough to have crossed the token's
     # ~60min TTL — the exact case refresh_github_token() exists to cover.
     refresh_github_token()
@@ -2624,6 +2642,49 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     snap = _fetch_pr_snapshot(pr.repo, pr.number)
     merge_commit = snap.merge_commit if snap else None
     return (True, merge_commit)
+
+
+def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
+    """The checkpoint wrapper: decide, then run `merge_pr_unchecked` only on
+    a permitted decision. Returns (success, merge_commit_oid) — see
+    `merge_pr_unchecked` for the transport and its own refusal paths.
+
+    For a service in SHEPHERD_MERGE_APPROVAL_SERVICES the merge is not this
+    pod's to make: it refuses and prints one greppable `MERGE_GATED` line
+    BEFORE the checkpoint runs at all, so a pod can never create an
+    approval request even with MCTL_POLICY_APPROVALS=mctl-api set in its own
+    env — defence in depth on top of `decide()`'s `fix_only` override, which
+    already keeps `process_one` from calling this for a gated service.
+    """
+    service = pr.repo.split("/")[-1]
+    if _merge_gate_delegated(service):
+        print(f"MERGE_GATED pr={pr.repo}#{pr.number} head={pr.head_sha}")
+        return (False, None)
+
+    pr_ref = f"https://github.com/{pr.repo}/pull/{pr.number}"
+    # The policy checkpoint (#197), immediately before the merge: a refusal
+    # is answered like any other failed merge, as `wait`, and `gh` never
+    # runs. The head SHA is in the arguments, so an approval for one head
+    # never merges another. `policy=` is passed only when
+    # `configured_policy()` actually differs from the checkpoint's own
+    # BUILTIN_POLICY default, so an unconfigured process's merge decision
+    # is unchanged byte-for-byte, including for callers that inject their
+    # own policy by wrapping `policy_checkpoint.checkpoint` itself.
+    policy = policy_checkpoint.configured_policy()
+    policy_kwargs = {} if policy is policy_checkpoint.BUILTIN_POLICY else {"policy": policy}
+    try:
+        policy_checkpoint.require(policy_checkpoint.checkpoint(
+            policy_checkpoint.GITHUB_PR_MERGE,
+            "merge",
+            pr_ref,
+            {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
+            metadata={"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha},
+            **policy_kwargs,
+        ))
+    except policy_checkpoint.PolicyRefused as e:
+        print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
+        return (False, None)
+    return merge_pr_unchecked(pr)
 
 
 def _format_check_name(c: CheckBlocker) -> str:
@@ -2729,7 +2790,9 @@ def process_one(
         # Any successful probe clears the outage counter (mctl-agents#411) —
         # a change-only write so a healthy run does not touch .status.yaml.
         _update_status_if_changed(ref, ref.status, ci_probe_failures=None)
-    decision, payload = decide(pr, codex, fix_only=(ref.mode == FIX_ONLY), ci=ci)
+    decision, payload = decide(
+        pr, codex, fix_only=(ref.mode == FIX_ONLY or _merge_gate_delegated(ref.service)), ci=ci,
+    )
 
     ci_required_failed = len(ci.blockers) if ci.known else 0
     ci_check_names = ", ".join(sorted({c.name for c in ci.blockers})) if ci.known else ""
@@ -3207,9 +3270,10 @@ def process_one(
 
     if decision == "merge":
         # Defensive re-check: decide() should never return "merge" for a
-        # never-merge or fix-only service, but this belt-and-braces guard
-        # makes that a property of process_one too, not just of decide().
-        if ref.service in NEVER_MERGE_SERVICES or ref.mode == FIX_ONLY:
+        # never-merge, fix-only or merge-gated service, but this
+        # belt-and-braces guard makes that a property of process_one too,
+        # not just of decide().
+        if ref.service in NEVER_MERGE_SERVICES or ref.mode == FIX_ONLY or _merge_gate_delegated(ref.service):
             owner = _merge_owner_for(ref.service)
             print(
                 f"error: {ref.service}/{ref.slug}: decide() returned merge "

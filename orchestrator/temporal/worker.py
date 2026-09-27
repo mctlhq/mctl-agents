@@ -63,6 +63,7 @@ from orchestrator.temporal.activities.lifecycle_reconcile import (
     reconcile_lifecycle_ownership,
 )
 from orchestrator.temporal.activities.orphans import detect_orphans
+from orchestrator.temporal.activities.pr_merge import merge_pull_request_gated
 from orchestrator.temporal.activities.pr_state import get_pr_state
 from orchestrator.temporal.activities.proposals import find_proposal_slug
 from orchestrator.temporal.activities.registry import resolve_agent_release
@@ -564,6 +565,12 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # The approval wait's read-only poll (#198, ADR-014 §7): one GET of
         # one ActionApprovalRequest, never a mutation.
         read_action_approval,
+        # The gated merge (#519, docs/adr/017-shepherd-merge-approval.md):
+        # a handful of bounded GitHub reads plus, only on a permitted
+        # decision, one `gh pr merge` — the same shape as the shepherd's own
+        # per-tick merge, so it belongs on the control queue rather than the
+        # long-holding execution one.
+        merge_pull_request_gated,
     ]
     workflows: list[type] = [
         DevLoopWorkflow,
