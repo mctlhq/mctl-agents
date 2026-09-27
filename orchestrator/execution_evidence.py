@@ -1,0 +1,1099 @@
+"""`ExecutionEvidence` — the versioned, hashed, tamper-evident envelope that
+joins the canonical governance records of one governed execution (mctlhq/
+mctl-agents#520, parent #199, ADR 018:
+docs/adr/018-execution-evidence-envelope-contract.md).
+
+mctl-agents already has five sealed, canonical governance contracts, each
+owned by exactly one store: execution identity (`we_`,
+`orchestrator/work_context/`, `orchestrator/execution_identity.py`), context
+snapshots (`cs_`/`cs-`, `orchestrator/context_snapshot.py`, ADR 009),
+execution requests (`xr_`, `orchestrator/work_context/execution_requests.py`),
+human approvals (`aar_`, `orchestrator/action_approvals.py`), policy
+decisions (`orchestrator/policy_checkpoint.py`, ADR 014) and the model usage
+ledger (`orchestrator/usage_ledger.py`, ADR 012). This module is the one
+document that says, for a single governed execution, *which* of those
+canonical records applied: a frozen-dataclass schema, a `sha256:`-prefixed
+content-hash rule, redaction and a validator. It contains **no persistence,
+no store, no retrieval and no I/O of any kind** — Tier B (durable storage
+and the retrieval API) is a separate, later mctl-api issue. This module
+ships inert and additive: nothing in `run_issue_investigator.py`,
+`run_implementer.py`, `run_shepherd.py` or `temporal/workflows/dev_loop.py`
+imports it.
+
+PR #483 tried to build the referent as `orchestrator/evidence_store.py`,
+writing durable `_evidence/` trees into the public `mctl-gitops` repository
+with 3650-day retention. That design is superseded and must not be
+continued (ADR 018): governance evidence does not belong in a public repo,
+persistence is Tier B and owned by mctl-api, and this module defines no
+second store for work items, executions, snapshots, execution requests,
+approvals or usage — every block below is a reference, never a copy.
+
+Stdlib only, deliberately, mirroring `orchestrator/context_snapshot.py` and
+`orchestrator/policy_checkpoint.py`: only `re`, `dataclasses`,
+`collections.abc` and `typing` at module scope, plus three intra-repo
+imports, each avoiding a duplicated rule: `hash_bytes`/`canonical_json` from
+`orchestrator.context_snapshot` (the one hashing/canonicalization rule),
+`UNDECIDED_CODES`/`VERDICTS` from `orchestrator.policy_checkpoint` (the one
+undecided-code and verdict vocabulary), and `contains_credential`/
+`safe_scalar` from `orchestrator.redaction` (the one credential-shape
+screen). No `pathlib`, `os`, `open`, `httpx`, `urllib` or `subprocess`
+anywhere, and no second hashing or ad hoc JSON-dump convention.
+
+No field here is ever consumed by an authorization decision. Nothing in
+this module records allow/deny/permit/grant. Every reference block carries
+ids and hashes only, never a payload, a path, or free text — every
+human-facing reason is a slug from a closed vocabulary.
+"""
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from orchestrator.context_snapshot import canonical_json, hash_bytes
+from orchestrator.policy_checkpoint import UNDECIDED_CODES, VERDICTS
+from orchestrator.redaction import contains_credential, safe_scalar
+
+API_VERSION = "evidence.mctl.ai/v1alpha1"
+KIND = "ExecutionEvidence"
+
+# The complete allow-list, mirroring context_snapshot.SUPPORTED_API_VERSIONS:
+# a document declaring anything else fails loudly in from_dict, never falls
+# back to a default shape.
+SUPPORTED_API_VERSIONS = {API_VERSION: KIND}
+
+EVIDENCE_ID_PREFIX = "ev-"
+
+# ---------------------------------------------------------------------------
+# Owning-module prefixes and vocabularies, duplicated on purpose.
+#
+# Importing orchestrator.work_context.execution_requests, action_approvals or
+# orchestrator.usage_ledger at module scope would pull this module into
+# their import graphs (usage_ledger imports httpx directly; action_approvals
+# and work_context are stdlib-only today but are the client mirrors of a
+# store, not this contract's business). context_snapshot.py:84-94 states the
+# same rationale for WORK_CONTEXT_SURFACE_KINDS: duplicating a tiny prefix or
+# closed vocabulary is deliberate — a divergence is a one-line fix in
+# whichever module is wrong — and tests/test_execution_evidence.py's T11
+# asserts every one of these equals its owner, so a rename there breaks this
+# test rather than silently diverging here.
+# ---------------------------------------------------------------------------
+
+#: orchestrator/work_context/snapshots.py:39 EXECUTION_ID_PREFIX
+EXECUTION_ID_PREFIX = "we_"
+#: orchestrator/work_context/snapshots.py:42 SNAPSHOT_ID_PREFIX (the mctl-api
+#: store id)
+SNAPSHOT_ID_PREFIX = "cs_"
+#: orchestrator/context_snapshot.py's seal() local id ("cs-" + hash[7:23]);
+#: not exported as a symbol there, so no equality test is possible — see the
+#: "Store id vs local id" open question this proposal resolved.
+SNAPSHOT_LOCAL_ID_PREFIX = "cs-"
+SNAPSHOT_ID_PREFIXES = (SNAPSHOT_ID_PREFIX, SNAPSHOT_LOCAL_ID_PREFIX)
+#: orchestrator/work_context/execution_requests.py:32 REQUEST_ID_PREFIX
+REQUEST_ID_PREFIX = "xr_"
+#: orchestrator/action_approvals.py:47 ID_PREFIX
+APPROVAL_ID_PREFIX = "aar_"
+
+#: orchestrator/work_context/execution_requests.py KINDS
+EXECUTION_REQUEST_KINDS = frozenset({"start", "resume"})
+#: orchestrator/work_context/execution_requests.py STATES
+EXECUTION_REQUEST_STATES = frozenset({"pending", "claimed", "fulfilled", "rejected"})
+#: orchestrator/action_approvals.py's typed answers (PENDING/APPROVED/DENIED/
+#: EXPIRED/CONSUMED)
+APPROVAL_STATES = frozenset({"pending", "approved", "denied", "expired", "consumed"})
+#: orchestrator/usage_ledger.py DEVLOOP_STAGES
+USAGE_DEVLOOP_STAGES = frozenset({"investigator", "implementer", "reviewer", "shepherd"})
+
+# Closed vocabularies for this contract's own fields (requirements.md's
+# resolved open questions).
+OUTCOME_CODES = frozenset({"succeeded", "failed", "refused", "abandoned", "superseded"})
+GAP_CODES = frozenset({"not_produced", "store_unavailable", "not_applicable", "redacted_out", "undecided"})
+BLOCK_NAMES = frozenset({
+    "execution", "outcome", "policy_decisions", "snapshot_refs",
+    "execution_request", "usage", "approvals", "artifacts",
+})
+
+COMPLETE = "COMPLETE"
+INCOMPLETE = "INCOMPLETE"
+
+# `reason_code`/`outcome.reason_code` are machine-readable slugs, never
+# prose: same shape as context_snapshot's MAX_CONFLICT_SUBJECT_LENGTH /
+# _CONFLICT_SUBJECT_PATTERN.
+MAX_SLUG_LENGTH = 128
+_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+
+# ArtifactRef.name: bounded, and never a place to smuggle a path — no `/`,
+# `\`, `..` or leading `~`.
+MAX_ARTIFACT_NAME_LENGTH = 256
+_ARTIFACT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# The generic redaction-safety-net cap `_safe()` applies to every leaf
+# regardless of which field it came from — mirrors
+# `orchestrator/redaction.py`'s MAX_ATTRIBUTE_CHARS. Per-field schema bounds
+# (MAX_SLUG_LENGTH, MAX_ARTIFACT_NAME_LENGTH, ...) are enforced separately by
+# `validate()`.
+MAX_LEAF_CHARS = 256
+
+#: A sentinel distinguishing "this leaf was dropped" from a legitimate None.
+_DROPPED = object()
+
+
+class ExecutionEvidenceError(ValueError):
+    """Fail-closed schema/validation failure. Every raise site below is
+    either a structural problem (`from_dict`: wrong type, unknown key,
+    unsupported `api_version`/`kind`) or a semantic one (`validate`/`seal`:
+    closed vocabulary violation, a required block absent and ungapped).
+    Non-retryable: callers fix the document, never catch this to fall back
+    to a default shape."""
+
+
+# ---------------------------------------------------------------------------
+# Parse helpers — copied and retyped from context_snapshot.py (deliberate
+# duplication, context_snapshot.py:84-94's rationale: these are tiny and a
+# divergence is a one-line fix, unlike the credential screen or the hash
+# rule, which are imported instead).
+# ---------------------------------------------------------------------------
+
+
+def _reject_unknown_keys(data: Mapping[str, Any], allowed: frozenset[str], *, where: str) -> None:
+    unknown = set(data) - allowed
+    if unknown:
+        raise ExecutionEvidenceError(f"{where}: unknown key(s) {sorted(unknown)!r}")
+
+
+def _require_mapping(value: Any, *, where: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ExecutionEvidenceError(f"{where} must be a mapping, got {type(value).__name__}")
+    return value
+
+
+def _require_str(value: Any, *, where: str, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise ExecutionEvidenceError(f"{where} must be a non-empty string")
+    return value
+
+
+def _require_int(value: Any, *, where: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ExecutionEvidenceError(f"{where} must be an int")
+    return value
+
+
+def _require_bool(value: Any, *, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise ExecutionEvidenceError(f"{where} must be a bool")
+    return value
+
+
+def _optional_str(value: Any, *, where: str) -> str | None:
+    if value is None:
+        return None
+    return _require_str(value, where=where, allow_empty=True)
+
+
+def _require_sha256(value: Any, *, where: str) -> str:
+    text = _require_str(value, where=where)
+    if not text.startswith("sha256:"):
+        raise ExecutionEvidenceError(f"{where} must carry the 'sha256:' prefix, got {text!r}")
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Reference blocks — ids and hashes only, never a copy of the referent.
+#
+# Every leaf string field below allows an empty value at parse time: a blank
+# leaf means "absent" (never supplied, or dropped by `_safe()` before
+# hashing). Whether an absent, required leaf was properly accounted for by a
+# `Gap` is `seal()`'s job (it holds the `Requirements` profile); `validate()`
+# checks vocabulary/shape only when a value is present, and skips a blank
+# one rather than re-deriving what `seal()` already decided.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ExecutionJoin:
+    """Joins this envelope to the canonical execution the #196 identity
+    contract mints (`we_...`). A reference only: no execution state, no
+    `ExecutionContext` field, is copied here."""
+
+    execution_id: str
+    work_item_id: str = ""
+    trace_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"execution_id": self.execution_id, "work_item_id": self.work_item_id, "trace_id": self.trace_id}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ExecutionJoin:
+        mapping = _require_mapping(data, where="execution")
+        _reject_unknown_keys(mapping, frozenset({"execution_id", "work_item_id", "trace_id"}), where="execution")
+        return cls(
+            execution_id=_require_str(
+                mapping.get("execution_id", ""), where="execution.execution_id", allow_empty=True
+            ),
+            work_item_id=_require_str(
+                mapping.get("work_item_id", ""), where="execution.work_item_id", allow_empty=True
+            ),
+            trace_id=_require_str(mapping.get("trace_id", ""), where="execution.trace_id", allow_empty=True),
+        )
+
+
+@dataclass(frozen=True)
+class SnapshotRef:
+    """One `ContextSnapshot` this execution sealed or consulted — an id plus
+    its `sha256:`-prefixed `content_hash`. No source, selector, locator or
+    body: `context_snapshot.EvidenceRef` already forbids a payload field on
+    the other side of this same seam."""
+
+    snapshot_id: str = ""
+    content_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"snapshot_id": self.snapshot_id, "content_hash": self.content_hash}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> SnapshotRef:
+        mapping = _require_mapping(data, where="snapshot_ref")
+        _reject_unknown_keys(mapping, frozenset({"snapshot_id", "content_hash"}), where="snapshot_ref")
+        return cls(
+            snapshot_id=_require_str(
+                mapping.get("snapshot_id", ""), where="snapshot_ref.snapshot_id", allow_empty=True
+            ),
+            content_hash=_require_str(
+                mapping.get("content_hash", ""), where="snapshot_ref.content_hash", allow_empty=True
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ExecutionRequestRef:
+    """The `xr_` execution request that dispatched this execution, if any."""
+
+    request_id: str = ""
+    kind: str = ""
+    state: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"request_id": self.request_id, "kind": self.kind, "state": self.state}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ExecutionRequestRef:
+        mapping = _require_mapping(data, where="execution_request")
+        _reject_unknown_keys(mapping, frozenset({"request_id", "kind", "state"}), where="execution_request")
+        return cls(
+            request_id=_require_str(
+                mapping.get("request_id", ""), where="execution_request.request_id", allow_empty=True
+            ),
+            kind=_require_str(mapping.get("kind", ""), where="execution_request.kind", allow_empty=True),
+            state=_require_str(mapping.get("state", ""), where="execution_request.state", allow_empty=True),
+        )
+
+
+@dataclass(frozen=True)
+class UsageRef:
+    """Join keys into the canonical model usage ledger only — `session_id`,
+    optional `result_uuid`, `model_key` and optional `devloop_stage`. No
+    token count, no cost figure, no ledger row content: this mirrors the
+    ledger's own `(session_id, result_uuid, model_key)` idempotency key, so
+    a row is locatable and never copied."""
+
+    session_id: str = ""
+    model_key: str = ""
+    result_uuid: str | None = None
+    devloop_stage: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "model_key": self.model_key,
+            "result_uuid": self.result_uuid,
+            "devloop_stage": self.devloop_stage,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> UsageRef:
+        mapping = _require_mapping(data, where="usage")
+        _reject_unknown_keys(
+            mapping, frozenset({"session_id", "model_key", "result_uuid", "devloop_stage"}), where="usage"
+        )
+        return cls(
+            session_id=_require_str(mapping.get("session_id", ""), where="usage.session_id", allow_empty=True),
+            model_key=_require_str(mapping.get("model_key", ""), where="usage.model_key", allow_empty=True),
+            result_uuid=_optional_str(mapping.get("result_uuid"), where="usage.result_uuid"),
+            devloop_stage=_optional_str(mapping.get("devloop_stage"), where="usage.devloop_stage"),
+        )
+
+
+@dataclass(frozen=True)
+class ApprovalRef:
+    """The `aar_` human approval this execution's action relied on, and the
+    `intent_hash` it was bound to — never the intent's own fields."""
+
+    approval_id: str = ""
+    intent_hash: str = ""
+    state: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"approval_id": self.approval_id, "intent_hash": self.intent_hash, "state": self.state}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ApprovalRef:
+        mapping = _require_mapping(data, where="approval")
+        _reject_unknown_keys(mapping, frozenset({"approval_id", "intent_hash", "state"}), where="approval")
+        return cls(
+            approval_id=_require_str(mapping.get("approval_id", ""), where="approval.approval_id", allow_empty=True),
+            intent_hash=_require_str(mapping.get("intent_hash", ""), where="approval.intent_hash", allow_empty=True),
+            state=_require_str(mapping.get("state", ""), where="approval.state", allow_empty=True),
+        )
+
+
+@dataclass(frozen=True)
+class PolicyDecisionRef:
+    """One `policy_checkpoint.Decision` this execution's action produced.
+    `undecided` is `self.code in UNDECIDED_CODES` — the same expression
+    `Decision.undecided` uses, against the same imported frozenset; there is
+    no second list."""
+
+    action_digest: str = ""
+    verdict: str = ""
+    code: str = ""
+    policy_version: str = ""
+    rule_id: str = ""
+    approval_ref: str = ""
+
+    @property
+    def undecided(self) -> bool:
+        return self.code in UNDECIDED_CODES
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_digest": self.action_digest,
+            "verdict": self.verdict,
+            "code": self.code,
+            "policy_version": self.policy_version,
+            "rule_id": self.rule_id,
+            "approval_ref": self.approval_ref,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> PolicyDecisionRef:
+        mapping = _require_mapping(data, where="policy_decision")
+        _reject_unknown_keys(
+            mapping,
+            frozenset({"action_digest", "verdict", "code", "policy_version", "rule_id", "approval_ref"}),
+            where="policy_decision",
+        )
+        return cls(
+            action_digest=_require_str(
+                mapping.get("action_digest", ""), where="policy_decision.action_digest", allow_empty=True
+            ),
+            verdict=_require_str(mapping.get("verdict", ""), where="policy_decision.verdict", allow_empty=True),
+            code=_require_str(mapping.get("code", ""), where="policy_decision.code", allow_empty=True),
+            policy_version=_require_str(
+                mapping.get("policy_version", ""), where="policy_decision.policy_version", allow_empty=True
+            ),
+            rule_id=_require_str(mapping.get("rule_id", ""), where="policy_decision.rule_id", allow_empty=True),
+            approval_ref=_require_str(
+                mapping.get("approval_ref", ""), where="policy_decision.approval_ref", allow_empty=True
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ArtifactRef:
+    """An immutable ref to a generated artifact: a bounded `name`, a `kind`
+    and a `sha256:`-prefixed `content_hash`. Never the artifact's bytes."""
+
+    name: str = ""
+    kind: str = ""
+    content_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"name": self.name, "kind": self.kind, "content_hash": self.content_hash}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ArtifactRef:
+        mapping = _require_mapping(data, where="artifact")
+        _reject_unknown_keys(mapping, frozenset({"name", "kind", "content_hash"}), where="artifact")
+        return cls(
+            name=_require_str(mapping.get("name", ""), where="artifact.name", allow_empty=True),
+            kind=_require_str(mapping.get("kind", ""), where="artifact.kind", allow_empty=True),
+            content_hash=_require_str(
+                mapping.get("content_hash", ""), where="artifact.content_hash", allow_empty=True
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """The final outcome of the governed execution: a `code` from the closed
+    `OUTCOME_CODES` set and a machine-readable `reason_code` slug."""
+
+    code: str = ""
+    reason_code: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"code": self.code, "reason_code": self.reason_code}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Outcome:
+        mapping = _require_mapping(data, where="outcome")
+        _reject_unknown_keys(mapping, frozenset({"code", "reason_code"}), where="outcome")
+        return cls(
+            code=_require_str(mapping.get("code", ""), where="outcome.code", allow_empty=True),
+            reason_code=_require_str(mapping.get("reason_code", ""), where="outcome.reason_code", allow_empty=True),
+        )
+
+
+@dataclass(frozen=True)
+class Gap:
+    """An explicit statement that a block of evidence is missing: `block`
+    names which one (closed set `BLOCK_NAMES`), `code` says why (closed set
+    `GAP_CODES`), and `required` says whether that absence makes the
+    envelope `INCOMPLETE`. Never silent: "no record" is always a `Gap`, not
+    an absent key."""
+
+    block: str
+    code: str
+    required: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"block": self.block, "code": self.code, "required": self.required}
+
+    @classmethod
+    def from_dict(cls, data: Any) -> Gap:
+        mapping = _require_mapping(data, where="gap")
+        _reject_unknown_keys(mapping, frozenset({"block", "code", "required"}), where="gap")
+        return cls(
+            block=_require_str(mapping.get("block"), where="gap.block"),
+            code=_require_str(mapping.get("code"), where="gap.code"),
+            required=_require_bool(mapping.get("required"), where="gap.required"),
+        )
+
+
+@dataclass(frozen=True)
+class Requirements:
+    """Which optional evidence blocks this execution was supposed to
+    produce (design.md's resolution of requirements.md's "which blocks are
+    required" open question). `execution` and `outcome` are always
+    required — `seal()`'s signature already makes them mandatory arguments,
+    so they carry no flag here. `policy_decisions` defaults to required,
+    matching "at least one policy-decision reference" in the default
+    profile; every other block defaults to not-required, since it applies
+    only when the execution's own design says it does."""
+
+    policy_decisions: bool = True
+    snapshot_refs: bool = False
+    execution_request: bool = False
+    usage: bool = False
+    approvals: bool = False
+    artifacts: bool = False
+
+
+#: The default profile: execution join, outcome and at least one policy
+#: decision are required; every other block is required-if-applicable.
+DEFAULT_REQUIREMENTS = Requirements()
+
+
+# ---------------------------------------------------------------------------
+# Redaction — every block, no exceptions, before a single byte is hashed.
+# ---------------------------------------------------------------------------
+
+
+def _is_block_required(block: str, requirements: Requirements) -> bool:
+    if block in ("execution", "outcome"):
+        return True
+    return bool(getattr(requirements, block, False))
+
+
+def _safe_node(value: Any, *, block: str, required: bool) -> tuple[Any, list[Gap]]:
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        gaps: list[Gap] = []
+        for key, sub in value.items():
+            cleaned, sub_gaps = _safe_node(sub, block=block, required=required)
+            gaps.extend(sub_gaps)
+            if cleaned is _DROPPED:
+                gaps.append(Gap(block=block, code="redacted_out", required=required))
+                continue
+            out[key] = cleaned
+        return out, gaps
+    if isinstance(value, list):
+        out_list: list[Any] = []
+        list_gaps: list[Gap] = []
+        for item in value:
+            cleaned, sub_gaps = _safe_node(item, block=block, required=required)
+            list_gaps.extend(sub_gaps)
+            if cleaned is _DROPPED:
+                list_gaps.append(Gap(block=block, code="redacted_out", required=required))
+                continue
+            out_list.append(cleaned)
+        return out_list, list_gaps
+    if value is None or isinstance(value, bool):
+        return value, []
+    if isinstance(value, int | float):
+        return value, []
+    if isinstance(value, str):
+        # An empty string is a legitimate "not applicable" leaf, not a
+        # payload to screen: `safe_scalar` (mirroring the OTel attribute
+        # guard it was extracted from) rejects zero-length strings outright,
+        # which would turn every blank optional field into a spurious
+        # redaction. Only a non-empty string goes through the bounded,
+        # credential-shape check.
+        if value == "" or (safe_scalar(value, max_chars=MAX_LEAF_CHARS) and not contains_credential(value)):
+            return value, []
+        return _DROPPED, []
+    # Not a declared scalar or structure at all: reject rather than guess.
+    return _DROPPED, []
+
+
+def _safe(payload: Mapping[str, Any], *, requirements: Requirements) -> tuple[dict[str, Any], tuple[Gap, ...]]:
+    """Walk every block of `payload` (`_content_payload`'s output, before
+    hashing) and drop — never mask — any leaf that is not a bounded, safe
+    scalar or that matches a credential shape
+    (`orchestrator.redaction.contains_credential`). Every drop becomes an
+    explicit `Gap(block=..., code="redacted_out", required=<per
+    requirements>)`, following `context_snapshot.Redaction`'s "rule ids and
+    volume only, never matched text" accounting — the gap records THAT a
+    drop happened and where, never what was dropped. `api_version`/`kind`
+    are fixed constants and are never walked."""
+    clean: dict[str, Any] = {}
+    gaps: list[Gap] = []
+    for block, value in payload.items():
+        if block in ("api_version", "kind"):
+            clean[block] = value
+            continue
+        required = _is_block_required(block, requirements)
+        cleaned_value, block_gaps = _safe_node(value, block=block, required=required)
+        clean[block] = cleaned_value
+        gaps.extend(block_gaps)
+    return clean, tuple(gaps)
+
+
+# ---------------------------------------------------------------------------
+# ExecutionEvidence — the top-level envelope.
+# ---------------------------------------------------------------------------
+
+
+_EVIDENCE_KEYS = frozenset({
+    "api_version", "kind", "evidence_id", "content_hash", "created_at",
+    "execution", "outcome", "policy_decisions", "snapshot_refs",
+    "execution_request", "usage", "approvals", "artifacts", "gaps",
+})
+
+
+@dataclass(frozen=True)
+class ExecutionEvidence:
+    """One immutable, content-addressed, redacted statement of which
+    canonical governance records applied to one governed execution. Only
+    ever produced by `seal()`; `from_dict` reconstructs an already-sealed
+    document and re-validates its shape, but never recomputes the hash —
+    use `recompute_content_hash` to verify one."""
+
+    api_version: str
+    kind: str
+    evidence_id: str
+    content_hash: str
+    created_at: str
+    execution: ExecutionJoin
+    outcome: Outcome
+    policy_decisions: tuple[PolicyDecisionRef, ...] = ()
+    snapshot_refs: tuple[SnapshotRef, ...] = ()
+    execution_request: ExecutionRequestRef | None = None
+    usage: UsageRef | None = None
+    approvals: tuple[ApprovalRef, ...] = ()
+    artifacts: tuple[ArtifactRef, ...] = ()
+    gaps: tuple[Gap, ...] = ()
+
+    @property
+    def completeness(self) -> str:
+        """Derived from `gaps`, never a field: `INCOMPLETE` iff at least one
+        gap is `required`. Not in `__init__`, not accepted by `from_dict` —
+        a caller cannot construct a `COMPLETE` envelope while evidence is
+        missing."""
+        return INCOMPLETE if any(g.required for g in self.gaps) else COMPLETE
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "api_version": self.api_version,
+            "kind": self.kind,
+            "evidence_id": self.evidence_id,
+            "content_hash": self.content_hash,
+            "created_at": self.created_at,
+            "execution": self.execution.to_dict(),
+            "outcome": self.outcome.to_dict(),
+            "policy_decisions": [p.to_dict() for p in self.policy_decisions],
+            "snapshot_refs": [s.to_dict() for s in self.snapshot_refs],
+            "execution_request": self.execution_request.to_dict() if self.execution_request is not None else None,
+            "usage": self.usage.to_dict() if self.usage is not None else None,
+            "approvals": [a.to_dict() for a in self.approvals],
+            "artifacts": [a.to_dict() for a in self.artifacts],
+            "gaps": [g.to_dict() for g in self.gaps],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> ExecutionEvidence:
+        mapping = _require_mapping(data, where="ExecutionEvidence")
+        _reject_unknown_keys(mapping, _EVIDENCE_KEYS, where="ExecutionEvidence")
+
+        api_version_raw = mapping.get("api_version")
+        expected_kind = SUPPORTED_API_VERSIONS.get(api_version_raw) if isinstance(api_version_raw, str) else None
+        if not isinstance(api_version_raw, str) or expected_kind is None:
+            raise ExecutionEvidenceError(
+                f"unsupported api_version {api_version_raw!r}, expected one of {sorted(SUPPORTED_API_VERSIONS)!r}"
+            )
+        api_version = api_version_raw
+        kind_raw = mapping.get("kind")
+        if kind_raw != expected_kind:
+            raise ExecutionEvidenceError(
+                f"kind must be {expected_kind!r} for api_version {api_version!r}, got {kind_raw!r}"
+            )
+        kind = kind_raw
+
+        evidence_id = _require_str(mapping.get("evidence_id"), where="evidence_id")
+        content_hash = _require_sha256(mapping.get("content_hash"), where="content_hash")
+        created_at = _require_str(mapping.get("created_at"), where="created_at")
+
+        execution = ExecutionJoin.from_dict(mapping.get("execution"))
+        outcome = Outcome.from_dict(mapping.get("outcome"))
+
+        policy_decisions_raw = mapping.get("policy_decisions", [])
+        if not isinstance(policy_decisions_raw, list):
+            raise ExecutionEvidenceError("policy_decisions must be a list")
+        policy_decisions = tuple(PolicyDecisionRef.from_dict(p) for p in policy_decisions_raw)
+
+        snapshot_refs_raw = mapping.get("snapshot_refs", [])
+        if not isinstance(snapshot_refs_raw, list):
+            raise ExecutionEvidenceError("snapshot_refs must be a list")
+        snapshot_refs = tuple(SnapshotRef.from_dict(s) for s in snapshot_refs_raw)
+
+        execution_request_raw = mapping.get("execution_request")
+        execution_request = (
+            ExecutionRequestRef.from_dict(execution_request_raw) if execution_request_raw is not None else None
+        )
+
+        usage_raw = mapping.get("usage")
+        usage = UsageRef.from_dict(usage_raw) if usage_raw is not None else None
+
+        approvals_raw = mapping.get("approvals", [])
+        if not isinstance(approvals_raw, list):
+            raise ExecutionEvidenceError("approvals must be a list")
+        approvals = tuple(ApprovalRef.from_dict(a) for a in approvals_raw)
+
+        artifacts_raw = mapping.get("artifacts", [])
+        if not isinstance(artifacts_raw, list):
+            raise ExecutionEvidenceError("artifacts must be a list")
+        artifacts = tuple(ArtifactRef.from_dict(a) for a in artifacts_raw)
+
+        gaps_raw = mapping.get("gaps", [])
+        if not isinstance(gaps_raw, list):
+            raise ExecutionEvidenceError("gaps must be a list")
+        gaps = tuple(Gap.from_dict(g) for g in gaps_raw)
+
+        evidence = cls(
+            api_version=api_version,
+            kind=kind,
+            evidence_id=evidence_id,
+            content_hash=content_hash,
+            created_at=created_at,
+            execution=execution,
+            outcome=outcome,
+            policy_decisions=policy_decisions,
+            snapshot_refs=snapshot_refs,
+            execution_request=execution_request,
+            usage=usage,
+            approvals=approvals,
+            artifacts=artifacts,
+            gaps=gaps,
+        )
+        evidence.validate()
+        return evidence
+
+    def validate(self) -> None:
+        """Enforce the vocabulary/shape rules `from_dict`'s type checks and
+        `seal()`'s construction cannot. Checks are skipped when a value is
+        blank: a blank leaf means "absent" (never supplied, or dropped by
+        `_safe()`), and whether an absent required block was properly
+        gapped is `seal()`'s job — the only place a `Requirements` profile
+        is ever in hand. Raises `ExecutionEvidenceError`; never silently
+        coerces or drops a field."""
+        if self.api_version != API_VERSION:
+            raise ExecutionEvidenceError(f"api_version must be {API_VERSION!r}, got {self.api_version!r}")
+        if self.kind != KIND:
+            raise ExecutionEvidenceError(f"kind must be {KIND!r}, got {self.kind!r}")
+        if not self.content_hash.startswith("sha256:"):
+            raise ExecutionEvidenceError(
+                f"content_hash must carry the 'sha256:' prefix, got {self.content_hash!r}"
+            )
+        if not self.evidence_id.startswith(EVIDENCE_ID_PREFIX):
+            raise ExecutionEvidenceError(
+                f"evidence_id must start with {EVIDENCE_ID_PREFIX!r}, got {self.evidence_id!r}"
+            )
+
+        _check_execution_join(self.execution)
+        _check_outcome(self.outcome)
+        for decision in self.policy_decisions:
+            _check_policy_decision(decision)
+        for ref in self.snapshot_refs:
+            _check_snapshot_ref(ref)
+        if self.execution_request is not None:
+            _check_execution_request(self.execution_request)
+        if self.usage is not None:
+            _check_usage(self.usage)
+        for approval in self.approvals:
+            _check_approval(approval)
+        for artifact in self.artifacts:
+            _check_artifact(artifact)
+        for gap in self.gaps:
+            _check_gap(gap)
+
+    def to_log_dict(self) -> dict[str, Any]:
+        """Trace/telemetry-export shape (#195 owns traces): `evidence_id`,
+        `content_hash`, derived `completeness`, the outcome code and integer
+        `*_count` values per block — nothing else, the same count-not-list
+        idiom as `ContextSnapshot.to_log_dict`'s `evidence_ref_count`."""
+        return {
+            "evidence_id": self.evidence_id,
+            "content_hash": self.content_hash,
+            "completeness": self.completeness,
+            "outcome_code": self.outcome.code,
+            "policy_decision_count": len(self.policy_decisions),
+            "snapshot_ref_count": len(self.snapshot_refs),
+            "approval_count": len(self.approvals),
+            "artifact_count": len(self.artifacts),
+            "gap_count": len(self.gaps),
+        }
+
+
+def _check_execution_join(join: ExecutionJoin) -> None:
+    if join.execution_id and not join.execution_id.startswith(EXECUTION_ID_PREFIX):
+        raise ExecutionEvidenceError(
+            f"execution.execution_id must start with {EXECUTION_ID_PREFIX!r}, got {join.execution_id!r}"
+        )
+
+
+def _check_outcome(outcome: Outcome) -> None:
+    if outcome.code and outcome.code not in OUTCOME_CODES:
+        raise ExecutionEvidenceError(f"outcome.code {outcome.code!r} is not one of {sorted(OUTCOME_CODES)!r}")
+    if outcome.reason_code and (
+        len(outcome.reason_code) > MAX_SLUG_LENGTH or not _SLUG_PATTERN.match(outcome.reason_code)
+    ):
+        raise ExecutionEvidenceError(
+            f"outcome.reason_code must be a 1..{MAX_SLUG_LENGTH} character code of [a-z0-9._-]"
+        )
+
+
+def _check_policy_decision(decision: PolicyDecisionRef) -> None:
+    if decision.action_digest and not decision.action_digest.startswith("sha256:"):
+        raise ExecutionEvidenceError(
+            f"policy_decision.action_digest must carry the 'sha256:' prefix, got {decision.action_digest!r}"
+        )
+    if decision.verdict and decision.verdict not in VERDICTS:
+        raise ExecutionEvidenceError(f"policy_decision.verdict {decision.verdict!r} is not one of {sorted(VERDICTS)!r}")
+
+
+def _check_snapshot_ref(ref: SnapshotRef) -> None:
+    if ref.snapshot_id and not ref.snapshot_id.startswith(SNAPSHOT_ID_PREFIXES):
+        raise ExecutionEvidenceError(
+            f"snapshot_ref.snapshot_id must start with one of {SNAPSHOT_ID_PREFIXES!r}, got {ref.snapshot_id!r}"
+        )
+    if ref.content_hash and not ref.content_hash.startswith("sha256:"):
+        raise ExecutionEvidenceError(
+            f"snapshot_ref.content_hash must carry the 'sha256:' prefix, got {ref.content_hash!r}"
+        )
+
+
+def _check_execution_request(ref: ExecutionRequestRef) -> None:
+    if ref.request_id and not ref.request_id.startswith(REQUEST_ID_PREFIX):
+        raise ExecutionEvidenceError(
+            f"execution_request.request_id must start with {REQUEST_ID_PREFIX!r}, got {ref.request_id!r}"
+        )
+    if ref.kind and ref.kind not in EXECUTION_REQUEST_KINDS:
+        raise ExecutionEvidenceError(
+            f"execution_request.kind {ref.kind!r} is not one of {sorted(EXECUTION_REQUEST_KINDS)!r}"
+        )
+    if ref.state and ref.state not in EXECUTION_REQUEST_STATES:
+        raise ExecutionEvidenceError(
+            f"execution_request.state {ref.state!r} is not one of {sorted(EXECUTION_REQUEST_STATES)!r}"
+        )
+
+
+def _check_usage(ref: UsageRef) -> None:
+    if ref.devloop_stage and ref.devloop_stage not in USAGE_DEVLOOP_STAGES:
+        raise ExecutionEvidenceError(
+            f"usage.devloop_stage {ref.devloop_stage!r} is not one of {sorted(USAGE_DEVLOOP_STAGES)!r}"
+        )
+
+
+def _check_approval(ref: ApprovalRef) -> None:
+    if ref.approval_id and not ref.approval_id.startswith(APPROVAL_ID_PREFIX):
+        raise ExecutionEvidenceError(
+            f"approval.approval_id must start with {APPROVAL_ID_PREFIX!r}, got {ref.approval_id!r}"
+        )
+    if ref.intent_hash and not ref.intent_hash.startswith("sha256:"):
+        raise ExecutionEvidenceError(f"approval.intent_hash must carry the 'sha256:' prefix, got {ref.intent_hash!r}")
+    if ref.state and ref.state not in APPROVAL_STATES:
+        raise ExecutionEvidenceError(f"approval.state {ref.state!r} is not one of {sorted(APPROVAL_STATES)!r}")
+
+
+def _check_artifact(ref: ArtifactRef) -> None:
+    if ref.name:
+        _check_artifact_name(ref.name)
+    if ref.content_hash and not ref.content_hash.startswith("sha256:"):
+        raise ExecutionEvidenceError(f"artifact.content_hash must carry the 'sha256:' prefix, got {ref.content_hash!r}")
+
+
+def _check_artifact_name(name: str) -> None:
+    if (
+        len(name) > MAX_ARTIFACT_NAME_LENGTH
+        or not _ARTIFACT_NAME_PATTERN.match(name)
+        or "/" in name
+        or "\\" in name
+        or ".." in name
+        or name.startswith("~")
+    ):
+        raise ExecutionEvidenceError(
+            f"artifact.name {name!r} must be a bounded, separator-free name with no path fragment"
+        )
+
+
+def _check_gap(gap: Gap) -> None:
+    if gap.block not in BLOCK_NAMES:
+        raise ExecutionEvidenceError(f"gap.block {gap.block!r} is not one of {sorted(BLOCK_NAMES)!r}")
+    if gap.code not in GAP_CODES:
+        raise ExecutionEvidenceError(f"gap.code {gap.code!r} is not one of {sorted(GAP_CODES)!r}")
+
+
+# ---------------------------------------------------------------------------
+# Sealing.
+# ---------------------------------------------------------------------------
+
+
+def _content_payload(
+    *,
+    execution: ExecutionJoin,
+    outcome: Outcome,
+    policy_decisions: Sequence[PolicyDecisionRef] = (),
+    snapshot_refs: Sequence[SnapshotRef] = (),
+    execution_request: ExecutionRequestRef | None = None,
+    usage: UsageRef | None = None,
+    approvals: Sequence[ApprovalRef] = (),
+    artifacts: Sequence[ArtifactRef] = (),
+) -> dict[str, Any]:
+    """Every field that participates in `content_hash` — everything except
+    `content_hash`, `evidence_id` and `created_at`. Every optional block
+    (`policy_decisions`, `snapshot_refs`, `execution_request`, `usage`,
+    `approvals`, `artifacts`) enters the payload ONLY when non-empty/present,
+    mirroring `context_snapshot.py:1174-1207`'s rule: a future optional
+    block added to this schema must not re-identify an already-sealed
+    envelope, and an envelope sealed without one today hashes exactly as if
+    the key were never declared."""
+    payload: dict[str, Any] = {
+        "api_version": API_VERSION,
+        "kind": KIND,
+        "execution": execution.to_dict(),
+        "outcome": outcome.to_dict(),
+    }
+    if policy_decisions:
+        payload["policy_decisions"] = [p.to_dict() for p in policy_decisions]
+    if snapshot_refs:
+        payload["snapshot_refs"] = [s.to_dict() for s in snapshot_refs]
+    if execution_request is not None:
+        payload["execution_request"] = execution_request.to_dict()
+    if usage is not None:
+        payload["usage"] = usage.to_dict()
+    if approvals:
+        payload["approvals"] = [a.to_dict() for a in approvals]
+    if artifacts:
+        payload["artifacts"] = [a.to_dict() for a in artifacts]
+    return payload
+
+
+def _check_required_blocks(
+    *,
+    requirements: Requirements,
+    execution: ExecutionJoin,
+    outcome: Outcome,
+    policy_decisions: tuple[PolicyDecisionRef, ...],
+    snapshot_refs: tuple[SnapshotRef, ...],
+    execution_request: ExecutionRequestRef | None,
+    usage: UsageRef | None,
+    approvals: tuple[ApprovalRef, ...],
+    artifacts: tuple[ArtifactRef, ...],
+    gaps: tuple[Gap, ...],
+) -> None:
+    gapped_blocks = {g.block for g in gaps}
+
+    def _check(block: str, required: bool, absent: bool) -> None:
+        if required and absent and block not in gapped_blocks:
+            raise ExecutionEvidenceError(f"block {block!r} is required but absent and carries no Gap")
+
+    _check("execution", True, not execution.execution_id)
+    _check("outcome", True, not outcome.code)
+    _check("policy_decisions", requirements.policy_decisions, len(policy_decisions) == 0)
+    _check("snapshot_refs", requirements.snapshot_refs, len(snapshot_refs) == 0)
+    _check("execution_request", requirements.execution_request, execution_request is None)
+    _check("usage", requirements.usage, usage is None)
+    _check("approvals", requirements.approvals, len(approvals) == 0)
+    _check("artifacts", requirements.artifacts, len(artifacts) == 0)
+
+
+def seal(
+    *,
+    execution: ExecutionJoin,
+    outcome: Outcome,
+    created_at: str,
+    policy_decisions: Sequence[PolicyDecisionRef] = (),
+    snapshot_refs: Sequence[SnapshotRef] = (),
+    execution_request: ExecutionRequestRef | None = None,
+    usage: UsageRef | None = None,
+    approvals: Sequence[ApprovalRef] = (),
+    artifacts: Sequence[ArtifactRef] = (),
+    gaps: Sequence[Gap] = (),
+    requirements: Requirements = DEFAULT_REQUIREMENTS,
+) -> ExecutionEvidence:
+    """The only constructor that produces a sealed `ExecutionEvidence`.
+
+    Order: assemble `_content_payload()` -> `_safe()` redacts every block
+    (never masks; each drop becomes a `redacted_out` Gap) -> reconstruct
+    each block from the redacted payload, so the returned envelope never
+    carries a value `_safe()` dropped -> `_check_required_blocks()` raises
+    `ExecutionEvidenceError` if `requirements` marks a block required and it
+    is both absent and ungapped -> `content_hash = hash_bytes(canonical_json(
+    <redacted payload, plus gaps when non-empty>))` -> `evidence_id = "ev-" +
+    content_hash[7:23]` -> `validate()` before returning. `created_at` is
+    caller-supplied and excluded from the hash, so sealing identical inputs
+    twice at different times yields the same identity."""
+    raw_payload = _content_payload(
+        execution=execution,
+        outcome=outcome,
+        policy_decisions=policy_decisions,
+        snapshot_refs=snapshot_refs,
+        execution_request=execution_request,
+        usage=usage,
+        approvals=approvals,
+        artifacts=artifacts,
+    )
+    safe_payload, redaction_gaps = _safe(raw_payload, requirements=requirements)
+    all_gaps = tuple(gaps) + redaction_gaps
+
+    clean_execution = ExecutionJoin.from_dict(safe_payload["execution"])
+    clean_outcome = Outcome.from_dict(safe_payload["outcome"])
+    clean_policy_decisions = tuple(PolicyDecisionRef.from_dict(p) for p in safe_payload.get("policy_decisions", []))
+    clean_snapshot_refs = tuple(SnapshotRef.from_dict(s) for s in safe_payload.get("snapshot_refs", []))
+    clean_execution_request = (
+        ExecutionRequestRef.from_dict(safe_payload["execution_request"])
+        if "execution_request" in safe_payload
+        else None
+    )
+    clean_usage = UsageRef.from_dict(safe_payload["usage"]) if "usage" in safe_payload else None
+    clean_approvals = tuple(ApprovalRef.from_dict(a) for a in safe_payload.get("approvals", []))
+    clean_artifacts = tuple(ArtifactRef.from_dict(a) for a in safe_payload.get("artifacts", []))
+
+    _check_required_blocks(
+        requirements=requirements,
+        execution=clean_execution,
+        outcome=clean_outcome,
+        policy_decisions=clean_policy_decisions,
+        snapshot_refs=clean_snapshot_refs,
+        execution_request=clean_execution_request,
+        usage=clean_usage,
+        approvals=clean_approvals,
+        artifacts=clean_artifacts,
+        gaps=all_gaps,
+    )
+
+    hash_payload = dict(safe_payload)
+    if all_gaps:
+        hash_payload["gaps"] = [g.to_dict() for g in all_gaps]
+    content_hash = hash_bytes(canonical_json(hash_payload))
+    evidence_id = EVIDENCE_ID_PREFIX + content_hash[7:23]
+
+    evidence = ExecutionEvidence(
+        api_version=API_VERSION,
+        kind=KIND,
+        evidence_id=evidence_id,
+        content_hash=content_hash,
+        created_at=created_at,
+        execution=clean_execution,
+        outcome=clean_outcome,
+        policy_decisions=clean_policy_decisions,
+        snapshot_refs=clean_snapshot_refs,
+        execution_request=clean_execution_request,
+        usage=clean_usage,
+        approvals=clean_approvals,
+        artifacts=clean_artifacts,
+        gaps=all_gaps,
+    )
+    evidence.validate()
+    return evidence
+
+
+def recompute_content_hash(evidence: ExecutionEvidence) -> str:
+    """Recompute the `content_hash` a fresh `seal()` of `evidence`'s fields
+    would produce, without mutating `evidence`. Used to verify golden
+    fixtures and reseal-stability. Pure: `evidence` is already sealed and
+    redacted, so this never re-runs `_safe()`."""
+    payload = _content_payload(
+        execution=evidence.execution,
+        outcome=evidence.outcome,
+        policy_decisions=evidence.policy_decisions,
+        snapshot_refs=evidence.snapshot_refs,
+        execution_request=evidence.execution_request,
+        usage=evidence.usage,
+        approvals=evidence.approvals,
+        artifacts=evidence.artifacts,
+    )
+    if evidence.gaps:
+        payload["gaps"] = [g.to_dict() for g in evidence.gaps]
+    return hash_bytes(canonical_json(payload))
+
+
+def evidence_ref(evidence: ExecutionEvidence, kind: str) -> dict[str, str]:
+    """`{"evidence_id": ..., "kind": ...}` — exactly the two keys
+    `context_snapshot.EvidenceRef.from_dict` accepts, so a caller sealing
+    this envelope can attach it to a `ContextSnapshot.evidence_refs` entry
+    without either module importing the other. The same `evidence_id` is
+    also valid as a `human_input` `"evidence:"` context ref
+    (`orchestrator/human_input.py:46`), which already reserves that prefix."""
+    return {"evidence_id": evidence.evidence_id, "kind": kind}
+
+
+__all__ = [
+    "API_VERSION",
+    "APPROVAL_ID_PREFIX",
+    "APPROVAL_STATES",
+    "BLOCK_NAMES",
+    "COMPLETE",
+    "DEFAULT_REQUIREMENTS",
+    "EVIDENCE_ID_PREFIX",
+    "EXECUTION_ID_PREFIX",
+    "EXECUTION_REQUEST_KINDS",
+    "EXECUTION_REQUEST_STATES",
+    "GAP_CODES",
+    "INCOMPLETE",
+    "KIND",
+    "OUTCOME_CODES",
+    "REQUEST_ID_PREFIX",
+    "SNAPSHOT_ID_PREFIX",
+    "SNAPSHOT_ID_PREFIXES",
+    "SNAPSHOT_LOCAL_ID_PREFIX",
+    "SUPPORTED_API_VERSIONS",
+    "USAGE_DEVLOOP_STAGES",
+    "ApprovalRef",
+    "ArtifactRef",
+    "ExecutionEvidence",
+    "ExecutionEvidenceError",
+    "ExecutionJoin",
+    "ExecutionRequestRef",
+    "Gap",
+    "Outcome",
+    "PolicyDecisionRef",
+    "Requirements",
+    "SnapshotRef",
+    "UsageRef",
+    "evidence_ref",
+    "recompute_content_hash",
+    "seal",
+]
