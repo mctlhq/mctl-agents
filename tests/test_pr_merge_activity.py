@@ -229,3 +229,78 @@ async def test_a_granted_approval_merges_exactly_once(
     assert second.ran
     assert merges == ["mctlhq/mctl-web"]
     assert second.approver == "github:root"
+
+
+def _approved_merge_setup(monkeypatch: pytest.MonkeyPatch):
+    _enable_gate(monkeypatch)
+    monkeypatch.setenv(pc.APPROVALS_ENV, pc.APPROVALS_MCTL_API)
+    monkeypatch.setenv("MCTL_TOKEN", "test-token")
+    monkeypatch.setenv("MCTL_API_BASE_URL", "https://api.example.test")
+    fake = FakeMctlApi(_Clock())  # type: ignore[arg-type]
+    monkeypatch.setattr(aa, "_no_redirect_opener", lambda: fake)
+    monkeypatch.setattr(run_shepherd, "read_codex_review", lambda _pr: APPROVED_REVIEW)
+    monkeypatch.setattr(act, "_sleep", lambda _s: None)
+    return fake
+
+
+async def _approve_and_rerun(env: ActivityEnvironment, fake):
+    first = await env.run(act.merge_pull_request_gated, _action())
+    assert first.code == pc.CODE_APPROVAL_PENDING
+    fake.decide(first.approval_ref, "approve")
+    return await env.run(act.merge_pull_request_gated, GatedActionInput(
+        payload=_action().payload, execution_id="ctx-519", actor="system:dev-loop-workflow", trace_id="tr-519",
+        approval_ref=first.approval_ref,
+    ))
+
+
+async def test_an_approved_merge_retries_a_transient_gh_failure(
+    env: ActivityEnvironment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude P2 on c079004: run_gated's contract has the side effect retry
+    its own transient errors, because an escape spends the human's approval
+    and the watch latches the head as effect_failed."""
+    fake = _approved_merge_setup(monkeypatch)
+    pr = make_pr()
+    monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", lambda *_a, **_kw: pr)
+    answers = [(False, None), (True, "m" * 40)]
+    monkeypatch.setattr(run_shepherd, "merge_pr_unchecked", lambda _pr: answers.pop(0))
+
+    result = await _approve_and_rerun(env, fake)
+
+    assert result.ran
+    assert result.result == {"merge_commit": "m" * 40}
+    assert answers == []
+
+
+async def test_a_merge_that_landed_despite_the_error_is_not_retried(
+    env: ActivityEnvironment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _approved_merge_setup(monkeypatch)
+    open_pr = make_pr()
+    merged_pr = make_pr(merged=True, merge_commit="c" * 40)
+    snapshots = iter([open_pr, open_pr, merged_pr])
+    monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", lambda *_a, **_kw: next(snapshots))
+    calls: list[str] = []
+    monkeypatch.setattr(run_shepherd, "merge_pr_unchecked", lambda _pr: (calls.append("merge"), (False, None))[1])
+
+    result = await _approve_and_rerun(env, fake)
+
+    assert result.ran
+    assert result.result == {"merge_commit": "c" * 40}
+    assert calls == ["merge"]
+
+
+async def test_an_approved_merge_gives_up_after_its_attempts(
+    env: ActivityEnvironment, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _approved_merge_setup(monkeypatch)
+    pr = make_pr()
+    monkeypatch.setattr(run_shepherd, "_fetch_pr_snapshot", lambda *_a, **_kw: pr)
+    calls: list[str] = []
+    monkeypatch.setattr(run_shepherd, "merge_pr_unchecked", lambda _pr: (calls.append("merge"), (False, None))[1])
+
+    result = await _approve_and_rerun(env, fake)
+
+    assert not result.ran
+    assert result.effect_error
+    assert len(calls) == act.MERGE_EFFECT_ATTEMPTS

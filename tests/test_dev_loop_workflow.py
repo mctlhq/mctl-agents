@@ -263,6 +263,7 @@ def _fake_activities(
     # with. None keeps the default `merge_gate_disabled`.
     gate_results: list[GatedActionResult] | None = None,
     gate_calls: list[GatedActionInput] | None = None,
+    mint_raises: bool = False,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -618,6 +619,8 @@ def _fake_activities(
     # SERVICES are unset, which they are in every test in this module.
     @activity.defn(name="mint_execution_context")
     async def fake_mint_execution_context(req: MintRequest) -> MintedContext:
+        if mint_raises:
+            raise ApplicationError("mctl-api hung", non_retryable=True)
         return MintedContext(
             context_id="ex-test-merge-gate", trace_id=req.trace_id or "0" * 32,
             content_hash="sha256:" + "0" * 64, stored=False,
@@ -7134,10 +7137,11 @@ def _open_pr(head_sha: str) -> PRState:
 class TestMergeGateInTheWatch:
     """Workflow-level: the gated merge activity as the watch loop drives it."""
 
-    async def _run(self, env, *, pr_states, gate_results, issue: int, caplog=None):
+    async def _run(self, env, *, pr_states, gate_results, issue: int, caplog=None, mint_raises=False):
         gate_calls: list[GatedActionInput] = []
         activities, _calls, investigate_ran, _ops = _fake_activities(
             released=True, pr_states=pr_states, gate_results=gate_results, gate_calls=gate_calls,
+            mint_raises=mint_raises,
         )
 
         @activity.defn(name="read_action_approval")
@@ -7187,6 +7191,17 @@ class TestMergeGateInTheWatch:
         assert result.pr is not None and result.pr.state == "MERGED"
         assert [c.payload["head_sha"] for c in gate_calls] == ["a" * 40, "b" * 40]
 
+    async def test_a_failing_identity_mint_never_fails_the_watch(self, env):
+        """Claude P2 on c079004: the mint is awaited inline on every fresh
+        watch, gated or not; an ActivityError from it used to fail a DevLoop
+        whose implement had already succeeded. It now skips the gate."""
+        result, gate_calls = await self._run(
+            env, pr_states=[_open_pr("a" * 40)] * 3 + [MERGED_PR],
+            gate_results=[GatedActionResult(code="merge_gate_disabled")], issue=5195, mint_raises=True,
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert gate_calls == []
+
     async def test_a_head_move_cancels_the_wait_and_asks_about_the_new_head(self, env):
         """agy P2: an attempt waiting on a human for head A used to block the
         gate until that receipt expired, even after the PR moved to head B.
@@ -7214,7 +7229,8 @@ class TestMergeGateInTheWatch:
                 gate_results=[ran], issue=5193,
             )
         assert result.pr is not None and result.pr.state == "MERGED"
-        assert len(gate_calls) >= 1
+        # `ran` latches its head: no pointless second attempt on the merged PR.
+        assert len(gate_calls) == 1
         lines = [r.getMessage() for r in caplog.records]
         assert any(line.startswith("MERGE_APPROVED ") and "approver=alice" in line for line in lines), lines
 
@@ -7240,7 +7256,7 @@ class TestMergeGateSettling:
         assert not wf._gate_may_start(head_sha="a", poll_index=10 + MERGE_GATE_OFF_REPROBE_POLLS - 1)
         assert wf._gate_may_start(head_sha="a", poll_index=10 + MERGE_GATE_OFF_REPROBE_POLLS)
 
-    @pytest.mark.parametrize("outcome", sorted(MERGE_GATE_SETTLED_OUTCOMES))
+    @pytest.mark.parametrize("outcome", [*sorted(MERGE_GATE_SETTLED_OUTCOMES), "ran"])
     def test_a_settled_outcome_latches_its_head(self, outcome: str) -> None:
         wf = _bare_loop()
         wf._gate_head = "a"
@@ -7252,13 +7268,12 @@ class TestMergeGateSettling:
         "result",
         [
             None,
-            _gate_result("ran"),
             _gate_result("mismatch"),
             _gate_result("refused"),
             _gate_result("undecided"),
             _gate_result("blocked", "merge_precondition_unmet"),
         ],
-        ids=["failure", "ran", "mismatch", "refused", "undecided", "precondition-unmet"],
+        ids=["failure", "mismatch", "refused", "undecided", "precondition-unmet"],
     )
     def test_other_outcomes_are_asked_again_next_poll(self, result) -> None:
         wf = _bare_loop()

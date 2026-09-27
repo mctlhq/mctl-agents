@@ -4018,22 +4018,35 @@ class DevLoopWorkflow:
         if self._merge_gate_execution_id:
             return self._merge_gate_execution_id, self._merge_gate_trace_id
         info = workflow.info()
-        minted: MintedContext = await workflow.execute_activity(
-            mint_execution_context,
-            MintRequest(
-                trace_id=workflow.uuid4().hex,
-                workflow_type="review-fix",
-                actor_type="system",
-                actor_id="devloop-workflow",
-                actor_verification="control-plane-verified",
-                executor_type="devloop-workflow",
-                trigger_type="pull_request",
-                temporal_workflow_id=info.workflow_id,
-                temporal_run_id=info.run_id,
-            ),
-            start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
-            retry_policy=FAST_ACTIVITY_RETRY_POLICY,
-        )
+        try:
+            minted: MintedContext = await workflow.execute_activity(
+                mint_execution_context,
+                MintRequest(
+                    trace_id=workflow.uuid4().hex,
+                    workflow_type="review-fix",
+                    actor_type="system",
+                    actor_id="devloop-workflow",
+                    actor_verification="control-plane-verified",
+                    executor_type="devloop-workflow",
+                    trigger_type="pull_request",
+                    temporal_workflow_id=info.workflow_id,
+                    temporal_run_id=info.run_id,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+        except Exception as exc:  # noqa: BLE001 — ActivityError and friends
+            # Same convention as `_ownership`: nothing on this loop's path may
+            # fail a watch whose implement already succeeded -- and this runs
+            # on every fresh watch, gated or not. A mint that fails at the
+            # Temporal level (e.g. a hung mctl-api timing the activity out)
+            # skips the gate this poll; the next poll mints again.
+            workflow.logger.warning(
+                "merge gate identity mint failed for %s: %r -- skipping the gate this poll",
+                info.workflow_id,
+                exc,
+            )
+            return "", ""
         if not minted.stored:
             # A locally-minted, `unverified` context mctl-api has never seen:
             # the approval create this attempt makes under it is refused.
@@ -4141,15 +4154,18 @@ class DevLoopWorkflow:
         (mctlhq/mctl-agents#519 review). A gate that answered "off" for this
         service is latched off for MERGE_GATE_OFF_REPROBE_POLLS polls; a
         settled outcome (MERGE_GATE_SETTLED_OUTCOMES) latches the head it was
-        decided about until the PR's head moves. Everything else — `ran`,
-        a precondition not met yet, `mismatch`, `refused`, `undecided`, an
+        decided about until the PR's head moves, as does `ran` (that head is
+        merged). Everything else — a precondition not met yet, `mismatch`, `refused`, `undecided`, an
         unexpected failure (`None`) — is asked again on the next poll.
         """
         if result is None:
             return
         if result.outcome == OUTCOME_BLOCKED and result.code in MERGE_GATE_OFF_CODES:
             self._gate_off_until_poll = poll_index + MERGE_GATE_OFF_REPROBE_POLLS
-        elif result.outcome in MERGE_GATE_SETTLED_OUTCOMES:
+        elif result.outcome in MERGE_GATE_SETTLED_OUTCOMES or result.ran:
+            # `ran` too: the PR at this head was just merged, and a fresh
+            # attempt on this very poll would only re-read it to answer
+            # `merge_precondition_unmet`.
             self._gate_settled_head = self._gate_head
 
     def _gate_may_start(self, *, head_sha: str, poll_index: int) -> bool:
@@ -5560,10 +5576,12 @@ class DevLoopWorkflow:
                                 repo=state.repo, number=state.number, poll_index=poll_index,
                             )
                             gate_task = None
+                        execution_id = trace_id = ""
                         if gate_task is None and self._gate_may_start(
                             head_sha=state.head_sha, poll_index=poll_index
                         ):
                             execution_id, trace_id = await self._merge_gate_identity()
+                        if gate_task is None and execution_id:
                             # Bounded by the watch's remaining budget AND the
                             # wait's own hard ceiling, which exists for the
                             # receipt whose expiry is unreadable.

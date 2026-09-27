@@ -30,6 +30,7 @@ from the caller beyond the head SHA it asked about):
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 from temporalio import activity
@@ -49,6 +50,18 @@ CODE_MERGE_FORBIDDEN = "merge_forbidden"
 #: The PR, recomputed just now, is not in a mergeable state, or the
 #: shepherd's own `decide()` does not currently say `merge`.
 CODE_MERGE_PRECONDITION_UNMET = "merge_precondition_unmet"
+
+#: `run_gated`'s contract: the side effect retries its own transient errors
+#: before raising, because an escape after the consume spends the human's
+#: approval (and the watch then latches this head as `effect_failed`). A
+#: non-zero `gh pr merge` that reaches the side effect is the transient set
+#: -- a 5xx, a secondary rate limit, a token that lapsed, a mergeability
+#: recompute in flight -- since the head-moved case is screened out above.
+MERGE_EFFECT_ATTEMPTS = 3
+#: Seconds to wait before attempts 2 and 3.
+MERGE_EFFECT_BACKOFF_SECONDS = (5.0, 15.0)
+#: Seam for tests.
+_sleep = time.sleep
 
 
 def _blocked(code: str, reason: str) -> GatedActionResult:
@@ -108,13 +121,30 @@ def _sync_merge_pull_request_gated(inp: GatedActionInput) -> GatedActionResult:
     pr_ref = f"https://github.com/{repo}/pull/{number}"
 
     def _side_effect() -> dict[str, Any] | None:
-        ok, merge_commit = run_shepherd.merge_pr_unchecked(pr)
-        if not ok:
-            # Every escape here costs a human decision (run_gated's
-            # contract): the receipt is already spent, so this is reported
-            # as effect_error/effect_failed, never retried on this receipt.
-            raise RuntimeError(f"gh pr merge failed for {repo}#{number} (see activity log for the gh output)")
-        return {"merge_commit": merge_commit or ""}
+        for attempt in range(MERGE_EFFECT_ATTEMPTS):
+            if attempt:
+                _sleep(MERGE_EFFECT_BACKOFF_SECONDS[attempt - 1])
+                # Re-read before retrying: a merge that actually landed
+                # despite the non-zero exit is never attempted again, and a
+                # head that moved is not merged under this approval (the
+                # `match_head_commit` guard would refuse it anyway).
+                snap = run_shepherd._fetch_pr_snapshot(repo, number)
+                if snap is not None and snap.merged:
+                    return {"merge_commit": snap.merge_commit or ""}
+                if snap is not None and snap.head_sha != pr.head_sha:
+                    raise RuntimeError(
+                        f"{repo}#{number} head moved to {snap.head_sha} after the approved merge failed"
+                    )
+            ok, merge_commit = run_shepherd.merge_pr_unchecked(pr)
+            if ok:
+                return {"merge_commit": merge_commit or ""}
+        # Every escape here costs a human decision (run_gated's contract):
+        # the receipt is already spent, so this is reported as
+        # effect_error/effect_failed, never retried on this receipt.
+        raise RuntimeError(
+            f"gh pr merge failed {MERGE_EFFECT_ATTEMPTS} times for {repo}#{number} "
+            "(see activity log for the gh output)"
+        )
 
     return run_gated(
         inp,

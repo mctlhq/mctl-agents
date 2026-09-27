@@ -148,12 +148,12 @@ so no in-flight execution's history replays a command it never recorded:
 
   | outcome | logged | asked again |
   | --- | --- | --- |
-  | `ran` | `MERGE_APPROVED` with `approval_ref`, approver, `decided_at`; the next poll observes `MERGED` via the ordinary `get_pr_state` path | — |
+  | `ran` | `MERGE_APPROVED` with `approval_ref`, approver, `decided_at`; the next poll observes `MERGED` via the ordinary `get_pr_state` path | not for this head (it is merged) |
   | `blocked`: gate off or forbidden (`merge_gate_disabled`, `merge_forbidden`) | no | not for `MERGE_GATE_OFF_REPROBE_POLLS` (8) polls: the gate is latched off, then re-probed, so turning it on mid-watch is noticed within ~2 hours |
   | `blocked`: precondition unmet, `approval_required` | no | next poll |
   | `mismatch` | no | next poll, about the new head: a new intent and a new human decision |
   | `denied`, `expired`, `timed_out` | yes | not for this head. The same head is the same intent and the same idempotency key, so it would only get the same spent receipt back; `next_attempt()` is never called, so a denial is never worn down. A new head is asked about once |
-  | `consumed`, `effect_failed` | yes | not for this head, as above |
+  | `consumed`, `effect_failed` | yes | not for this head, as above. `effect_failed` is reached only after the side effect's own `MERGE_EFFECT_ATTEMPTS` (3) tries, re-reading the PR between them, per `run_gated`'s contract |
   | `refused` | yes | next poll (a refused create may come from a degraded identity, which is re-minted rather than cached) |
   | `already_waiting`, `undecided` | no | next poll |
 
@@ -181,7 +181,7 @@ so no in-flight execution's history replays a command it never recorded:
   for the watch (and across hops), except when the mint degrades to an
   unverified local context (`MintedContext.stored` false): that one is
   logged and not cached, so the next attempt mints again instead of the
-  whole watch being refused under an identity mctl-api never saw.
+  whole watch being refused under an identity mctl-api never saw. A mint that fails at the Temporal level (a timeout) is logged and skips the gate for that poll: nothing on the merge watch's path may fail a DevLoop whose implement already succeeded.
 
 ## Consequences
 
