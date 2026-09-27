@@ -138,6 +138,12 @@ _ARTIFACT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # fixture and test already uses, and it is bounded and pattern-checked here
 # the same way every other schema field is.
 MAX_CREATED_AT_LENGTH = 40
+# The exact shapes `seal()` produces (`hash_bytes` → "sha256:" + 64 lowercase
+# hex; the id is "ev-" + 16 of those hex chars). A prefix check alone let a
+# forged, self-consistent pair carry arbitrary text -- a credential, or an
+# unbounded blob -- through `from_dict` into `to_dict()` and `to_log_dict()`.
+_SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_EVIDENCE_ID_PATTERN = re.compile(r"ev-[0-9a-f]{16}")
 _CREATED_AT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 
 # The generic redaction-safety-net cap `_safe()` applies to every leaf
@@ -217,8 +223,10 @@ def _optional_str(value: Any, *, where: str) -> str | None:
 
 def _require_sha256(value: Any, *, where: str) -> str:
     text = _require_str(value, where=where)
-    if not text.startswith("sha256:"):
-        raise ExecutionEvidenceError(f"{where} must carry the 'sha256:' prefix, got {text!r}")
+    if not _SHA256_PATTERN.fullmatch(text):
+        raise ExecutionEvidenceError(
+            f"{where} must be 'sha256:' followed by 64 lowercase hex characters, got {text[:80]!r}"
+        )
     return text
 
 
@@ -797,13 +805,15 @@ class ExecutionEvidence:
             raise ExecutionEvidenceError(f"api_version must be {API_VERSION!r}, got {self.api_version!r}")
         if self.kind != KIND:
             raise ExecutionEvidenceError(f"kind must be {KIND!r}, got {self.kind!r}")
-        if not self.content_hash.startswith("sha256:"):
+        if not _SHA256_PATTERN.fullmatch(self.content_hash):
             raise ExecutionEvidenceError(
-                f"content_hash must carry the 'sha256:' prefix, got {self.content_hash!r}"
+                "content_hash must be 'sha256:' followed by 64 lowercase hex characters, "
+                f"got {self.content_hash[:80]!r}"
             )
-        if not self.evidence_id.startswith(EVIDENCE_ID_PREFIX):
+        if not _EVIDENCE_ID_PATTERN.fullmatch(self.evidence_id):
             raise ExecutionEvidenceError(
-                f"evidence_id must start with {EVIDENCE_ID_PREFIX!r}, got {self.evidence_id!r}"
+                f"evidence_id must be {EVIDENCE_ID_PREFIX!r} followed by 16 lowercase hex characters, "
+                f"got {self.evidence_id[:80]!r}"
             )
         expected_evidence_id = EVIDENCE_ID_PREFIX + self.content_hash[7:23]
         if self.evidence_id != expected_evidence_id:

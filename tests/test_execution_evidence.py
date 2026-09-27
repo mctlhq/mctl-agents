@@ -192,6 +192,26 @@ def test_from_dict_rejects_a_malformed_created_at():
         ee.ExecutionEvidence.from_dict(doc)
 
 
+@pytest.mark.parametrize(
+    "content_hash",
+    [
+        "sha256:ghp_" + "a" * 40,  # a credential riding in the hash field
+        "sha256:" + "x" * 100_000,  # an unbounded blob
+        "sha256:" + "A" * 64,  # right length, wrong alphabet
+        "sha256:" + "a" * 63,  # one short
+    ],
+)
+def test_from_dict_rejects_a_forged_self_consistent_hash_and_id(content_hash):
+    """A forged pair whose id is derived from the forged hash is internally
+    consistent, so only a shape check on both fields rejects it -- before it
+    reaches to_dict() or the to_log_dict() telemetry export."""
+    doc = _seal().to_dict()
+    doc["content_hash"] = content_hash
+    doc["evidence_id"] = ee.EVIDENCE_ID_PREFIX + content_hash[7:23]
+    with pytest.raises(ee.ExecutionEvidenceError, match="content_hash"):
+        ee.ExecutionEvidence.from_dict(doc)
+
+
 # ---------------------------------------------------------------------------
 # T3 — golden fixture
 # ---------------------------------------------------------------------------
