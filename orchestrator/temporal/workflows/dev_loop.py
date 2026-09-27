@@ -124,6 +124,14 @@ with workflow.unsafe.imports_passed_through():
     )
     from orchestrator.temporal.issue_ref import parse_issue_url, request_engine_ref
     from orchestrator.temporal.workflows.action_approval import (
+        DEFAULT_MAX_WAIT_SECONDS,
+        OUTCOME_BLOCKED,
+        OUTCOME_CONSUMED,
+        OUTCOME_DENIED,
+        OUTCOME_EFFECT_FAILED,
+        OUTCOME_EXPIRED,
+        OUTCOME_REFUSED,
+        OUTCOME_TIMED_OUT,
         ApprovalWaitResult,
         run_gated_action,
     )
@@ -428,6 +436,27 @@ MERGE_WATCH_MAX_HOPS = 16
 # other cross-module Temporal call, so a dropped registration is not a type
 # error anywhere (see tests/test_worker_roles.py).
 MERGE_GATE_ACTIVITY = "merge_pull_request_gated"
+#: The gated activity's answers meaning "this gate does not apply to this
+#: service" (`activities/pr_merge.py`'s CODE_MERGE_GATE_DISABLED and
+#: CODE_MERGE_FORBIDDEN, mirrored as strings so workflow code does not
+#: import the activity module; tests/test_dev_loop_workflow.py pins the
+#: two copies equal). After one, the watch stops asking for
+#: MERGE_GATE_OFF_REPROBE_POLLS polls instead of scheduling the activity on
+#: every poll just to hear it again.
+MERGE_GATE_OFF_CODES = frozenset({"merge_gate_disabled", "merge_forbidden"})
+#: How long a gate found off stays latched off: 8 polls, two hours at the
+#: 15-minute MERGE_POLL_INTERVAL. Long enough to cut the off-state cost to
+#: an eighth, short enough that turning the gate ON mid-watch is noticed
+#: within hours rather than never (a gated service's shepherd already
+#: defers its merge to this watch the moment its own env says so).
+MERGE_GATE_OFF_REPROBE_POLLS = 8
+#: Outcomes that settle the gate for the head they were decided about: the
+#: same head asks again under the same intent, hence the same idempotency
+#: key, and gets the same spent or refused receipt back. Only a NEW head
+#: (a new intent, a new human decision) is worth another attempt.
+MERGE_GATE_SETTLED_OUTCOMES = frozenset({
+    OUTCOME_DENIED, OUTCOME_EXPIRED, OUTCOME_TIMED_OUT, OUTCOME_CONSUMED, OUTCOME_EFFECT_FAILED,
+})
 # No pre-existing workflow history ever recorded the gate's commands (the
 # identity mint, the gated activity, the child approval wait), so entering it
 # unconditionally would replay a command an in-flight execution never made.
@@ -1423,6 +1452,10 @@ class MergeWatchResume:
     # until the first gate attempt of this watch.
     merge_gate_execution_id: str = ""
     merge_gate_trace_id: str = ""
+    # The head a denied/expired/timed-out/consumed/effect-failed gate
+    # attempt was decided about (MERGE_GATE_SETTLED_OUTCOMES): carried so a
+    # hop does not re-ask about a head the previous run already settled.
+    merge_gate_settled_head: str = ""
     last_lifecycle_op: str = ""
     last_lifecycle_op_landed: bool = False
     # Deliberately a DIFFERENT question from `abandoned` below -- whether
@@ -1573,6 +1606,14 @@ class DevLoopWorkflow:
         # intent's hash and orphan a pending receipt.
         self._merge_gate_execution_id = ""
         self._merge_gate_trace_id = ""
+        # The head the in-flight (or last finished) gate attempt asked about;
+        # the head a settled outcome was decided about (carried across a hop
+        # as `MergeWatchResume.merge_gate_settled_head`); and the poll index
+        # before which a gate found off is not asked again (per run: a
+        # continued run re-probes at once). See `_gate_may_start`.
+        self._gate_head = ""
+        self._gate_settled_head = ""
+        self._gate_off_until_poll = 0
         # The last relinquishing write and whether it landed, so the
         # abandonment branch in _watch_pr's finally has a reader.
         self._last_lifecycle_op = ""
@@ -3367,6 +3408,7 @@ class DevLoopWorkflow:
         self._policy_ref = resume.policy_ref
         self._merge_gate_execution_id = resume.merge_gate_execution_id
         self._merge_gate_trace_id = resume.merge_gate_trace_id
+        self._gate_settled_head = resume.merge_gate_settled_head
         self._last_lifecycle_op = resume.last_lifecycle_op
         self._last_lifecycle_op_landed = resume.last_lifecycle_op_landed
         self._claim_abandoned = resume.claim_abandoned
@@ -3992,6 +4034,20 @@ class DevLoopWorkflow:
             start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
             retry_policy=FAST_ACTIVITY_RETRY_POLICY,
         )
+        if not minted.stored:
+            # A locally-minted, `unverified` context mctl-api has never seen:
+            # the approval create this attempt makes under it is refused.
+            # Not cached, so the next attempt mints again and recovers once
+            # mctl-api does, instead of the whole watch being refused under
+            # one dead identity. Nothing was created under this one, so
+            # re-minting orphans no receipt.
+            workflow.logger.warning(
+                "merge gate identity for %s could not be stored in mctl-api "
+                "(degraded to an unverified local context); this attempt will "
+                "likely be refused, the next one mints again",
+                info.workflow_id,
+            )
+            return minted.context_id, minted.trace_id
         self._merge_gate_execution_id = minted.context_id
         self._merge_gate_trace_id = minted.trace_id
         return self._merge_gate_execution_id, self._merge_gate_trace_id
@@ -4047,11 +4103,11 @@ class DevLoopWorkflow:
 
     def _apply_gate_outcome(self, result: ApprovalWaitResult | None, *, repo: str, number: int) -> None:
         """Log a finished merge-gate attempt per the outcome table
-        (mctlhq/mctl-agents#519 design.md). Every outcome just logs and lets
-        the watch keep polling: `ran` merges through the activity itself, so
-        the NEXT poll observes MERGED via the ordinary `get_pr_state` path;
-        nothing here ever calls `next_attempt()`, so a denial or an expiry is
-        never worn down by asking again on the next poll's fresh attempt.
+        (mctlhq/mctl-agents#519, docs/adr/016-shepherd-merge-approval.md).
+        `ran` merges through the activity itself, so the next poll observes
+        MERGED via the ordinary `get_pr_state` path; nothing here ever calls
+        `next_attempt()`, so a denial or an expiry is never worn down.
+        Whether the watch asks again is `_record_gate_result`'s call.
         """
         if result is None:
             # An unexpected failure, already logged by `_merge_gate`/`_drain_gate`.
@@ -4066,7 +4122,7 @@ class DevLoopWorkflow:
                 result.decided_at,
             )
             return
-        if result.outcome in ("denied", "expired", "timed_out", "consumed", "effect_failed"):
+        if result.outcome in MERGE_GATE_SETTLED_OUTCOMES or result.outcome == OUTCOME_REFUSED:
             workflow.logger.info(
                 "merge gate for %s#%s ended %s (code=%s approval_ref=%s): %s",
                 repo,
@@ -4080,19 +4136,64 @@ class DevLoopWorkflow:
         # "mismatch" (the head moved — the next poll asks about the new one),
         # "already_waiting" and "undecided": nothing to log, just keep watching.
 
+    def _record_gate_result(self, result: ApprovalWaitResult | None, *, poll_index: int) -> None:
+        """Decide whether the watch asks again after a finished attempt
+        (mctlhq/mctl-agents#519 review). A gate that answered "off" for this
+        service is latched off for MERGE_GATE_OFF_REPROBE_POLLS polls; a
+        settled outcome (MERGE_GATE_SETTLED_OUTCOMES) latches the head it was
+        decided about until the PR's head moves. Everything else — `ran`,
+        a precondition not met yet, `mismatch`, `refused`, `undecided`, an
+        unexpected failure (`None`) — is asked again on the next poll.
+        """
+        if result is None:
+            return
+        if result.outcome == OUTCOME_BLOCKED and result.code in MERGE_GATE_OFF_CODES:
+            self._gate_off_until_poll = poll_index + MERGE_GATE_OFF_REPROBE_POLLS
+        elif result.outcome in MERGE_GATE_SETTLED_OUTCOMES:
+            self._gate_settled_head = self._gate_head
+
+    def _gate_may_start(self, *, head_sha: str, poll_index: int) -> bool:
+        """Whether this poll may start a new gate attempt for `head_sha`:
+        not while the gate is latched off, and not for a head an earlier
+        attempt already settled (see `_record_gate_result`)."""
+        return poll_index >= self._gate_off_until_poll and head_sha != self._gate_settled_head
+
+    def _finish_gate(
+        self, gate_task: asyncio.Task[ApprovalWaitResult | None], service: str, slug: str,
+        *, repo: str, number: int, poll_index: int,
+    ) -> None:
+        """Drain a finished gate task, log its outcome and record it. The
+        one path every finished attempt takes, whichever way the watch
+        reaches it — a later poll, the hop, or `_settle_gate` on any exit —
+        so `MERGE_APPROVED` is never drained and dropped."""
+        result = _drain_gate(gate_task, service, slug)
+        self._apply_gate_outcome(result, repo=repo, number=number)
+        self._record_gate_result(result, poll_index=poll_index)
+
     async def _settle_gate(
         self, gate_task: asyncio.Task[ApprovalWaitResult | None] | None, service: str, slug: str,
+        *, repo: str = "", number: int = 0, poll_index: int = 0,
     ) -> None:
-        """Leave no pending merge-gate task behind when the watch ends
-        (mctlhq/mctl-agents#519), mirroring `_settle_tick`. Cancellation
-        propagates into `run_gated_action`'s child `ActionApprovalWaitWorkflow`
-        when one is running, and an unconsumed receipt simply expires — no
-        `gh pr merge` can follow a cancelled wait.
+        """Leave no pending merge-gate task behind (mctlhq/mctl-agents#519),
+        mirroring `_settle_tick`: when the watch ends, and when the PR's
+        head moves under an attempt still waiting on a human. A finished
+        task goes through `_finish_gate`, so its outcome is logged on every
+        exit. An in-flight one is cancelled: that propagates into
+        `run_gated_action`'s child `ActionApprovalWaitWorkflow`, and a
+        receipt nobody approved simply expires.
+
+        What cancellation does NOT stop is a gated activity already running
+        with an approved receipt: activities are cancelled TRY_CANCEL and
+        this one does not heartbeat, so a consume already under way still
+        runs `gh pr merge` (for the head the human approved — the activity
+        re-checks the head before it merges), and its result is not
+        recorded here. A cancelled wait never STARTS a merge; it cannot
+        recall one already in flight.
         """
         if gate_task is None:
             return
         if gate_task.done():
-            _drain_gate(gate_task, service, slug)
+            self._finish_gate(gate_task, service, slug, repo=repo, number=number, poll_index=poll_index)
             return
         workflow.logger.info(
             "cancelling an in-flight merge gate for %s/%s — the watch is ending",
@@ -5237,6 +5338,18 @@ class DevLoopWorkflow:
                     polls_this_run=polls_this_run, tick_task=tick_task, gate_task=gate_task, hops=hops
                 ):
                     hopping = True
+                    if gate_task is not None:
+                        # The hop predicate refuses while a gate attempt is in
+                        # flight, so this one is done. Finish it BEFORE the
+                        # resume record is built, so a settled head it
+                        # records is carried into the continued run.
+                        self._finish_gate(
+                            gate_task, service, slug,
+                            repo=(last.repo if last is not None else None) or "",
+                            number=(last.number if last is not None else None) or 0,
+                            poll_index=poll_index,
+                        )
+                        gate_task = None
                     remaining = deadline - workflow.now()
                     workflow.logger.info(
                         "merge watch for %s/%s hopping via continue_as_new: "
@@ -5279,6 +5392,7 @@ class DevLoopWorkflow:
                         policy_ref=self._policy_ref,
                         merge_gate_execution_id=self._merge_gate_execution_id,
                         merge_gate_trace_id=self._merge_gate_trace_id,
+                        merge_gate_settled_head=self._gate_settled_head,
                         last_lifecycle_op=self._last_lifecycle_op,
                         last_lifecycle_op_landed=self._last_lifecycle_op_landed,
                         claim_abandoned=self._claim_abandoned,
@@ -5342,19 +5456,9 @@ class DevLoopWorkflow:
                         self._poll_index_for_heartbeat += 1
                         await self._track_ownership(state)
                     if state.state in ("MERGED", "CLOSED"):
-                        if gate_task is not None and gate_task.done():
-                            # mctlhq/mctl-agents#519 review: a successful
-                            # gated merge makes the very next poll observe
-                            # MERGED right here, which used to return before
-                            # the gate-outcome block further down ever ran --
-                            # MERGE_APPROVED was unreachable on the one path
-                            # it exists for. Drain and apply the outcome
-                            # before the watch ends.
-                            self._apply_gate_outcome(
-                                _drain_gate(gate_task, service, slug),
-                                repo=state.repo or "", number=state.number or 0,
-                            )
-                            gate_task = None
+                        # A gate attempt that just merged this PR is finished
+                        # by `_settle_gate` in the `finally` below, which logs
+                        # MERGE_APPROVED on this exit as on every other.
                         if track_ownership and self._owned_entity_id:
                             done = await self._ownership(
                                 "terminal",
@@ -5430,15 +5534,43 @@ class DevLoopWorkflow:
                     # internally), so a fresh attempt is never started on top
                     # of one already asking.
                     if gate_enabled and state.repo and state.number is not None and state.head_sha:
-                        if gate_task is not None and gate_task.done():
-                            self._apply_gate_outcome(
-                                _drain_gate(gate_task, service, slug),
-                                repo=state.repo, number=state.number,
+                        if gate_task is not None and not gate_task.done() and state.head_sha != self._gate_head:
+                            # The head moved under an attempt still waiting on
+                            # a human: that approval would be for a commit that
+                            # is no longer the PR (the activity would refuse to
+                            # merge it anyway). Cancel it and ask about the new
+                            # head now, rather than after the old receipt
+                            # expires.
+                            workflow.logger.info(
+                                "head of %s#%s moved from %s to %s -- cancelling the merge gate "
+                                "waiting on the old head",
+                                state.repo,
+                                state.number,
+                                self._gate_head,
+                                state.head_sha,
+                            )
+                            await self._settle_gate(
+                                gate_task, service, slug,
+                                repo=state.repo, number=state.number, poll_index=poll_index,
                             )
                             gate_task = None
-                        if gate_task is None:
+                        if gate_task is not None and gate_task.done():
+                            self._finish_gate(
+                                gate_task, service, slug,
+                                repo=state.repo, number=state.number, poll_index=poll_index,
+                            )
+                            gate_task = None
+                        if gate_task is None and self._gate_may_start(
+                            head_sha=state.head_sha, poll_index=poll_index
+                        ):
                             execution_id, trace_id = await self._merge_gate_identity()
-                            remaining_budget = (deadline - workflow.now()).total_seconds()
+                            # Bounded by the watch's remaining budget AND the
+                            # wait's own hard ceiling, which exists for the
+                            # receipt whose expiry is unreadable.
+                            remaining_budget = min(
+                                (deadline - workflow.now()).total_seconds(), float(DEFAULT_MAX_WAIT_SECONDS)
+                            )
+                            self._gate_head = state.head_sha
                             gate_task = asyncio.create_task(self._merge_gate(
                                 repo=state.repo,
                                 number=state.number,
@@ -5513,7 +5645,12 @@ class DevLoopWorkflow:
             # every exit from this watch (MERGED/CLOSED, the #516 terminal
             # exit, the deadline, `abandon`, a hop) must leave no pending
             # merge-gate task behind.
-            await self._settle_gate(gate_task, service, slug)
+            await self._settle_gate(
+                gate_task, service, slug,
+                repo=(last.repo if last is not None else None) or "",
+                number=(last.number if last is not None else None) or 0,
+                poll_index=poll_index,
+            )
             # A hop keeps the claim: this run is not the one relinquishing
             # it, the continued run is still watching, and the owner id
             # (workflow_id) plus the epoch both stay valid across

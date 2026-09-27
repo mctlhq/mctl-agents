@@ -557,3 +557,18 @@ def test_module_import_is_stdlib_only():
     third_party = ("claude_agent_sdk", "temporalio", "httpx", "yaml", "anyio")
     leaked = sorted(n for n in result.stdout.split("\n") if n.split(".")[0] in third_party)
     assert not leaked, leaked
+
+
+@pytest.mark.parametrize("status", [aa.PENDING, aa.UNKNOWN, aa.MISMATCH, aa.REFUSED])
+def test_an_undecided_answer_never_names_an_approver(status):
+    """`Decision.approver` is empty on `pending` (policy_checkpoint.py) by
+    construction: a record carrying `decided_by` on an undecided status must
+    not forward it (#519 review P3)."""
+    record = aa.ApprovalRecord(id="aar_1", state=status, intent_hash="h", expires_at="", decided_by="github:root")
+    assert aa._outcome(aa.ApprovalAnswer(status=status, record=record)).decided_by == ""
+
+
+@pytest.mark.parametrize("status", [aa.DENIED, aa.EXPIRED, aa.CONSUMED])
+def test_a_decided_answer_names_its_approver(status):
+    record = aa.ApprovalRecord(id="aar_1", state=status, intent_hash="h", expires_at="", decided_by="github:root")
+    assert aa._outcome(aa.ApprovalAnswer(status=status, record=record)).decided_by == "github:root"

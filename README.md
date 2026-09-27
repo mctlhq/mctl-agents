@@ -407,6 +407,17 @@ codex findings. See `.env.example` for the full list.
 - **skip** (`SHEPHERD_SKIP_SERVICES`) — discover nothing; the service is
   owned end-to-end by another PR lifecycle.
 
+**Merge-approval gate** (`SHEPHERD_MERGE_APPROVAL_SERVICES`, mctl-agents#519,
+[ADR 016](docs/adr/016-shepherd-merge-approval.md)) is orthogonal to the
+modes above: a listed service still resolves to full, but when
+`MCTL_POLICY_MERGE_APPROVAL=require` is also set the shepherd defers its
+merge (`defer-merge`, owner `devloop-workflow`) and `DevLoopWorkflow`'s
+merge watch performs it as a human-approved Temporal activity. Both
+variables must be set on the shepherd CWFT **and** on the control-queue
+worker: set on the shepherd alone, it defers while the worker's activity
+answers `merge_gate_disabled`, so nothing merges and the only signal is the
+shepherd's `MERGE_GATED` line.
+
 `NEVER_MERGE_SERVICES` (currently `{"mctl-academy"}`) is a code
 constant, not an env var: such a service never resolves to full, and
 `merge_pr()` independently refuses to merge it — content publication

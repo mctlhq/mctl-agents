@@ -142,36 +142,57 @@ so no in-flight execution's history replays a command it never recorded:
   `get_pr_state`, submitting shepherd ticks, heartbeating the
   lifecycle-ownership claim and honouring `abandon` while a human decides,
   for as long as days.
-- **Outcomes**, applied by `_apply_gate_outcome` once `gate_task.done()`:
+- **Outcomes.** Every finished attempt goes through one path,
+  `_finish_gate`: `_apply_gate_outcome` logs it and `_record_gate_result`
+  decides whether the watch asks again.
 
-  | outcome | action |
-  | --- | --- |
-  | `ran` | log `MERGE_APPROVED` with `approval_ref`, approver, `decided_at`; the next poll observes `MERGED` via the ordinary `get_pr_state` path |
-  | `blocked` (gate off, forbidden, precondition unmet, `approval_required`) | nothing; keep watching |
-  | `mismatch` | the head moved; the next poll asks about the new head, a new intent and a new human decision |
-  | `denied`, `expired`, `timed_out` | log and keep watching; never call `next_attempt()` automatically, so a denial is never worn down by asking again |
-  | `consumed`, `effect_failed` | never merge again on that receipt; keep watching so a human sees it |
-  | `already_waiting`, `undecided` | nothing this poll |
+  | outcome | logged | asked again |
+  | --- | --- | --- |
+  | `ran` | `MERGE_APPROVED` with `approval_ref`, approver, `decided_at`; the next poll observes `MERGED` via the ordinary `get_pr_state` path | — |
+  | `blocked`: gate off or forbidden (`merge_gate_disabled`, `merge_forbidden`) | no | not for `MERGE_GATE_OFF_REPROBE_POLLS` (8) polls: the gate is latched off, then re-probed, so turning it on mid-watch is noticed within ~2 hours |
+  | `blocked`: precondition unmet, `approval_required` | no | next poll |
+  | `mismatch` | no | next poll, about the new head: a new intent and a new human decision |
+  | `denied`, `expired`, `timed_out` | yes | not for this head. The same head is the same intent and the same idempotency key, so it would only get the same spent receipt back; `next_attempt()` is never called, so a denial is never worn down. A new head is asked about once |
+  | `consumed`, `effect_failed` | yes | not for this head, as above |
+  | `refused` | yes | next poll (a refused create may come from a degraded identity, which is re-minted rather than cached) |
+  | `already_waiting`, `undecided` | no | next poll |
 
-  The `ran` outcome is logged from two places: the ordinary poll-boundary
-  check further down the loop, and — because a successful gated merge's
-  own `gh pr merge` call means the very next poll observes `MERGED` before
-  that check ever runs — the loop's MERGED/CLOSED branch also drains and
-  applies a just-finished `gate_task` before returning, so `MERGE_APPROVED`
-  is not lost on the one path it exists to record.
-- **Settling.** The watch's existing `finally` (`_settle_gate`, mirroring
+  `_finish_gate` runs wherever a finished task is found: on a later poll,
+  on the hop (before the resume record is built, so a settled head is
+  carried in `MergeWatchResume.merge_gate_settled_head`), and in
+  `_settle_gate` on every exit. `MERGE_APPROVED` is therefore logged on
+  the MERGED/CLOSED exit, the hop, `abandon`, the deadline and the
+  mctl-agents#516 terminal exit alike.
+- **Head moves.** When a poll sees a new head while an attempt is still
+  waiting on a human for the old one, the watch cancels that attempt
+  (`_settle_gate`) and asks about the new head on the same poll, rather
+  than waiting for the old receipt to expire.
+- **Settling.** The watch's `finally` (`_settle_gate`, mirroring
   `_settle_tick`) cancels and awaits any still-in-flight `gate_task` on
-  every exit — `MERGED`/`CLOSED`, the mctl-agents#516 terminal exit, the
-  deadline, `abandon`. Cancellation propagates into `run_gated_action`'s
-  child `ActionApprovalWaitWorkflow`; an unconsumed receipt simply expires.
+  every exit. Cancellation propagates into `run_gated_action`'s child
+  `ActionApprovalWaitWorkflow`, and a receipt nobody approved simply
+  expires: a cancelled wait never *starts* a merge. It cannot recall one
+  already under way. Activities are cancelled `TRY_CANCEL` and
+  `merge_pull_request_gated` does not heartbeat, so a consume already
+  running with an approved receipt still runs `gh pr merge` — for the head
+  the human approved, since the activity re-checks the head first — and
+  its result is not recorded by the ended watch.
+- **Identity.** The gate's execution identity is minted once and cached
+  for the watch (and across hops), except when the mint degrades to an
+  unverified local context (`MintedContext.stored` false): that one is
+  logged and not cached, so the next attempt mints again instead of the
+  whole watch being refused under an identity mctl-api never saw.
 
 ## Consequences
 
 Zero behaviour change until gitops sets both
 `MCTL_POLICY_MERGE_APPROVAL=require` (worker and shepherd CWFT) and
 `SHEPHERD_MERGE_APPROVAL_SERVICES=<service>`: the gated activity's first
-check short-circuits, so an unset flag costs one cheap activity per
-15-minute poll. `MCTL_POLICY_APPROVALS=mctl-api` must also be set on the
+check short-circuits, and its `merge_gate_disabled` answer latches the gate
+off for 8 polls, so an unset flag costs one cheap activity per two hours of
+merge watch (and its few history events) rather than one per 15-minute
+poll, which would have roughly doubled history growth against
+`MERGE_WATCH_HISTORY_FLOOR` and made every watch hop about twice as often. `MCTL_POLICY_APPROVALS=mctl-api` must also be set on the
 worker for an approval request to be created at all; without it the gate
 is `approval_required` -> `blocked` -> no merge, which fails closed rather
 than open. `workflow.patched(MERGE_GATE_PATCH)` means in-flight executions
@@ -182,8 +203,10 @@ reads the shepherd tick already does (PR snapshot, reviews, review
 comments, checks) — about a doubling of that PR's read traffic while the
 gate is on. The wait itself holds no pod and no activity: its cost is one
 durable timer plus one read-only GET every 15 minutes, bounded by the
-receipt's own expiry and the remaining merge-watch budget
-(`MERGE_WATCH_DEADLINE`, 14 days).
+receipt's own expiry, the remaining merge-watch budget
+(`MERGE_WATCH_DEADLINE`, 14 days) and the wait's own 7-day ceiling
+(`DEFAULT_MAX_WAIT_SECONDS`), which exists for a receipt whose expiry is
+unreadable.
 
 A gated service with no live `DevLoopWorkflow` watching its PR simply does
 not merge; the `MERGE_GATED` line printed by `run_shepherd.merge_pr` is the

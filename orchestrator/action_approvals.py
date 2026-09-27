@@ -339,9 +339,17 @@ _OUTCOMES = {
 }
 
 
+#: The store states a human's decision exists for; only these forward the
+#: record's `decided_by`, so `Decision.approver` is empty on `pending` (and
+#: every other undecided answer) by construction, not by the store's grace.
+_DECIDED = frozenset({APPROVED, DENIED, EXPIRED, CONSUMED})
+
+
 def _outcome(answer: ApprovalAnswer, ref: str = "") -> pc.ApprovalOutcome:
     status = _OUTCOMES.get(answer.status, pc.APPROVAL_UNKNOWN)
-    decided_by = answer.record.decided_by if answer.record is not None else ""
+    decided_by = (
+        answer.record.decided_by if answer.record is not None and answer.status in _DECIDED else ""
+    )
     return pc.ApprovalOutcome(status, approval_ref=ref, reason=answer.reason or answer.code, decided_by=decided_by)
 
 

@@ -26,9 +26,10 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner
 
 import orchestrator.human_input as hi
+from orchestrator import policy_checkpoint as pc
 from orchestrator.context_snapshot import ExecutionCorrelation as _ExecutionCorrelation
 from orchestrator.lifecycle.contract import Owner, answer_from
-from orchestrator.temporal.activities.action_approval import GatedActionInput, GatedActionResult
+from orchestrator.temporal.activities.action_approval import ApprovalPoll, GatedActionInput, GatedActionResult
 from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult
 from orchestrator.temporal.activities.deploy_state import DeployStatus, DeployTarget, ReleaseInfo
 from orchestrator.temporal.activities.identity import MintedContext, MintRequest
@@ -45,6 +46,7 @@ from orchestrator.temporal.constants import (
     implementation_max_concurrent_activities,
 )
 from orchestrator.temporal.workflows import dev_loop
+from orchestrator.temporal.workflows.action_approval import ActionApprovalWaitWorkflow, ApprovalWaitResult
 from orchestrator.temporal.workflows.dev_loop import (
     INCIDENT_WATCH_WINDOW,
     LIFECYCLE_HEARTBEAT_EVERY_POLLS,
@@ -53,6 +55,9 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_UNKNOWN_HEARTBEAT_LIMIT,
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     LOOP_TERMINAL_PROPOSAL_STATUSES,
+    MERGE_GATE_OFF_CODES,
+    MERGE_GATE_OFF_REPROBE_POLLS,
+    MERGE_GATE_SETTLED_OUTCOMES,
     MERGE_WATCH_MAX_HOPS,
     PROPOSAL_TERMINAL_CONFIRM_POLLS,
     SHEPHERD_TICK_EVERY_POLLS,
@@ -253,6 +258,11 @@ def _fake_activities(
     implement_params_log: list[dict] | None = None,
     shepherd_params_log: list[dict] | None = None,
     approve_params_log: list[dict] | None = None,
+    # mctlhq/mctl-agents#519: what the gated merge activity answers, call by
+    # call (the last answer repeats), and a log of the inputs it was called
+    # with. None keeps the default `merge_gate_disabled`.
+    gate_results: list[GatedActionResult] | None = None,
+    gate_calls: list[GatedActionInput] | None = None,
 ):
     """Fakes with the same names/signatures as the real activities, so
     Worker(..., activities=[...]) can register them under the exact
@@ -615,6 +625,10 @@ def _fake_activities(
 
     @activity.defn(name="merge_pull_request_gated")
     async def fake_merge_pull_request_gated(inp: GatedActionInput) -> GatedActionResult:
+        if gate_calls is not None:
+            gate_calls.append(inp)
+        if gate_results:
+            return gate_results.pop(0) if len(gate_results) > 1 else gate_results[0]
         return GatedActionResult(code="merge_gate_disabled")
 
     activities = [
@@ -7105,3 +7119,199 @@ class TestWorkContextGapMerge:
         # The window itself survives the hop.
         assert wf._resume_pending is True
         assert wf._current_surface == SurfaceRef(kind="github")
+
+
+# ─── The merge gate in the watch loop (mctlhq/mctl-agents#519) ─────────────
+
+
+def _open_pr(head_sha: str) -> PRState:
+    return PRState(
+        found=True, pr_url=MERGED_PR.pr_url, repo=MERGED_PR.repo, number=MERGED_PR.number,
+        state="OPEN", head_sha=head_sha,
+    )
+
+
+class TestMergeGateInTheWatch:
+    """Workflow-level: the gated merge activity as the watch loop drives it."""
+
+    async def _run(self, env, *, pr_states, gate_results, issue: int, caplog=None):
+        gate_calls: list[GatedActionInput] = []
+        activities, _calls, investigate_ran, _ops = _fake_activities(
+            released=True, pr_states=pr_states, gate_results=gate_results, gate_calls=gate_calls,
+        )
+
+        @activity.defn(name="read_action_approval")
+        async def fake_read_action_approval(approval_id: str) -> ApprovalPoll:
+            # Nobody ever decides: the wait stays pending until cancelled.
+            return ApprovalPoll(approval_id=approval_id, state="pending", expires_at="2099-01-01T00:00:00+00:00")
+
+        async with Worker(
+            env.client, task_queue=TASK_QUEUE, workflows=[DevLoopWorkflow, ActionApprovalWaitWorkflow],
+            activities=[*activities, fake_read_action_approval],
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url=f"https://github.com/mctlhq/mctl-telegram/issues/{issue}"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            result = await handle.result()
+        return result, gate_calls
+
+    async def test_a_gate_found_off_is_not_asked_again_on_every_poll(self, env):
+        """Claude P2: with the gate off, the activity used to run on every
+        poll of a 14-day watch just to answer `merge_gate_disabled` again.
+        It is now latched off for MERGE_GATE_OFF_REPROBE_POLLS polls."""
+        polls = MERGE_GATE_OFF_REPROBE_POLLS + 2
+        result, gate_calls = await self._run(
+            env, pr_states=[_open_pr("a" * 40)] * polls + [MERGED_PR],
+            gate_results=[GatedActionResult(code="merge_gate_disabled")], issue=5191,
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        # Poll 1 asks, polls 2..8 are latched off, poll 9 re-probes.
+        assert len(gate_calls) == 2
+
+    async def test_a_denied_head_is_not_asked_again_until_the_head_moves(self, env):
+        """Claude P2: a denial used to be re-attempted on every later poll
+        (same intent, same spent receipt). The head it was decided about is
+        latched; a NEW head is a new intent and is asked about once."""
+        denied = GatedActionResult(code=pc.CODE_APPROVAL_DENIED, approval_ref="aar_1")
+        result, gate_calls = await self._run(
+            env,
+            pr_states=[_open_pr("a" * 40)] * 4 + [_open_pr("b" * 40)] * 3 + [MERGED_PR],
+            gate_results=[denied], issue=5192,
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert [c.payload["head_sha"] for c in gate_calls] == ["a" * 40, "b" * 40]
+
+    async def test_a_head_move_cancels_the_wait_and_asks_about_the_new_head(self, env):
+        """agy P2: an attempt waiting on a human for head A used to block the
+        gate until that receipt expired, even after the PR moved to head B.
+        The watch now cancels it and asks about B on the poll that sees B."""
+        pending = GatedActionResult(code=pc.CODE_APPROVAL_PENDING, approval_ref="aar_a")
+        denied = GatedActionResult(code=pc.CODE_APPROVAL_DENIED, approval_ref="aar_b")
+        result, gate_calls = await self._run(
+            env,
+            pr_states=[_open_pr("a" * 40)] * 2 + [_open_pr("b" * 40)] * 2 + [MERGED_PR],
+            gate_results=[pending, denied], issue=5194,
+        )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert [c.payload["head_sha"] for c in gate_calls] == ["a" * 40, "b" * 40]
+
+    async def test_a_gated_merge_logs_merge_approved_when_the_watch_ends(self, env, caplog):
+        """Claude/agy P2: the successful gated merge's MERGE_APPROVED line must
+        survive the watch ending on the MERGED poll that follows it."""
+        ran = GatedActionResult(
+            code=pc.CODE_APPROVED, approval_ref="aar_ok", ran=True, result={"merge_commit": "c" * 40},
+            approver="alice", decided_at="2026-09-27T00:00:00Z",
+        )
+        with caplog.at_level(logging.INFO, logger="temporalio.workflow"):
+            result, gate_calls = await self._run(
+                env, pr_states=[_open_pr("a" * 40), _open_pr("a" * 40), MERGED_PR],
+                gate_results=[ran], issue=5193,
+            )
+        assert result.pr is not None and result.pr.state == "MERGED"
+        assert len(gate_calls) >= 1
+        lines = [r.getMessage() for r in caplog.records]
+        assert any(line.startswith("MERGE_APPROVED ") and "approver=alice" in line for line in lines), lines
+
+
+def _gate_result(outcome: str, code: str = "") -> ApprovalWaitResult:
+    return ApprovalWaitResult(outcome=outcome, code=code)
+
+
+class TestMergeGateSettling:
+    """Direct unit tests for the merge-gate helpers, for the same reason
+    TestTickSettling exists: the in-flight and the finished-at-exit branches
+    are not reliably reachable through the time-skipping harness."""
+
+    def test_the_off_codes_mirror_the_activity(self) -> None:
+        from orchestrator.temporal.activities import pr_merge
+
+        assert frozenset({pr_merge.CODE_MERGE_GATE_DISABLED, pr_merge.CODE_MERGE_FORBIDDEN}) == MERGE_GATE_OFF_CODES
+
+    @pytest.mark.parametrize("code", sorted(MERGE_GATE_OFF_CODES))
+    def test_an_off_answer_latches_the_gate_off_for_the_reprobe_window(self, code: str) -> None:
+        wf = _bare_loop()
+        wf._record_gate_result(_gate_result("blocked", code), poll_index=10)
+        assert not wf._gate_may_start(head_sha="a", poll_index=10 + MERGE_GATE_OFF_REPROBE_POLLS - 1)
+        assert wf._gate_may_start(head_sha="a", poll_index=10 + MERGE_GATE_OFF_REPROBE_POLLS)
+
+    @pytest.mark.parametrize("outcome", sorted(MERGE_GATE_SETTLED_OUTCOMES))
+    def test_a_settled_outcome_latches_its_head(self, outcome: str) -> None:
+        wf = _bare_loop()
+        wf._gate_head = "a"
+        wf._record_gate_result(_gate_result(outcome), poll_index=3)
+        assert not wf._gate_may_start(head_sha="a", poll_index=4)
+        assert wf._gate_may_start(head_sha="b", poll_index=4)
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            None,
+            _gate_result("ran"),
+            _gate_result("mismatch"),
+            _gate_result("refused"),
+            _gate_result("undecided"),
+            _gate_result("blocked", "merge_precondition_unmet"),
+        ],
+        ids=["failure", "ran", "mismatch", "refused", "undecided", "precondition-unmet"],
+    )
+    def test_other_outcomes_are_asked_again_next_poll(self, result) -> None:
+        wf = _bare_loop()
+        wf._gate_head = "a"
+        wf._record_gate_result(result, poll_index=3)
+        assert wf._gate_may_start(head_sha="a", poll_index=4)
+
+    async def test_settle_gate_logs_a_finished_merge_on_any_exit(
+        self, tick_logger: logging.Logger, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The hop/abandon/deadline/#516 exits reach only `_settle_gate`,
+        which used to drain a finished attempt and drop MERGE_APPROVED."""
+        wf = _bare_loop()
+
+        async def merged() -> ApprovalWaitResult:
+            return ApprovalWaitResult(outcome="ran", approval_id="aar_ok", approver="alice", decided_at="t")
+
+        gate_task = asyncio.create_task(merged())
+        await gate_task
+        with caplog.at_level(logging.INFO, logger=tick_logger.name):
+            await wf._settle_gate(gate_task, SERVICE, SLUG, repo="mctlhq/mctl-telegram", number=77)
+        assert any(
+            r.getMessage().startswith("MERGE_APPROVED pr=mctlhq/mctl-telegram#77 approval_ref=aar_ok approver=alice")
+            for r in caplog.records
+        )
+
+    async def test_settle_gate_records_a_finished_denial(self, tick_logger: logging.Logger) -> None:
+        """...and records it, so a hop that finishes the attempt carries the
+        settled head into the continued run."""
+        wf = _bare_loop()
+        wf._gate_head = "a"
+
+        async def denied() -> ApprovalWaitResult:
+            return _gate_result("denied")
+
+        gate_task = asyncio.create_task(denied())
+        await gate_task
+        await wf._settle_gate(gate_task, SERVICE, SLUG, repo="r", number=1, poll_index=2)
+        assert wf._gate_settled_head == "a"
+
+    async def test_settle_gate_cancels_an_in_flight_wait_without_raising(self, tick_logger: logging.Logger) -> None:
+        """The head-move and watch-end path: an attempt still waiting on a
+        human is cancelled, and CancelledError does not escape."""
+        wf = _bare_loop()
+        running = asyncio.Event()
+
+        async def waits_on_a_human() -> ApprovalWaitResult:
+            running.set()
+            await asyncio.sleep(3600)
+            return _gate_result("ran")
+
+        gate_task = asyncio.create_task(waits_on_a_human())
+        with anyio.fail_after(5):
+            await running.wait()
+        await wf._settle_gate(gate_task, SERVICE, SLUG, repo="r", number=1)
+        assert gate_task.cancelled()

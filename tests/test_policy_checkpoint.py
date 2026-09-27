@@ -256,6 +256,13 @@ def test_configured_policy_bogus_value_fails_closed_never_allow(monkeypatch):
     assert merge_rules[0].verdict == pc.DENY
 
 
+def test_configured_policy_bogus_value_never_reaches_the_policy_version(monkeypatch):
+    """The raw env value would ride into the intent hash, the POLICY_DECISION
+    line and a span attribute; only bounded fields may (#519 review P3)."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, "sometimes-" + "x" * 500)
+    assert "sometimes" not in pc.configured_policy().version
+
+
 def test_configured_policy_never_mutates_the_builtin_policy(monkeypatch):
     before = pc.BUILTIN_POLICY
     monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)

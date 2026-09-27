@@ -399,8 +399,11 @@ def configured_policy() -> Policy:
         return MERGE_APPROVAL_POLICY
     # Fail closed: an unrecognized value must refuse every merge, never
     # silently fall back to ALLOW (mirrors _MisconfiguredApprovals above).
+    # The raw value is NOT put into the version: it reaches the intent hash,
+    # the POLICY_DECISION line and a span attribute, which carry only
+    # bounded fields. The DENY rule id already names the misconfiguration.
     return Policy(
-        version=f"mctl-agents/policy/v1-merge-approval-misconfigured:{value}",
+        version="mctl-agents/policy/v1-merge-approval-misconfigured",
         rules=tuple(
             Rule("github-pr-merge-misconfigured", GITHUB_PR_MERGE, "merge", DENY)
             if rule.rule_id == "github-pr-merge" else rule
