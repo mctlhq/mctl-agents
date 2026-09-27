@@ -124,7 +124,18 @@ def store_ref_from(snapshot: ContextSnapshot, answer: SnapshotAnswer) -> StoreRe
     `snapshot_id` is `cs_`-prefixed (`_is_snapshot_id`) — an unverifiable ref
     is worse than no ref at all (mctlhq/mctl-agents#526). `snapshot.work_context`
     must be present; a snapshot with no work context (no store execution)
-    never has a store answer worth a ref either."""
+    never has a store answer worth a ref either.
+
+    On a cross-attempt replay (`persist`'s document-comparison branch after a
+    409), `answer.content_hash` is the ORIGINAL attempt's stored hash, not
+    this attempt's — `snapshot` here is this attempt's own document, which
+    differs from the stored bytes in exactly the retry-volatile fields
+    `differing_fields` already excused, so its canonical hash can never equal
+    that stored hash. `answer.local_content_hash` is this attempt's own hash
+    for that same case (`persist`'s docstring); preferring it keeps
+    `hash_bytes(canonical_bytes(snapshot)) == store_ref.store_content_hash`
+    true for a legitimate replay while a genuine divergence (never reaching
+    `stored`) is still caught upstream."""
     if not answer.stored or not _is_snapshot_id(answer.snapshot_id):
         return None
     work_context = snapshot.work_context
@@ -134,7 +145,7 @@ def store_ref_from(snapshot: ContextSnapshot, answer: SnapshotAnswer) -> StoreRe
         work_item_id=work_context.work_item_id,
         execution_id=work_context.execution_id,
         store_snapshot_id=answer.snapshot_id,
-        store_content_hash=answer.content_hash,
+        store_content_hash=answer.local_content_hash or answer.content_hash,
     )
 
 

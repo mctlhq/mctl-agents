@@ -826,12 +826,24 @@ def assess_evidence(
             observations=len(ordered), newest_age_seconds=newest_age_seconds,
         )
 
+    # A duplicate copy of the SAME observation (the same snapshot, observed
+    # at the same moment) must not each increment the streak — that would
+    # let N copies of one real observation satisfy
+    # `min_consecutive_observations = N` on their own
+    # (mctlhq/mctl-agents#526). Two observations of the same snapshot at
+    # genuinely different moments (e.g. two replay-CLI runs) still count
+    # separately, so the key includes `observed_at`, not `context_snapshot_id`
+    # alone.
     consecutive = 0
+    seen_observations: set[tuple[str, str, str]] = set()
     for record in ordered:
-        if _declared_identity_matches(record, expected) and _catalog_identity_matches(record, expected):
-            consecutive += 1
-        else:
+        if not (_declared_identity_matches(record, expected) and _catalog_identity_matches(record, expected)):
             break
+        observation_key = (record.context_snapshot_id, record.content_hash, record.observed_at)
+        if observation_key in seen_observations:
+            continue
+        seen_observations.add(observation_key)
+        consecutive += 1
     if consecutive < policy.min_consecutive_observations:
         return EvidenceAssessment(
             status="insufficient-observations", reason_code="fewer-than-minimum-consecutive-observations",

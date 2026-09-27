@@ -561,6 +561,32 @@ def test_assess_evidence_precedence():
     assert ce.assess_evidence(none_only, expected=expected, now=now, policy=policy).status == "missing"
 
 
+def test_assess_evidence_duplicate_observations_do_not_each_count():
+    """mctlhq/mctl-agents#526: N duplicate copies of the exact same
+    observation (same snapshot, same content, same `observed_at`) must not
+    satisfy `min_consecutive_observations = N` on their own — that would let
+    one real observation, logged twice, pass as evidence of repeated
+    agreement. Two observations of the same snapshot at genuinely different
+    moments still count separately."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+
+    one_real_observation = _record(expected, observed_at="2026-09-26T00:00:00Z")
+    three_copies = [one_real_observation, one_real_observation, one_real_observation]
+    result = ce.assess_evidence(three_copies, expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations"
+
+    # The same underlying snapshot observed at three genuinely different
+    # moments is three real observations, not duplicates, and still passes.
+    distinct_moments = [
+        replace(one_real_observation, observed_at=iso)
+        for iso in ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    ]
+    result = ce.assess_evidence(distinct_moments, expected=expected, now=now, policy=policy)
+    assert result.status == "fresh"
+
+
 def test_assess_evidence_malformed_observed_at_is_stale_not_a_crash():
     """A malformed `observed_at` string (not ISO-8601 at all) cannot be
     parsed for a freshness comparison; `assess_evidence` must fail closed

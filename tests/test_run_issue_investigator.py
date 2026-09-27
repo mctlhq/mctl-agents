@@ -4034,6 +4034,37 @@ def test_context_eval_on_prints_exactly_one_line_after_assembly(tmp_path, monkey
     assert payload["outcome"] is None
 
 
+def test_context_eval_on_carries_the_strategy_catalog_identity(tmp_path, monkeypatch, capsys):
+    """Regression for the catalog-identity fix in commit 61d2d79
+    (mctlhq/mctl-agents#526): before that fix, `_emit_context_eval` never
+    called `_load_catalog_identity`, so a live record's
+    `identity.strategy_content_hash`/`strategy_implementation_hash` were
+    always `""` and `assess_evidence` could never call the evidence `fresh`
+    (ADR 015 sec. 7). The default strategy (`deterministic-fixed-order`,
+    `1.0.0`) has a real committed catalog entry, so a live record must carry
+    its `contentHash`/`implementationHash` exactly."""
+    from orchestrator import context_release
+
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", "on")
+
+    def agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="shadow", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+    lines = capsys.readouterr().out.splitlines()
+    context_eval_line = next(line for line in lines if line.startswith("[context] context_eval="))
+    payload = json.loads(context_eval_line.split("=", 1)[1])
+
+    catalog_version = context_release.load_version("deterministic-fixed-order", "1.0.0")
+    assert payload["identity"]["strategy_content_hash"] == catalog_version.content_hash
+    assert payload["identity"]["strategy_implementation_hash"] == catalog_version.implementation_hash
+    assert payload["identity"]["strategy_content_hash"] != ""
+    assert payload["identity"]["strategy_implementation_hash"] != ""
+
+
 def test_context_eval_failure_never_fails_the_investigation(tmp_path, monkeypatch, capsys):
     """T18: a context_eval.evaluate monkeypatched to raise does not fail the
     investigation in shadow OR in on; one bounded warn: line is printed."""
