@@ -611,25 +611,30 @@ def promote(
     revision; `binding=None` starts revision 1 for an agent/environment
     with no committed binding yet.
 
-    **Slice A**: a `production` promotion is *always* refused as
-    `evidence-missing`, whatever its `evidence` block says — the evaluator
-    whose record it would validate is mctlhq/mctl-agents#526, not yet on the
-    running image, so this does not guess at its format. The real checks
-    (exact identity, <= 7 days, >= 3 consecutive observe runs, no
-    `hash-mismatch`) are mctlhq/mctl-agents#528."""
+    **Slice A**: a promotion to any environment other than `shadow` is
+    *always* refused as `evidence-missing`, whatever its `evidence` block
+    says — the evaluator whose record it would validate is
+    mctlhq/mctl-agents#526, not yet on the running image, so this does not
+    guess at its format. The real checks (exact identity, <= 7 days, >= 3
+    consecutive observe runs, no `hash-mismatch`) are mctlhq/mctl-agents#528."""
     if binding is not None and (binding.agent != agent or binding.environment != environment):
         raise ContextReleaseError(
             VERDICT_UNKNOWN, "binding does not match the requested (agent, environment)"
         )
     if not reason.strip():
         raise ContextReleaseError(VERDICT_UNKNOWN, "reason must be a non-empty string")
+    if not isinstance(promoted_by, str) or not promoted_by.strip():
+        raise ContextReleaseError(VERDICT_UNKNOWN, "promoted_by must be a non-empty string")
+    if not isinstance(promoted_at, str) or not promoted_at.strip():
+        raise ContextReleaseError(VERDICT_UNKNOWN, "promoted_at must be a non-empty string")
 
-    if environment == "production":
+    if environment != "shadow":
         raise ContextReleaseError(
             VERDICT_EVIDENCE_MISSING,
-            "production promotion is refused until mctlhq/mctl-agents#526's evaluator evidence exists on the "
-            "running image (mctlhq/mctl-agents#528 implements the real checks); this image has no evidence "
-            "format to validate against, so it does not guess",
+            f"{environment!r} promotion is refused until mctlhq/mctl-agents#526's evaluator evidence exists on "
+            "the running image (mctlhq/mctl-agents#528 implements the real checks); only 'shadow' accepts an "
+            "evidence-free promotion in this slice, and this image has no evidence format to validate against "
+            "for anything else, so it does not guess",
         )
 
     if evidence_kind not in EVIDENCE_KINDS:
@@ -729,12 +734,29 @@ def rollback(
 
 
 def build_version_document(
-    name: str, version: str, *, lifecycle: str = "published", root: Path = REPO_ROOT
+    name: str,
+    version: str,
+    *,
+    lifecycle: str | None = None,
+    agents: Sequence[str] | None = None,
+    root: Path = REPO_ROOT,
+    versions_dir: Path = VERSIONS_DIR,
 ) -> dict[str, Any]:
     """Build a fresh `ContextStrategyVersion` document for `name`@`version`,
     with `implementationHash`/`contentHash` computed from the code in
     `root` at call time. Raises if `name` is not a strategy
-    `orchestrator/context_assembly.py` implements."""
+    `orchestrator/context_assembly.py` implements.
+
+    `lifecycle`/`agents` default to the CURRENT on-disk document's values
+    when `versions_dir/name/version.yaml` already exists, and only fall back
+    to `'published'`/`['issue-investigator']` for a version with no prior
+    document. This is what makes the documented hash-drift repair command —
+    `python tools/context_release.py publish --strategy <name> --version
+    <version>`, run with no `--lifecycle` — a pure hash refresh: it must not
+    silently resurrect a `deprecated`/`disabled` version back to `published`
+    or reset a version's `agents` list to the single-agent default. Pass
+    `lifecycle`/`agents` explicitly to change either on purpose.
+    """
     if name not in STRATEGIES:
         raise ContextReleaseError(
             VERDICT_UNKNOWN, f"{name!r} is not a strategy orchestrator/context_assembly.py implements "
@@ -742,8 +764,31 @@ def build_version_document(
         )
     if not _SEMVER_RE.match(version):
         raise ContextReleaseError(VERDICT_UNKNOWN, f"version must be semver X.Y.Z, got {version!r}")
-    if lifecycle not in LIFECYCLE_VALUES:
+
+    existing_path = versions_dir / name / f"{version}.yaml"
+    existing_lifecycle: str | None = None
+    existing_agents: list[str] | None = None
+    if existing_path.is_file():
+        existing_document, _ = _read_yaml_and_hash(existing_path)
+        existing_spec = existing_document.get("spec")
+        if isinstance(existing_spec, dict):
+            if existing_spec.get("lifecycle") in LIFECYCLE_VALUES:
+                existing_lifecycle = existing_spec["lifecycle"]
+            candidate_agents = existing_spec.get("agents")
+            if (
+                isinstance(candidate_agents, list)
+                and candidate_agents
+                and all(isinstance(a, str) for a in candidate_agents)
+            ):
+                existing_agents = list(candidate_agents)
+
+    resolved_lifecycle = lifecycle if lifecycle is not None else (existing_lifecycle or "published")
+    resolved_agents = list(agents) if agents is not None else (existing_agents or ["issue-investigator"])
+
+    if resolved_lifecycle not in LIFECYCLE_VALUES:
         raise ContextReleaseError(VERDICT_UNKNOWN, f"lifecycle must be one of {sorted(LIFECYCLE_VALUES)!r}")
+    if not resolved_agents or not all(isinstance(a, str) for a in resolved_agents):
+        raise ContextReleaseError(VERDICT_UNKNOWN, "agents must be a non-empty list of agent names")
 
     files = sorted(IMPLEMENTATION_FILES_BY_STRATEGY[name])
     implementation_hash = compute_implementation_hash(files, root=root)
@@ -755,12 +800,12 @@ def build_version_document(
     # YAML does not move once the real hash is known. `compute_content_hash`
     # pops whatever is there before hashing, so the placeholder never
     # participates in its own hash.
-    spec: dict[str, Any] = {"lifecycle": lifecycle}
+    spec: dict[str, Any] = {"lifecycle": resolved_lifecycle}
     if ranker is not None:
         spec["ranker"] = {"name": ranker[0], "version": ranker[1]}
     spec["implementation"] = {"files": files, "implementationHash": implementation_hash}
     spec["contentHash"] = ""
-    spec["agents"] = ["issue-investigator"]
+    spec["agents"] = resolved_agents
 
     document = {
         "apiVersion": API_VERSION,
