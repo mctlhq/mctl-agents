@@ -102,6 +102,14 @@ def test_halving_the_poll_interval_did_not_halve_the_other_bounds() -> None:
         ), field
 
 
+def test_terminal_confirm_polls_stay_below_the_grace_give_up() -> None:
+    """mctl-agents#516: the terminal-status exit must fire before the
+    pr_lookup_grace_polls give-up under BOTH cadences, or it is dead code
+    and the no-PR tests would only fail by timing out."""
+    for cadence in (dev_loop.CADENCE, dev_loop.LEGACY_CADENCE):
+        assert PROPOSAL_TERMINAL_CONFIRM_POLLS < cadence.pr_lookup_grace_polls, cadence
+
+
 def test_the_shepherd_tick_got_faster_without_shrinking_its_window() -> None:
     """The point of the change (#213 follow-up): a finished review is picked
     up in minutes rather than hours, and the active window stays long enough

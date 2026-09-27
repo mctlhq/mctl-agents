@@ -5290,10 +5290,13 @@ class DevLoopWorkflow:
                     # version is what the row records about the entity it is
                     # letting go of.
                     head_sha=(last.head_sha or "") if last is not None else "",
-                    # mctlhq/mctl-agents#516: when `watch_ended` is set (the
-                    # not-found branch's terminal-status break), name the
-                    # observed proposal status instead of the generic
-                    # fallback -- the row should record why the owner let go.
+                    # mctlhq/mctl-agents#516: `watch_ended` is a defensive
+                    # fallback here only. The terminal-status break cannot
+                    # reach this write today: a claim (`_owned_entity_id`) is
+                    # only taken on a found poll, which also sets
+                    # `saw_open_pr` and so rules that break out. If a future
+                    # path combines them, the row names the status rather
+                    # than the generic text.
                     reason=(
                         f"pull request {(last.state or '').lower()}"
                         if terminal_state and last is not None

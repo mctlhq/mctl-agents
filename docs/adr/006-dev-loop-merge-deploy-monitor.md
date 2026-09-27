@@ -167,8 +167,9 @@ PR AND read a `LOOP_TERMINAL_PROPOSAL_STATUSES` status (`needs-triage`,
 `review-stuck`, `rejected`, `error`), AND no OPEN pull request was resolved
 earlier in this watch (`saw_open_pr`). The two-poll confirmation absorbs a
 stale `.status.yaml` read from gitops `main`. The effect is an earlier end
-(about 15 minutes instead of ~2 h), a `DevLoopResult.ended` reason naming the
-status, and a lifecycle release that names it too. The only watch that runs to
+(about 15 minutes instead of ~2 h) and a `DevLoopResult.ended` reason naming
+the status. No lifecycle row is involved: a claim is only taken on a poll that
+resolves a PR, and that sets `saw_open_pr`, which rules this exit out. The only watch that runs to
 the 14-day deadline is one with an OPEN PR, and that case is deliberately
 unchanged. `merged` is not
 in that set: the existing MERGED/CLOSED arm already ends the watch on it and
