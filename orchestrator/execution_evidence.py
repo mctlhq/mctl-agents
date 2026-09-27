@@ -618,8 +618,12 @@ class ExecutionEvidence:
     document and re-validates its shape, but never recomputes the hash —
     use `recompute_content_hash` to verify one. `from_dict` also runs every
     block through the same `_safe()` redaction/bounds check `seal()` applies
-    before hashing, so a credential-shaped value or an over-cap blob in the
-    raw mapping can never survive into `to_dict()`."""
+    before hashing, but fails closed on a hit: a document that needs
+    redaction was never legitimately produced by `seal()` (which redacts
+    before hashing), so `from_dict` raises `ExecutionEvidenceError` rather
+    than rewriting the document — that rewrite would otherwise leave
+    `content_hash`/`evidence_id` certifying content the returned envelope no
+    longer carries."""
 
     api_version: str
     kind: str
@@ -709,12 +713,15 @@ class ExecutionEvidence:
             raise ExecutionEvidenceError("artifacts must be a list")
 
         # Read-path parity with seal(): a document handed to from_dict is
-        # documented as "already sealed", but from_dict is the only gate
-        # between an arbitrary caller-supplied mapping and to_dict() ever
-        # re-emitting it. Route every block through the same _safe()
-        # redaction and per-leaf bounds check seal() runs before hashing, so
-        # a credential-shaped value or an over-cap blob smuggled into a raw
-        # dict can never survive a from_dict/to_dict round trip.
+        # documented as "already sealed", meaning seal() already redacted
+        # every block before computing content_hash/evidence_id. Route every
+        # block through the same _safe() redaction and per-leaf bounds check
+        # seal() runs before hashing, but only to detect a hit, never to
+        # rewrite the document: content_hash/evidence_id below are the raw,
+        # caller-supplied values, so silently accepting a redacted rewrite
+        # here would return an envelope whose identity fields certify
+        # content it no longer carries. A hit means this document was never
+        # legitimately produced by seal() — reject it instead.
         raw_payload: dict[str, Any] = {"execution": execution_raw, "outcome": outcome_raw}
         if policy_decisions_raw:
             raw_payload["policy_decisions"] = policy_decisions_raw
@@ -729,6 +736,16 @@ class ExecutionEvidence:
         if artifacts_raw:
             raw_payload["artifacts"] = artifacts_raw
         safe_payload, redaction_gaps = _safe(raw_payload, requirements=DEFAULT_REQUIREMENTS)
+        if redaction_gaps:
+            offending = sorted({gap.block for gap in redaction_gaps})
+            raise ExecutionEvidenceError(
+                "from_dict rejects a document that requires redaction on read: "
+                f"block(s) {offending!r} contain a credential-shaped or over-cap leaf. "
+                "A document produced by seal() is redacted before hashing and would "
+                "never trigger this; fix the document rather than relying on from_dict "
+                "to silently rewrite it, which would leave content_hash/evidence_id "
+                "certifying content the returned envelope no longer carries."
+            )
 
         execution = ExecutionJoin.from_dict(safe_payload["execution"])
         outcome = Outcome.from_dict(safe_payload["outcome"])
@@ -746,6 +763,7 @@ class ExecutionEvidence:
         gaps_raw = mapping.get("gaps", [])
         if not isinstance(gaps_raw, list):
             raise ExecutionEvidenceError("gaps must be a list")
+        # redaction_gaps is always empty here: a non-empty result raises above.
         gaps = tuple(Gap.from_dict(g) for g in gaps_raw) + redaction_gaps
 
         evidence = cls(
