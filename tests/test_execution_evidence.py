@@ -23,6 +23,7 @@ from orchestrator import execution_evidence as ee
 from orchestrator import policy_checkpoint as pc
 from orchestrator import redaction as red
 from orchestrator import tracing_sdk as ts
+from orchestrator import usage_ledger as ul
 from orchestrator.context_snapshot import ContextSnapshotError, EvidenceRef
 from orchestrator.human_input import CONTEXT_REF_PREFIXES
 from orchestrator.work_context import execution_requests as xr
@@ -141,6 +142,13 @@ def test_recompute_content_hash_agrees_with_seal_without_mutating():
     assert ev.to_dict() == before
 
 
+def test_validate_rejects_an_evidence_id_that_does_not_derive_from_content_hash():
+    doc = _seal().to_dict()
+    doc["evidence_id"] = ee.EVIDENCE_ID_PREFIX + "0" * 16
+    with pytest.raises(ee.ExecutionEvidenceError, match="does not match"):
+        ee.ExecutionEvidence.from_dict(doc)
+
+
 # ---------------------------------------------------------------------------
 # T2 — optional-block hash stability
 # ---------------------------------------------------------------------------
@@ -160,6 +168,28 @@ def test_adding_an_optional_block_changes_the_hash():
     without = _seal()
     with_snapshot = _seal(snapshot_refs=[_snapshot_ref()])
     assert without.content_hash != with_snapshot.content_hash
+
+
+# ---------------------------------------------------------------------------
+# created_at: excluded from content_hash by design (identical evidence_id
+# for two different created_at values, above), but still bounded and
+# format-checked like every other schema field.
+# ---------------------------------------------------------------------------
+def test_seal_rejects_a_malformed_created_at():
+    with pytest.raises(ee.ExecutionEvidenceError, match="created_at"):
+        _seal(created_at="not-a-timestamp")
+
+
+def test_seal_rejects_an_overlong_created_at():
+    with pytest.raises(ee.ExecutionEvidenceError, match="created_at"):
+        _seal(created_at="2026-01-01T00:00:00." + "9" * 40 + "Z")
+
+
+def test_from_dict_rejects_a_malformed_created_at():
+    doc = _seal().to_dict()
+    doc["created_at"] = "yesterday"
+    with pytest.raises(ee.ExecutionEvidenceError, match="created_at"):
+        ee.ExecutionEvidence.from_dict(doc)
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +277,17 @@ def test_redaction_drops_every_known_credential_shape(credential):
     evidence = _seal(execution=_execution(trace_id=credential))
     assert credential not in json.dumps(evidence.to_dict())
     assert evidence.execution.trace_id == ""
+
+
+@pytest.mark.parametrize("block", sorted(ee.BLOCK_NAMES))
+def test_recompute_content_hash_agrees_after_a_leaf_is_redacted(block):
+    # A redacted envelope must still be reproducible: recompute_content_hash
+    # has to hash the same leaf representation _safe() wrote at seal() time,
+    # not whatever a fresh to_dict() of the reconstructed dataclass defaults
+    # an absent field to.
+    evidence = _seal_with_credential_in(block)
+    assert evidence.completeness in (ee.COMPLETE, ee.INCOMPLETE)  # sealed at all
+    assert ee.recompute_content_hash(evidence) == evidence.content_hash
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +445,10 @@ def test_execution_request_vocabularies_agree_with_their_owning_module():
 
 def test_approval_states_agree_with_their_owning_module():
     assert ee.APPROVAL_STATES == {aa.PENDING, aa.APPROVED, aa.DENIED, aa.EXPIRED, aa.CONSUMED}
+
+
+def test_usage_devloop_stages_agree_with_their_owning_module():
+    assert ee.USAGE_DEVLOOP_STAGES == ul.DEVLOOP_STAGES
 
 
 # ---------------------------------------------------------------------------

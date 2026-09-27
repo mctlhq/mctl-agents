@@ -128,6 +128,18 @@ _SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 MAX_ARTIFACT_NAME_LENGTH = 256
 _ARTIFACT_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
+# `created_at` is excluded from `content_hash` by design (requirements.md:
+# "sealing the same inputs twice with different created_at values SHALL
+# produce the identical evidence_id and content_hash" — the same rule
+# `context_snapshot.py` and `capability.py` already state for their own
+# `created_at`). Exclusion from the hash is not exemption from being a
+# bounded, closed-shape field: it is an ISO8601 UTC timestamp
+# (`YYYY-MM-DDTHH:MM:SS[.ffffff]Z`), the shape every existing caller,
+# fixture and test already uses, and it is bounded and pattern-checked here
+# the same way every other schema field is.
+MAX_CREATED_AT_LENGTH = 40
+_CREATED_AT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
+
 # The generic redaction-safety-net cap `_safe()` applies to every leaf
 # regardless of which field it came from — mirrors
 # `orchestrator/redaction.py`'s MAX_ATTRIBUTE_CHARS. Per-field schema bounds
@@ -137,6 +149,17 @@ MAX_LEAF_CHARS = 256
 
 #: A sentinel distinguishing "this leaf was dropped" from a legitimate None.
 _DROPPED = object()
+
+#: The stable value written in place of a dropped leaf inside a mapping.
+#: Chosen to equal exactly what every reference block's own `from_dict`
+#: already defaults an absent string field to (`mapping.get(field, "")`), so
+#: a leaf redacted before hashing at `seal()` time hashes identically when
+#: `recompute_content_hash()` later rebuilds the payload from the
+#: reconstructed, already-redacted dataclass via its `to_dict()` (which
+#: always emits every key). Omitting the key outright — the alternative —
+#: would make every redacted envelope's `content_hash` unreproducible,
+#: because `to_dict()` cannot omit a key.
+_REDACTED_LEAF = ""
 
 
 class ExecutionEvidenceError(ValueError):
@@ -516,6 +539,10 @@ def _safe_node(value: Any, *, block: str, required: bool) -> tuple[Any, list[Gap
             gaps.extend(sub_gaps)
             if cleaned is _DROPPED:
                 gaps.append(Gap(block=block, code="redacted_out", required=required))
+                # Keep the key, with the same value its owning dataclass's
+                # from_dict already defaults an absent field to, rather than
+                # omitting it — see _REDACTED_LEAF.
+                out[key] = _REDACTED_LEAF
                 continue
             out[key] = cleaned
         return out, gaps
@@ -730,6 +757,13 @@ class ExecutionEvidence:
             raise ExecutionEvidenceError(
                 f"evidence_id must start with {EVIDENCE_ID_PREFIX!r}, got {self.evidence_id!r}"
             )
+        expected_evidence_id = EVIDENCE_ID_PREFIX + self.content_hash[7:23]
+        if self.evidence_id != expected_evidence_id:
+            raise ExecutionEvidenceError(
+                f"evidence_id {self.evidence_id!r} does not match the id derived from content_hash "
+                f"({expected_evidence_id!r})"
+            )
+        _check_created_at(self.created_at)
 
         _check_execution_join(self.execution)
         _check_outcome(self.outcome)
@@ -764,6 +798,14 @@ class ExecutionEvidence:
             "artifact_count": len(self.artifacts),
             "gap_count": len(self.gaps),
         }
+
+
+def _check_created_at(created_at: str) -> None:
+    if len(created_at) > MAX_CREATED_AT_LENGTH or not _CREATED_AT_PATTERN.match(created_at):
+        raise ExecutionEvidenceError(
+            "created_at must be an ISO8601 UTC timestamp of the form "
+            f"YYYY-MM-DDTHH:MM:SS[.ffffff]Z, got {created_at!r}"
+        )
 
 
 def _check_execution_join(join: ExecutionJoin) -> None:
