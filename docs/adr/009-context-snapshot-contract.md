@@ -399,7 +399,8 @@ unchanged.
 
 Trust still grants nothing (sec. 5): a tier orders what the model reads,
 never what anyone may do. Wiring promotion/rollback of strategies is
-mctlhq/mctl-agents#472; measuring them is #266.
+mctlhq/mctl-agents#472; measuring them is #266
+(`docs/adr/015-context-evaluation-contract.md`).
 
 ## Alternatives
 
@@ -510,10 +511,11 @@ future work this ADR fixes the seam for, not work it performs:
 | Follow-up | Owning issue |
 |---|---|
 | (a) A producer wired into `run_issue_investigator.py` that calls `seal()` with real fetched/hashed sources | delivered by mctlhq/mctl-agents#265 (`orchestrator/context_assembly.py`, gated by `ISSUE_INVESTIGATOR_CONTEXT_MODE`, default `off`) |
-| (b) Persisting sealed snapshots next to `ExecutionRecord` in mctl-api (the "Where sealed snapshots durably live" open question — `retention: execution-record` names the intended home) | needs an issue |
+| (b) Persisting sealed snapshots next to `ExecutionRecord` in mctl-api (the "Where sealed snapshots durably live" open question — `retention: execution-record` names the intended home) | delivered by mctlhq/mctl-agents#431, proven live in #490 |
 | (c) A redaction helper that hashes post-redaction bytes for real (sec. 7 states none exists today) | needs an issue |
 | (d) Emitting `to_log_dict()`'s attributes into #195 traces | mctlhq/mctl-agents#195 |
 | (e) Per-file enumeration of agent-directed reads inside `target-repo` sources, replacing the single `selector.mode: agent-directed` source with a real per-file list (sec. 8) | needs an issue |
+| (f) Measuring retrieval quality, freshness, cost and outcome impact of the snapshots (b) now persists | mctlhq/mctl-agents#266, `docs/adr/015-context-evaluation-contract.md` |
 
 `ExecutionCorrelation` now has a producer: ADR 011
 (`docs/adr/011-execution-identity-contract.md`,
