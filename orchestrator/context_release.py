@@ -691,6 +691,10 @@ def rollback(
     a target whose version has since become `disabled` and names it."""
     if not reason.strip():
         raise ContextReleaseError(VERDICT_UNKNOWN, "reason must be a non-empty string")
+    if not isinstance(promoted_by, str) or not promoted_by.strip():
+        raise ContextReleaseError(VERDICT_UNKNOWN, "promoted_by must be a non-empty string")
+    if not isinstance(promoted_at, str) or not promoted_at.strip():
+        raise ContextReleaseError(VERDICT_UNKNOWN, "promoted_at must be a non-empty string")
     target = next((r for r in binding.history if r.revision == to_revision), None)
     if target is None:
         raise ContextReleaseError(

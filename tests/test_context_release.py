@@ -268,6 +268,59 @@ def test_production_promotion_is_always_refused_as_evidence_missing(tmp_path):
     assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISSING
 
 
+def test_non_shadow_promotion_is_refused_even_when_not_named_production(tmp_path):
+    """`promote()` allowlists 'shadow' as the only evidence-free environment
+    (commit 8266e37) — any other environment name, not just the literal
+    string 'production', must be refused."""
+    versions_dir = tmp_path / "versions"
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
+    with pytest.raises(cr.ContextReleaseError) as excinfo:
+        cr.promote(
+            None,
+            agent="issue-investigator",
+            environment="staging",
+            strategy_name="deterministic-fixed-order",
+            strategy_version="1.0.0",
+            promoted_by="octocat",
+            reason="looks ready",
+            promoted_at="2026-09-27T00:00:00Z",
+            versions_dir=versions_dir,
+        )
+    assert excinfo.value.code == cr.VERDICT_EVIDENCE_MISSING
+
+
+def test_promote_refuses_empty_promoted_by(tmp_path):
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
+    with pytest.raises(cr.ContextReleaseError, match="promoted_by"):
+        cr.promote(
+            None,
+            agent="issue-investigator",
+            environment="shadow",
+            strategy_name="deterministic-fixed-order",
+            strategy_version="1.0.0",
+            promoted_by="   ",
+            reason="baseline",
+            promoted_at="2026-09-27T00:00:00Z",
+            versions_dir=tmp_path / "versions",
+        )
+
+
+def test_promote_refuses_empty_promoted_at(tmp_path):
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
+    with pytest.raises(cr.ContextReleaseError, match="promoted_at"):
+        cr.promote(
+            None,
+            agent="issue-investigator",
+            environment="shadow",
+            strategy_name="deterministic-fixed-order",
+            strategy_version="1.0.0",
+            promoted_by="octocat",
+            reason="baseline",
+            promoted_at="   ",
+            versions_dir=tmp_path / "versions",
+        )
+
+
 def test_shadow_promotion_with_none_evidence_and_reason_is_accepted(tmp_path):
     versions_dir = tmp_path / "versions"
     _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
@@ -426,6 +479,64 @@ def test_rollback_to_unknown_revision_raises(tmp_path):
         )
 
 
+def test_rollback_refuses_empty_promoted_by(tmp_path):
+    """A binding `rollback()` builds must always round-trip through
+    `load_binding()`, which requires `promotedBy` to be a non-empty string —
+    so `rollback()` validates it up front, matching `promote()`."""
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
+    _write_binding(tmp_path, history=[_revision(revision=1)])
+    binding = cr.load_binding("issue-investigator", "shadow", bindings_dir=tmp_path / "bindings")
+    with pytest.raises(cr.ContextReleaseError, match="promoted_by"):
+        cr.rollback(
+            binding, to_revision=1, promoted_by="   ", reason="x", promoted_at="2026-09-27T02:00:00Z",
+            versions_dir=tmp_path / "versions",
+        )
+
+
+def test_rollback_refuses_empty_promoted_at(tmp_path):
+    _write_version(tmp_path, name="deterministic-fixed-order", version="1.0.0")
+    _write_binding(tmp_path, history=[_revision(revision=1)])
+    binding = cr.load_binding("issue-investigator", "shadow", bindings_dir=tmp_path / "bindings")
+    with pytest.raises(cr.ContextReleaseError, match="promoted_at"):
+        cr.rollback(
+            binding, to_revision=1, promoted_by="octocat", reason="x", promoted_at="   ",
+            versions_dir=tmp_path / "versions",
+        )
+
+
+# ---------------------------------------------------------------------------
+# build_version_document — lifecycle/agents preservation on refresh
+# (commit 8266e37)
+# ---------------------------------------------------------------------------
+def test_build_version_document_preserves_existing_lifecycle_and_agents_on_refresh(tmp_path):
+    """The documented hash-drift repair command — `publish` with no
+    `--lifecycle` — must be a pure hash refresh: it must not silently
+    resurrect a deprecated/disabled version back to 'published' or reset
+    `agents` to the single-agent default."""
+    versions_dir = tmp_path / "versions"
+    first = cr.build_version_document(
+        "deterministic-fixed-order",
+        "1.0.0",
+        lifecycle="deprecated",
+        agents=["issue-investigator", "some-other-agent"],
+        versions_dir=versions_dir,
+    )
+    path = versions_dir / "deterministic-fixed-order" / "1.0.0.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(first), encoding="utf-8")
+
+    refreshed = cr.build_version_document("deterministic-fixed-order", "1.0.0", versions_dir=versions_dir)
+    assert refreshed["spec"]["lifecycle"] == "deprecated"
+    assert refreshed["spec"]["agents"] == ["issue-investigator", "some-other-agent"]
+
+
+def test_build_version_document_defaults_when_no_existing_document(tmp_path):
+    versions_dir = tmp_path / "versions"
+    document = cr.build_version_document("deterministic-fixed-order", "1.0.0", versions_dir=versions_dir)
+    assert document["spec"]["lifecycle"] == "published"
+    assert document["spec"]["agents"] == ["issue-investigator"]
+
+
 # ---------------------------------------------------------------------------
 # T13 — drift guard: a synthetic edit to a declared implementation file makes
 # the real-catalog drift-guard test below fail with the republish command.
@@ -546,6 +657,27 @@ def test_cli_resolve_prints_verdict():
     )
     assert result.returncode == 0, result.stderr
     assert "verdict=ok" in result.stdout
+
+
+def test_cli_promote_rejects_unsafe_agent_path_segment(tmp_path):
+    """`--agent`/`--environment` are validated against a safe path-segment
+    pattern before they reach `BINDINGS_DIR / environment / f"{agent}.yaml"`
+    (commit 8266e37) — a `..` segment must be rejected by argparse, not
+    silently escape the catalog directory."""
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "../escape", "--environment", "shadow",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "x",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "must be a single path segment" in result.stderr
 
 
 def test_cli_help_exits_zero():
