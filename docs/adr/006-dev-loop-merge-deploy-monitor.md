@@ -157,14 +157,20 @@ second `run` parameter.
 PR-shaped: MERGED/CLOSED, a non-transient `get_pr_state` failure, the
 `pr_lookup_grace_polls` give-up when no PR link ever resolves, or the
 14-day `MERGE_WATCH_DEADLINE`. None of them read the proposal's own
-`status:`, so a proposal parked in a terminal status with NO pull request
-(e.g. `no-commits` → `needs-triage`) kept the watch running, heartbeating a
-healthy-looking lifecycle-ownership claim, for up to 14 days with nothing
-left to observe. `_watch_pr` now ends the watch, under the
-`proposal-terminal-end` patch, when the same `get_pr_state` poll finds no PR
-AND the proposal's status is a `LOOP_TERMINAL_PROPOSAL_STATUSES` member
-(`needs-triage`, `review-stuck`, `rejected`, `error`) AND no OPEN pull
-request was resolved earlier in this watch (`saw_open_pr`). `merged` is not
+`status:`. A proposal parked in a terminal status with NO pull request
+(e.g. `no-commits` → `needs-triage`) was already bounded, by the
+`pr_lookup_grace_polls` give-up (8 polls, ~2 h), but the watch spent those
+polls on a proposal nothing would advance and ended with no recorded reason.
+`_watch_pr` now ends the watch, under the `proposal-terminal-end` patch, once
+`PROPOSAL_TERMINAL_CONFIRM_POLLS` (2) CONSECUTIVE `get_pr_state` polls find no
+PR AND read a `LOOP_TERMINAL_PROPOSAL_STATUSES` status (`needs-triage`,
+`review-stuck`, `rejected`, `error`), AND no OPEN pull request was resolved
+earlier in this watch (`saw_open_pr`). The two-poll confirmation absorbs a
+stale `.status.yaml` read from gitops `main`. The effect is an earlier end
+(about 15 minutes instead of ~2 h), a `DevLoopResult.ended` reason naming the
+status, and a lifecycle release that names it too. The only watch that runs to
+the 14-day deadline is one with an OPEN PR, and that case is deliberately
+unchanged. `merged` is not
 in that set: the existing MERGED/CLOSED arm already ends the watch on it and
 drives 6.2-6.4. And the check never fires while a linked pull request is
 OPEN, whatever the status: reconcile's own repair

@@ -1329,8 +1329,8 @@ class TestGetPRState:
     async def test_proposal_status_is_parsed_when_no_pr_field_exists(self, env, monkeypatch):
         """The `found=False` no-commits shape: no `pr:` field at all, but the
         status IS readable — this is what lets a needs-triage proposal with
-        no PR link end the merge watch on its first poll instead of after
-        the grace polls."""
+        no PR link end the merge watch after PROPOSAL_TERMINAL_CONFIRM_POLLS
+        consecutive polls instead of after the grace polls."""
         from orchestrator.temporal.activities.pr_state import get_pr_state
 
         self._handler(monkeypatch, status_yaml="status: needs-triage\n")

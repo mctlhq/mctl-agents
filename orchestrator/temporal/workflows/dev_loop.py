@@ -38,8 +38,11 @@ signal (a graceful, cluster-access-free alternative to Temporal
 next observation point. The post-implement merge watch (`_watch_pr`) itself
 ends early, under the `proposal-terminal-end` patch, when the proposal's own
 `.status.yaml` `status:` reaches a `LOOP_TERMINAL_PROPOSAL_STATUSES` member
-(`needs-triage`, `review-stuck`, `rejected`, `error`) with no pull request
-linked and none resolved OPEN earlier in the watch (mctl-agents#516) --
+(`needs-triage`, `review-stuck`, `rejected`, `error`) on
+`PROPOSAL_TERMINAL_CONFIRM_POLLS` consecutive polls with no pull request
+linked and none resolved OPEN earlier in the watch (mctl-agents#516). This ends
+a PR-less watch sooner than the `pr_lookup_grace_polls` give-up that already
+bounded it, and records why --
 `merged` deliberately does NOT trigger this exit, since the existing
 MERGED/CLOSED pull-request arm already ends the watch and is what drives the
 deploy-observation and incident-watch stages. Every one of these paths
@@ -444,6 +447,16 @@ LOOP_TERMINAL_PROPOSAL_STATUSES = frozenset({
     "rejected",
     "error",
 })
+
+
+# How many CONSECUTIVE not-found polls must read a loop-terminal status before
+# the watch ends on it (mctlhq/mctl-agents#516). The status comes from a
+# contents-API read of `.status.yaml` on `main`, which can lag the latest
+# write -- the same "gitops main lag" PR_LOOKUP_GRACE_POLLS absorbs. A proposal
+# re-driven out of `needs-triage` could otherwise be ended by one stale sample.
+# Two costs one extra poll against a change whose benefit is ending ~2 h
+# (pr_lookup_grace_polls) earlier; it must stay below pr_lookup_grace_polls.
+PROPOSAL_TERMINAL_CONFIRM_POLLS = 2
 
 
 def _loop_terminal_status(status: str | None) -> str:
@@ -1337,6 +1350,10 @@ class MergeWatchResume:
     # access) must keep riding the existing `pr_lookup_grace_polls` rule
     # rather than being treated as "no pull request ever existed".
     saw_open_pr: bool = False
+    # Consecutive not-found polls, ending with the latest, that read a
+    # loop-terminal status (PROPOSAL_TERMINAL_CONFIRM_POLLS). Carried so a hop
+    # between the two observations neither restarts nor skips the count.
+    terminal_status_polls: int = 0
 
     # --- Lifecycle claim: the ownership row this loop holds, or doesn't.
     # Must survive the boundary so a hop is invisible to the reconciler and
@@ -4889,6 +4906,7 @@ class DevLoopWorkflow:
             track_ownership = resume.track_ownership
             proposal_terminal_end = resume.proposal_terminal_end
             saw_open_pr = resume.saw_open_pr
+            terminal_status_polls = resume.terminal_status_polls
         else:
             # In-loop shepherd (#213): evaluated once — the marker also fixes
             # whether tick commands appear in this execution's history at all.
@@ -4946,6 +4964,7 @@ class DevLoopWorkflow:
             # has resolved an OPEN PR yet.
             proposal_terminal_end = workflow.patched(PROPOSAL_TERMINAL_PATCH)
             saw_open_pr = False
+            terminal_status_polls = 0
             # NOTE (ADR-010 phase 2, #352): there is deliberately no
             # "lifecycle-claims" patch marker here. This PR reverted the watch-end
             # write to a bare `release` because nothing in this repository calls
@@ -5017,6 +5036,7 @@ class DevLoopWorkflow:
                         track_ownership=track_ownership,
                         proposal_terminal_end=proposal_terminal_end,
                         saw_open_pr=saw_open_pr,
+                        terminal_status_polls=terminal_status_polls,
                         owned_entity_id=self._owned_entity_id,
                         owner_epoch=self._owner_epoch,
                         owned_head_sha=self._owned_head_sha,
@@ -5080,6 +5100,7 @@ class DevLoopWorkflow:
                 if state.found:
                     last = state
                     polls_without_pr = 0
+                    terminal_status_polls = 0
                     if state.state not in ("MERGED", "CLOSED"):
                         # mctlhq/mctl-agents#516: an OPEN PR resolved at any
                         # point in this watch guards the terminal-status
@@ -5187,7 +5208,13 @@ class DevLoopWorkflow:
                     terminal_status = (
                         _loop_terminal_status(state.proposal_status) if proposal_terminal_end else ""
                     )
-                    if terminal_status and not saw_open_pr:
+                    # Confirmed over PROPOSAL_TERMINAL_CONFIRM_POLLS consecutive
+                    # polls, never on one possibly-stale read: any poll that
+                    # resolves a PR or reads a live status resets the count.
+                    terminal_status_polls = (
+                        terminal_status_polls + 1 if terminal_status and not saw_open_pr else 0
+                    )
+                    if terminal_status_polls >= PROPOSAL_TERMINAL_CONFIRM_POLLS:
                         watch_ended = f"proposal {terminal_status}"
                         break
                     # Give up after GRACE consecutive unresolvable polls — this

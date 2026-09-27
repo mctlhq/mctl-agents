@@ -52,6 +52,7 @@ from orchestrator.temporal.workflows.dev_loop import (
     LIFECYCLE_UNKNOWN_WRITE_LIMIT,
     LOOP_TERMINAL_PROPOSAL_STATUSES,
     MERGE_WATCH_MAX_HOPS,
+    PROPOSAL_TERMINAL_CONFIRM_POLLS,
     SHEPHERD_TICK_EVERY_POLLS,
     SHEPHERD_TICKS_MAX,
     AbandonState,
@@ -4411,9 +4412,10 @@ class TestProposalTerminalEnd:
         assert result.ended == ""
         assert "mctl-agents-shepherd" in calls
 
-    async def test_terminal_status_with_no_pr_ends_the_watch_on_the_first_poll(self, env):
+    async def test_terminal_status_with_no_pr_ends_the_watch_after_the_confirm_polls(self, env):
         """T2c/T3: a terminal-set status with NO pull request ends the watch
-        at the very first poll -- not after cadence.pr_lookup_grace_polls.
+        after PROPOSAL_TERMINAL_CONFIRM_POLLS consecutive polls -- not after
+        cadence.pr_lookup_grace_polls, and never on one possibly-stale read.
         `DevLoopResult.ended` names the status, and `DevLoopResult.pr`
         carries the last observed (found=False) PRState. No shepherd tick or
         ownership row is ever touched: no PR was ever found to tick on or
@@ -4462,15 +4464,62 @@ class TestProposalTerminalEnd:
             with anyio.fail_after(10):
                 result = await handle.result()
 
-        assert poll_count["n"] == 1, (
+        assert poll_count["n"] == PROPOSAL_TERMINAL_CONFIRM_POLLS, (
             f"watch polled get_pr_state {poll_count['n']} times; a terminal "
-            "status with no PR must end on the FIRST poll"
+            f"status with no PR must end after exactly {PROPOSAL_TERMINAL_CONFIRM_POLLS} "
+            "consecutive polls"
         )
         assert result.ended == "proposal needs-triage"
         assert result.pr is not None
         assert result.pr.found is False
         assert result.pr.proposal_status == "needs-triage"
         assert not ownership_ops, "no PR was ever resolved, so no row could exist to relinquish"
+
+    async def test_a_single_stale_terminal_read_does_not_end_the_watch(self, env):
+        """A lone terminal-status read (a stale `.status.yaml` on gitops
+        `main`) followed by a live status resets the confirmation count: the
+        watch ends only once PROPOSAL_TERMINAL_CONFIRM_POLLS consecutive polls
+        agree, here on polls 3 and 4, never on poll 1."""
+        assert PROPOSAL_TERMINAL_CONFIRM_POLLS == 2  # the sequence below is built for 2
+        base_activities, _calls, investigate_ran, _ownership_ops = _fake_activities(released=True)
+        statuses = ["needs-triage", "accepted", "needs-triage", "needs-triage"]
+        poll_count = {"n": 0}
+
+        @activity.defn(name="get_pr_state")
+        async def fake_get_pr_state_stale_then_confirmed(service: str, slug: str) -> PRState:
+            status = statuses[min(poll_count["n"], len(statuses) - 1)]
+            poll_count["n"] += 1
+            return PRState(found=False, proposal_status=status)
+
+        activities = [
+            a for a in base_activities if getattr(a, "__name__", "") != "fake_get_pr_state"
+        ]
+        activities.append(fake_get_pr_state_stale_then_confirmed)
+
+        async with Worker(
+            env.client,
+            task_queue=TASK_QUEUE,
+            workflows=[DevLoopWorkflow],
+            activities=activities,
+        ):
+            handle = await env.client.start_workflow(
+                DevLoopWorkflow.run,
+                IssueRef(issue_url="https://github.com/mctlhq/mctl-telegram/issues/5164"),
+                id=f"dev-loop-test-{uuid.uuid4()}",
+                task_queue=TASK_QUEUE,
+            )
+            with anyio.fail_after(10):
+                await investigate_ran.wait()
+            await handle.signal(DevLoopWorkflow.approve)
+            with anyio.fail_after(10):
+                result = await handle.result()
+
+        assert poll_count["n"] == 4, (
+            f"watch polled get_pr_state {poll_count['n']} times; the stale read on "
+            "poll 1 must be reset by the live status on poll 2, so the end comes "
+            "on poll 4"
+        )
+        assert result.ended == "proposal needs-triage"
 
     async def test_saw_open_pr_guards_a_later_transient_404_with_a_terminal_status(self, env):
         """T2d: once an OPEN PR has resolved, a LATER poll that returns
