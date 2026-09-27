@@ -150,7 +150,8 @@ See design.md for the full comparison; summarized:
   metrics are the issue-investigator's; other agents may reuse the module.
 - Storing raw production context anywhere, or a new mctl-api route.
 - Changing what the assembler selects, or promoting/rolling back a
-  strategy on this evidence (that is #472).
+  strategy on this evidence (that is #472,
+  `docs/adr/019-context-strategy-release-contract.md`).
 - Replacing or re-implementing #60's final-output evaluation.
 
 ## Platform impact
