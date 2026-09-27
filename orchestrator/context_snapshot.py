@@ -180,6 +180,12 @@ def _optional_str(value: Any, *, where: str) -> str | None:
     return _require_str(value, where=where)
 
 
+def _optional_int(value: Any, *, where: str) -> int | None:
+    if value is None:
+        return None
+    return _require_int(value, where=where)
+
+
 def _require_sha256(value: Any, *, where: str) -> str:
     text = _require_str(value, where=where)
     if not text.startswith("sha256:"):
@@ -649,32 +655,60 @@ class WorkContextRef:
 class ContextStrategy:
     """Which assembler/ranker produced this snapshot. `ranker_name`/
     `ranker_version` stay optional because no ranker exists yet; a future
-    one is identified here without an `apiVersion` bump (ADR 009 sec. 6)."""
+    one is identified here without an `apiVersion` bump (ADR 009 sec. 6).
+
+    `release_revision`/`content_hash` are ADR 009 amendment 2
+    (mctlhq/mctl-agents#472): the `ContextStrategyBinding` revision and the
+    `ContextStrategyVersion` content hash a snapshot was sealed under, when
+    it was sealed under one at all. Following amendment 1's `conflicts`
+    precedent byte-for-byte: optional, omitted from `to_dict()` when unset,
+    and entering `content_hash` (the snapshot's own hash field, not this
+    one) only when present — so every snapshot sealed before this field
+    existed, or sealed at `CONTEXT_RELEASE_ROLLOUT_MODE=off`, keeps its
+    exact bytes and its `snapshot_id`."""
 
     name: str
     version: str
     ranker_name: str | None = None
     ranker_version: str | None = None
+    release_revision: int | None = None
+    content_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        doc: dict[str, Any] = {
             "name": self.name,
             "version": self.version,
             "ranker_name": self.ranker_name,
             "ranker_version": self.ranker_version,
         }
+        if self.release_revision is not None:
+            doc["release_revision"] = self.release_revision
+        if self.content_hash is not None:
+            doc["content_hash"] = self.content_hash
+        return doc
 
     @classmethod
     def from_dict(cls, data: Any) -> ContextStrategy:
         mapping = _require_mapping(data, where="strategy")
         _reject_unknown_keys(
-            mapping, frozenset({"name", "version", "ranker_name", "ranker_version"}), where="strategy"
+            mapping,
+            frozenset(
+                {"name", "version", "ranker_name", "ranker_version", "release_revision", "content_hash"}
+            ),
+            where="strategy",
         )
+        content_hash = mapping.get("content_hash")
         return cls(
             name=_require_str(mapping.get("name"), where="strategy.name"),
             version=_require_str(mapping.get("version"), where="strategy.version"),
             ranker_name=_optional_str(mapping.get("ranker_name"), where="strategy.ranker_name"),
             ranker_version=_optional_str(mapping.get("ranker_version"), where="strategy.ranker_version"),
+            release_revision=_optional_int(
+                mapping.get("release_revision"), where="strategy.release_revision"
+            ),
+            content_hash=_require_sha256(content_hash, where="strategy.content_hash")
+            if content_hash is not None
+            else None,
         )
 
 

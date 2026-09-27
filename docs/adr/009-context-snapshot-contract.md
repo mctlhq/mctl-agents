@@ -399,8 +399,41 @@ unchanged.
 
 Trust still grants nothing (sec. 5): a tier orders what the model reads,
 never what anyone may do. Wiring promotion/rollback of strategies is
-mctlhq/mctl-agents#472; measuring them is #266
-(`docs/adr/015-context-evaluation-contract.md`).
+mctlhq/mctl-agents#472 (`docs/adr/019-context-strategy-release-contract.md`);
+measuring them is #266 (`docs/adr/015-context-evaluation-contract.md`).
+
+## Amendment 2 — release provenance fields (mctlhq/mctl-agents#472)
+
+> **Status:** accepted (Slice A of mctlhq/mctl-agents#472; see
+> `docs/adr/019-context-strategy-release-contract.md` for what a
+> "binding revision" and a version's "content hash" mean, how they are
+> produced, and the promotion/rollback lifecycle around them — this
+> amendment only extends the snapshot's own field shape, sec. 6's rule for
+> exactly how)
+
+`ContextStrategy` (sec. 1) gains two optional fields, following amendment
+1's `conflicts` precedent byte-for-byte:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `release_revision` | int, optional | the `ContextStrategyBinding` revision this snapshot was sealed under, when it was sealed under a resolved binding at all (ADR 019) |
+| `content_hash` | str, optional, `sha256:`-prefixed | the `ContextStrategyVersion.spec.contentHash` of the strategy version that produced this snapshot, when known |
+
+*Hashing.* Both fields enter the snapshot's own `content_hash` (sec. 2)
+**only when set**, and `to_dict()` omits each when unset — the same rule
+`conflicts` and `work_context` already follow. A snapshot sealed without a
+resolved binding (every snapshot sealed at `CONTEXT_RELEASE_ROLLOUT_MODE=off`,
+the default, including every snapshot persisted before this amendment and
+the checked-in golden fixture) therefore keeps its exact bytes and its
+`snapshot_id`. `from_dict` accepts both keys and still rejects any unknown
+key inside `strategy`; `content_hash`, when present, is validated by the
+same `_require_sha256` every other hash field in this schema uses.
+
+This amendment reopens nothing else sec. 1-7 fixed, and adds no new closed
+vocabulary: `release_revision`/`content_hash` are identifiers to correlate
+a snapshot with its binding history, never inputs to a policy or
+authorization decision (sec. 5, restated as normative for the whole release
+lifecycle in ADR 019).
 
 ## Alternatives
 
@@ -516,6 +549,7 @@ future work this ADR fixes the seam for, not work it performs:
 | (d) Emitting `to_log_dict()`'s attributes into #195 traces | mctlhq/mctl-agents#195 |
 | (e) Per-file enumeration of agent-directed reads inside `target-repo` sources, replacing the single `selector.mode: agent-directed` source with a real per-file list (sec. 8) | needs an issue |
 | (f) Measuring retrieval quality, freshness, cost and outcome impact of the snapshots (b) now persists | mctlhq/mctl-agents#266, `docs/adr/015-context-evaluation-contract.md` |
+| (g) Promoting/rolling back a strategy version through an immutable, content-pinned version and an atomic, audited per-(agent, environment) binding, and a rollout ladder that can observe a candidate strategy without changing what the model reads | mctlhq/mctl-agents#472, `docs/adr/019-context-strategy-release-contract.md` (Slice A: catalog and validation only; Slice B/#527 wires the rollout ladder; Slice C/#528 gates production promotion on (f)'s evaluator) |
 
 `ExecutionCorrelation` now has a producer: ADR 011
 (`docs/adr/011-execution-identity-contract.md`,

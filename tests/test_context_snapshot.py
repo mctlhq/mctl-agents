@@ -305,6 +305,109 @@ def test_module_import_is_stdlib_only():
 
 
 # ---------------------------------------------------------------------------
+# T11 (mctlhq/mctl-agents#472, tasks.md task 11): the same two T5 invariants
+# above, extended to orchestrator/context_release.py — the release-catalog
+# loader/resolver this proposal adds. No promotion, binding or hash it
+# produces may ever be read by a policy, capability-eligibility or
+# authorization decision (ADR 009 sec. 5, restated in ADR 019), and the
+# module itself must never be reachable from a policy path's import graph.
+# ---------------------------------------------------------------------------
+def test_context_release_serialized_shapes_have_no_authorization_field_name():
+    from orchestrator import context_release as cr
+
+    version = cr.build_version_document("deterministic-fixed-order", "1.0.0")
+    resolved = cr.ResolvedContextStrategy(
+        agent="issue-investigator",
+        environment="shadow",
+        strategy="deterministic-fixed-order",
+        version="1.0.0",
+        ranker_name=None,
+        ranker_version=None,
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        release_revision=1,
+        verdict=cr.VERDICT_OK,
+    )
+    revision = cr.ContextStrategyBindingRevision(
+        revision=1,
+        strategy="deterministic-fixed-order",
+        version="1.0.0",
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        promoted_by="octocat",
+        promoted_at="2026-09-27T00:00:00Z",
+        reason="baseline",
+        evidence_kind="none",
+    )
+    binding = cr.ContextStrategyBinding(agent="issue-investigator", environment="shadow", history=(revision,))
+
+    keys: set[str] = set()
+    keys |= set(_walk_keys(version))
+    keys |= set(_walk_keys(resolved.to_dict()))
+    keys |= set(_walk_keys(binding.to_dict()))
+    for key in keys:
+        lowered = key.lower()
+        for token in _FORBIDDEN_TOKENS:
+            assert token not in lowered, f"field name {key!r} contains forbidden token {token!r}"
+
+
+def test_context_release_verdicts_have_no_authorization_token():
+    from orchestrator import context_release as cr
+
+    for verdict in cr.VERDICTS:
+        lowered = verdict.lower()
+        for token in _FORBIDDEN_TOKENS:
+            assert token not in lowered, f"verdict {verdict!r} contains forbidden token {token!r}"
+
+
+def test_context_release_is_not_imported_by_any_policy_module():
+    """Import-direction assertion: no module whose name says "policy" or
+    "lifecycle" (this repository's closest thing to a policy path —
+    orchestrator/policy_checkpoint.py, orchestrator/lifecycle/*) imports
+    orchestrator.context_release, at module scope or otherwise. A promotion,
+    binding or hash is ordering and measurement only (ADR 009 sec. 5); it
+    must never become reachable from an authorization decision."""
+    policy_like = sorted(
+        p for p in REPO_ROOT.joinpath("orchestrator").rglob("*.py")
+        if ("policy" in p.stem or "lifecycle" in p.parts) and p.name != "context_release.py"
+    )
+    assert policy_like, "expected at least one policy-like module to check against"
+    offenders = [
+        p for p in policy_like
+        if "context_release" in p.read_text(encoding="utf-8")
+    ]
+    assert not offenders, f"policy-like module(s) reference context_release: {offenders}"
+
+
+def test_context_release_module_does_not_leak_claude_sdk_or_mcp():
+    """Mirrors test_module_import_is_stdlib_only above: importing
+    orchestrator.context_release (which parses YAML, unlike
+    context_snapshot/context_assembly's stdlib-only pair) must still never
+    pull in the agent SDK or MCP — the same non-negotiable
+    tests/test_worker_isolation.py enforces for the rest of the orchestration
+    process."""
+    result = subprocess.run(
+        [
+            sys.executable, "-c",
+            "import orchestrator.context_release, sys; "
+            "print(chr(10).join(sorted(sys.modules)))",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"import failed:\n{result.stderr[-2000:]}"
+    loaded = set(result.stdout.split("\n"))
+    third_party_prefixes = ("claude_agent_sdk", "temporalio", "httpx", "mcp")
+    leaked = sorted(
+        name for name in loaded
+        if any(name == prefix or name.startswith(prefix + ".") for prefix in third_party_prefixes)
+    )
+    assert not leaked, f"orchestrator.context_release pulled in third-party modules: {leaked}"
+
+
+# ---------------------------------------------------------------------------
 # T6 — boundary invariants: evidence_refs accept only {evidence_id, kind};
 # the trace-export helper never emits a locator/selector/payload string.
 # ---------------------------------------------------------------------------
@@ -946,3 +1049,83 @@ def test_surface_vocabularies_are_identical():
     from orchestrator.work_context.contract import SURFACE_KINDS
 
     assert cs.WORK_CONTEXT_SURFACE_KINDS == SURFACE_KINDS
+
+
+# ---------------------------------------------------------------------------
+# ADR 009 amendment 2 (mctlhq/mctl-agents#472): ContextStrategy gains
+# optional release_revision/content_hash, following amendment 1's
+# `conflicts` precedent byte-for-byte — task 2 / T1 / T2.
+# ---------------------------------------------------------------------------
+def test_golden_fixture_snapshot_id_unchanged_by_amendment_2():
+    """T1: the checked-in golden fixture's content_hash/snapshot_id are
+    unaffected by the new optional fields existing — it was sealed before
+    they did, and neither is present in its `strategy` block."""
+    raw = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+    recorded_hash = raw["content_hash"]
+    assert "release_revision" not in raw["strategy"]
+    assert "content_hash" not in raw["strategy"]
+    snapshot = cs.ContextSnapshot.from_dict(raw)
+    assert cs.recompute_content_hash(snapshot) == recorded_hash
+    assert snapshot.snapshot_id == "cs-" + recorded_hash[7:23]
+
+
+def test_sealing_without_release_fields_matches_sealing_before_they_existed():
+    """T2: a snapshot sealed with the two new fields left unset produces a
+    `snapshot_id` identical to one sealed with a bare two-field strategy —
+    the same guarantee amendment 1 made for `conflicts`."""
+    before = _minimal_snapshot(strategy=cs.ContextStrategy(name="deterministic-fixed-order", version="1.0.0"))
+    after = _minimal_snapshot(
+        strategy=cs.ContextStrategy(
+            name="deterministic-fixed-order",
+            version="1.0.0",
+            release_revision=None,
+            content_hash=None,
+        )
+    )
+    assert before.snapshot_id == after.snapshot_id
+    assert before.content_hash == after.content_hash
+    assert "release_revision" not in before.strategy.to_dict()
+    assert "content_hash" not in before.strategy.to_dict()
+
+
+def test_sealing_with_release_fields_set_changes_content_hash():
+    unset = _minimal_snapshot()
+    released = _minimal_snapshot(
+        strategy=cs.ContextStrategy(
+            name="deterministic-fixed-order",
+            version="1.0.0",
+            release_revision=3,
+            content_hash="sha256:" + "4d" * 32,
+        )
+    )
+    assert unset.content_hash != released.content_hash
+    assert unset.snapshot_id != released.snapshot_id
+
+
+def test_strategy_release_fields_round_trip():
+    strategy = cs.ContextStrategy(
+        name="trust-freshness-ranked",
+        version="1.0.0",
+        ranker_name="trust-freshness-recency",
+        ranker_version="1.0.0",
+        release_revision=2,
+        content_hash="sha256:" + "5e" * 32,
+    )
+    doc = strategy.to_dict()
+    assert doc["release_revision"] == 2
+    assert doc["content_hash"] == "sha256:" + "5e" * 32
+    assert cs.ContextStrategy.from_dict(doc) == strategy
+
+
+def test_strategy_from_dict_still_rejects_unknown_key():
+    doc = _strategy().to_dict()
+    doc["unexpected"] = "nope"
+    with pytest.raises(cs.ContextSnapshotError, match="unknown key"):
+        cs.ContextStrategy.from_dict(doc)
+
+
+def test_strategy_content_hash_requires_sha256_prefix():
+    doc = _strategy().to_dict()
+    doc["content_hash"] = "not-a-hash"
+    with pytest.raises(cs.ContextSnapshotError, match="sha256"):
+        cs.ContextStrategy.from_dict(doc)
