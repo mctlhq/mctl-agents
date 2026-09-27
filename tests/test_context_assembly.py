@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from orchestrator import context_assembly as ca
+from orchestrator import context_release as cr
+from orchestrator import context_rollout as rollout
 from orchestrator import context_snapshot as cs
 from orchestrator.run_issue_investigator import IssueData, IssueRef
 
@@ -556,21 +558,27 @@ def test_module_import_is_stdlib_only():
 # ---------------------------------------------------------------------------
 _FORBIDDEN_TOKENS = ("allow", "deny", "permit", "grant", "authorized")
 
+# mctlhq/mctl-agents#527 Slice B task 13: the new stdlib-only ladder module
+# gets the same coverage as context_assembly.py itself.
+_GUARDED_MODULES = ("orchestrator/context_assembly.py", "orchestrator/context_rollout.py")
 
-def test_module_source_has_no_authorization_vocabulary():
+
+@pytest.mark.parametrize("relpath", _GUARDED_MODULES)
+def test_module_source_has_no_authorization_vocabulary(relpath):
     # Whole-word match, matching test_context_snapshot.py's field-name check
     # in spirit: a bare substring match would false-positive on
     # `allowed_tools` (a legitimate parameter name copied from
     # options.py's tool list, not an authorization decision).
-    source = (REPO_ROOT / "orchestrator" / "context_assembly.py").read_text(encoding="utf-8").lower()
+    source = (REPO_ROOT / relpath).read_text(encoding="utf-8").lower()
     for token in _FORBIDDEN_TOKENS:
         assert not re.search(rf"\b{token}\b", source), (
-            f"forbidden authorization token {token!r} found in context_assembly.py"
+            f"forbidden authorization token {token!r} found in {relpath}"
         )
 
 
-def test_module_does_not_import_a_policy_or_permission_symbol():
-    source = (REPO_ROOT / "orchestrator" / "context_assembly.py").read_text(encoding="utf-8")
+@pytest.mark.parametrize("relpath", _GUARDED_MODULES)
+def test_module_does_not_import_a_policy_or_permission_symbol(relpath):
+    source = (REPO_ROOT / relpath).read_text(encoding="utf-8")
     for line in source.splitlines():
         stripped = line.strip()
         if stripped.startswith("import ") or stripped.startswith("from "):
@@ -739,3 +747,354 @@ def test_run_pipeline_can_run_twice_over_the_same_candidates_one_call_per_orderi
     assert ranked_outcome.strategy.name == ca.RANKED_STRATEGY_NAME
     # The caller's own objects are never touched by either call.
     assert all(c.rank == 0 and c.content_hash == "" for c in candidates)
+
+
+# ---------------------------------------------------------------------------
+# mctlhq/mctl-agents#527 Slice B — context-release selection, the `observe`
+# shadow pass, and the two release telemetry lines. T8-T11/T13/T15/T17 map
+# onto that proposal's tasks.md "## Tests" section; T7 lives in
+# tests/test_context_rollout.py, T12 is the existing isolation tests above
+# (unchanged), T14 lives in tests/test_tracing.py.
+# ---------------------------------------------------------------------------
+
+
+def _walk_keys(value):
+    if isinstance(value, dict):
+        for key, sub in value.items():
+            yield key
+            yield from _walk_keys(sub)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_keys(item)
+
+
+@pytest.fixture(autouse=True)
+def _clean_release_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    monkeypatch.delenv(rollout.REQUIRED_ENV_VAR, raising=False)
+    monkeypatch.delenv(ca.STRATEGY_ENV_VAR, raising=False)
+
+
+# ---------------------------------------------------------------------------
+# T8 — break-glass
+# ---------------------------------------------------------------------------
+def test_enforce_blocks_on_unresolvable_binding_by_default(monkeypatch):
+    """`production` (the real default `execution.environment`) has no
+    committed binding — the fail-closed default until mctlhq/mctl-agents#528
+    creates one."""
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ENFORCE)
+    config = ca.AssemblyConfig()
+    with pytest.raises(ca.ContextStrategyNotResolved):
+        ca.resolve_strategy_for_run("issue-investigator", config, environment="production")
+
+
+def test_enforce_with_required_explicitly_true_also_blocks(monkeypatch):
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ENFORCE)
+    monkeypatch.setenv(rollout.REQUIRED_ENV_VAR, "true")
+    config = ca.AssemblyConfig()
+    with pytest.raises(ca.ContextStrategyNotResolved):
+        ca.resolve_strategy_for_run("issue-investigator", config, environment="production")
+
+
+def test_enforce_with_required_false_falls_back_to_the_default_strategy(monkeypatch):
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ENFORCE)
+    monkeypatch.setenv(rollout.REQUIRED_ENV_VAR, "false")
+    config = ca.AssemblyConfig()
+    effective, resolution = ca.resolve_strategy_for_run("issue-investigator", config, environment="production")
+    assert effective == ca.STRATEGY_NAME
+    assert resolution.mode == rollout.ENFORCE
+    assert resolution.reason == ca.RELEASE_REASON_FALLBACK
+    assert resolution.verdict in cr.VERDICTS
+    assert resolution.bound_strategy is None
+    assert resolution.binding_revision is None
+
+
+# ---------------------------------------------------------------------------
+# T9 — observe isolation, the stage's whole safety claim.
+# ---------------------------------------------------------------------------
+def test_observe_isolation_preserves_authoritative_bytes_environment_and_rendered(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv(ca.STRATEGY_ENV_VAR, "trust-freshness-ranked")
+    proposal_dir = tmp_path / "proposal"
+
+    def _run():
+        return ca.assemble_investigator_context(
+            mode="shadow",
+            issue=_issue(),
+            issue_url="https://github.com/mctlhq/mctl-agents/issues/265",
+            full_repo="mctlhq/mctl-agents",
+            repo_dir=tmp_path / "repo",
+            target_repo_sha="a" * 40,
+            proposal_dir=proposal_dir,
+            service="mctl-agents",
+            slug="issue-265-x",
+            prompt_template="PROMPT",
+            resolver_mode="legacy",
+            now=NOW,
+        )
+
+    monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    baseline = _run()
+
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    observed = _run()
+
+    assert observed.snapshot.content_hash == baseline.snapshot.content_hash
+    assert observed.snapshot.snapshot_id == baseline.snapshot.snapshot_id
+    assert observed.rendered == baseline.rendered
+    assert observed.snapshot.execution.environment == "production"
+    assert observed.metrics.release_mode == rollout.OBSERVE
+    assert observed.metrics.binding_revision is not None
+    assert observed.metrics.strategy_name == "trust-freshness-ranked"
+
+
+def test_observe_persists_the_snapshot_exactly_once_per_run(tmp_path, monkeypatch):
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    monkeypatch.setenv(ca.STRATEGY_ENV_VAR, "trust-freshness-ranked")
+    calls: list[cs.ContextSnapshot] = []
+    monkeypatch.setattr(ca, "_persist_to_work_item_store", lambda snapshot, client: calls.append(snapshot))
+
+    ca.assemble_investigator_context(
+        mode="shadow",
+        issue=_issue(),
+        issue_url="https://github.com/mctlhq/mctl-agents/issues/265",
+        full_repo="mctlhq/mctl-agents",
+        repo_dir=tmp_path / "repo",
+        target_repo_sha="a" * 40,
+        proposal_dir=tmp_path / "proposal",
+        service="mctl-agents",
+        slug="issue-265-x",
+        prompt_template="PROMPT",
+        resolver_mode="legacy",
+    )
+    assert len(calls) == 1
+
+
+def test_observe_shadow_pass_failure_logs_observe_pass_failed_and_the_run_still_succeeds(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    assembly_input = _assembly_input(tmp_path, config=config)
+    execution = _execution()
+
+    real_run_pipeline = ca.run_pipeline
+    calls = {"n": 0}
+
+    def flaky_run_pipeline(candidates, cfg, now):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the shadow pass
+            raise RuntimeError("boom")
+        return real_run_pipeline(candidates, cfg, now)
+
+    monkeypatch.setattr(ca, "run_pipeline", flaky_run_pipeline)
+    result = ca.assemble(assembly_input, mode="shadow", execution=execution)
+
+    result.snapshot.validate()  # the authoritative pass completed successfully
+    assert result.metrics.strategy_name == ca.RANKED_STRATEGY_NAME
+
+    out = capsys.readouterr().out
+    release_lines = [line for line in out.splitlines() if line.startswith("CONTEXT_STRATEGY_RELEASE ")]
+    assert len(release_lines) == 1
+    parsed = json.loads(release_lines[0].split(" ", 1)[1])
+    assert parsed["reason"] == ca.RELEASE_REASON_OBSERVE_FAILED
+
+    compare_lines = [line for line in out.splitlines() if line.startswith("CONTEXT_STRATEGY_COMPARE ")]
+    assert compare_lines == []  # no candidate snapshot_id was produced
+
+
+# ---------------------------------------------------------------------------
+# T10 — telemetry safety
+# ---------------------------------------------------------------------------
+def test_release_and_compare_lines_never_carry_a_locator_selector_or_payload(tmp_path, monkeypatch, capsys):
+    marker = "CONTEXT-LEAK-CANARY"
+    comments = (("c1", "alice", "2026-09-18T00:00:00Z", marker),)
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    assembly_input = _assembly_input(tmp_path, issue=_issue(comments=comments), config=config)
+    result = ca.assemble(assembly_input, mode="shadow", execution=_execution())
+
+    out = capsys.readouterr().out
+    lines = [line for line in out.splitlines() if line]
+    release_lines = [line for line in lines if line.startswith("CONTEXT_STRATEGY_RELEASE ")]
+    compare_lines = [line for line in lines if line.startswith("CONTEXT_STRATEGY_COMPARE ")]
+    assert len(release_lines) == 1
+    assert len(compare_lines) == 1
+
+    for prefix, group in (("CONTEXT_STRATEGY_RELEASE ", release_lines), ("CONTEXT_STRATEGY_COMPARE ", compare_lines)):
+        for line in group:
+            assert "\n" not in line
+            assert marker not in line
+            payload = line[len(prefix):]
+            parsed = json.loads(payload)
+            assert json.dumps(parsed, sort_keys=True) == payload
+            for key in _walk_keys(parsed):
+                assert "locator" not in key.lower()
+                assert "selector" not in key.lower()
+            for source in result.snapshot.sources:
+                assert source.locator not in payload
+                assert json.dumps(dict(source.selector)) not in payload
+
+
+# ---------------------------------------------------------------------------
+# T11 — delegation to mctlhq/mctl-agents#526
+# ---------------------------------------------------------------------------
+_FORBIDDEN_EVALUATION_TOKENS = ("delta", "ratio", "score_diff", "better", "winner")
+
+
+def test_release_telemetry_does_not_reimplement_evaluation_semantics():
+    source = (REPO_ROOT / "orchestrator" / "context_assembly.py").read_text(encoding="utf-8")
+    start = source.index("def _emit_release_verdict")
+    end = source.index("def assemble(")
+    emitters_source = source[start:end].lower()
+    for token in _FORBIDDEN_EVALUATION_TOKENS:
+        assert token not in emitters_source, f"forbidden evaluation token {token!r} found in release telemetry"
+    assert "assemblymetrics" not in emitters_source.replace("_", "")
+    assert "pipelinecounters" not in emitters_source.replace("_", "")
+
+
+def test_compare_line_key_set_is_exactly_the_eight_names_task_9_lists(capsys):
+    resolution = ca.StrategyResolution(
+        mode=rollout.OBSERVE,
+        reason=ca.RELEASE_REASON_OBSERVE,
+        bound_strategy="deterministic-fixed-order",
+        bound_version="1.0.0",
+        binding_revision=2,
+        strategy_content_hash="sha256:" + "0" * 64,
+        override_active=True,
+        verdict=cr.VERDICT_OK,
+    )
+    ca._emit_strategy_compare(
+        resolution,
+        authoritative_strategy="trust-freshness-ranked",
+        authoritative_version="1.0.0",
+        authoritative_snapshot_id="cs-authoritative",
+        bound_snapshot_id="cs-bound",
+    )
+    out = capsys.readouterr().out.strip()
+    prefix, _, payload = out.partition(" ")
+    assert prefix == "CONTEXT_STRATEGY_COMPARE"
+    parsed = json.loads(payload)
+    assert set(parsed) == {
+        "mode",
+        "authoritative_strategy",
+        "authoritative_version",
+        "authoritative_snapshot_id",
+        "bound_strategy",
+        "bound_version",
+        "bound_snapshot_id",
+        "binding_revision",
+    }
+
+
+# ---------------------------------------------------------------------------
+# T13 — enforce substitution reaches the collectors, not only the pipeline
+# ---------------------------------------------------------------------------
+def test_enforce_substitution_reaches_the_collectors_not_only_the_pipeline(tmp_path, monkeypatch):
+    """`collect_prior_proposal` (`:821`) reads `assembly_input.config.ranked`;
+    an `enforce` run bound to `trust-freshness-ranked` (via a stubbed
+    `context_release.resolve` — no `trust-freshness-ranked` binding is
+    committed to the catalog) must seal byte-identical to a run configured
+    with that strategy directly, proving the substitution happened before
+    the collector loop and not only before `run_pipeline`."""
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    (proposal_dir / "requirements.md").write_text("req")
+    (proposal_dir / ".status.yaml").write_text("updated_at: '2026-09-10T00:00:00Z'\n")
+
+    fake_resolved = cr.ResolvedContextStrategy(
+        agent="issue-investigator",
+        environment="production",
+        strategy=ca.RANKED_STRATEGY_NAME,
+        version=ca.RANKED_STRATEGY_VERSION,
+        ranker_name=ca.RANKER_NAME,
+        ranker_version=ca.RANKER_VERSION,
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        release_revision=99,
+        verdict=cr.VERDICT_OK,
+    )
+    monkeypatch.setattr(cr, "resolve", lambda agent, environment: fake_resolved)
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ENFORCE)
+
+    default_config = ca.AssemblyConfig()  # deterministic — the binding must override it
+    assembly_input = _assembly_input(tmp_path, config=default_config, proposal_dir=proposal_dir)
+    execution = _execution(environment="production")
+    enforced = ca.assemble(assembly_input, mode="shadow", execution=execution)
+
+    monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    ranked_config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    assembly_input_ranked = _assembly_input(tmp_path, config=ranked_config, proposal_dir=proposal_dir)
+    baseline = ca.assemble(assembly_input_ranked, mode="shadow", execution=execution)
+
+    assert enforced.snapshot.content_hash == baseline.snapshot.content_hash
+    assert enforced.snapshot.snapshot_id == baseline.snapshot.snapshot_id
+
+
+# ---------------------------------------------------------------------------
+# T15 — metrics shape at off
+# ---------------------------------------------------------------------------
+def test_metrics_shape_at_off_carries_off_safe_defaults(tmp_path):
+    assembly_input = _assembly_input(tmp_path)
+    result = _assemble(assembly_input)
+
+    assert result.metrics.release_mode == "off"
+    assert result.metrics.binding_revision is None
+    assert result.metrics.strategy_content_hash is None
+    assert result.metrics.override_active is False
+
+    log_dict = result.metrics.to_log_dict()
+    assert log_dict["release_mode"] == "off"
+    assert log_dict["binding_revision"] is None
+    assert log_dict["strategy_content_hash"] is None
+    assert log_dict["override_active"] is False
+
+    pre_existing_keys = {
+        "mode", "candidates_by_kind", "included_by_kind", "candidates_total",
+        "candidates_dropped_pre_budget", "dropped_stale", "dropped_duplicate",
+        "excluded_budget", "truncated_sources", "used_sources", "used_bytes",
+        "assembly_latency_ms", "collector_calls", "strategy_name", "strategy_version",
+        "stale_demoted", "conflict_count", "conflict_sources_capped", "snapshot",
+    }
+    assert pre_existing_keys <= set(log_dict)
+
+
+# ---------------------------------------------------------------------------
+# T17 — observe always resolves `shadow`; enforce passes the environment
+# through unchanged.
+# ---------------------------------------------------------------------------
+def test_observe_always_resolves_shadow_regardless_of_execution_environment(monkeypatch):
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    seen: list[str] = []
+
+    def fake_resolve(agent, environment):
+        seen.append(environment)
+        raise cr.ContextReleaseError(cr.VERDICT_UNKNOWN, "stub")
+
+    monkeypatch.setattr(cr, "resolve", fake_resolve)
+    config = ca.AssemblyConfig()
+    for env in ("production", "staging", None):
+        ca.resolve_strategy_for_run("issue-investigator", config, environment=env)
+    assert seen == ["shadow", "shadow", "shadow"]
+
+
+def test_enforce_passes_the_given_environment_through_unchanged(monkeypatch):
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.ENFORCE)
+    monkeypatch.setenv(rollout.REQUIRED_ENV_VAR, "false")  # avoid raising so the loop completes
+    seen: list[str] = []
+
+    def fake_resolve(agent, environment):
+        seen.append(environment)
+        raise cr.ContextReleaseError(cr.VERDICT_UNKNOWN, "stub")
+
+    monkeypatch.setattr(cr, "resolve", fake_resolve)
+    config = ca.AssemblyConfig()
+    for env in ("production", "staging"):
+        ca.resolve_strategy_for_run("issue-investigator", config, environment=env)
+    assert seen == ["production", "staging"]
+
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+    ca.resolve_strategy_for_run("issue-investigator", config, environment=None)
+    assert seen[-1] == "production"

@@ -579,13 +579,17 @@ def test_published_catalog_hashes_are_not_drifted():
 
 def test_committed_shadow_binding_resolves():
     """The CI preflight: every committed binding must resolve on this
-    commit. Slice A ships exactly one — the shadow baseline — and it must
-    resolve to exactly what the investigator runs today."""
+    commit. It must resolve to exactly what the investigator runs today.
+    Slice A shipped revision 1 (the shadow baseline); Slice B
+    (mctlhq/mctl-agents#527) appends revision 2 when it republishes the
+    catalog for its own `context_assembly.py` changes — the exact revision
+    number is whatever the append-only history's highest entry is, never
+    hard-coded here (design.md's "the second to merge rebases and appends")."""
     resolved = cr.resolve("issue-investigator", "shadow")
     assert resolved.verdict == cr.VERDICT_OK
     assert resolved.strategy == "deterministic-fixed-order"
     assert resolved.version == "1.0.0"
-    assert resolved.release_revision == 1
+    assert resolved.release_revision >= 2
 
 
 def test_committed_catalog_has_no_production_binding():

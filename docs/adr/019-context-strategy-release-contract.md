@@ -216,6 +216,15 @@ kinds, closed-vocabulary codes, versions, hashes, counts and ratios only —
 never a `locator`, a `selector`, or any byte derived from a retrieved
 payload (ADR 009 sec. 5, ADR 015 sec. 3).
 
+> **Note (Slice B, mctlhq/mctl-agents#527).** The `CONTEXT_STRATEGY_COMPARE`
+> line ships in Slice B carrying only the two strategy identities, the
+> binding revision and the two `snapshot_id`s — no counter deltas. Deltas,
+> ratios and any verdict about which strategy performed better are
+> mctlhq/mctl-agents#526's evaluation semantic, deferred to Slice C once that
+> evaluator exists on the running image; reimplementing them here would risk
+> a second, disagreeing metric. This sentence supersedes the paragraph above
+> until #526 lands and Slice C amends it back.
+
 ### 6. Durable provenance — ADR 009 amendment 2
 
 `ContextStrategy` gains two optional fields, `release_revision: int | None`

@@ -18,3 +18,15 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 2
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:b754c0c2b2da450f7df7a099e8f4275efed52af7f68f593130a782d2c8a6fcf3
+    implementationHash: sha256:e56ca07ccd6503a6b964f0d683bd37a58b29386020588d2641ea042ffc2d518c
+    promotedBy: implementer-agent
+    promotedAt: '2026-09-27T23:47:51Z'
+    reason: 'republish pins after #527 Slice B'
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null

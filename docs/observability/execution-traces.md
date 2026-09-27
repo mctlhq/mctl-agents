@@ -111,6 +111,11 @@ workflow, so the recorded activity input is unchanged.
 | `mctl.github.mutation` | command spans | **proposed** | `true` when the operation writes to GitHub |
 | `mctl.artifact.name` / `mctl.artifact.kind` | `mctl.artifact.write` event | **proposed** | a file name (`requirements.md`) and `proposal` |
 | `mctl.policy.rule_id`, `.decision`, `.code`, `.version`, `.action_kind`, `.operation` | `mctl.policy.decision` event | **proposed** | `orchestrator/policy_checkpoint.emit` |
+| `mctl.context.strategy.name` | `CONTEXT_STRATEGY_RELEASE` / `CONTEXT_STRATEGY_COMPARE` log lines | **proposed** | `orchestrator/context_assembly.py` |
+| `mctl.context.strategy.version` | `CONTEXT_STRATEGY_RELEASE` / `CONTEXT_STRATEGY_COMPARE` log lines | **proposed** | `orchestrator/context_assembly.py` |
+| `mctl.context.strategy.content_hash` | `CONTEXT_STRATEGY_RELEASE` log line | **proposed** | `orchestrator/context_assembly.py` |
+| `mctl.context.binding.revision` | `CONTEXT_STRATEGY_RELEASE` / `CONTEXT_STRATEGY_COMPARE` log lines | **proposed** | `orchestrator/context_assembly.py` |
+| `mctl.context.release.mode` | `CONTEXT_STRATEGY_RELEASE` / `CONTEXT_STRATEGY_COMPARE` log lines | **proposed** | `orchestrator/context_assembly.py` |
 | `error.type` | any failed span | upstream | exception class, `exit_<n>`, `http_<status>`, `tool_error`, or an Argo phase |
 
 Latency is the span's own duration. A `chat` span starts when its input was complete
@@ -269,6 +274,12 @@ that to a rejection.
   in their own PR as the catalog requires.
 - Promote the reserved names this code now emits to `shipped`, naming
   `orchestrator/tracing.py` and `orchestrator/temporal/activities/argo.py`.
+- Reserve `mctl.context.strategy.name`, `mctl.context.strategy.version`,
+  `mctl.context.strategy.content_hash`, `mctl.context.binding.revision` and
+  `mctl.context.release.mode` (mctlhq/mctl-agents#527 Slice B). These are
+  emitted today as structured log-line fields only (`CONTEXT_STRATEGY_RELEASE`
+  / `CONTEXT_STRATEGY_COMPARE`, `orchestrator/context_assembly.py`), never
+  onto a real OTel span — wiring them into spans is mctlhq/mctl-agents#195.
 
 ## Live-evidence checklist for closing #195
 
