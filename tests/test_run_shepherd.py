@@ -25,6 +25,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from orchestrator import policy_checkpoint as pc
 from orchestrator import pr_adoption, run_implementer, run_shepherd
 from orchestrator.ci_checks import CheckBlocker, CIStatus
 from orchestrator.run_shepherd import (
@@ -560,6 +561,35 @@ def test_merge_pr_refuses_never_merge_service(monkeypatch, capsys) -> None:
     mocked_subprocess.run.assert_not_called()
     mocked_refresh.assert_not_called()
     assert "error:" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _merge_gate_delegated: both conditions required (mctlhq/mctl-agents#519)
+# ---------------------------------------------------------------------------
+def test_merge_gate_delegated_false_when_policy_unconfigured(monkeypatch) -> None:
+    """Service listed but the merge-approval policy variant is off:
+    configured_policy() is still BUILTIN_POLICY, so delegation must not
+    kick in -- the service list alone must never gate a merge (mirrors
+    pr_merge._gate_enabled's own two-condition rule)."""
+    monkeypatch.delenv(pc.MERGE_APPROVAL_ENV, raising=False)
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset({"mctl-web"}))
+    assert run_shepherd._merge_gate_delegated("mctl-web") is False
+
+
+def test_merge_gate_delegated_false_when_service_not_listed(monkeypatch) -> None:
+    """Policy configured but this service opted out: the policy env alone
+    must never gate every service sharing the pod."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset())
+    assert run_shepherd._merge_gate_delegated("mctl-web") is False
+
+
+def test_merge_gate_delegated_true_when_both_conditions_hold(monkeypatch) -> None:
+    """Both the policy variant and the service opt-in: this service's merge
+    is delegated to the gated Temporal activity."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset({"mctl-web"}))
+    assert run_shepherd._merge_gate_delegated("mctl-web") is True
 
 
 def test_decide_never_returns_merge_for_academy() -> None:

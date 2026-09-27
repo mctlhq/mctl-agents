@@ -366,7 +366,7 @@ BUILTIN_POLICY = Policy(
     ),
 )
 
-#: Selects the merge policy (mctlhq/mctl-agents#519, docs/adr/017-shepherd-
+#: Selects the merge policy (mctlhq/mctl-agents#519, docs/adr/016-shepherd-
 #: merge-approval.md). Unset, empty or `none`: BUILTIN_POLICY, unchanged —
 #: the shepherd's merge stays byte-for-byte what it is today. `require`:
 #: MERGE_APPROVAL_POLICY. Any other value is a misconfiguration and fails

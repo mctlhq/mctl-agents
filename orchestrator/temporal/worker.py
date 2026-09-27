@@ -565,7 +565,7 @@ def worker_plans(role: str, visibility: VisibilityActivities) -> list[WorkerPlan
         # The approval wait's read-only poll (#198, ADR-014 §7): one GET of
         # one ActionApprovalRequest, never a mutation.
         read_action_approval,
-        # The gated merge (#519, docs/adr/017-shepherd-merge-approval.md):
+        # The gated merge (#519, docs/adr/016-shepherd-merge-approval.md):
         # a handful of bounded GitHub reads plus, only on a permitted
         # decision, one `gh pr merge` — the same shape as the shepherd's own
         # per-tick merge, so it belongs on the control queue rather than the

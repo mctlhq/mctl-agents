@@ -1,5 +1,5 @@
 """orchestrator/temporal/activities/pr_merge.py — the gated merge activity
-(mctlhq/mctl-agents#519, docs/adr/017-shepherd-merge-approval.md).
+(mctlhq/mctl-agents#519, docs/adr/016-shepherd-merge-approval.md).
 
 Every read is `run_shepherd`'s own (monkeypatched here, exercised for real in
 tests/test_run_shepherd.py); the approval flow itself runs against the same

@@ -1,5 +1,5 @@
 """Activity: the shepherd's merge, gated behind a human approval
-(mctlhq/mctl-agents#519, docs/adr/017-shepherd-merge-approval.md).
+(mctlhq/mctl-agents#519, docs/adr/016-shepherd-merge-approval.md).
 
 The merge side effect moves out of the per-tick shepherd pod and into this
 gated Temporal activity, owned by `DevLoopWorkflow`'s merge watch — the one

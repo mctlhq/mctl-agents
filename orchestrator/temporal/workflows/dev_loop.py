@@ -421,7 +421,7 @@ MERGE_WATCH_HISTORY_FLOOR = 4096
 # change existed.
 MERGE_WATCH_MAX_HOPS = 16
 
-# The gated merge (mctlhq/mctl-agents#519, docs/adr/017-shepherd-merge-
+# The gated merge (mctlhq/mctl-agents#519, docs/adr/016-shepherd-merge-
 # approval.md): the shepherd's own merge decision, run through
 # `run_gated_action` as the first adopter of the Temporal action-approval
 # primitives. The registered activity name -- scheduled by string, like every
@@ -5342,6 +5342,19 @@ class DevLoopWorkflow:
                         self._poll_index_for_heartbeat += 1
                         await self._track_ownership(state)
                     if state.state in ("MERGED", "CLOSED"):
+                        if gate_task is not None and gate_task.done():
+                            # mctlhq/mctl-agents#519 review: a successful
+                            # gated merge makes the very next poll observe
+                            # MERGED right here, which used to return before
+                            # the gate-outcome block further down ever ran --
+                            # MERGE_APPROVED was unreachable on the one path
+                            # it exists for. Drain and apply the outcome
+                            # before the watch ends.
+                            self._apply_gate_outcome(
+                                _drain_gate(gate_task, service, slug),
+                                repo=state.repo or "", number=state.number or 0,
+                            )
+                            gate_task = None
                         if track_ownership and self._owned_entity_id:
                             done = await self._ownership(
                                 "terminal",
