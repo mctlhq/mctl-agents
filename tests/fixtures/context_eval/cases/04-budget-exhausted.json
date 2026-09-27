@@ -1,0 +1,70 @@
+{
+  "case_id": "04-budget-exhausted",
+  "config": {
+    "max_sources": 12,
+    "max_bytes": 50,
+    "max_bytes_per_source": 50000,
+    "max_candidates": 100,
+    "max_comments": 20
+  },
+  "candidates": [
+    {
+      "source_id": "inline-template",
+      "kind": "inline-template",
+      "locator": "orchestrator/run_issue_investigator.py:_build_prompt",
+      "selector": {"mode": "content-addressed"},
+      "raw_text": "XXXXXXXXXX",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": null,
+      "trust_tier": "authoritative",
+      "trust_rationale": "in-process-prompt-scaffold",
+      "reason_code": "prompt-scaffold",
+      "strategy_step": "primary"
+    },
+    {
+      "source_id": "issue",
+      "kind": "github-issue",
+      "locator": "https://github.com/mctlhq/mctl-agents/issues/526",
+      "selector": {"fields": "number,title,body,state,url"},
+      "raw_text": "YYYYYYYYYYYYYYYYYYYY",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": 3600,
+      "trust_tier": "untrusted",
+      "trust_rationale": "github-issue-body-third-party-text",
+      "reason_code": "primary-problem-statement",
+      "strategy_step": "primary"
+    },
+    {
+      "source_id": "issue-comment-1",
+      "kind": "github-issue-comment",
+      "locator": "https://github.com/mctlhq/mctl-agents/issues/526#issuecomment-1",
+      "selector": {"fields": "id,author,created_at,body"},
+      "raw_text": "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": 3600,
+      "trust_tier": "untrusted",
+      "trust_rationale": "github-issue-body-third-party-text",
+      "reason_code": "issue-comment",
+      "strategy_step": "secondary",
+      "content_time": "2026-09-19T00:00:00Z"
+    },
+    {
+      "source_id": "target-repo",
+      "kind": "target-repo",
+      "locator": "git+https://github.com/mctlhq/mctl-agents@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "selector": {"mode": "agent-directed"},
+      "raw_text": "",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": null,
+      "trust_tier": "authoritative",
+      "trust_rationale": "pinned-target-repository-sha",
+      "reason_code": "target-repository-tree",
+      "strategy_step": "primary"
+    }
+  ],
+  "labels": {
+    "useful_source_ids": ["issue-comment-1"],
+    "noise_source_ids": [],
+    "expected_conflict_source_ids": []
+  }
+}

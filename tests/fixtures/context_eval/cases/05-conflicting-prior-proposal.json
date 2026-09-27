@@ -1,0 +1,84 @@
+{
+  "case_id": "05-conflicting-prior-proposal",
+  "config": {
+    "max_sources": 12,
+    "max_bytes": 120000,
+    "max_bytes_per_source": 50000,
+    "max_candidates": 100,
+    "max_comments": 20
+  },
+  "candidates": [
+    {
+      "source_id": "inline-template",
+      "kind": "inline-template",
+      "locator": "orchestrator/run_issue_investigator.py:_build_prompt",
+      "selector": {"mode": "content-addressed"},
+      "raw_text": "PROMPT SCAFFOLD",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": null,
+      "trust_tier": "authoritative",
+      "trust_rationale": "in-process-prompt-scaffold",
+      "reason_code": "prompt-scaffold",
+      "strategy_step": "primary"
+    },
+    {
+      "source_id": "issue",
+      "kind": "github-issue",
+      "locator": "https://github.com/mctlhq/mctl-agents/issues/526",
+      "selector": {"fields": "number,title,body,state,url"},
+      "raw_text": "Add a retrieval-quality evaluator for context assembly.",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": 3600,
+      "trust_tier": "untrusted",
+      "trust_rationale": "github-issue-body-third-party-text",
+      "reason_code": "primary-problem-statement",
+      "strategy_step": "primary"
+    },
+    {
+      "source_id": "target-repo",
+      "kind": "target-repo",
+      "locator": "git+https://github.com/mctlhq/mctl-agents@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "selector": {"mode": "agent-directed"},
+      "raw_text": "",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": null,
+      "trust_tier": "authoritative",
+      "trust_rationale": "pinned-target-repository-sha",
+      "reason_code": "target-repository-tree",
+      "strategy_step": "primary"
+    },
+    {
+      "source_id": "proposal-dir-requirements.md",
+      "kind": "proposal-dir",
+      "locator": "gitops://agents-state/mctl-agents/proposals/issue-526/requirements.md",
+      "selector": {"path": "requirements.md"},
+      "raw_text": "# requirements\nThe evaluator must verify identity before computing metrics.",
+      "observed_at": "2026-09-01T00:00:00Z",
+      "max_age_seconds": 86400,
+      "trust_tier": "corroborated",
+      "trust_rationale": "prior-agent-authored-proposal",
+      "reason_code": "prior-proposal-document",
+      "strategy_step": "secondary",
+      "content_time": "2026-09-01T00:00:00Z"
+    },
+    {
+      "source_id": "issue-comment-later",
+      "kind": "github-issue-comment",
+      "locator": "https://github.com/mctlhq/mctl-agents/issues/526#issuecomment-3",
+      "selector": {"fields": "id,author,created_at,body"},
+      "raw_text": "Comment by carol: actually the freshness window is now owned by ADR 019.",
+      "observed_at": "2026-09-19T00:00:00Z",
+      "max_age_seconds": 3600,
+      "trust_tier": "untrusted",
+      "trust_rationale": "github-issue-body-third-party-text",
+      "reason_code": "issue-comment",
+      "strategy_step": "secondary",
+      "content_time": "2026-09-15T00:00:00Z"
+    }
+  ],
+  "labels": {
+    "useful_source_ids": ["issue", "proposal-dir-requirements.md", "issue-comment-later"],
+    "noise_source_ids": [],
+    "expected_conflict_source_ids": ["proposal-dir-requirements.md", "issue-comment-later"]
+  }
+}

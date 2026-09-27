@@ -8,8 +8,8 @@ spec:
   - revision: 1
     strategy: deterministic-fixed-order
     version: 1.0.0
-    contentHash: sha256:91eed91f07fe0236e0f7da3c62c49f8d478bc05129c143d406637477c58ae680
-    implementationHash: sha256:faab455f51953973cffb524f779bf8ff387cc68d40e29b71e9b3998fbe4b4d50
+    contentHash: sha256:23ce56fca599b0ab13d76f9d404088545f90ea11045a33689d46c5e0435d88ef
+    implementationHash: sha256:1811252a5bc1d39df9dcbc610ea02e27e0b7dceb06a23b48570a12ad9c97a7d5
     promotedBy: mctl-agents-bot
     promotedAt: '2026-09-27T16:16:31Z'
     reason: 'inert shadow baseline: today''s default, made explicit (mctlhq/mctl-agents#472

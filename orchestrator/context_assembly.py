@@ -39,7 +39,7 @@ import re
 import stat
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -67,6 +67,7 @@ from orchestrator.temporal.issue_ref import loop_workflow_id
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a runtime cycle
     from orchestrator.run_issue_investigator import IssueData
+    from orchestrator.work_context.snapshots import SnapshotAnswer, StoreRef
 
 STRATEGY_NAME = "deterministic-fixed-order"
 STRATEGY_VERSION = "1.0.0"
@@ -318,6 +319,12 @@ class AssemblyResult:
     snapshot: ContextSnapshot
     rendered: Mapping[str, str]
     metrics: AssemblyMetrics
+    #: The store's identity for `snapshot`, when a store execution persisted
+    #: it successfully (mctlhq/mctl-agents#526, ADR 015 sec. 1) — `None`
+    #: otherwise (no store execution, an unfavourable persist answer, or a
+    #: reported id that is not `cs_`-prefixed). A defaulted final field, so
+    #: every existing `AssemblyResult(...)` construction compiles unchanged.
+    store_ref: StoreRef | None = None
 
 
 def _to_context_source(candidate: CandidateSource) -> ContextSource:
@@ -1219,7 +1226,11 @@ def assemble_investigator_context(
     client = _client(work_item_client) if _work_context_active(work_context) else None
     work_context = _link_prior_snapshot(work_context, client)
     result = assemble(assembly_input, mode=mode, execution=execution, work_context=work_context)
-    _persist_to_work_item_store(result.snapshot, client)
+    answer = _persist_to_work_item_store(result.snapshot, client)
+    if answer is not None:
+        from orchestrator.work_context.snapshots import store_ref_from
+
+        return replace(result, store_ref=store_ref_from(result.snapshot, answer))
     return result
 
 
@@ -1274,8 +1285,12 @@ def _link_prior_snapshot(work_context: WorkContextRef | None, client: Any | None
     return linked
 
 
-def _persist_to_work_item_store(snapshot: ContextSnapshot, client: Any | None) -> None:
+def _persist_to_work_item_store(snapshot: ContextSnapshot, client: Any | None) -> SnapshotAnswer | None:
     """Store the sealed snapshot as its execution's (mctl-api, insert-only).
+    Returns the store's `SnapshotAnswer`, or `None` when there is no client
+    (no store execution, or the rollout gate is below `observe`) — the answer
+    is the caller's (`assemble_investigator_context`'s) to turn into a
+    `StoreRef` (mctlhq/mctl-agents#526); nothing here changes because of that.
 
     A divergence — this execution already sealed a different context — is
     refused by the store and never overwritten. It blocks the run from
@@ -1283,13 +1298,14 @@ def _persist_to_work_item_store(snapshot: ContextSnapshot, client: Any | None) -
     execution's snapshot when `blocks_on_unknown()` holds; at `observe` it is
     logged and the issue path still decides."""
     if client is None:
-        return
+        return None
     from orchestrator.work_context import rollout
     from orchestrator.work_context.snapshots import SNAPSHOT_DIVERGED, persist
 
     answer = persist(snapshot, client)
     _emit_snapshot_answer("persist", answer)
     if answer.stored:
-        return
+        return answer
     if (answer.verdict == SNAPSHOT_DIVERGED and rollout.new_answer_may_veto()) or rollout.blocks_on_unknown():
         raise SnapshotNotPersisted(f"{answer.verdict}: {answer.reason}")
+    return answer

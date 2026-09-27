@@ -548,7 +548,7 @@ future work this ADR fixes the seam for, not work it performs:
 | (c) A redaction helper that hashes post-redaction bytes for real (sec. 7 states none exists today) | needs an issue |
 | (d) Emitting `to_log_dict()`'s attributes into #195 traces | mctlhq/mctl-agents#195 |
 | (e) Per-file enumeration of agent-directed reads inside `target-repo` sources, replacing the single `selector.mode: agent-directed` source with a real per-file list (sec. 8) | needs an issue |
-| (f) Measuring retrieval quality, freshness, cost and outcome impact of the snapshots (b) now persists | mctlhq/mctl-agents#266, `docs/adr/015-context-evaluation-contract.md` |
+| (f) Measuring retrieval quality, freshness, cost and outcome impact of the snapshots (b) now persists | mctlhq/mctl-agents#266 (contract), mctlhq/mctl-agents#526 (evaluator, live emission, fixtures, replay CLI), `docs/adr/015-context-evaluation-contract.md` |
 | (g) Promoting/rolling back a strategy version through an immutable, content-pinned version and an atomic, audited per-(agent, environment) binding, and a rollout ladder that can observe a candidate strategy without changing what the model reads | mctlhq/mctl-agents#472, `docs/adr/019-context-strategy-release-contract.md` (Slice A: catalog and validation only; Slice B/#527 wires the rollout ladder; Slice C/#528 gates production promotion on (f)'s evaluator) |
 
 `ExecutionCorrelation` now has a producer: ADR 011

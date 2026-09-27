@@ -85,6 +85,59 @@ def is_store_execution(execution_id: str | None) -> bool:
     return isinstance(execution_id, str) and execution_id.startswith(EXECUTION_ID_PREFIX)
 
 
+@dataclass(frozen=True)
+class StoreRef:
+    """What the store reported for one execution's snapshot: two ids and one
+    hash — never a canonical document, never a payload (mctlhq/mctl-agents#526,
+    ADR 015 sec. 1). `store_snapshot_id` is opaque to every consumer: it is
+    carried and compared against what the store reported, and is never
+    recomputed locally — only `store_content_hash` is ever re-derived and
+    checked (`hash_bytes(canonical_bytes(snapshot)) == store_content_hash`)."""
+
+    work_item_id: str
+    execution_id: str
+    store_snapshot_id: str
+    store_content_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "work_item_id": self.work_item_id,
+            "execution_id": self.execution_id,
+            "store_snapshot_id": self.store_snapshot_id,
+            "store_content_hash": self.store_content_hash,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> StoreRef:
+        mapping = data if isinstance(data, dict) else {}
+        return cls(
+            work_item_id=str(mapping.get("work_item_id", "")),
+            execution_id=str(mapping.get("execution_id", "")),
+            store_snapshot_id=str(mapping.get("store_snapshot_id", "")),
+            store_content_hash=str(mapping.get("store_content_hash", "")),
+        )
+
+
+def store_ref_from(snapshot: ContextSnapshot, answer: SnapshotAnswer) -> StoreRef | None:
+    """`StoreRef` for `snapshot`'s persist `answer`, or `None` unless the
+    answer is `stored` (`snapshot-sealed`/`snapshot-replayed`) and its
+    `snapshot_id` is `cs_`-prefixed (`_is_snapshot_id`) — an unverifiable ref
+    is worse than no ref at all (mctlhq/mctl-agents#526). `snapshot.work_context`
+    must be present; a snapshot with no work context (no store execution)
+    never has a store answer worth a ref either."""
+    if not answer.stored or not _is_snapshot_id(answer.snapshot_id):
+        return None
+    work_context = snapshot.work_context
+    if work_context is None:
+        return None
+    return StoreRef(
+        work_item_id=work_context.work_item_id,
+        execution_id=work_context.execution_id,
+        store_snapshot_id=answer.snapshot_id,
+        store_content_hash=answer.content_hash,
+    )
+
+
 def canonical_bytes(snapshot: ContextSnapshot) -> bytes:
     """The bytes the store keeps: the whole sealed document, canonical.
     It carries the snapshot's strategy name and version, so a retry from a

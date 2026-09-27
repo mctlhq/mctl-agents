@@ -3995,6 +3995,71 @@ def test_shadow_mode_prompt_is_byte_identical_to_off_and_seals_a_snapshot(tmp_pa
     assert published_status["context"]["snapshot_id"].startswith("cs-")
 
 
+def test_context_eval_unset_leaves_stdout_unchanged(tmp_path, monkeypatch, capsys):
+    """mctlhq/mctl-agents#526 T17: with ISSUE_INVESTIGATOR_CONTEXT_EVAL unset,
+    investigator stdout contains no `context_eval=` line and is otherwise
+    byte-identical to today."""
+    monkeypatch.delenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", raising=False)
+
+    def agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="shadow", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+    out = capsys.readouterr().out
+    assert "[context] context_assembly=" in out
+    assert "context_eval=" not in out
+
+
+def test_context_eval_on_prints_exactly_one_line_after_assembly(tmp_path, monkeypatch, capsys):
+    """T17 (on)."""
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", "on")
+
+    def agent(repo_dir, prompt, proposal_dir):
+        for name in ("requirements.md", "design.md", "tasks.md"):
+            (proposal_dir / name).write_text(f"v1 {name}")
+
+    issue = _shadow_harness(tmp_path, monkeypatch, mode="shadow", agent=agent)
+    result = investigate(issue.ref.url, state_dir=tmp_path)
+    assert result.error is None
+    lines = capsys.readouterr().out.splitlines()
+    assembly_idx = next(i for i, line in enumerate(lines) if line.startswith("[context] context_assembly="))
+    context_eval_lines = [i for i, line in enumerate(lines) if line.startswith("[context] context_eval=")]
+    assert len(context_eval_lines) == 1
+    assert context_eval_lines[0] == assembly_idx + 1
+    payload = json.loads(lines[context_eval_lines[0]].split("=", 1)[1])
+    assert payload["evidence_kind"] == "live"
+    assert payload["outcome"] is None
+
+
+def test_context_eval_failure_never_fails_the_investigation(tmp_path, monkeypatch, capsys):
+    """T18: a context_eval.evaluate monkeypatched to raise does not fail the
+    investigation in shadow OR in on; one bounded warn: line is printed."""
+    from orchestrator import context_eval
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("synthetic evaluator failure")
+
+    monkeypatch.setattr(context_eval, "evaluate", _boom)
+    monkeypatch.setenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", "on")
+
+    for mode in ("shadow", "on"):
+
+        def agent(repo_dir, prompt, proposal_dir):
+            for name in ("requirements.md", "design.md", "tasks.md"):
+                (proposal_dir / name).write_text(f"v1 {name}")
+
+        issue = _shadow_harness(tmp_path, monkeypatch, mode=mode, agent=agent)
+        result = investigate(issue.ref.url, state_dir=tmp_path)
+        assert result.error is None
+        out = capsys.readouterr().out
+        assert "context_eval=" not in out
+        warn_lines = [line for line in out.splitlines() if line.startswith("warn: context evaluation failed")]
+        assert len(warn_lines) == 1
+
+
 def test_on_mode_appends_context_and_still_publishes(tmp_path, monkeypatch):
     """T10 (on mode). A comment gives `on` mode an actual renderable source
     (`target-repo`/`inline-template` render nothing and a first

@@ -631,3 +631,86 @@ insert-or-ignore dedupes on that derived id, which is what makes a widened
 Not yet scheduled: this proposal ships the code and
 `docs/operations/usage-collector.md`'s CronWorkflow manifest, but applying
 that manifest to `mctl-gitops` is an owner step, not performed here.
+
+### Context evaluation
+
+`orchestrator/context_eval.py` scores a sealed `ContextSnapshot`'s retrieval
+quality (mctlhq/mctl-agents#526, ADR 015) — a second, independent
+measurement of what the investigator's context assembly (`orchestrator/
+context_assembly.py`, the "Context assembly pilot" block above) actually
+selected, never of what the model then did with it (#60 stays separate).
+Pure and stdlib-only: no network, no filesystem, no clock read, no env
+var — every timestamp is a parameter, and it never grants, blocks or
+authorizes anything (ADR 009 sec. 5/6, ADR 014).
+
+**Enabling live emission.** Set `ISSUE_INVESTIGATOR_CONTEXT_EVAL=on`
+alongside `ISSUE_INVESTIGATOR_CONTEXT_MODE=shadow` (or `on`) — unset or
+anything but `on` prints nothing and changes no other investigator output.
+One extra line appears right after the existing assembly line:
+
+```
+[context] context_assembly={...}
+[context] context_eval={...}
+```
+
+Evaluation is strictly best-effort: a metric bug can never fail an
+investigation that would otherwise have succeeded, in every context mode
+including `on` (unlike assembly itself, which propagates a failure in
+`on` because a sealed snapshot must never describe a prompt that was not
+actually built).
+
+**Reading a `context_eval=` line.** `verdict` is `"evaluated"` or
+`"hash-mismatch"` (identity failed; `metrics` is `null` and `mismatch_fields`
+names the disagreeing fields — no metrics are computed at all on a
+mismatch). `identity` names the strategy, its version, the ranker (when
+any), the evaluator's own version, and the strategy version's catalog
+identity (mctlhq/mctl-agents#472's `contentHash`/`implementationHash`).
+`metrics` holds ADR 015 sec. 2's table: `selected_precision`/
+`useful_recall`/`f1` are `null` on a live record (there is no ground truth
+in production — labels live only in the fixture corpus), `stale_rate`,
+`duplicate_rate`, `noise_rate`, byte/token-estimate counts, and
+`coverage_by_kind`. `outcome` is `null` on a live record — the outcome is
+not knowable yet.
+
+**Running the replay CLI.** Score an already-sealed snapshot, read-only, no
+rerun of the investigation, no writer token:
+
+```bash
+# The newest we_-prefixed execution that carries a stored snapshot.
+python -m orchestrator.run_context_eval --work-item wi_...
+
+# Exactly one execution.
+python -m orchestrator.run_context_eval --work-item wi_... --execution we_...
+```
+
+It issues no write of any kind (no seal, no POST, no `.status.yaml` update,
+no gitops commit) and prints one `context_eval=<json>` line with
+`evidence_kind: "stored-replay"`, `capability_calls: 0` (it describes the
+assembly being scored, which ran long ago) and a separate
+`replay_store_reads` counting this CLI's own reads. It exits non-zero with a
+named reason for an absent work item, a snapshot-less execution, or an
+undecodable stored document, and never prints the stored document itself.
+
+**Regenerating the baseline.** `tests/fixtures/context_eval/` holds 7 curated
+cases and a committed `baseline.json` scored under both strategies through
+the real pipeline. The suite (`tests/test_context_eval.py`) fails on any
+metric drift, naming the case, the strategy and the metric. Regenerating is
+a deliberate, explicit step — never a side effect of a normal test run or of
+CI:
+
+```bash
+uv run python -m tests.test_context_eval --regenerate            # every case
+uv run python -m tests.test_context_eval --regenerate 02-stale-source
+```
+
+**What #472 requires.** mctlhq/mctl-agents#472's production promotion path
+(`docs/adr/019-context-strategy-release-contract.md`) reads this module's
+`assess_evidence(...)` to decide whether the evidence in front of it is
+`fresh`, `missing`, `stale`, `mismatched` or `insufficient-observations` —
+never `fresh` for `evidence.kind = "none"`, by construction. The freshness
+window (7 days) and minimum observation count (3) are ADR 019's v1
+promotion policy constants, exported as `ADR019_V1_FRESHNESS_WINDOW_SECONDS`
+/ `ADR019_V1_MIN_CONSECUTIVE_OBSERVATIONS`; there is no environment variable
+for either, so changing them is an ADR 019 amendment, never a runtime knob.
+`assess_evidence` only reports a status — deciding that `fresh` permits a
+production promotion is mctlhq/mctl-agents#528's.
