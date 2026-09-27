@@ -290,6 +290,23 @@ def test_recompute_content_hash_agrees_after_a_leaf_is_redacted(block):
     assert ee.recompute_content_hash(evidence) == evidence.content_hash
 
 
+@pytest.mark.parametrize("block", sorted(ee.BLOCK_NAMES))
+def test_from_dict_round_trips_an_envelope_that_was_redacted_at_seal_time(block):
+    # The legitimate counterpart to
+    # test_from_dict_rejects_a_credential_planted_directly_in_the_raw_mapping
+    # below: a document produced by seal() already carries the
+    # _REDACTED_LEAF ("") in place of the credential _safe() dropped, plus
+    # the redacted_out Gap recording it. from_dict's hard-fail read-path
+    # check must not mistake that already-safe leaf for a fresh credential
+    # hit and reject a document seal() actually produced.
+    sealed = _seal_with_credential_in(block)
+    reloaded = ee.ExecutionEvidence.from_dict(sealed.to_dict())
+    assert reloaded.to_dict() == sealed.to_dict()
+    assert reloaded.content_hash == sealed.content_hash
+    matching = [g for g in reloaded.gaps if g.block == block and g.code == "redacted_out"]
+    assert len(matching) == 1, reloaded.gaps
+
+
 def test_from_dict_rejects_a_credential_planted_directly_in_the_raw_mapping():
     # from_dict is a read path too (e.g. a document handed back from
     # storage): a credential planted straight into the raw mapping, bypassing
