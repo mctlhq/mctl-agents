@@ -35,6 +35,14 @@ from opentelemetry.sdk.trace.export import (
 from opentelemetry.trace import Link, SpanKind, Status, StatusCode
 
 from orchestrator import tracing
+from orchestrator.redaction import (  # noqa: F401 — MAX_ATTRIBUTE_CHARS re-exported for compatibility
+    _CREDENTIAL_VALUE,
+    _DENIED_KEY,
+    _TOKEN_KEY,
+    MAX_ATTRIBUTE_CHARS,
+    _scalar_allowed,
+    value_allowed,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +52,6 @@ logger = logging.getLogger(__name__)
 MAX_QUEUE_SIZE = 2048
 MAX_EXPORT_BATCH_SIZE = 256
 SCHEDULE_DELAY_MILLIS = 2000
-
-# An attribute value longer than this is a payload, not an identifier. It is
-# DROPPED, not truncated: a truncated payload is still a payload.
-MAX_ATTRIBUTE_CHARS = 256
 
 # ---------------------------------------------------------------------------
 # Redaction guard
@@ -72,33 +76,12 @@ _ALLOWED_KEY = re.compile(
 )
 # Opt-in only (MCTL_TRACE_ERROR_DETAIL): still value-checked and length-capped.
 _ERROR_DETAIL_KEY = re.compile(r"^exception\.(?:message|stacktrace)$")
-# Denylist, applied ON TOP of the allowlist — so `mctl.issue.body` or
-# `mctl.tool.arguments` is refused even though it is in the mctl namespace.
-# Mirrors the Collector's patterns (mctl-docs telemetry-attributes.md,
-# "Privacy") plus the payload-shaped suffixes this repo could plausibly
-# produce.
-_DENIED_KEY = re.compile(
-    r"(?i)(?:authorization|cookie|api[-_]?key|secret|passw(?:or)?d|credential|private[-_]?key|session[-_]?key"
-    r"|(?:^|[._])(?:prompts?|completions?|messages?|arguments?|args|argv|input|output|results?|body|content"
-    r"|text|payload|stdout|stderr|command|cmd|diff|query|description|comment)$)"
-)
-_TOKEN_KEY = re.compile(r"(?i)token")
 # The two usage counters are the only keys allowed to contain "token": they
 # are integers, and an integer cannot hold a credential.
 _USAGE_TOKEN_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens"})
-# Credential SHAPES, checked on every string value regardless of its key:
-# GitHub tokens, fine-grained PATs, sk- keys (Anthropic/OpenAI), Vault
-# tokens, JWTs, PEM private keys, bearer headers, basic-auth URLs.
-_CREDENTIAL_VALUE = re.compile(
-    r"(?:gh[pousr]_[A-Za-z0-9]{16,}"
-    r"|github_pat_[A-Za-z0-9_]{16,}"
-    r"|sk-[A-Za-z0-9_-]{16,}"
-    r"|hv[sbr]\.[A-Za-z0-9_-]{16,}"
-    r"|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
-    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|(?i:bearer\s+[A-Za-z0-9._~+/-]{12,})"
-    r"|://[^/\s:@]+:[^/\s@]+@)"
-)
+# `_CREDENTIAL_VALUE`, `_DENIED_KEY`, `_TOKEN_KEY` and `MAX_ATTRIBUTE_CHARS`
+# now live in `orchestrator/redaction.py` (mctl-agents#520) so they can be
+# shared with the stdlib-only evidence module; imported above unchanged.
 
 
 def key_allowed(key: str, *, error_detail: bool = False) -> bool:
@@ -113,20 +96,6 @@ def key_allowed(key: str, *, error_detail: bool = False) -> bool:
     if _TOKEN_KEY.search(key) or _DENIED_KEY.search(key):
         return False
     return bool(_ALLOWED_KEY.match(key))
-
-
-def _scalar_allowed(value: Any) -> bool:
-    if isinstance(value, bool | int | float):
-        return True
-    if isinstance(value, str):
-        return 0 < len(value) <= MAX_ATTRIBUTE_CHARS and not _CREDENTIAL_VALUE.search(value)
-    return False
-
-
-def value_allowed(value: Any) -> bool:
-    if isinstance(value, list | tuple):
-        return len(value) <= 32 and all(_scalar_allowed(v) for v in value)
-    return _scalar_allowed(value)
 
 
 def redact_attributes(attributes: Mapping[str, Any] | None, *, error_detail: bool = False) -> dict[str, Any]:
