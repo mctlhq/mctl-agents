@@ -616,7 +616,10 @@ class ExecutionEvidence:
     canonical governance records applied to one governed execution. Only
     ever produced by `seal()`; `from_dict` reconstructs an already-sealed
     document and re-validates its shape, but never recomputes the hash —
-    use `recompute_content_hash` to verify one."""
+    use `recompute_content_hash` to verify one. `from_dict` also runs every
+    block through the same `_safe()` redaction/bounds check `seal()` applies
+    before hashing, so a credential-shaped value or an over-cap blob in the
+    raw mapping can never survive into `to_dict()`."""
 
     api_version: str
     kind: str
@@ -682,41 +685,68 @@ class ExecutionEvidence:
         content_hash = _require_sha256(mapping.get("content_hash"), where="content_hash")
         created_at = _require_str(mapping.get("created_at"), where="created_at")
 
-        execution = ExecutionJoin.from_dict(mapping.get("execution"))
-        outcome = Outcome.from_dict(mapping.get("outcome"))
+        execution_raw = mapping.get("execution")
+        outcome_raw = mapping.get("outcome")
 
         policy_decisions_raw = mapping.get("policy_decisions", [])
         if not isinstance(policy_decisions_raw, list):
             raise ExecutionEvidenceError("policy_decisions must be a list")
-        policy_decisions = tuple(PolicyDecisionRef.from_dict(p) for p in policy_decisions_raw)
 
         snapshot_refs_raw = mapping.get("snapshot_refs", [])
         if not isinstance(snapshot_refs_raw, list):
             raise ExecutionEvidenceError("snapshot_refs must be a list")
-        snapshot_refs = tuple(SnapshotRef.from_dict(s) for s in snapshot_refs_raw)
 
         execution_request_raw = mapping.get("execution_request")
-        execution_request = (
-            ExecutionRequestRef.from_dict(execution_request_raw) if execution_request_raw is not None else None
-        )
 
         usage_raw = mapping.get("usage")
-        usage = UsageRef.from_dict(usage_raw) if usage_raw is not None else None
 
         approvals_raw = mapping.get("approvals", [])
         if not isinstance(approvals_raw, list):
             raise ExecutionEvidenceError("approvals must be a list")
-        approvals = tuple(ApprovalRef.from_dict(a) for a in approvals_raw)
 
         artifacts_raw = mapping.get("artifacts", [])
         if not isinstance(artifacts_raw, list):
             raise ExecutionEvidenceError("artifacts must be a list")
-        artifacts = tuple(ArtifactRef.from_dict(a) for a in artifacts_raw)
+
+        # Read-path parity with seal(): a document handed to from_dict is
+        # documented as "already sealed", but from_dict is the only gate
+        # between an arbitrary caller-supplied mapping and to_dict() ever
+        # re-emitting it. Route every block through the same _safe()
+        # redaction and per-leaf bounds check seal() runs before hashing, so
+        # a credential-shaped value or an over-cap blob smuggled into a raw
+        # dict can never survive a from_dict/to_dict round trip.
+        raw_payload: dict[str, Any] = {"execution": execution_raw, "outcome": outcome_raw}
+        if policy_decisions_raw:
+            raw_payload["policy_decisions"] = policy_decisions_raw
+        if snapshot_refs_raw:
+            raw_payload["snapshot_refs"] = snapshot_refs_raw
+        if execution_request_raw is not None:
+            raw_payload["execution_request"] = execution_request_raw
+        if usage_raw is not None:
+            raw_payload["usage"] = usage_raw
+        if approvals_raw:
+            raw_payload["approvals"] = approvals_raw
+        if artifacts_raw:
+            raw_payload["artifacts"] = artifacts_raw
+        safe_payload, redaction_gaps = _safe(raw_payload, requirements=DEFAULT_REQUIREMENTS)
+
+        execution = ExecutionJoin.from_dict(safe_payload["execution"])
+        outcome = Outcome.from_dict(safe_payload["outcome"])
+        policy_decisions = tuple(PolicyDecisionRef.from_dict(p) for p in safe_payload.get("policy_decisions", []))
+        snapshot_refs = tuple(SnapshotRef.from_dict(s) for s in safe_payload.get("snapshot_refs", []))
+        execution_request = (
+            ExecutionRequestRef.from_dict(safe_payload["execution_request"])
+            if "execution_request" in safe_payload
+            else None
+        )
+        usage = UsageRef.from_dict(safe_payload["usage"]) if "usage" in safe_payload else None
+        approvals = tuple(ApprovalRef.from_dict(a) for a in safe_payload.get("approvals", []))
+        artifacts = tuple(ArtifactRef.from_dict(a) for a in safe_payload.get("artifacts", []))
 
         gaps_raw = mapping.get("gaps", [])
         if not isinstance(gaps_raw, list):
             raise ExecutionEvidenceError("gaps must be a list")
-        gaps = tuple(Gap.from_dict(g) for g in gaps_raw)
+        gaps = tuple(Gap.from_dict(g) for g in gaps_raw) + redaction_gaps
 
         evidence = cls(
             api_version=api_version,

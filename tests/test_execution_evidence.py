@@ -290,6 +290,30 @@ def test_recompute_content_hash_agrees_after_a_leaf_is_redacted(block):
     assert ee.recompute_content_hash(evidence) == evidence.content_hash
 
 
+def test_from_dict_redacts_a_credential_planted_directly_in_the_raw_mapping():
+    # from_dict is a read path too (e.g. a document handed back from
+    # storage): a credential planted straight into the raw mapping, bypassing
+    # seal(), must still be dropped before to_dict() can ever re-emit it.
+    doc = _seal().to_dict()
+    doc["execution"]["trace_id"] = _CREDENTIAL
+    evidence = ee.ExecutionEvidence.from_dict(doc)
+    assert evidence.execution.trace_id == ""
+    assert _CREDENTIAL not in json.dumps(evidence.to_dict())
+    matching = [g for g in evidence.gaps if g.block == "execution" and g.code == "redacted_out"]
+    assert len(matching) == 1, evidence.gaps
+
+
+def test_from_dict_drops_an_over_cap_leaf_planted_directly_in_the_raw_mapping():
+    # Same read-path parity, for the generic per-leaf length cap rather than
+    # the credential shape: an over-cap blob must be dropped, not re-emitted.
+    doc = _seal().to_dict()
+    oversized = "x" * (ee.MAX_LEAF_CHARS + 1)
+    doc["execution"]["trace_id"] = oversized
+    evidence = ee.ExecutionEvidence.from_dict(doc)
+    assert evidence.execution.trace_id == ""
+    assert oversized not in json.dumps(evidence.to_dict())
+
+
 # ---------------------------------------------------------------------------
 # T6 — completeness is derived and iff
 # ---------------------------------------------------------------------------
