@@ -25,6 +25,7 @@ from unittest.mock import patch
 import pytest
 import yaml
 
+from orchestrator import policy_checkpoint as pc
 from orchestrator import pr_adoption, run_implementer, run_shepherd
 from orchestrator.ci_checks import CheckBlocker, CIStatus
 from orchestrator.run_shepherd import (
@@ -560,6 +561,128 @@ def test_merge_pr_refuses_never_merge_service(monkeypatch, capsys) -> None:
     mocked_subprocess.run.assert_not_called()
     mocked_refresh.assert_not_called()
     assert "error:" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# _merge_gate_delegated: both conditions required (mctlhq/mctl-agents#519)
+# ---------------------------------------------------------------------------
+def test_merge_gate_delegated_false_when_policy_unconfigured(monkeypatch) -> None:
+    """Service listed but the merge-approval policy variant is off:
+    configured_policy() is still BUILTIN_POLICY, so delegation must not
+    kick in -- the service list alone must never gate a merge (mirrors
+    pr_merge._gate_enabled's own two-condition rule)."""
+    monkeypatch.delenv(pc.MERGE_APPROVAL_ENV, raising=False)
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset({"mctl-web"}))
+    assert run_shepherd._merge_gate_delegated("mctl-web") is False
+
+
+def test_merge_gate_delegated_false_when_service_not_listed(monkeypatch) -> None:
+    """Policy configured but this service opted out: the policy env alone
+    must never gate every service sharing the pod."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset())
+    assert run_shepherd._merge_gate_delegated("mctl-web") is False
+
+
+def test_merge_gate_delegated_true_when_both_conditions_hold(monkeypatch) -> None:
+    """Both the policy variant and the service opt-in: this service's merge
+    is delegated to the gated Temporal activity."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset({"mctl-web"}))
+    assert run_shepherd._merge_gate_delegated("mctl-web") is True
+
+
+def _gate_mctl_web(monkeypatch, *extra: str) -> None:
+    """Put mctl-web (and `extra`) behind the merge-approval gate, with an
+    approval store configured too: the env a shepherd pod must be safe in."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    monkeypatch.setenv(pc.APPROVALS_ENV, "mctl-api")
+    monkeypatch.setattr(run_shepherd, "SHEPHERD_MERGE_APPROVAL_SERVICES", frozenset({"mctl-web", *extra}))
+
+
+def test_merge_pr_refuses_a_gated_service_before_the_checkpoint(monkeypatch, capsys) -> None:
+    """The defence-in-depth guarantee (mctlhq/mctl-agents#519): a shepherd
+    pod never creates an approval request for a gated service, even with
+    MCTL_POLICY_APPROVALS=mctl-api in its own env, because merge_pr returns
+    MERGE_GATED before the checkpoint runs at all -- and never merges."""
+    _gate_mctl_web(monkeypatch)
+    pr = make_pr()
+    assert pr.repo.split("/")[-1] == "mctl-web"
+
+    def _no_checkpoint(*_a, **_kw):
+        raise AssertionError("policy_checkpoint.checkpoint ran for a gated service")
+
+    def _no_merge(*_a, **_kw):
+        raise AssertionError("merge_pr_unchecked ran for a gated service")
+
+    monkeypatch.setattr(run_shepherd.policy_checkpoint, "checkpoint", _no_checkpoint)
+    monkeypatch.setattr(run_shepherd, "merge_pr_unchecked", _no_merge)
+
+    assert run_shepherd.merge_pr(pr) == (False, None)
+    assert f"MERGE_GATED pr={pr.repo}#{pr.number} head={pr.head_sha}" in capsys.readouterr().out
+
+
+def test_merge_owner_for_a_gated_service_is_the_devloop_workflow(monkeypatch) -> None:
+    _gate_mctl_web(monkeypatch)
+    assert run_shepherd._merge_owner_for("mctl-web") == "devloop-workflow"
+
+
+def test_never_merge_services_win_over_the_merge_gate(monkeypatch) -> None:
+    """A never-merge service listed for the gate too is still a human
+    CODEOWNER's merge: the NEVER_MERGE_SERVICES check comes first."""
+    _gate_mctl_web(monkeypatch, "mctl-gitops")
+    assert run_shepherd._merge_gate_delegated("mctl-gitops") is True
+    assert run_shepherd._merge_owner_for("mctl-gitops") == "human-codeowner"
+
+
+def test_process_one_defers_a_gated_services_merge_to_the_devloop(tmp_path, monkeypatch) -> None:
+    """A FULL-mode service behind the gate: a clean, green, approved PR
+    yields defer-merge (decide() runs with fix_only forced on), merge_pr is
+    never called, and the owner recorded is devloop-workflow."""
+    _gate_mctl_web(monkeypatch)
+    ref = make_ref(tmp_path, service="mctl-web")
+    assert ref.mode == run_shepherd.FULL
+    pr = make_pr(checks_green=True)
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
+    fix_only_seen: list[bool] = []
+    real_decide = run_shepherd.decide
+
+    def spy_decide(*args, **kwargs):
+        fix_only_seen.append(kwargs.get("fix_only"))
+        return real_decide(*args, **kwargs)
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "decide", side_effect=spy_decide), \
+         patch.object(run_shepherd, "merge_pr") as mocked_merge:
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "defer-merge"
+    # decide() itself deferred: the widened re-check below it never had to.
+    assert fix_only_seen == [True]
+    mocked_merge.assert_not_called()
+    assert read_status(ref)["merge_owner"] == "devloop-workflow"
+
+
+def test_process_one_rechecks_the_gate_when_decide_says_merge(tmp_path, monkeypatch) -> None:
+    """The widened defensive re-check: even if decide() returned merge for a
+    gated service, process_one refuses, defers and never calls merge_pr."""
+    _gate_mctl_web(monkeypatch)
+    ref = make_ref(tmp_path, service="mctl-web")
+    pr = make_pr(checks_green=True)
+    review = CodexReview(has_responded=True, findings=[], head_verdict="APPROVED")
+
+    with patch.object(run_shepherd, "find_pr_for_proposal", return_value=pr), \
+         patch.object(run_shepherd, "read_codex_review", return_value=review), \
+         patch.object(run_shepherd, "read_copilot_review",
+                      return_value=run_shepherd.CopilotReview(False, 0)), \
+         patch.object(run_shepherd, "decide", return_value=("merge", {})), \
+         patch.object(run_shepherd, "merge_pr") as mocked_merge:
+        result = process_one(ref, skip_subprocess=True)
+    assert result.decision == "defer-merge"
+    mocked_merge.assert_not_called()
+    assert read_status(ref)["merge_owner"] == "devloop-workflow"
 
 
 def test_decide_never_returns_merge_for_academy() -> None:

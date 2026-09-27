@@ -369,11 +369,46 @@ def test_a_policy_decision_is_an_event_with_rule_decision_and_code(exported, cap
     assert attributes["mctl.policy.version"] == decision.policy_version
     if decision.rule_id:
         assert attributes["mctl.policy.rule_id"] == decision.rule_id
+    # mctl-agents#519: an ALLOW never reaches a human, so these are empty —
+    # and, like every other empty attribute, dropped rather than sent as "".
+    assert decision.approval_ref == decision.approver == decision.decided_at == ""
+    assert "mctl.policy.approval_ref" not in attributes
+    assert "mctl.policy.approver" not in attributes
+    assert "mctl.policy.decided_at" not in attributes
     # The target and the free-text reason stay in the audit log line only.
     assert "mctlhq/mctl-telegram" not in span.to_json()
     assert decision.reason not in span.to_json() or not decision.reason
     _assert_no_payload(exported, BODY_MARKER)
     assert "POLICY_DECISION" in capsys.readouterr().out
+
+
+def test_a_granted_decisions_approver_and_timestamp_reach_the_span_event(exported):
+    """mctl-agents#519: a decision that reached a human carries the approver
+    and the observation timestamp on the span event too, not just the log."""
+
+    class _Granting:
+        def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
+            return policy_checkpoint.ApprovalOutcome(
+                policy_checkpoint.APPROVAL_GRANTED, approval_ref="aar_9", decided_by="github:root",
+            )
+
+    with tracing.span("pod"):
+        decision = policy_checkpoint.checkpoint(
+            policy_checkpoint.MCP_TOOL_CALL,
+            "mcp__mctl__mctl_deploy_service",
+            "mctl",
+            {"service": "x"},
+            grants=("mcp__mctl__*",),
+            approvals=_Granting(),
+        )
+
+    assert decision.permitted and decision.approver == "github:root" and decision.decided_at
+    (span,) = exported.get_finished_spans()
+    (event,) = [e for e in span.events if e.name == tracing.POLICY_DECISION_EVENT]
+    attributes = dict(event.attributes)
+    assert attributes["mctl.policy.approval_ref"] == "aar_9"
+    assert attributes["mctl.policy.approver"] == "github:root"
+    assert attributes["mctl.policy.decided_at"] == decision.decided_at
 
 
 def test_a_published_proposal_records_one_artifact_event_per_file(exported, tmp_path):

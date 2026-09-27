@@ -222,6 +222,10 @@ class ApprovalWaitResult:
     signal_wakes: int = 0
     poll_wakes: int = 0
     rechecks: int = 0
+    #: `GatedActionResult.approver` / `.decided_at` of the call that produced
+    #: this outcome; empty unless that decision reached a human.
+    approver: str = ""
+    decided_at: str = ""
 
     @property
     def ran(self) -> bool:
@@ -357,6 +361,8 @@ class ActionApprovalWaitWorkflow:
             result=result.result if result is not None and result.ran else None,
             reason=reason_of(result) if result is not None else "",
             signal_wakes=self._signal_wakes, poll_wakes=self._poll_wakes, rechecks=self._rechecks,
+            approver=result.approver if result is not None else "",
+            decided_at=result.decided_at if result is not None else "",
         )
 
     @workflow.run
@@ -453,6 +459,7 @@ async def run_gated_action(
         return ApprovalWaitResult(
             outcome=outcome, approval_id=first.approval_ref, attempt=action.attempt, code=first.code,
             result=first.result if first.ran else None, reason=reason_of(first),
+            approver=first.approver, decided_at=first.decided_at,
         )
     wait = ApprovalWaitInput(
         approval_id=first.approval_ref, activity=activity, action=replace(action, approval_ref=""),

@@ -47,6 +47,7 @@ import json
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from orchestrator.context_snapshot import canonical_json, hash_bytes
@@ -171,6 +172,12 @@ class Decision:
     rule_id: str
     action_digest: str
     approval_ref: str = ""
+    #: `ApprovalRecord.decided_by` when this decision reached a human
+    #: through the approval store; empty otherwise (including `pending`).
+    approver: str = ""
+    #: When this process observed that human decision, ISO-8601 UTC; empty
+    #: exactly when `approver` is empty.
+    decided_at: str = ""
 
     @property
     def permitted(self) -> bool:
@@ -230,6 +237,8 @@ class ApprovalOutcome:
     status: str
     approval_ref: str = ""
     reason: str = ""
+    #: `ApprovalRecord.decided_by`, when the store named who decided.
+    decided_by: str = ""
 
 
 class ApprovalLookup(Protocol):
@@ -357,6 +366,51 @@ BUILTIN_POLICY = Policy(
     ),
 )
 
+#: Selects the merge policy (mctlhq/mctl-agents#519, docs/adr/016-shepherd-
+#: merge-approval.md). Unset, empty or `none`: BUILTIN_POLICY, unchanged —
+#: the shepherd's merge stays byte-for-byte what it is today. `require`:
+#: MERGE_APPROVAL_POLICY. Any other value is a misconfiguration and fails
+#: closed (DENY), never ALLOW.
+MERGE_APPROVAL_ENV = "MCTL_POLICY_MERGE_APPROVAL"
+MERGE_APPROVAL_REQUIRE = "require"
+
+#: `BUILTIN_POLICY` with `github-pr-merge` (ALLOW) replaced by a
+#: REQUIRE_APPROVAL rule of its own, under a distinct policy version: since
+#: `policy_version` is a field of the approval intent hash, a receipt
+#: approved under one rule set can never be spent under the other.
+MERGE_APPROVAL_POLICY = Policy(
+    version="mctl-agents/policy/v1-merge-approval",
+    rules=tuple(
+        Rule("github-pr-merge-approval", GITHUB_PR_MERGE, "merge", REQUIRE_APPROVAL)
+        if rule.rule_id == "github-pr-merge" else rule
+        for rule in BUILTIN_POLICY.rules
+    ),
+)
+
+
+def configured_policy() -> Policy:
+    """The policy the shepherd's merge (and its gated-activity twin) decide
+    under, selected by `MERGE_APPROVAL_ENV`. `BUILTIN_POLICY` is never
+    mutated by this: each variant is its own `Policy` built from it."""
+    value = os.environ.get(MERGE_APPROVAL_ENV, "").strip()
+    if value in ("", "none"):
+        return BUILTIN_POLICY
+    if value == MERGE_APPROVAL_REQUIRE:
+        return MERGE_APPROVAL_POLICY
+    # Fail closed: an unrecognized value must refuse every merge, never
+    # silently fall back to ALLOW (mirrors _MisconfiguredApprovals above).
+    # The raw value is NOT put into the version: it reaches the intent hash,
+    # the POLICY_DECISION line and a span attribute, which carry only
+    # bounded fields. The DENY rule id already names the misconfiguration.
+    return Policy(
+        version="mctl-agents/policy/v1-merge-approval-misconfigured",
+        rules=tuple(
+            Rule("github-pr-merge-misconfigured", GITHUB_PR_MERGE, "merge", DENY)
+            if rule.rule_id == "github-pr-merge" else rule
+            for rule in BUILTIN_POLICY.rules
+        ),
+    )
+
 
 def evaluate(policy: Policy, request: ActionRequest) -> tuple[Rule | None, str, str]:
     """(matching rule, code, reason) for request under policy. Pure; raises
@@ -389,28 +443,32 @@ def _verdict_for(code: str) -> str:
 
 def _redeem(
     approvals: ApprovalLookup, request: ActionRequest, rule_id: str, policy_version: str, approval_ref: str,
-) -> tuple[str, str, str]:
-    """(code, reason, approval ref) of the approval step. Fails closed:
-    anything but a well-formed GRANTED with a ref is a refusal."""
+) -> tuple[str, str, str, str]:
+    """(code, reason, approval ref, approver) of the approval step. Fails
+    closed: anything but a well-formed GRANTED with a ref is a refusal.
+    `approver` is `ApprovalOutcome.decided_by`, forwarded unchanged; empty
+    unless the store named who decided."""
     try:
         outcome = approvals.redeem(request, rule_id=rule_id, policy_version=policy_version,
                                    approval_ref=approval_ref)
     except Exception as exc:  # noqa: BLE001 — an unreadable approval store is no approval
-        return CODE_APPROVAL_LOOKUP_ERROR, f"approval lookup failed: {type(exc).__name__}", ""
+        return CODE_APPROVAL_LOOKUP_ERROR, f"approval lookup failed: {type(exc).__name__}", "", ""
     status = getattr(outcome, "status", None)
     ref = str(getattr(outcome, "approval_ref", "") or "")
     detail = str(getattr(outcome, "reason", "") or "")
+    approver = str(getattr(outcome, "decided_by", "") or "")
     code = _APPROVAL_CODES.get(status, CODE_APPROVAL_LOOKUP_ERROR) if isinstance(status, str) else \
         CODE_APPROVAL_LOOKUP_ERROR
     if code == CODE_APPROVED and not ref:
-        return CODE_APPROVAL_LOOKUP_ERROR, "approval lookup granted without naming a receipt", ""
+        return CODE_APPROVAL_LOOKUP_ERROR, "approval lookup granted without naming a receipt", "", ""
     if code == CODE_APPROVED:
-        return code, f"rule {rule_id}: approval {ref} consumed for this action", ref
+        return code, f"rule {rule_id}: approval {ref} consumed for this action", ref, approver
     if code == CODE_APPROVAL_REQUIRED:
-        return code, f"rule {rule_id}: needs an approval bound to {request.action_digest()}", ref
+        return code, f"rule {rule_id}: needs an approval bound to {request.action_digest()}", ref, approver
     if code == CODE_APPROVAL_LOOKUP_ERROR:
-        return code, f"approval lookup failed: {detail or status}", ref
-    return code, f"rule {rule_id}: {code}{f' ({ref})' if ref else ''}{f': {detail}' if detail else ''}", ref
+        return code, f"approval lookup failed: {detail or status}", ref, approver
+    return (code, f"rule {rule_id}: {code}{f' ({ref})' if ref else ''}{f': {detail}' if detail else ''}", ref,
+            approver)
 
 
 def decide(
@@ -447,15 +505,21 @@ def decide(
         emit(request, decision)
         return decision
     ref = ""
+    approver = ""
     if code == CODE_APPROVAL_REQUIRED:
         try:
             lookup = approvals if approvals is not None else configured_approvals()
         except Exception as exc:  # noqa: BLE001 — a store that cannot be built is no approval
             code, reason = CODE_APPROVAL_LOOKUP_ERROR, f"approval store unavailable: {type(exc).__name__}"
         else:
-            code, reason, ref = _redeem(lookup, request, rule.rule_id if rule else "", policy.version, approval_ref)
+            code, reason, ref, approver = _redeem(
+                lookup, request, rule.rule_id if rule else "", policy.version, approval_ref)
+    # The observation timestamp is set only alongside an approver: a
+    # decision that never reached a human (still pending, no store, denied
+    # by policy) carries neither.
+    decided_at = datetime.now(UTC).isoformat() if approver else ""
     decision = Decision(_verdict_for(code), code, reason, policy.version, rule.rule_id if rule else "",
-                        digest, ref)
+                        digest, ref, approver, decided_at)
     emit(request, decision)
     return decision
 
@@ -500,6 +564,8 @@ def decision_record(request: ActionRequest, decision: Decision) -> dict[str, Any
         "code": decision.code,
         "reason": decision.reason,
         "approval_ref": decision.approval_ref,
+        "approver": decision.approver,
+        "decided_at": decision.decided_at,
     }
 
 
@@ -509,11 +575,13 @@ def emit(request: ActionRequest, decision: Decision) -> None:
     raises.
 
     The span event carries the bounded fields only — rule, verdict, code,
-    policy version, action kind and operation. Not the target, not the free
-    text `reason`, not even the args digest: the log line above is the audit
-    record, the event is how a trace shows where in the run the decision
-    fell. `orchestrator.tracing` is imported here rather than at module scope
-    to keep this module's import stdlib-only by construction, and it is a
+    policy version, action kind, operation, and (for an approval-flow
+    decision) the receipt id, approver and decision timestamp. Not the
+    target, not the free text `reason`, not even the args digest: the log
+    line above is the audit record, the event is how a trace shows where in
+    the run the decision fell. `orchestrator.tracing` is imported here
+    rather than at module scope to keep this module's import stdlib-only by
+    construction, and it is a
     no-op unless tracing is configured."""
     try:
         print(f"{DECISION_PREFIX} {json.dumps(decision_record(request, decision), sort_keys=True)}", flush=True)
@@ -529,6 +597,9 @@ def emit(request: ActionRequest, decision: Decision) -> None:
             policy_version=decision.policy_version,
             action_kind=request.action_kind,
             operation=request.operation,
+            approval_ref=decision.approval_ref,
+            approver=decision.approver,
+            decided_at=decision.decided_at,
         )
     except Exception:  # noqa: BLE001, S110 — same rule: tracing never fails the action
         pass

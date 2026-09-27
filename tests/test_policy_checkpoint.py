@@ -143,6 +143,34 @@ def test_an_approval_binds_to_the_exact_action_only():
         assert not d.permitted and d.code == pc.CODE_APPROVAL_REQUIRED and d.approval_ref == ""
 
 
+def test_a_granted_decision_carries_the_approver_and_a_timestamp(capsys):
+    """mctlhq/mctl-agents#519: a REQUIRE_APPROVAL decision that reached a
+    human records who and when, in both the Decision and the log line."""
+    request = pc.ActionRequest(pc.MCP_TOOL_CALL, DEPLOY, "mctl", pc.args_digest_of({"service": "x"}),
+                               execution_id="ctx-1", actor="human:alice", grants=GRANTS)
+
+    class _Granting:
+        def redeem(self, request, *, rule_id, policy_version, approval_ref=""):
+            return pc.ApprovalOutcome(pc.APPROVAL_GRANTED, approval_ref="aar_1", decided_by="github:root")
+
+    decision = pc.decide(request, approvals=_Granting())
+    assert decision.permitted
+    assert decision.approver == "github:root"
+    assert decision.decided_at  # non-empty, ISO-ish
+    rec = _records(capsys)[-1]
+    assert (rec["approver"], rec["decided_at"]) == ("github:root", decision.decided_at)
+
+
+def test_a_decision_that_never_reached_a_human_carries_neither(capsys):
+    d = _mcp(DEPLOY, {"service": "x"})  # NO_APPROVALS: approval_required, no human involved
+    assert (d.approver, d.decided_at) == ("", "")
+    rec = _records(capsys)[-1]
+    assert (rec["approver"], rec["decided_at"]) == ("", "")
+
+    allow = _mcp(READ, {"service": "x"})
+    assert (allow.approver, allow.decided_at) == ("", "")
+
+
 def test_the_default_store_never_approves():
     probe = pc.ActionRequest(pc.MCP_TOOL_CALL, DEPLOY, "mctl", "sha256:x")
     assert pc.NO_APPROVALS.redeem(probe, rule_id="r", policy_version="v").status == pc.APPROVAL_NONE
@@ -193,6 +221,67 @@ def test_early_refusals_carry_the_policy_that_was_asked(monkeypatch):
     monkeypatch.delenv("MCTL_EXECUTION_CONTEXT_FILE", raising=False)
     monkeypatch.setenv("MCTL_REQUIRE_EXECUTION_CONTEXT", "1")
     assert pc.checkpoint(pc.MCP_TOOL_CALL, READ, "mctl", {}, policy=other).policy_version == "test/other"
+
+
+# ---------------------------------------------------------------------------
+# configured_policy() — the merge-approval policy variant (mctlhq/mctl-agents#519)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("value", ["", "none"])
+def test_configured_policy_unset_or_none_is_the_builtin_policy(monkeypatch, value):
+    if value:
+        monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, value)
+    else:
+        monkeypatch.delenv(pc.MERGE_APPROVAL_ENV, raising=False)
+    assert pc.configured_policy() is pc.BUILTIN_POLICY
+
+
+def test_configured_policy_require_gates_the_merge_rule_under_its_own_version(monkeypatch):
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    policy = pc.configured_policy()
+    assert policy is pc.MERGE_APPROVAL_POLICY
+    assert policy.version != pc.BUILTIN_POLICY.version
+    merge_rules = [r for r in policy.rules if r.action_kind == pc.GITHUB_PR_MERGE]
+    assert len(merge_rules) == 1
+    assert (merge_rules[0].rule_id, merge_rules[0].verdict) == ("github-pr-merge-approval", pc.REQUIRE_APPROVAL)
+    # Every other rule is untouched.
+    other_ids = {r.rule_id for r in policy.rules if r.action_kind != pc.GITHUB_PR_MERGE}
+    assert other_ids == {r.rule_id for r in pc.BUILTIN_POLICY.rules if r.action_kind != pc.GITHUB_PR_MERGE}
+
+
+def test_configured_policy_bogus_value_fails_closed_never_allow(monkeypatch):
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, "sometimes")
+    policy = pc.configured_policy()
+    merge_rules = [r for r in policy.rules if r.action_kind == pc.GITHUB_PR_MERGE]
+    assert len(merge_rules) == 1
+    assert merge_rules[0].verdict == pc.DENY
+
+
+def test_configured_policy_bogus_value_never_reaches_the_policy_version(monkeypatch):
+    """The raw env value would ride into the intent hash, the POLICY_DECISION
+    line and a span attribute; only bounded fields may (#519 review P3)."""
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, "sometimes-" + "x" * 500)
+    assert "sometimes" not in pc.configured_policy().version
+
+
+def test_configured_policy_never_mutates_the_builtin_policy(monkeypatch):
+    before = pc.BUILTIN_POLICY
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, pc.MERGE_APPROVAL_REQUIRE)
+    pc.configured_policy()
+    monkeypatch.setenv(pc.MERGE_APPROVAL_ENV, "bogus")
+    pc.configured_policy()
+    assert pc.BUILTIN_POLICY is before
+    merge_rule = next(r for r in pc.BUILTIN_POLICY.rules if r.rule_id == "github-pr-merge")
+    assert merge_rule.verdict == pc.ALLOW
+
+
+def test_configured_policy_require_refuses_without_an_approval_store():
+    """A github-pr-merge request under the variant, with NO_APPROVALS, is
+    refused approval_required and never permitted."""
+    request = pc.ActionRequest(pc.GITHUB_PR_MERGE, "merge", "https://github.com/mctlhq/mctl-web/pull/1",
+                               pc.args_digest_of({"match_head_commit": "a" * 40}), execution_id="ctx-1")
+    decision = pc.decide(request, policy=pc.MERGE_APPROVAL_POLICY, approvals=pc.NO_APPROVALS)
+    assert not decision.permitted
+    assert decision.code == pc.CODE_APPROVAL_REQUIRED
 
 
 def test_the_execution_identity_is_bound_into_the_action(monkeypatch, capsys):

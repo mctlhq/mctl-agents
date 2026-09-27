@@ -75,6 +75,7 @@ with workflow.unsafe.imports_passed_through():
         UNOWNED,
         EntityRef,
     )
+    from orchestrator.temporal.activities.action_approval import GatedActionInput
     from orchestrator.temporal.activities.argo import SubmitAndWaitInput, WorkflowResult, submit_and_wait
     from orchestrator.temporal.activities.deploy_state import (
         DeployStatus,
@@ -92,6 +93,7 @@ with workflow.unsafe.imports_passed_through():
         bind_dispatched_execution,
     )
     from orchestrator.temporal.activities.human_input import find_human_input_request
+    from orchestrator.temporal.activities.identity import MintedContext, MintRequest, mint_execution_context
     from orchestrator.temporal.activities.incidents import (
         Incident,
         IncidentQueryResult,
@@ -121,6 +123,18 @@ with workflow.unsafe.imports_passed_through():
         pre_start_reason as render_pre_start_reason,
     )
     from orchestrator.temporal.issue_ref import parse_issue_url, request_engine_ref
+    from orchestrator.temporal.workflows.action_approval import (
+        DEFAULT_MAX_WAIT_SECONDS,
+        OUTCOME_BLOCKED,
+        OUTCOME_CONSUMED,
+        OUTCOME_DENIED,
+        OUTCOME_EFFECT_FAILED,
+        OUTCOME_EXPIRED,
+        OUTCOME_REFUSED,
+        OUTCOME_TIMED_OUT,
+        ApprovalWaitResult,
+        run_gated_action,
+    )
     from orchestrator.work_context.contract import (
         ACTOR_KINDS,
         SURFACE_KINDS,
@@ -414,6 +428,39 @@ MERGE_WATCH_HISTORY_FLOOR = 4096
 # the current run until MERGE_WATCH_DEADLINE, exactly as it did before this
 # change existed.
 MERGE_WATCH_MAX_HOPS = 16
+
+# The gated merge (mctlhq/mctl-agents#519, docs/adr/016-shepherd-merge-
+# approval.md): the shepherd's own merge decision, run through
+# `run_gated_action` as the first adopter of the Temporal action-approval
+# primitives. The registered activity name -- scheduled by string, like every
+# other cross-module Temporal call, so a dropped registration is not a type
+# error anywhere (see tests/test_worker_roles.py).
+MERGE_GATE_ACTIVITY = "merge_pull_request_gated"
+#: The gated activity's answers meaning "this gate does not apply to this
+#: service" (`activities/pr_merge.py`'s CODE_MERGE_GATE_DISABLED and
+#: CODE_MERGE_FORBIDDEN, mirrored as strings so workflow code does not
+#: import the activity module; tests/test_dev_loop_workflow.py pins the
+#: two copies equal). After one, the watch stops asking for
+#: MERGE_GATE_OFF_REPROBE_POLLS polls instead of scheduling the activity on
+#: every poll just to hear it again.
+MERGE_GATE_OFF_CODES = frozenset({"merge_gate_disabled", "merge_forbidden"})
+#: How long a gate found off stays latched off: 8 polls, two hours at the
+#: 15-minute MERGE_POLL_INTERVAL. Long enough to cut the off-state cost to
+#: an eighth, short enough that turning the gate ON mid-watch is noticed
+#: within hours rather than never (a gated service's shepherd already
+#: defers its merge to this watch the moment its own env says so).
+MERGE_GATE_OFF_REPROBE_POLLS = 8
+#: Outcomes that settle the gate for the head they were decided about: the
+#: same head asks again under the same intent, hence the same idempotency
+#: key, and gets the same spent or refused receipt back. Only a NEW head
+#: (a new intent, a new human decision) is worth another attempt.
+MERGE_GATE_SETTLED_OUTCOMES = frozenset({
+    OUTCOME_DENIED, OUTCOME_EXPIRED, OUTCOME_TIMED_OUT, OUTCOME_CONSUMED, OUTCOME_EFFECT_FAILED,
+})
+# No pre-existing workflow history ever recorded the gate's commands (the
+# identity mint, the gated activity, the child approval wait), so entering it
+# unconditionally would replay a command an in-flight execution never made.
+MERGE_GATE_PATCH = "gated-merge"
 # The implementer writes the pr: link into .status.yaml in the same commit
 # that flips it to implemented, so the link should be visible on the first
 # poll. A few polls of grace absorb gitops main lag; after that, a missing
@@ -1280,6 +1327,29 @@ def _drain_tick(tick_task: asyncio.Task[None], service: str, slug: str) -> None:
         )
 
 
+def _drain_gate(
+    gate_task: asyncio.Task[ApprovalWaitResult | None], service: str, slug: str
+) -> ApprovalWaitResult | None:
+    """Retrieve a finished merge-gate task's result (mctlhq/mctl-agents#519),
+    mirroring `_drain_tick`. `_merge_gate` catches its own failures, so this
+    should always find a value or a cleanly cancelled task -- but a task
+    whose exception is never retrieved disappears silently, and the watch
+    loop drops the reference on the next poll either way."""
+    if gate_task.cancelled():
+        return None
+    exc = gate_task.exception()
+    if exc is not None:
+        workflow.logger.error(
+            "merge gate for %s/%s ended with an unretrieved %s: %r",
+            service,
+            slug,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    return gate_task.result()
+
+
 @dataclass(frozen=True)
 class ImplementExecutionState:
     """What THIS workflow knows about its implement step, for #389.
@@ -1376,6 +1446,16 @@ class MergeWatchResume:
     unknown_heartbeats: int = 0
     proposal_ref: str = ""
     policy_ref: str = ""
+    # The merge gate's execution identity (mctlhq/mctl-agents#519): carried
+    # so a hop keeps asking under the SAME identity rather than minting a
+    # new one, which would change the approval intent's hash mid-wait. ""
+    # until the first gate attempt of this watch.
+    merge_gate_execution_id: str = ""
+    merge_gate_trace_id: str = ""
+    # The head a denied/expired/timed-out/consumed/effect-failed gate
+    # attempt was decided about (MERGE_GATE_SETTLED_OUTCOMES): carried so a
+    # hop does not re-ask about a head the previous run already settled.
+    merge_gate_settled_head: str = ""
     last_lifecycle_op: str = ""
     last_lifecycle_op_landed: bool = False
     # Deliberately a DIFFERENT question from `abandoned` below -- whether
@@ -1518,6 +1598,22 @@ class DevLoopWorkflow:
         self._unknown_heartbeats = 0
         self._proposal_ref = ""
         self._policy_ref = ""
+        # The merge gate's own execution identity (mctlhq/mctl-agents#519):
+        # minted once, on the first gate attempt, and reused for every
+        # revalidation of that attempt AND across a continue_as_new hop
+        # (`MergeWatchResume.merge_gate_execution_id`/`_trace_id`) — never
+        # re-minted, since a changed execution_id would change the approval
+        # intent's hash and orphan a pending receipt.
+        self._merge_gate_execution_id = ""
+        self._merge_gate_trace_id = ""
+        # The head the in-flight (or last finished) gate attempt asked about;
+        # the head a settled outcome was decided about (carried across a hop
+        # as `MergeWatchResume.merge_gate_settled_head`); and the poll index
+        # before which a gate found off is not asked again (per run: a
+        # continued run re-probes at once). See `_gate_may_start`.
+        self._gate_head = ""
+        self._gate_settled_head = ""
+        self._gate_off_until_poll = 0
         # The last relinquishing write and whether it landed, so the
         # abandonment branch in _watch_pr's finally has a reader.
         self._last_lifecycle_op = ""
@@ -3310,6 +3406,9 @@ class DevLoopWorkflow:
         self._unknown_heartbeats = resume.unknown_heartbeats
         self._proposal_ref = resume.proposal_ref
         self._policy_ref = resume.policy_ref
+        self._merge_gate_execution_id = resume.merge_gate_execution_id
+        self._merge_gate_trace_id = resume.merge_gate_trace_id
+        self._gate_settled_head = resume.merge_gate_settled_head
         self._last_lifecycle_op = resume.last_lifecycle_op
         self._last_lifecycle_op_landed = resume.last_lifecycle_op_landed
         self._claim_abandoned = resume.claim_abandoned
@@ -3900,6 +3999,233 @@ class DevLoopWorkflow:
         except Exception as exc:  # noqa: BLE001 — whatever the tick raised on its way out
             workflow.logger.warning(
                 "in-flight shepherd tick for %s/%s ended with %r", service, slug, exc
+            )
+
+    async def _merge_gate_identity(self) -> tuple[str, str]:
+        """The stable execution identity every merge-gate attempt of THIS
+        watch binds to (mctlhq/mctl-agents#519). Minted once, on the first
+        attempt, and cached (`self._merge_gate_execution_id`/`_trace_id`,
+        carried across a hop via `MergeWatchResume`) rather than re-minted:
+        `execution_id` is a field of the approval intent hash, so a changed
+        identity would orphan a pending receipt as a fresh, unrelated
+        request every time this method ran.
+
+        `trace_id` is minted here (`workflow.uuid4()`, deterministic and
+        replay-safe) because `seal()` requires a well-formed one and this is
+        workflow code, which may not read `os.urandom` directly the way
+        `mint_local`'s degrade path does.
+        """
+        if self._merge_gate_execution_id:
+            return self._merge_gate_execution_id, self._merge_gate_trace_id
+        info = workflow.info()
+        try:
+            minted: MintedContext = await workflow.execute_activity(
+                mint_execution_context,
+                MintRequest(
+                    trace_id=workflow.uuid4().hex,
+                    workflow_type="review-fix",
+                    actor_type="system",
+                    actor_id="devloop-workflow",
+                    actor_verification="control-plane-verified",
+                    executor_type="devloop-workflow",
+                    trigger_type="pull_request",
+                    temporal_workflow_id=info.workflow_id,
+                    temporal_run_id=info.run_id,
+                ),
+                start_to_close_timeout=FAST_ACTIVITY_TIMEOUT,
+                retry_policy=FAST_ACTIVITY_RETRY_POLICY,
+            )
+        except Exception as exc:  # noqa: BLE001 — ActivityError and friends
+            # Same convention as `_ownership`: nothing on this loop's path may
+            # fail a watch whose implement already succeeded -- and this runs
+            # on every fresh watch, gated or not. A mint that fails at the
+            # Temporal level (e.g. a hung mctl-api timing the activity out)
+            # skips the gate this poll; the next poll mints again.
+            workflow.logger.warning(
+                "merge gate identity mint failed for %s: %r -- skipping the gate this poll",
+                info.workflow_id,
+                exc,
+            )
+            return "", ""
+        if not minted.stored:
+            # A locally-minted, `unverified` context mctl-api has never seen:
+            # the approval create this attempt makes under it is refused.
+            # Not cached, so the next attempt mints again and recovers once
+            # mctl-api does, instead of the whole watch being refused under
+            # one dead identity. Nothing was created under this one, so
+            # re-minting orphans no receipt.
+            workflow.logger.warning(
+                "merge gate identity for %s could not be stored in mctl-api "
+                "(degraded to an unverified local context); this attempt will "
+                "likely be refused, the next one mints again",
+                info.workflow_id,
+            )
+            return minted.context_id, minted.trace_id
+        self._merge_gate_execution_id = minted.context_id
+        self._merge_gate_trace_id = minted.trace_id
+        return self._merge_gate_execution_id, self._merge_gate_trace_id
+
+    async def _merge_gate(
+        self,
+        *,
+        repo: str,
+        number: int,
+        head_sha: str,
+        service: str,
+        slug: str,
+        execution_id: str,
+        trace_id: str,
+        max_wait_seconds: float,
+    ) -> ApprovalWaitResult | None:
+        """One merge-approval attempt for the head this poll observed
+        (mctlhq/mctl-agents#519): runs `merge_pull_request_gated` through
+        `run_gated_action`, which recomputes the world in the activity and
+        may durably wait on a human for as long as `max_wait_seconds`.
+
+        Run as a background task beside the poll loop (mirrors
+        `_shepherd_tick`), never awaited inline: the human wait inside can
+        span days, and awaiting it here would freeze `get_pr_state` polling,
+        in-loop shepherd ticks and the lifecycle-ownership heartbeat for the
+        same span. `None` on an unexpected failure — logged here, since
+        running as a task means nothing else would see it.
+        """
+        try:
+            return await run_gated_action(
+                MERGE_GATE_ACTIVITY,
+                GatedActionInput(
+                    payload={
+                        "repo": repo, "pr_number": number, "head_sha": head_sha, "service": service, "slug": slug,
+                    },
+                    execution_id=execution_id,
+                    actor="system:devloop-workflow",
+                    trace_id=trace_id,
+                ),
+                max_wait_seconds=max(1, int(max_wait_seconds)),
+            )
+        except Exception as exc:  # noqa: BLE001 — a bug here must not sink silently
+            workflow.logger.error(
+                "merge gate for %s#%s (%s/%s) raised an unexpected %s: %r",
+                repo,
+                number,
+                service,
+                slug,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    def _apply_gate_outcome(self, result: ApprovalWaitResult | None, *, repo: str, number: int) -> None:
+        """Log a finished merge-gate attempt per the outcome table
+        (mctlhq/mctl-agents#519, docs/adr/016-shepherd-merge-approval.md).
+        `ran` merges through the activity itself, so the next poll observes
+        MERGED via the ordinary `get_pr_state` path; nothing here ever calls
+        `next_attempt()`, so a denial or an expiry is never worn down.
+        Whether the watch asks again is `_record_gate_result`'s call.
+        """
+        if result is None:
+            # An unexpected failure, already logged by `_merge_gate`/`_drain_gate`.
+            return
+        if result.ran:
+            workflow.logger.info(
+                "MERGE_APPROVED pr=%s#%s approval_ref=%s approver=%s decided_at=%s",
+                repo,
+                number,
+                result.approval_id,
+                result.approver,
+                result.decided_at,
+            )
+            return
+        if result.outcome in MERGE_GATE_SETTLED_OUTCOMES or result.outcome == OUTCOME_REFUSED:
+            workflow.logger.info(
+                "merge gate for %s#%s ended %s (code=%s approval_ref=%s): %s",
+                repo,
+                number,
+                result.outcome,
+                result.code,
+                result.approval_id,
+                result.reason,
+            )
+        # "blocked" (gate off, forbidden, precondition unmet, approval_required),
+        # "mismatch" (the head moved — the next poll asks about the new one),
+        # "already_waiting" and "undecided": nothing to log, just keep watching.
+
+    def _record_gate_result(self, result: ApprovalWaitResult | None, *, poll_index: int) -> None:
+        """Decide whether the watch asks again after a finished attempt
+        (mctlhq/mctl-agents#519 review). A gate that answered "off" for this
+        service is latched off for MERGE_GATE_OFF_REPROBE_POLLS polls; a
+        settled outcome (MERGE_GATE_SETTLED_OUTCOMES) latches the head it was
+        decided about until the PR's head moves, as does `ran` (that head is
+        merged). Everything else — a precondition not met yet, `mismatch`, `refused`, `undecided`, an
+        unexpected failure (`None`) — is asked again on the next poll.
+        """
+        if result is None:
+            return
+        if result.outcome == OUTCOME_BLOCKED and result.code in MERGE_GATE_OFF_CODES:
+            self._gate_off_until_poll = poll_index + MERGE_GATE_OFF_REPROBE_POLLS
+        elif result.outcome in MERGE_GATE_SETTLED_OUTCOMES or result.ran:
+            # `ran` too: the PR at this head was just merged, and a fresh
+            # attempt on this very poll would only re-read it to answer
+            # `merge_precondition_unmet`.
+            self._gate_settled_head = self._gate_head
+
+    def _gate_may_start(self, *, head_sha: str, poll_index: int) -> bool:
+        """Whether this poll may start a new gate attempt for `head_sha`:
+        not while the gate is latched off, and not for a head an earlier
+        attempt already settled (see `_record_gate_result`)."""
+        return poll_index >= self._gate_off_until_poll and head_sha != self._gate_settled_head
+
+    def _finish_gate(
+        self, gate_task: asyncio.Task[ApprovalWaitResult | None], service: str, slug: str,
+        *, repo: str, number: int, poll_index: int,
+    ) -> None:
+        """Drain a finished gate task, log its outcome and record it. The
+        one path every finished attempt takes, whichever way the watch
+        reaches it — a later poll, the hop, or `_settle_gate` on any exit —
+        so `MERGE_APPROVED` is never drained and dropped."""
+        result = _drain_gate(gate_task, service, slug)
+        self._apply_gate_outcome(result, repo=repo, number=number)
+        self._record_gate_result(result, poll_index=poll_index)
+
+    async def _settle_gate(
+        self, gate_task: asyncio.Task[ApprovalWaitResult | None] | None, service: str, slug: str,
+        *, repo: str = "", number: int = 0, poll_index: int = 0,
+    ) -> None:
+        """Leave no pending merge-gate task behind (mctlhq/mctl-agents#519),
+        mirroring `_settle_tick`: when the watch ends, and when the PR's
+        head moves under an attempt still waiting on a human. A finished
+        task goes through `_finish_gate`, so its outcome is logged on every
+        exit. An in-flight one is cancelled: that propagates into
+        `run_gated_action`'s child `ActionApprovalWaitWorkflow`, and a
+        receipt nobody approved simply expires.
+
+        What cancellation does NOT stop is a gated activity already running
+        with an approved receipt: activities are cancelled TRY_CANCEL and
+        this one does not heartbeat, so a consume already under way still
+        runs `gh pr merge` (for the head the human approved — the activity
+        re-checks the head before it merges), and its result is not
+        recorded here. A cancelled wait never STARTS a merge; it cannot
+        recall one already in flight.
+        """
+        if gate_task is None:
+            return
+        if gate_task.done():
+            self._finish_gate(gate_task, service, slug, repo=repo, number=number, poll_index=poll_index)
+            return
+        workflow.logger.info(
+            "cancelling an in-flight merge gate for %s/%s — the watch is ending",
+            service,
+            slug,
+        )
+        gate_task.cancel()
+        try:
+            await gate_task
+        except asyncio.CancelledError:
+            # Same rule as `_settle_tick`: CancelledError is a BaseException
+            # and must not propagate out of _watch_pr's finally.
+            workflow.logger.debug("in-flight merge gate cancelled for %s/%s", service, slug)
+        except Exception as exc:  # noqa: BLE001 — whatever the gate raised on its way out
+            workflow.logger.warning(
+                "in-flight merge gate for %s/%s ended with %r", service, slug, exc
             )
 
     async def _ownership(self, op: str, *, repo: str, number: int, head_sha: str = "",
@@ -4794,6 +5120,7 @@ class DevLoopWorkflow:
         *,
         polls_this_run: int,
         tick_task: asyncio.Task[None] | None,
+        gate_task: asyncio.Task[ApprovalWaitResult | None] | None = None,
         hops: int,
     ) -> bool:
         """Should the merge watch end this run via continue_as_new right now?
@@ -4821,6 +5148,14 @@ class DevLoopWorkflow:
             # Never hop with an in-loop shepherd tick in flight. The
             # suggestion stays true once crossed, so the hop simply happens
             # at the next clean boundary instead of here.
+            return False
+        if gate_task is not None and not gate_task.done():
+            # mctlhq/mctl-agents#519: never hop while a merge-approval wait
+            # is in flight -- the wait is a plain `asyncio.Task` wrapping a
+            # `run_gated_action` call, which cannot be carried across a
+            # continue_as_new boundary. Same rule as the shepherd tick above:
+            # the suggestion stays true once crossed, so the hop happens at
+            # the next clean boundary (once the gate task settles) instead.
             return False
         if hops >= MERGE_WATCH_MAX_HOPS:
             workflow.logger.error(
@@ -4985,6 +5320,14 @@ class DevLoopWorkflow:
                 self._policy_ref = f"devloop:{service}"
 
         tick_task: asyncio.Task[None] | None = None
+        # mctlhq/mctl-agents#519: evaluated once, like `hop_enabled` just
+        # above -- NOT carried through `MergeWatchResume`, so a continued run
+        # (a fresh history) re-evaluates it against the currently deployed
+        # code exactly as `hop_enabled` does, and an execution whose history
+        # predates this marker never enters the gate at all (migration by
+        # attrition, tests/test_patch_memoization.py).
+        gate_enabled = workflow.patched(MERGE_GATE_PATCH)
+        gate_task: asyncio.Task[ApprovalWaitResult | None] | None = None
         poll_index = resume.poll_index if resume is not None else 0
         shepherd_ticks = resume.shepherd_ticks if resume is not None else 0
         hops = resume.hops if resume is not None else 0
@@ -5008,9 +5351,21 @@ class DevLoopWorkflow:
             # the reason `abandon` is a signal and not a Temporal `terminate`.
             while workflow.now() < deadline and not self._abandoned:
                 if hop_enabled and self._merge_watch_hop_suggested(
-                    polls_this_run=polls_this_run, tick_task=tick_task, hops=hops
+                    polls_this_run=polls_this_run, tick_task=tick_task, gate_task=gate_task, hops=hops
                 ):
                     hopping = True
+                    if gate_task is not None:
+                        # The hop predicate refuses while a gate attempt is in
+                        # flight, so this one is done. Finish it BEFORE the
+                        # resume record is built, so a settled head it
+                        # records is carried into the continued run.
+                        self._finish_gate(
+                            gate_task, service, slug,
+                            repo=(last.repo if last is not None else None) or "",
+                            number=(last.number if last is not None else None) or 0,
+                            poll_index=poll_index,
+                        )
+                        gate_task = None
                     remaining = deadline - workflow.now()
                     workflow.logger.info(
                         "merge watch for %s/%s hopping via continue_as_new: "
@@ -5051,6 +5406,9 @@ class DevLoopWorkflow:
                         unknown_heartbeats=self._unknown_heartbeats,
                         proposal_ref=self._proposal_ref,
                         policy_ref=self._policy_ref,
+                        merge_gate_execution_id=self._merge_gate_execution_id,
+                        merge_gate_trace_id=self._merge_gate_trace_id,
+                        merge_gate_settled_head=self._gate_settled_head,
                         last_lifecycle_op=self._last_lifecycle_op,
                         last_lifecycle_op_landed=self._last_lifecycle_op_landed,
                         claim_abandoned=self._claim_abandoned,
@@ -5114,6 +5472,9 @@ class DevLoopWorkflow:
                         self._poll_index_for_heartbeat += 1
                         await self._track_ownership(state)
                     if state.state in ("MERGED", "CLOSED"):
+                        # A gate attempt that just merged this PR is finished
+                        # by `_settle_gate` in the `finally` below, which logs
+                        # MERGE_APPROVED on this exit as on every other.
                         if track_ownership and self._owned_entity_id:
                             done = await self._ownership(
                                 "terminal",
@@ -5181,6 +5542,63 @@ class DevLoopWorkflow:
                                 _drain_tick(tick_task, service, slug)
                             shepherd_ticks += 1
                             tick_task = asyncio.create_task(self._shepherd_tick(service, slug))
+                    # The merge gate (mctlhq/mctl-agents#519): a background
+                    # task beside this poll, never awaited inline -- see
+                    # `_merge_gate`'s docstring. At most one in flight: while
+                    # `gate_task` is not done it IS the pending human wait
+                    # (`run_gated_action` awaits its whole child workflow
+                    # internally), so a fresh attempt is never started on top
+                    # of one already asking.
+                    if gate_enabled and state.repo and state.number is not None and state.head_sha:
+                        if gate_task is not None and not gate_task.done() and state.head_sha != self._gate_head:
+                            # The head moved under an attempt still waiting on
+                            # a human: that approval would be for a commit that
+                            # is no longer the PR (the activity would refuse to
+                            # merge it anyway). Cancel it and ask about the new
+                            # head now, rather than after the old receipt
+                            # expires.
+                            workflow.logger.info(
+                                "head of %s#%s moved from %s to %s -- cancelling the merge gate "
+                                "waiting on the old head",
+                                state.repo,
+                                state.number,
+                                self._gate_head,
+                                state.head_sha,
+                            )
+                            await self._settle_gate(
+                                gate_task, service, slug,
+                                repo=state.repo, number=state.number, poll_index=poll_index,
+                            )
+                            gate_task = None
+                        if gate_task is not None and gate_task.done():
+                            self._finish_gate(
+                                gate_task, service, slug,
+                                repo=state.repo, number=state.number, poll_index=poll_index,
+                            )
+                            gate_task = None
+                        execution_id = trace_id = ""
+                        if gate_task is None and self._gate_may_start(
+                            head_sha=state.head_sha, poll_index=poll_index
+                        ):
+                            execution_id, trace_id = await self._merge_gate_identity()
+                        if gate_task is None and execution_id:
+                            # Bounded by the watch's remaining budget AND the
+                            # wait's own hard ceiling, which exists for the
+                            # receipt whose expiry is unreadable.
+                            remaining_budget = min(
+                                (deadline - workflow.now()).total_seconds(), float(DEFAULT_MAX_WAIT_SECONDS)
+                            )
+                            self._gate_head = state.head_sha
+                            gate_task = asyncio.create_task(self._merge_gate(
+                                repo=state.repo,
+                                number=state.number,
+                                head_sha=state.head_sha,
+                                service=service,
+                                slug=slug,
+                                execution_id=execution_id,
+                                trace_id=trace_id,
+                                max_wait_seconds=remaining_budget,
+                            ))
                 else:
                     polls_without_pr += 1
                     if last is None and state.number is not None:
@@ -5241,6 +5659,16 @@ class DevLoopWorkflow:
                 await workflow.sleep(cadence.poll_interval)
         finally:
             await self._settle_tick(tick_task, service, slug)
+            # mctlhq/mctl-agents#519: same rule as the shepherd tick above --
+            # every exit from this watch (MERGED/CLOSED, the #516 terminal
+            # exit, the deadline, `abandon`, a hop) must leave no pending
+            # merge-gate task behind.
+            await self._settle_gate(
+                gate_task, service, slug,
+                repo=(last.repo if last is not None else None) or "",
+                number=(last.number if last is not None else None) or 0,
+                poll_index=poll_index,
+            )
             # A hop keeps the claim: this run is not the one relinquishing
             # it, the continued run is still watching, and the owner id
             # (workflow_id) plus the epoch both stay valid across

@@ -612,14 +612,19 @@ def record_policy_decision(
     policy_version: str,
     action_kind: str,
     operation: str,
+    approval_ref: str = "",
+    approver: str = "",
+    decided_at: str = "",
 ) -> None:
     """A policy checkpoint decision, as an event on the current span.
 
     Only the bounded fields: the rule, the verdict, the reason CODE (never
     the free-form reason text, which can quote an exception), the policy
-    version and the action's kind and operation. Never the target (it can
-    be a URL with a path) and never the arguments (only ever a digest in
-    the audit record, and not even that here)."""
+    version and the action's kind and operation, plus — for an
+    approval-flow decision — the receipt id, the approver identity and the
+    observation timestamp; empty for a decision that never reached a human.
+    Never the target (it can be a URL with a path) and never the arguments
+    (only ever a digest in the audit record, and not even that here)."""
     if not _state.enabled:
         return
     current().event(
@@ -631,6 +636,9 @@ def record_policy_decision(
             "mctl.policy.version": policy_version,
             "mctl.policy.action_kind": action_kind,
             "mctl.policy.operation": operation,
+            "mctl.policy.approval_ref": approval_ref,
+            "mctl.policy.approver": approver,
+            "mctl.policy.decided_at": decided_at,
         },
     )
 
