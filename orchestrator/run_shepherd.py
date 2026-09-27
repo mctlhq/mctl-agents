@@ -568,7 +568,7 @@ SHEPHERD_FIX_ONLY_SERVICES = _service_set_from_env("SHEPHERD_FIX_ONLY_SERVICES")
 
 # Services whose merge has moved out of the shepherd pod entirely, into a
 # gated Temporal activity owned by DevLoopWorkflow (mctlhq/mctl-agents#519,
-# docs/adr/017-shepherd-merge-approval.md). Unset = empty = today's
+# docs/adr/016-shepherd-merge-approval.md). Unset = empty = today's
 # behaviour: the shepherd merges in-pod as it always has. A gated service's
 # tick still discovers, reviews and pushes follow-up commits exactly like a
 # fix-only one; only the merge step is delegated.
@@ -578,8 +578,19 @@ SHEPHERD_MERGE_APPROVAL_SERVICES = _service_set_from_env("SHEPHERD_MERGE_APPROVA
 def _merge_gate_delegated(service: str) -> bool:
     """True when `service`'s merge is owned by DevLoopWorkflow's gated
     activity, not this pod. Independent of `_service_mode`: a gated service
-    still reviews and fixes in FULL mode, it just never merges here."""
-    return service in SHEPHERD_MERGE_APPROVAL_SERVICES
+    still reviews and fixes in FULL mode, it just never merges here.
+
+    Both conditions, independently, mirroring `pr_merge._gate_enabled` (the
+    activity's own copy of this rule): the policy env alone would gate every
+    service sharing this pod at once, and the service list alone would do
+    nothing while `configured_policy()` is still the unchanged ALLOW rule
+    (mctlhq/mctl-agents#519 review — the two must move together or a
+    non-opted-in service silently stalls too).
+    """
+    return (
+        policy_checkpoint.configured_policy() is not policy_checkpoint.BUILTIN_POLICY
+        and service in SHEPHERD_MERGE_APPROVAL_SERVICES
+    )
 
 # Merge for these repos is gated on a human CODEOWNER by design. No
 # environment value may grant an agent the merge decision for a service listed
@@ -2665,13 +2676,13 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
     # The policy checkpoint (#197), immediately before the merge: a refusal
     # is answered like any other failed merge, as `wait`, and `gh` never
     # runs. The head SHA is in the arguments, so an approval for one head
-    # never merges another. `policy=` is passed only when
-    # `configured_policy()` actually differs from the checkpoint's own
-    # BUILTIN_POLICY default, so an unconfigured process's merge decision
-    # is unchanged byte-for-byte, including for callers that inject their
-    # own policy by wrapping `policy_checkpoint.checkpoint` itself.
-    policy = policy_checkpoint.configured_policy()
-    policy_kwargs = {} if policy is policy_checkpoint.BUILTIN_POLICY else {"policy": policy}
+    # never merges another. Deliberately the checkpoint's own BUILTIN_POLICY
+    # default, never `configured_policy()`: `_merge_gate_delegated` above
+    # already returned for every service the merge-approval variant is
+    # meant to apply to, so reaching this line means either the policy is
+    # unconfigured or this service opted out — either way this pod's own
+    # merge must stay exactly what it is today (mctlhq/mctl-agents#519
+    # review — the inverse used to gate every non-opted-in service).
     try:
         policy_checkpoint.require(policy_checkpoint.checkpoint(
             policy_checkpoint.GITHUB_PR_MERGE,
@@ -2679,7 +2690,6 @@ def merge_pr(pr: PRSnapshot) -> tuple[bool, str | None]:
             pr_ref,
             {"method": "merge", "delete_branch": True, "match_head_commit": pr.head_sha},
             metadata={"repo": pr.repo, "pr": str(pr.number), "head_sha": pr.head_sha},
-            **policy_kwargs,
         ))
     except policy_checkpoint.PolicyRefused as e:
         print(f"warn: not merging {pr.repo}#{pr.number}: {e}")
