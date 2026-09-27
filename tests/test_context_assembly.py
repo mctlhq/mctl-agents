@@ -693,6 +693,20 @@ def test_run_pipeline_ranked_strategy_detects_conflicts_and_demotes_stale():
     assert outcome.counters.dropped_stale == 0
 
 
+def test_run_pipeline_applies_the_max_candidates_ceiling_before_the_rest_of_the_pipeline():
+    candidates = [_pipeline_candidate(f"c{i}", raw=f"payload-{i}".encode()) for i in range(5)]
+    config = ca.AssemblyConfig(max_candidates=3)
+    outcome = ca.run_pipeline(candidates, config, _NOW)
+    assert [c.source_id for c in outcome.candidates] == ["c0", "c1", "c2"]
+    assert outcome.counters.excluded_candidate_ceiling == 2
+
+
+def test_run_pipeline_leaves_the_ceiling_counter_at_zero_when_under_the_ceiling():
+    candidates = [_pipeline_candidate("only", raw=b"payload")]
+    outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(max_candidates=3), _NOW)
+    assert outcome.counters.excluded_candidate_ceiling == 0
+
+
 def test_run_pipeline_does_not_mutate_its_input_candidates():
     candidates = [_pipeline_candidate("only", raw=b"payload")]
     outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(), _NOW)
