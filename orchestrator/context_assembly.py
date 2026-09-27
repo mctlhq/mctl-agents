@@ -32,6 +32,7 @@ never authorization".
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re
@@ -974,6 +975,7 @@ class PipelineCounters:
     truncated_sources: int
     stale_demoted: int
     conflict_sources_capped: int
+    excluded_candidate_ceiling: int
 
 
 @dataclass(frozen=True)
@@ -992,18 +994,32 @@ class PipelineOutcome:
 
 
 def run_pipeline(candidates: list[CandidateSource], config: AssemblyConfig, now: datetime) -> PipelineOutcome:
-    """The deterministic selection pipeline (mctlhq/mctl-agents#266), moved
-    out of `assemble()` unchanged: for `config.strategy`, either the default
-    drop-stale branch or the ranked rank/`detect_conflicts`/`flag_stale`
-    branch, then the shared `deduplicate` / `truncate_to_per_source_limit` /
-    `apply_budget` tail every strategy applies.
+    """The deterministic selection pipeline (mctlhq/mctl-agents#266): the
+    pre-budget candidate-count ceiling first, then, for `config.strategy`,
+    either the default drop-stale branch or the ranked
+    rank/`detect_conflicts`/`flag_stale` branch, then the shared
+    `deduplicate` / `truncate_to_per_source_limit` / `apply_budget` tail
+    every strategy applies. This is the complete candidate-list pipeline
+    `assemble()` runs between its collectors and `seal()` — the sibling
+    comment-count ceiling stays in `assemble()`, since it counts
+    `assembly_input.issue.comments`, not `CandidateSource`s, so it is out of
+    this function's inputs.
 
     A pure function of its arguments — no collector, no I/O, no clock beyond
-    `now` — though it mutates the `CandidateSource` objects it is given in
-    place, exactly as this logic did inline inside `assemble()` before this
-    extraction. This is what lets an evaluator run a fixture's candidate list
-    through the real pipeline under either strategy with no network, no
-    collector and no clone, rather than re-implementing ranking in test code."""
+    `now` — and it never mutates the `CandidateSource` objects it is given:
+    every candidate is copied before any stage rewrites it (rank, inclusion,
+    hash, byte count), so the same input list can be run through this
+    function twice — once per strategy, as ADR 015 sec. 4's fixture contract
+    requires — without the second call seeing the first call's rewrites.
+    This is what lets an evaluator run a fixture's candidate list through the
+    real pipeline under either strategy with no network, no collector and no
+    clone, rather than re-implementing ranking in test code."""
+    candidates = [copy.copy(c) for c in candidates]
+    excluded_candidate_ceiling = 0
+    if len(candidates) > config.max_candidates:
+        excluded_candidate_ceiling = len(candidates) - config.max_candidates
+        candidates = candidates[: config.max_candidates]
+
     dropped_stale = 0
     conflicts: list[ContextConflict] = []
     conflict_sources_capped = 0
@@ -1057,6 +1073,7 @@ def run_pipeline(candidates: list[CandidateSource], config: AssemblyConfig, now:
         truncated_sources=truncated_sources,
         stale_demoted=stale_demoted,
         conflict_sources_capped=conflict_sources_capped,
+        excluded_candidate_ceiling=excluded_candidate_ceiling,
     )
     return PipelineOutcome(
         candidates=ordered, strategy=strategy, budget=budget, conflicts=conflicts, counters=counters
@@ -1086,12 +1103,11 @@ def assemble(
     candidates_before_ceiling = _count_by_kind(candidates)
     candidates_total = len(candidates)
 
-    candidates_dropped_pre_budget = max(0, len(assembly_input.issue.comments) - config.max_comments)
-    if len(candidates) > config.max_candidates:
-        candidates_dropped_pre_budget += len(candidates) - config.max_candidates
-        candidates = candidates[: config.max_candidates]
-
     outcome = run_pipeline(candidates, config, assembly_input.now)
+    candidates_dropped_pre_budget = (
+        max(0, len(assembly_input.issue.comments) - config.max_comments)
+        + outcome.counters.excluded_candidate_ceiling
+    )
 
     sources = tuple(_to_context_source(c) for c in outcome.candidates)
     retention = RetentionPolicy(class_="execution-record", expires_after_days=180)

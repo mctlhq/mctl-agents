@@ -693,8 +693,35 @@ def test_run_pipeline_ranked_strategy_detects_conflicts_and_demotes_stale():
     assert outcome.counters.dropped_stale == 0
 
 
-def test_run_pipeline_mutates_and_returns_the_same_objects_given():
+def test_run_pipeline_does_not_mutate_its_input_candidates():
     candidates = [_pipeline_candidate("only", raw=b"payload")]
     outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(), _NOW)
-    assert outcome.candidates[0] is candidates[0]
+    assert outcome.candidates[0] is not candidates[0]
     assert outcome.candidates[0].content_hash == cs.hash_bytes(b"payload")
+    assert candidates[0].content_hash == ""
+    assert candidates[0].rank == 0
+
+
+def test_run_pipeline_can_run_twice_over_the_same_candidates_one_call_per_ordering():
+    # ADR 015 sec. 4: every fixture case is run through `run_pipeline` under
+    # BOTH orderings, from the same candidate list — this must not let the
+    # first call's rewrites (rank, hash, inclusion) leak into the second.
+    candidates = [
+        _pipeline_candidate("issue", kind="github-issue", raw=b"issue"),
+        _pipeline_candidate("dup-1", raw=b"same"),
+        _pipeline_candidate("dup-2", raw=b"same"),
+        _pipeline_candidate("stale", raw=b"stale-source", observed_at="2026-01-01T00:00:00Z"),
+    ]
+    default_outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(), _NOW)
+    ranked_config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    ranked_outcome = ca.run_pipeline(candidates, ranked_config, _NOW)
+    second_default_outcome = ca.run_pipeline(candidates, ca.AssemblyConfig(), _NOW)
+
+    def snapshot(outcome: ca.PipelineOutcome) -> list[tuple[str, bool, str, int]]:
+        return [(c.source_id, c.included, c.reason_code, c.rank) for c in outcome.candidates]
+
+    assert snapshot(default_outcome) == snapshot(second_default_outcome)
+    assert default_outcome.strategy.name == ca.STRATEGY_NAME
+    assert ranked_outcome.strategy.name == ca.RANKED_STRATEGY_NAME
+    # The caller's own objects are never touched by either call.
+    assert all(c.rank == 0 and c.content_hash == "" for c in candidates)
