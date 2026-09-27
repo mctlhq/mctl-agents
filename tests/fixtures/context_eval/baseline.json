@@ -127,7 +127,7 @@
       ],
       "noise_rate": 0.0,
       "selected_precision": 0.3333333333333333,
-      "stale_rate": 0.25,
+      "stale_rate": 0.0,
       "useful_recall": 0.5
     },
     "trust-freshness-ranked": {
@@ -387,7 +387,7 @@
       ],
       "noise_rate": 0.0,
       "selected_precision": 0.5,
-      "stale_rate": 0.2,
+      "stale_rate": 0.0,
       "useful_recall": 0.6666666666666666
     },
     "trust-freshness-ranked": {

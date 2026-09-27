@@ -309,10 +309,16 @@ def _compute_metrics(
         conflict_members = {sid for c in snapshot.conflicts for sid in c.source_ids}
         conflicts_expected_detected = len(expected_conflict & conflict_members)
 
+    # ADR 015 sec. 2: "over selected sources" — the default strategy DROPS a
+    # stale candidate (excluded from `selected`), while the ranked strategy
+    # DEMOTES it (stays selected, `reason_code == "stale-demoted"`). Counting
+    # over all `sources` instead of `selected` would report the same rate for
+    # both strategies and hide exactly the distinction this metric exists to
+    # surface.
     stale_matches = sum(
-        1 for s in sources if s.freshness.staleness == "stale" or s.selection.reason_code == "stale-demoted"
+        1 for s in selected if s.freshness.staleness == "stale" or s.selection.reason_code == "stale-demoted"
     )
-    stale_rate = (stale_matches / total) if total else 0.0
+    stale_rate = (stale_matches / len(selected)) if selected else 0.0
 
     dropped_duplicate = (
         assembly.dropped_duplicate
@@ -515,13 +521,13 @@ def link_outcome(
             return OutcomeLink(
                 outcome="unknown", outcome_source=OUTCOME_SOURCE_LEDGER,
                 work_item_state=work_item_state, execution_phase=execution_phase,
-                reason_code=f"unrecognised-execution-phase:{execution_phase}",
+                reason_code="unrecognised-execution-phase",
             )
         if work_item_state not in WORK_ITEM_STATES:
             return OutcomeLink(
                 outcome="unknown", outcome_source=OUTCOME_SOURCE_LEDGER,
                 work_item_state=work_item_state, execution_phase=execution_phase,
-                reason_code=f"unrecognised-work-item-state:{work_item_state}",
+                reason_code="unrecognised-work-item-state",
             )
         phase_outcome = _PHASE_TO_OUTCOME[execution_phase]
         outcome = phase_outcome if work_item_state == "completed" else _STATE_OVERRIDE.get(
@@ -542,7 +548,7 @@ def link_outcome(
         return OutcomeLink(
             outcome="unknown", outcome_source=OUTCOME_SOURCE_STATUS_YAML,
             work_item_state="", execution_phase="",
-            reason_code=f"unrecognised-status-yaml-status:{status_yaml_status}",
+            reason_code="unrecognised-status-yaml-status",
         )
     return OutcomeLink(
         outcome=mapped, outcome_source=OUTCOME_SOURCE_STATUS_YAML,
@@ -721,8 +727,20 @@ class EvidenceAssessment:
     newest_age_seconds: int | None
 
 
-def _parse_observed_at(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def _parse_observed_at(value: str) -> datetime | None:
+    """Best-effort ISO-8601 parse of a record's `observed_at`. Returns `None`
+    — never raises — for a malformed string (`datetime.fromisoformat` would
+    raise `ValueError`) or a timezone-naive one (subtracting it from the
+    caller's tz-aware `now` would raise `TypeError`): `assess_evidence` has
+    no way to know a naive timestamp's offset, so it cannot be trusted for a
+    freshness comparison either way."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
 
 
 def _declared_identity_matches(record: EvalRecord, expected: EvidenceIdentity) -> bool:
@@ -792,7 +810,16 @@ def assess_evidence(
             observations=len(ordered), newest_age_seconds=None,
         )
 
-    newest_age_seconds = int((now - _parse_observed_at(newest.observed_at)).total_seconds())
+    newest_observed_at = _parse_observed_at(newest.observed_at)
+    if newest_observed_at is None:
+        # A malformed or timezone-naive `observed_at` cannot be trusted for a
+        # freshness comparison; fail closed rather than raise or silently
+        # assume freshness (mctlhq/mctl-agents#526, ADR 015 sec. 7).
+        return EvidenceAssessment(
+            status="stale", reason_code="observed-at-unparseable", evidence_kind=newest.evidence_kind,
+            observations=len(ordered), newest_age_seconds=None,
+        )
+    newest_age_seconds = int((now - newest_observed_at).total_seconds())
     if newest_age_seconds > policy.window_seconds:
         return EvidenceAssessment(
             status="stale", reason_code="observation-older-than-window", evidence_kind=newest.evidence_kind,

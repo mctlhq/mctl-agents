@@ -233,9 +233,13 @@ def test_harness_uses_the_real_run_pipeline(monkeypatch):
 
 
 def test_stale_rate_counts_both_dropped_and_demoted_shapes():
-    """T6: the same fixture case, scored under both strategies, must count
-    the default strategy's dropped `reason_code == "stale"` source AND the
-    ranked strategy's still-selected `reason_code == "stale-demoted"` source."""
+    """T6: `stale_rate` is computed "over selected sources" (ADR 015 sec. 2).
+    The default strategy DROPS its stale source (excluded from `selected`),
+    so it never counts and `stale_rate` is `0.0` — dropped content was never
+    delivered to the model. The ranked strategy DEMOTES rather than drops, so
+    the still-selected `reason_code == "stale-demoted"` source does count and
+    `stale_rate > 0`. Counting the dropped source too (over all sources
+    rather than selected ones) would hide exactly this distinction."""
     case = next(c for c in _load_cases() if c["case_id"] == "02-stale-source")
     default_snapshot, _, _ = _seal_case(case, ca.STRATEGY_NAME)
     ranked_snapshot, _, _ = _seal_case(case, ca.RANKED_STRATEGY_NAME)
@@ -251,7 +255,7 @@ def test_stale_rate_counts_both_dropped_and_demoted_shapes():
 
     default_metrics = ce.evaluate(default_snapshot, observed_at=default_snapshot.created_at).metrics
     ranked_metrics = ce.evaluate(ranked_snapshot, observed_at=ranked_snapshot.created_at).metrics
-    assert default_metrics.stale_rate > 0
+    assert default_metrics.stale_rate == 0.0
     assert ranked_metrics.stale_rate > 0
 
 
@@ -453,9 +457,15 @@ def test_outcome_vocabularies_are_pinned_to_work_context_contract():
 
 
 def test_unrecognised_work_item_state_is_unknown_with_a_reason():
+    """ADR 015 sec. 3: `reason_code` is a closed-vocabulary code, never
+    interpolated external text — the unrecognised value itself must not
+    appear in it (`work_item_state` still carries the raw value in its own
+    dedicated field)."""
     link = ce.link_outcome(work_item_state="quantum-superposed", execution_phase="Succeeded")
     assert link.outcome == "unknown"
-    assert "quantum-superposed" in link.reason_code
+    assert link.reason_code == "unrecognised-work-item-state"
+    assert "quantum-superposed" not in link.reason_code
+    assert link.work_item_state == "quantum-superposed"
 
 
 def test_status_yaml_fallback_used_only_without_a_store_execution():
@@ -549,6 +559,37 @@ def test_assess_evidence_precedence():
     # `fresh` is never reachable for evidence_kind == "none".
     none_only = [replace(r, evidence_kind="none") for r in three_agreeing]
     assert ce.assess_evidence(none_only, expected=expected, now=now, policy=policy).status == "missing"
+
+
+def test_assess_evidence_malformed_observed_at_is_stale_not_a_crash():
+    """A malformed `observed_at` string (not ISO-8601 at all) cannot be
+    parsed for a freshness comparison; `assess_evidence` must fail closed
+    (`status: "stale"`) rather than raise `ValueError`."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+
+    malformed = _record(expected, observed_at="not-a-timestamp")
+    result = ce.assess_evidence([malformed], expected=expected, now=now, policy=policy)
+    assert result.status == "stale"
+    assert result.reason_code == "observed-at-unparseable"
+    assert result.newest_age_seconds is None
+
+
+def test_assess_evidence_timezone_naive_observed_at_is_stale_not_a_crash():
+    """A timezone-naive `observed_at` (no `Z` and no UTC offset) cannot be
+    subtracted from the tz-aware `now` `assess_evidence` receives;
+    `datetime.fromisoformat` alone would raise `TypeError`, so this must fail
+    closed (`status: "stale"`) instead."""
+    expected = _identity()
+    policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=1)
+    now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+
+    naive = _record(expected, observed_at="2026-09-26T00:00:00")
+    result = ce.assess_evidence([naive], expected=expected, now=now, policy=policy)
+    assert result.status == "stale"
+    assert result.reason_code == "observed-at-unparseable"
+    assert result.newest_age_seconds is None
 
 
 def test_freshness_constants_pinned_and_policy_rejects_non_positive():
