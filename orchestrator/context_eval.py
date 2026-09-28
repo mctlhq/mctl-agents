@@ -99,17 +99,25 @@ EXECUTION_PHASES = frozenset({"Pending", "Running", "Succeeded", "Failed", "Erro
 # ---------------------------------------------------------------------------
 
 
+STORE_MATCH_STORED = "stored"
+STORE_MATCH_RETRY_EQUIVALENT = "retry-equivalent"
+
+
 @dataclass(frozen=True)
 class IdentityCheck:
     """The result of verifying a snapshot's (and, when present, its store's)
     identity. `store_ok` is `None` when no `StoreRef` was supplied — the
     store identity simply does not apply, which is not the same as it
-    holding. `mismatch_fields` names every disagreeing field, never the
-    values themselves."""
+    holding. `store_match` says which hash held: `stored` (mctl-api's own
+    digest) or `retry-equivalent` (the ref's `local_content_hash` — the store
+    kept another attempt's bytes, which `persist` already found to differ
+    only in retry-volatile fields). `mismatch_fields` names every
+    disagreeing field, never the values themselves."""
 
     document_ok: bool
     store_ok: bool | None
     mismatch_fields: tuple[str, ...] = ()
+    store_match: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -136,13 +144,20 @@ def verify_identity(snapshot: ContextSnapshot, store_ref: StoreRef | None = None
         mismatch_fields.append("snapshot_id")
 
     store_ok: bool | None = None
+    store_match: str | None = None
     if store_ref is not None:
         store_hash = hash_bytes(canonical_json(snapshot.to_dict()))
-        store_ok = store_hash == store_ref.store_content_hash
-        if not store_ok:
+        if store_hash == store_ref.store_content_hash:
+            store_ok, store_match = True, STORE_MATCH_STORED
+        elif store_ref.local_content_hash and store_hash == store_ref.local_content_hash:
+            store_ok, store_match = True, STORE_MATCH_RETRY_EQUIVALENT
+        else:
+            store_ok = False
             mismatch_fields.append("store_content_hash")
 
-    return IdentityCheck(document_ok=document_ok, store_ok=store_ok, mismatch_fields=tuple(mismatch_fields))
+    return IdentityCheck(
+        document_ok=document_ok, store_ok=store_ok, mismatch_fields=tuple(mismatch_fields), store_match=store_match
+    )
 
 
 def _safe_or_kind(source_id: str, by_id: Mapping[str, ContextSource]) -> str:
@@ -761,6 +776,12 @@ def _catalog_identity_matches(record: EvalRecord, expected: EvidenceIdentity) ->
     )
 
 
+def _observation_key(record: EvalRecord) -> tuple[str, ...]:
+    if record.store_ref is not None and record.store_ref.execution_id:
+        return ("store", record.store_ref.work_item_id, record.store_ref.execution_id)
+    return ("local", record.context_snapshot_id, record.content_hash, record.observed_at)
+
+
 def assess_evidence(
     records: Sequence[EvalRecord], *, expected: EvidenceIdentity, now: datetime, policy: FreshnessPolicy
 ) -> EvidenceAssessment:
@@ -771,8 +792,11 @@ def assess_evidence(
     (`strategy_content_hash`/`strategy_implementation_hash`) -> `mismatched`
     (`catalog-identity-unavailable` when empty); the newest observation older
     than `policy.window_seconds` -> `stale`; fewer than
-    `policy.min_consecutive_observations` newest-first records agreeing on
-    the full identity -> `insufficient-observations`; else `fresh`. A record
+    `policy.min_consecutive_observations` newest-first observations agreeing
+    on the full identity -> `insufficient-observations`; else `fresh`.
+    Observations, not records, are counted (`_observation_key`): one per
+    store execution, else one per local document and `observed_at`; the run
+    ends at the first `evidence_kind == "none"` record. A record
     whose own `verdict != "evaluated"` (a hash-mismatch) never counts as an
     observation at all. `fresh` is unreachable for `evidence_kind == "none"`
     by construction. `now` is an argument: this function reads no clock."""
@@ -786,28 +810,29 @@ def assess_evidence(
 
     ordered = sorted(usable, key=lambda r: r.observed_at, reverse=True)
     newest = ordered[0]
+    observations = len({_observation_key(r) for r in ordered})
 
     if newest.evidence_kind == "none":
         return EvidenceAssessment(
             status="missing", reason_code="evidence-kind-none", evidence_kind=newest.evidence_kind,
-            observations=len(ordered), newest_age_seconds=None,
+            observations=observations, newest_age_seconds=None,
         )
 
     if not _declared_identity_matches(newest, expected):
         return EvidenceAssessment(
             status="mismatched", reason_code="declared-identity-mismatch", evidence_kind=newest.evidence_kind,
-            observations=len(ordered), newest_age_seconds=None,
+            observations=observations, newest_age_seconds=None,
         )
 
     if not expected.strategy_content_hash or not expected.strategy_implementation_hash:
         return EvidenceAssessment(
             status="mismatched", reason_code="catalog-identity-unavailable", evidence_kind=newest.evidence_kind,
-            observations=len(ordered), newest_age_seconds=None,
+            observations=observations, newest_age_seconds=None,
         )
     if not _catalog_identity_matches(newest, expected):
         return EvidenceAssessment(
             status="mismatched", reason_code="catalog-identity-mismatch", evidence_kind=newest.evidence_kind,
-            observations=len(ordered), newest_age_seconds=None,
+            observations=observations, newest_age_seconds=None,
         )
 
     newest_observed_at = _parse_observed_at(newest.observed_at)
@@ -817,53 +842,39 @@ def assess_evidence(
         # assume freshness (mctlhq/mctl-agents#526, ADR 015 sec. 7).
         return EvidenceAssessment(
             status="stale", reason_code="observed-at-unparseable", evidence_kind=newest.evidence_kind,
-            observations=len(ordered), newest_age_seconds=None,
+            observations=observations, newest_age_seconds=None,
         )
     newest_age_seconds = int((now - newest_observed_at).total_seconds())
     if newest_age_seconds > policy.window_seconds:
         return EvidenceAssessment(
             status="stale", reason_code="observation-older-than-window", evidence_kind=newest.evidence_kind,
-            observations=len(ordered), newest_age_seconds=newest_age_seconds,
+            observations=observations, newest_age_seconds=newest_age_seconds,
         )
 
-    # A duplicate copy of the SAME observation (the same snapshot, observed
-    # at the same moment) must not each increment the streak — that would
-    # let N copies of one real observation satisfy
-    # `min_consecutive_observations = N` on their own
-    # (mctlhq/mctl-agents#526). Two observations of the same snapshot at
-    # genuinely different moments (e.g. two replay-CLI runs) still count
-    # separately, so the key includes `observed_at` too.
-    #
-    # The "same snapshot" the store itself agrees on is `store_ref
-    # .store_snapshot_id` (ADR 015 sec. 1) when a record carries one — never
-    # `context_snapshot_id`/`content_hash`, which is this record's own LOCAL
-    # document identity and can legitimately differ across records that are
-    # all evidence of the one snapshot the store persisted (e.g. retries of
-    # the same execution). Keying on the local identity would let the store's
-    # single snapshot be counted as several distinct observations. Only when
-    # no `store_ref` exists (no store execution backs the record) is the
-    # local document identity the best available notion of "same document".
-    consecutive = 0
-    seen_observations: set[tuple[str, str]] = set()
+    # Observations are counted, not records (mctlhq/mctl-agents#526, ADR 015
+    # sec. 7 step 5). A record backed by the store is one observation per
+    # store execution — `store_ref.execution_id` is the store's own retry
+    # identity, so the attempts of one execution (whose local
+    # `content_hash`/`observed_at` are restamped on every retry) count once.
+    # A record with no store backing falls back to its local document
+    # identity plus `observed_at`; replaying one stored snapshot through the
+    # CLI stamps the same `observed_at` every time, so that is one
+    # observation too. An `evidence_kind: none` record ends the run.
+    counted: set[tuple[str, ...]] = set()
     for record in ordered:
+        if record.evidence_kind == "none":
+            break
         if not (_declared_identity_matches(record, expected) and _catalog_identity_matches(record, expected)):
             break
-        snapshot_identity = (
-            record.store_ref.store_snapshot_id if record.store_ref is not None
-            else f"{record.context_snapshot_id}:{record.content_hash}"
-        )
-        observation_key = (snapshot_identity, record.observed_at)
-        if observation_key in seen_observations:
-            continue
-        seen_observations.add(observation_key)
-        consecutive += 1
+        counted.add(_observation_key(record))
+    consecutive = len(counted)
     if consecutive < policy.min_consecutive_observations:
         return EvidenceAssessment(
             status="insufficient-observations", reason_code="fewer-than-minimum-consecutive-observations",
-            evidence_kind=newest.evidence_kind, observations=len(ordered), newest_age_seconds=newest_age_seconds,
+            evidence_kind=newest.evidence_kind, observations=consecutive, newest_age_seconds=newest_age_seconds,
         )
 
     return EvidenceAssessment(
-        status="fresh", reason_code="ok", evidence_kind=newest.evidence_kind, observations=len(ordered),
+        status="fresh", reason_code="ok", evidence_kind=newest.evidence_kind, observations=consecutive,
         newest_age_seconds=newest_age_seconds,
     )

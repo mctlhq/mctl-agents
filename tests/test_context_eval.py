@@ -587,50 +587,40 @@ def test_assess_evidence_duplicate_observations_do_not_each_count():
     assert result.status == "fresh"
 
 
-def test_assess_evidence_dedups_on_store_snapshot_identity_not_local_document_identity():
-    """mctlhq/mctl-agents#526, ADR 015 sec. 1: the store considers a single
-    execution's snapshot one document (`store_ref.store_snapshot_id`), but
-    each record's own `context_snapshot_id`/`content_hash` is this record's
-    LOCAL document identity, which can legitimately differ across records
-    that are all evidence of that one stored snapshot (e.g. records from
-    different retries of the same execution). Keying the dedup on the local
-    identity would let the store's one snapshot be counted as several
-    distinct observations; it must dedup on `store_snapshot_id` instead."""
+def test_assess_evidence_counts_store_executions_not_retry_attempts():
+    """mctlhq/mctl-agents#526, ADR 015 sec. 7 step 5: the retries of one store
+    execution restamp `created_at` (so `observed_at`), `content_hash` and the
+    local snapshot id, yet the store calls them one execution. Three such
+    records are ONE observation; three executions are three. An
+    `evidence_kind: none` record ends the run, and `observations` reports the
+    deduplicated count."""
     expected = _identity()
     policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
     now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
+    isos = ("2026-09-26T00:00:03Z", "2026-09-26T00:00:02Z", "2026-09-26T00:00:01Z")
 
-    same_store_ref = wc_snapshots.StoreRef(
-        work_item_id="wi_1", execution_id="we_1", store_snapshot_id="cs_shared",
-        store_content_hash="sha256:" + "a" * 64,
-    )
-    # Three records the store calls the SAME snapshot (same store_ref), each
-    # with a different local document identity (as different retry attempts
-    # would carry) and the same observed_at (one evaluation instant): this
-    # must count as ONE observation, not three.
-    one_real_observation = _record(expected, observed_at="2026-09-26T00:00:00Z")
-    retries_of_one_store_snapshot = [
-        replace(one_real_observation, context_snapshot_id=f"cs-{i}",
-                content_hash="sha256:" + str(i) * 64, store_ref=same_store_ref)
-        for i in (1, 2, 3)
-    ]
-    result = ce.assess_evidence(retries_of_one_store_snapshot, expected=expected, now=now, policy=policy)
-    assert result.status == "insufficient-observations"
-
-    # Three records against genuinely DIFFERENT store snapshots, one per
-    # moment, are three real observations and still count separately.
-    distinct_store_refs = [
-        replace(
-            one_real_observation, observed_at=iso,
-            store_ref=wc_snapshots.StoreRef(
-                work_item_id="wi_1", execution_id="we_1", store_snapshot_id=f"cs_{i}",
-                store_content_hash="sha256:" + str(i) * 64,
-            ),
+    def ref(execution_id: str) -> wc_snapshots.StoreRef:
+        return wc_snapshots.StoreRef(
+            work_item_id="wi_1", execution_id=execution_id, store_snapshot_id="cs_" + execution_id,
+            store_content_hash="sha256:" + "a" * 64,
         )
-        for i, iso in enumerate(("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z"))
+
+    base = _record(expected, observed_at=isos[0])
+    retries = [
+        replace(base, observed_at=iso, context_snapshot_id=f"cs-{i}", content_hash="sha256:" + str(i) * 64,
+                store_ref=ref("we_1"))
+        for i, iso in enumerate(isos)
     ]
-    result = ce.assess_evidence(distinct_store_refs, expected=expected, now=now, policy=policy)
-    assert result.status == "fresh"
+    result = ce.assess_evidence(retries, expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations" and result.observations == 1
+
+    executions = [replace(r, store_ref=ref(f"we_{i}")) for i, r in enumerate(retries)]
+    result = ce.assess_evidence(executions, expected=expected, now=now, policy=policy)
+    assert result.status == "fresh" and result.observations == 3
+
+    none_in_run = [executions[0], executions[1], replace(executions[2], evidence_kind="none")]
+    result = ce.assess_evidence(none_in_run, expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations" and result.observations == 2
 
 
 def test_assess_evidence_malformed_observed_at_is_stale_not_a_crash():

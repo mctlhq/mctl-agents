@@ -502,19 +502,17 @@ def test_store_ref_from_populated_for_sealed_and_replayed(tmp_path):
         )
 
 
-def test_store_ref_from_always_uses_the_store_minted_hash_for_a_cross_attempt_replay(tmp_path):
-    """On a cross-attempt replay (`persist`'s document-comparison branch
-    after a 409), `answer.content_hash` is the hash mctl-api itself reported
-    for the stored document; `answer.local_content_hash` is this attempt's
-    own, locally computed hash. ADR 015 sec. 1 defines `store_content_hash`
-    as minted by mctl-api and never recomputed locally, so `store_ref_from`
-    must carry `answer.content_hash` regardless of whether
-    `local_content_hash` is populated — using the local hash would make
-    `context_eval.verify_identity`'s store check compare a value against
-    itself instead of against what the store actually holds."""
+def test_store_ref_from_carries_both_hashes_for_a_cross_attempt_replay(tmp_path):
+    """On a cross-attempt replay (`persist`'s document-comparison branch after
+    a 409), `store_content_hash` stays mctl-api's own digest of the STORED
+    attempt and `local_content_hash` carries this attempt's sealed hash
+    (ADR 015 sec. 1). `verify_identity` then holds as `retry-equivalent`, not
+    `stored`, and a document matching neither hash is still a mismatch."""
+    from orchestrator import context_eval as ce
+
     snap = _sealed(tmp_path, _work_context())
-    stored_hash = "sha256:" + "9" * 64  # mctl-api's own hash for the stored document
-    this_attempt_hash = ws.hash_bytes(ws.canonical_bytes(snap))  # this attempt's own, local, hash
+    stored_hash = "sha256:" + "9" * 64  # mctl-api's own hash for the other attempt's document
+    this_attempt_hash = ws.hash_bytes(ws.canonical_bytes(snap))
     answer = ws.SnapshotAnswer(
         ws.SNAPSHOT_REPLAYED, snapshot_id="cs_original", content_hash=stored_hash,
         reason="same context as the stored snapshot, assembled on another attempt",
@@ -523,10 +521,23 @@ def test_store_ref_from_always_uses_the_store_minted_hash_for_a_cross_attempt_re
     ref = ws.store_ref_from(snap, answer)
     assert ref == ws.StoreRef(
         work_item_id=WID, execution_id=E2, store_snapshot_id="cs_original", store_content_hash=stored_hash,
+        local_content_hash=this_attempt_hash,
     )
-    # `store_content_hash` is the store's own hash, not a recomputation of
-    # this attempt's own snapshot bytes.
-    assert ref.store_content_hash != ws.hash_bytes(ws.canonical_bytes(snap))
+    assert ref.to_dict()["local_content_hash"] == this_attempt_hash
+    assert ws.StoreRef.from_dict(ref.to_dict()) == ref
+
+    check = ce.verify_identity(snap, ref)
+    assert check.ok and check.store_match == ce.STORE_MATCH_RETRY_EQUIVALENT
+
+    neither = replace(ref, local_content_hash="sha256:" + "8" * 64)
+    check = ce.verify_identity(snap, neither)
+    assert check.store_ok is False and "store_content_hash" in check.mismatch_fields
+
+    # A same-attempt replay (the store holds exactly these bytes) is `stored`,
+    # and its ref keeps the four-field shape.
+    same = ws.store_ref_from(snap, replace(answer, content_hash=this_attempt_hash))
+    assert same.local_content_hash == "" and "local_content_hash" not in same.to_dict()
+    assert ce.verify_identity(snap, same).store_match == ce.STORE_MATCH_STORED
 
 
 def test_persist_to_work_item_store_still_raises_under_pre_change_conditions_and_returns_the_answer(

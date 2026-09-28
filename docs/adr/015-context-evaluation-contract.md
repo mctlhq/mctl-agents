@@ -45,7 +45,13 @@ and computes no metric until both check out:
   locally.
 
 `StoreRef` is `{work_item_id, execution_id, store_snapshot_id,
-store_content_hash}`. When no store execution exists, or the persist
+store_content_hash}`, plus `local_content_hash` on a cross-attempt replay
+only: when `persist` finds after a 409 that the store kept another attempt's
+document, differing only in retry-volatile fields, `store_content_hash`
+stays mctl-api's own digest and `local_content_hash` carries the hash this
+attempt sealed. Verification then reports `store_match: retry-equivalent`
+instead of `stored`, so a retried execution is measured without claiming the
+store holds its bytes. When no store execution exists, or the persist
 answer was not `stored`, evaluation still verifies the document identity
 and records `store_ref: null` rather than failing. A hash mismatch, on
 either pair, produces a record with `verdict: "hash-mismatch"`, the two
@@ -155,7 +161,11 @@ this fixed precedence (never order-dependent):
    -> `stale`.
 5. Fewer than the caller-supplied minimum number of consecutive
    newest-first observations agree on the full identity -> `insufficient-
-   observations`.
+   observations`. Observations, not records, are counted: one per store
+   execution (`store_ref.execution_id`, so the retries of one execution
+   count once), else one per local `(context_snapshot_id, content_hash,
+   observed_at)`; the run ends at the first `evidence_kind: none` record.
+   `observations` in the assessment reports this deduplicated count.
 6. Otherwise -> `fresh`.
 
 The freshness window and minimum-observation count are ADR 019's **v1

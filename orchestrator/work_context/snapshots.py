@@ -92,20 +92,32 @@ class StoreRef:
     ADR 015 sec. 1). `store_snapshot_id` is opaque to every consumer: it is
     carried and compared against what the store reported, and is never
     recomputed locally — only `store_content_hash` is ever re-derived and
-    checked (`hash_bytes(canonical_bytes(snapshot)) == store_content_hash`)."""
+    checked (`hash_bytes(canonical_bytes(snapshot)) == store_content_hash`).
+
+    `local_content_hash` is set only for a cross-attempt replay (`persist`
+    after a 409 whose stored document differs from this attempt's only in
+    retry-volatile fields): the store kept another attempt's bytes, so
+    `store_content_hash` (mctl-api's own digest) cannot match this attempt's
+    document, and `local_content_hash` is the hash this attempt sealed. It is
+    omitted from `to_dict()` when empty, so an ordinary ref keeps its four
+    fields."""
 
     work_item_id: str
     execution_id: str
     store_snapshot_id: str
     store_content_hash: str
+    local_content_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "work_item_id": self.work_item_id,
             "execution_id": self.execution_id,
             "store_snapshot_id": self.store_snapshot_id,
             "store_content_hash": self.store_content_hash,
         }
+        if self.local_content_hash:
+            out["local_content_hash"] = self.local_content_hash
+        return out
 
     @classmethod
     def from_dict(cls, data: Any) -> StoreRef:
@@ -115,6 +127,7 @@ class StoreRef:
             execution_id=str(mapping.get("execution_id", "")),
             store_snapshot_id=str(mapping.get("store_snapshot_id", "")),
             store_content_hash=str(mapping.get("store_content_hash", "")),
+            local_content_hash=str(mapping.get("local_content_hash", "")),
         )
 
 
@@ -138,7 +151,9 @@ def store_ref_from(snapshot: ContextSnapshot, answer: SnapshotAnswer) -> StoreRe
     differ from the stored ones in retry-volatile fields, so the store
     identity check correctly does not hold for that attempt's own snapshot
     object — that is a real, not spurious, mismatch of this call's document
-    against the stored one."""
+    against the stored one. So that attempt's ref also carries
+    `local_content_hash`, and `verify_identity` reports the match as
+    `retry-equivalent` rather than `stored`."""
     if not answer.stored or not _is_snapshot_id(answer.snapshot_id):
         return None
     work_context = snapshot.work_context
@@ -149,6 +164,11 @@ def store_ref_from(snapshot: ContextSnapshot, answer: SnapshotAnswer) -> StoreRe
         execution_id=work_context.execution_id,
         store_snapshot_id=answer.snapshot_id,
         store_content_hash=answer.content_hash,
+        local_content_hash=(
+            answer.local_content_hash
+            if answer.local_content_hash and answer.local_content_hash != answer.content_hash
+            else ""
+        ),
     )
 
 
