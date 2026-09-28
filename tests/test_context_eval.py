@@ -847,14 +847,19 @@ def test_context_eval_module_is_pure():
 
 
 def test_only_investigator_and_replay_cli_import_context_eval():
-    """mctlhq/mctl-agents#528 adds one legitimate fourth caller:
-    `orchestrator/context_release.py` imports `context_eval` inside
-    `assess_production_evidence`'s function body only (never at module
-    scope — `test_context_release_never_imports_context_eval_at_module_scope`
-    pins that), the same direction `context_release` already imports
-    `context_snapshot`."""
+    """mctlhq/mctl-agents#528 adds two legitimate callers: `orchestrator/
+    context_release.py` imports `context_eval` inside `assess_production_
+    evidence`'s function body only (never at module scope —
+    `test_context_release_never_imports_context_eval_at_module_scope` pins
+    that), and `orchestrator/context_assembly.py` imports it inside
+    `_emit_strategy_compare`'s function body only, for the compare line's
+    evaluator reference — both the same deferred direction `context_release`
+    already imports `context_snapshot`."""
     orchestrator_dir = REPO_ROOT / "orchestrator"
-    allowed = {"run_issue_investigator.py", "run_context_eval.py", "context_eval.py", "context_release.py"}
+    allowed = {
+        "run_issue_investigator.py", "run_context_eval.py", "context_eval.py", "context_release.py",
+        "context_assembly.py",
+    }
     offenders = []
     for path in sorted(orchestrator_dir.rglob("*.py")):
         if path.name in allowed:

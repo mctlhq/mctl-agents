@@ -31,10 +31,11 @@ retrieval-quality record orders and measures what a model was shown. It
 grants nothing, blocks nothing, and no policy, capability-eligibility or
 authorization decision may ever read one. `tests/test_context_eval.py`
 scans `orchestrator/`'s imports and asserts that only
-`run_issue_investigator`, `run_context_eval` and `context_release` (deferred
-inside a function body — mctlhq/mctl-agents#528's production evidence gate,
-the same direction `context_release` already imports this module's sibling
-`context_snapshot`) import this module at all.
+`run_issue_investigator`, `run_context_eval`, `context_release` and
+`context_assembly` (the latter two deferred inside a function body —
+mctlhq/mctl-agents#528's production evidence gate and compare-line
+evaluator reference, the same direction `context_release` already imports
+this module's sibling `context_snapshot`) import this module at all.
 
 Vocabularies (`WORK_ITEM_STATES`, `EXECUTION_PHASES`) that this module needs
 for outcome linking are duplicated from `orchestrator/work_context/

@@ -67,3 +67,15 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 6
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:46c96b32b424c6f6c8ee68678b142c0dd5cf29bc221b9582decff20fc21c5691
+    implementationHash: sha256:1f390be609347c28ded9cab5be7f04d112147d82f8981a88a5847b6a3361603d
+    promotedBy: mctl-agents[bot]
+    promotedAt: '2026-09-28T22:17:44Z'
+    reason: republish pins after issue-528 Slice C
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null
