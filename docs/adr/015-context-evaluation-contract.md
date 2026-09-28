@@ -1,6 +1,6 @@
 # ADR 015 — Context evaluation contract: measuring retrieval quality
 
-> **Status:** proposed
+> **Status:** accepted
 > **Date:** 2026-09-26
 > **Issue:** mctlhq/mctl-agents#266 (parent: ADR 009 amendment 1's closing
 > line, `docs/adr/009-context-snapshot-contract.md`: "Wiring
@@ -40,12 +40,20 @@ and computes no metric until both check out:
 - **Store identity** — `cs_` + `store_content_hash`: `hash_bytes
   (canonical_bytes(snapshot)) == store_ref.store_content_hash`
   (`work_context/snapshots.py`), a hash over the *whole* canonical document,
-  minted by mctl-api. `store_snapshot_id` (`cs_`-prefixed) is opaque: it is
+  minted by mctl-api (or, on a cross-attempt replay, `==
+  store_ref.local_content_hash`; see below). `store_snapshot_id`
+  (`cs_`-prefixed) is opaque: it is
   carried and compared to what the store reported, and is never recomputed
   locally.
 
 `StoreRef` is `{work_item_id, execution_id, store_snapshot_id,
-store_content_hash}`. When no store execution exists, or the persist
+store_content_hash}`, plus `local_content_hash` on a cross-attempt replay
+only: when `persist` finds after a 409 that the store kept another attempt's
+document, differing only in retry-volatile fields, `store_content_hash`
+stays mctl-api's own digest and `local_content_hash` carries the hash this
+attempt sealed. Verification then reports `store_match: retry-equivalent`
+instead of `stored`, so a retried execution is measured without claiming the
+store holds its bytes. When no store execution exists, or the persist
 answer was not `stored`, evaluation still verifies the document identity
 and records `store_ref: null` rather than failing. A hash mismatch, on
 either pair, produces a record with `verdict: "hash-mismatch"`, the two
@@ -123,6 +131,65 @@ capability-eligibility decision (ADR 009 sec. 5/6; ADR 014). This
 evaluator adds a second read-only measurement of the same non-authoritative
 data; it does not change what boundary enforces anything.
 
+### 7. Evidence freshness and promotion readiness
+
+Added by mctlhq/mctl-agents#526, alongside the delivery of the module this
+ADR had deferred (sec. "Implementation map" below). `context_eval.py` records
+each evaluation's evidence `kind` from the closed set `{"none",
+"fixture-baseline", "stored-replay", "live"}`, plus the evaluated strategy's
+name, version, ranker (name/version), the evaluator's own identity
+(`evaluator_name`, `evaluator_version`, `metrics_contract_version`), and the
+strategy version's catalog identity: mctlhq/mctl-agents#472's
+`contentHash`/`implementationHash` for that (name, version), obtained by the
+CALLER (the live emitter, the fixture harness, the replay CLI) through
+`orchestrator.context_release.load_version`, imported inside the function
+body — `context_eval` itself never reads the catalog. `pipeline_source_hash`
+travels alongside as a diagnostic only; it is never an assessment input.
+
+`assess_evidence(records, *, expected, now, policy)` returns a status from
+the closed set `{"fresh", "missing", "stale", "mismatched",
+"insufficient-observations"}` with a machine-readable reason code, applying
+this fixed precedence (never order-dependent):
+
+1. No usable record, or the newest one's `evidence_kind == "none"` ->
+   `missing`.
+2. Any declared-identity field (strategy name/version, ranker name/version)
+   differs from the promotion candidate's -> `mismatched`.
+3. The catalog identity (`strategy_content_hash`/
+   `strategy_implementation_hash`) is empty (the caller could not load the
+   version) or differs from the candidate's -> `mismatched`, with
+   `catalog-identity-unavailable` when empty.
+4. The newest observation (the newest store-backed record, step 5; none at
+   all -> `insufficient-observations`, `no-store-backed-observation`) is
+   older than the caller-supplied freshness window -> `stale`.
+5. Fewer than the caller-supplied minimum number of consecutive
+   newest-first observations agree on the full identity -> `insufficient-
+   observations`. Observations, not records, are counted: one per store
+   execution (`store_ref.execution_id`, so the retries of one execution
+   count once). A record with `store_ref: null` is not a promotion
+   observation — a retry restamps every local identity field, so nothing
+   tells its attempts apart — and is never counted. The run ends at the
+   first `evidence_kind: none` record. `observations` in the assessment
+   reports this deduplicated count.
+6. Otherwise -> `fresh`.
+
+The freshness window and minimum-observation count are ADR 019's **v1
+promotion policy constants** (mctlhq/mctl-agents#472 Slice A): 7 days
+(`ADR019_V1_FRESHNESS_WINDOW_SECONDS = 604800`) and 3 consecutive
+observations (`ADR019_V1_MIN_CONSECUTIVE_OBSERVATIONS = 3`). `context_eval`
+exports them as named constants and takes them as explicit
+`FreshnessPolicy` parameters — no `from_env()`, no environment variable, no
+inference from observation history. Changing either value is an ADR 019
+amendment, not a runtime knob.
+
+`assess_evidence` reports a status and a reason code only. It does not
+decide whether a `fresh` assessment permits a production promotion — that
+decision belongs to mctlhq/mctl-agents#528 (#472 Slice C), reading ADR 019.
+Production promotion MUST refuse evidence whose `kind` is `"none"`; a
+`fresh` assessment is `assess_evidence`'s only possible answer for evidence
+that could license a promotion, and it is unreachable for `kind == "none"`
+by construction.
+
 ## Alternatives
 
 See design.md for the full comparison; summarized:
@@ -167,8 +234,8 @@ See design.md for the full comparison; summarized:
 
 ## Implementation map
 
-This proposal lands incrementally, matching ADR 009's own precedent of
-shipping the contract ahead of a full producer. This PR changes:
+This proposal landed incrementally, matching ADR 009's own precedent of
+shipping the contract ahead of a full producer. #266 delivered:
 
 ```
 docs/adr/015-context-evaluation-contract.md   # this document
@@ -177,9 +244,22 @@ orchestrator/context_assembly.py              # run_pipeline extraction (behavio
 tests/test_context_assembly.py                # run_pipeline unit coverage
 ```
 
-The evaluator module (`orchestrator/context_eval.py`), the live emission
-in `run_issue_investigator.py`, the fixture set under
-`tests/fixtures/context_eval/`, the committed baseline, the
-`run_context_eval` replay CLI and the README/`.env.example` runbook remain
-as follow-up work against this contract — sec. 1 through 5 above are
-normative for that work and must not be reopened by it.
+mctlhq/mctl-agents#526 delivered the rest, plus sec. 7 above:
+
+```
+orchestrator/work_context/snapshots.py   # StoreRef, store_ref_from
+orchestrator/context_assembly.py         # returns the persist answer; AssemblyResult.store_ref
+orchestrator/context_eval.py             # the evaluator itself: identity, metrics, telemetry
+                                          # safety, outcome linking, freshness/promotion readiness
+orchestrator/run_issue_investigator.py   # guarded live emission (ISSUE_INVESTIGATOR_CONTEXT_EVAL)
+orchestrator/run_context_eval.py         # read-only stored-replay CLI
+tests/fixtures/context_eval/             # 7 curated cases + the committed baseline
+tests/test_context_eval.py               # the fixture harness, and every T1-T29 in tasks.md
+tests/test_work_context_snapshots.py     # StoreRef/store_ref_from/persist-return-value coverage
+docs/adr/009-context-snapshot-contract.md  # follow-up row (f) annotated with #526
+README.md                                # "Context evaluation" runbook subsection
+.env.example                             # ISSUE_INVESTIGATOR_CONTEXT_EVAL, commented out
+```
+
+Sections 1 through 6 above were normative for that work and were not
+reopened by it.

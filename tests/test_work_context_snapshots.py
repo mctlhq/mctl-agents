@@ -455,3 +455,123 @@ def test_the_snapshot_log_line_imports_nothing_at_call_time():
 
     tree = ast.parse(inspect.getsource(ca._emit_snapshot_answer))
     assert not [n for n in ast.walk(tree) if isinstance(n, ast.Import | ast.ImportFrom)]
+
+
+# ---------------------------------------------------------------------------
+# StoreRef / store_ref_from / the persist answer reaching AssemblyResult
+# (mctlhq/mctl-agents#526, ADR 015 sec. 1 — T2, T3, T4)
+# ---------------------------------------------------------------------------
+
+
+def test_store_ref_to_dict_from_dict_round_trip():
+    ref = ws.StoreRef(
+        work_item_id=WID, execution_id=E2, store_snapshot_id="cs_abc", store_content_hash="sha256:" + "1" * 64
+    )
+    assert ws.StoreRef.from_dict(ref.to_dict()) == ref
+    # No field can hold a document, payload, locator or selector: the shape
+    # is exactly the four id/hash fields.
+    assert set(ref.to_dict()) == {"work_item_id", "execution_id", "store_snapshot_id", "store_content_hash"}
+
+
+def test_store_ref_from_is_none_for_every_unfavourable_or_unverifiable_answer(tmp_path):
+    snap = _sealed(tmp_path, _work_context())
+    unfavourable = (
+        ws.SNAPSHOT_SKIPPED, ws.SNAPSHOT_DIVERGED, ws.SNAPSHOT_UNKNOWN, ws.SNAPSHOT_REFUSED, ws.SNAPSHOT_ABSENT,
+    )
+    for verdict in unfavourable:
+        answer = ws.SnapshotAnswer(verdict, snapshot_id="cs_abc", content_hash="sha256:" + "1" * 64)
+        assert ws.store_ref_from(snap, answer) is None
+    # `stored` but not `cs_`-prefixed: an unverifiable ref is worse than none.
+    not_cs_prefixed = ws.SnapshotAnswer(
+        ws.SNAPSHOT_SEALED, snapshot_id="not-cs-prefixed", content_hash="sha256:" + "1" * 64
+    )
+    assert ws.store_ref_from(snap, not_cs_prefixed) is None
+    # No work context at all: nothing to build a ref from either.
+    no_wc = replace(snap, work_context=None)
+    ok_answer = ws.SnapshotAnswer(ws.SNAPSHOT_SEALED, snapshot_id="cs_ok", content_hash="sha256:" + "1" * 64)
+    assert ws.store_ref_from(no_wc, ok_answer) is None
+
+
+def test_store_ref_from_populated_for_sealed_and_replayed(tmp_path):
+    snap = _sealed(tmp_path, _work_context())
+    for verdict in (ws.SNAPSHOT_SEALED, ws.SNAPSHOT_REPLAYED):
+        answer = ws.SnapshotAnswer(verdict, snapshot_id="cs_realid", content_hash="sha256:" + "2" * 64)
+        ref = ws.store_ref_from(snap, answer)
+        assert ref == ws.StoreRef(
+            work_item_id=WID, execution_id=E2, store_snapshot_id="cs_realid", store_content_hash="sha256:" + "2" * 64,
+        )
+
+
+def test_store_ref_from_carries_both_hashes_for_a_cross_attempt_replay(tmp_path):
+    """On a cross-attempt replay (`persist`'s document-comparison branch after
+    a 409), `store_content_hash` stays mctl-api's own digest of the STORED
+    attempt and `local_content_hash` carries this attempt's sealed hash
+    (ADR 015 sec. 1). `verify_identity` then holds as `retry-equivalent`, not
+    `stored`, and a document matching neither hash is still a mismatch."""
+    from orchestrator import context_eval as ce
+
+    snap = _sealed(tmp_path, _work_context())
+    stored_hash = "sha256:" + "9" * 64  # mctl-api's own hash for the other attempt's document
+    this_attempt_hash = ws.hash_bytes(ws.canonical_bytes(snap))
+    answer = ws.SnapshotAnswer(
+        ws.SNAPSHOT_REPLAYED, snapshot_id="cs_original", content_hash=stored_hash,
+        reason="same context as the stored snapshot, assembled on another attempt",
+        local_snapshot_id=snap.snapshot_id, local_content_hash=this_attempt_hash,
+    )
+    ref = ws.store_ref_from(snap, answer)
+    assert ref == ws.StoreRef(
+        work_item_id=WID, execution_id=E2, store_snapshot_id="cs_original", store_content_hash=stored_hash,
+        local_content_hash=this_attempt_hash,
+    )
+    assert ref.to_dict()["local_content_hash"] == this_attempt_hash
+    assert ws.StoreRef.from_dict(ref.to_dict()) == ref
+
+    check = ce.verify_identity(snap, ref)
+    assert check.ok and check.store_match == ce.STORE_MATCH_RETRY_EQUIVALENT
+
+    neither = replace(ref, local_content_hash="sha256:" + "8" * 64)
+    check = ce.verify_identity(snap, neither)
+    assert check.store_ok is False and "store_content_hash" in check.mismatch_fields
+
+    # A same-attempt replay (the store holds exactly these bytes) is `stored`,
+    # and its ref keeps the four-field shape.
+    same = ws.store_ref_from(snap, replace(answer, content_hash=this_attempt_hash))
+    assert same.local_content_hash == "" and "local_content_hash" not in same.to_dict()
+    assert ce.verify_identity(snap, same).store_match == ce.STORE_MATCH_STORED
+
+
+def test_persist_to_work_item_store_still_raises_under_pre_change_conditions_and_returns_the_answer(
+    tmp_path, monkeypatch
+):
+    """`_persist_to_work_item_store`'s return type widens to
+    `SnapshotAnswer | None`, but every existing raise condition and the
+    `WORK_CONTEXT_SNAPSHOT` log line stay byte-identical (mctlhq/mctl-agents#526
+    task 2)."""
+    snap = _sealed(tmp_path)
+    # No client at all: `None`, no raise, matching today's early return.
+    assert ca._persist_to_work_item_store(snap, None) is None
+
+    # A stored (sealed) answer: returned, never raised.
+    stored_answer = ca._persist_to_work_item_store(snap, _Store())
+    assert stored_answer is not None and stored_answer.stored
+
+    # A divergence at `enforce` still raises SnapshotNotPersisted, unchanged.
+    other = cs.canonical_json({**snap.to_dict(), "sources": [], "content_hash": "sha256:other"})
+    monkeypatch.setenv("WORK_CONTEXT_ROLLOUT_MODE", "enforce")
+    monkeypatch.setenv("WORK_CONTEXT_REQUIRED", "false")
+    with pytest.raises(ca.SnapshotNotPersisted, match=ws.SNAPSHOT_DIVERGED):
+        ca._persist_to_work_item_store(snap, _Store(stored=other))
+
+
+def test_assemble_investigator_context_populates_store_ref_only_when_persisted(tmp_path, observe):
+    """`AssemblyResult.store_ref` is populated end to end when the persist
+    answer is `stored`, and stays `None` when there is no store execution —
+    assembly never fails for that reason alone (mctlhq/mctl-agents#526)."""
+    result = ca.assemble_investigator_context(**_assemble_kwargs(tmp_path, _work_context(), _Store()))
+    assert result.store_ref == ws.StoreRef(
+        work_item_id=WID, execution_id=E2, store_snapshot_id="cs_new",
+        store_content_hash=cs.hash_bytes(ws.canonical_bytes(result.snapshot)),
+    )
+
+    no_store_result = ca.assemble_investigator_context(**_assemble_kwargs(tmp_path, None, _NoCalls()))
+    assert no_store_result.store_ref is None

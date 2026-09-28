@@ -55,3 +55,15 @@ spec:
       kind: none
       ref: null
       evaluatorVersion: null
+  - revision: 5
+    strategy: deterministic-fixed-order
+    version: 1.0.0
+    contentHash: sha256:6558b0841d1f9565265bc99ccd2a18a500b09bcc32e9b7d77d52fbdf363e31cd
+    implementationHash: sha256:4c8ac5090a87758f180563654487b36faeb8ab800f0b4c086557ca5f32aeb028
+    promotedBy: mashkovd
+    promotedAt: '2026-09-28T06:47:50Z'
+    reason: 'republish pins after merging main (#532) into #526'
+    evidence:
+      kind: none
+      ref: null
+      evaluatorVersion: null

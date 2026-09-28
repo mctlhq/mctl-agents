@@ -85,6 +85,93 @@ def is_store_execution(execution_id: str | None) -> bool:
     return isinstance(execution_id, str) and execution_id.startswith(EXECUTION_ID_PREFIX)
 
 
+@dataclass(frozen=True)
+class StoreRef:
+    """What the store reported for one execution's snapshot: two ids and one
+    hash — never a canonical document, never a payload (mctlhq/mctl-agents#526,
+    ADR 015 sec. 1). `store_snapshot_id` is opaque to every consumer: it is
+    carried and compared against what the store reported, and is never
+    recomputed locally — only `store_content_hash` is ever re-derived and
+    checked (`hash_bytes(canonical_bytes(snapshot)) == store_content_hash`).
+
+    `local_content_hash` is set only for a cross-attempt replay (`persist`
+    after a 409 whose stored document differs from this attempt's only in
+    retry-volatile fields): the store kept another attempt's bytes, so
+    `store_content_hash` (mctl-api's own digest) cannot match this attempt's
+    document, and `local_content_hash` is the hash this attempt sealed. It is
+    omitted from `to_dict()` when empty, so an ordinary ref keeps its four
+    fields."""
+
+    work_item_id: str
+    execution_id: str
+    store_snapshot_id: str
+    store_content_hash: str
+    local_content_hash: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        out = {
+            "work_item_id": self.work_item_id,
+            "execution_id": self.execution_id,
+            "store_snapshot_id": self.store_snapshot_id,
+            "store_content_hash": self.store_content_hash,
+        }
+        if self.local_content_hash:
+            out["local_content_hash"] = self.local_content_hash
+        return out
+
+    @classmethod
+    def from_dict(cls, data: Any) -> StoreRef:
+        mapping = data if isinstance(data, dict) else {}
+        return cls(
+            work_item_id=str(mapping.get("work_item_id", "")),
+            execution_id=str(mapping.get("execution_id", "")),
+            store_snapshot_id=str(mapping.get("store_snapshot_id", "")),
+            store_content_hash=str(mapping.get("store_content_hash", "")),
+            local_content_hash=str(mapping.get("local_content_hash", "")),
+        )
+
+
+def store_ref_from(snapshot: ContextSnapshot, answer: SnapshotAnswer) -> StoreRef | None:
+    """`StoreRef` for `snapshot`'s persist `answer`, or `None` unless the
+    answer is `stored` (`snapshot-sealed`/`snapshot-replayed`) and its
+    `snapshot_id` is `cs_`-prefixed (`_is_snapshot_id`) — an unverifiable ref
+    is worse than no ref at all (mctlhq/mctl-agents#526). `snapshot.work_context`
+    must be present; a snapshot with no work context (no store execution)
+    never has a store answer worth a ref either.
+
+    `store_content_hash` is always `answer.content_hash` — the hash mctl-api
+    itself reported for the stored document, never `answer.local_content_hash`
+    (this attempt's own, locally computed hash). ADR 015 sec. 1 defines
+    `store_content_hash` as minted by mctl-api and never recomputed locally;
+    putting a local hash there makes `context_eval.verify_identity`'s store
+    check vacuous (it would compare a locally recomputed hash against
+    itself) instead of actually verifying this document against what the
+    store holds. On a cross-attempt replay (`persist`'s document-comparison
+    branch after a 409) this attempt's own canonical bytes legitimately
+    differ from the stored ones in retry-volatile fields, so the store
+    identity check correctly does not hold for that attempt's own snapshot
+    object — that is a real, not spurious, mismatch of this call's document
+    against the stored one. So that attempt's ref also carries
+    `local_content_hash`, and `verify_identity` reports the match as
+    `retry-equivalent` rather than `stored`."""
+    if not answer.stored or not _is_snapshot_id(answer.snapshot_id):
+        return None
+    work_context = snapshot.work_context
+    if work_context is None:
+        return None
+    return StoreRef(
+        work_item_id=work_context.work_item_id,
+        execution_id=work_context.execution_id,
+        store_snapshot_id=answer.snapshot_id,
+        store_content_hash=answer.content_hash,
+        local_content_hash=(
+            answer.local_content_hash
+            if answer.local_content_hash and answer.local_content_hash != answer.content_hash
+            else ""
+        ),
+    )
+
+
 def canonical_bytes(snapshot: ContextSnapshot) -> bytes:
     """The bytes the store keeps: the whole sealed document, canonical.
     It carries the snapshot's strategy name and version, so a retry from a

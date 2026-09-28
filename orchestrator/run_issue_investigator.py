@@ -2017,7 +2017,60 @@ def _assemble_context(
     # is not one `python -O` could strip away.
     result = cast(context_assembly.AssemblyResult, result)
     print(f"[context] context_assembly={json.dumps(result.metrics.to_log_dict(), sort_keys=True)}")
+    _emit_context_eval(result)
     return result
+
+
+def _context_eval_enabled() -> bool:
+    return os.getenv("ISSUE_INVESTIGATOR_CONTEXT_EVAL", "off").strip().lower() == "on"
+
+
+def _load_catalog_identity(strategy_name: str, strategy_version: str) -> tuple[str, str]:
+    """`(content_hash, implementation_hash)` from mctlhq/mctl-agents#472's
+    catalog, or `("", "")` when the version cannot be loaded (absent,
+    disabled, or a recomputed-hash mismatch) — `orchestrator.context_release`
+    is imported here, inside the function body, never at this module's top
+    level, matching how `context_assembly` already imports
+    `orchestrator.work_context` lazily. Without this, a live record's catalog
+    identity is always empty and `assess_evidence` can never call it `fresh`
+    (mctlhq/mctl-agents#526, ADR 015 sec. 7)."""
+    try:
+        from orchestrator import context_release
+
+        version = context_release.load_version(strategy_name, strategy_version)
+    except Exception:  # noqa: BLE001 — an unloadable catalog version is empty identity, not a crash
+        return "", ""
+    return version.content_hash, version.implementation_hash
+
+
+def _emit_context_eval(result: context_assembly.AssemblyResult) -> None:
+    """Best-effort, in EVERY mode — including `on` — unlike `_assemble_context`
+    itself. A sealed snapshot must describe the prompt actually built, so
+    assembly propagates in `on`; an evaluation describes nothing the prompt
+    depends on, so a metric bug here must never be able to fail an
+    investigation that would otherwise have succeeded (mctlhq/mctl-agents#526,
+    ADR 015). Off by default: `ISSUE_INVESTIGATOR_CONTEXT_EVAL` unset or
+    anything but `on` prints nothing and never imports `context_eval` at
+    all, so investigator stdout stays byte-identical to today."""
+    if not _context_eval_enabled():
+        return
+    try:
+        from orchestrator import context_eval
+
+        strategy = result.snapshot.strategy
+        content_hash, implementation_hash = _load_catalog_identity(strategy.name, strategy.version)
+        record = context_eval.evaluate(
+            result.snapshot,
+            observed_at=result.snapshot.created_at,
+            store_ref=result.store_ref,
+            assembly=context_eval.assembly_counters_from(result.metrics),
+            evidence_kind="live",
+            strategy_content_hash=content_hash,
+            strategy_implementation_hash=implementation_hash,
+        )
+        print(f"[context] context_eval={json.dumps(record.to_log_dict(), sort_keys=True)}")
+    except Exception as exc:  # noqa: BLE001 — a metric bug must never fail an investigation
+        print(f"warn: context evaluation failed: {type(exc).__name__}: {exc}")
 
 
 # What the staging checks below are, and are not, for.
