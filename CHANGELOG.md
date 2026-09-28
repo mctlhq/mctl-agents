@@ -1,5 +1,54 @@
 # Changelog
 
+## [1.60.0](https://github.com/mctlhq/mctl-agents/compare/1.59.0...1.60.0) (2026-09-28)
+
+
+### Features
+
+* **agents:** context strategy release contract Slice A (catalog only) ([2f4c70e](https://github.com/mctlhq/mctl-agents/commit/2f4c70ec0668248e74767aebad51da0563f34b51))
+* **agents:** gate the shepherd's merge behind action-approval (mctl-agents[#519](https://github.com/mctlhq/mctl-agents/issues/519)) ([e0b7741](https://github.com/mctlhq/mctl-agents/commit/e0b7741dc65a9cfe52316a78bab3bf0e4ac88c71))
+* **agents:** issue-266-feat-context-evals-measure-retrieval-qua ([cd53998](https://github.com/mctlhq/mctl-agents/commit/cd53998b74e7afb86f963f4b3c1584d71671ed2c))
+* **agents:** issue-266-feat-context-evals-measure-retrieval-qua ([19f5678](https://github.com/mctlhq/mctl-agents/commit/19f56787d94e2b69136cbc9679eb4140e2f94735))
+* **agents:** issue-472-feat-context-platform-version-promote-ob ([db32ddd](https://github.com/mctlhq/mctl-agents/commit/db32ddd06a9d8a07ed46940ec1882155a572774a))
+* **agents:** issue-516-fix-devloop-end-devloopworkflow-when-its ([01c1e3f](https://github.com/mctlhq/mctl-agents/commit/01c1e3f5a9fafc791d752a90aa57314feac75e17))
+* **agents:** issue-519-feat-governance-gate-shepherd-merge-thro ([085e19d](https://github.com/mctlhq/mctl-agents/commit/085e19d1362b0c14997b0fa40b85ad716e296730))
+* **agents:** issue-520-feat-evidence-define-and-seal-the-govern ([610504e](https://github.com/mctlhq/mctl-agents/commit/610504e1b013e0da6abc1b4b56c3d4718a186c48))
+* **agents:** issue-526-feat-context-evals-complete-evaluation-b ([27805d3](https://github.com/mctlhq/mctl-agents/commit/27805d3fec1f5f78ee7c46c29d5b62b0e4a61524))
+* **agents:** issue-526-feat-context-evals-complete-evaluation-b ([b89262c](https://github.com/mctlhq/mctl-agents/commit/b89262cfee77247a33806b72fbe6487d4c56fa47))
+* **agents:** issue-527-feat-context-platform-472-slice-b-contex ([9c378b7](https://github.com/mctlhq/mctl-agents/commit/9c378b7119f5065fa34fea68062274ab174945df))
+* **agents:** issue-527-feat-context-platform-472-slice-b-contex ([f929573](https://github.com/mctlhq/mctl-agents/commit/f929573c3d1a9e8c0cc0746c5d800a83381c9237))
+* **agents:** issue-533-register-newton-mcp-gateway-as-a-non-rot ([a040907](https://github.com/mctlhq/mctl-agents/commit/a040907d1c671fc6da485d1500db38d2d58c7672))
+* **agents:** issue-533-register-newton-mcp-gateway-as-a-non-rot ([c460218](https://github.com/mctlhq/mctl-agents/commit/c4602181c9bd8bfd6e7225e12fb9fe495314782a))
+* **evidence:** define and seal the governed execution evidence envelope ([a55330b](https://github.com/mctlhq/mctl-agents/commit/a55330bd7232e7ffe382fed1911b5fc1570f453c))
+
+
+### Bug Fixes
+
+* **agents:** address P1/P2 codex findings on issue-266-feat-context-evals-measure-retrieval-qua ([20b34f1](https://github.com/mctlhq/mctl-agents/commit/20b34f1dfcd2d1b55b3a674cf4adb077b385a6fa))
+* **agents:** address P1/P2 codex findings on issue-266-feat-context-evals-measure-retrieval-qua ([2aaafb0](https://github.com/mctlhq/mctl-agents/commit/2aaafb01b5c8f5ae0509ebfc5f7b6a55c8f38ec6))
+* **agents:** address P1/P2 codex findings on issue-472-feat-context-platform-version-promote-ob ([8266e37](https://github.com/mctlhq/mctl-agents/commit/8266e3769227453840c90e778f6a8e8b85a1d5fc))
+* **agents:** address P1/P2 codex findings on issue-519-feat-governance-gate-shepherd-merge-thro ([7a31425](https://github.com/mctlhq/mctl-agents/commit/7a31425a8c244fec2bcec8a6ca8ffaeaf4b5a3d5))
+* **agents:** address P1/P2 codex findings on issue-519-feat-governance-gate-shepherd-merge-thro ([4c9e3b7](https://github.com/mctlhq/mctl-agents/commit/4c9e3b735f49c635be986d0b62ebb41afdfa34be))
+* **agents:** address P1/P2 codex findings on issue-520-feat-evidence-define-and-seal-the-govern ([8296b49](https://github.com/mctlhq/mctl-agents/commit/8296b49d526e48b7a409b6983958af5f7269341d))
+* **agents:** address P1/P2 codex findings on issue-520-feat-evidence-define-and-seal-the-govern ([1f3636c](https://github.com/mctlhq/mctl-agents/commit/1f3636c21000e322588cceb76fdf6b97c11447a4))
+* **agents:** address P1/P2 codex findings on issue-520-feat-evidence-define-and-seal-the-govern ([a01f97d](https://github.com/mctlhq/mctl-agents/commit/a01f97dd55f40275323a693fb060678b0b13f351))
+* **agents:** address P1/P2 codex findings on issue-520-feat-evidence-define-and-seal-the-govern ([f647192](https://github.com/mctlhq/mctl-agents/commit/f6471924f8717d1fb9fc3c108a7aa0635ea4c821))
+* **agents:** address P1/P2 codex findings on issue-520-feat-evidence-define-and-seal-the-govern ([749b77b](https://github.com/mctlhq/mctl-agents/commit/749b77b349b867e7c75c94acccda0cbaf5782a86))
+* **agents:** address P1/P2 codex findings on issue-526-feat-context-evals-complete-evaluation-b ([ff1be66](https://github.com/mctlhq/mctl-agents/commit/ff1be668ad24a623ef6a69d183272c3812ecc06c))
+* **agents:** address P1/P2 codex findings on issue-526-feat-context-evals-complete-evaluation-b ([d71b429](https://github.com/mctlhq/mctl-agents/commit/d71b429fa5be56368e3be5c6eca739ccd1552470))
+* **agents:** address P1/P2 codex findings on issue-526-feat-context-evals-complete-evaluation-b ([61d2d79](https://github.com/mctlhq/mctl-agents/commit/61d2d799d5b5d716a5aec14dae4032de780cf3f2))
+* **agents:** address P1/P2 codex findings on issue-527-feat-context-platform-472-slice-b-contex ([0c56421](https://github.com/mctlhq/mctl-agents/commit/0c56421ce9cce614621dac60256c4c1f74a1bcdd))
+* **agents:** address P1/P2 codex findings on issue-527-feat-context-platform-472-slice-b-contex ([50c0b6d](https://github.com/mctlhq/mctl-agents/commit/50c0b6df4444a8420989da2558558443010fb3b0))
+* **agents:** bound content_hash and evidence_id to their sealed shapes ([7dabdac](https://github.com/mctlhq/mctl-agents/commit/7dabdaccd964869b8f77942acf30afeb4b9cc19b))
+* **agents:** confirm the [#516](https://github.com/mctlhq/mctl-agents/issues/516) terminal exit over two polls; correct the record ([df08650](https://github.com/mctlhq/mctl-agents/commit/df08650dcf431cdaac7a9da5fe5d5ed4649dbf38))
+* **agents:** finish every merge-gate attempt, latch settled outcomes, follow head moves ([c079004](https://github.com/mctlhq/mctl-agents/commit/c079004ab1d47ecb3763c40b9e98d0b3e90cc029))
+* **agents:** issue-516-fix-devloop-end-devloopworkflow-when-its ([830aac8](https://github.com/mctlhq/mctl-agents/commit/830aac82c8690cedf950d95af51dfb2881bae719))
+* **agents:** keep a failed identity mint off the watch's path, retry the approved merge ([e557f1f](https://github.com/mctlhq/mctl-agents/commit/e557f1ff7d8a5395b45d05889f30cd33aa4a7614))
+* **agents:** measure evidence freshness from the newest observation ([067b51a](https://github.com/mctlhq/mctl-agents/commit/067b51ae052e8a811ac21db03f2d60644b38e02b))
+* **agents:** only store-backed records count as promotion observations ([2ac23c2](https://github.com/mctlhq/mctl-agents/commit/2ac23c2774de3a3f4c3c437426285d66cb32a615))
+* **agents:** validate rollback() promoted_by/promoted_at, add tests ([2512eee](https://github.com/mctlhq/mctl-agents/commit/2512eee518a7e05866259b5ef921fcfc28ae1d91))
+* **agents:** verify retried executions honestly and count executions, not attempts ([695cace](https://github.com/mctlhq/mctl-agents/commit/695cace6e9aa3af586630a9c88309c2489f06f4e))
+
 ## [1.59.0](https://github.com/mctlhq/mctl-agents/compare/1.58.0...1.59.0) (2026-09-26)
 
 
