@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.61.0](https://github.com/mctlhq/mctl-agents/compare/1.60.0...1.61.0) (2026-09-28)
+
+
+### Features
+
+* **agents:** issue-463-shepherd-extract-severity-misses-claude ([793cda6](https://github.com/mctlhq/mctl-agents/commit/793cda603259ef0d51411f80a5ecf85f6ffce72f))
+
+
+### Bug Fixes
+
+* **shepherd:** parse closed-bold severity markers ([0fb6d56](https://github.com/mctlhq/mctl-agents/commit/0fb6d561a21e1493a8c07df191000dc61f0e8062))
+
 ## [1.60.0](https://github.com/mctlhq/mctl-agents/compare/1.59.0...1.60.0) (2026-09-28)
 
 
