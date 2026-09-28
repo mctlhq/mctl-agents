@@ -131,8 +131,10 @@ def verify_identity(snapshot: ContextSnapshot, store_ref: StoreRef | None = None
     identity: `hash_bytes(canonical_json(snapshot.to_dict())) ==
     store_ref.store_content_hash` (the same bytes
     `work_context.snapshots.canonical_bytes` hashes; a test pins the two
-    equal for a real snapshot). `store_ref.store_snapshot_id` is never
-    recomputed or compared here — it is opaque, carried through only."""
+    equal for a real snapshot), or, on a cross-attempt replay, `==
+    store_ref.local_content_hash`, reported as `store_match:
+    retry-equivalent`. `store_ref.store_snapshot_id` is never recomputed or
+    compared here — it is opaque, carried through only."""
     mismatch_fields: list[str] = []
     document_ok = True
     if recompute_content_hash(snapshot) != snapshot.content_hash:
@@ -776,10 +778,14 @@ def _catalog_identity_matches(record: EvalRecord, expected: EvidenceIdentity) ->
     )
 
 
-def _observation_key(record: EvalRecord) -> tuple[str, ...]:
+def _observation_key(record: EvalRecord) -> tuple[str, str] | None:
+    """One promotion observation per store execution, or `None` for a record
+    with no store backing: nothing identifies its execution across retries
+    (a retry restamps its snapshot id, `content_hash` and `observed_at`), so
+    it cannot be told apart from another attempt and is never counted."""
     if record.store_ref is not None and record.store_ref.execution_id:
-        return ("store", record.store_ref.work_item_id, record.store_ref.execution_id)
-    return ("local", record.context_snapshot_id, record.content_hash, record.observed_at)
+        return (record.store_ref.work_item_id, record.store_ref.execution_id)
+    return None
 
 
 def assess_evidence(
@@ -795,8 +801,8 @@ def assess_evidence(
     `policy.min_consecutive_observations` newest-first observations agreeing
     on the full identity -> `insufficient-observations`; else `fresh`.
     Observations, not records, are counted (`_observation_key`): one per
-    store execution, else one per local document and `observed_at`; the run
-    ends at the first `evidence_kind == "none"` record. A record
+    store execution; a record with no `store_ref` is never an observation;
+    the run ends at the first `evidence_kind == "none"` record. A record
     whose own `verdict != "evaluated"` (a hash-mismatch) never counts as an
     observation at all. `fresh` is unreachable for `evidence_kind == "none"`
     by construction. `now` is an argument: this function reads no clock."""
@@ -810,7 +816,7 @@ def assess_evidence(
 
     ordered = sorted(usable, key=lambda r: r.observed_at, reverse=True)
     newest = ordered[0]
-    observations = len({_observation_key(r) for r in ordered})
+    observations = len({key for r in ordered if (key := _observation_key(r)) is not None})
 
     if newest.evidence_kind == "none":
         return EvidenceAssessment(
@@ -852,21 +858,20 @@ def assess_evidence(
         )
 
     # Observations are counted, not records (mctlhq/mctl-agents#526, ADR 015
-    # sec. 7 step 5). A record backed by the store is one observation per
-    # store execution — `store_ref.execution_id` is the store's own retry
-    # identity, so the attempts of one execution (whose local
-    # `content_hash`/`observed_at` are restamped on every retry) count once.
-    # A record with no store backing falls back to its local document
-    # identity plus `observed_at`; replaying one stored snapshot through the
-    # CLI stamps the same `observed_at` every time, so that is one
-    # observation too. An `evidence_kind: none` record ends the run.
-    counted: set[tuple[str, ...]] = set()
+    # sec. 7 step 5): one per store execution, keyed by
+    # `store_ref.execution_id`, the store's own retry identity, so the
+    # attempts of one execution count once. A record with no store backing
+    # is not an observation at all (see `_observation_key`). An
+    # `evidence_kind: none` record ends the run.
+    counted: set[tuple[str, str]] = set()
     for record in ordered:
         if record.evidence_kind == "none":
             break
         if not (_declared_identity_matches(record, expected) and _catalog_identity_matches(record, expected)):
             break
-        counted.add(_observation_key(record))
+        key = _observation_key(record)
+        if key is not None:
+            counted.add(key)
     consecutive = len(counted)
     if consecutive < policy.min_consecutive_observations:
         return EvidenceAssessment(

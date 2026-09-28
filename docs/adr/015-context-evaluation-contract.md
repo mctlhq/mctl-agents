@@ -40,7 +40,9 @@ and computes no metric until both check out:
 - **Store identity** — `cs_` + `store_content_hash`: `hash_bytes
   (canonical_bytes(snapshot)) == store_ref.store_content_hash`
   (`work_context/snapshots.py`), a hash over the *whole* canonical document,
-  minted by mctl-api. `store_snapshot_id` (`cs_`-prefixed) is opaque: it is
+  minted by mctl-api (or, on a cross-attempt replay, `==
+  store_ref.local_content_hash`; see below). `store_snapshot_id`
+  (`cs_`-prefixed) is opaque: it is
   carried and compared to what the store reported, and is never recomputed
   locally.
 
@@ -163,9 +165,11 @@ this fixed precedence (never order-dependent):
    newest-first observations agree on the full identity -> `insufficient-
    observations`. Observations, not records, are counted: one per store
    execution (`store_ref.execution_id`, so the retries of one execution
-   count once), else one per local `(context_snapshot_id, content_hash,
-   observed_at)`; the run ends at the first `evidence_kind: none` record.
-   `observations` in the assessment reports this deduplicated count.
+   count once). A record with `store_ref: null` is not a promotion
+   observation — a retry restamps every local identity field, so nothing
+   tells its attempts apart — and is never counted. The run ends at the
+   first `evidence_kind: none` record. `observations` in the assessment
+   reports this deduplicated count.
 6. Otherwise -> `fresh`.
 
 The freshness window and minimum-observation count are ADR 019's **v1

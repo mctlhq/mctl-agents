@@ -510,6 +510,13 @@ def _record(identity: ce.EvidenceIdentity, *, observed_at: str, verdict: str = c
     )
 
 
+def _store_ref(execution_id: str) -> wc_snapshots.StoreRef:
+    return wc_snapshots.StoreRef(
+        work_item_id="wi_1", execution_id=execution_id, store_snapshot_id="cs_" + execution_id,
+        store_content_hash="sha256:" + "a" * 64,
+    )
+
+
 def test_assess_evidence_precedence():
     expected = _identity()
     policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
@@ -541,7 +548,10 @@ def test_assess_evidence_precedence():
 
     # A differing pipeline_source_hash alone never gates: still fresh.
     three_agreeing = [
-        _record(_identity(pipeline_source_hash="sha256:" + str(i) * 64), observed_at=iso)
+        replace(
+            _record(_identity(pipeline_source_hash="sha256:" + str(i) * 64), observed_at=iso),
+            store_ref=_store_ref(f"we_{i}"),
+        )
         for i, iso in enumerate(("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z"))
     ]
     fresh = ce.assess_evidence(three_agreeing, expected=expected, now=now, policy=policy)
@@ -561,30 +571,34 @@ def test_assess_evidence_precedence():
     assert ce.assess_evidence(none_only, expected=expected, now=now, policy=policy).status == "missing"
 
 
-def test_assess_evidence_duplicate_observations_do_not_each_count():
-    """mctlhq/mctl-agents#526: N duplicate copies of the exact same
-    observation (same snapshot, same content, same `observed_at`) must not
-    satisfy `min_consecutive_observations = N` on their own — that would let
-    one real observation, logged twice, pass as evidence of repeated
-    agreement. Two observations of the same snapshot at genuinely different
-    moments still count separately."""
+def test_assess_evidence_never_counts_a_record_without_store_backing():
+    """ADR 015 sec. 7 step 5: a record with `store_ref: null` (the live
+    emitter below the work-context `observe` stage, or a non-`we_`
+    execution) is not a promotion observation. The retries of one such
+    execution restamp every local identity field, so three of them must not
+    reach `fresh`; neither may one record duplicated three times."""
     expected = _identity()
     policy = ce.FreshnessPolicy(window_seconds=ce.ADR019_V1_FRESHNESS_WINDOW_SECONDS, min_consecutive_observations=3)
     now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
 
-    one_real_observation = _record(expected, observed_at="2026-09-26T00:00:00Z")
-    three_copies = [one_real_observation, one_real_observation, one_real_observation]
-    result = ce.assess_evidence(three_copies, expected=expected, now=now, policy=policy)
-    assert result.status == "insufficient-observations"
-
-    # The same underlying snapshot observed at three genuinely different
-    # moments is three real observations, not duplicates, and still passes.
-    distinct_moments = [
-        replace(one_real_observation, observed_at=iso)
-        for iso in ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    base = _record(expected, observed_at="2026-09-26T00:00:03Z")
+    restamped_retries = [
+        replace(base, observed_at=f"2026-09-26T00:00:0{i}Z", context_snapshot_id=f"cs-{i}",
+                content_hash="sha256:" + str(i) * 64)
+        for i in (3, 2, 1)
     ]
-    result = ce.assess_evidence(distinct_moments, expected=expected, now=now, policy=policy)
-    assert result.status == "fresh"
+    result = ce.assess_evidence(restamped_retries, expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations" and result.observations == 0
+
+    result = ce.assess_evidence([base, base, base], expected=expected, now=now, policy=policy)
+    assert result.status == "insufficient-observations" and result.observations == 0
+
+    # Unbacked records between store-backed ones neither count nor break the run.
+    mixed = [replace(base, store_ref=_store_ref("we_a")), restamped_retries[1],
+             replace(base, observed_at="2026-09-25T00:00:00Z", store_ref=_store_ref("we_b")),
+             replace(base, observed_at="2026-09-24T00:00:00Z", store_ref=_store_ref("we_c"))]
+    result = ce.assess_evidence(mixed, expected=expected, now=now, policy=policy)
+    assert result.status == "fresh" and result.observations == 3
 
 
 def test_assess_evidence_counts_store_executions_not_retry_attempts():
@@ -599,11 +613,7 @@ def test_assess_evidence_counts_store_executions_not_retry_attempts():
     now = datetime(2026, 9, 27, 0, 0, 0, tzinfo=UTC)
     isos = ("2026-09-26T00:00:03Z", "2026-09-26T00:00:02Z", "2026-09-26T00:00:01Z")
 
-    def ref(execution_id: str) -> wc_snapshots.StoreRef:
-        return wc_snapshots.StoreRef(
-            work_item_id="wi_1", execution_id=execution_id, store_snapshot_id="cs_" + execution_id,
-            store_content_hash="sha256:" + "a" * 64,
-        )
+    ref = _store_ref
 
     base = _record(expected, observed_at=isos[0])
     retries = [
