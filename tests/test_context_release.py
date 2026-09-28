@@ -15,6 +15,7 @@ implementation file" gets it for free by naming one that does not exist.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import sys
@@ -1090,6 +1091,147 @@ def test_cli_promote_rejects_unsafe_agent_path_segment(tmp_path):
     )
     assert result.returncode != 0
     assert "must be a single path segment" in result.stderr
+
+
+def test_cli_promote_requires_evidence_ref_for_context_eval_kind(tmp_path):
+    """T13/T6: `--evidence-kind context-eval` without `--evidence-ref` is
+    rejected before any catalog access — this never touches the real
+    committed catalog, so it is safe regardless of its current hash state."""
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "x", "--evidence-kind", "context-eval",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unknown:" in result.stderr
+    assert "--evidence-ref" in result.stderr
+
+
+def test_cli_promote_malformed_evidence_line_exits_nonzero_naming_the_line(tmp_path):
+    """T13: an unparsable evidence file exits non-zero with `unknown:` and
+    the offending line number, before any catalog access."""
+    evidence_path = tmp_path / "evidence.jsonl"
+    valid_line = json.dumps({"record_kind": ce.RECORD_KIND, "verdict": ce.VERDICT_EVALUATED})
+    evidence_path.write_text(f"{valid_line}\nnot-json-at-all\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "x", "--evidence-kind", "context-eval",
+            "--evidence-ref", "run-1", "--evidence-file", str(evidence_path),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "unknown:" in result.stderr
+    assert "line 2" in result.stderr
+
+
+def _real_catalog_evidence_records() -> list[str]:
+    """JSONL lines of three fresh, distinct-execution `observe-candidate`
+    records matching the REAL committed `deterministic-fixed-order`@1.0.0
+    identity — read via `cr.load_version` so this never hardcodes a hash
+    that a republish would change."""
+    version = cr.load_version("deterministic-fixed-order", "1.0.0")
+    identity = ce.EvidenceIdentity(
+        strategy_name=version.name, strategy_version=version.version, ranker_name=version.ranker_name,
+        ranker_version=version.ranker_version, strategy_content_hash=version.content_hash,
+        strategy_implementation_hash=version.implementation_hash, evaluator_name=ce.EVALUATOR_NAME,
+        evaluator_version=ce.EVALUATOR_VERSION, metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
+    )
+    isos = ("2026-09-26T00:00:00Z", "2026-09-25T00:00:00Z", "2026-09-24T00:00:00Z")
+    records = [
+        ce.EvalRecord(
+            record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+            verdict=ce.VERDICT_EVALUATED, identity=identity, evidence_kind="observe-candidate",
+            context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64, store_ref=None, metrics=None,
+            outcome=None, observed_at=iso,
+            execution_ref=ce.ExecutionRef(work_item_id="wi_1", execution_id=f"we_{i}"),
+        )
+        for i, iso in enumerate(isos)
+    ]
+    return [json.dumps(r.to_log_dict()) for r in records]
+
+
+def test_cli_promote_production_dry_run_with_fresh_evidence_prints_the_gate_and_writes_nothing(tmp_path):
+    """T13: `promote --environment production --evidence-file <fresh>.jsonl
+    --dry-run` prints the passing gate and writes no file. Runs against the
+    REAL committed catalog (`cr.load_version` inside the CLI has no
+    `--versions-dir` override), so this DoD is only exercised once task 10's
+    republish has run — see `tests/test_context_release.py::test_published_
+    catalog_hashes_are_not_drifted` for that guard."""
+    evidence_path = tmp_path / "evidence.jsonl"
+    evidence_path.write_text("\n".join(_real_catalog_evidence_records()) + "\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "3 clean observe-mode soak runs",
+            "--evidence-kind", "context-eval", "--evidence-ref", "argo-workflow-logs://soak-2026-09",
+            "--evidence-evaluator-version", ce.EVALUATOR_VERSION, "--evidence-file", str(evidence_path),
+            "--dry-run",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "gate: status=ok" in result.stdout
+    assert "observations=3" in result.stdout
+    assert "would write" in result.stdout
+    assert not (REPO_ROOT / "config" / "context-strategies" / "bindings" / "production").exists()
+
+
+def test_cli_promote_production_stale_evidence_exits_nonzero_naming_evidence_stale(tmp_path):
+    version = cr.load_version("deterministic-fixed-order", "1.0.0")
+    identity = ce.EvidenceIdentity(
+        strategy_name=version.name, strategy_version=version.version, ranker_name=version.ranker_name,
+        ranker_version=version.ranker_version, strategy_content_hash=version.content_hash,
+        strategy_implementation_hash=version.implementation_hash, evaluator_name=ce.EVALUATOR_NAME,
+        evaluator_version=ce.EVALUATOR_VERSION, metrics_contract_version=ce.METRICS_CONTRACT_VERSION,
+    )
+    stale_isos = ("2026-01-03T00:00:00Z", "2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z")
+    records = [
+        ce.EvalRecord(
+            record_kind=ce.RECORD_KIND, evaluator_name=ce.EVALUATOR_NAME, evaluator_version=ce.EVALUATOR_VERSION,
+            verdict=ce.VERDICT_EVALUATED, identity=identity, evidence_kind="observe-candidate",
+            context_snapshot_id="cs-x", content_hash="sha256:" + "c" * 64, store_ref=None, metrics=None,
+            outcome=None, observed_at=iso,
+            execution_ref=ce.ExecutionRef(work_item_id="wi_1", execution_id=f"we_{i}"),
+        )
+        for i, iso in enumerate(stale_isos)
+    ]
+    evidence_path = tmp_path / "evidence.jsonl"
+    evidence_path.write_text("\n".join(json.dumps(r.to_log_dict()) for r in records) + "\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            sys.executable, str(REPO_ROOT / "tools" / "context_release.py"),
+            "promote", "--agent", "issue-investigator", "--environment", "production",
+            "--strategy", "deterministic-fixed-order", "--version", "1.0.0",
+            "--promoted-by", "octocat", "--reason", "stale evidence", "--evidence-kind", "context-eval",
+            "--evidence-ref", "argo-workflow-logs://soak-2026-01", "--evidence-evaluator-version",
+            ce.EVALUATOR_VERSION, "--evidence-file", str(evidence_path), "--dry-run",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "evidence-stale" in result.stderr
 
 
 def test_cli_help_exits_zero():
