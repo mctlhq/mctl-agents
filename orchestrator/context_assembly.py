@@ -1242,6 +1242,7 @@ def _emit_release_verdict(
     every stage except `observe`, where the binding never drives the
     authoritative run — there, `strategy` is what ran and `bound_strategy` is
     only the shadow/compare candidate."""
+    line: dict[str, str | int | bool | None]
     if resolution is None:
         line = {
             "mode": "off",
@@ -1381,8 +1382,11 @@ def assemble(
             # module-level `candidates` (collected under the authoritative
             # `config.ranked`) would silently misclassify a prior proposal's
             # freshness whenever the bound strategy differs from the running
-            # one in `ranked`-ness. See T13
-            # (`test_enforce_substitution_reaches_the_collectors_not_only_the_pipeline`).
+            # one in `ranked`-ness. T13
+            # (`test_enforce_substitution_reaches_the_collectors_not_only_the_pipeline`)
+            # pins the analogous enforce-path substitution but never reaches
+            # this observe-only branch; the pin for this branch is
+            # `test_observe_shadow_pass_recollects_under_the_bound_strategy`.
             shadow_config = replace(config, strategy=resolution.bound_strategy)
             shadow_input = replace(assembly_input, config=shadow_config)
             shadow_candidates: list[CandidateSource] = []

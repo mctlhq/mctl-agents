@@ -1034,6 +1034,66 @@ def test_enforce_substitution_reaches_the_collectors_not_only_the_pipeline(tmp_p
 
 
 # ---------------------------------------------------------------------------
+# T13b — the observe shadow pass re-collects under the bound strategy
+# ---------------------------------------------------------------------------
+def test_observe_shadow_pass_recollects_under_the_bound_strategy(tmp_path, monkeypatch, capsys):
+    """`collect_prior_proposal` (`:821`) reads `assembly_input.config.ranked`.
+    T13 only pins the enforce-path substitution reaching the collectors; its
+    `mode=rollout.ENFORCE` never reaches the `observe` shadow pass in
+    `assemble` (`:1386`), which only fires at `observe` with a
+    `bound_strategy` that differs from the authoritative one. This test
+    covers that branch directly: an `observe` run whose authoritative
+    strategy is `deterministic-fixed-order` (non-ranked) and whose bound
+    strategy is `trust-freshness-ranked` must produce a shadow snapshot
+    (`CONTEXT_STRATEGY_COMPARE`'s `bound_snapshot_id`) identical to a direct
+    `trust-freshness-ranked` run over the same proposal directory --
+    proving the substitution reached the collectors, not only
+    `run_pipeline`. Before the re-collection fix, the shadow pass reused
+    the authoritative-config candidates (always collected non-ranked here),
+    so the prior proposal kept its retrieval-time `observed_at` instead of
+    picking up its `.status.yaml` `updated_at`, and this assertion would
+    fail."""
+    proposal_dir = tmp_path / "proposal"
+    proposal_dir.mkdir()
+    (proposal_dir / "requirements.md").write_text("req")
+    (proposal_dir / ".status.yaml").write_text("updated_at: '2026-09-10T00:00:00Z'\n")
+
+    monkeypatch.delenv("AGENT_ENVIRONMENT", raising=False)
+
+    fake_resolved = cr.ResolvedContextStrategy(
+        agent="issue-investigator",
+        environment=rollout.OBSERVE_ENVIRONMENT,
+        strategy=ca.RANKED_STRATEGY_NAME,
+        version=ca.RANKED_STRATEGY_VERSION,
+        ranker_name=ca.RANKER_NAME,
+        ranker_version=ca.RANKER_VERSION,
+        content_hash="sha256:" + "0" * 64,
+        implementation_hash="sha256:" + "1" * 64,
+        release_revision=99,
+        verdict=cr.VERDICT_OK,
+    )
+    monkeypatch.setattr(cr, "resolve", lambda agent, environment: fake_resolved)
+
+    config = ca.AssemblyConfig()  # deterministic-fixed-order -- authoritative stays non-ranked
+    assembly_input = _assembly_input(tmp_path, config=config, proposal_dir=proposal_dir)
+    execution = _execution()
+
+    monkeypatch.setenv(rollout.ENV_VAR, rollout.OBSERVE)
+    ca.assemble(assembly_input, mode="shadow", execution=execution)
+    out = capsys.readouterr().out
+    compare_lines = [line for line in out.splitlines() if line.startswith("CONTEXT_STRATEGY_COMPARE ")]
+    assert len(compare_lines) == 1
+    bound_snapshot_id = json.loads(compare_lines[0].split(" ", 1)[1])["bound_snapshot_id"]
+
+    monkeypatch.delenv(rollout.ENV_VAR, raising=False)
+    ranked_config = ca.AssemblyConfig(strategy=ca.RANKED_STRATEGY_NAME)
+    assembly_input_ranked = _assembly_input(tmp_path, config=ranked_config, proposal_dir=proposal_dir)
+    baseline = ca.assemble(assembly_input_ranked, mode="shadow", execution=execution)
+
+    assert bound_snapshot_id == baseline.snapshot.snapshot_id
+
+
+# ---------------------------------------------------------------------------
 # T15 — metrics shape at off
 # ---------------------------------------------------------------------------
 def test_metrics_shape_at_off_carries_off_safe_defaults(tmp_path):
