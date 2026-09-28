@@ -364,19 +364,23 @@ def test_context_release_is_not_imported_by_any_policy_module():
     """Import-direction assertion: no module whose name says "policy" or
     "lifecycle" (this repository's closest thing to a policy path —
     orchestrator/policy_checkpoint.py, orchestrator/lifecycle/*) imports
-    orchestrator.context_release, at module scope or otherwise. A promotion,
-    binding or hash is ordering and measurement only (ADR 009 sec. 5); it
-    must never become reachable from an authorization decision."""
+    orchestrator.context_release or orchestrator.context_rollout
+    (mctlhq/mctl-agents#527 Slice B's stdlib-only ladder), at module scope or
+    otherwise. A promotion, binding, rollout stage or hash is ordering and
+    measurement only (ADR 009 sec. 5); it must never become reachable from an
+    authorization decision."""
     policy_like = sorted(
         p for p in REPO_ROOT.joinpath("orchestrator").rglob("*.py")
-        if ("policy" in p.stem or "lifecycle" in p.parts) and p.name != "context_release.py"
+        if ("policy" in p.stem or "lifecycle" in p.parts)
+        and p.name not in {"context_release.py", "context_rollout.py"}
     )
     assert policy_like, "expected at least one policy-like module to check against"
+    forbidden_substrings = ("context_release", "context_rollout")
     offenders = [
         p for p in policy_like
-        if "context_release" in p.read_text(encoding="utf-8")
+        if any(substring in p.read_text(encoding="utf-8") for substring in forbidden_substrings)
     ]
-    assert not offenders, f"policy-like module(s) reference context_release: {offenders}"
+    assert not offenders, f"policy-like module(s) reference context_release/context_rollout: {offenders}"
 
 
 def test_context_release_module_does_not_leak_claude_sdk_or_mcp():
