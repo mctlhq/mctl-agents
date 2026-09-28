@@ -48,6 +48,17 @@ def test_dot_github_is_non_rotating():
     assert ".github" not in ROTATING_SERVICES
 
 
+def test_newton_mcp_gateway_is_a_registered_service():
+    """mctlhq/newton-mcp-gateway must be a valid implementer/investigator target."""
+    assert "newton-mcp-gateway" in SERVICES
+
+
+def test_newton_mcp_gateway_is_non_rotating():
+    """No agents/newton-mcp-gateway/ scaffold, so it must stay out of the rotation."""
+    assert "newton-mcp-gateway" in NON_ROTATING_SERVICES
+    assert "newton-mcp-gateway" not in ROTATING_SERVICES
+
+
 def test_no_service_name_is_shell_glob_hostile_beyond_a_leading_dot():
     """A service name becomes a path segment under agents-state/.
 
